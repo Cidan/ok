@@ -110,9 +110,25 @@ async fn plain(uri: Uri, endpoint: &str) -> Result<Channel, Status> {
         .map_err(|e| Status::unavailable(format!("connect to {endpoint}: {e}")))
 }
 
+/// Who a loopback plaintext endpoint is called as: a development principal named — the clone's
+/// (`dev`), or else `OK_DEV_PRINCIPAL` — for a development server; else this machine's credential,
+/// for an installation served on localhost without TLS (docker compose).
+#[derive(Debug, PartialEq, Eq)]
+enum LoopbackCaller {
+    Dev(String),
+    Machine,
+}
+
+fn loopback_caller(dev: Option<&str>, env: Option<String>) -> LoopbackCaller {
+    match dev.map(str::to_owned).or(env.filter(|p| !p.is_empty())) {
+        Some(p) => LoopbackCaller::Dev(p),
+        None => LoopbackCaller::Machine,
+    }
+}
+
 /// Connects to `endpoint` — the SCM, or another of ok's services — as this machine's user. On a
-/// loopback development server the caller is `dev`, or else `OK_DEV_PRINCIPAL`. Runs on the store
-/// runtime.
+/// loopback plaintext endpoint the caller is a development principal when one is named
+/// (`loopback_caller`), and this machine's credential otherwise. Runs on the store runtime.
 pub async fn connect(endpoint: &str, dev: Option<&str>) -> Result<(Conn, DevPrincipal), Status> {
     let uri: Uri = endpoint
         .parse()
@@ -138,14 +154,22 @@ pub async fn connect(endpoint: &str, dev: Option<&str>) -> Result<(Conn, DevPrin
                     DevPrincipal(None),
                 ));
             }
-            let principal = dev
-                .map(str::to_owned)
-                .or_else(|| std::env::var(DEV_PRINCIPAL).ok().filter(|p| !p.is_empty()))
-                .ok_or_else(|| {
-                    Status::unauthenticated(format!(
-                        "a loopback development SCM needs {DEV_PRINCIPAL}"
-                    ))
-                })?;
+            let principal = match loopback_caller(dev, std::env::var(DEV_PRINCIPAL).ok()) {
+                LoopbackCaller::Dev(p) => p,
+                LoopbackCaller::Machine => {
+                    let auth = machine().map_err(|e| {
+                        Status::unauthenticated(format!(
+                            "{}: sign in with jj auth login {endpoint} (a development server takes {DEV_PRINCIPAL} instead)",
+                            e.message()
+                        ))
+                    })?;
+                    let channel = plain(uri, endpoint).await?;
+                    return Ok((
+                        Measured::new(Authed::new(channel, auth)),
+                        DevPrincipal(None),
+                    ));
+                }
+            };
             let value = principal.parse().map_err(|_| {
                 Status::invalid_argument(format!("{DEV_PRINCIPAL} is not a header value"))
             })?;
@@ -272,5 +296,31 @@ impl Client {
                 .max_decoding_message_size(MAX_MESSAGE)
                 .max_encoding_message_size(MAX_MESSAGE),
         )
+    }
+}
+
+#[cfg(test)]
+mod loopback_tests {
+    use super::LoopbackCaller;
+    use super::loopback_caller;
+
+    // A development principal named — the clone's first, then the environment's — makes a
+    // development call; with none, the machine's credential is presented: an installation on
+    // localhost without TLS is no development server.
+    #[test]
+    fn a_loopback_endpoint_is_called_as_named_or_as_the_machine() {
+        assert_eq!(
+            loopback_caller(Some("ada"), Some("bea".into())),
+            LoopbackCaller::Dev("ada".into())
+        );
+        assert_eq!(
+            loopback_caller(None, Some("bea".into())),
+            LoopbackCaller::Dev("bea".into())
+        );
+        assert_eq!(
+            loopback_caller(None, Some(String::new())),
+            LoopbackCaller::Machine
+        );
+        assert_eq!(loopback_caller(None, None), LoopbackCaller::Machine);
     }
 }

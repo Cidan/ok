@@ -536,7 +536,7 @@ func sandbox(bwrap string, proc []string, tmp, contextFile string) []string {
 
 // HideSecrets is the prefix every Bazel command a worker runs runs under (bubblewrap): the worker's
 // own view of the file system and its network, but each of hidden covered — a directory with an
-// empty one, a file with an empty file, and a link with an empty directory over the directory
+// empty one, a file with an empty file (emptyFile), and a link with an empty directory over the directory
 // that holds it (a Kubernetes projected volume's files are links to the volume's own, renewed
 // in place) — so nothing a change's build, tests, or repository rules run can read it; then each
 // of kept, beneath a hidden directory, bound back. A path that does not exist is passed over.
@@ -551,7 +551,7 @@ func HideSecrets(bwrap string, hidden, kept []string) []string {
 		case info.IsDir():
 			out = append(out, "--tmpfs", p)
 		default:
-			out = append(out, "--ro-bind", "/dev/null", p)
+			out = append(out, "--ro-bind", emptyFile(), p)
 		}
 	}
 	for _, p := range kept {
@@ -561,6 +561,20 @@ func HideSecrets(bwrap string, hidden, kept []string) []string {
 	}
 	return append(out, "--die-with-parent", "--")
 }
+
+// emptyFile is a read-only file of no bytes, which HideSecrets covers a secret file with: in a
+// rootless container /dev/null is a mount whose locked flags bubblewrap cannot bind with.
+var emptyFile = sync.OnceValue(func() string {
+	f, err := os.CreateTemp("", "ok-empty-")
+	if err != nil {
+		return "/dev/null"
+	}
+	f.Close()
+	if err := os.Chmod(f.Name(), 0o444); err != nil {
+		return "/dev/null"
+	}
+	return f.Name()
+})
 
 // hide is the prefix a slot's Bazel commands run under (HideSecrets): the worker's secrets, the
 // other slots' checkouts, output bases, and scratch out of sight, and the slot's own in it. It is
@@ -599,7 +613,19 @@ func CheckSandbox(bwrap string, secrets []string) ([]string, error) {
 		}
 		failed = append(failed, fmt.Sprintf("%v: %s", err, strings.TrimSpace(string(out))))
 	}
-	return nil, fmt.Errorf("bubblewrap cannot make the sandbox run jobs run in (%s); %s", strings.Join(failed, "; with the pod's /proc: "), checkout.UserNamespaces())
+	why := checkout.UserNamespaces()
+	if selinuxContainer() {
+		why = "this container runs as SELinux's container_t, which refuses the sandbox a /dev/pts of its own: " +
+			"run the worker without its SELinux label (podman, docker: --security-opt label=disable; Kubernetes: " +
+			"securityContext.seLinuxOptions.type: spc_t; docs/install.md, \"Workers' nodes\")"
+	}
+	return nil, fmt.Errorf("bubblewrap cannot make the sandbox run jobs run in (%s); %s", strings.Join(failed, "; with the pod's /proc: "), why)
+}
+
+// selinuxContainer reports whether this process runs as a container's SELinux type.
+func selinuxContainer() bool {
+	b, err := os.ReadFile("/proc/self/attr/current")
+	return err == nil && strings.Contains(string(b), ":container_t:")
 }
 
 // wholeLint reports whether a job lints the whole repository: the lint a change that makes an
