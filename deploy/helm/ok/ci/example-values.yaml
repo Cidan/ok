@@ -21,10 +21,13 @@ server:
   extraSecretMounts:
     - {name: oidc, secretName: ok-oidc, mountPath: /etc/ok/secrets/oidc}
     - {name: people, secretName: ok-people, mountPath: /etc/ok/secrets/people}
+httpRoute:
+  enabled: true
+  parentRefs: [{name: public, namespace: gateway, sectionName: https}]
 ingress:
   enabled: true
-  className: nginx
-  annotations: {nginx.ingress.kubernetes.io/backend-protocol: GRPC}
+  className: traefik
+  host: ok.example.com
 worker:
   checkout: virtual
   dockerConfigSecret: registry-credentials

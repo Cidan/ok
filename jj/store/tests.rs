@@ -1167,7 +1167,7 @@ fn a_failed_fetch_fails_every_waiter() {
 
 // Reads made while a fetch is in flight go out at once, in fetches of their own that overlap it —
 // never more than MAX_IN_FLIGHT of a kind at a time — and those that wait for the limit go out as
-// fetches return.
+// fetches return. Nothing here is timed: a slow machine passes as a fast one does.
 #[test]
 fn reads_overlap_up_to_the_limit() {
     use crate::batch::MAX_IN_FLIGHT;
@@ -1194,9 +1194,7 @@ fn reads_overlap_up_to_the_limit() {
         }),
     );
     let n = 3 * MAX_IN_FLIGHT as u32;
-    let started = std::time::Instant::now();
     let got = block_on(futures::future::join_all((0..n).map(|k| b.get(k))));
-    let took = started.elapsed();
     assert!(got.iter().all(|r| r.as_ref().is_ok_and(Option::is_some)));
     assert_eq!(calls.lock().unwrap().len(), n as usize, "one key a fetch");
     assert_eq!(
@@ -1204,25 +1202,54 @@ fn reads_overlap_up_to_the_limit() {
         MAX_IN_FLIGHT,
         "as many fetches at once as the limit, and no more"
     );
-    assert!(
-        took < Duration::from_millis(100 * 3 * 2),
-        "{n} fetches of 100 ms, {MAX_IN_FLIGHT} at a time, took {took:?}"
-    );
 
-    // A read made while another fetch is in flight does not wait for it.
-    let started = std::time::Instant::now();
-    let first = {
-        let b = b.clone();
-        std::thread::spawn(move || block_on(b.get(1000)))
-    };
-    std::thread::sleep(Duration::from_millis(30));
-    block_on(b.get(1001)).unwrap();
-    let second = started.elapsed();
-    first.join().unwrap().unwrap();
-    assert!(
-        second < Duration::from_millis(180),
-        "the second read waited for the first fetch: {second:?}"
+    // A read made while another fetch is in flight does not wait for it: the first fetch is held
+    // until the second read has its value, so a second read that waited would never finish.
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let held = Arc::new(Mutex::new(held));
+    let (entered, first_in_flight) = std::sync::mpsc::channel::<()>();
+    let entered = Arc::new(Mutex::new(entered));
+    let gated: Arc<Batcher<u32, String>> = Batcher::new(
+        "gated",
+        1,
+        Box::new(move |keys: Vec<u32>| {
+            let held = held.clone();
+            let entered = entered.clone();
+            Box::pin(async move {
+                if keys.contains(&1000) {
+                    let _ = entered.lock().unwrap().send(());
+                    tokio::task::spawn_blocking(move || {
+                        let _ = held.lock().unwrap().recv_timeout(Duration::from_secs(60));
+                    })
+                    .await
+                    .unwrap();
+                }
+                Ok(keys.into_iter().map(|k| (k, format!("v{k}"))).collect())
+            })
+        }),
     );
+    let first = {
+        let gated = gated.clone();
+        std::thread::spawn(move || block_on(gated.get(1000)))
+    };
+    first_in_flight
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the first fetch never started");
+    let second = {
+        let gated = gated.clone();
+        std::thread::spawn(move || block_on(gated.get(1001)))
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !second.is_finished() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the second read waited for the first fetch"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    second.join().unwrap().unwrap();
+    release.send(()).unwrap();
+    first.join().unwrap().unwrap();
 }
 
 /// A 3,600-byte chunk, `ok's stored chunk\n` 200 times, as one zstd frame with a content checksum —

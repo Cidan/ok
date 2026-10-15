@@ -1,9 +1,15 @@
 package checkout
 
 import (
+	"fmt"
+	"os"
+	"os/exec"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 // A root process keeps every range of ids it has, each mapped to itself.
@@ -45,5 +51,53 @@ func TestNamespaceMaps(t *testing.T) {
 		if len(uids) != 1 || uids[0] != tc.wantUID || len(gids) != 1 || gids[0] != tc.wantGID || allow != tc.wantAllowSetgroups {
 			t.Errorf("%s: %+v %+v %v", tc.name, uids, gids, allow)
 		}
+	}
+}
+
+// isolateHelper marks the test binary run again by TestIsolateWithoutPrivilegeEscalation.
+const isolateHelper = "OK_TEST_ISOLATE_HELPER"
+
+// The copy Isolate starts is root of its namespace, able to mount, even where privilege
+// escalation is not allowed — as Kubernetes runs a container with allowPrivilegeEscalation:
+// false, under which no exec gains a capability.
+func TestIsolateWithoutPrivilegeEscalation(t *testing.T) {
+	if dir := os.Getenv(isolateHelper); dir != "" {
+		if os.Getenv(isolatedEnv) == "" {
+			if err := unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := Isolate(); err != nil {
+			fmt.Println("isolate:", err)
+			os.Exit(2)
+		}
+		if err := unix.Mount("tmpfs", dir, "tmpfs", 0, ""); err != nil {
+			fmt.Println("mount:", err)
+			os.Exit(3)
+		}
+		fmt.Println("isolated, and mounted")
+		os.Exit(0)
+	}
+	// A sandbox whose /proc numbers an outer PID namespace's processes cannot be given a clone's
+	// maps at all — they are written at the number the clone returns, which there names another
+	// process, or none — and Isolate takes its other way there, which no_new_privs forbids.
+	if self, err := os.Readlink("/proc/self"); err != nil || self != strconv.Itoa(os.Getpid()) {
+		t.Skipf("this sandbox's /proc numbers another PID namespace's processes (/proc/self is %q, this process %d)", self, os.Getpid())
+	}
+	probe := exec.Command("/proc/self/exe", "-test.run=^$")
+	probe.SysProcAttr = &syscall.SysProcAttr{Cloneflags: syscall.CLONE_NEWUSER,
+		UidMappings: []syscall.SysProcIDMap{{ContainerID: 0, HostID: os.Geteuid(), Size: 1}},
+		GidMappings: []syscall.SysProcIDMap{{ContainerID: 0, HostID: os.Getegid(), Size: 1}}}
+	if err := probe.Run(); err != nil {
+		if os.Getenv("OK_TEST_INTEGRATION") == "require" {
+			t.Fatalf("OK_TEST_INTEGRATION=require, and this host makes no user namespace: %v; %s", err, UserNamespaces())
+		}
+		t.Skipf("this host makes no user namespace: %v", err)
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestIsolateWithoutPrivilegeEscalation$", "-test.v")
+	cmd.Env = append(os.Environ(), isolateHelper+"="+t.TempDir())
+	out, err := cmd.CombinedOutput()
+	if err != nil || !strings.Contains(string(out), "isolated, and mounted") {
+		t.Fatalf("isolating without privilege escalation: %v\n%s", err, out)
 	}
 }

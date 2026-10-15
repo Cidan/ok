@@ -20,23 +20,42 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{/* A ServiceAccount's subject, as its tokens name it. */}}
 {{- define "ok.subject" -}}system:serviceaccount:{{ .root.Release.Namespace }}:{{ include "ok.name" .root }}-{{ .account }}{{- end -}}
 
-{{/* What every pod mounts: ok.yaml, and the database's URL. */}}
+{{/* What every pod mounts: ok.yaml. */}}
 {{- define "ok.configVolumes" -}}
 - name: config
   configMap:
     name: {{ include "ok.name" . }}-config
-- name: database
-  secret:
-    secretName: {{ .Values.database.urlSecret.name }}
-    items: [{key: {{ .Values.database.urlSecret.key }}, path: url}]
 {{- end -}}
 {{- define "ok.configMounts" -}}
 - name: config
   mountPath: /etc/ok/config
   readOnly: true
+{{- end -}}
+
+{{/* The database's URL, with its password: the server's and the deployer's, which keep tables.
+     Never a worker's, which runs a change's code and keeps none. */}}
+{{- define "ok.databaseVolumes" -}}
+- name: database
+  secret:
+    secretName: {{ .Values.database.urlSecret.name }}
+    items: [{key: {{ .Values.database.urlSecret.key }}, path: url}]
+{{- end -}}
+{{- define "ok.databaseMounts" -}}
 - name: database
   mountPath: /etc/ok/secrets/database
   readOnly: true
+{{- end -}}
+
+{{/* A worker's or the deployer's resources: its own, and, for a virtual checkout, the FUSE device
+     resource its node's device plugin offers (fuseResource), which lets it open /dev/fuse. */}}
+{{- define "ok.resources" -}}
+{{- $r := deepCopy (default dict .resources) -}}
+{{- if and (eq .checkout "virtual") .fuseResource -}}
+{{- $limits := deepCopy (default dict $r.limits) -}}
+{{- $_ := set $limits .fuseResource 1 -}}
+{{- $_ := set $r "limits" $limits -}}
+{{- end -}}
+{{- if $r }}{{ toYaml $r }}{{ end -}}
 {{- end -}}
 
 {{/* A role's projected ServiceAccount token, with which it certifies its key at identity. */}}

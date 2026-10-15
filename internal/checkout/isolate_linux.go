@@ -28,17 +28,23 @@ const isolatedEnv = "OK_CHECKOUT_ISOLATED"
 // orphans the copy leaves (it is a subreaper), stop what the copy leaves running, and exit with
 // the copy's status. Call it first in main.
 //
-// The copy starts in its namespaces before they map any id: it tells this process its number as
-// /proc numbers it — a sandbox's /proc may number an outer PID namespace's processes, so the
-// number fork returns may name another process there — this process writes the maps there, and
-// the copy runs itself again, now root of the namespace with every capability (an exec with no
-// id mapped grants none).
+// The copy's ids are mapped before it first runs (the clone's maps, which Go writes between the
+// clone and the exec), so it starts as root of the namespace with every capability — the only
+// way it can where privilege escalation is not allowed (no_new_privs: a container's
+// allowPrivilegeEscalation: false), under which no later exec gains a capability. Where that
+// cannot be done — a sandbox's /proc may number an outer PID namespace's processes, so the number
+// the clone returns names another process there — the copy starts with no id mapped, tells this
+// process its number as /proc numbers it, this process writes the maps there, and the copy runs
+// itself again, now root of the namespace (which needs privilege escalation allowed).
 func Isolate() error {
 	switch os.Getenv(isolatedEnv) {
 	case "1":
 		// Mounts made here stay here.
 		if err := unix.Mount("", "/", "", unix.MS_REC|unix.MS_PRIVATE, ""); err != nil {
-			return fmt.Errorf("making the mount namespace private: %w", err)
+			if status, _ := os.ReadFile("/proc/self/status"); strings.Contains(string(status), "NoNewPrivs:\t1") {
+				return fmt.Errorf("making the mount namespace private: %w: its ids were mapped only after it first ran, and privilege escalation is not allowed (no_new_privs), so it holds no capability", err)
+			}
+			return fmt.Errorf("making the mount namespace private: %w; %s", err, UserNamespaces())
 		}
 		return nil
 	case "pending":
@@ -60,42 +66,15 @@ func Isolate() error {
 	if err := unix.Prctl(unix.PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0); err != nil {
 		return fmt.Errorf("becoming a subreaper: %w", err)
 	}
-	// The running program itself, whatever path it was started by — which a sandbox may not
-	// show — through the kernel's own link to it.
-	cmd := exec.Command("/proc/self/exe", os.Args[1:]...)
-	cmd.Args[0] = os.Args[0]
-	cmd.Env = append(os.Environ(), isolatedEnv+"=pending")
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-	mapped, mappedW, err := os.Pipe()
-	if err != nil {
-		return err
-	}
-	numberR, number, err := os.Pipe()
-	if err != nil {
-		return err
-	}
-	cmd.ExtraFiles = []*os.File{mapped, number}
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Cloneflags: syscall.CLONE_NEWUSER | syscall.CLONE_NEWNS,
-		Setpgid:    true,
-		Pdeathsig:  syscall.SIGKILL,
-	}
 	signals := make(chan os.Signal, 8)
 	signal.Notify(signals, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP, syscall.SIGQUIT)
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("running in a user and mount namespace of its own: %w", err)
+	cmd, err := startMapped(uids, gids, allowSetgroups)
+	if err != nil {
+		var err2 error
+		if cmd, err2 = startUnmapped(uids, gids, allowSetgroups); err2 != nil {
+			return fmt.Errorf("running in a user and mount namespace of its own: %w (with its ids unmapped at first: %w); %s", err, err2, UserNamespaces())
+		}
 	}
-	mapped.Close()
-	number.Close()
-	if err := writeMaps(numberR, uids, gids, allowSetgroups); err != nil {
-		_ = cmd.Process.Kill()
-		return fmt.Errorf("mapping the ids of its user namespace: %w", err)
-	}
-	if _, err := mappedW.Write([]byte{1}); err != nil {
-		_ = cmd.Process.Kill()
-		return err
-	}
-	mappedW.Close()
 	child := cmd.Process.Pid
 	go func() {
 		for s := range signals {
@@ -113,6 +92,68 @@ func Isolate() error {
 	}
 	os.Exit(code)
 	return nil
+}
+
+// copyOf is the command that runs this program again, as it was run, through the kernel's own link
+// to it — whatever path it was started by, which a sandbox may not show.
+func copyOf(state string) *exec.Cmd {
+	cmd := exec.Command("/proc/self/exe", os.Args[1:]...)
+	cmd.Args[0] = os.Args[0]
+	cmd.Env = append(os.Environ(), isolatedEnv+"="+state)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	return cmd
+}
+
+// startMapped starts the copy with its ids mapped as it is cloned: it runs as root of its
+// namespace from the start.
+func startMapped(uids, gids []syscall.SysProcIDMap, allowSetgroups bool) (*exec.Cmd, error) {
+	cmd := copyOf("1")
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Cloneflags:                 syscall.CLONE_NEWUSER | syscall.CLONE_NEWNS,
+		UidMappings:                uids,
+		GidMappings:                gids,
+		GidMappingsEnableSetgroups: allowSetgroups,
+		Setpgid:                    true,
+		Pdeathsig:                  syscall.SIGKILL,
+	}
+	return cmd, cmd.Start()
+}
+
+// startUnmapped starts the copy with no id mapped, and maps them where the copy's /proc numbers it
+// (awaitMaps).
+func startUnmapped(uids, gids []syscall.SysProcIDMap, allowSetgroups bool) (*exec.Cmd, error) {
+	cmd := copyOf("pending")
+	mapped, mappedW, err := os.Pipe()
+	if err != nil {
+		return nil, err
+	}
+	defer mappedW.Close()
+	numberR, number, err := os.Pipe()
+	if err != nil {
+		return nil, err
+	}
+	cmd.ExtraFiles = []*os.File{mapped, number}
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Cloneflags: syscall.CLONE_NEWUSER | syscall.CLONE_NEWNS,
+		Setpgid:    true,
+		Pdeathsig:  syscall.SIGKILL,
+	}
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	mapped.Close()
+	number.Close()
+	if err := writeMaps(numberR, uids, gids, allowSetgroups); err != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return nil, fmt.Errorf("mapping the ids of its user namespace: %w", err)
+	}
+	if _, err := mappedW.Write([]byte{1}); err != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return nil, err
+	}
+	return cmd, nil
 }
 
 // writeMaps reads the copy's number in /proc from it and writes its namespace's maps there.

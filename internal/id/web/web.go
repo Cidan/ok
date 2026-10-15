@@ -242,7 +242,12 @@ func (w *Web) oidcBegin(rw http.ResponseWriter, r *http.Request) {
 		w.message(rw, r, http.StatusInternalServerError, "Sign-in failed", err.Error())
 		return
 	}
-	http.Redirect(rw, r, p.Begin(id, st), http.StatusFound)
+	to, err := p.Begin(r.Context(), id, st)
+	if err != nil {
+		w.render(rw, r, http.StatusServiceUnavailable, LoginPage(w.loginView(r, err.Error())))
+		return
+	}
+	http.Redirect(rw, r, to, http.StatusFound)
 }
 
 func (w *Web) oidcCallback(rw http.ResponseWriter, r *http.Request) {

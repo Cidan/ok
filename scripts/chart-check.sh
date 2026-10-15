@@ -13,7 +13,11 @@ for values in "" "$chart/ci/example-values.yaml"; do
   [ -n "$values" ] && args+=(-f "$values")
   helm lint "$chart" "${args[@]:2}"
   helm template ok "$chart" "${args[@]}" > "$out/chart.yaml"
-  go run github.com/yannh/kubeconform/cmd/kubeconform@v0.7.0 -strict -summary -kubernetes-version 1.33.0 "$out/chart.yaml"
+  # The Gateway API's resources against their CRDs' schemas, from the community catalog.
+  go run github.com/yannh/kubeconform/cmd/kubeconform@v0.7.0 -strict -summary -kubernetes-version 1.33.0 \
+    -schema-location default \
+    -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
+    "$out/chart.yaml"
   yq 'select(.kind == "ConfigMap") | .data["ok.yaml"]' "$out/chart.yaml" > "$out/ok.yaml"
   go run ./cmd/ok config check -config "$out/ok.yaml"
 done

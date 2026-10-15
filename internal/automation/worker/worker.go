@@ -58,10 +58,12 @@ type Config struct {
 	Browse scmpb.BrowseClient
 	// Bazel is Bazel's path (or bazelisk's), BazelFlags the installation's flags for every
 	// command (a remote cache), Bwrap bubblewrap's path, and Env their whole environment; the
-	// worker adds TMPDIR, a directory of the run's own under Scratch.
+	// worker adds TMPDIR, a directory of the run's own under Scratch. Proc is how the sandbox
+	// gets its /proc, as CheckSandbox found it can: ProcFresh when nil.
 	Bazel      string
 	BazelFlags []string
 	Bwrap      string
+	Proc       []string
 	Env        []string
 	Scratch    string
 	// OutputBases is where each slot keeps its Bazel output bases — slot n's in n/ and n-base/ —
@@ -487,16 +489,53 @@ func commands(in jobInput) ([][]string, error) {
 	return out, nil
 }
 
+// How the sandbox gets its /proc. ProcFresh is a procfs of its own PID namespace, showing only its
+// own processes. A container runtime masks parts of a pod's /proc with mounts over them
+// (/proc/kcore, /proc/keys, …), and the kernel then refuses a fresh procfs to a user namespace;
+// ProcBound binds the pod's /proc instead, masks and all — no more than the pod shows, and no
+// process outside the sandbox's PID namespace is one it can signal, nor one of another user
+// namespace one it can trace.
+var (
+	ProcFresh = []string{"--proc", "/proc"}
+	ProcBound = []string{"--ro-bind", "/proc", "/proc"}
+)
+
 // sandbox is the prefix a run's own programs run within (bubblewrap): every file visible and
 // none writable but tmp, its own, no network, no other process, a session of its own, and gone
 // when the worker is.
-func sandbox(bwrap, tmp, contextFile string) []string {
-	out := []string{bwrap, "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--bind", tmp, tmp,
-		"--setenv", "TMPDIR", tmp, "--unshare-net", "--unshare-ipc", "--unshare-pid", "--new-session", "--die-with-parent"}
+func sandbox(bwrap string, proc []string, tmp, contextFile string) []string {
+	if proc == nil {
+		proc = ProcFresh
+	}
+	out := []string{bwrap, "--ro-bind", "/", "/", "--dev", "/dev"}
+	out = append(out, proc...)
+	out = append(out, "--bind", tmp, tmp,
+		"--setenv", "TMPDIR", tmp, "--unshare-net", "--unshare-ipc", "--unshare-pid", "--new-session", "--die-with-parent")
 	if contextFile != "" {
 		out = append(out, "--setenv", workflow.ContextEnv, contextFile)
 	}
 	return out
+}
+
+// CheckSandbox runs nothing in the sandbox runs' programs run in, once, and returns how it gives
+// the sandbox its /proc (Config.Proc): a fresh one where it can, else the pod's. A worker whose
+// node makes neither fails as it starts, saying why, instead of failing every run job and lint.
+func CheckSandbox(bwrap string) ([]string, error) {
+	tmp, err := os.MkdirTemp("", "ok-sandbox-check-")
+	if err != nil {
+		return nil, err
+	}
+	defer os.RemoveAll(tmp)
+	var failed []string
+	for _, proc := range [][]string{ProcFresh, ProcBound} {
+		args := append(sandbox(bwrap, proc, tmp, ""), "true")
+		out, err := exec.Command(args[0], args[1:]...).CombinedOutput()
+		if err == nil {
+			return proc, nil
+		}
+		failed = append(failed, fmt.Sprintf("%v: %s", err, strings.TrimSpace(string(out))))
+	}
+	return nil, fmt.Errorf("bubblewrap cannot make the sandbox run jobs run in (%s); %s", strings.Join(failed, "; with the pod's /proc: "), checkout.UserNamespaces())
 }
 
 // wholeLint reports whether a job lints the whole repository: the lint a change that makes an
@@ -599,7 +638,7 @@ func perform(ctx context.Context, cfg Config, files *changedFiles, run *automati
 	}
 	d := cfg.driver(settings, env, log)
 	in := jobInput{job: run.GetJob(), jc: jc, settings: settings, driver: d, dir: cfg.checkout.Dir(), tree: tree,
-		sandbox: sandbox(cfg.Bwrap, tmp, contextFile), commit: run.GetCommitId()}
+		sandbox: sandbox(cfg.Bwrap, cfg.Proc, tmp, contextFile), commit: run.GetCommitId()}
 	if run.GetJob().GetKind() == automationpb.Job_KIND_LINT && !wholeLint(run.GetJob()) && jc != nil {
 		g, err := graphAt(ctx, cfg, d, run.GetRepositoryId(), run.GetCommitId(), cfg.checkout, log)
 		if err != nil || ctx.Err() != nil {

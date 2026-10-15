@@ -42,6 +42,9 @@ server:
   roles: [identity, scm, automation, control]
   replicas: 1
   resources: {}
+  # Where the SCM spools what a publish uploads and a garbage collection compacts: an emptyDir, as
+  # large as the largest push and the largest repository's packs.
+  tmp: {sizeLimit: 20Gi}
   extraSecretMounts: []         # [{name, secretName, mountPath}]
   nodeSelector: {}
   tolerations: []
@@ -51,10 +54,21 @@ service:
   type: ClusterIP
   port: 8472
 
+# ok's public address through the Gateway API (docs/install.md): an HTTPRoute to the server, on
+# the Gateway parentRefs names, for publicURL's host unless hostnames says otherwise. TLS is the
+# Gateway's listener's.
+httpRoute:
+  enabled: false
+  parentRefs: []                # [{name, namespace, sectionName}]
+  hostnames: []
+  annotations: {}
+
+# Or through an Ingress: your controller must speak HTTP/2 to the backend, for gRPC — set its
+# annotation for it.
 ingress:
   enabled: false
   className: ""
-  annotations: {}               # gRPC needs HTTP/2 to the backend: your controller's annotation
+  annotations: {}
   host: ok.example.com
   tls: []                       # [{secretName, hosts}]
 
@@ -63,16 +77,22 @@ worker:
   replicas: 2
   slots: 2
   runMemoryGiB: 4
-  # real writes each commit to disk; virtual presents it through okfs, which needs /dev/fuse
-  # (bound in from the node) and user namespaces.
+  # real writes each commit to disk; virtual presents it through okfs, which needs user namespaces
+  # and /dev/fuse. A node's container runtime lets a pod open /dev/fuse only as a device plugin
+  # offers it: name the resource it offers in fuseResource (devic.es/fuse, generic-device-plugin's;
+  # docs/install.md, "Workers' nodes"). Without one, /dev/fuse is bound in from the node, which
+  # works only where the runtime applies no device allowlist (an unprivileged LXC node's).
   checkout: real
+  fuseResource: ""
   bazelFlags: []                # every Bazel command's: --remote_cache=…, --disk_cache=…
   # A Secret holding config.json with the registry credentials pushes use (DOCKER_CONFIG).
   dockerConfigSecret: ""
   state: {sizeLimit: 100Gi}     # an emptyDir: its checkouts, Bazel's output bases, kept graphs
   resources: {}
   # Workers make user namespaces (bubblewrap, and a virtual checkout's mount): a seccomp profile
-  # that allows it.
+  # that allows it. On nodes that restrict them through AppArmor (Ubuntu 23.10 and later), add
+  # appArmorProfile: {type: Localhost, localhostProfile: ok-sandbox}, the profile in
+  # deploy/apparmor loaded on each node (docs/install.md, "Workers' nodes").
   securityContext:
     seccompProfile: {type: Unconfined}
     allowPrivilegeEscalation: false
@@ -83,11 +103,13 @@ worker:
 deploy:
   enabled: false
   checkout: real
+  fuseResource: ""              # as a worker's
   bazelFlags: []
   # What the migrations it runs get: {NAME: {secretName, key}}, mounted and read as files.
   migrationEnv: {}
   state: {sizeLimit: 50Gi}
   resources: {}
+  # As a worker's: a virtual checkout makes user namespaces.
   securityContext:
     seccompProfile: {type: Unconfined}
     allowPrivilegeEscalation: false

@@ -129,7 +129,7 @@ same page is at `<public_url>/id/admin`.
 
 | How | Configure |
 |---|---|
-| OpenID Connect | `identity.sign_in.oidc`: each provider's `issuer`, `client_id`, `client_secret_file`. A person is matched by their verified email (`match: email`, the default), or by an ID the provider and the system of record share (`match: external_id`, `claim: oid` for Entra). |
+| OpenID Connect | `identity.sign_in.oidc`: each provider's `issuer`, `client_id`, `client_secret_file`, and `ca_file` when its certificate is from a CA the system does not trust. A person is matched by their verified email (`match: email`, the default), or by an ID the provider and the system of record share (`match: external_id`, `claim: oid` for Entra). ok reaches a provider when someone first signs in with it, and again after a failure: a provider that is down keeps only its own sign-in from working. |
 | LDAP password | `identity.sign_in.ldap`: the directory, the account ok searches as, and `user_filter` with `{username}`. |
 | Passkeys | Always on when `public_url` has a host name: people add them on their account page, `<public_url>/id/account`, after signing in another way. |
 | A proxy | `identity.trusted_header`: a header an authenticating proxy in front of ok writes with the principal's name, and strips from every request it forwards. |

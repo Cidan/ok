@@ -456,13 +456,17 @@ func TestExchangeNeverFreshensOverAMissingObject(t *testing.T) {
 
 // GC races publishes that keep re-using stale, unreachable subgraphs: whatever the
 // interleaving, a publish that commits references only objects that exist, and every
-// object it reaches reads back.
+// object it reaches reads back. Each interleaving that matters is made, not hoped for: in a
+// third of the rounds the sweep runs before the publish asks what is missing; in a third, between
+// the publish's asking and its commit — the race the commit's check is for; and in the rest the
+// two run at once.
 func TestGCRacesPublishes(t *testing.T) {
 	ctx := context.Background()
 	e := newCLEnv(t)
 	const rounds = 30
 	var heldFirst, sweptFirst int
 	for round := range rounds {
+		mode := round % 3 // 0: the sweep first; 1: the sweep between Missing and Commit; 2: at once
 		g := newBuilder(t)
 		contents := bytesOf(120_000+round, byte(10+round))
 		file := g.file(contents)
@@ -481,10 +485,16 @@ func TestGCRacesPublishes(t *testing.T) {
 		var wg sync.WaitGroup
 		var pubErr, gcErr error
 		var treeWasHeld bool
-		wg.Add(2)
+		sweep := func() { _, gcErr = e.s.GC(ctx, e.repo, time.Now(), GCOptions{}) }
+		if mode == 0 {
+			sweep()
+		}
+		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			time.Sleep(time.Duration(round%6) * time.Millisecond)
+			if mode == 2 {
+				time.Sleep(time.Duration(round%6) * time.Millisecond)
+			}
 			for attempt := 0; attempt < 2; attempt++ {
 				p, err := e.s.BeginPublish(ctx, e.repo, alice, testWorkspace, b.order, b.manifests())
 				if err != nil {
@@ -498,6 +508,9 @@ func TestGCRacesPublishes(t *testing.T) {
 						if r.ID == tree {
 							treeWasHeld = false
 						}
+					}
+					if mode == 1 {
+						sweep()
 					}
 				}
 				for _, r := range objs {
@@ -521,11 +534,14 @@ func TestGCRacesPublishes(t *testing.T) {
 				}
 			}
 		}()
-		go func() {
-			defer wg.Done()
-			time.Sleep(time.Duration((round/6)%6) * time.Millisecond)
-			_, gcErr = e.s.GC(ctx, e.repo, time.Now(), GCOptions{})
-		}()
+		if mode == 2 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				time.Sleep(time.Duration((round/6)%6) * time.Millisecond)
+				sweep()
+			}()
+		}
 		wg.Wait()
 		if pubErr != nil || gcErr != nil {
 			t.Fatalf("round %d: publish %v, gc %v", round, pubErr, gcErr)
@@ -543,8 +559,8 @@ func TestGCRacesPublishes(t *testing.T) {
 		}
 	}
 	t.Logf("%d rounds: the publish found the old tree first in %d, the sweep took it first in %d", rounds, heldFirst, sweptFirst)
-	if heldFirst == 0 || sweptFirst == 0 {
-		t.Errorf("every round ran in one order (the publish first in %d of %d)", heldFirst, rounds)
+	if heldFirst < rounds/3 || sweptFirst < rounds/3 {
+		t.Errorf("the made orders did not happen: the publish found the old tree first in %d of %d, the sweep took it first in %d", heldFirst, rounds, sweptFirst)
 	}
 	clean(t, e.s, e.repo)
 }

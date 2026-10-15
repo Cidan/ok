@@ -1,0 +1,22 @@
+# ok's workers and deployer, on nodes that restrict unprivileged user namespaces through AppArmor
+# (kernel.apparmor_restrict_unprivileged_userns = 1: Ubuntu 23.10 and later). It confines nothing
+# more than an unconfined process, and allows what the restriction denies: making user namespaces,
+# which a run job's sandbox (bubblewrap) and a virtual checkout (okfs) need.
+#
+# Load it on every node that runs workers or the deployer:
+#
+#   sudo install -m 0644 ok-sandbox /etc/apparmor.d/ok-sandbox
+#   sudo apparmor_parser -r /etc/apparmor.d/ok-sandbox
+#
+# and give their containers the profile (docs/install.md, "Workers' nodes"):
+#
+#   worker:
+#     securityContext:
+#       appArmorProfile: {type: Localhost, localhostProfile: ok-sandbox}
+
+abi <abi/4.0>,
+include <tunables/global>
+
+profile ok-sandbox flags=(unconfined) {
+  userns,
+}

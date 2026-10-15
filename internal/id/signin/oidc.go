@@ -6,9 +6,14 @@ package signin
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
+	"net/http"
+	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
@@ -76,17 +81,26 @@ type OIDCConfig struct {
 	TrustUnverifiedEmail bool
 	// HostedDomain, for Google, is the Workspace domain the person must belong to (the hd claim).
 	HostedDomain string
+	// CAFile verifies the provider's certificate, when it is not one the system trusts: a
+	// provider inside the organization, behind its own CA.
+	CAFile string
 }
 
 // OIDC signs people in with one OpenID Connect provider: the authorization code flow with PKCE.
+// It discovers the provider's endpoints and keys when someone first signs in with it, and again
+// after a failure, so a provider that is down when ok starts keeps only its own sign-in from
+// working, until it is back.
 type OIDC struct {
-	cfg      OIDCConfig
-	provider *oidc.Provider
-	oauth    oauth2.Config
+	cfg         OIDCConfig
+	redirectURL string
+	client      *http.Client
+
+	mu       sync.Mutex
+	oauth    *oauth2.Config
 	verifier *oidc.IDTokenVerifier
 }
 
-// NewOIDC discovers the provider's endpoints and keys.
+// NewOIDC checks a provider's configuration; it reaches the provider on the first sign-in.
 func NewOIDC(ctx context.Context, cfg OIDCConfig, redirectURL string) (*OIDC, error) {
 	if cfg.ID == "" || cfg.Issuer == "" || cfg.ClientID == "" {
 		return nil, errors.New("an OpenID Connect provider needs an id, an issuer, and a client ID")
@@ -103,19 +117,42 @@ func NewOIDC(ctx context.Context, cfg OIDCConfig, redirectURL string) (*OIDC, er
 	if len(cfg.Scopes) == 0 {
 		cfg.Scopes = []string{"email", "profile"}
 	}
-	p, err := oidc.NewProvider(ctx, cfg.Issuer)
-	if err != nil {
-		return nil, fmt.Errorf("the OpenID Connect provider %s: %w", cfg.ID, err)
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	if cfg.CAFile != "" {
+		pem, err := os.ReadFile(cfg.CAFile)
+		if err != nil {
+			return nil, fmt.Errorf("the OpenID Connect provider %s's ca_file: %w", cfg.ID, err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pem) {
+			return nil, fmt.Errorf("the OpenID Connect provider %s's ca_file %s holds no certificate", cfg.ID, cfg.CAFile)
+		}
+		tr.TLSClientConfig = &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
 	}
-	return &OIDC{
-		cfg:      cfg,
-		provider: p,
-		oauth: oauth2.Config{
-			ClientID: cfg.ClientID, ClientSecret: cfg.ClientSecret, Endpoint: p.Endpoint(),
-			RedirectURL: redirectURL, Scopes: append([]string{oidc.ScopeOpenID}, cfg.Scopes...),
-		},
-		verifier: p.Verifier(&oidc.Config{ClientID: cfg.ClientID}),
-	}, nil
+	return &OIDC{cfg: cfg, redirectURL: redirectURL, client: &http.Client{Transport: tr, Timeout: 30 * time.Second}}, nil
+}
+
+// discover returns the provider's OAuth configuration and token verifier, discovering them the
+// first time and after a failure.
+func (o *OIDC) discover(ctx context.Context) (*oauth2.Config, *oidc.IDTokenVerifier, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.oauth != nil {
+		return o.oauth, o.verifier, nil
+	}
+	ctx, cancel := context.WithTimeout(oidc.ClientContext(ctx, o.client), 20*time.Second)
+	defer cancel()
+	p, err := oidc.NewProvider(ctx, o.cfg.Issuer)
+	if err != nil {
+		return nil, nil, fmt.Errorf("%s cannot be reached to sign you in; try again shortly (%w)", o.cfg.Name, err)
+	}
+	o.oauth = &oauth2.Config{
+		ClientID: o.cfg.ClientID, ClientSecret: o.cfg.ClientSecret, Endpoint: p.Endpoint(),
+		RedirectURL: o.redirectURL, Scopes: append([]string{oidc.ScopeOpenID}, o.cfg.Scopes...),
+	}
+	// The verifier fetches the provider's keys with the provider's client, CA and all.
+	o.verifier = p.VerifierContext(oidc.ClientContext(context.Background(), o.client), &oidc.Config{ClientID: o.cfg.ClientID})
+	return o.oauth, o.verifier, nil
 }
 
 // ID names the provider in URLs.
@@ -134,20 +171,28 @@ type OIDCState struct {
 
 // Begin returns the provider's authorization URL for a sign-in whose state the caller keeps under
 // stateID.
-func (o *OIDC) Begin(stateID string, st OIDCState) string {
+func (o *OIDC) Begin(ctx context.Context, stateID string, st OIDCState) (string, error) {
+	oc, _, err := o.discover(ctx)
+	if err != nil {
+		return "", err
+	}
 	opts := []oauth2.AuthCodeOption{oidc.Nonce(st.Nonce), oauth2.S256ChallengeOption(st.Verifier)}
 	if o.cfg.HostedDomain != "" {
 		opts = append(opts, oauth2.SetAuthURLParam("hd", o.cfg.HostedDomain))
 	}
-	return o.oauth.AuthCodeURL(stateID, opts...)
+	return oc.AuthCodeURL(stateID, opts...), nil
 }
 
 // Finish exchanges the code the provider returned for an ID token, verifies it — issuer,
 // audience, expiry, signature, the nonce — and returns the person it names.
 func (o *OIDC) Finish(ctx context.Context, people People, st OIDCState, code string) (store.Principal, error) {
-	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	oc, verifier, err := o.discover(ctx)
+	if err != nil {
+		return store.Principal{}, err
+	}
+	ctx, cancel := context.WithTimeout(oidc.ClientContext(ctx, o.client), 20*time.Second)
 	defer cancel()
-	tok, err := o.oauth.Exchange(ctx, code, oauth2.VerifierOption(st.Verifier))
+	tok, err := oc.Exchange(ctx, code, oauth2.VerifierOption(st.Verifier))
 	if err != nil {
 		return store.Principal{}, fmt.Errorf("%s refused the sign-in: %w", o.cfg.Name, err)
 	}
@@ -155,7 +200,7 @@ func (o *OIDC) Finish(ctx context.Context, people People, st OIDCState, code str
 	if !ok {
 		return store.Principal{}, fmt.Errorf("%s returned no ID token", o.cfg.Name)
 	}
-	idt, err := o.verifier.Verify(ctx, raw)
+	idt, err := verifier.Verify(ctx, raw)
 	if err != nil {
 		return store.Principal{}, fmt.Errorf("%s's ID token: %w", o.cfg.Name, err)
 	}

@@ -266,6 +266,8 @@ type OIDC struct {
 	Claim                string   `yaml:"claim"`
 	TrustUnverifiedEmail bool     `yaml:"trust_unverified_email"`
 	HostedDomain         string   `yaml:"hosted_domain"`
+	// CAFile verifies the provider's certificate, when the system does not trust its CA.
+	CAFile string `yaml:"ca_file"`
 }
 
 // LDAP is an LDAP directory people sign in to.

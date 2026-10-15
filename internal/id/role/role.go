@@ -176,7 +176,8 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (*Role, error)
 			return nil, fmt.Errorf("identity.sign_in.oidc.%s: %w", o.ID, err)
 		}
 		p, err := signin.NewOIDC(ctx, signin.OIDCConfig{ID: o.ID, Name: o.Name, Issuer: o.Issuer, ClientID: o.ClientID, ClientSecret: secret,
-			Scopes: o.Scopes, Match: signin.Match(o.Match), Claim: o.Claim, TrustUnverifiedEmail: o.TrustUnverifiedEmail, HostedDomain: o.HostedDomain}, callback)
+			Scopes: o.Scopes, Match: signin.Match(o.Match), Claim: o.Claim, TrustUnverifiedEmail: o.TrustUnverifiedEmail, HostedDomain: o.HostedDomain,
+			CAFile: o.CAFile}, callback)
 		if err != nil {
 			return nil, err
 		}

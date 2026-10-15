@@ -53,15 +53,15 @@ spec:
             httpGet: {path: /readyz, port: http}
             periodSeconds: 10
           securityContext: {{- toYaml .Values.worker.securityContext | nindent 12 }}
-          {{- with .Values.worker.resources }}
-          resources: {{- toYaml . | nindent 12 }}
+          {{- with include "ok.resources" .Values.worker }}
+          resources: {{- . | nindent 12 }}
           {{- end }}
           volumeMounts:
             {{- include "ok.configMounts" . | nindent 12 }}
             - {name: ok-token, mountPath: /var/run/secrets/ok, readOnly: true}
             - {name: state, mountPath: /var/lib/ok}
             - {name: tmp, mountPath: /tmp}
-            {{- if eq .Values.worker.checkout "virtual" }}
+            {{- if and (eq .Values.worker.checkout "virtual") (not .Values.worker.fuseResource) }}
             - {name: fuse, mountPath: /dev/fuse}
             {{- end }}
             {{- if .Values.worker.dockerConfigSecret }}
@@ -74,7 +74,7 @@ spec:
           emptyDir: {sizeLimit: {{ .Values.worker.state.sizeLimit }}}
         - name: tmp
           emptyDir: {}
-        {{- if eq .Values.worker.checkout "virtual" }}
+        {{- if and (eq .Values.worker.checkout "virtual") (not .Values.worker.fuseResource) }}
         - name: fuse
           hostPath: {path: /dev/fuse, type: CharDevice}
         {{- end }}

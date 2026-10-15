@@ -12,6 +12,7 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=${VERSION}"
 
 FROM gcr.io/distroless/static-debian13:nonroot
 COPY --from=build /out/ok /usr/local/bin/ok
-USER nonroot
+# distroless's nonroot, by number: Kubernetes' runAsNonRoot verifies only a numeric user.
+USER 65532:65532
 EXPOSE 8472 8473
 ENTRYPOINT ["/usr/local/bin/ok"]

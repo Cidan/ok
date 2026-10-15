@@ -9,9 +9,12 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -26,10 +29,15 @@ type Provider struct {
 	ClientID, ClientSecret string
 	key                    *rsa.PrivateKey
 
+	// CAFile, for a provider NewTLS started, holds the certificate its server presents: what an
+	// ok configured with the provider's ca_file trusts.
+	CAFile string
+
 	mu sync.Mutex
 	// Claims are what the next sign-in's ID token says, besides the protocol's claims.
 	claims map[string]any
 	codes  map[string]grant
+	down   bool
 }
 
 type grant struct {
@@ -40,19 +48,47 @@ type grant struct {
 // New starts a provider; it stops when the test ends.
 func New(t *testing.T) *Provider {
 	t.Helper()
+	p := newProvider(t)
+	p.Server = httptest.NewServer(p.mux())
+	t.Cleanup(p.Close)
+	return p
+}
+
+// NewTLS starts a provider serving HTTPS with a certificate no system trusts, which CAFile holds.
+func NewTLS(t *testing.T) *Provider {
+	t.Helper()
+	p := newProvider(t)
+	p.Server = httptest.NewTLSServer(p.mux())
+	t.Cleanup(p.Close)
+	p.CAFile = filepath.Join(t.TempDir(), "ca.crt")
+	if err := os.WriteFile(p.CAFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: p.Certificate().Raw}), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func newProvider(t *testing.T) *Provider {
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		t.Fatal(err)
 	}
-	p := &Provider{ClientID: "ok-client", ClientSecret: "s3cret", key: key, codes: map[string]grant{}}
+	return &Provider{ClientID: "ok-client", ClientSecret: "s3cret", key: key, codes: map[string]grant{}}
+}
+
+func (p *Provider) mux() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/.well-known/openid-configuration", p.discovery)
 	mux.HandleFunc("/keys", p.keys)
 	mux.HandleFunc("/authorize", p.authorize)
 	mux.HandleFunc("/token", p.token)
-	p.Server = httptest.NewServer(mux)
-	t.Cleanup(p.Close)
-	return p
+	return mux
+}
+
+// SetDown makes the provider answer discovery with 503 Service Unavailable, as one that is down.
+func (p *Provider) SetDown(down bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.down = down
 }
 
 // SignInAs makes the next sign-ins vouch for these claims: email, email_verified, sub, hd, ….
@@ -63,6 +99,13 @@ func (p *Provider) SignInAs(claims map[string]any) {
 }
 
 func (p *Provider) discovery(w http.ResponseWriter, _ *http.Request) {
+	p.mu.Lock()
+	down := p.down
+	p.mu.Unlock()
+	if down {
+		http.Error(w, "down", http.StatusServiceUnavailable)
+		return
+	}
 	json.NewEncoder(w).Encode(map[string]any{
 		"issuer":                                p.URL,
 		"authorization_endpoint":                p.URL + "/authorize",

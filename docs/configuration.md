@@ -46,6 +46,7 @@ identity:
         client_id: 1234.apps.googleusercontent.com
         client_secret_file: /etc/ok/secrets/google-client-secret
         hosted_domain: example.com       # Google: only your Workspace's accounts
+        # ca_file: /etc/ok/secrets/corp-ca.crt   # a provider behind your own CA
   system_of_record:
     interval: 10m
     google:
@@ -185,7 +186,7 @@ A worker (`ok worker run`) reads `services` (automation and the SCM), `workload`
 | `worker.name` | Its name among the workers. Default: the host's (its pod's). |
 | `worker.slots` | How many runs it runs at once, each in a checkout and Bazel output base of its own. Default 1. |
 | `worker.run_memory_gib` | The memory it keeps free under its cgroup's limit for each run it starts beside the others. Default 4. |
-| `worker.checkout` | `virtual` — each commit presented through okfs, which needs `/dev/fuse` and runs ok's jj as the worker's daemon — or `real`, each commit written to disk. Default `virtual`. |
+| `worker.checkout` | `virtual` — each commit presented through okfs, which needs `/dev/fuse` and user namespaces, and runs ok's jj as the worker's daemon — or `real`, each commit written to disk. Default `virtual` (the Helm chart's: `real`; [install.md](install.md), "Workers' nodes"). |
 | `worker.jj` | ok's jj, for virtual checkouts. Default: `jj` on the `PATH`. |
 | `worker.bazel` | Bazel, or bazelisk, which runs the version a repository's `.bazelversion` names. Default: `bazelisk`, else `bazel`, on the `PATH`. |
 | `worker.bazel_flags` | Flags every Bazel command gets before the repository's own: a remote cache, a disk cache, `--jobs`. |

@@ -71,14 +71,21 @@ spec:
           {{- end }}
           volumeMounts:
             {{- include "ok.configMounts" . | nindent 12 }}
+            {{- include "ok.databaseMounts" . | nindent 12 }}
             - {name: ca, mountPath: /etc/ok/ca, readOnly: true}
+            # The root file system is read-only: the SCM spools what a publish uploads, and a
+            # garbage collection's compacted packs, here.
+            - {name: tmp, mountPath: /tmp}
             {{- range .Values.server.extraSecretMounts }}
             - {name: {{ .name }}, mountPath: {{ .mountPath }}, readOnly: true}
             {{- end }}
       volumes:
         {{- include "ok.configVolumes" . | nindent 8 }}
+        {{- include "ok.databaseVolumes" . | nindent 8 }}
         - name: ca
           secret: {secretName: {{ .Values.identity.caSecret }}}
+        - name: tmp
+          emptyDir: {sizeLimit: {{ .Values.server.tmp.sizeLimit }}}
         {{- range .Values.server.extraSecretMounts }}
         - name: {{ .name }}
           secret: {secretName: {{ .secretName }}}

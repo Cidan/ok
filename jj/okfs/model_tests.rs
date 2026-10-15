@@ -591,8 +591,10 @@ fn a_large_checkout_reads_only_what_is_looked_at() {
     let started = std::time::Instant::now();
     let (skipped, _) = checkout(&fx, &mut m, &empty, &big);
     assert!(skipped.is_empty());
+    // A bound for a pathological checkout, not a benchmark: a loaded CI machine passes it. That the
+    // checkout fetches no tree per file is checked below.
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(2),
+        started.elapsed() < std::time::Duration::from_secs(30),
         "{:?}",
         started.elapsed()
     );

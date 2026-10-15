@@ -15,13 +15,15 @@ they read is one configuration file, `ok.yaml`, which the chart renders from its
   logs. Credentials are key files mounted from Secrets, or, without them, AWS's credential chain:
   the pod's role.
 - **The identity CA**, which issues every credential: made once, kept secret.
-- **Sign-in**: an OpenID Connect client (Google, Entra ID, Okta, Keycloak, …) or LDAP, and a
-  system of record to sync people and groups from ([identity.md](identity.md)).
-- **An ingress that speaks HTTP/2 to ok** (gRPC): ok serves its pages, its gRPC services, and its
-  REST on one port, and jj calls it over gRPC.
-- **Workers' nodes** that let a container make user namespaces (bubblewrap's sandbox; and a virtual
-  checkout's mount, which also needs `/dev/fuse` on the node). The chart runs workers with an
-  unconfined seccomp profile for it; `worker.checkout: real`, the default, needs no FUSE.
+- **Sign-in**: an OpenID Connect client (Google, Entra ID, Okta, Keycloak, Dex, …) or LDAP, and a
+  system of record to sync people and groups from ([identity.md](identity.md)). A provider behind
+  your own CA is trusted with its `ca_file`.
+- **A gateway that speaks HTTP/2 to ok** (gRPC): ok serves its pages, its gRPC services, and its
+  REST on one port, and jj calls it over gRPC. The chart makes a Gateway API HTTPRoute
+  (`httpRoute`), which any Gateway API implementation serves — Envoy Gateway, Cilium, Istio,
+  Traefik, NGINX Gateway Fabric; its Service's `appProtocol: kubernetes.io/h2c` has the gateway
+  speak HTTP/2 to it. An Ingress works too, with your controller's annotation for HTTP/2 backends.
+- **Workers' nodes** that let a container make user namespaces: see [Workers' nodes](#workers-nodes).
 
 ## Steps
 
@@ -32,12 +34,14 @@ kubectl create namespace ok
 ok identity ca init -dir ca -name "Example"
 kubectl -n ok create secret generic ok-identity-ca --from-file=tls.crt=ca/tls.crt --from-file=tls.key=ca/tls.key
 
-# The database's URL, and the sign-in client's secret.
+# The database's URL (it reaches only the server and the deployer, never a worker), and the
+# sign-in client's secret.
 kubectl -n ok create secret generic ok-database --from-literal=url='postgres://ok:…@db.example.com:5432/ok'
 kubectl -n ok create secret generic ok-oidc --from-literal=client-secret='…'
 ```
 
-A values file for a Google Workspace installation, its buckets on AWS with the pod's role:
+A values file for a Google Workspace installation, its buckets on AWS with the pod's role, reached
+through a Gateway named `public` in the `gateway` namespace:
 
 ```yaml
 domain: example.com
@@ -62,12 +66,9 @@ server:
   extraSecretMounts:
     - {name: oidc, secretName: ok-oidc, mountPath: /etc/ok/secrets/oidc}
     - {name: google, secretName: ok-google, mountPath: /etc/ok/secrets/google}
-ingress:
+httpRoute:
   enabled: true
-  className: nginx
-  host: ok.example.com
-  annotations: {nginx.ingress.kubernetes.io/backend-protocol: GRPC}
-  tls: [{secretName: ok-tls, hosts: [ok.example.com]}]
+  parentRefs: [{name: public, namespace: gateway}]   # its HTTPS listener holds ok.example.com's certificate
 worker:
   replicas: 2
   bazelFlags: ["--remote_cache=grpcs://cache.example.com"]
@@ -81,6 +82,38 @@ ok config check -config ok.yaml   # the same check the roles make, on a file of 
 ```
 
 The chart's `ci/example-values.yaml` uses every part of it, the deployer included.
+
+## Workers' nodes
+
+Workers run each run job's program in a sandbox (bubblewrap), and a virtual checkout mounts FUSE;
+both make **user namespaces**. The chart runs workers and the deployer with the seccomp profile
+`Unconfined`, which allows them, and a worker checks as it starts that it can make its sandbox,
+failing with what to change on the node if it cannot.
+
+- **Ubuntu 23.10 and later** restrict unprivileged user namespaces through AppArmor
+  (`kernel.apparmor_restrict_unprivileged_userns = 1`). Either load the `ok-sandbox` profile
+  ([deploy/apparmor/ok-sandbox](../deploy/apparmor/ok-sandbox)) on each node and give workers and
+  the deployer it —
+
+  ```yaml
+  worker:
+    securityContext:
+      seccompProfile: {type: Unconfined}
+      appArmorProfile: {type: Localhost, localhostProfile: ok-sandbox}
+      allowPrivilegeEscalation: false
+  ```
+
+  — or set the sysctl to 0 on the nodes. Inside kind, whose nodes cannot use AppArmor profiles, set
+  it on the machine that runs kind.
+- **A virtual checkout** (`worker.checkout: virtual`) also opens `/dev/fuse`, which a container
+  runtime allows a pod only as a device plugin offers it. Run one that offers `/dev/fuse` —
+  [generic-device-plugin](https://github.com/squat/generic-device-plugin), with a `fuse` device —
+  and name the resource it offers: `worker.fuseResource: devic.es/fuse`. Without a device plugin,
+  check out real (the default), which needs no FUSE.
+- **The runner image** (`ok-runner`) carries bazelisk, which runs the Bazel your repository's
+  `.bazelversion` names; bubblewrap; FUSE's mount helper; Python; and a C and C++ compiler, which
+  Bazel's default C++ toolchain looks for. A repository whose builds need more brings it as a
+  hermetic toolchain, or you build your own image from this one.
 
 ## Signing in, and the first repository
 

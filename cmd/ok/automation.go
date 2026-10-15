@@ -116,6 +116,13 @@ func workerRun(args []string) error {
 	if err != nil {
 		return fmt.Errorf("bubblewrap: %w", err)
 	}
+	proc, err := worker.CheckSandbox(bwrap)
+	if err != nil {
+		return err
+	}
+	if proc[0] != worker.ProcFresh[0] {
+		slog.Info("ok worker: the sandbox binds the pod's /proc: its runtime's masks refuse a fresh one")
+	}
 
 	o, err := idclient.Options(cfg.Services)
 	if err != nil {
@@ -228,6 +235,7 @@ func workerRun(args []string) error {
 		Bazel:          bazel,
 		BazelFlags:     w.BazelFlags,
 		Bwrap:          bwrap,
+		Proc:           proc,
 		Names:          cfg.Names(),
 		Directory:      identitypb.NewDirectoryClient(id),
 		TreeRepository: cfg.Identity.TreeRepository,

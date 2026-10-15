@@ -1,0 +1,22 @@
+{{- if .Values.httpRoute.enabled }}
+# ok's one public address through the Gateway API: every path to the server, which runs identity
+# (/id/…), the SCM, and control. The Service's appProtocol, kubernetes.io/h2c, has the gateway speak
+# HTTP/2 to it, which gRPC needs.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: {{ include "ok.name" . }}
+  labels: {{- include "ok.labels" . | nindent 4 }}
+  {{- with .Values.httpRoute.annotations }}
+  annotations: {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  parentRefs: {{- required "httpRoute.parentRefs names the Gateway (or its listener) ok is reached through" .Values.httpRoute.parentRefs | toYaml | nindent 4 }}
+  hostnames: {{- default (list (urlParse .Values.publicURL).hostname) .Values.httpRoute.hostnames | toYaml | nindent 4 }}
+  rules:
+    - backendRefs:
+        - name: {{ include "ok.name" . }}-server
+          port: {{ .Values.service.port }}
+      # Uploads and long-running streams (the change feed, a run's log) outlive a default timeout.
+      timeouts: {request: "0s"}
+{{- end }}
