@@ -1,0 +1,13 @@
+ok is starting at {{ .Values.publicURL }}.
+
+  kubectl -n {{ .Release.Namespace }} rollout status deployment/{{ include "ok.name" . }}-server
+
+Sign a machine in, and clone:
+
+  jj auth login {{ .Values.publicURL }}
+  jj clone <repository> <directory>
+{{- if .Values.deploy.enabled }}
+
+The deployer rolls the workloads deploy.grants names; grant each one before its deploy stanza lands
+(docs/deploy.md, "Grants").
+{{- end }}

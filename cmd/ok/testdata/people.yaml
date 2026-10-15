@@ -1,0 +1,14 @@
+people:
+  - id: "1001"
+    email: Ada.Lovelace@example.com
+    name: Ada Lovelace
+  - id: "1002"
+    handle: grace
+    email: grace@example.com
+    active: false
+  - id: "1003"
+    email: ada.lovelace@example.com
+groups:
+  - id: eng
+    name: Engineering
+    members: ["1001", "1002", "1003"]

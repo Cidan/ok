@@ -1,0 +1,4 @@
+# The Rust that builds ok's jj, as its CI and releases do.
+[toolchain]
+channel = "1.98.1"
+profile = "minimal"

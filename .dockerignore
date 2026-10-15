@@ -1,0 +1,5 @@
+# What an image's build does not need: build outputs and version control's state.
+target/
+**/target/
+.git/
+.jj/

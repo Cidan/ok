@@ -1,0 +1,29 @@
+name: test host
+description: >-
+  What ok's integration tests need besides the build: an S3 server (versitygw, over a directory),
+  Bazel (bazelisk, pinned), bubblewrap, FUSE's mount helper, and unprivileged user namespaces, which
+  Ubuntu's AppArmor restricts by default. PostgreSQL is the job's service; the environment the tests
+  read is the job's (docs/building.md, "Tests").
+runs:
+  using: composite
+  steps:
+    - name: S3
+      shell: bash
+      run: |
+        docker run -d --name ok-s3 -e ROOT_ACCESS_KEY="$AWS_ACCESS_KEY_ID" -e ROOT_SECRET_KEY="$AWS_SECRET_ACCESS_KEY" \
+          -p 127.0.0.1:59000:7070 docker.io/versity/versitygw:v1.8.0 --port :7070 posix /tmp
+    - name: Bazel, bubblewrap, FUSE, and user namespaces
+      shell: bash
+      run: |
+        case "$(uname -m)" in
+          x86_64) arch=amd64 sum=5a408715e932c0250d28bd84555f12edbf70117de42f9181691c736eacc4a992 ;;
+          aarch64) arch=arm64 sum=e20e8b0f4f240091b7a55bf17b9398bd4f40ee70ae0208dff95dd4c445fb4010 ;;
+        esac
+        curl -fsSL -o /tmp/bazelisk "https://github.com/bazelbuild/bazelisk/releases/download/v1.29.0/bazelisk-linux-$arch"
+        echo "$sum  /tmp/bazelisk" | sha256sum -c -
+        sudo install -m 0755 /tmp/bazelisk /usr/local/bin/bazelisk
+        sudo ln -sf bazelisk /usr/local/bin/bazel
+        sudo apt-get update -q
+        sudo apt-get install -y -q --no-install-recommends bubblewrap fuse3
+        sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+        test -c /dev/fuse

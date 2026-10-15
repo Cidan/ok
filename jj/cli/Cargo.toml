@@ -1,0 +1,40 @@
+[package]
+name = "ok-jj"
+description = "ok's jj: upstream jj with ok's stores and commands"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "jj"
+path = "main.rs"
+
+[dependencies]
+chrono.workspace = true
+clap.workspace = true
+dunce.workspace = true
+futures.workspace = true
+hex.workspace = true
+jj-cli.workspace = true
+jj-lib.workspace = true
+mimalloc.workspace = true
+ok-cl.workspace = true
+ok-credential.workspace = true
+ok-proto.workspace = true
+ok-review.workspace = true
+ok-store.workspace = true
+ok-working-copy.workspace = true
+okfs.workspace = true
+okfs-fuse.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tonic.workspace = true
+
+[dev-dependencies]
+libc.workspace = true
+ok-store.workspace = true
+ok-testscm.workspace = true
+okfs-fuse.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+

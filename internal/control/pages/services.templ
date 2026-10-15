@@ -1,0 +1,597 @@
+package pages
+
+import (
+	"strconv"
+
+	"github.com/Cidan/ok/internal/web/breadcrumb"
+	"github.com/Cidan/ok/internal/web/layout"
+	"github.com/Cidan/ok/internal/web/nav"
+)
+
+// The Services pages (docs/deploy.md, "Services"): every group of services ok deploys
+// (groups.go), each with its status in aggregate; and a group's page — the sub-nav of its
+// services beside the pane, which shows the group's overview or one of its services: what it
+// runs and what ok deployed, its pods, the image each runs, its recent deployments. Read-only,
+// and live: each refreshes itself every five seconds, which the deployer's observer — reading
+// the cluster every ten — keeps current.
+//
+// Regions, smallest first (docs/web.md, "Navigation & hydration"):
+//   - #service-groups, the list of groups, and #service-live, what a group's pane shows: live
+//     regions, refreshed in place, without a fade. A pane's refresh carries the sub-nav's rows
+//     (#service-nav) out of band, so their statuses come from the same reading as the pane's.
+//   - #service-main, the pane: a navigation within a group swaps it, and the sub-nav's rows out
+//     of band, with the new selection; the header and the sub-nav do not fade.
+//   - #content: entering a group from the list, leaving it for the list, a deployment, a commit,
+//     or a CL changes the layout, so the whole content region swaps.
+
+// liveEvery is how often a Services page's live regions refresh.
+const liveEvery = "every 5s"
+
+templ ServicesPage(n nav.Model, v ServicesView) {
+	@layout.Shell(shell("Services · "+Brand, layout.LeftNav, n)) {
+		@ServicesContent(v)
+	}
+}
+
+templ ServicesContent(v ServicesView) {
+	<div class="flex h-full flex-1 flex-col overflow-hidden">
+		<div class="shrink-0">
+			@PageHead("Services", "What ok deploys, and what runs.", "")
+		</div>
+		<div id="services" data-hydrate class="hydrating flex-1 overflow-y-auto">
+			<div class="mx-auto w-full max-w-5xl px-6 pb-16 sm:px-10">
+				<div id="service-groups" data-live hx-get="/services" hx-trigger={ liveEvery } hx-target="this" hx-swap="innerHTML">
+					@serviceGroupsPanel(v)
+				</div>
+			</div>
+		</div>
+	</div>
+}
+
+// serviceGroupsPanel is the list of groups: what #service-groups refreshes.
+templ serviceGroupsPanel(v ServicesView) {
+	@panel() {
+		@panelHead() {
+			<h3>Services</h3>
+			<span class="flex-1"></span>
+			if v.Error == "" {
+				<span class="text-zinc-500">{ strconv.Itoa(len(v.Groups)) }</span>
+			}
+		}
+		if v.Error != "" {
+			@panelEmpty() {
+				{ v.Error }
+			}
+		} else if len(v.Groups) == 0 {
+			@panelEmpty() {
+				No repository declares a service yet.
+			}
+		} else {
+			<div class="divide-y divide-zinc-800/70">
+				for _, g := range v.Groups {
+					@serviceGroupRow(g)
+				}
+			</div>
+		}
+	}
+}
+
+// serviceGroupRow is a group in the list: its name and what it holds, the reason for its status,
+// a dot for each service's status, the deployment ok made last, and its status in aggregate.
+templ serviceGroupRow(g ServiceGroup) {
+	<div class="flex items-start gap-4 px-4 py-3 text-sm transition-colors hover:bg-zinc-900/40">
+		<div class="min-w-0 flex-1">
+			<div class="flex items-center gap-2">
+				<a href={ templ.SafeURL(g.Href()) } hx-get={ g.Href() } hx-target="#content" hx-swap={ swapNav } hx-push-url="true" class="truncate font-medium text-zinc-100 transition-colors hover:text-sky-300">{ g.Name }</a>
+				if !g.Declared() {
+					@chip(toneNeutral) {
+						No Longer Declared
+					}
+				}
+			</div>
+			<div class="mt-0.5 truncate text-zinc-500">{ g.Detail() }</div>
+			<div class="mt-0.5 break-words text-zinc-400">
+				if g.Reason != "" {
+					{ g.Reason }
+				} else {
+					—
+				}
+			</div>
+		</div>
+		<div class="hidden w-64 shrink-0 md:block">
+			<div class="flex min-h-[1.625rem] flex-wrap items-center gap-1.5" aria-label="Services">
+				for _, sv := range g.Members {
+					@statusDot(serviceStatusTone(sv.StatusKind), sv.Name+": "+sv.StatusLabel)
+				}
+			</div>
+			if sv, ok := g.Newest(); ok {
+				<div class="mt-0.5 flex min-w-0 items-center gap-1.5 whitespace-nowrap text-zinc-500">
+					@contentLink(sv.CommitHref, "font-mono transition-colors hover:text-zinc-300") {
+						{ sv.Commit }
+					}
+					if sv.CL != 0 {
+						<span class="text-zinc-700">·</span>
+						@contentLink(sv.CLHref, "text-sky-400 transition-colors hover:text-sky-300") {
+							CL #{ strconv.FormatInt(sv.CL, 10) }
+						}
+					}
+				</div>
+			} else {
+				<div class="mt-0.5 text-zinc-600">Not deployed</div>
+			}
+		</div>
+		<div class="flex w-40 shrink-0 flex-col items-end gap-1">
+			@chip(serviceStatusTone(g.StatusKind)) {
+				{ g.StatusLabel }
+			}
+			if sv, ok := g.Newest(); ok {
+				<span class="whitespace-nowrap text-zinc-600" title={ sv.AgeTitle }>{ sv.Age }</span>
+			}
+		</div>
+	</div>
+}
+
+// contentLink is a link out of the Services pages — a commit, a CL, a deployment, a repository:
+// an htmx navigation of the content region.
+templ contentLink(href, class string) {
+	<a href={ templ.SafeURL(href) } hx-get={ href } hx-target="#content" hx-swap={ swapNav } hx-push-url="true" class={ class }>
+		{ children... }
+	</a>
+}
+
+// --- A group's page ----------------------------------------------------------------------
+templ ServiceGroupPage(n nav.Model, v ServiceGroupView) {
+	@layout.Shell(shell(serviceGroupTitle(v), layout.LeftNav, n)) {
+		@ServiceGroupContent(v)
+	}
+}
+
+// ServiceGroupContent is the group's page across the content region: the header, the sub-nav
+// of its services, and the pane.
+templ ServiceGroupContent(v ServiceGroupView) {
+	<div class="flex h-full flex-1 flex-col overflow-hidden">
+		<div class="shrink-0">
+			@PageHeadWide(v.Group.Name, v.Group.Detail(), "")
+		</div>
+		<div class="flex min-h-0 flex-1 gap-6 pl-6 sm:pl-10">
+			<aside class="flex w-64 shrink-0 flex-col pb-6 max-md:hidden">
+				@serviceNav(v)
+			</aside>
+			<div id="service-main" data-hydrate class="hydrating min-w-0 flex-1 overflow-y-auto pr-6 sm:pr-10">
+				@ServiceGroupMain(v)
+			</div>
+		</div>
+	</div>
+}
+
+// ServiceGroupMain is the pane: where it is in the group, then what it shows — a live region
+// that refreshes itself.
+templ ServiceGroupMain(v ServiceGroupView) {
+	<div class="pb-16">
+		<div class="mb-4 flex min-h-9 items-center">
+			@breadcrumb.Trail(serviceGroupCrumbs(v), "")
+		</div>
+		<div id="service-live" data-live hx-get={ v.Href() } hx-trigger={ liveEvery } hx-target="this" hx-swap="innerHTML" class="space-y-4">
+			@serviceGroupBody(v)
+		</div>
+	</div>
+}
+
+// serviceGroupPane is the response to a navigation within the group: the pane, and the sub-nav
+// with its new selection.
+templ serviceGroupPane(v ServiceGroupView) {
+	@ServiceGroupMain(v)
+	@serviceNavOOB(v)
+}
+
+// serviceGroupLive is the response to the pane's refresh: what it shows, and the sub-nav with the
+// same reading's statuses — unless the deployer could not be asked, when the sub-nav keeps the
+// last.
+templ serviceGroupLive(v ServiceGroupView) {
+	@serviceGroupBody(v)
+	if v.Error == "" {
+		@serviceNavOOB(v)
+	}
+}
+
+// serviceGroupBody is what the pane shows: the group's overview, or one of its services.
+templ serviceGroupBody(v ServiceGroupView) {
+	if v.Error != "" {
+		@panel() {
+			@panelTitle("Status")
+			@panelEmpty() {
+				{ v.Error }
+			}
+		}
+	} else if v.Service != nil {
+		@serviceStatusPanel(*v.Service)
+		@serviceImagesPanel(*v.Service)
+		@servicePodsPanel(*v.Service)
+		@serviceRecentPanel(v.Service.Recent, false)
+	} else {
+		@serviceGroupStatusPanel(v.Group)
+		@serviceMembersPanel(v.Group)
+		@serviceRecentPanel(v.Recent, true)
+	}
+}
+
+// serviceNav is the group's sub-nav: its overview, when it has one, and each of its services
+// with its status, the one the pane shows selected. Its rows (#service-nav) come again, out of
+// band, with every response to the pane, which swaps them into the same scroll container.
+templ serviceNav(v ServiceGroupView) {
+	<div class="flex min-h-0 flex-1 flex-col">
+		@panelFill() {
+			@panelTitle("Services")
+			<nav id="service-nav" data-live aria-label="Services" class="min-h-0 flex-1 overflow-y-auto p-2">
+				@serviceNavRows(v)
+			</nav>
+		}
+	</div>
+}
+
+// serviceNavOOB is the sub-nav's rows for an out-of-band swap into it.
+templ serviceNavOOB(v ServiceGroupView) {
+	<nav id="service-nav" hx-swap-oob="innerHTML">
+		@serviceNavRows(v)
+	</nav>
+}
+
+// serviceNavRows are the sub-nav's rows.
+templ serviceNavRows(v ServiceGroupView) {
+	if v.Group.Overview() {
+		@serviceNavRow(v.Group.Href(), v.Selected == 0) {
+			<span class="flex h-4 w-4 shrink-0 items-center justify-center text-zinc-500">
+				@iconOverview()
+			</span>
+			<span class="min-w-0 flex-1 truncate">Overview</span>
+		}
+	}
+	for _, sv := range v.Group.Members {
+		@serviceNavRow(ServiceHref(sv.ID), v.Selected == sv.ID) {
+			<span class="flex h-4 w-4 shrink-0 items-center justify-center">
+				@statusDot(serviceStatusTone(sv.StatusKind), sv.StatusLabel)
+			</span>
+			<span class={ "min-w-0 flex-1 truncate", templ.KV("text-zinc-500", !sv.Declared) } title={ serviceNavTitle(sv) }>{ sv.Name }</span>
+		}
+	}
+}
+
+// serviceNavRow is a row of the sub-nav: a navigation within the group, the pane alone.
+templ serviceNavRow(href string, current bool) {
+	<a
+		href={ templ.SafeURL(href) }
+		hx-get={ href }
+		hx-target="#service-main"
+		hx-swap={ swapPane }
+		hx-push-url="true"
+		if current {
+			aria-current="page"
+		}
+		class={ treeRowClass, "gap-2 pl-2" }
+	>
+		{ children... }
+	</a>
+}
+
+// --- The overview ------------------------------------------------------------------------
+
+// serviceGroupStatusPanel is the group's status in aggregate: its worst service's, and why.
+templ serviceGroupStatusPanel(g ServiceGroup) {
+	@panel() {
+		@panelHead() {
+			<h3>Status</h3>
+			<span class="flex-1"></span>
+			@chip(serviceStatusTone(g.StatusKind)) {
+				{ g.StatusLabel }
+			}
+		}
+		@panelBody() {
+			<dl class="space-y-1.5 text-sm">
+				@runInfoRow("Why", g.Reason)
+				@runInfoRow("Healthy", g.Healthy())
+				if sv, ok := g.Newest(); ok {
+					<div class="flex min-h-[1.625rem] items-start gap-3 leading-[1.625rem]">
+						<dt class="w-28 shrink-0 text-zinc-500">Last Deployed</dt>
+						<dd class="flex min-w-0 flex-wrap items-center gap-2">
+							<span class="text-zinc-300">{ sv.Name }</span>
+							@contentLink(sv.CommitHref, "font-mono text-zinc-400 transition-colors hover:text-zinc-200") {
+								{ sv.Commit }
+							}
+							if sv.CL != 0 {
+								@contentLink(sv.CLHref, "text-sky-400 transition-colors hover:text-sky-300") {
+									CL #{ strconv.FormatInt(sv.CL, 10) }
+								}
+							}
+							<span class="text-zinc-600" title={ sv.AgeTitle }>{ sv.Age }</span>
+						</dd>
+					</div>
+				} else {
+					@runInfoRow("Last Deployed", "")
+				}
+			</dl>
+		}
+	}
+}
+
+// serviceMembersPanel is the group's services: each one's status, what ok deployed, and how
+// many of its pods are Ready.
+templ serviceMembersPanel(g ServiceGroup) {
+	@panel() {
+		@panelHead() {
+			<span class="min-w-0 flex-1">Service</span>
+			<span class="w-44 shrink-0">Status</span>
+			<span class="hidden w-56 shrink-0 lg:block">Deployed</span>
+			<span class="w-16 shrink-0 text-right">Ready</span>
+		}
+		<div class="divide-y divide-zinc-800/70">
+			for _, sv := range g.Members {
+				<div class="flex items-start gap-3 px-4 py-3 text-sm transition-colors hover:bg-zinc-900/40">
+					<div class="min-w-0 flex-1">
+						<a href={ templ.SafeURL(ServiceHref(sv.ID)) } hx-get={ ServiceHref(sv.ID) } hx-target="#service-main" hx-swap={ swapPane } hx-push-url="true" class="block truncate font-medium text-zinc-100 transition-colors hover:text-sky-300">{ sv.Name }</a>
+						<div class="mt-0.5 truncate text-zinc-500">{ sv.Repository } · { sv.Workload }</div>
+						<div class="mt-0.5 break-words text-zinc-400">
+							if sv.Reason != "" {
+								{ sv.Reason }
+							} else {
+								—
+							}
+						</div>
+					</div>
+					<div class="flex w-44 shrink-0 flex-wrap items-center gap-1.5">
+						@chip(serviceStatusTone(sv.StatusKind)) {
+							{ sv.StatusLabel }
+						}
+						if !sv.Declared {
+							@chip(toneNeutral) {
+								No Longer Declared
+							}
+						}
+					</div>
+					<div class="hidden w-56 shrink-0 lg:block">
+						if sv.DeployedID != 0 {
+							<div class="truncate font-mono text-zinc-300" title={ sv.Version }>{ sv.Version }</div>
+							<div class="mt-0.5 flex flex-wrap items-center gap-x-1.5 whitespace-nowrap text-zinc-500">
+								@contentLink(sv.CommitHref, "font-mono transition-colors hover:text-zinc-300") {
+									{ sv.Commit }
+								}
+								if sv.CL != 0 {
+									@contentLink(sv.CLHref, "text-sky-400 transition-colors hover:text-sky-300") {
+										CL #{ strconv.FormatInt(sv.CL, 10) }
+									}
+								}
+								<span class="text-zinc-600" title={ sv.AgeTitle }>{ sv.Age }</span>
+							</div>
+						} else {
+							<div class="text-zinc-600">Not deployed</div>
+						}
+					</div>
+					<div class="w-16 shrink-0 text-right text-zinc-300">
+						if sv.Found {
+							{ strconv.Itoa(int(sv.Ready)) }/{ strconv.Itoa(int(sv.Replicas)) }
+						} else {
+							<span class="text-zinc-600">—</span>
+						}
+					</div>
+				</div>
+			}
+		</div>
+	}
+}
+
+// --- A service -----------------------------------------------------------------------------
+templ serviceStatusPanel(v ServiceView) {
+	@panel() {
+		@panelHead() {
+			<h3>Status</h3>
+			<span class="flex-1"></span>
+			@chip(serviceStatusTone(v.StatusKind)) {
+				{ v.StatusLabel }
+			}
+		}
+		@panelBody() {
+			<dl class="space-y-1.5 text-sm">
+				@runInfoRow("Why", v.Reason)
+				<div class="flex min-h-[1.625rem] items-start gap-3 leading-[1.625rem]">
+					<dt class="w-28 shrink-0 text-zinc-500">Repository</dt>
+					<dd class="min-w-0">
+						@contentLink(v.RepositoryHref, "text-sky-400 transition-colors hover:text-sky-300") {
+							{ v.Repository }
+						}
+					</dd>
+				</div>
+				@runInfoRow("Workload", v.Workload)
+				if v.Found {
+					@runInfoRow("Ready", strconv.Itoa(int(v.Ready))+" of "+strconv.Itoa(int(v.Replicas))+" pods")
+					@runInfoRow("Live Copy", v.Live)
+				} else {
+					@runInfoRow("Ready", "")
+					@runInfoRow("Live Copy", "")
+				}
+				@serviceDeploymentRow("Deployed", v.Deployed)
+				@serviceDeploymentRow("Latest", v.Latest)
+				@runInfoRow("Deploy", v.Deploy)
+				if !v.Declared {
+					@runInfoRow("Declared", "No longer: main's workflow files do not declare it")
+				}
+			</dl>
+		}
+	}
+}
+
+// serviceDeploymentRow is a deployment in a status row: its status, commit, and CL, linked.
+templ serviceDeploymentRow(label string, d *ServiceDeployment) {
+	<div class="flex min-h-[1.625rem] items-start gap-3 leading-[1.625rem]">
+		<dt class="w-28 shrink-0 text-zinc-500">{ label }</dt>
+		if d == nil {
+			<dd class="text-zinc-600">—</dd>
+		} else {
+			<dd class="flex min-w-0 flex-wrap items-center gap-2">
+				@chip(deployStatusTone(d.StatusKind)) {
+					{ d.StatusLabel }
+				}
+				@contentLink(d.Href, "text-sky-400 transition-colors hover:text-sky-300") {
+					Deployment { strconv.FormatInt(d.ID, 10) }
+				}
+				@contentLink(d.CommitHref, "font-mono text-zinc-400 transition-colors hover:text-zinc-200") {
+					{ d.Commit }
+				}
+				if d.CL != 0 {
+					@contentLink(d.CLHref, "text-sky-400 transition-colors hover:text-sky-300") {
+						CL #{ strconv.FormatInt(d.CL, 10) }
+					}
+				}
+				<span class="text-zinc-600" title={ d.AgeTitle }>{ d.Age }</span>
+			</dd>
+		}
+	</div>
+}
+
+templ serviceImagesPanel(v ServiceView) {
+	@panel() {
+		@panelTitle("Images")
+		if len(v.Images) == 0 {
+			@panelEmpty() {
+				The cluster shows no images.
+			}
+		} else {
+			<div class="divide-y divide-zinc-800/70">
+				for _, im := range v.Images {
+					<div class="px-4 py-3 text-sm">
+						<div class="flex items-center gap-2">
+							<span class="font-medium text-zinc-200">{ im.Container }</span>
+							<span class="flex-1"></span>
+							if im.Deployed != "" && !im.Matches {
+								@chip(toneWarn) {
+									Differs From Deployed
+								}
+							}
+						</div>
+						<dl class="mt-1 space-y-0.5">
+							<div class="flex gap-3">
+								<dt class="w-20 shrink-0 text-zinc-500">Running</dt>
+								<dd class="min-w-0 break-all font-mono text-zinc-300">{ im.Running }</dd>
+							</div>
+							<div class="flex gap-3">
+								<dt class="w-20 shrink-0 text-zinc-500">Deployed</dt>
+								if im.Deployed == "" {
+									<dd class="text-zinc-600">—</dd>
+								} else {
+									<dd class="min-w-0 break-all font-mono text-zinc-400">{ im.Deployed }</dd>
+								}
+							</div>
+						</dl>
+					</div>
+				}
+			</div>
+		}
+	}
+}
+
+templ servicePodsPanel(v ServiceView) {
+	@panel() {
+		@panelHead() {
+			<h3>Pods</h3>
+			<span class="flex-1"></span>
+			<span class="text-zinc-500">{ strconv.Itoa(len(v.Pods)) }</span>
+		}
+		if len(v.Pods) == 0 {
+			@panelEmpty() {
+				No pods run.
+			}
+		} else {
+			<div class="divide-y divide-zinc-800/70">
+				for _, p := range v.Pods {
+					@servicePodRow(p)
+				}
+			</div>
+		}
+	}
+}
+
+templ servicePodRow(p ServicePod) {
+	<div class="px-4 py-3 text-sm">
+		<div class="flex flex-wrap items-center gap-2">
+			<span class="min-w-0 truncate font-mono text-zinc-200">{ p.Name }</span>
+			if p.Copy != "" {
+				@chip(toneNeutral) {
+					{ p.Copy }
+				}
+			}
+			<span class="flex-1"></span>
+			if p.Terminating {
+				@chip(toneNeutral) {
+					Terminating
+				}
+			} else if p.Ready {
+				@chip(toneSuccess) {
+					Ready
+				}
+			} else {
+				@chip(toneDanger) {
+					Not Ready
+				}
+			}
+			<span class="w-24 shrink-0 text-right text-zinc-500">{ pluralCount(int(p.Restarts), "Restart", "Restarts") }</span>
+			<span class="w-28 shrink-0 whitespace-nowrap text-right text-zinc-600" title={ p.AgeTitle }>{ p.Age }</span>
+		</div>
+		if p.Reason != "" {
+			<div class="mt-1 text-red-300">{ p.Reason }</div>
+		}
+		for _, im := range p.Images {
+			<div class="mt-1 flex gap-3">
+				<span class="w-20 shrink-0 text-zinc-500">{ im.Container }</span>
+				<span class="min-w-0 break-all font-mono text-zinc-400">{ im.Image }</span>
+				if !im.Matches {
+					<span class="shrink-0 text-amber-300">not deployed by ok</span>
+				}
+			</div>
+		}
+	</div>
+}
+
+// serviceRecentPanel is the latest deployments: a service's, or a group's (named, each with the
+// service it deployed).
+templ serviceRecentPanel(recent []ServiceDeployment, named bool) {
+	@panel() {
+		@panelTitle("Recent Deployments")
+		if len(recent) == 0 {
+			@panelEmpty() {
+				Never deployed.
+			}
+		} else {
+			<div class="divide-y divide-zinc-800/70">
+				for _, d := range recent {
+					<a href={ templ.SafeURL(d.Href) } hx-get={ d.Href } hx-target="#content" hx-swap={ swapNav } hx-push-url="true" class="flex items-start gap-3 px-4 py-2.5 text-sm transition-colors hover:bg-zinc-900/40">
+						@chip(deployStatusTone(d.StatusKind)) {
+							{ d.StatusLabel }
+						}
+						<div class="min-w-0 flex-1">
+							<div class="flex flex-wrap items-center gap-x-2">
+								if named {
+									<span class="font-medium text-zinc-200">{ d.Service }</span>
+								}
+								<span class="font-mono text-zinc-300">Deployment { strconv.FormatInt(d.ID, 10) }</span>
+								<span class="font-mono text-zinc-500">{ d.Commit }</span>
+								if d.CL != 0 {
+									<span class="text-zinc-500">CL #{ strconv.FormatInt(d.CL, 10) }</span>
+								}
+								if d.Stage != "" {
+									<span class="text-zinc-500">{ d.Stage }</span>
+								}
+							</div>
+							if d.Reason != "" {
+								<div class="mt-0.5 break-words text-zinc-400">{ d.Reason }</div>
+							}
+						</div>
+						<span class="shrink-0 whitespace-nowrap text-zinc-600" title={ d.AgeTitle }>{ d.Age }</span>
+					</a>
+				}
+			</div>
+		}
+	}
+}
+
+// iconOverview is the sub-nav's Overview: a list of the group's services.
+templ iconOverview() {
+	<svg class="h-4 w-4" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M5.75 2.5h8.5a.75.75 0 0 1 0 1.5h-8.5a.75.75 0 0 1 0-1.5Zm0 5h8.5a.75.75 0 0 1 0 1.5h-8.5a.75.75 0 0 1 0-1.5Zm0 5h8.5a.75.75 0 0 1 0 1.5h-8.5a.75.75 0 0 1 0-1.5ZM2 14a1 1 0 1 1 0-2 1 1 0 0 1 0 2Zm1-6a1 1 0 1 1-2 0 1 1 0 0 1 2 0ZM2 4a1 1 0 1 1 0-2 1 1 0 0 1 0 2Z"></path></svg>
+}

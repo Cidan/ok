@@ -1,0 +1,18 @@
+// Package clipboard is a reusable, application-neutral copy-to-clipboard control: a button
+// that writes a supplied string to the clipboard and briefly reflects success. All behaviour
+// lives in the client controller (clipboard.js), which the consuming app embeds and serves
+// like the other component :js groups; the component only emits the markup contract the
+// controller keys off. The consumer supplies the classes and the button's visual content
+// (children) — typically an idle icon/label and a done icon/label marked data-copy-idle /
+// data-copy-done, which the controller swaps on a successful copy.
+package clipboard
+
+// Button renders a copy trigger for `text`. On click the controller copies `text`, then for a
+// short window sets data-copied="true" on the button and, if present, hides the
+// [data-copy-idle] child and shows the [data-copy-done] child. class and children are entirely
+// caller-supplied so the control carries no app-specific styling.
+templ Button(text, class string) {
+	<button type="button" data-copy={ text } class={ class } aria-label="Copy to clipboard">
+		{ children... }
+	</button>
+}

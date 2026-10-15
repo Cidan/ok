@@ -1,0 +1,18 @@
+[package]
+name = "ok-working-copy"
+description = "A working copy for ok's jj"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+async-trait.workspace = true
+jj-lib.workspace = true
+rayon.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+

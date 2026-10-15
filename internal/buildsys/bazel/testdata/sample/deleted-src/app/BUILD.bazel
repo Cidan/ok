@@ -1,0 +1,19 @@
+load("//:defs.bzl", "cat", "check_test")
+
+cat(
+    name = "joined",
+    srcs = [
+        "//lib:files",
+        "//lib:gen",
+    ],
+)
+
+check_test(
+    name = "joined_test",
+    data = [":joined"],
+)
+
+cat(
+    name = "other",
+    srcs = ["c.txt"],
+)

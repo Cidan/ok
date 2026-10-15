@@ -1,0 +1,99 @@
+{{- if .Values.deploy.enabled }}
+# ok's deployer, as the robot deploy.ok. This Deployment is its blue copy; it rolls itself onto a
+# green copy it makes, and each copy learns which it is from its color label.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "ok.name" . }}-deploy
+  labels: {{- include "ok.labels" . | nindent 4 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "ok.name" . }}-deploy
+  labels: {{- include "ok.labels" . | nindent 4 }}
+spec:
+  selector:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: deploy
+  ports:
+    - {name: http, port: 8472, targetPort: http, appProtocol: kubernetes.io/h2c}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "ok.name" . }}-deploy
+  labels: {{- include "ok.labels" . | nindent 4 }}
+    app.kubernetes.io/component: deploy
+spec:
+  # No replicas: the deployer owns them once it rolls itself (blue to 0, green live), and an upgrade
+  # that set them would bring blue back beside green.
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: deploy
+  template:
+    metadata:
+      labels: {{- include "ok.labels" . | nindent 8 }}
+        app.kubernetes.io/component: deploy
+        {{ include "ok.colorLabel" . }}: blue
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: {{ include "ok.name" . }}-deploy
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: deploy
+          image: {{ include "ok.runnerImage" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: [deploy, serve, -config, /etc/ok/config/ok.yaml]
+          env:
+            - name: OK_DEPLOY_COLOR
+              valueFrom: {fieldRef: {fieldPath: "metadata.labels['{{ include "ok.colorLabel" . }}']"}}
+            - name: HOSTNAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+          ports:
+            - {name: http, containerPort: 8472}
+            - {name: metrics, containerPort: 8473}
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+            periodSeconds: 10
+          securityContext: {{- toYaml .Values.deploy.securityContext | nindent 12 }}
+          {{- with .Values.deploy.resources }}
+          resources: {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            {{- include "ok.configMounts" . | nindent 12 }}
+            - {name: ok-token, mountPath: /var/run/secrets/ok, readOnly: true}
+            - {name: state, mountPath: /var/lib/ok}
+            - {name: tmp, mountPath: /tmp}
+            {{- if eq .Values.deploy.checkout "virtual" }}
+            - {name: fuse, mountPath: /dev/fuse}
+            {{- end }}
+            {{- range $name, $ref := .Values.deploy.migrationEnv }}
+            - {name: env-{{ $name | lower | replace "_" "-" }}, mountPath: /etc/ok/migration-env/{{ $name | lower }}, readOnly: true}
+            {{- end }}
+      volumes:
+        {{- include "ok.configVolumes" . | nindent 8 }}
+        {{- include "ok.tokenVolume" . | nindent 8 }}
+        - name: state
+          emptyDir: {sizeLimit: {{ .Values.deploy.state.sizeLimit }}}
+        - name: tmp
+          emptyDir: {}
+        {{- if eq .Values.deploy.checkout "virtual" }}
+        - name: fuse
+          hostPath: {path: /dev/fuse, type: CharDevice}
+        {{- end }}
+        {{- range $name, $ref := .Values.deploy.migrationEnv }}
+        - name: env-{{ $name | lower | replace "_" "-" }}
+          secret:
+            secretName: {{ $ref.secretName }}
+            items: [{key: {{ $ref.key }}, path: value}]
+        {{- end }}
+---
+# The deployer rolls itself: its own grant, in its own namespace.
+{{- include "ok.grant" (dict "root" . "grant" (dict "namespace" .Release.Namespace "deployment" (printf "%s-deploy" (include "ok.name" .)) "accounts" (list (printf "%s-deploy" (include "ok.name" .))))) }}
+{{- end }}

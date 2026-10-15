@@ -1,0 +1,119 @@
+package pages
+
+import (
+	"strconv"
+
+	"github.com/Cidan/ok/internal/web/layout"
+	"github.com/Cidan/ok/internal/web/nav"
+)
+
+// The run page — one run of a CL's checks (docs/automation.md): what it runs and why, where
+// it stands, and its log. While the run goes on, its status panel and its log are live regions
+// that refresh themselves (docs/web.md, "Live regions").
+templ RunViewPage(n nav.Model, v RunView) {
+	@layout.Shell(shell(v.Check.Name+" · CL #"+strconv.FormatInt(v.CLNumber, 10)+" · "+v.Chrome.Name+" · "+Brand, layout.LeftNav, n)) {
+		@RunViewContent(v)
+	}
+}
+
+templ RunViewContent(v RunView) {
+	<div class="flex h-full flex-1 flex-col overflow-hidden">
+		<div class="shrink-0">
+			@PageHead(v.Chrome.Name, v.Chrome.Subtitle, "") {
+				@changesLink(v.Chrome.ChangesHref, "#repo-main")
+				@codeButton(v.Chrome.Clone)
+			}
+		</div>
+		<div id="repo-main" data-hydrate class="hydrating flex-1 overflow-y-auto">
+			@RunViewMain(v)
+		</div>
+	</div>
+}
+
+templ RunViewMain(v RunView) {
+	<div class="mx-auto w-full max-w-[92rem] px-6 pb-16 sm:px-10 lg:px-12">
+		<div class="mb-5 min-w-0">
+			<div class="flex items-center gap-2.5 text-sm">
+				<a href={ templ.SafeURL(v.CLHref) } hx-get={ v.CLHref } hx-target="#repo-main" hx-swap="innerHTML swap:70ms settle:1ms" hx-push-url="true" class="text-sky-400 transition-colors hover:text-sky-300">CL #{ strconv.FormatInt(v.CLNumber, 10) }</a>
+				<span class="text-zinc-600">/</span>
+				<span class="font-mono text-zinc-500">Run { strconv.FormatInt(v.ID, 10) }</span>
+			</div>
+			<h2 class="mt-2 truncate font-mono text-xl font-semibold tracking-tight text-zinc-50">{ v.Check.Name }</h2>
+		</div>
+		<div class="space-y-4">
+			@runStatus(v)
+			@panel() {
+				@panelHead() {
+					<h3>Log</h3>
+					<span class="flex-1"></span>
+					<a href={ templ.SafeURL(v.RawHref) } class="text-sky-400 transition-colors hover:text-sky-300">Raw</a>
+				}
+				<pre class="max-h-[70vh] overflow-auto whitespace-pre-wrap break-words px-4 py-3 font-mono text-[12.5px] leading-[1.6] text-zinc-300">
+					if v.Log.Truncated {
+						<span class="text-zinc-500">The log is long: this is its end. Raw has all of it.{ "\n" }</span>
+					}
+					@runLogChunk(v.Log)
+				</pre>
+			}
+		</div>
+	</div>
+}
+
+// runStatus is the run's status panel, a live region: while the run goes on it refreshes itself.
+templ runStatus(v RunView) {
+	<div
+		id="run-status"
+		data-live
+		if v.Live {
+			hx-get={ v.StatusHref }
+			hx-trigger="every 2s"
+			hx-target="this"
+			hx-swap="outerHTML"
+		}
+	>
+		@panel() {
+			@panelHead() {
+				<h3>Run</h3>
+				<span class="flex-1"></span>
+				@chip(clCheckTone(v.Check.StatusKind)) {
+					{ v.Check.StatusLabel }
+				}
+			}
+			@panelBody() {
+				<dl class="space-y-1.5 text-sm">
+					@clInfoRow("Job", v.Check.Name)
+					@clInfoRow("Defined In", v.Check.Source)
+					@runInfoRow("Why", v.Check.Why)
+					@runInfoRow("Outcome", v.Check.Reason)
+					@clInfoRow("Patchset", strconv.FormatInt(v.Patchset, 10)+" · "+v.Commit)
+					@runInfoRow("Worker", v.Worker)
+					@runInfoRow("Queued", v.Queued)
+					@runInfoRow("Started", v.Started)
+					@runInfoRow("Finished", v.Finished)
+					@runInfoRow("Duration", v.Check.Duration)
+				</dl>
+			}
+		}
+	</div>
+}
+
+// runInfoRow is a status row whose value may be long (it wraps) or empty ("—").
+templ runInfoRow(label, value string) {
+	<div class="flex min-h-[1.625rem] items-start gap-3 leading-[1.625rem]">
+		<dt class="w-28 shrink-0 text-zinc-500">{ label }</dt>
+		if value == "" {
+			<dd class="text-zinc-600">—</dd>
+		} else {
+			<dd class="min-w-0 break-words text-zinc-300">{ value }</dd>
+		}
+	</div>
+}
+
+// runLogChunk is what the log gained since the page last read it and — while the run goes on — a
+// reader that fetches the rest, replacing itself with it.
+templ runLogChunk(l RunLog) {
+	<span data-live>{ l.Text }</span>
+	if l.NextHref != "" {
+		<span data-live hx-get={ l.NextHref } hx-trigger="every 2s" hx-target="this" hx-swap="outerHTML"></span>
+	}
+}

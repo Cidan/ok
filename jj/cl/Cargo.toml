@@ -1,0 +1,24 @@
+[package]
+name = "ok-cl"
+description = "jj cl and jj sync: ChangeLists in ok's SCM"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+futures.workspace = true
+jj-lib.workspace = true
+ok-encoding.workspace = true
+ok-store.workspace = true
+thiserror.workspace = true
+tonic.workspace = true
+
+[dev-dependencies]
+ok-proto.workspace = true
+ok-testscm.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+

@@ -1,0 +1,179 @@
+package nav
+
+// LeftRail renders the collapsible left navigation drawer: a 64px icon rail that
+// expands to a 288px panel (zinc palette, 300ms transitions, a mobile overlay). Open/closed state lives as data-open on the
+// enclosing [data-nav] shell (rendered by the layout); every collapse-reactive class
+// keys off the group-data-[open=true]/nav: variant, so the only JS needed is flipping
+// that one attribute (see nav.js). The rail itself always lays out at w-72 inside an
+// overflow-hidden clip, so labels slide out of view rather than reflow.
+//
+// The rail lives in the persistent htmx shell and is NOT re-rendered by a content swap —
+// it is rendered once (on the full/deep-link load) and then stays put, so its collapse
+// transition (the aside's transition-all) plays uninterrupted when the drawer opens/closes.
+// The active highlight is server-computed for the initial render (sectionRowClass/
+// footerClass) and thereafter refreshed CLIENT-SIDE by nav.js (updateActive) on
+// htmx:after:swap, keyed off the pushed URL — so navigation never has to replace the rail.
+// Active-eligible links carry data-nav-link so nav.js knows which to toggle.
+templ LeftRail(m Model) {
+	<div id="nav-rail" class="contents">
+		@leftRailBody(m)
+	</div>
+}
+
+// leftRailBody is the rail markup (backdrop + surface aside). The nav destination links
+// carry hx-get/hx-target="#content"/hx-swap/hx-push-url so htmx swaps just the content
+// region and pushes the URL (they stay real <a href> too, for progressive enhancement and
+// correct link semantics); inert actions (Href "#", e.g. Search) remain plain <button>s
+// with no hx-* so they never navigate. A section row with a Menu gets a kebab dropdown of the
+// app's actions (nav.js opens and closes it; the app's own script acts on the actions).
+templ leftRailBody(m Model) {
+	<div data-nav-backdrop class="fixed inset-0 bg-black/50 z-40 hidden group-data-[open=true]/nav:max-md:block"></div>
+	<aside
+		data-nav-surface
+		class="absolute left-0 top-0 bottom-0 z-50 flex flex-col transition-all duration-300 overflow-hidden w-16 bg-transparent md:bg-zinc-950 pointer-events-none md:pointer-events-auto group-data-[open=true]/nav:w-72 group-data-[open=true]/nav:bg-zinc-900 group-data-[open=true]/nav:shadow-2xl group-data-[open=true]/nav:pointer-events-auto"
+	>
+		<div class="w-72 flex-1 min-h-0 flex flex-col">
+			<div class="flex flex-col mt-4">
+				<button data-nav-toggle type="button" class="w-16 h-12 flex items-center justify-center shrink-0 hover:text-zinc-100 text-zinc-400 pointer-events-auto">
+					@icon(m.Brand.Icon, "w-6 h-6 shrink-0")
+				</button>
+				for _, it := range m.Actions {
+					if it.isAction() {
+						<button type="button" class={ railItemBase + " h-12" }>
+							@railItemInner(it)
+						</button>
+					} else {
+						<a href={ it.url() } hx-get={ it.Href } hx-target="#content" hx-swap="innerHTML swap:70ms settle:1ms" hx-push-url="true" data-nav-link?={ m.HighlightActions } class={ m.actionRowClass(it) }>
+							@railItemInner(it)
+						</a>
+					}
+				}
+			</div>
+			<div class="flex-1 overflow-y-auto min-h-0 mt-6 mb-4 justify-start space-y-1 w-full opacity-0 hidden md:flex md:flex-col group-data-[open=true]/nav:opacity-100 group-data-[open=true]/nav:flex group-data-[open=true]/nav:flex-col">
+				for _, sec := range m.Sections {
+					<div class="px-5 pb-2 shrink-0 text-xs font-semibold text-zinc-500 uppercase tracking-wider hidden group-data-[open=true]/nav:block">{ sec.Title }</div>
+					for _, it := range sec.Items {
+						<div class="relative group w-full flex items-center shrink-0">
+							<a href={ it.url() } hx-get={ it.Href } hx-target="#content" hx-swap="innerHTML swap:70ms settle:1ms" hx-push-url="true" data-nav-link class={ m.sectionRowClass(it) }>
+								<span class="relative truncate text-sm pl-1">
+									if it.Unread {
+										<div class="absolute w-2 h-2 rounded-full bg-green-500" style="left: 0; bottom: 1px;"></div>
+									}
+									{ it.Label }
+								</span>
+							</a>
+							if len(it.Menu) > 0 {
+								<div data-nav-kebab-wrap class="absolute right-2 opacity-0 group-hover:opacity-100 transition-opacity items-center hidden group-data-[open=true]/nav:flex">
+									<div class="relative">
+										<button type="button" data-nav-kebab class="p-1 rounded text-zinc-400 hover:text-zinc-100 hover:bg-zinc-700">
+											@icon("kebab", "w-4 h-4")
+										</button>
+										<div data-nav-menu class="hidden absolute right-0 top-full mt-1 w-32 bg-zinc-800 rounded shadow-lg border border-zinc-700 z-50 py-1 overflow-hidden">
+											for _, a := range it.Menu {
+												<button type="button" { a.Attrs... } class={ a.class() }>{ a.Label }</button>
+											}
+										</div>
+									</div>
+								</div>
+							}
+						</div>
+					}
+				}
+			</div>
+			for i, it := range m.Footer {
+				<a href={ it.url() } hx-get={ it.Href } hx-target="#content" hx-swap="innerHTML swap:70ms settle:1ms" hx-push-url="true" data-nav-link class={ m.footerClass(it, i == 0) }>
+					<div class="w-16 flex items-center justify-center shrink-0">
+						@icon(it.Icon, "w-5 h-5 shrink-0")
+					</div>
+					<span class={ railLabelBase }>{ it.Label }</span>
+				</a>
+			}
+		</div>
+	</aside>
+}
+
+// railItemInner is the shared icon + sliding label body of a rail action/footer row, used
+// by both the <a> (destination) and <button> (no-op action) wrappers.
+templ railItemInner(it Item) {
+	<div class="w-16 flex items-center justify-center shrink-0">
+		@icon(it.Icon, "w-5 h-5 shrink-0")
+	</div>
+	<span class={ railLabelBase }>{ it.Label }</span>
+}
+
+// TopBar renders the same model as a horizontal top navigation, for the TopNav layout.
+templ TopBar(m Model) {
+	<header class="h-14 shrink-0 border-b border-zinc-900 bg-zinc-950 flex items-center px-3 gap-1">
+		<a href={ m.Brand.url() } class="w-10 h-10 flex items-center justify-center text-zinc-300 hover:text-zinc-100 shrink-0">
+			@icon(m.Brand.Icon, "w-6 h-6")
+		</a>
+		<nav class="flex items-center gap-1">
+			for _, it := range append(append([]Item{}, m.Actions...), m.Footer...) {
+				if it.isAction() {
+					<button type="button" class={ topItemClass(m, it) }>
+						@icon(it.Icon, "w-4 h-4")
+						<span>{ it.Label }</span>
+					</button>
+				} else {
+					<a href={ it.url() } hx-get={ it.Href } hx-target="#content" hx-swap="innerHTML swap:70ms settle:1ms" hx-push-url="true" data-nav-link class={ topItemClass(m, it) }>
+						@icon(it.Icon, "w-4 h-4")
+						<span>{ it.Label }</span>
+					</a>
+				}
+			}
+		</nav>
+	</header>
+}
+
+// icon renders a named SVG icon at the given Tailwind size classes. A small shared set of
+// common nav glyphs (logo/new/search/home/repo/org/notes/tasks/server/settings/kebab); an unknown
+// name renders nothing. Consumers pick the names that fit their app.
+templ icon(name, cls string) {
+	switch name {
+		case "bolt":
+			<svg class={ cls } fill="none" stroke="currentColor" viewBox="0 0 24 24">
+				<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path>
+			</svg>
+		case "home":
+			<svg class={ cls } fill="none" stroke="currentColor" viewBox="0 0 24 24">
+				<path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M2.25 12l8.954-8.955c.44-.439 1.152-.439 1.591 0L21.75 12M4.5 9.75v10.125c0 .621.504 1.125 1.125 1.125H9.75v-4.875c0-.621.504-1.125 1.125-1.125h2.25c.621 0 1.125.504 1.125 1.125V21h4.125c.621 0 1.125-.504 1.125-1.125V9.75"></path>
+			</svg>
+		case "repo":
+			<svg class={ cls } fill="none" stroke="currentColor" viewBox="0 0 24 24">
+				<path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M12 6.042A8.967 8.967 0 006 3.75c-1.052 0-2.062.18-3 .512v14.25A8.987 8.987 0 016 18c2.305 0 4.408.867 6 2.292m0-14.25a8.966 8.966 0 016-2.292c1.052 0 2.062.18 3 .512v14.25A8.987 8.987 0 0018 18a8.967 8.967 0 00-6 2.292m0-14.25v14.25"></path>
+			</svg>
+		case "org":
+			<svg class={ cls } fill="none" stroke="currentColor" viewBox="0 0 24 24">
+				<path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M3.75 21h16.5M4.5 3h15M5.25 3v18m13.5-18v18M9 6.75h1.5m-1.5 3h1.5m-1.5 3h1.5m3-6H15m-1.5 3H15m-1.5 3H15M9 21v-3.375c0-.621.504-1.125 1.125-1.125h3.75c.621 0 1.125.504 1.125 1.125V21"></path>
+			</svg>
+		case "new":
+			<svg class={ cls } fill="none" stroke="currentColor" viewBox="0 0 24 24">
+				<path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M12 4v16m8-8H4"></path>
+			</svg>
+		case "search":
+			<svg class={ cls } fill="none" stroke="currentColor" viewBox="0 0 24 24">
+				<path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path>
+			</svg>
+		case "notes":
+			<svg class={ cls } fill="none" stroke="currentColor" viewBox="0 0 24 24">
+				<path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M19.5 14.25v-2.625a3.375 3.375 0 0 0-3.375-3.375h-1.5A1.125 1.125 0 0 1 13.5 7.125v-1.5a3.375 3.375 0 0 0-3.375-3.375H8.25m0 12.75h7.5m-7.5 3H12M10.5 2.25H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 0 0-9-9Z"></path>
+			</svg>
+		case "tasks":
+			<svg class={ cls } fill="none" stroke="currentColor" viewBox="0 0 24 24">
+				<path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4"></path>
+			</svg>
+		case "server":
+			<svg class={ cls } fill="none" stroke="currentColor" viewBox="0 0 24 24">
+				<path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M5.25 14.25h13.5m-13.5 0a3 3 0 01-3-3m3 3a3 3 0 100 6h13.5a3 3 0 100-6m-16.5-3a3 3 0 013-3h13.5a3 3 0 013 3m-19.5 0a4.5 4.5 0 01.9-2.7L5.737 5.1a3.375 3.375 0 012.7-1.35h7.126c1.062 0 2.062.5 2.7 1.35l2.587 3.45a4.5 4.5 0 01.9 2.7m0 0a3 3 0 01-3 3m0 3h.008v.008h-.008v-.008zm0-6h.008v.008h-.008v-.008zm-3 6h.008v.008h-.008v-.008zm0-6h.008v.008h-.008v-.008z"></path>
+			</svg>
+		case "settings":
+			<svg class={ cls } fill="none" stroke="currentColor" viewBox="0 0 24 24">
+				<path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path>
+				<path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path>
+			</svg>
+		case "kebab":
+			<svg class={ cls } fill="none" stroke="currentColor" viewBox="0 0 24 24">
+				<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6a1 1 0 110-2 1 1 0 010 2zm0 7a1 1 0 110-2 1 1 0 010 2zm0 7a1 1 0 110-2 1 1 0 010 2z"></path>
+			</svg>
+	}
+}

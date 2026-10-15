@@ -1,0 +1,365 @@
+package main
+
+import (
+	"context"
+	"crypto/x509"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"os/exec"
+	"os/signal"
+	"runtime"
+	"strings"
+	"syscall"
+	"text/tabwriter"
+
+	"github.com/Cidan/ok/internal/client/auth"
+	"github.com/Cidan/ok/internal/config"
+	"github.com/Cidan/ok/internal/credential"
+	"github.com/Cidan/ok/internal/dial"
+	"github.com/Cidan/ok/internal/id/ca"
+	"github.com/Cidan/ok/internal/id/role"
+	"github.com/Cidan/ok/internal/serve"
+	identitypb "github.com/Cidan/ok/proto/ok/identity/v1"
+)
+
+// identityServe runs the identity role until it is told to stop.
+func identityServe(args []string) error {
+	flags := flag.NewFlagSet("identity serve", flag.ContinueOnError)
+	path := flags.String("config", "ok.yaml", "the installation's configuration")
+	dev := flags.Bool("dev", false, "accept development principals (ok-dev-principal), on a loopback address only")
+	if err := flags.Parse(args); err != nil {
+		return usageError(err.Error())
+	}
+	cfg, err := config.Load(*path)
+	if err != nil {
+		return err
+	}
+	if *dev && !loopback(cfg.Listen) {
+		return fmt.Errorf("-dev serves only on loopback, and listen is %s", cfg.Listen)
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	r, err := role.Build(ctx, cfg, role.Options{Dev: *dev})
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+	opts := []serve.Option{serve.WithAuthn(r.Resolver), serve.WithListenAddr(cfg.Listen), serve.WithMetricsAddr(cfg.MetricsListen)}
+	if cfg.TLS != nil {
+		tc, err := serve.LoadTLS(cfg.TLS.Cert, cfg.TLS.Key)
+		if err != nil {
+			return err
+		}
+		opts = append(opts, serve.WithTLS(tc))
+	}
+	if *dev {
+		opts = append(opts, serve.WithReflection())
+	}
+	return serve.Run(ctx, r.Root, opts...)
+}
+
+func loopback(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	ip := net.ParseIP(host)
+	return host == "localhost" || ip != nil && ip.IsLoopback()
+}
+
+// caInit makes an identity CA.
+func caInit(args []string, stdout io.Writer) error {
+	flags := flag.NewFlagSet("identity ca init", flag.ContinueOnError)
+	dir := flags.String("dir", "", "the directory to make the CA in: identity.ca_dir")
+	name := flags.String("name", "ok", "the installation's name, in the CA's")
+	if err := flags.Parse(args); err != nil {
+		return usageError(err.Error())
+	}
+	if *dir == "" {
+		return usageError("-dir is required")
+	}
+	if err := ca.Init(*dir, *name); err != nil {
+		return err
+	}
+	fmt.Fprintf(stdout, "made the identity CA in %s: keep tls.key secret, and back it up\n", *dir)
+	return nil
+}
+
+// authLogin signs this machine in.
+func authLogin(args []string, stdout io.Writer) error {
+	flags := flag.NewFlagSet("auth login", flag.ContinueOnError)
+	server := flags.String("server", os.Getenv("OK_SERVER"), "ok's address: https://ok.example.com")
+	label := flags.String("label", defaultLabel(), "what this machine is called on your account page")
+	noBrowser := flags.Bool("no-browser", false, "do not open a browser")
+	if err := flags.Parse(args); err != nil {
+		return usageError(err.Error())
+	}
+	if *server == "" {
+		return usageError("-server is required (or OK_SERVER)")
+	}
+	srv, err := auth.ParseServer(*server)
+	if err != nil {
+		return err
+	}
+	dir, err := auth.Dir()
+	if err != nil {
+		return err
+	}
+	var open func(string) error
+	if !*noBrowser {
+		open = openBrowser
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	who, err := auth.Login(ctx, srv, dir, *label, stdout, open)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(stdout, "signed in as %s\n", who)
+	return nil
+}
+
+func defaultLabel() string {
+	host, _ := os.Hostname()
+	if u := os.Getenv("USER"); u != "" && host != "" {
+		return u + "@" + host
+	}
+	if host != "" {
+		return host
+	}
+	return "a command line"
+}
+
+func openBrowser(url string) error {
+	switch runtime.GOOS {
+	case "darwin":
+		return exec.Command("open", url).Start()
+	case "windows":
+		return exec.Command("rundll32", "url.dll,FileProtocolHandler", url).Start()
+	}
+	if os.Getenv("DISPLAY") == "" && os.Getenv("WAYLAND_DISPLAY") == "" {
+		return errors.New("no display")
+	}
+	return exec.Command("xdg-open", url).Start()
+}
+
+func authStatus(stdout io.Writer) error {
+	dir, err := auth.Dir()
+	if err != nil {
+		return err
+	}
+	c, err := auth.Load(dir)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(stdout, "signed in to %s as %s; the certificate renews before %s\n", c.Server().URL, c.Principal(), c.NotAfter().Local().Format("Jan 2 15:04 MST"))
+	return nil
+}
+
+func authLogout(stdout io.Writer) error {
+	dir, err := auth.Dir()
+	if err != nil {
+		return err
+	}
+	if err := auth.Logout(context.Background(), dir); err != nil {
+		return err
+	}
+	fmt.Fprintln(stdout, "signed out")
+	return nil
+}
+
+// adminClient dials ok as the signed-in machine's principal, and says where it is.
+func adminClient() (identitypb.AdminClient, auth.Server, func(), error) {
+	dir, err := auth.Dir()
+	if err != nil {
+		return nil, auth.Server{}, nil, err
+	}
+	c, err := auth.Load(dir)
+	if err != nil {
+		return nil, auth.Server{}, nil, err
+	}
+	conn, err := c.Server().Dial(dial.Options{Credential: c})
+	if err != nil {
+		return nil, auth.Server{}, nil, err
+	}
+	return identitypb.NewAdminClient(conn), c.Server(), func() { conn.Close() }, nil
+}
+
+const adminUsage = `ok admin — administering ok identity, as the signed-in administrator
+
+  ok admin sync                              run the sync from the system of record now
+  ok admin status                            how the sync went, and who waits
+  ok admin name [-group] EXTERNAL_ID NAME    set a waiting person's handle, or a group's name
+  ok admin robots                            list robots and their bindings
+  ok admin robot create NAME                 make a robot: NAME.robot.<domain>
+  ok admin robot delete NAME                 delete a robot; its name is retired
+  ok admin robot bind NAME ISSUER SUBJECT    let a robot sign in with an issuer's tokens
+  ok admin robot unbind NAME ISSUER SUBJECT
+  ok admin robot certify NAME -dir DIR       certify a key for a robot no issuer vouches for, and
+                                             write its credential to DIR (workload.credential_dir)
+  ok admin credentials PRINCIPAL             list a principal's credentials
+  ok admin revoke CREDENTIAL                 revoke a credential
+`
+
+func admin(args []string, stdout io.Writer) error {
+	if len(args) == 0 {
+		return usageError("ok admin needs a command\n" + adminUsage)
+	}
+	client, srv, done, err := adminClient()
+	if err != nil {
+		return err
+	}
+	defer done()
+	ctx := context.Background()
+	switch args[0] {
+	case "sync":
+		resp, err := client.Sync(ctx, &identitypb.SyncRequest{})
+		if err != nil {
+			return err
+		}
+		for _, c := range resp.GetChanges() {
+			fmt.Fprintln(stdout, c)
+		}
+		for _, w := range resp.GetWaiting() {
+			fmt.Fprintf(stdout, "waiting: %s: %s\n", w.GetExternalId(), w.GetReason())
+		}
+		if len(resp.GetChanges()) == 0 {
+			fmt.Fprintln(stdout, "nothing changed")
+		}
+		return nil
+	case "status":
+		st, err := client.GetSyncStatus(ctx, &identitypb.GetSyncStatusRequest{})
+		if err != nil {
+			return err
+		}
+		last := "never"
+		if st.GetLastRun() != nil {
+			last = st.GetLastRun().AsTime().Local().Format("Jan 2 15:04:05 MST")
+		}
+		fmt.Fprintf(stdout, "system of record: %s\nlast sync: %s\n", or(st.GetSource(), "none"), last)
+		if st.GetError() != "" {
+			fmt.Fprintf(stdout, "it failed: %s\n", st.GetError())
+		}
+		for _, w := range st.GetWaiting() {
+			fmt.Fprintf(stdout, "waiting: %s: %s\n", w.GetExternalId(), w.GetReason())
+		}
+		return nil
+	case "name":
+		flags := flag.NewFlagSet("admin name", flag.ContinueOnError)
+		group := flags.Bool("group", false, "the external ID is a group's")
+		if err := flags.Parse(args[1:]); err != nil || flags.NArg() != 2 {
+			return usageError("ok admin name [-group] EXTERNAL_ID NAME")
+		}
+		_, err := client.SetName(ctx, &identitypb.SetNameRequest{ExternalId: flags.Arg(0), Group: *group, Name: flags.Arg(1)})
+		return err
+	case "robots":
+		resp, err := client.ListRobots(ctx, &identitypb.ListRobotsRequest{})
+		if err != nil {
+			return err
+		}
+		tw := tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
+		for _, r := range resp.GetRobots() {
+			var bs []string
+			for _, b := range r.GetBindings() {
+				bs = append(bs, b.GetIssuer()+" "+b.GetSubject())
+			}
+			fmt.Fprintf(tw, "%s\t%s\n", r.GetPrincipal().GetName(), strings.Join(bs, "; "))
+		}
+		return tw.Flush()
+	case "robot":
+		return adminRobot(ctx, client, srv, args[1:], stdout)
+	case "credentials":
+		if len(args) != 2 {
+			return usageError("ok admin credentials PRINCIPAL")
+		}
+		resp, err := client.ListCredentials(ctx, &identitypb.AdminListCredentialsRequest{Principal: args[1]})
+		if err != nil {
+			return err
+		}
+		tw := tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
+		for _, c := range resp.GetCredentials() {
+			state := "active"
+			if c.GetRevoked() != nil {
+				state = "revoked"
+			}
+			fmt.Fprintf(tw, "%s\t%s\t%s\n", c.GetId(), c.GetLabel(), state)
+		}
+		return tw.Flush()
+	case "revoke":
+		if len(args) != 2 {
+			return usageError("ok admin revoke CREDENTIAL")
+		}
+		_, err := client.RevokeCredential(ctx, &identitypb.RevokeCredentialRequest{Id: args[1]})
+		return err
+	}
+	return usageError(fmt.Sprintf("unknown command ok admin %s\n%s", args[0], adminUsage))
+}
+
+func adminRobot(ctx context.Context, client identitypb.AdminClient, srv auth.Server, args []string, stdout io.Writer) error {
+	if len(args) < 2 {
+		return usageError(adminUsage)
+	}
+	switch args[0] {
+	case "create":
+		resp, err := client.CreateRobot(ctx, &identitypb.CreateRobotRequest{Name: args[1]})
+		if err != nil {
+			return err
+		}
+		fmt.Fprintln(stdout, resp.GetPrincipal().GetName())
+		return nil
+	case "delete":
+		_, err := client.DeleteRobot(ctx, &identitypb.DeleteRobotRequest{Name: args[1]})
+		return err
+	case "certify":
+		flags := flag.NewFlagSet("admin robot certify", flag.ContinueOnError)
+		dir := flags.String("dir", "", "where to write the robot's key and certificate")
+		label := flags.String("label", "", "what the credential is called (default: the robot's name)")
+		if err := flags.Parse(args[2:]); err != nil || *dir == "" {
+			return usageError("ok admin robot certify NAME -dir DIR [-label L]")
+		}
+		if *label == "" {
+			*label = args[1]
+		}
+		key, err := credential.NewKey()
+		if err != nil {
+			return err
+		}
+		spki, err := x509.MarshalPKIXPublicKey(&key.PublicKey)
+		if err != nil {
+			return err
+		}
+		resp, err := client.CertifyRobot(ctx, &identitypb.CertifyRobotRequest{Robot: args[1], PublicKey: spki, Label: *label})
+		if err != nil {
+			return err
+		}
+		if err := auth.Save(*dir, srv, resp.GetCertificate().GetChain()[0], key); err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, "certified %s's key as credential %s in %s; keep key.pem secret\n", args[1], resp.GetCertificate().GetCredential(), *dir)
+		return nil
+	case "bind", "unbind":
+		if len(args) != 4 {
+			return usageError("ok admin robot " + args[0] + " NAME ISSUER SUBJECT")
+		}
+		b := &identitypb.Binding{Issuer: args[2], Subject: args[3]}
+		var err error
+		if args[0] == "bind" {
+			_, err = client.Bind(ctx, &identitypb.BindRequest{Robot: args[1], Binding: b})
+		} else {
+			_, err = client.Unbind(ctx, &identitypb.UnbindRequest{Robot: args[1], Binding: b})
+		}
+		return err
+	}
+	return usageError(adminUsage)
+}
+
+func or(s, def string) string {
+	if s == "" {
+		return def
+	}
+	return s
+}

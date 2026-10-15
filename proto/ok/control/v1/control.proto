@@ -1,0 +1,382 @@
+syntax = "proto3";
+
+// ok control's ChangeLists service (docs/changelists.md, "From the command line"): a CL's
+// whole lifecycle for a person — where it stands, followed as it changes, and every action its
+// page offers — for ok's jj (`jj cl status`, `jj cl review`, `jj cl submit`, …) and, as every
+// service is served as REST too, as JSON over HTTPS at ok's address.
+//
+// ok control decides who may do what, as on the CL's page (docs/changelists.md): any person may
+// call it, and each action is refused, with a reason, to a person it is not theirs to take.
+package ok.control.v1;
+
+option go_package = "github.com/Cidan/ok/proto/ok/control/v1;controlpb";
+
+import "proto/ok/v1/annotations.proto";
+
+service ChangeLists {
+  option (ok.v1.callers) = CALLER_PEOPLE;
+
+  // Status reads where a CL stands now.
+  rpc Status(CLRef) returns (CLStatus);
+  // Watch streams where a CL stands: at once, then each time anything about it changes, until
+  // it is finished (deployed, or abandoned) or an hour has passed. Each message is whole, so a
+  // client that loses the stream just watches again.
+  rpc Watch(CLRef) returns (stream CLStatus);
+
+  // RequestReview sends a draft for review, assigning reviewers and posting an optional
+  // message; ReturnToDraft takes an open CL out of review.
+  rpc RequestReview(ReviewersRequest) returns (CLStatus);
+  rpc ReturnToDraft(CLRef) returns (CLStatus);
+  // AddReviewers assigns reviewers to an active CL, with an optional message; RemoveReviewers
+  // unassigns them.
+  rpc AddReviewers(ReviewersRequest) returns (CLStatus);
+  rpc RemoveReviewers(ReviewersRequest) returns (CLStatus);
+
+  // Reply grants or revokes the person's review labels on the CL, with an optional message.
+  rpc Reply(ReplyRequest) returns (CLStatus);
+  // Comment opens a thread — on the CL, a file, or a line of the current patchset — or replies
+  // to one.
+  rpc Comment(CommentRequest) returns (CLStatus);
+  // Resolve resolves or reopens a thread.
+  rpc Resolve(ResolveRequest) returns (CLStatus);
+
+  // Submit hands an approved CL — with stack, also its unsubmitted ancestors — to the landing
+  // queue, which lands it once post passes.
+  rpc Submit(SubmitRequest) returns (CLStatus);
+  // CancelSubmit stops the CL's submission: nothing of it lands.
+  rpc CancelSubmit(CLRef) returns (CLStatus);
+  // Abandon closes an active CL without landing it; Restore reopens it.
+  rpc Abandon(AbandonRequest) returns (CLStatus);
+  rpc Restore(CLRef) returns (CLStatus);
+  // Rollback opens a new CL undoing a landed one (and those landed above it in its stack).
+  rpc Rollback(RollbackRequest) returns (RollbackResponse);
+
+  // Rerun queues checks of the CL's current patchset again: the runs named, or every one that
+  // failed.
+  rpc Rerun(RunsRequest) returns (CLStatus);
+  // CancelRuns cancels runs of the CL's checks.
+  rpc CancelRuns(RunsRequest) returns (CLStatus);
+  // ReadLog streams a run of the CL's checks' log from an offset: what there is, then — with
+  // follow — what is written, until the run finishes.
+  rpc ReadLog(ReadLogRequest) returns (stream LogChunk);
+
+  // RetryDeployment runs a deployment of the CL's commit that failed, was halted, or was
+  // canceled again; HaltDeployment stops one; AllowHazards lets one apply a migration that
+  // deletes data. Retry and halt are the CL's author's or a repository admin's; allowing hazards
+  // is an admin's.
+  rpc RetryDeployment(DeploymentRequest) returns (CLStatus);
+  rpc HaltDeployment(DeploymentRequest) returns (CLStatus);
+  rpc AllowHazards(DeploymentRequest) returns (CLStatus);
+}
+
+// A CL: its repository, by name, and its number.
+message CLRef {
+  string repository = 1;
+  int64 number = 2;
+}
+
+// Where a CL stands. Everything a person or an agent needs to know what happens next, and why.
+message CLStatus {
+  CL cl = 1;
+  // Where it is in its lifecycle: one value, derived the same way wherever ok shows it.
+  Stage stage = 2;
+  // Who must act for it to move on.
+  WaitingOn waiting_on = 3;
+  // The people it waits for, by handle, when it waits on people.
+  repeated string waiting_for = 4;
+  // Where it stands, in a sentence.
+  string summary = 5;
+  Review review = 6;
+  Checks pre = 7;
+  Post post = 8;                // unset until it is first submitted
+  Deployments deployments = 9;  // unset until it lands
+  // The first thing that failed, with what is needed to see why: set at PRE_FAILED,
+  // POST_FAILED, and DEPLOY_FAILED.
+  Failure failure = 10;
+  // What ok could not read just now (ok automation, the deployer): the rest stands, and the
+  // stage is as much as could be told.
+  repeated string unavailable = 11;
+}
+
+enum Stage {
+  STAGE_UNSPECIFIED = 0;
+  STAGE_DRAFT = 1;        // pre passed (or will); not sent for review
+  STAGE_PRE_RUNNING = 2;  // its current patchset's pre is being planned or run
+  STAGE_PRE_FAILED = 3;
+  STAGE_IN_REVIEW = 4;    // pre passed; review not yet approved
+  STAGE_SUBMITTABLE = 5;  // approved and pre passed: its author may submit it
+  STAGE_SUBMITTED = 6;    // in the landing queue: post being planned or run
+  STAGE_POST_FAILED = 7;  // its submission failed: post failed, or the SCM refused it
+  STAGE_LANDED = 8;       // on main; the deployer has yet to plan its deployments
+  STAGE_DEPLOYING = 9;
+  STAGE_DEPLOYED = 10;       // every deployment of its commit succeeded (or there were none)
+  STAGE_DEPLOY_FAILED = 11;  // a deployment of its commit failed or was halted
+  STAGE_ABANDONED = 12;
+}
+
+enum WaitingOn {
+  WAITING_ON_UNSPECIFIED = 0;
+  WAITING_ON_NOBODY = 1;      // finished
+  WAITING_ON_AUTOMATION = 2;  // ok is working: it moves on by itself
+  WAITING_ON_AUTHOR = 3;      // its author: send for review, fix, submit, or retry
+  WAITING_ON_REVIEWERS = 4;   // an LGTM, an owner's Approval, or a thread's resolution
+  WAITING_ON_ADMINS = 5;      // a repository admin: a deployment's hazards to allow
+}
+
+message CL {
+  string repository = 1;
+  int64 number = 2;
+  string title = 3;
+  string author = 4;  // handle
+  Status status = 5;
+  int32 patchset = 6;        // the current patchset
+  string change_id = 7;      // as jj shows it
+  string commit_id = 8;      // the current patchset's commit, hex
+  string landed_commit = 9;  // hex; once landed
+  string submitted_by = 10;  // handle; once landed
+  int64 parent = 11;         // the CL below it in its stack; 0: on main
+  bool rollback = 12;        // a rollback CL
+  string url = 13;           // its page
+
+  enum Status {
+    STATUS_UNSPECIFIED = 0;
+    STATUS_DRAFT = 1;
+    STATUS_OPEN = 2;
+    STATUS_SUBMITTED = 3;
+    STATUS_ABANDONED = 4;
+  }
+}
+
+// Review, against the current patchset: an LGTM, every owner set's Approval, and no unresolved
+// thread. Only an active CL's is evaluated: a closed CL's says whether it was approved, its
+// reviewers, and its threads, and nothing of its LGTM, owner sets, or //identity.
+message Review {
+  bool approved = 1;
+  bool lgtm = 2;
+  repeated string lgtm_by = 3;  // handles whose LGTM counts
+  bool self_lgtm_allowed = 4;   // every governing OWNERS sets allowself
+  repeated OwnerSet owner_sets = 5;
+  repeated string identity = 6;  // approvals a change to //identity still needs, in words
+  repeated Thread unresolved = 7;
+  repeated string reviewers = 8;  // handles
+  // Why approval cannot be decided (OWNERS or //identity do not resolve): it fails closed.
+  string error = 9;
+  // At SUBMITTABLE, what still keeps it from submitting — a conflict with main, say — or empty.
+  string blocked = 10;
+}
+
+message OwnerSet {
+  string config = 1;  // the governing OWNERS file; empty: none governs these files
+  repeated string rules = 2;
+  repeated string owners = 3;  // as OWNERS writes them: user: alice, acl: admins, *
+  repeated string approved_by = 4;
+  bool satisfied = 5;
+  bool implicit = 6;  // the author is a listed owner
+  int32 files = 7;
+}
+
+message Thread {
+  int64 id = 1;
+  string author = 2;  // handle
+  string file = 3;    // empty: on the CL
+  int32 line = 4;     // 0: on the file, or the CL
+  string body = 5;    // its first comment
+  int32 patchset = 6;
+  int32 replies = 7;
+}
+
+// A patchset's pre.
+message Checks {
+  Verdict verdict = 1;
+  int32 patchset = 2;
+  string commit_id = 3;     // hex
+  repeated Check runs = 4;  // the plan, then the latest run of each job it selected
+  int32 passed = 5;
+  int32 total = 6;
+
+  enum Verdict {
+    VERDICT_UNSPECIFIED = 0;
+    VERDICT_NONE = 1;  // not planned yet
+    VERDICT_PENDING = 2;
+    VERDICT_PASSED = 3;
+    VERDICT_FAILED = 4;
+  }
+}
+
+// One run of a check.
+message Check {
+  int64 run = 1;
+  string name = 2;    // the job: a workflow job's name, or a built-in's
+  string source = 3;  // the workflow file it comes from, or "Built In"
+  string kind = 4;    // plan, build, test, run, lint
+  repeated string targets = 5;
+  Status status = 6;
+  string reason = 7;  // why it failed, was canceled, or errored
+  string url = 8;     // its page
+  // A post run that carries its pre run's pass: it never ran, and its log is that run's.
+  int64 carried_from = 9;
+  string why = 10;  // what selected it
+
+  enum Status {
+    STATUS_UNSPECIFIED = 0;
+    STATUS_QUEUED = 1;
+    STATUS_RUNNING = 2;
+    STATUS_PASSED = 3;
+    STATUS_FAILED = 4;
+    STATUS_CANCELED = 5;
+    STATUS_ERROR = 6;
+  }
+}
+
+// The CL's latest submission to the landing queue, and its post on the attempt that counts.
+message Post {
+  int64 submission = 1;
+  Status status = 2;
+  string submitted_by = 3;  // handle
+  string note = 4;          // what the queue waits for, while it is active
+  string reason = 5;        // why it failed or was canceled
+  string attempt = 6;       // where the attempt that counts stands: planning, waiting, testing, …
+  repeated Check runs = 7;  // its plan, then its jobs, on the CL's candidate
+  int32 passed = 8;
+  int32 total = 9;
+  int32 patchset = 10;  // the CL's patchset it submitted
+
+  enum Status {
+    STATUS_UNSPECIFIED = 0;
+    STATUS_ACTIVE = 1;
+    STATUS_LANDED = 2;
+    STATUS_FAILED = 3;
+    STATUS_CANCELED = 4;
+  }
+}
+
+// The deployments that cover the CL's landed commit.
+message Deployments {
+  // The deployer has planned the commit: these are all its deployments. Before, they are yet to
+  // be made.
+  bool planned = 1;
+  // Each deploy's latest deployment covering the commit — the one that decides it — newest
+  // first. A deployment a newer commit replaced is not among them; its replacement is.
+  repeated Deployment items = 2;
+}
+
+message Deployment {
+  int64 id = 1;
+  string name = 2;
+  string workload = 3;  // namespace/name, or empty for a deploy that only migrates
+  Status status = 4;
+  string stage = 5;  // queued, push, migrate, hazard, roll, done
+  string reason = 6;
+  string url = 7;
+
+  enum Status {
+    STATUS_UNSPECIFIED = 0;
+    STATUS_WAITING = 1;
+    STATUS_RUNNING = 2;
+    STATUS_SUCCEEDED = 3;
+    STATUS_FAILED = 4;
+    STATUS_HALTED = 5;
+    STATUS_CANCELED = 6;
+  }
+}
+
+// What failed, and what is needed to see why.
+message Failure {
+  string what = 1;       // pre, post, submission, deployment
+  string name = 2;       // the check or deployment
+  int64 run = 3;         // the run, for a check
+  int64 deployment = 4;  // the deployment
+  string reason = 5;
+  string log_tail = 6;  // the end of its log: a check's last lines
+  string url = 7;
+}
+
+enum Label {
+  LABEL_UNSPECIFIED = 0;
+  LABEL_LGTM = 1;
+  LABEL_APPROVAL = 2;
+}
+
+message ReviewersRequest {
+  CLRef cl = 1;
+  // People, by handle ("bob"), address ("bob@example.com"), or principal.
+  repeated string reviewers = 2;
+  string message = 3;
+}
+
+message ReplyRequest {
+  CLRef cl = 1;
+  message Grant {
+    Label label = 1;
+    bool granted = 2;  // false revokes it
+  }
+  repeated Grant grants = 2;
+  string message = 3;
+}
+
+message CommentRequest {
+  CLRef cl = 1;
+  string body = 2;
+  int64 reply_to = 3;  // a thread to reply to; its anchor is the reply's
+  string file = 4;     // a new thread's file; empty: on the CL
+  int32 line = 5;      // its line, 1-based; 0: on the file
+  Side side = 6;       // the side of the diff its line is on (default: the patchset's)
+  int32 patchset = 7;  // 0: the current one
+
+  enum Side {
+    SIDE_UNSPECIFIED = 0;
+    SIDE_BASE = 1;
+    SIDE_PATCHSET = 2;
+  }
+}
+
+message ResolveRequest {
+  CLRef cl = 1;
+  int64 thread = 2;
+  bool resolved = 3;  // false reopens it
+}
+
+message SubmitRequest {
+  CLRef cl = 1;
+  bool stack = 2;  // with its unsubmitted ancestors, bottom first
+}
+
+message AbandonRequest {
+  CLRef cl = 1;
+  string reason = 2;
+}
+
+message RollbackRequest {
+  CLRef cl = 1;
+  string reason = 2;
+}
+
+message RollbackResponse {
+  CLStatus rollback = 1;  // the new rollback CL
+}
+
+message RunsRequest {
+  CLRef cl = 1;
+  repeated int64 runs = 2;
+  // Rerun: every check of the current patchset's pre whose latest run failed, canceled, or
+  // errored, beside the runs named.
+  bool failed = 3;
+}
+
+message ReadLogRequest {
+  CLRef cl = 1;
+  int64 run = 2;
+  int64 offset = 3;  // negative: that many bytes from the end
+  bool follow = 4;
+}
+
+message LogChunk {
+  int64 offset = 1;
+  string data = 2;  // the log is text; bytes that are not UTF-8 read as U+FFFD
+  bool end = 3;     // the run finished and every byte has been sent
+}
+
+message DeploymentRequest {
+  CLRef cl = 1;
+  int64 deployment = 2;  // a deployment covering the CL's landed commit
+}

@@ -1,0 +1,18 @@
+[package]
+name = "ok-encoding"
+description = "The SCM's canonical encoding of jj's objects"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+blake3.workspace = true
+jj-lib.workspace = true
+
+[dev-dependencies]
+serde.workspace = true
+serde_json.workspace = true
+

@@ -1,0 +1,100 @@
+# ok's chart. Everything ok reads is one configuration file, ok.yaml, which this chart renders
+# from these values (docs/configuration.md); `config` passes through what is your installation's
+# to choose — sign-in, the system of record, the buckets — as ok.yaml writes it.
+
+image:
+  repository: ghcr.io/cidan/ok
+  tag: ""                       # the chart's appVersion unless set
+  pullPolicy: IfNotPresent
+# The image for workers and the deployer: ok, ok's jj, bazelisk, bubblewrap, and FUSE.
+runnerImage:
+  repository: ghcr.io/cidan/ok-runner
+  tag: ""
+imagePullSecrets: []
+
+domain: example.com             # every name is under it: ada.human.example.com
+installation: ok                # what the pages call it
+publicURL: https://ok.example.com
+
+# The PostgreSQL every role keeps its tables in: a Secret holding its URL, with its password.
+database:
+  urlSecret: {name: ok-database, key: url}
+  maxConnections: 20
+
+identity:
+  # The identity CA (ok identity ca init -dir DIR): a Secret holding tls.crt and tls.key.
+  caSecret: ok-identity-ca
+  bootstrapAdmins: []           # handles who administer until a tree declares admins.acl
+  treeRepository: ""            # the repository whose groups-and-ACLs tree is ok's
+  # The cluster's ServiceAccount token issuer, by which workers and the deployer prove themselves
+  # (kubectl get --raw /.well-known/openid-configuration | jq -r .issuer).
+  kubernetesIssuer: https://kubernetes.default.svc.cluster.local
+  extraFederation: []           # more issuers, as identity.federation writes them (a CI's)
+  extraRobots: []               # more robots, as identity.robots writes them
+
+# Passed through into ok.yaml, merged over what the chart renders: identity's sign_in,
+# system_of_record, session, and trusted_header; scm.objects and its other keys; automation.logs;
+# tls. Secret files they name are mounted with server.extraSecretMounts.
+config: {}
+
+# ok serve: the roles in one Deployment.
+server:
+  roles: [identity, scm, automation, control]
+  replicas: 1
+  resources: {}
+  extraSecretMounts: []         # [{name, secretName, mountPath}]
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+service:
+  type: ClusterIP
+  port: 8472
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}               # gRPC needs HTTP/2 to the backend: your controller's annotation
+  host: ok.example.com
+  tls: []                       # [{secretName, hosts}]
+
+worker:
+  enabled: true
+  replicas: 2
+  slots: 2
+  runMemoryGiB: 4
+  # real writes each commit to disk; virtual presents it through okfs, which needs /dev/fuse
+  # (bound in from the node) and user namespaces.
+  checkout: real
+  bazelFlags: []                # every Bazel command's: --remote_cache=…, --disk_cache=…
+  # A Secret holding config.json with the registry credentials pushes use (DOCKER_CONFIG).
+  dockerConfigSecret: ""
+  state: {sizeLimit: 100Gi}     # an emptyDir: its checkouts, Bazel's output bases, kept graphs
+  resources: {}
+  # Workers make user namespaces (bubblewrap, and a virtual checkout's mount): a seccomp profile
+  # that allows it.
+  securityContext:
+    seccompProfile: {type: Unconfined}
+    allowPrivilegeEscalation: false
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+deploy:
+  enabled: false
+  checkout: real
+  bazelFlags: []
+  # What the migrations it runs get: {NAME: {secretName, key}}, mounted and read as files.
+  migrationEnv: {}
+  state: {sizeLimit: 50Gi}
+  resources: {}
+  securityContext:
+    seccompProfile: {type: Unconfined}
+    allowPrivilegeEscalation: false
+  # The workloads it rolls, each granted it in its namespace (docs/deploy.md, "Grants"):
+  # [{namespace, deployment | statefulset, accounts: [the ServiceAccounts its pods run as]}].
+  grants: []
+  # Holds the deployer to its grants: it creates only -green copies, runs pods only as accounts a
+  # grant names, never changes an account, and adds no host access.
+  admissionPolicy:
+    enabled: false

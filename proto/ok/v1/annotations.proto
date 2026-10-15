@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+package ok.v1;
+
+import "google/protobuf/descriptor.proto";
+
+option go_package = "github.com/Cidan/ok/proto/ok/v1;okpb";
+
+// Caller is who may call a service: a kind of principal, or one of ok's roles, never a name — the
+// robot each role is comes from the installation's configuration.
+enum Caller {
+  CALLER_UNSPECIFIED = 0;
+  // Anyone, with no credential: the CA's certificates, a device login's start.
+  CALLER_ANYONE = 1;
+  // Any active person.
+  CALLER_PEOPLE = 2;
+  // Any active robot.
+  CALLER_ROBOTS = 3;
+  // ok's roles, each as its robot.
+  CALLER_IDENTITY = 10;
+  CALLER_SCM = 11;
+  CALLER_CONTROL = 12;
+  CALLER_AUTOMATION = 13;
+  CALLER_WORKER = 14;
+  CALLER_DEPLOY = 15;
+}
+
+extend google.protobuf.ServiceOptions {
+  // callers are who may call the service; a service names at least one, and ok's server refuses
+  // every other caller before the service sees the request.
+  repeated Caller callers = 51000;
+}

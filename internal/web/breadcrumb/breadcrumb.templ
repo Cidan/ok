@@ -1,0 +1,25 @@
+package breadcrumb
+
+// Trail renders the crumbs as a horizontal path: a "/" divider is inserted between segments,
+// each Crumb with an Href becomes a link, and a Crumb with an empty Href renders as the plain
+// (current-location) segment. class is merged onto the container so the consumer controls
+// placement/spacing; the segment/link/divider styling follows the estate's zinc design system
+// (as nav/layout do), keeping every trail visually consistent across apps.
+templ Trail(crumbs []Crumb, class string) {
+	<nav class={ "flex min-w-0 flex-wrap items-center gap-1.5 text-sm", class } aria-label="Breadcrumb">
+		for i, c := range crumbs {
+			if i > 0 {
+				<span class="select-none text-zinc-600">/</span>
+			}
+			if c.Href != "" {
+				if c.Target != "" {
+					<a href={ templ.SafeURL(c.Href) } hx-get={ c.Href } hx-target={ c.Target } hx-swap={ c.swap() } hx-push-url="true" class="truncate text-zinc-400 transition-colors hover:text-zinc-200">{ c.Label }</a>
+				} else {
+					<a href={ templ.SafeURL(c.Href) } class="truncate text-zinc-400 transition-colors hover:text-zinc-200">{ c.Label }</a>
+				}
+			} else {
+				<span class="truncate font-medium text-zinc-100">{ c.Label }</span>
+			}
+		}
+	</nav>
+}

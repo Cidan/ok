@@ -1,0 +1,26 @@
+[package]
+name = "ok-proto"
+description = "ok's protocols, as prost messages and tonic clients"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+prost.workspace = true
+prost-types.workspace = true
+tonic.workspace = true
+tonic-prost.workspace = true
+
+[dev-dependencies]
+ok-encoding.workspace = true
+
+[build-dependencies]
+protox.workspace = true
+tonic-prost-build.workspace = true
+
+[[test]]
+name = "scm"
+path = "scm_tests.rs"

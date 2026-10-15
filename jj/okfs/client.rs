@@ -1,0 +1,229 @@
+//! jj's side of the daemon: finding it, starting it, and replacing one of another build
+//! (docs/okfs.md, "The daemon"). Where the user has a systemd user manager it runs as the
+//! `okfs.service` unit, which keeps its mounts' connections across restarts; elsewhere it is a
+//! detached process of its own. `OKFS_DAEMON=spawn` forces the latter, and `OKFS_DAEMON=external`
+//! (tests) only connects to a daemon something else started.
+
+use std::io;
+use std::os::unix::process::CommandExt as _;
+use std::path::Path;
+use std::path::PathBuf;
+use std::process::Command;
+use std::process::Stdio;
+use std::time::Duration;
+use std::time::Instant;
+
+use ok_proto::ok::okfs::v1 as pb;
+
+use crate::control::Client;
+use crate::control::Paths;
+use crate::control::private_dir;
+use crate::daemon::build_id;
+
+/// The systemd user unit's name.
+pub const UNIT: &str = "okfs.service";
+
+fn mode() -> String {
+    std::env::var("OKFS_DAEMON").unwrap_or_default()
+}
+
+/// Whether the user has a systemd user manager to run the daemon under.
+fn systemd_user() -> bool {
+    if mode() == "spawn" {
+        return false;
+    }
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .is_some_and(|d| Path::new(&d).join("systemd/private").exists())
+}
+
+/// A connection to the daemon, starting it (or replacing one of another build) when needed.
+pub fn connect(paths: &Paths) -> io::Result<Client> {
+    if let Ok(mut c) = Client::connect(paths) {
+        match c.call(pb::request::Request::Hello(pb::Hello {}))? {
+            pb::response::Response::Hello(h) if h.version == build_id() || mode() == "external" => {
+                return Ok(c);
+            }
+            pb::response::Response::Hello(h) => {
+                drop(c);
+                restart(paths, h.pid)?;
+            }
+            _ => {
+                return Err(io::Error::other(
+                    "the okfs daemon answered Hello with something else",
+                ));
+            }
+        }
+    } else {
+        if mode() == "external" {
+            return Err(io::Error::other(format!(
+                "no okfs daemon at {} (OKFS_DAEMON=external)",
+                paths.socket().display()
+            )));
+        }
+        start(paths)?;
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Ok(mut c) = Client::connect(paths)
+            && c.call(pb::request::Request::Hello(pb::Hello {})).is_ok()
+        {
+            return Ok(c);
+        }
+        if Instant::now() > deadline {
+            return Err(io::Error::other(format!(
+                "the okfs daemon did not start (see {})",
+                if systemd_user() {
+                    "journalctl --user -u okfs".to_owned()
+                } else {
+                    paths.state.join("daemon.log").display().to_string()
+                }
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn run(cmd: &mut Command) -> io::Result<()> {
+    let out = cmd.stdin(Stdio::null()).output()?;
+    if !out.status.success() {
+        return Err(io::Error::other(format!(
+            "{:?}: {}",
+            cmd,
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
+/// A value for a unit's `Environment=`, quoted as systemd reads it.
+fn unit_env(name: &str, value: &std::ffi::OsStr) -> String {
+    let v = value
+        .to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    format!("Environment=\"{name}={v}\"\n")
+}
+
+/// The unit file, running this binary with the installing jj's `PATH` (and `OK_CONFIG_DIR`), so the
+/// daemon reads, and renews, the credential the CLI does.
+fn unit_text(exe: &Path) -> String {
+    let mut env = String::new();
+    for name in ["PATH", "OK_CONFIG_DIR"] {
+        if let Some(v) = std::env::var_os(name).filter(|v| !v.is_empty()) {
+            env.push_str(&unit_env(name, &v));
+        }
+    }
+    format!(
+        "# Written by ok's jj (docs/okfs.md): virtual workspaces' daemon.\n\
+         [Unit]\n\
+         Description=okfs: virtual workspaces for ok's jj\n\
+         \n\
+         [Service]\n\
+         Type=notify\n\
+         NotifyAccess=main\n\
+         {}\
+         ExecStart={} fs daemon\n\
+         Restart=always\n\
+         RestartSec=1\n\
+         FileDescriptorStoreMax=4096\n\
+         FileDescriptorStorePreserve=on-success\n\
+         \n\
+         [Install]\n\
+         WantedBy=default.target\n",
+        env,
+        exe.display()
+    )
+}
+
+fn unit_path() -> io::Result<PathBuf> {
+    let config = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+        .ok_or_else(|| io::Error::other("no HOME"))?;
+    Ok(config.join("systemd/user").join(UNIT))
+}
+
+/// Installs (or updates) the unit for this binary; true when it changed.
+fn install_unit() -> io::Result<bool> {
+    let exe = std::env::current_exe()?;
+    let path = unit_path()?;
+    let text = unit_text(&exe);
+    if std::fs::read_to_string(&path).is_ok_and(|t| t == text) {
+        return Ok(false);
+    }
+    std::fs::create_dir_all(path.parent().unwrap())?;
+    std::fs::write(&path, text)?;
+    Ok(true)
+}
+
+fn start(paths: &Paths) -> io::Result<()> {
+    if systemd_user() {
+        if install_unit()? {
+            run(Command::new("systemctl").args(["--user", "daemon-reload"]))?;
+        }
+        return run(Command::new("systemctl").args(["--user", "enable", "--now", UNIT]));
+    }
+    spawn(paths)
+}
+
+/// Starts the daemon as a detached process of its own, logging to the state directory.
+fn spawn(paths: &Paths) -> io::Result<()> {
+    private_dir(&paths.state)?;
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(paths.state.join("daemon.log"))?;
+    let mut cmd = Command::new(std::env::current_exe()?);
+    cmd.args(["fs", "daemon"])
+        .stdin(Stdio::null())
+        .stdout(log.try_clone()?)
+        .stderr(log)
+        .env_remove("NOTIFY_SOCKET");
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    cmd.spawn()?;
+    Ok(())
+}
+
+/// Replaces a daemon of another build with this one.
+fn restart(paths: &Paths, pid: u32) -> io::Result<()> {
+    if mode() == "external" {
+        return Ok(());
+    }
+    if systemd_user() {
+        if install_unit()? {
+            run(Command::new("systemctl").args(["--user", "daemon-reload"]))?;
+        }
+        return run(Command::new("systemctl").args(["--user", "restart", UNIT]));
+    }
+    unsafe {
+        libc::kill(pid as i32, libc::SIGTERM);
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Path::new(&format!("/proc/{pid}")).exists() {
+        if Instant::now() > deadline {
+            return Err(io::Error::other(format!(
+                "the old okfs daemon (pid {pid}) did not exit"
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    spawn(paths)
+}
+
+/// Whether lingering is on for this user (mounts outlive the login session).
+pub fn lingering() -> bool {
+    let user = std::env::var("USER").unwrap_or_default();
+    Path::new("/var/lib/systemd/linger").join(user).exists()
+}
+
+/// Whether the daemon runs under systemd here.
+pub fn under_systemd() -> bool {
+    systemd_user()
+}

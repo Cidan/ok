@@ -1,0 +1,2123 @@
+{
+  "comment": [
+    "Golden vectors for the SCM's canonical encoding (docs/scm.md, \"Objects and identity\").",
+    "Both internal/scm/encoding (Go) and jj's encoding (Rust) must encode every valid object to",
+    "exactly its bytes and ID, decode those bytes back to the same bytes, and reject every invalid input",
+    "with its error code. A byte string is the concatenation of its lines; each line is hex, and anything",
+    "after '#' is a comment. A file or chunk given by contents_repeat is its kind byte followed by the",
+    "pattern repeated count times. A commit with a secure_sig also lists its signed_data."
+  ],
+  "valid": [
+    {
+      "name": "file/empty",
+      "object": {
+        "kind": "file",
+        "contents": ""
+      },
+      "bytes": [
+        "01  # kind: file"
+      ],
+      "id": "48fc721fbbc172e0925fa27af1671de225ba927134802998b10a1568a188652b"
+    },
+    {
+      "name": "file/text",
+      "object": {
+        "kind": "file",
+        "contents": "68656c6c6f2c20717561790a"
+      },
+      "bytes": [
+        "01  # kind: file",
+        "68656c6c6f2c20717561790a  # contents"
+      ],
+      "id": "4770c0ae9fb948764172a1554f73a803951ad0591a08c41eaeb9bd1f597450b1"
+    },
+    {
+      "name": "file/binary",
+      "object": {
+        "kind": "file",
+        "contents": "00ff800a"
+      },
+      "bytes": [
+        "01  # kind: file",
+        "00ff800a  # contents"
+      ],
+      "id": "41cfa642dd5bf28121524b3409964c2831b0e57ddb97b4256f38e9edc48b3aaf"
+    },
+    {
+      "name": "file/multi-block",
+      "object": {
+        "kind": "file",
+        "contents_repeat": {
+          "hex": "00010203040506070809",
+          "count": 410
+        }
+      },
+      "id": "9d7efe650ccacb3196badcf648a8c9081679dec048726552c6b295a99ba51a5c"
+    },
+    {
+      "name": "file/large",
+      "object": {
+        "kind": "file",
+        "contents_repeat": {
+          "hex": "6a6a2d717561790a",
+          "count": 32768
+        }
+      },
+      "id": "c8bd8758f0d76aceddcf10ae0373165ad00bca272030e76fc67f89f96ae93483"
+    },
+    {
+      "name": "chunk/text",
+      "object": {
+        "kind": "chunk",
+        "contents": "68656c6c6f2c20717561790a"
+      },
+      "bytes": [
+        "10  # kind: chunk",
+        "68656c6c6f2c20717561790a  # contents"
+      ],
+      "id": "72fe5aa00589a1935c312330e7572724a8acce29a9926f0da2edb5b0728892bc"
+    },
+    {
+      "name": "chunk/empty",
+      "object": {
+        "kind": "chunk",
+        "contents": ""
+      },
+      "bytes": [
+        "10  # kind: chunk"
+      ],
+      "id": "b35d4ab392fb952c8d7625efbfaff8af2c8cebf20d1ff9784a8ffe08dc667e12"
+    },
+    {
+      "name": "symlink/relative",
+      "object": {
+        "kind": "symlink",
+        "target": "../lib/libfoo.so"
+      },
+      "bytes": [
+        "02  # kind: symlink",
+        "2e2e2f6c69622f6c6962666f6f2e736f  # target \"../lib/libfoo.so\""
+      ],
+      "id": "23632d00f8fcb68e8d4ac4f45f05664f588b72037a505e32da3b3f7ebc84635f"
+    },
+    {
+      "name": "symlink/unicode",
+      "object": {
+        "kind": "symlink",
+        "target": "données/ファイル"
+      },
+      "bytes": [
+        "02  # kind: symlink",
+        "646f6e6ec3a965732fe38395e382a1e382a4e383ab  # target \"données/ファイル\""
+      ],
+      "id": "169a35fecdf283535f06a9530c1eb30c168cd9cbcbb98f03024035dfae0979b4"
+    },
+    {
+      "name": "symlink/empty",
+      "object": {
+        "kind": "symlink",
+        "target": ""
+      },
+      "bytes": [
+        "02  # kind: symlink"
+      ],
+      "id": "ab13bedf42e84bae0f7c62c7dd6a8ada571e8829bed6ea558217f0361b5e25d0"
+    },
+    {
+      "name": "tree/empty",
+      "object": {
+        "kind": "tree",
+        "entries": []
+      },
+      "bytes": [
+        "03  # kind: tree",
+        "0000000000000000  # entries count"
+      ],
+      "id": "50e0128f7b0e5cb3b43642a0da19e9735ff5491876aa04c0aa33f1b8cb080014"
+    },
+    {
+      "name": "tree/every-value",
+      "object": {
+        "kind": "tree",
+        "entries": [
+          {
+            "name": "README.md",
+            "value": {
+              "file": {
+                "id": "f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1",
+                "executable": false,
+                "copy_id": ""
+              }
+            }
+          },
+          {
+            "name": "bin",
+            "value": {
+              "tree": "7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b"
+            }
+          },
+          {
+            "name": "link",
+            "value": {
+              "symlink": "5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c"
+            }
+          },
+          {
+            "name": "run.sh",
+            "value": {
+              "file": {
+                "id": "f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2",
+                "executable": true,
+                "copy_id": "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1"
+              }
+            }
+          }
+        ]
+      },
+      "bytes": [
+        "03  # kind: tree",
+        "0400000000000000  # entries count",
+        "0900000000000000  # name length",
+        "524541444d452e6d64  # name \"README.md\"",
+        "00  # README.md: tag file",
+        "f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1  # README.md: file id",
+        "00  # README.md: executable",
+        "0000000000000000  # README.md: copy_id length",
+        "0300000000000000  # name length",
+        "62696e  # name \"bin\"",
+        "02  # bin: tag tree",
+        "7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b  # bin: tree id",
+        "0400000000000000  # name length",
+        "6c696e6b  # name \"link\"",
+        "01  # link: tag symlink",
+        "5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c  # link: symlink id",
+        "0600000000000000  # name length",
+        "72756e2e7368  # name \"run.sh\"",
+        "00  # run.sh: tag file",
+        "f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2  # run.sh: file id",
+        "01  # run.sh: executable",
+        "2000000000000000  # run.sh: copy_id length",
+        "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1  # run.sh: copy_id"
+      ],
+      "id": "2c2c1b74bddfc6738e064c7e0bc707c4951de9f223b29c91e5373f84685a2508"
+    },
+    {
+      "name": "tree/byte-order",
+      "object": {
+        "kind": "tree",
+        "entries": [
+          {
+            "name": "Z",
+            "value": {
+              "tree": "7070707070707070707070707070707070707070707070707070707070707070"
+            }
+          },
+          {
+            "name": "a",
+            "value": {
+              "tree": "7171717171717171717171717171717171717171717171717171717171717171"
+            }
+          },
+          {
+            "name": "a-b",
+            "value": {
+              "tree": "7272727272727272727272727272727272727272727272727272727272727272"
+            }
+          },
+          {
+            "name": "a.b",
+            "value": {
+              "tree": "7373737373737373737373737373737373737373737373737373737373737373"
+            }
+          },
+          {
+            "name": "aa",
+            "value": {
+              "tree": "7474747474747474747474747474747474747474747474747474747474747474"
+            }
+          },
+          {
+            "name": "~",
+            "value": {
+              "tree": "7575757575757575757575757575757575757575757575757575757575757575"
+            }
+          },
+          {
+            "name": "é",
+            "value": {
+              "tree": "7676767676767676767676767676767676767676767676767676767676767676"
+            }
+          }
+        ]
+      },
+      "bytes": [
+        "03  # kind: tree",
+        "0700000000000000  # entries count",
+        "0100000000000000  # name length",
+        "5a  # name \"Z\"",
+        "02  # Z: tag tree",
+        "7070707070707070707070707070707070707070707070707070707070707070  # Z: tree id",
+        "0100000000000000  # name length",
+        "61  # name \"a\"",
+        "02  # a: tag tree",
+        "7171717171717171717171717171717171717171717171717171717171717171  # a: tree id",
+        "0300000000000000  # name length",
+        "612d62  # name \"a-b\"",
+        "02  # a-b: tag tree",
+        "7272727272727272727272727272727272727272727272727272727272727272  # a-b: tree id",
+        "0300000000000000  # name length",
+        "612e62  # name \"a.b\"",
+        "02  # a.b: tag tree",
+        "7373737373737373737373737373737373737373737373737373737373737373  # a.b: tree id",
+        "0200000000000000  # name length",
+        "6161  # name \"aa\"",
+        "02  # aa: tag tree",
+        "7474747474747474747474747474747474747474747474747474747474747474  # aa: tree id",
+        "0100000000000000  # name length",
+        "7e  # name \"~\"",
+        "02  # ~: tag tree",
+        "7575757575757575757575757575757575757575757575757575757575757575  # ~: tree id",
+        "0200000000000000  # name length",
+        "c3a9  # name \"é\"",
+        "02  # é: tag tree",
+        "7676767676767676767676767676767676767676767676767676767676767676  # é: tree id"
+      ],
+      "id": "928a0d81f7b73ddb8d370bc4abfd1ef3120fd0d1d7349c497d43274ffcfaeb4d"
+    },
+    {
+      "name": "copy_history/new",
+      "object": {
+        "kind": "copy_history",
+        "current_path": "src/main.rs",
+        "parents": [],
+        "salt": ""
+      },
+      "bytes": [
+        "04  # kind: copy_history",
+        "0b00000000000000  # current_path length",
+        "7372632f6d61696e2e7273  # current_path \"src/main.rs\"",
+        "0000000000000000  # parents count",
+        "0000000000000000  # salt length"
+      ],
+      "id": "f9883abfdc0891b5ba962827f2c4668df422c17392a9e92af4d512461411c7c5"
+    },
+    {
+      "name": "copy_history/rename",
+      "object": {
+        "kind": "copy_history",
+        "current_path": "src/lib.rs",
+        "parents": [
+          "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1"
+        ],
+        "salt": "5a17"
+      },
+      "bytes": [
+        "04  # kind: copy_history",
+        "0a00000000000000  # current_path length",
+        "7372632f6c69622e7273  # current_path \"src/lib.rs\"",
+        "0100000000000000  # parents count",
+        "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1  # parents[0]",
+        "0200000000000000  # salt length",
+        "5a17  # salt"
+      ],
+      "id": "797abbb13f89abe0bb72b080a8da35bcb3ffc05f4b219c2f0cadf43f6f097acb"
+    },
+    {
+      "name": "copy_history/merge",
+      "object": {
+        "kind": "copy_history",
+        "current_path": "docs/merged.md",
+        "parents": [
+          "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3",
+          "c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2"
+        ],
+        "salt": ""
+      },
+      "bytes": [
+        "04  # kind: copy_history",
+        "0e00000000000000  # current_path length",
+        "646f63732f6d65726765642e6d64  # current_path \"docs/merged.md\"",
+        "0200000000000000  # parents count",
+        "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3  # parents[0]",
+        "c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2  # parents[1]",
+        "0000000000000000  # salt length"
+      ],
+      "id": "716537279844f3bbc866439a541178da109e6e7ad70d8f9fbc89a2a051ec8511"
+    },
+    {
+      "name": "commit/minimal",
+      "object": {
+        "kind": "commit",
+        "parents": [
+          "0000000000000000000000000000000000000000000000000000000000000000"
+        ],
+        "predecessors": [],
+        "root_tree": [
+          "50e0128f7b0e5cb3b43642a0da19e9735ff5491876aa04c0aa33f1b8cb080014"
+        ],
+        "conflict_labels": [
+          ""
+        ],
+        "change_id": "c0ffee00c0ffee00c0ffee00c0ffee00",
+        "description": "",
+        "author": {
+          "name": "Alice Example",
+          "email": "alice@acme.org",
+          "time": {
+            "millis": 1790000000123,
+            "tz_offset": -420
+          }
+        },
+        "committer": {
+          "name": "Alice Example",
+          "email": "alice@acme.org",
+          "time": {
+            "millis": 1790000000123,
+            "tz_offset": -420
+          }
+        },
+        "secure_sig": null
+      },
+      "bytes": [
+        "05  # kind: commit",
+        "0100000000000000  # parents count",
+        "0000000000000000000000000000000000000000000000000000000000000000  # parents[0]",
+        "0000000000000000  # predecessors count",
+        "0100000000000000  # root_tree terms",
+        "50e0128f7b0e5cb3b43642a0da19e9735ff5491876aa04c0aa33f1b8cb080014  # root_tree[0]",
+        "0100000000000000  # conflict_labels terms",
+        "0000000000000000  # conflict_labels[0] length",
+        "c0ffee00c0ffee00c0ffee00c0ffee00  # change_id",
+        "0000000000000000  # description length",
+        "0d00000000000000  # author.name length",
+        "416c696365204578616d706c65  # author.name \"Alice Example\"",
+        "0e00000000000000  # author.email length",
+        "616c6963654061636d652e6f7267  # author.email \"alice@acme.org\"",
+        "7b6c50c4a0010000  # author.time.millis",
+        "5cfeffff  # author.time.tz_offset",
+        "0d00000000000000  # committer.name length",
+        "416c696365204578616d706c65  # committer.name \"Alice Example\"",
+        "0e00000000000000  # committer.email length",
+        "616c6963654061636d652e6f7267  # committer.email \"alice@acme.org\"",
+        "7b6c50c4a0010000  # committer.time.millis",
+        "5cfeffff  # committer.time.tz_offset",
+        "00  # secure_sig absent"
+      ],
+      "id": "b3c9baecb01be6cf91f551756b4b9050bac49fd3d4ce374a9724d6030f075439"
+    },
+    {
+      "name": "commit/typical",
+      "object": {
+        "kind": "commit",
+        "parents": [
+          "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
+        ],
+        "predecessors": [
+          "b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1"
+        ],
+        "root_tree": [
+          "7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e"
+        ],
+        "conflict_labels": [
+          ""
+        ],
+        "change_id": "c0ffee00c0ffee00c0ffee00c0ffee00",
+        "description": "Add the rate limiter\n\nBurst of 10, refill 1/s. ✅\n",
+        "author": {
+          "name": "Alice Example",
+          "email": "alice@acme.org",
+          "time": {
+            "millis": 1790000000123,
+            "tz_offset": -420
+          }
+        },
+        "committer": {
+          "name": "Bob",
+          "email": "bob@acme.org",
+          "time": {
+            "millis": 1790000456789,
+            "tz_offset": 60
+          }
+        },
+        "secure_sig": null
+      },
+      "bytes": [
+        "05  # kind: commit",
+        "0100000000000000  # parents count",
+        "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1  # parents[0]",
+        "0100000000000000  # predecessors count",
+        "b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1  # predecessors[0]",
+        "0100000000000000  # root_tree terms",
+        "7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e  # root_tree[0]",
+        "0100000000000000  # conflict_labels terms",
+        "0000000000000000  # conflict_labels[0] length",
+        "c0ffee00c0ffee00c0ffee00c0ffee00  # change_id",
+        "3300000000000000  # description length",
+        "416464207468652072617465206c696d697465720a0a4275727374206f662031  # description \"Add the rate limiter\\n\\nBurst of 10, refill 1/s. ✅\\n\"",
+        "302c20726566696c6c20312f732e20e29c850a",
+        "0d00000000000000  # author.name length",
+        "416c696365204578616d706c65  # author.name \"Alice Example\"",
+        "0e00000000000000  # author.email length",
+        "616c6963654061636d652e6f7267  # author.email \"alice@acme.org\"",
+        "7b6c50c4a0010000  # author.time.millis",
+        "5cfeffff  # author.time.tz_offset",
+        "0300000000000000  # committer.name length",
+        "426f62  # committer.name \"Bob\"",
+        "0c00000000000000  # committer.email length",
+        "626f624061636d652e6f7267  # committer.email \"bob@acme.org\"",
+        "556457c4a0010000  # committer.time.millis",
+        "3c000000  # committer.time.tz_offset",
+        "00  # secure_sig absent"
+      ],
+      "id": "643a8c34e97069df634e897131b8511c08bcce97976973ffeb625750cb6d318f"
+    },
+    {
+      "name": "commit/merge",
+      "object": {
+        "kind": "commit",
+        "parents": [
+          "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+          "a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2"
+        ],
+        "predecessors": [],
+        "root_tree": [
+          "7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e"
+        ],
+        "conflict_labels": [
+          ""
+        ],
+        "change_id": "c0ffee00c0ffee00c0ffee00c0ffee00",
+        "description": "merge\n",
+        "author": {
+          "name": "Alice Example",
+          "email": "alice@acme.org",
+          "time": {
+            "millis": 1790000000123,
+            "tz_offset": -420
+          }
+        },
+        "committer": {
+          "name": "Alice Example",
+          "email": "alice@acme.org",
+          "time": {
+            "millis": 1790000000123,
+            "tz_offset": -420
+          }
+        },
+        "secure_sig": null
+      },
+      "bytes": [
+        "05  # kind: commit",
+        "0200000000000000  # parents count",
+        "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1  # parents[0]",
+        "a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2  # parents[1]",
+        "0000000000000000  # predecessors count",
+        "0100000000000000  # root_tree terms",
+        "7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e  # root_tree[0]",
+        "0100000000000000  # conflict_labels terms",
+        "0000000000000000  # conflict_labels[0] length",
+        "c0ffee00c0ffee00c0ffee00c0ffee00  # change_id",
+        "0600000000000000  # description length",
+        "6d657267650a  # description \"merge\\n\"",
+        "0d00000000000000  # author.name length",
+        "416c696365204578616d706c65  # author.name \"Alice Example\"",
+        "0e00000000000000  # author.email length",
+        "616c6963654061636d652e6f7267  # author.email \"alice@acme.org\"",
+        "7b6c50c4a0010000  # author.time.millis",
+        "5cfeffff  # author.time.tz_offset",
+        "0d00000000000000  # committer.name length",
+        "416c696365204578616d706c65  # committer.name \"Alice Example\"",
+        "0e00000000000000  # committer.email length",
+        "616c6963654061636d652e6f7267  # committer.email \"alice@acme.org\"",
+        "7b6c50c4a0010000  # committer.time.millis",
+        "5cfeffff  # committer.time.tz_offset",
+        "00  # secure_sig absent"
+      ],
+      "id": "c7dcec9537915e2ba3190f2c2e5392a3692bcb888f10b6fb65ed8c43ba022393"
+    },
+    {
+      "name": "commit/conflict-3",
+      "object": {
+        "kind": "commit",
+        "parents": [
+          "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
+        ],
+        "predecessors": [],
+        "root_tree": [
+          "7171717171717171717171717171717171717171717171717171717171717171",
+          "7272727272727272727272727272727272727272727272727272727272727272",
+          "7373737373737373737373737373737373737373737373737373737373737373"
+        ],
+        "conflict_labels": [
+          "rebase destination",
+          "parent of rebased revision",
+          "rebased revision"
+        ],
+        "change_id": "c0ffee00c0ffee00c0ffee00c0ffee00",
+        "description": "",
+        "author": {
+          "name": "Alice Example",
+          "email": "alice@acme.org",
+          "time": {
+            "millis": 1790000000123,
+            "tz_offset": -420
+          }
+        },
+        "committer": {
+          "name": "Alice Example",
+          "email": "alice@acme.org",
+          "time": {
+            "millis": 1790000000123,
+            "tz_offset": -420
+          }
+        },
+        "secure_sig": null
+      },
+      "bytes": [
+        "05  # kind: commit",
+        "0100000000000000  # parents count",
+        "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1  # parents[0]",
+        "0000000000000000  # predecessors count",
+        "0300000000000000  # root_tree terms",
+        "7171717171717171717171717171717171717171717171717171717171717171  # root_tree[0]",
+        "7272727272727272727272727272727272727272727272727272727272727272  # root_tree[1]",
+        "7373737373737373737373737373737373737373737373737373737373737373  # root_tree[2]",
+        "0300000000000000  # conflict_labels terms",
+        "1200000000000000  # conflict_labels[0] length",
+        "7265626173652064657374696e6174696f6e  # conflict_labels[0] \"rebase destination\"",
+        "1a00000000000000  # conflict_labels[1] length",
+        "706172656e74206f662072656261736564207265766973696f6e  # conflict_labels[1] \"parent of rebased revision\"",
+        "1000000000000000  # conflict_labels[2] length",
+        "72656261736564207265766973696f6e  # conflict_labels[2] \"rebased revision\"",
+        "c0ffee00c0ffee00c0ffee00c0ffee00  # change_id",
+        "0000000000000000  # description length",
+        "0d00000000000000  # author.name length",
+        "416c696365204578616d706c65  # author.name \"Alice Example\"",
+        "0e00000000000000  # author.email length",
+        "616c6963654061636d652e6f7267  # author.email \"alice@acme.org\"",
+        "7b6c50c4a0010000  # author.time.millis",
+        "5cfeffff  # author.time.tz_offset",
+        "0d00000000000000  # committer.name length",
+        "416c696365204578616d706c65  # committer.name \"Alice Example\"",
+        "0e00000000000000  # committer.email length",
+        "616c6963654061636d652e6f7267  # committer.email \"alice@acme.org\"",
+        "7b6c50c4a0010000  # committer.time.millis",
+        "5cfeffff  # committer.time.tz_offset",
+        "00  # secure_sig absent"
+      ],
+      "id": "61b9c234d11b8184d683f65c08c5805ef257d0b665df4fff743aa162beb8c017"
+    },
+    {
+      "name": "commit/conflict-5",
+      "object": {
+        "kind": "commit",
+        "parents": [
+          "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
+        ],
+        "predecessors": [],
+        "root_tree": [
+          "7171717171717171717171717171717171717171717171717171717171717171",
+          "7272727272727272727272727272727272727272727272727272727272727272",
+          "7373737373737373737373737373737373737373737373737373737373737373",
+          "7474747474747474747474747474747474747474747474747474747474747474",
+          "7575757575757575757575757575757575757575757575757575757575757575"
+        ],
+        "conflict_labels": [
+          "a",
+          "b",
+          "c",
+          "d",
+          "e"
+        ],
+        "change_id": "c0ffee00c0ffee00c0ffee00c0ffee00",
+        "description": "",
+        "author": {
+          "name": "Alice Example",
+          "email": "alice@acme.org",
+          "time": {
+            "millis": 1790000000123,
+            "tz_offset": -420
+          }
+        },
+        "committer": {
+          "name": "Alice Example",
+          "email": "alice@acme.org",
+          "time": {
+            "millis": 1790000000123,
+            "tz_offset": -420
+          }
+        },
+        "secure_sig": null
+      },
+      "bytes": [
+        "05  # kind: commit",
+        "0100000000000000  # parents count",
+        "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1  # parents[0]",
+        "0000000000000000  # predecessors count",
+        "0500000000000000  # root_tree terms",
+        "7171717171717171717171717171717171717171717171717171717171717171  # root_tree[0]",
+        "7272727272727272727272727272727272727272727272727272727272727272  # root_tree[1]",
+        "7373737373737373737373737373737373737373737373737373737373737373  # root_tree[2]",
+        "7474747474747474747474747474747474747474747474747474747474747474  # root_tree[3]",
+        "7575757575757575757575757575757575757575757575757575757575757575  # root_tree[4]",
+        "0500000000000000  # conflict_labels terms",
+        "0100000000000000  # conflict_labels[0] length",
+        "61  # conflict_labels[0] \"a\"",
+        "0100000000000000  # conflict_labels[1] length",
+        "62  # conflict_labels[1] \"b\"",
+        "0100000000000000  # conflict_labels[2] length",
+        "63  # conflict_labels[2] \"c\"",
+        "0100000000000000  # conflict_labels[3] length",
+        "64  # conflict_labels[3] \"d\"",
+        "0100000000000000  # conflict_labels[4] length",
+        "65  # conflict_labels[4] \"e\"",
+        "c0ffee00c0ffee00c0ffee00c0ffee00  # change_id",
+        "0000000000000000  # description length",
+        "0d00000000000000  # author.name length",
+        "416c696365204578616d706c65  # author.name \"Alice Example\"",
+        "0e00000000000000  # author.email length",
+        "616c6963654061636d652e6f7267  # author.email \"alice@acme.org\"",
+        "7b6c50c4a0010000  # author.time.millis",
+        "5cfeffff  # author.time.tz_offset",
+        "0d00000000000000  # committer.name length",
+        "416c696365204578616d706c65  # committer.name \"Alice Example\"",
+        "0e00000000000000  # committer.email length",
+        "616c6963654061636d652e6f7267  # committer.email \"alice@acme.org\"",
+        "7b6c50c4a0010000  # committer.time.millis",
+        "5cfeffff  # committer.time.tz_offset",
+        "00  # secure_sig absent"
+      ],
+      "id": "6badd5b0e133d95c3b6989cd50c3c6d2ee2f9534818ce277094fe97929dc6b73"
+    },
+    {
+      "name": "commit/signed",
+      "object": {
+        "kind": "commit",
+        "parents": [
+          "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
+        ],
+        "predecessors": [],
+        "root_tree": [
+          "7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e"
+        ],
+        "conflict_labels": [
+          ""
+        ],
+        "change_id": "c0ffee00c0ffee00c0ffee00c0ffee00",
+        "description": "signed\n",
+        "author": {
+          "name": "Alice Example",
+          "email": "alice@acme.org",
+          "time": {
+            "millis": 1790000000123,
+            "tz_offset": -420
+          }
+        },
+        "committer": {
+          "name": "Alice Example",
+          "email": "alice@acme.org",
+          "time": {
+            "millis": 1790000000123,
+            "tz_offset": -420
+          }
+        },
+        "secure_sig": "2d2d2d2d2d424547494e20535348205349474e41545552452d2d2d2d2d0a55314e4955306c480a2d2d2d2d2d454e4420535348205349474e41545552452d2d2d2d2d0a"
+      },
+      "bytes": [
+        "05  # kind: commit",
+        "0100000000000000  # parents count",
+        "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1  # parents[0]",
+        "0000000000000000  # predecessors count",
+        "0100000000000000  # root_tree terms",
+        "7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e  # root_tree[0]",
+        "0100000000000000  # conflict_labels terms",
+        "0000000000000000  # conflict_labels[0] length",
+        "c0ffee00c0ffee00c0ffee00c0ffee00  # change_id",
+        "0700000000000000  # description length",
+        "7369676e65640a  # description \"signed\\n\"",
+        "0d00000000000000  # author.name length",
+        "416c696365204578616d706c65  # author.name \"Alice Example\"",
+        "0e00000000000000  # author.email length",
+        "616c6963654061636d652e6f7267  # author.email \"alice@acme.org\"",
+        "7b6c50c4a0010000  # author.time.millis",
+        "5cfeffff  # author.time.tz_offset",
+        "0d00000000000000  # committer.name length",
+        "416c696365204578616d706c65  # committer.name \"Alice Example\"",
+        "0e00000000000000  # committer.email length",
+        "616c6963654061636d652e6f7267  # committer.email \"alice@acme.org\"",
+        "7b6c50c4a0010000  # committer.time.millis",
+        "5cfeffff  # committer.time.tz_offset",
+        "01  # secure_sig present",
+        "4300000000000000  # secure_sig length",
+        "2d2d2d2d2d424547494e20535348205349474e41545552452d2d2d2d2d0a5531  # secure_sig",
+        "4e4955306c480a2d2d2d2d2d454e4420535348205349474e41545552452d2d2d",
+        "2d2d0a"
+      ],
+      "signed_data": [
+        "05  # kind: commit",
+        "0100000000000000  # parents count",
+        "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1  # parents[0]",
+        "0000000000000000  # predecessors count",
+        "0100000000000000  # root_tree terms",
+        "7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e  # root_tree[0]",
+        "0100000000000000  # conflict_labels terms",
+        "0000000000000000  # conflict_labels[0] length",
+        "c0ffee00c0ffee00c0ffee00c0ffee00  # change_id",
+        "0700000000000000  # description length",
+        "7369676e65640a  # description \"signed\\n\"",
+        "0d00000000000000  # author.name length",
+        "416c696365204578616d706c65  # author.name \"Alice Example\"",
+        "0e00000000000000  # author.email length",
+        "616c6963654061636d652e6f7267  # author.email \"alice@acme.org\"",
+        "7b6c50c4a0010000  # author.time.millis",
+        "5cfeffff  # author.time.tz_offset",
+        "0d00000000000000  # committer.name length",
+        "416c696365204578616d706c65  # committer.name \"Alice Example\"",
+        "0e00000000000000  # committer.email length",
+        "616c6963654061636d652e6f7267  # committer.email \"alice@acme.org\"",
+        "7b6c50c4a0010000  # committer.time.millis",
+        "5cfeffff  # committer.time.tz_offset",
+        "00  # secure_sig absent"
+      ],
+      "id": "77657774acf6f0e37450874f1970ae467efe5b0fdb7923f5568e9e2212871985"
+    },
+    {
+      "name": "commit/signed-empty",
+      "object": {
+        "kind": "commit",
+        "parents": [
+          "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
+        ],
+        "predecessors": [],
+        "root_tree": [
+          "7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e"
+        ],
+        "conflict_labels": [
+          ""
+        ],
+        "change_id": "c0ffee00c0ffee00c0ffee00c0ffee00",
+        "description": "signed\n",
+        "author": {
+          "name": "Alice Example",
+          "email": "alice@acme.org",
+          "time": {
+            "millis": 1790000000123,
+            "tz_offset": -420
+          }
+        },
+        "committer": {
+          "name": "Alice Example",
+          "email": "alice@acme.org",
+          "time": {
+            "millis": 1790000000123,
+            "tz_offset": -420
+          }
+        },
+        "secure_sig": ""
+      },
+      "bytes": [
+        "05  # kind: commit",
+        "0100000000000000  # parents count",
+        "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1  # parents[0]",
+        "0000000000000000  # predecessors count",
+        "0100000000000000  # root_tree terms",
+        "7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e  # root_tree[0]",
+        "0100000000000000  # conflict_labels terms",
+        "0000000000000000  # conflict_labels[0] length",
+        "c0ffee00c0ffee00c0ffee00c0ffee00  # change_id",
+        "0700000000000000  # description length",
+        "7369676e65640a  # description \"signed\\n\"",
+        "0d00000000000000  # author.name length",
+        "416c696365204578616d706c65  # author.name \"Alice Example\"",
+        "0e00000000000000  # author.email length",
+        "616c6963654061636d652e6f7267  # author.email \"alice@acme.org\"",
+        "7b6c50c4a0010000  # author.time.millis",
+        "5cfeffff  # author.time.tz_offset",
+        "0d00000000000000  # committer.name length",
+        "416c696365204578616d706c65  # committer.name \"Alice Example\"",
+        "0e00000000000000  # committer.email length",
+        "616c6963654061636d652e6f7267  # committer.email \"alice@acme.org\"",
+        "7b6c50c4a0010000  # committer.time.millis",
+        "5cfeffff  # committer.time.tz_offset",
+        "01  # secure_sig present",
+        "0000000000000000  # secure_sig length"
+      ],
+      "signed_data": [
+        "05  # kind: commit",
+        "0100000000000000  # parents count",
+        "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1  # parents[0]",
+        "0000000000000000  # predecessors count",
+        "0100000000000000  # root_tree terms",
+        "7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e  # root_tree[0]",
+        "0100000000000000  # conflict_labels terms",
+        "0000000000000000  # conflict_labels[0] length",
+        "c0ffee00c0ffee00c0ffee00c0ffee00  # change_id",
+        "0700000000000000  # description length",
+        "7369676e65640a  # description \"signed\\n\"",
+        "0d00000000000000  # author.name length",
+        "416c696365204578616d706c65  # author.name \"Alice Example\"",
+        "0e00000000000000  # author.email length",
+        "616c6963654061636d652e6f7267  # author.email \"alice@acme.org\"",
+        "7b6c50c4a0010000  # author.time.millis",
+        "5cfeffff  # author.time.tz_offset",
+        "0d00000000000000  # committer.name length",
+        "416c696365204578616d706c65  # committer.name \"Alice Example\"",
+        "0e00000000000000  # committer.email length",
+        "616c6963654061636d652e6f7267  # committer.email \"alice@acme.org\"",
+        "7b6c50c4a0010000  # committer.time.millis",
+        "5cfeffff  # committer.time.tz_offset",
+        "00  # secure_sig absent"
+      ],
+      "id": "2431ef613375b3bb39193ea06900a2e24ff34154beac8a87dc08bfcac1ecb57a"
+    },
+    {
+      "name": "commit/extreme-times",
+      "object": {
+        "kind": "commit",
+        "parents": [
+          "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
+        ],
+        "predecessors": [],
+        "root_tree": [
+          "7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e"
+        ],
+        "conflict_labels": [
+          ""
+        ],
+        "change_id": "c0ffee00c0ffee00c0ffee00c0ffee00",
+        "description": "",
+        "author": {
+          "name": "",
+          "email": "",
+          "time": {
+            "millis": -9223372036854775808,
+            "tz_offset": -2147483648
+          }
+        },
+        "committer": {
+          "name": "x",
+          "email": "y",
+          "time": {
+            "millis": 9223372036854775807,
+            "tz_offset": 2147483647
+          }
+        },
+        "secure_sig": null
+      },
+      "bytes": [
+        "05  # kind: commit",
+        "0100000000000000  # parents count",
+        "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1  # parents[0]",
+        "0000000000000000  # predecessors count",
+        "0100000000000000  # root_tree terms",
+        "7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e  # root_tree[0]",
+        "0100000000000000  # conflict_labels terms",
+        "0000000000000000  # conflict_labels[0] length",
+        "c0ffee00c0ffee00c0ffee00c0ffee00  # change_id",
+        "0000000000000000  # description length",
+        "0000000000000000  # author.name length",
+        "0000000000000000  # author.email length",
+        "0000000000000080  # author.time.millis",
+        "00000080  # author.time.tz_offset",
+        "0100000000000000  # committer.name length",
+        "78  # committer.name \"x\"",
+        "0100000000000000  # committer.email length",
+        "79  # committer.email \"y\"",
+        "ffffffffffffff7f  # committer.time.millis",
+        "ffffff7f  # committer.time.tz_offset",
+        "00  # secure_sig absent"
+      ],
+      "id": "e1ecb1e568e3840c87f6a3a4f6fd505ddd75fdef623ecc329bb43a57e18dfd43"
+    },
+    {
+      "name": "operation/snapshot",
+      "object": {
+        "kind": "operation",
+        "view_id": "e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1",
+        "parents": [
+          "d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1"
+        ],
+        "metadata": {
+          "start": {
+            "millis": 1790000000000,
+            "tz_offset": 0
+          },
+          "end": {
+            "millis": 1790000000250,
+            "tz_offset": 0
+          },
+          "description": "snapshot working copy",
+          "hostname": "workstation",
+          "username": "alice",
+          "is_snapshot": true,
+          "workspace_name": "default",
+          "attributes": {}
+        },
+        "commit_predecessors": {}
+      },
+      "bytes": [
+        "06  # kind: operation",
+        "e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1  # view_id",
+        "0100000000000000  # parents count",
+        "d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1  # parents[0]",
+        "006c50c4a0010000  # metadata.start.millis",
+        "00000000  # metadata.start.tz_offset",
+        "fa6c50c4a0010000  # metadata.end.millis",
+        "00000000  # metadata.end.tz_offset",
+        "1500000000000000  # metadata.description length",
+        "736e617073686f7420776f726b696e6720636f7079  # metadata.description \"snapshot working copy\"",
+        "0b00000000000000  # metadata.hostname length",
+        "776f726b73746174696f6e  # metadata.hostname \"workstation\"",
+        "0500000000000000  # metadata.username length",
+        "616c696365  # metadata.username \"alice\"",
+        "01  # metadata.is_snapshot",
+        "01  # metadata.workspace_name present",
+        "0700000000000000  # metadata.workspace_name length",
+        "64656661756c74  # metadata.workspace_name \"default\"",
+        "0000000000000000  # metadata.attributes count",
+        "01  # commit_predecessors present",
+        "0000000000000000  # commit_predecessors count"
+      ],
+      "id": "69a2b1c11bdd91b2e2691e26f5e26cde669cd337c156fc3b5cd028fa86228b56"
+    },
+    {
+      "name": "operation/rewrite",
+      "object": {
+        "kind": "operation",
+        "view_id": "e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2",
+        "parents": [
+          "d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2"
+        ],
+        "metadata": {
+          "start": {
+            "millis": 1790000000000,
+            "tz_offset": 0
+          },
+          "end": {
+            "millis": 1790000000250,
+            "tz_offset": 0
+          },
+          "description": "describe commit a1a1a1a1",
+          "hostname": "workstation",
+          "username": "alice",
+          "is_snapshot": false,
+          "workspace_name": "laptop-home",
+          "attributes": {
+            "args": "jj describe -m 'x'",
+            "b": "",
+            "aa": "sorted by bytes"
+          }
+        },
+        "commit_predecessors": {
+          "a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3": [
+            "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
+          ],
+          "a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2": [
+            "a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0",
+            "9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f"
+          ],
+          "a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4": []
+        }
+      },
+      "bytes": [
+        "06  # kind: operation",
+        "e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2  # view_id",
+        "0100000000000000  # parents count",
+        "d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2  # parents[0]",
+        "006c50c4a0010000  # metadata.start.millis",
+        "00000000  # metadata.start.tz_offset",
+        "fa6c50c4a0010000  # metadata.end.millis",
+        "00000000  # metadata.end.tz_offset",
+        "1800000000000000  # metadata.description length",
+        "646573637269626520636f6d6d6974206131613161316131  # metadata.description \"describe commit a1a1a1a1\"",
+        "0b00000000000000  # metadata.hostname length",
+        "776f726b73746174696f6e  # metadata.hostname \"workstation\"",
+        "0500000000000000  # metadata.username length",
+        "616c696365  # metadata.username \"alice\"",
+        "00  # metadata.is_snapshot",
+        "01  # metadata.workspace_name present",
+        "0b00000000000000  # metadata.workspace_name length",
+        "6c6170746f702d686f6d65  # metadata.workspace_name \"laptop-home\"",
+        "0300000000000000  # metadata.attributes count",
+        "0200000000000000  # metadata.attributes key length",
+        "6161  # metadata.attributes key \"aa\"",
+        "0f00000000000000  # metadata.attributes[\"aa\"] length",
+        "736f72746564206279206279746573  # metadata.attributes[\"aa\"] \"sorted by bytes\"",
+        "0400000000000000  # metadata.attributes key length",
+        "61726773  # metadata.attributes key \"args\"",
+        "1200000000000000  # metadata.attributes[\"args\"] length",
+        "6a6a206465736372696265202d6d20277827  # metadata.attributes[\"args\"] \"jj describe -m 'x'\"",
+        "0100000000000000  # metadata.attributes key length",
+        "62  # metadata.attributes key \"b\"",
+        "0000000000000000  # metadata.attributes[\"b\"] length",
+        "01  # commit_predecessors present",
+        "0300000000000000  # commit_predecessors count",
+        "a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2  # commit",
+        "0200000000000000  #   predecessors count",
+        "a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0  #   predecessors[0]",
+        "9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f  #   predecessors[1]",
+        "a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3  # commit",
+        "0100000000000000  #   predecessors count",
+        "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1  #   predecessors[0]",
+        "a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4  # commit",
+        "0000000000000000  #   predecessors count"
+      ],
+      "id": "776f2eab505da4312d304fc36d77583f1454db88f2d7d17bb791c864198a17ea"
+    },
+    {
+      "name": "operation/unrecorded",
+      "object": {
+        "kind": "operation",
+        "view_id": "e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3",
+        "parents": [
+          "d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3",
+          "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
+        ],
+        "metadata": {
+          "start": {
+            "millis": 1790000000000,
+            "tz_offset": 0
+          },
+          "end": {
+            "millis": 1790000000250,
+            "tz_offset": 0
+          },
+          "description": "reconcile divergent operations",
+          "hostname": "workstation",
+          "username": "alice",
+          "is_snapshot": false,
+          "workspace_name": null,
+          "attributes": {}
+        },
+        "commit_predecessors": null
+      },
+      "bytes": [
+        "06  # kind: operation",
+        "e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3  # view_id",
+        "0200000000000000  # parents count",
+        "d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3  # parents[0]",
+        "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4  # parents[1]",
+        "006c50c4a0010000  # metadata.start.millis",
+        "00000000  # metadata.start.tz_offset",
+        "fa6c50c4a0010000  # metadata.end.millis",
+        "00000000  # metadata.end.tz_offset",
+        "1e00000000000000  # metadata.description length",
+        "7265636f6e63696c6520646976657267656e74206f7065726174696f6e73  # metadata.description \"reconcile divergent operations\"",
+        "0b00000000000000  # metadata.hostname length",
+        "776f726b73746174696f6e  # metadata.hostname \"workstation\"",
+        "0500000000000000  # metadata.username length",
+        "616c696365  # metadata.username \"alice\"",
+        "00  # metadata.is_snapshot",
+        "00  # metadata.workspace_name absent",
+        "0000000000000000  # metadata.attributes count",
+        "00  # commit_predecessors absent"
+      ],
+      "id": "43aed9afee0bc53c9ab8dfa46e9c3cff4ebecbab17b010eaad2b7a04d1941cd8"
+    },
+    {
+      "name": "view/root",
+      "object": {
+        "kind": "view",
+        "head_ids": [
+          "0000000000000000000000000000000000000000000000000000000000000000"
+        ],
+        "local_bookmarks": {},
+        "local_tags": {},
+        "remote_views": {},
+        "git_refs": {},
+        "git_heads": {},
+        "wc_commit_ids": {}
+      },
+      "bytes": [
+        "07  # kind: view",
+        "0100000000000000  # head_ids (sorted) count",
+        "0000000000000000000000000000000000000000000000000000000000000000  # head_ids (sorted)[0]",
+        "0000000000000000  # local_bookmarks count",
+        "0000000000000000  # local_tags count",
+        "0000000000000000  # remote_views count",
+        "0000000000000000  # git_refs count",
+        "0000000000000000  # git_heads count",
+        "0000000000000000  # wc_commit_ids count"
+      ],
+      "id": "50c9e9795bd0eaad65c478c01fa93149454f0e9eb1cbad31b91ff989fcfbc31b"
+    },
+    {
+      "name": "view/one-workspace",
+      "object": {
+        "kind": "view",
+        "head_ids": [
+          "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
+        ],
+        "local_bookmarks": {},
+        "local_tags": {},
+        "remote_views": {},
+        "git_refs": {},
+        "git_heads": {},
+        "wc_commit_ids": {
+          "default": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
+        }
+      },
+      "bytes": [
+        "07  # kind: view",
+        "0100000000000000  # head_ids (sorted) count",
+        "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1  # head_ids (sorted)[0]",
+        "0000000000000000  # local_bookmarks count",
+        "0000000000000000  # local_tags count",
+        "0000000000000000  # remote_views count",
+        "0000000000000000  # git_refs count",
+        "0000000000000000  # git_heads count",
+        "0100000000000000  # wc_commit_ids count",
+        "0700000000000000  # wc_commit_ids key length",
+        "64656661756c74  # wc_commit_ids key \"default\"",
+        "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1  # wc_commit_ids[\"default\"]"
+      ],
+      "id": "945c6093f2e595eb1ee6af1f1a3a193ef9346fea8cef61b9e19e2a5485563140"
+    },
+    {
+      "name": "view/every-field",
+      "object": {
+        "kind": "view",
+        "head_ids": [
+          "a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3",
+          "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+          "a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2"
+        ],
+        "local_bookmarks": {
+          "main": [
+            "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
+          ],
+          "feature": [
+            "a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2",
+            "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+            "a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3"
+          ],
+          "new": [
+            "a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2",
+            null,
+            "a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3"
+          ],
+          "gone": [
+            null
+          ]
+        },
+        "local_tags": {
+          "v1.0": [
+            "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
+          ]
+        },
+        "remote_views": {
+          "team": {
+            "bookmarks": {
+              "main": {
+                "target": [
+                  "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
+                ],
+                "state": "new"
+              },
+              "cl/12": {
+                "target": [
+                  "a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2"
+                ],
+                "state": "tracked"
+              }
+            },
+            "tags": {
+              "v1.0": {
+                "target": [
+                  "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
+                ],
+                "state": "new"
+              }
+            }
+          },
+          "origin": {
+            "bookmarks": {},
+            "tags": {}
+          }
+        },
+        "git_refs": {
+          "refs/heads/main": [
+            "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
+          ]
+        },
+        "git_heads": {
+          "default": [
+            "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
+          ]
+        },
+        "wc_commit_ids": {
+          "default": "a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3",
+          "laptop-home": "a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2",
+          "b": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+          "aa": "a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2"
+        }
+      },
+      "bytes": [
+        "07  # kind: view",
+        "0300000000000000  # head_ids (sorted) count",
+        "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1  # head_ids (sorted)[0]",
+        "a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2  # head_ids (sorted)[1]",
+        "a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3  # head_ids (sorted)[2]",
+        "0400000000000000  # local_bookmarks count",
+        "0700000000000000  # local_bookmarks key length",
+        "66656174757265  # local_bookmarks key \"feature\"",
+        "0300000000000000  # local_bookmarks[\"feature\"] terms",
+        "01  # local_bookmarks[\"feature\"][0] present",
+        "a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2  # local_bookmarks[\"feature\"][0]",
+        "01  # local_bookmarks[\"feature\"][1] present",
+        "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1  # local_bookmarks[\"feature\"][1]",
+        "01  # local_bookmarks[\"feature\"][2] present",
+        "a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3  # local_bookmarks[\"feature\"][2]",
+        "0400000000000000  # local_bookmarks key length",
+        "676f6e65  # local_bookmarks key \"gone\"",
+        "0100000000000000  # local_bookmarks[\"gone\"] terms",
+        "00  # local_bookmarks[\"gone\"][0] absent",
+        "0400000000000000  # local_bookmarks key length",
+        "6d61696e  # local_bookmarks key \"main\"",
+        "0100000000000000  # local_bookmarks[\"main\"] terms",
+        "01  # local_bookmarks[\"main\"][0] present",
+        "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1  # local_bookmarks[\"main\"][0]",
+        "0300000000000000  # local_bookmarks key length",
+        "6e6577  # local_bookmarks key \"new\"",
+        "0300000000000000  # local_bookmarks[\"new\"] terms",
+        "01  # local_bookmarks[\"new\"][0] present",
+        "a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2  # local_bookmarks[\"new\"][0]",
+        "00  # local_bookmarks[\"new\"][1] absent",
+        "01  # local_bookmarks[\"new\"][2] present",
+        "a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3  # local_bookmarks[\"new\"][2]",
+        "0100000000000000  # local_tags count",
+        "0400000000000000  # local_tags key length",
+        "76312e30  # local_tags key \"v1.0\"",
+        "0100000000000000  # local_tags[\"v1.0\"] terms",
+        "01  # local_tags[\"v1.0\"][0] present",
+        "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1  # local_tags[\"v1.0\"][0]",
+        "0200000000000000  # remote_views count",
+        "0600000000000000  # remote_views key length",
+        "6f726967696e  # remote_views key \"origin\"",
+        "0000000000000000  # remote_views[\"origin\"].bookmarks count",
+        "0000000000000000  # remote_views[\"origin\"].tags count",
+        "0400000000000000  # remote_views key length",
+        "7465616d  # remote_views key \"team\"",
+        "0200000000000000  # remote_views[\"team\"].bookmarks count",
+        "0500000000000000  # remote_views[\"team\"].bookmarks key length",
+        "636c2f3132  # remote_views[\"team\"].bookmarks key \"cl/12\"",
+        "0100000000000000  # remote_views[\"team\"].bookmarks[\"cl/12\"].target terms",
+        "01  # remote_views[\"team\"].bookmarks[\"cl/12\"].target[0] present",
+        "a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2  # remote_views[\"team\"].bookmarks[\"cl/12\"].target[0]",
+        "01  # remote_views[\"team\"].bookmarks[\"cl/12\"].state tracked",
+        "0400000000000000  # remote_views[\"team\"].bookmarks key length",
+        "6d61696e  # remote_views[\"team\"].bookmarks key \"main\"",
+        "0100000000000000  # remote_views[\"team\"].bookmarks[\"main\"].target terms",
+        "01  # remote_views[\"team\"].bookmarks[\"main\"].target[0] present",
+        "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1  # remote_views[\"team\"].bookmarks[\"main\"].target[0]",
+        "00  # remote_views[\"team\"].bookmarks[\"main\"].state new",
+        "0100000000000000  # remote_views[\"team\"].tags count",
+        "0400000000000000  # remote_views[\"team\"].tags key length",
+        "76312e30  # remote_views[\"team\"].tags key \"v1.0\"",
+        "0100000000000000  # remote_views[\"team\"].tags[\"v1.0\"].target terms",
+        "01  # remote_views[\"team\"].tags[\"v1.0\"].target[0] present",
+        "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1  # remote_views[\"team\"].tags[\"v1.0\"].target[0]",
+        "00  # remote_views[\"team\"].tags[\"v1.0\"].state new",
+        "0100000000000000  # git_refs count",
+        "0f00000000000000  # git_refs key length",
+        "726566732f68656164732f6d61696e  # git_refs key \"refs/heads/main\"",
+        "0100000000000000  # git_refs[\"refs/heads/main\"] terms",
+        "01  # git_refs[\"refs/heads/main\"][0] present",
+        "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1  # git_refs[\"refs/heads/main\"][0]",
+        "0100000000000000  # git_heads count",
+        "0700000000000000  # git_heads key length",
+        "64656661756c74  # git_heads key \"default\"",
+        "0100000000000000  # git_heads[\"default\"] terms",
+        "01  # git_heads[\"default\"][0] present",
+        "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1  # git_heads[\"default\"][0]",
+        "0400000000000000  # wc_commit_ids count",
+        "0200000000000000  # wc_commit_ids key length",
+        "6161  # wc_commit_ids key \"aa\"",
+        "a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2  # wc_commit_ids[\"aa\"]",
+        "0100000000000000  # wc_commit_ids key length",
+        "62  # wc_commit_ids key \"b\"",
+        "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1  # wc_commit_ids[\"b\"]",
+        "0700000000000000  # wc_commit_ids key length",
+        "64656661756c74  # wc_commit_ids key \"default\"",
+        "a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3  # wc_commit_ids[\"default\"]",
+        "0b00000000000000  # wc_commit_ids key length",
+        "6c6170746f702d686f6d65  # wc_commit_ids key \"laptop-home\"",
+        "a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2  # wc_commit_ids[\"laptop-home\"]"
+      ],
+      "id": "23cfe90db09fee338db8ab1937bd1761b6b3c858b47e9853d86e8efdc811b9b8"
+    }
+  ],
+  "invalid": [
+    {
+      "name": "empty input",
+      "error": "truncated",
+      "bytes": []
+    },
+    {
+      "name": "kind 0x00",
+      "error": "kind",
+      "bytes": [
+        "00  # kind byte",
+        "0000000000000000  # (unused)"
+      ]
+    },
+    {
+      "name": "kind 0x08",
+      "error": "kind",
+      "bytes": [
+        "08  # kind byte",
+        "0000000000000000  # (unused)"
+      ]
+    },
+    {
+      "name": "kind 0x0f",
+      "error": "kind",
+      "bytes": [
+        "0f  # kind byte",
+        "0000000000000000  # (unused)"
+      ]
+    },
+    {
+      "name": "kind 0x11",
+      "error": "kind",
+      "bytes": [
+        "11  # kind byte",
+        "0000000000000000  # (unused)"
+      ]
+    },
+    {
+      "name": "kind 0xff",
+      "error": "kind",
+      "bytes": [
+        "ff  # kind byte",
+        "0000000000000000  # (unused)"
+      ]
+    },
+    {
+      "name": "tree with a trailing byte",
+      "error": "trailing",
+      "bytes": [
+        "03  # kind: tree",
+        "0000000000000000  # entries count",
+        "00  # trailing byte"
+      ]
+    },
+    {
+      "name": "view with trailing bytes",
+      "error": "trailing",
+      "bytes": [
+        "07  # kind: view",
+        "0000000000000000  # head_ids count",
+        "0000000000000000  # local_bookmarks count",
+        "0000000000000000  # local_tags count",
+        "0000000000000000  # remote_views count",
+        "0000000000000000  # git_refs count",
+        "0000000000000000  # git_heads count",
+        "0000000000000000  # wc_commit_ids count",
+        "0000  # trailing bytes"
+      ]
+    },
+    {
+      "name": "commit secure_sig option tag 2",
+      "error": "option",
+      "bytes": [
+        "05  # kind: commit",
+        "0100000000000000  # parents count",
+        "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1  # parents[0]",
+        "0000000000000000  # predecessors count",
+        "0100000000000000  # root_tree terms",
+        "7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e  # root_tree[0]",
+        "0100000000000000  # conflict_labels terms",
+        "0000000000000000  # conflict_labels[0] length",
+        "c0ffee00c0ffee00c0ffee00c0ffee00  # change_id",
+        "0100000000000000  # description length",
+        "78  # description",
+        "0100000000000000  # author.name length",
+        "61  # author.name",
+        "0100000000000000  # author.email length",
+        "65  # author.email",
+        "0000000000000000  # author.time.millis",
+        "00000000  # author.time.tz_offset",
+        "0100000000000000  # committer.name length",
+        "61  # committer.name",
+        "0100000000000000  # committer.email length",
+        "65  # committer.email",
+        "0000000000000000  # committer.time.millis",
+        "00000000  # committer.time.tz_offset",
+        "02  # secure_sig option tag 2",
+        "0000000000000000  # (unused)"
+      ]
+    },
+    {
+      "name": "commit description longer than the input",
+      "error": "truncated",
+      "bytes": [
+        "05  # kind: commit",
+        "0100000000000000  # parents count",
+        "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1  # parents[0]",
+        "0000000000000000  # predecessors count",
+        "0100000000000000  # root_tree terms",
+        "7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e  # root_tree[0]",
+        "0100000000000000  # conflict_labels terms",
+        "0000000000000000  # conflict_labels[0] length",
+        "c0ffee00c0ffee00c0ffee00c0ffee00  # change_id",
+        "0a00000000000000  # description length 10",
+        "73686f7274  # only 5 bytes remain"
+      ]
+    },
+    {
+      "name": "commit change_id cut short",
+      "error": "truncated",
+      "bytes": [
+        "05  # kind: commit",
+        "0100000000000000  # parents count",
+        "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1  # parents[0]",
+        "0000000000000000  # predecessors count",
+        "0100000000000000  # root_tree terms",
+        "7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e  # root_tree[0]",
+        "0100000000000000  # conflict_labels terms",
+        "0000000000000000  # conflict_labels[0] length",
+        "c0ffee00c0ffee00c0  # change_id cut after 9 of 16 bytes"
+      ]
+    },
+    {
+      "name": "commit description not UTF-8",
+      "error": "utf8",
+      "bytes": [
+        "05  # kind: commit",
+        "0100000000000000  # parents count",
+        "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1  # parents[0]",
+        "0000000000000000  # predecessors count",
+        "0100000000000000  # root_tree terms",
+        "7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e  # root_tree[0]",
+        "0100000000000000  # conflict_labels terms",
+        "0000000000000000  # conflict_labels[0] length",
+        "c0ffee00c0ffee00c0ffee00c0ffee00  # change_id",
+        "0200000000000000  # description length",
+        "c328  # invalid UTF-8"
+      ]
+    },
+    {
+      "name": "commit parents count u64 max",
+      "error": "truncated",
+      "bytes": [
+        "05  # kind: commit",
+        "ffffffffffffffff  # parents count u64 max"
+      ]
+    },
+    {
+      "name": "commit parents cut short",
+      "error": "truncated",
+      "bytes": [
+        "05  # kind: commit",
+        "0300000000000000  # parents count 3",
+        "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1  # parents[0]",
+        "a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2  # parents[1]"
+      ]
+    },
+    {
+      "name": "commit root_tree with 0 terms",
+      "error": "merge",
+      "bytes": [
+        "05  # kind: commit",
+        "0100000000000000  # parents count",
+        "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1  # parents[0]",
+        "0000000000000000  # predecessors count",
+        "0000000000000000  # root_tree terms 0",
+        "0100000000000000  # conflict_labels terms",
+        "0000000000000000  # conflict_labels[0] length"
+      ]
+    },
+    {
+      "name": "commit root_tree with 2 terms",
+      "error": "merge",
+      "bytes": [
+        "05  # kind: commit",
+        "0100000000000000  # parents count",
+        "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1  # parents[0]",
+        "0000000000000000  # predecessors count",
+        "0200000000000000  # root_tree terms 2",
+        "7070707070707070707070707070707070707070707070707070707070707070  # root_tree[0]",
+        "7171717171717171717171717171717171717171717171717171717171717171  # root_tree[1]",
+        "0100000000000000  # conflict_labels terms",
+        "0000000000000000  # conflict_labels[0] length"
+      ]
+    },
+    {
+      "name": "commit root_tree with 4 terms",
+      "error": "merge",
+      "bytes": [
+        "05  # kind: commit",
+        "0100000000000000  # parents count",
+        "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1  # parents[0]",
+        "0000000000000000  # predecessors count",
+        "0400000000000000  # root_tree terms 4",
+        "7070707070707070707070707070707070707070707070707070707070707070  # root_tree[0]",
+        "7171717171717171717171717171717171717171717171717171717171717171  # root_tree[1]",
+        "7272727272727272727272727272727272727272727272727272727272727272  # root_tree[2]",
+        "7373737373737373737373737373737373737373737373737373737373737373  # root_tree[3]",
+        "0100000000000000  # conflict_labels terms",
+        "0000000000000000  # conflict_labels[0] length"
+      ]
+    },
+    {
+      "name": "symlink target not UTF-8",
+      "error": "utf8",
+      "bytes": [
+        "02  # kind: symlink",
+        "6f6b2fff  # invalid UTF-8"
+      ]
+    },
+    {
+      "name": "tree entries unsorted",
+      "error": "unsorted",
+      "bytes": [
+        "03  # kind: tree",
+        "0200000000000000  # entries count",
+        "0100000000000000  # name length",
+        "62  # name \"b\"",
+        "02  # b: tag tree",
+        "7070707070707070707070707070707070707070707070707070707070707070  # b: tree id",
+        "0100000000000000  # name length",
+        "61  # name \"a\"",
+        "02  # a: tag tree",
+        "7070707070707070707070707070707070707070707070707070707070707070  # a: tree id"
+      ]
+    },
+    {
+      "name": "tree entries unsorted by raw bytes",
+      "error": "unsorted",
+      "bytes": [
+        "03  # kind: tree",
+        "0200000000000000  # entries count",
+        "0100000000000000  # name length",
+        "62  # name \"b\"",
+        "02  # b: tag tree",
+        "7070707070707070707070707070707070707070707070707070707070707070  # b: tree id",
+        "0200000000000000  # name length",
+        "6161  # name \"aa\"",
+        "02  # aa: tag tree",
+        "7070707070707070707070707070707070707070707070707070707070707070  # aa: tree id"
+      ]
+    },
+    {
+      "name": "tree entry repeats",
+      "error": "duplicate",
+      "bytes": [
+        "03  # kind: tree",
+        "0200000000000000  # entries count",
+        "0100000000000000  # name length",
+        "61  # name \"a\"",
+        "02  # a: tag tree",
+        "7070707070707070707070707070707070707070707070707070707070707070  # a: tree id",
+        "0100000000000000  # name length",
+        "61  # name \"a\"",
+        "02  # a: tag tree",
+        "7070707070707070707070707070707070707070707070707070707070707070  # a: tree id"
+      ]
+    },
+    {
+      "name": "tree entry name \"\"",
+      "error": "name",
+      "bytes": [
+        "03  # kind: tree",
+        "0100000000000000  # entries count",
+        "0000000000000000  # name length",
+        "02  # : tag tree",
+        "7070707070707070707070707070707070707070707070707070707070707070  # : tree id"
+      ]
+    },
+    {
+      "name": "tree entry name \".\"",
+      "error": "name",
+      "bytes": [
+        "03  # kind: tree",
+        "0100000000000000  # entries count",
+        "0100000000000000  # name length",
+        "2e  # name \".\"",
+        "02  # .: tag tree",
+        "7070707070707070707070707070707070707070707070707070707070707070  # .: tree id"
+      ]
+    },
+    {
+      "name": "tree entry name \"..\"",
+      "error": "name",
+      "bytes": [
+        "03  # kind: tree",
+        "0100000000000000  # entries count",
+        "0200000000000000  # name length",
+        "2e2e  # name \"..\"",
+        "02  # ..: tag tree",
+        "7070707070707070707070707070707070707070707070707070707070707070  # ..: tree id"
+      ]
+    },
+    {
+      "name": "tree entry name \"a/b\"",
+      "error": "name",
+      "bytes": [
+        "03  # kind: tree",
+        "0100000000000000  # entries count",
+        "0300000000000000  # name length",
+        "612f62  # name \"a/b\"",
+        "02  # a/b: tag tree",
+        "7070707070707070707070707070707070707070707070707070707070707070  # a/b: tree id"
+      ]
+    },
+    {
+      "name": "tree entry name \"a\\u0000b\"",
+      "error": "name",
+      "bytes": [
+        "03  # kind: tree",
+        "0100000000000000  # entries count",
+        "0300000000000000  # name length",
+        "610062  # name \"a\\u0000b\"",
+        "02  # a\u0000b: tag tree",
+        "7070707070707070707070707070707070707070707070707070707070707070  # a\u0000b: tree id"
+      ]
+    },
+    {
+      "name": "tree entry name not UTF-8",
+      "error": "utf8",
+      "bytes": [
+        "03  # kind: tree",
+        "0100000000000000  # entries count",
+        "0200000000000000  # name length",
+        "fffe  # invalid UTF-8"
+      ]
+    },
+    {
+      "name": "tree value tag 3",
+      "error": "tag",
+      "bytes": [
+        "03  # kind: tree",
+        "0100000000000000  # entries count",
+        "0100000000000000  # name length",
+        "6d  # name \"m\"",
+        "03  # m: tag 3",
+        "7070707070707070707070707070707070707070707070707070707070707070  # m: id"
+      ]
+    },
+    {
+      "name": "tree value tag 9",
+      "error": "tag",
+      "bytes": [
+        "03  # kind: tree",
+        "0100000000000000  # entries count",
+        "0100000000000000  # name length",
+        "6d  # name \"m\"",
+        "09  # m: tag 9",
+        "7070707070707070707070707070707070707070707070707070707070707070  # m: id"
+      ]
+    },
+    {
+      "name": "tree file executable byte 2",
+      "error": "bool",
+      "bytes": [
+        "03  # kind: tree",
+        "0100000000000000  # entries count",
+        "0100000000000000  # name length",
+        "66  # name \"f\"",
+        "00  # f: tag file",
+        "f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1  # f: file id",
+        "02  # f: executable byte 2",
+        "0000000000000000  # f: copy_id length"
+      ]
+    },
+    {
+      "name": "tree file copy_id of 16 bytes",
+      "error": "copy-id",
+      "bytes": [
+        "03  # kind: tree",
+        "0100000000000000  # entries count",
+        "0100000000000000  # name length",
+        "66  # name \"f\"",
+        "00  # f: tag file",
+        "f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1  # f: file id",
+        "00  # f: executable byte 0",
+        "1000000000000000  # f: copy_id length",
+        "00000000000000000000000000000000  # f: copy_id"
+      ]
+    },
+    {
+      "name": "tree file copy_id of 33 bytes",
+      "error": "copy-id",
+      "bytes": [
+        "03  # kind: tree",
+        "0100000000000000  # entries count",
+        "0100000000000000  # name length",
+        "66  # name \"f\"",
+        "00  # f: tag file",
+        "f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1  # f: file id",
+        "00  # f: executable byte 0",
+        "2100000000000000  # f: copy_id length",
+        "0000000000000000000000000000000000000000000000000000000000000000  # f: copy_id",
+        "00"
+      ]
+    },
+    {
+      "name": "tree entries count 2^63",
+      "error": "truncated",
+      "bytes": [
+        "03  # kind: tree",
+        "0000000000000080  # entries count 2^63"
+      ]
+    },
+    {
+      "name": "copy_history path \"\"",
+      "error": "path",
+      "bytes": [
+        "04  # kind: copy_history",
+        "0000000000000000  # current_path length",
+        "0000000000000000  # parents count",
+        "0000000000000000  # salt length"
+      ]
+    },
+    {
+      "name": "copy_history path \"/a\"",
+      "error": "path",
+      "bytes": [
+        "04  # kind: copy_history",
+        "0200000000000000  # current_path length",
+        "2f61  # current_path \"/a\"",
+        "0000000000000000  # parents count",
+        "0000000000000000  # salt length"
+      ]
+    },
+    {
+      "name": "copy_history path \"a/\"",
+      "error": "path",
+      "bytes": [
+        "04  # kind: copy_history",
+        "0200000000000000  # current_path length",
+        "612f  # current_path \"a/\"",
+        "0000000000000000  # parents count",
+        "0000000000000000  # salt length"
+      ]
+    },
+    {
+      "name": "copy_history path \"a//b\"",
+      "error": "path",
+      "bytes": [
+        "04  # kind: copy_history",
+        "0400000000000000  # current_path length",
+        "612f2f62  # current_path \"a//b\"",
+        "0000000000000000  # parents count",
+        "0000000000000000  # salt length"
+      ]
+    },
+    {
+      "name": "copy_history path \"a/./b\"",
+      "error": "path",
+      "bytes": [
+        "04  # kind: copy_history",
+        "0500000000000000  # current_path length",
+        "612f2e2f62  # current_path \"a/./b\"",
+        "0000000000000000  # parents count",
+        "0000000000000000  # salt length"
+      ]
+    },
+    {
+      "name": "copy_history path \"a/../b\"",
+      "error": "path",
+      "bytes": [
+        "04  # kind: copy_history",
+        "0600000000000000  # current_path length",
+        "612f2e2e2f62  # current_path \"a/../b\"",
+        "0000000000000000  # parents count",
+        "0000000000000000  # salt length"
+      ]
+    },
+    {
+      "name": "copy_history path \"a/b\\u0000\"",
+      "error": "path",
+      "bytes": [
+        "04  # kind: copy_history",
+        "0400000000000000  # current_path length",
+        "612f6200  # current_path \"a/b\\u0000\"",
+        "0000000000000000  # parents count",
+        "0000000000000000  # salt length"
+      ]
+    },
+    {
+      "name": "operation is_snapshot byte 2",
+      "error": "bool",
+      "bytes": [
+        "06  # kind: operation",
+        "e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1  # view_id",
+        "0000000000000000  # parents count",
+        "0000000000000000  # metadata.start.millis",
+        "00000000  # metadata.start.tz_offset",
+        "0000000000000000  # metadata.end.millis",
+        "00000000  # metadata.end.tz_offset",
+        "0000000000000000  # metadata.description length",
+        "0000000000000000  # metadata.hostname length",
+        "0000000000000000  # metadata.username length",
+        "02  # metadata.is_snapshot byte 2",
+        "00  # metadata.workspace_name tag",
+        "00  # workspace_name absent"
+      ]
+    },
+    {
+      "name": "operation workspace_name option tag 2",
+      "error": "option",
+      "bytes": [
+        "06  # kind: operation",
+        "e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1  # view_id",
+        "0000000000000000  # parents count",
+        "0000000000000000  # metadata.start.millis",
+        "00000000  # metadata.start.tz_offset",
+        "0000000000000000  # metadata.end.millis",
+        "00000000  # metadata.end.tz_offset",
+        "0000000000000000  # metadata.description length",
+        "0000000000000000  # metadata.hostname length",
+        "0000000000000000  # metadata.username length",
+        "01  # metadata.is_snapshot byte 1",
+        "02  # metadata.workspace_name tag"
+      ]
+    },
+    {
+      "name": "operation attributes unsorted",
+      "error": "unsorted",
+      "bytes": [
+        "06  # kind: operation",
+        "e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1  # view_id",
+        "0000000000000000  # parents count",
+        "0000000000000000  # metadata.start.millis",
+        "00000000  # metadata.start.tz_offset",
+        "0000000000000000  # metadata.end.millis",
+        "00000000  # metadata.end.tz_offset",
+        "0000000000000000  # metadata.description length",
+        "0000000000000000  # metadata.hostname length",
+        "0000000000000000  # metadata.username length",
+        "01  # metadata.is_snapshot byte 1",
+        "00  # metadata.workspace_name tag",
+        "0200000000000000  # metadata.attributes count",
+        "0100000000000000  # key length",
+        "62  # key \"b\"",
+        "0000000000000000  # value length",
+        "0100000000000000  # key length",
+        "61  # key \"a\"",
+        "0000000000000000  # value length",
+        "00  # commit_predecessors absent"
+      ]
+    },
+    {
+      "name": "operation attributes repeat",
+      "error": "duplicate",
+      "bytes": [
+        "06  # kind: operation",
+        "e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1  # view_id",
+        "0000000000000000  # parents count",
+        "0000000000000000  # metadata.start.millis",
+        "00000000  # metadata.start.tz_offset",
+        "0000000000000000  # metadata.end.millis",
+        "00000000  # metadata.end.tz_offset",
+        "0000000000000000  # metadata.description length",
+        "0000000000000000  # metadata.hostname length",
+        "0000000000000000  # metadata.username length",
+        "01  # metadata.is_snapshot byte 1",
+        "00  # metadata.workspace_name tag",
+        "0200000000000000  # metadata.attributes count",
+        "0100000000000000  # key length",
+        "61  # key \"a\"",
+        "0100000000000000  # value length",
+        "31  # value \"1\"",
+        "0100000000000000  # key length",
+        "61  # key \"a\"",
+        "0100000000000000  # value length",
+        "32  # value \"2\"",
+        "00  # commit_predecessors absent"
+      ]
+    },
+    {
+      "name": "operation commit_predecessors unsorted",
+      "error": "unsorted",
+      "bytes": [
+        "06  # kind: operation",
+        "e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1  # view_id",
+        "0000000000000000  # parents count",
+        "0000000000000000  # metadata.start.millis",
+        "00000000  # metadata.start.tz_offset",
+        "0000000000000000  # metadata.end.millis",
+        "00000000  # metadata.end.tz_offset",
+        "0000000000000000  # metadata.description length",
+        "0000000000000000  # metadata.hostname length",
+        "0000000000000000  # metadata.username length",
+        "01  # metadata.is_snapshot byte 1",
+        "00  # metadata.workspace_name tag",
+        "0000000000000000  # metadata.attributes count",
+        "01  # commit_predecessors present",
+        "0200000000000000  # count",
+        "a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2  # commit",
+        "0000000000000000  # predecessors count",
+        "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1  # commit (out of order)",
+        "0000000000000000  # predecessors count"
+      ]
+    },
+    {
+      "name": "operation commit_predecessors repeat",
+      "error": "duplicate",
+      "bytes": [
+        "06  # kind: operation",
+        "e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1  # view_id",
+        "0000000000000000  # parents count",
+        "0000000000000000  # metadata.start.millis",
+        "00000000  # metadata.start.tz_offset",
+        "0000000000000000  # metadata.end.millis",
+        "00000000  # metadata.end.tz_offset",
+        "0000000000000000  # metadata.description length",
+        "0000000000000000  # metadata.hostname length",
+        "0000000000000000  # metadata.username length",
+        "01  # metadata.is_snapshot byte 1",
+        "00  # metadata.workspace_name tag",
+        "0000000000000000  # metadata.attributes count",
+        "01  # commit_predecessors present",
+        "0200000000000000  # count",
+        "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1  # commit",
+        "0000000000000000  # predecessors count",
+        "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1  # commit (repeated)",
+        "0000000000000000  # predecessors count"
+      ]
+    },
+    {
+      "name": "view heads unsorted",
+      "error": "unsorted",
+      "bytes": [
+        "07  # kind: view",
+        "0200000000000000  # head_ids count",
+        "a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2  # head_ids[0]",
+        "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1  # head_ids[1]",
+        "0000000000000000  # local_bookmarks count",
+        "0000000000000000  # local_tags count",
+        "0000000000000000  # remote_views count",
+        "0000000000000000  # git_refs count",
+        "0000000000000000  # git_heads count",
+        "0000000000000000  # wc_commit_ids count"
+      ]
+    },
+    {
+      "name": "view heads repeat",
+      "error": "duplicate",
+      "bytes": [
+        "07  # kind: view",
+        "0200000000000000  # head_ids count",
+        "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1  # head_ids[0]",
+        "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1  # head_ids[1]",
+        "0000000000000000  # local_bookmarks count",
+        "0000000000000000  # local_tags count",
+        "0000000000000000  # remote_views count",
+        "0000000000000000  # git_refs count",
+        "0000000000000000  # git_heads count",
+        "0000000000000000  # wc_commit_ids count"
+      ]
+    },
+    {
+      "name": "view bookmark repeats",
+      "error": "duplicate",
+      "bytes": [
+        "07  # kind: view",
+        "0000000000000000  # head_ids count",
+        "0200000000000000  # local_bookmarks count",
+        "0400000000000000  # key length",
+        "6d61696e  # key \"main\"",
+        "0100000000000000  # main terms",
+        "01  # present",
+        "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1  # commit",
+        "0400000000000000  # key length",
+        "6d61696e  # key \"main\"",
+        "0100000000000000  # main terms",
+        "01  # present",
+        "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1  # commit",
+        "0000000000000000  # local_tags count",
+        "0000000000000000  # remote_views count",
+        "0000000000000000  # git_refs count",
+        "0000000000000000  # git_heads count",
+        "0000000000000000  # wc_commit_ids count"
+      ]
+    },
+    {
+      "name": "view bookmarks unsorted by raw bytes",
+      "error": "unsorted",
+      "bytes": [
+        "07  # kind: view",
+        "0000000000000000  # head_ids count",
+        "0200000000000000  # local_bookmarks count",
+        "0100000000000000  # key length",
+        "62  # key \"b\"",
+        "0100000000000000  # b terms",
+        "01  # present",
+        "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1  # commit",
+        "0200000000000000  # key length",
+        "6161  # key \"aa\"",
+        "0100000000000000  # aa terms",
+        "01  # present",
+        "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1  # commit",
+        "0000000000000000  # local_tags count",
+        "0000000000000000  # remote_views count",
+        "0000000000000000  # git_refs count",
+        "0000000000000000  # git_heads count",
+        "0000000000000000  # wc_commit_ids count"
+      ]
+    },
+    {
+      "name": "view ref target with 4 terms",
+      "error": "merge",
+      "bytes": [
+        "07  # kind: view",
+        "0000000000000000  # head_ids count",
+        "0100000000000000  # local_bookmarks count",
+        "0100000000000000  # key length",
+        "78  # key \"x\"",
+        "0400000000000000  # x terms 4",
+        "00  # absent",
+        "00  # absent",
+        "00  # absent",
+        "00  # absent",
+        "0000000000000000  # local_tags count",
+        "0000000000000000  # remote_views count",
+        "0000000000000000  # git_refs count",
+        "0000000000000000  # git_heads count",
+        "0000000000000000  # wc_commit_ids count"
+      ]
+    },
+    {
+      "name": "view ref target option tag 2",
+      "error": "option",
+      "bytes": [
+        "07  # kind: view",
+        "0000000000000000  # head_ids count",
+        "0100000000000000  # local_bookmarks count",
+        "0100000000000000  # key length",
+        "78  # key \"x\"",
+        "0100000000000000  # x terms",
+        "02  # option tag 2",
+        "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1  # commit",
+        "0000000000000000  # local_tags count",
+        "0000000000000000  # remote_views count",
+        "0000000000000000  # git_refs count",
+        "0000000000000000  # git_heads count",
+        "0000000000000000  # wc_commit_ids count"
+      ]
+    },
+    {
+      "name": "view remote ref state 2",
+      "error": "state",
+      "bytes": [
+        "07  # kind: view",
+        "0000000000000000  # head_ids count",
+        "0000000000000000  # local_bookmarks count",
+        "0000000000000000  # local_tags count",
+        "0100000000000000  # remote_views count",
+        "0400000000000000  # remote length",
+        "7465616d  # remote \"team\"",
+        "0100000000000000  # bookmarks count",
+        "0400000000000000  # key length",
+        "6d61696e  # key \"main\"",
+        "0100000000000000  # target terms",
+        "01  # present",
+        "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1  # commit",
+        "02  # state 2"
+      ]
+    }
+  ]
+}

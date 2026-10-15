@@ -1,0 +1,39 @@
+# An installation exercising every part of the chart: CI renders it, and checks the ok.yaml it
+# makes with ok config check.
+domain: example.com
+installation: Example ok
+publicURL: https://ok.example.com
+identity:
+  bootstrapAdmins: [ada]
+  treeRepository: infra
+config:
+  identity:
+    sign_in:
+      oidc:
+        - {id: google, name: Google, issuer: https://accounts.google.com, client_id: abc.apps.googleusercontent.com, client_secret_file: /etc/ok/secrets/oidc/client-secret}
+    system_of_record:
+      static: {file: /etc/ok/secrets/people/people.yaml}
+  scm:
+    objects: {endpoint: https://s3.us-east-1.amazonaws.com, bucket: example-ok-scm, region: us-east-1}
+  automation:
+    logs: {endpoint: https://s3.us-east-1.amazonaws.com, bucket: example-ok-logs, region: us-east-1}
+server:
+  extraSecretMounts:
+    - {name: oidc, secretName: ok-oidc, mountPath: /etc/ok/secrets/oidc}
+    - {name: people, secretName: ok-people, mountPath: /etc/ok/secrets/people}
+ingress:
+  enabled: true
+  className: nginx
+  annotations: {nginx.ingress.kubernetes.io/backend-protocol: GRPC}
+worker:
+  checkout: virtual
+  dockerConfigSecret: registry-credentials
+  bazelFlags: ["--remote_cache=grpcs://cache.example.com"]
+deploy:
+  enabled: true
+  migrationEnv:
+    APP_DATABASE_URL: {secretName: app-database, key: url}
+  grants:
+    - {namespace: shop, deployment: api, accounts: [api]}
+    - {namespace: shop, statefulset: db}
+  admissionPolicy: {enabled: true}

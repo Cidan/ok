@@ -1,0 +1,59 @@
+{{- define "ok.grant" -}}
+{{- $root := .root -}}
+{{- $g := .grant -}}
+{{- $workload := $g.deployment | default $g.statefulset -}}
+{{- if not $workload }}{{ fail "a deploy.grants entry names a deployment or a statefulset" }}{{ end -}}
+{{- if and $g.deployment $g.statefulset }}{{ fail "a deploy.grants entry names a deployment or a statefulset, not both" }}{{ end }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "ok.name" $root }}-deploy-{{ $workload }}
+  namespace: {{ $g.namespace }}
+  labels: {{- include "ok.labels" $root | nindent 4 }}
+rules:
+  {{- if $g.deployment }}
+  - apiGroups: [apps]
+    resources: [deployments]
+    resourceNames: [{{ $g.deployment }}, {{ $g.deployment }}-green]
+    verbs: [get, update, patch]
+  # RBAC cannot name what is created: the admission policy admits only the green copy.
+  - apiGroups: [apps]
+    resources: [deployments]
+    verbs: [create]
+  {{- else }}
+  - apiGroups: [apps]
+    resources: [statefulsets]
+    resourceNames: [{{ $g.statefulset }}]
+    verbs: [get, update, patch]
+  {{- end }}
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch]
+  # A verb no Kubernetes component reads: the admission policy lets the deployer run a pod
+  # template only as an account its grants name.
+  - apiGroups: [""]
+    resources: [serviceaccounts]
+    resourceNames: {{ toJson ($g.accounts | default (list "default")) }}
+    verbs: [deploy]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "ok.name" $root }}-deploy-{{ $workload }}
+  namespace: {{ $g.namespace }}
+  labels: {{- include "ok.labels" $root | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "ok.name" $root }}-deploy-{{ $workload }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "ok.name" $root }}-deploy
+    namespace: {{ $root.Release.Namespace }}
+{{- end -}}
+{{- if .Values.deploy.enabled }}
+{{- range .Values.deploy.grants }}
+---
+{{ include "ok.grant" (dict "root" $ "grant" .) }}
+{{- end }}
+{{- end }}

@@ -1,0 +1,255 @@
+package pages
+
+import (
+	"github.com/Cidan/ok/internal/web/breadcrumb"
+	"github.com/Cidan/ok/internal/web/clipboard"
+	"github.com/Cidan/ok/internal/web/layout"
+	"github.com/Cidan/ok/internal/web/nav"
+)
+
+// The repository browser: every path below a repository's root (its root is the landing,
+// RepoViewPage). The whole content region, edge to edge: the repository's header across the
+// top, the Files panel — the tree — down the left, and the pane on the right, which shows the
+// path: a directory's listing and README, a file, or a file's blame.
+//
+// Regions, smallest first (docs/web.md, "Navigation & hydration"):
+//   - The pane, #browse-main, a nested hydration boundary: every navigation within the browser
+//     (the tree, a listing, the breadcrumb, Blame) swaps it alone, so only it fades; the header
+//     and the tree stay put. tree.js follows each swap to select the path in the tree.
+//   - A folder's rows in the tree, fetched the first time it opens, into a [data-live] tree:
+//     they appear in place, with no fade.
+//   - #content: entering the browser (from the landing, a commit, a CL) or leaving it (to the
+//     landing, a commit, History) changes the layout, so the whole content region swaps.
+
+// RepoBrowsePage / RepoBrowseContent render the browser; RepoBrowseContent is what replaces
+// #content on entering it.
+templ RepoBrowsePage(n nav.Model, v BrowseView) {
+	@layout.Shell(shell(browseTitle(v), layout.LeftNav, n)) {
+		@RepoBrowseContent(v)
+	}
+}
+
+templ RepoBrowseContent(v BrowseView) {
+	<div data-browser data-tree="open" class="group/browser flex h-full flex-1 flex-col overflow-hidden">
+		<div class="shrink-0">
+			@PageHeadWide(v.Chrome.Name, v.Chrome.Subtitle, "") {
+				@changesLink(v.Chrome.ChangesHref, "#content")
+				@codeButton(v.Chrome.Clone)
+			}
+		</div>
+		<div class="flex min-h-0 flex-1 gap-6 pl-6 sm:pl-10">
+			@fileTree(v)
+			<div id="browse-main" data-hydrate class="hydrating min-w-0 flex-1 overflow-y-auto pr-6 sm:pr-10">
+				@RepoBrowseMain(v)
+			</div>
+		</div>
+	</div>
+}
+
+// RepoBrowseMain is the pane: what ServeBrowse returns alone when a navigation targets
+// #browse-main. Its root names the path it shows (data-browse-path, data-browse-kind), which
+// tree.js selects in the tree after each swap.
+templ RepoBrowseMain(v BrowseView) {
+	<div data-browse-path={ v.Path } data-browse-kind={ v.Kind } class="pb-16">
+		<div class="mb-4 flex min-h-9 items-center gap-2">
+			<button type="button" data-tree-toggle title="Show Files" aria-label="Show Files" class={ iconBtnClass, "hidden md:group-data-[tree=closed]/browser:inline-flex" }>
+				@iconSidebar()
+			</button>
+			@breadcrumb.Trail(v.Chrome.Crumbs, "")
+			@clipboard.Button(v.Path, iconBtnClass+" inline-flex") {
+				<span data-copy-idle title="Copy Path">
+					@iconCopy()
+				</span>
+				<span data-copy-done class="hidden text-emerald-400">
+					@iconCheck()
+				</span>
+			}
+		</div>
+		switch v.Kind {
+			case BrowseDirKind:
+				if v.Dir != nil {
+					@browseDir(*v.Dir)
+				}
+			case BrowseFileKind:
+				if v.File != nil {
+					@fileCard(*v.File)
+				}
+			case BrowseBlameKind:
+				if v.Blame != nil {
+					@browseBlame(*v.Blame)
+				}
+		}
+	</div>
+}
+
+// fileTree is the Files panel: its header (with the control that hides it), the revision being
+// browsed, and the tree. A folder's rows are fetched the first time it opens (treeFolder); the
+// tree is a live region, so they appear without a fade. Hidden below md, where the pane takes
+// the width, and while the reader has hidden it (data-tree, kept by tree.js).
+templ fileTree(v BrowseView) {
+	<aside class="flex w-72 shrink-0 flex-col pb-6 max-md:hidden group-data-[tree=closed]/browser:hidden">
+		@panelFill() {
+			@panelHead() {
+				<h3>Files</h3>
+				<span class="flex-1"></span>
+				<button type="button" data-tree-toggle title="Hide Files" aria-label="Hide Files" class={ iconBtnClass, "-mr-1.5 inline-flex" }>
+					@iconSidebar()
+				</button>
+			}
+			<div class="flex shrink-0 px-3 pt-3 pb-2">
+				@atChip(v.Chrome.At, "#content")
+			</div>
+			<nav data-tree data-live aria-label="Files" class="min-h-0 flex-1 overflow-y-auto px-2 pb-2">
+				<ul role="tree">
+					@treeNodes(v.Tree)
+				</ul>
+			</nav>
+		}
+	</aside>
+}
+
+// treeNodes are a folder's rows (the root's, or a folder's the tree fetches): what
+// ServeTreeChildren returns into the folder's list.
+templ treeNodes(nodes []TreeNode) {
+	for _, n := range nodes {
+		if n.IsDir {
+			@treeFolder(n)
+		} else {
+			@treeFile(n)
+		}
+	}
+}
+
+// treeFolder is a folder: a native <details>, so opening and closing it needs no script. Its
+// name opens it in the pane; its chevron opens it in the tree. One not rendered open fetches
+// its rows from ChildrenHref the first time it opens (hx-trigger "toggle once") into its list.
+templ treeFolder(n TreeNode) {
+	<li role="treeitem" aria-level={ treeLevel(n.Depth) }>
+		<details
+			data-tree-dir={ n.Path }
+			open?={ n.Open }
+			if !n.Open {
+				hx-get={ n.ChildrenHref }
+				hx-trigger="toggle once"
+				hx-target={ "#" + n.ChildrenID }
+				hx-swap="innerHTML"
+			}
+		>
+			<summary
+				data-tree-row
+				data-path={ n.Path }
+				if n.Current {
+					aria-current="page"
+				}
+				class={ treeRowClass, treeIndent(n.Depth), "cursor-pointer list-none [&::-webkit-details-marker]:hidden" }
+			>
+				<span data-tree-chevron class="flex h-4 w-4 shrink-0 items-center justify-center text-zinc-500 transition-transform">
+					@iconChevron()
+				</span>
+				<span class="shrink-0 text-sky-400/80">
+					@iconFolder()
+				</span>
+				<a href={ templ.SafeURL(n.Href) } hx-get={ n.Href } hx-target="#browse-main" hx-swap={ swapPane } hx-push-url="true" class="min-w-0 flex-1 truncate">{ n.Name }</a>
+			</summary>
+			<ul id={ n.ChildrenID } role="group">
+				if n.Open {
+					@treeNodes(n.Children)
+				}
+			</ul>
+		</details>
+	</li>
+}
+
+// treeFile is a file (or a symbolic link): one link, opening it in the pane.
+templ treeFile(n TreeNode) {
+	<li role="treeitem" aria-level={ treeLevel(n.Depth) }>
+		<a
+			href={ templ.SafeURL(n.Href) }
+			hx-get={ n.Href }
+			hx-target="#browse-main"
+			hx-swap={ swapPane }
+			hx-push-url="true"
+			data-tree-row
+			data-path={ n.Path }
+			if n.Current {
+				aria-current="page"
+			}
+			class={ treeRowClass, treeIndent(n.Depth) }
+		>
+			<span class="h-4 w-4 shrink-0"></span>
+			if n.IsLink {
+				<span class="shrink-0 text-zinc-400">
+					@iconSymlink()
+				</span>
+			} else {
+				<span class="shrink-0 text-zinc-500">
+					@iconFile()
+				</span>
+			}
+			<span class="min-w-0 flex-1 truncate">{ n.Name }</span>
+		</a>
+	</li>
+}
+
+// browseDir is a directory in the pane: the listing panel — the latest commit as its header,
+// the parent (..), and the entries — and the README. An entry opens in the pane; a commit, a
+// page of its own, in place of the browser (#content); the parent too, when it is the root.
+templ browseDir(d BrowseDir) {
+	@panel() {
+		@latestCommitBar(d.Latest, "#content")
+		<div class="divide-y divide-zinc-800/70">
+			if d.ParentHref != "" {
+				<div class="flex items-center gap-3 px-4 py-2.5 text-sm transition-colors hover:bg-zinc-900/40">
+					<span class="shrink-0 text-sky-400/80">
+						@iconFolder()
+					</span>
+					if d.ParentRoot {
+						<a href={ templ.SafeURL(d.ParentHref) } hx-get={ d.ParentHref } hx-target="#content" hx-swap={ swapNav } hx-push-url="true" title="Up" class="font-medium text-zinc-100">..</a>
+					} else {
+						<a href={ templ.SafeURL(d.ParentHref) } hx-get={ d.ParentHref } hx-target="#browse-main" hx-swap={ swapPane } hx-push-url="true" title="Up" class="font-medium text-zinc-100">..</a>
+					}
+				</div>
+			}
+			for _, e := range d.Entries {
+				@entryRow(e, "#browse-main", swapPane, "#content")
+			}
+		</div>
+	}
+	if d.Readme != nil {
+		@readmeCard(*d.Readme)
+	}
+}
+
+// browseBlame is a file's blame in the pane: each line beside the commit that last changed it.
+// View File opens the file in the pane; a commit, a page of its own, in place of the browser.
+templ browseBlame(b BrowseBlame) {
+	@panel() {
+		@panelHead() {
+			<h3>Blame</h3>
+			<span class="flex-1"></span>
+			if b.FileHref != "" {
+				<a href={ templ.SafeURL(b.FileHref) } hx-get={ b.FileHref } hx-target="#browse-main" hx-swap={ swapPane } hx-push-url="true" class="shrink-0 font-normal transition-colors hover:text-zinc-200">View File</a>
+			}
+		}
+		if b.Message != "" {
+			@panelEmpty() {
+				{ b.Message }
+			}
+		} else {
+			<div class="chroma overflow-x-auto">
+				<table class="w-full border-collapse font-mono text-[12.5px] leading-[1.6]">
+					<tbody>
+						for _, l := range b.Lines {
+							@blameLine(l)
+						}
+					</tbody>
+				</table>
+			</div>
+		}
+	}
+}
+
+// iconSidebar is the Files panel's show/hide control: a panel with its left column.
+templ iconSidebar() {
+	<svg class="h-4 w-4" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M1.75 1h12.5c.966 0 1.75.784 1.75 1.75v10.5A1.75 1.75 0 0 1 14.25 15H1.75A1.75 1.75 0 0 1 0 13.25V2.75C0 1.784.784 1 1.75 1ZM1.5 2.75v10.5c0 .138.112.25.25.25H5v-11H1.75a.25.25 0 0 0-.25.25ZM6.5 13.5h7.75a.25.25 0 0 0 .25-.25V2.75a.25.25 0 0 0-.25-.25H6.5Z"></path></svg>
+}

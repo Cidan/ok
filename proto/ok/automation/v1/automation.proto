@@ -1,0 +1,458 @@
+syntax = "proto3";
+
+// ok automation (docs/automation.md, "Execution"): the role that runs jobs — Bazel commands on one
+// commit — on workers, and records every run and its log.
+package ok.automation.v1;
+
+option go_package = "github.com/Cidan/ok/proto/ok/automation/v1;automationpb";
+
+import "google/protobuf/timestamp.proto";
+import "proto/ok/v1/annotations.proto";
+
+// ─── Runs: ok control's view and control of automation ───
+
+// Runs serves ok control, acting on behalf of a person it has authorized, whom each request
+// that changes something names (for_person).
+service Runs {
+  option (ok.v1.callers) = CALLER_CONTROL;
+  // Submit hands the landing queue a CL, or a stack of them bottom first, to land once post
+  // passes (docs/automation.md, "The landing queue"). ok control only: it has checked
+  // every gate but post, for the person it names.
+  rpc Submit(SubmitRequest) returns (Submission);
+  // CancelSubmission stops an active submission: nothing of it lands. A finished submission is
+  // returned as it is.
+  rpc CancelSubmission(CancelSubmissionRequest) returns (Submission);
+  // GetSubmission returns a submission with its attempts.
+  rpc GetSubmission(GetSubmissionRequest) returns (Submission);
+  // ListSubmissions lists a CL's submissions, newest first, with their attempts.
+  rpc ListSubmissions(ListSubmissionsRequest) returns (ListSubmissionsResponse);
+
+  // StartRun queues a job on a commit.
+  rpc StartRun(StartRunRequest) returns (Run);
+  rpc GetRun(GetRunRequest) returns (Run);
+  // ListRuns lists a CL's runs (one patchset's, or every patchset's), or a commit's, newest
+  // first.
+  rpc ListRuns(ListRunsRequest) returns (ListRunsResponse);
+  // CancelRun ends a queued run at once, and asks a running run's worker to stop it. A
+  // finished run is returned as it is.
+  rpc CancelRun(CancelRunRequest) returns (Run);
+  // RerunRun queues a finished run's job on its commit again, as a new run.
+  rpc RerunRun(RerunRunRequest) returns (Run);
+  // ReadLog streams a run's log from an offset: what there is, then — with follow — what is
+  // written, until the run finishes.
+  rpc ReadLog(ReadLogRequest) returns (stream LogChunk);
+  // GetPre returns a patchset's pre: its plan, the latest run of each job the plan selected,
+  // the workflow jobs it left to main, and whether pre has passed.
+  rpc GetPre(GetPreRequest) returns (Pre);
+}
+
+// ─── Pushes: the deployer's side ───
+
+// Pushes serves ok's deployer the runs that push a deployment's images (docs/deploy.md):
+// it starts, reads, and cancels them as itself.
+service Pushes {
+  option (ok.v1.callers) = CALLER_DEPLOY;
+  // StartRun queues a deployment's push: a push job, of the deploy phase, naming no person.
+  rpc StartRun(StartRunRequest) returns (Run);
+  rpc GetRun(GetRunRequest) returns (Run);
+  // CancelRun cancels a deployment's push.
+  rpc CancelRun(CancelRunRequest) returns (Run);
+}
+
+// ─── Work: the workers' side ───
+
+// Work serves automation's workers: each takes one run at a time, keeps its lease while it
+// runs it, streams its log, and records its outcome.
+service Work {
+  // Only ok's workers.
+  option (ok.v1.callers) = CALLER_WORKER;
+  // Lease assigns the oldest queued run to the calling worker, waiting up to wait_seconds for
+  // one. A response without a run means none came.
+  rpc Lease(LeaseRequest) returns (LeaseResponse);
+  // Heartbeat renews a lease. Its answer says whether the run's worker must stop it: it was
+  // canceled, it ran past its timeout, or the lease is no longer the worker's.
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  // AppendLog adds to a leased run's log, each request at its offset: a request resent after a
+  // lost answer is taken once, and a gap is refused.
+  rpc AppendLog(stream AppendLogRequest) returns (AppendLogResponse);
+  // Finish records a leased run's outcome and ends the lease.
+  rpc Finish(FinishRequest) returns (FinishResponse);
+  // Release gives a leased run back to the queue, its log cleared, without spending an
+  // attempt: its worker is shutting down, not lost.
+  rpc Release(ReleaseRequest) returns (ReleaseResponse);
+}
+
+// A job is Bazel, run on a commit's checkout, that must succeed (docs/automation.md, "The jobs, as
+// Bazel commands").
+message Job {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    KIND_BUILD = 1;  // `bazel build --keep_going` of the targets
+    KIND_TEST = 2;   // `bazel test` of the targets; args go to a lone target's test
+    KIND_RUN = 3;    // the lone target, a binary, built and run in a sandbox with args
+    // The repository's lint aspects over the targets and, for a run with a job context, its
+    // formatter in check mode over the files its change touches that exist at its commit — which
+    // the worker reads from the SCM: a change's files never travel with a job.
+    KIND_LINT = 4;
+    // Plan a patchset's pre, or post on a submission's candidate (docs/automation.md,
+    // "What runs"): the affected set, the built-in jobs, and the workflow jobs of the phase,
+    // from the workflow files at workflows_commit. Only automation starts a plan: for each
+    // patchset uploaded, and for each candidate the landing queue prepares.
+    KIND_PLAN = 5;
+    reserved 6;
+    // The lone target, a rules_oci oci_push, run on a commit of main (`bazel run`): its image
+    // built and pushed, tagged with the commit's ID, and the digest it pushed reported. Only the
+    // deployer starts one (docs/deploy.md, "Push").
+    KIND_PUSH = 7;
+  }
+  Kind kind = 1;
+  repeated string targets = 2;  // Bazel labels
+  // TEST and RUN, as the workflow file writes them: the worker expands their placeholders
+  // (docs/automation.md, "The job context") from the job context when it runs them.
+  repeated string args = 3;
+  reserved 4, 5;
+  // PLAN: the commit of main whose workflow files select the workflow jobs — main's head when
+  // the patchset was uploaded. Workflow files are read from main, never from the change.
+  bytes workflows_commit = 6;
+  // PLAN, of post: the commit the CL's pre ran on, its patchset's. The plan marks each job that
+  // nothing changed for between it and the candidate (PlannedJob.unchanged_since_pre). Empty
+  // when the patchset has no pre.
+  bytes pre_commit = 7;
+}
+
+// Why a run exists: its phase, and the CL, patchset, and job it runs for.
+message Origin {
+  enum Phase {
+    PHASE_UNSPECIFIED = 0;
+    PHASE_PRE = 1;
+    PHASE_POST = 2;
+    PHASE_MANUAL = 3;  // started by hand, by a person through ok control or an administrator
+    PHASE_DEPLOY = 4;  // a deployment's push, started by the deployer; job is the deploy's ID
+  }
+  Phase phase = 1;
+  int64 cl_number = 2;  // 0: none
+  int32 patchset = 3;
+  // The job's identity: a workflow job's defining file, phase, and name, or a built-in job's
+  // name.
+  string job = 4;
+}
+
+message Run {
+  enum Status {
+    STATUS_UNSPECIFIED = 0;
+    STATUS_QUEUED = 1;
+    STATUS_RUNNING = 2;
+    STATUS_PASSED = 3;
+    // The job failed: Bazel did not succeed, it ran past its timeout, or its commit has
+    // conflicts, so it has no checkout.
+    STATUS_FAILED = 4;
+    STATUS_CANCELED = 5;
+    STATUS_ERROR = 6;  // automation could not run it: its worker was lost twice, or failed
+  }
+  int64 id = 1;
+  int64 repository_id = 2;
+  bytes commit_id = 3;
+  Job job = 4;
+  Origin origin = 5;
+  Status status = 6;
+  string requested_by = 7;  // the principal the run was started or rerun for
+  int64 rerun_of = 8;       // 0: none
+  // 1, or 2 once a lost worker's run is queued again.
+  int32 attempt = 9;
+  string worker = 10;
+  int32 exit_code = 11;
+  string reason = 12;  // why it failed, was canceled, or errored
+  int64 log_size = 13;
+  int32 timeout_seconds = 14;
+  google.protobuf.Timestamp queued_at = 15;
+  google.protobuf.Timestamp started_at = 16;
+  google.protobuf.Timestamp finished_at = 17;
+  // Why a planned job runs: what selected it (a changed file's workflow directory, the
+  // dependency chain that made its target affected).
+  string why = 18;
+  // A push run that passed: the image it pushed.
+  repeated PushedImage pushed = 19;
+  // A post run that never ran: the pre run whose pass it carries, on the CL's patchset, where
+  // the job had the same inputs (docs/automation.md, "post"). 0: it ran.
+  int64 carried_from = 20;
+}
+
+// An image a push run pushed: where it went, and the digest of its manifest.
+message PushedImage {
+  string target = 1;      // the oci_push
+  string registry = 2;    // registry.example.com
+  string repository = 3;  // services/api
+  string digest = 4;      // sha256:<hex>
+  repeated string tags = 5;
+}
+
+message StartRunRequest {
+  int64 repository_id = 1;
+  bytes commit_id = 2;
+  Job job = 3;
+  Origin origin = 4;
+  int32 timeout_seconds = 5;  // 0: the service's default
+  string for_person = 6;      // ok control only
+}
+
+message GetRunRequest {
+  int64 id = 1;
+}
+
+message ListRunsRequest {
+  int64 repository_id = 1;
+  // A CL's runs (patchset 0: every patchset's), or a commit's.
+  int64 cl_number = 2;
+  int32 patchset = 3;
+  bytes commit_id = 4;
+  int32 limit = 5;      // 0: 100; at most 1000
+  int64 before_id = 6;  // the next page: runs older than this one
+}
+
+message ListRunsResponse {
+  repeated Run runs = 1;
+}
+
+message CancelRunRequest {
+  int64 id = 1;
+  string reason = 2;
+  string for_person = 3;  // ok control only
+}
+
+message RerunRunRequest {
+  int64 id = 1;
+  string for_person = 2;  // ok control only
+}
+
+message ReadLogRequest {
+  int64 id = 1;
+  int64 offset = 2;
+  bool follow = 3;
+}
+
+message LogChunk {
+  int64 offset = 1;
+  bytes data = 2;
+  // The log is complete: the run finished and every byte of it has been sent.
+  bool end = 3;
+}
+
+message LeaseRequest {
+  string worker = 1;  // the worker's name, unique among the workers (its pod's)
+  int32 wait_seconds = 2;
+}
+
+message LeaseResponse {
+  Run run = 1;
+  // How often to renew the lease: it lapses after three missed renewals.
+  int32 heartbeat_seconds = 2;
+  // The run's change (docs/automation.md, "The job context"), as JSON: the job context
+  // but its changed files, which the worker reads from the SCM and adds before writing the
+  // context into the checkout as ok-context.json. Empty for a run that has none (a manual
+  // run's).
+  bytes context = 3;
+}
+
+message HeartbeatRequest {
+  int64 run_id = 1;
+  string worker = 2;
+}
+
+message HeartbeatResponse {
+  enum Stop {
+    STOP_UNSPECIFIED = 0;  // keep running it
+    STOP_CANCELED = 1;     // finish it canceled
+    STOP_TIMED_OUT = 2;    // finish it failed
+    STOP_LEASE_LOST = 3;   // the run is no longer this worker's: abandon it
+  }
+  Stop stop = 1;
+  string reason = 2;
+}
+
+message AppendLogRequest {
+  int64 run_id = 1;
+  string worker = 2;
+  int64 offset = 3;
+  bytes data = 4;
+}
+
+message AppendLogResponse {
+  int64 size = 1;
+}
+
+message FinishRequest {
+  int64 run_id = 1;
+  string worker = 2;
+  Run.Status status = 3;  // PASSED, FAILED, CANCELED, or ERROR
+  int32 exit_code = 4;
+  string reason = 5;
+  // A plan run that passed: the jobs it selected, which automation queues as it records the
+  // outcome.
+  Plan plan = 6;
+  // A push run that passed: the image it pushed.
+  repeated PushedImage pushed = 7;
+}
+
+// A plan: the jobs a patchset's pre, or a candidate's post, runs, the workflow jobs it leaves
+// to main, and the change's footprint, which the landing queue decides by.
+message Plan {
+  repeated PlannedJob jobs = 1;
+  repeated SkippedJob skipped = 2;
+  repeated string affected = 3;  // the targets the change affects, by label
+  repeated string upstream = 4;  // the targets they build on
+}
+
+message PlannedJob {
+  // The job's identity: a workflow job's //<file>:<phase>:<name>, or a built-in job's name
+  // (build, lint, and test //<package>:<name> for each affected test).
+  string job = 1;
+  Job spec = 2;  // BUILD, TEST, RUN, or LINT
+  string why = 3;
+  reserved 4;
+  // Post: nothing the job reads differs between the commit pre ran on and the candidate — no
+  // target it builds, tests, or lints, nor a tool it runs, is affected between them, and its
+  // arguments name nothing of the change — so a pass of the same job in pre holds for the
+  // candidate, and is carried instead of run (Run.carried_from).
+  bool unchanged_since_pre = 5;
+}
+
+// A workflow job a plan selected but does not run: its target is not affected, so its result
+// on main stands.
+message SkippedJob {
+  string job = 1;
+  string target = 2;
+  string why = 3;
+}
+
+message GetPreRequest {
+  int64 repository_id = 1;
+  int64 cl_number = 2;
+  int32 patchset = 3;
+}
+
+// A patchset's pre.
+message Pre {
+  enum Verdict {
+    VERDICT_UNSPECIFIED = 0;
+    VERDICT_NONE = 1;     // no plan: the patchset has not been planned (yet)
+    VERDICT_PENDING = 2;  // the plan or a job has not finished
+    VERDICT_PASSED = 3;   // the plan and the latest run of every job passed
+    VERDICT_FAILED = 4;   // the plan, or the latest run of a job, did not pass
+  }
+  Verdict verdict = 1;
+  Run plan = 2;           // the plan's latest run
+  repeated Run jobs = 3;  // the latest run of each job the plan selected, in the plan's order
+  repeated SkippedJob skipped = 4;
+  bytes commit_id = 5;
+  bytes workflows_commit = 6;
+}
+
+message FinishResponse {}
+
+message SubmitRequest {
+  message CL {
+    int64 number = 1;
+    int32 patchset = 2;
+  }
+  int64 repository_id = 1;
+  repeated CL cls = 2;  // bottom first: a stack lands whole, in this order
+  string for_person = 3;
+}
+
+message CancelSubmissionRequest {
+  int64 id = 1;
+  string reason = 2;
+  string for_person = 3;  // ok control only
+}
+
+message GetSubmissionRequest {
+  int64 id = 1;
+}
+
+message ListSubmissionsRequest {
+  int64 repository_id = 1;
+  int64 cl_number = 2;
+  int32 limit = 3;  // 0: 50; at most 500
+}
+
+message ListSubmissionsResponse {
+  repeated Submission submissions = 1;
+}
+
+// A submission: what ok control handed the landing queue to land, and how it went.
+message Submission {
+  enum Status {
+    STATUS_UNSPECIFIED = 0;
+    STATUS_ACTIVE = 1;  // in the queue
+    STATUS_LANDED = 2;
+    STATUS_FAILED = 3;    // post failed, or the SCM refused it
+    STATUS_CANCELED = 4;  // by a person, or by a new patchset or the CL's leaving review
+  }
+  message CL {
+    int64 number = 1;
+    int32 patchset = 2;
+    bytes landed_commit = 3;  // once it lands
+  }
+  int64 id = 1;
+  int64 repository_id = 2;
+  repeated CL cls = 3;
+  string submitted_by = 4;
+  Status status = 5;
+  string reason = 6;  // why it failed or was canceled
+  string note = 7;    // what the queue is waiting for, while it is active
+  google.protobuf.Timestamp created_at = 8;
+  google.protobuf.Timestamp finished_at = 9;
+  repeated Attempt attempts = 10;  // newest first
+}
+
+// An attempt: a submission's candidates on one arrangement of main, and their post.
+message Attempt {
+  enum Status {
+    STATUS_UNSPECIFIED = 0;
+    STATUS_ACTIVE = 1;
+    STATUS_DISCARDED = 2;  // it no longer held for main: the queue tried another (reason)
+    STATUS_LANDED = 3;
+    STATUS_FAILED = 4;  // its failure failed the submission
+  }
+  enum Verdict {
+    VERDICT_UNSPECIFIED = 0;
+    VERDICT_PLANNING = 1;  // its post plans are being planned
+    VERDICT_WAITING = 2;   // planned: it waits for the queue to test it
+    VERDICT_TESTING = 3;
+    VERDICT_PASSED = 4;
+    VERDICT_FAILED = 5;
+  }
+  // A submission it is tested on: it speculates the submission lands first.
+  message Speculation {
+    int64 submission_id = 1;
+    repeated int64 cl_numbers = 2;
+  }
+  // One of its own candidates: a CL's patchset prepared on base, and its post.
+  message Candidate {
+    int64 cl_number = 1;
+    int32 patchset = 2;
+    bytes commit_id = 3;
+    bytes base = 4;
+    Run plan = 5;           // the latest planning run
+    repeated Run jobs = 6;  // the latest run of each job the plan selected, in its order
+    repeated SkippedJob skipped = 7;
+  }
+  int64 id = 1;
+  bytes base = 2;  // main's head it was prepared on
+  int64 base_seq = 3;
+  repeated Speculation chain = 4;
+  Status status = 5;
+  Verdict verdict = 6;
+  string reason = 7;  // why it was discarded, or failed
+  google.protobuf.Timestamp created_at = 8;
+  google.protobuf.Timestamp finished_at = 9;
+  repeated Candidate candidates = 10;
+}
+
+message ReleaseRequest {
+  int64 run_id = 1;
+  string worker = 2;
+  string reason = 3;
+}
+
+message ReleaseResponse {}

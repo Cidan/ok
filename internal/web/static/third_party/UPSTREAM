@@ -1,0 +1,17 @@
+# Browser libraries and fonts, unmodified from their upstream releases, served by ok's pages under
+# /assets/ (static.go). Each file is byte-identical to the release file named below, as jsDelivr
+# serves it from npm (https://cdn.jsdelivr.net/npm/<package>@<version>/<path>). To bump one,
+# replace its file(s) with the new release's and update its entry and license.
+#
+# file                          package                       version  path in the package          license
+htmx.min.js                     htmx.org                      4.0.0    dist/htmx.min.js              0BSD (htmx.LICENSE)
+fonts/ibm-plex-sans/*.woff2     @fontsource/ibm-plex-sans     5.3.0    files/ibm-plex-sans-latin-*   OFL-1.1 (fonts/ibm-plex-sans/LICENSE)
+#
+# sha256
+# e484d9171a9db30a39c8f16e3d709d4137f3211c659f8e6125816635033d593f  htmx.min.js
+# c4557c8a3ca4284da9445c144dd302689b723a6b95e5e4e140211a6132d8e0be  fonts/ibm-plex-sans/ibm-plex-sans-latin-300-normal.woff2
+# 6de912e531b6c98084f1b2d5e5a91bad77be4e68bc4e396e43c46fc435e5f3d9  fonts/ibm-plex-sans/ibm-plex-sans-latin-400-italic.woff2
+# 3b646991d30055a93a4ecc499713d4347953a74a947ecab435ab72070cbdab0e  fonts/ibm-plex-sans/ibm-plex-sans-latin-400-normal.woff2
+# 0717336fb31fcdcde4b8deb3675bb4a0f7f6d484864afcd6751ac29975962203  fonts/ibm-plex-sans/ibm-plex-sans-latin-500-normal.woff2
+# 8960851d691c054ed38e259bdcf1a6190d157b4203ed5bb32c632a863fb8ec2f  fonts/ibm-plex-sans/ibm-plex-sans-latin-600-normal.woff2
+# 42e7b0c143c19df9d99fd896e76b48f846edf0902d200bc29796b34d12c33aa7  fonts/ibm-plex-sans/ibm-plex-sans-latin-700-normal.woff2

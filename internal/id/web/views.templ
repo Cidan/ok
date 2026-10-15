@@ -1,0 +1,245 @@
+package web
+
+import "fmt"
+
+// page is every identity page's frame: a centered card under ok's mark. Tailwind class strings
+// are literal, so the scanner finds them.
+templ page(title, installation string) {
+	<!DOCTYPE html>
+	<html lang="en" class="h-full">
+		<head>
+			<meta charset="utf-8"/>
+			<meta name="viewport" content="width=device-width, initial-scale=1"/>
+			<meta name="referrer" content="same-origin"/>
+			<title>{ title } — { installation }</title>
+			<link rel="stylesheet" href="/id/assets/app.css"/>
+			<script src="/id/assets/passkeys.js" defer></script>
+		</head>
+		<body class="min-h-full bg-slate-950 text-slate-100 antialiased">
+			<main class="mx-auto flex min-h-screen max-w-lg flex-col justify-center px-6 py-16">
+				<div class="rounded-2xl bg-slate-900 p-8 shadow-2xl ring-1 ring-white/10">
+					<div class="flex items-center gap-4">
+						<div class="flex h-12 w-12 items-center justify-center rounded-xl bg-sky-500 text-xl font-bold text-white">ok</div>
+						<div>
+							<h1 class="text-xl font-semibold tracking-tight text-white">{ title }</h1>
+							<p class="text-sm text-slate-400">{ installation }</p>
+						</div>
+					</div>
+					{ children... }
+				</div>
+			</main>
+		</body>
+	</html>
+}
+
+templ errorText(msg string) {
+	if msg != "" {
+		<div role="alert" class="mt-6 rounded-lg bg-rose-500/15 px-4 py-3 text-sm text-rose-200 ring-1 ring-rose-500/30">{ msg }</div>
+	}
+}
+
+templ statusLine() {
+	<div id="status" role="status" class="mt-6 hidden rounded-lg px-4 py-3 text-sm"></div>
+}
+
+// LoginPage offers each way the installation signs people in.
+templ LoginPage(v LoginView) {
+	@page("Sign in", v.Installation) {
+		@errorText(v.Error)
+		<div class="mt-8 space-y-3">
+			for _, p := range v.Providers {
+				<a href={ templ.SafeURL("/id/login/oidc/" + p.ID + "?next=" + v.NextQuery) } class="flex w-full items-center justify-center rounded-xl bg-white px-5 py-3 text-base font-semibold text-slate-900 shadow transition hover:bg-slate-200">
+					Sign in with { p.Name }
+				</a>
+			}
+			if v.Passkeys {
+				<button id="passkey-login" type="button" data-begin="/id/login/passkey/begin" data-finish="/id/login/passkey/finish" data-next={ v.Next } class="flex w-full items-center justify-center rounded-xl bg-sky-500 px-5 py-3 text-base font-semibold text-white shadow transition hover:bg-sky-400 disabled:cursor-not-allowed disabled:opacity-50">
+					Sign in with a passkey
+				</button>
+			}
+		</div>
+		if v.LDAP {
+			<form method="post" action="/id/login/ldap" class="mt-8 space-y-3 border-t border-white/10 pt-6">
+				<input type="hidden" name="next" value={ v.Next }/>
+				<label class="block text-sm text-slate-300">
+					Username
+					<input name="username" autocomplete="username" required class="mt-1 block w-full rounded-lg bg-slate-800 px-3 py-2 text-slate-100 ring-1 ring-white/10 focus:outline-none focus:ring-2 focus:ring-sky-400"/>
+				</label>
+				<label class="block text-sm text-slate-300">
+					Password
+					<input name="password" type="password" autocomplete="current-password" required class="mt-1 block w-full rounded-lg bg-slate-800 px-3 py-2 text-slate-100 ring-1 ring-white/10 focus:outline-none focus:ring-2 focus:ring-sky-400"/>
+				</label>
+				<button type="submit" class="w-full rounded-xl bg-slate-700 px-5 py-3 text-base font-semibold text-white transition hover:bg-slate-600">Sign in with { v.LDAPName }</button>
+			</form>
+		}
+		@statusLine()
+	}
+}
+
+// DevicePage asks for the code a command line shows.
+templ DevicePage(v DeviceView) {
+	@page("Sign in a device", v.Installation) {
+		<p class="mt-6 text-sm leading-relaxed text-slate-300">
+			Enter the code your command line shows. You are signed in as
+			<span class="font-mono text-emerald-300">{ v.Principal }</span>.
+		</p>
+		@errorText(v.Error)
+		<form method="get" action="/id/device" class="mt-6 space-y-3">
+			<input name="code" value={ v.Code } placeholder="XXXX-XXXX" autocomplete="off" autocapitalize="characters" spellcheck="false" required class="block w-full rounded-lg bg-slate-800 px-3 py-3 text-center font-mono text-2xl tracking-widest text-slate-100 ring-1 ring-white/10 focus:outline-none focus:ring-2 focus:ring-sky-400"/>
+			<button type="submit" class="w-full rounded-xl bg-sky-500 px-5 py-3 text-base font-semibold text-white transition hover:bg-sky-400">Continue</button>
+		</form>
+	}
+}
+
+// DeviceConfirmPage asks the person to approve or deny a device's sign-in.
+templ DeviceConfirmPage(v DeviceConfirmView) {
+	@page("Approve this device?", v.Installation) {
+		<div class="mt-8 space-y-2 rounded-xl bg-slate-800/60 px-4 py-4 text-sm ring-1 ring-white/5">
+			<p><span class="text-slate-500">Device</span> <span class="font-medium text-white">{ v.Label }</span></p>
+			if v.From != "" {
+				<p><span class="text-slate-500">From</span> <span class="font-mono text-slate-200">{ v.From }</span></p>
+			}
+			<p><span class="text-slate-500">Asked</span> <span class="text-slate-200">{ v.Asked }</span></p>
+			<p><span class="text-slate-500">Code</span> <span class="font-mono text-slate-200">{ v.Code }</span></p>
+		</div>
+		<p class="mt-6 text-sm leading-relaxed text-slate-300">
+			Approving signs this device in as
+			<span class="font-mono text-emerald-300">{ v.Principal }</span>.
+			Approve only a code you started yourself, on a device you are using now.
+		</p>
+		<form method="post" action="/id/device" class="mt-6 grid grid-cols-2 gap-3">
+			<input type="hidden" name="code" value={ v.Code }/>
+			<button type="submit" name="decision" value="deny" class="rounded-xl bg-slate-700 px-5 py-3 text-base font-semibold text-white transition hover:bg-slate-600">Deny</button>
+			<button type="submit" name="decision" value="approve" class="rounded-xl bg-emerald-500 px-5 py-3 text-base font-semibold text-white transition hover:bg-emerald-400">Approve</button>
+		</form>
+	}
+}
+
+// MessagePage says how something ended.
+templ MessagePage(installation, title, message string, ok bool) {
+	@page(title, installation) {
+		if ok {
+			<div class="mt-6 rounded-lg bg-emerald-500/15 px-4 py-3 text-sm text-emerald-200 ring-1 ring-emerald-500/30">{ message }</div>
+		} else {
+			<div class="mt-6 rounded-lg bg-rose-500/15 px-4 py-3 text-sm text-rose-200 ring-1 ring-rose-500/30">{ message }</div>
+		}
+		<a href="/id/account" class="mt-6 inline-block text-sm text-sky-400 hover:text-sky-300">Your account</a>
+	}
+}
+
+// AccountPage is a person's credentials and passkeys.
+templ AccountPage(v AccountView) {
+	@page("Your account", v.Installation) {
+		<div class="mt-8 rounded-xl bg-slate-800/60 px-4 py-4 ring-1 ring-white/5">
+			<p class="font-mono text-lg font-medium text-emerald-300">{ v.Principal }</p>
+			if v.Email != "" {
+				<p class="mt-1 text-sm text-slate-400">{ v.Email }</p>
+			}
+		</div>
+		@errorText(v.Error)
+		<h2 class="mt-8 text-sm font-semibold uppercase tracking-widest text-slate-500">Devices</h2>
+		if len(v.Credentials) == 0 {
+			<p class="mt-2 text-sm text-slate-400">No device is signed in. Run <span class="font-mono">jj auth login</span> on one.</p>
+		}
+		<ul class="mt-2 divide-y divide-white/5">
+			for _, c := range v.Credentials {
+				<li class="flex items-center justify-between gap-4 py-3 text-sm">
+					<div>
+						<p class="font-medium text-white">{ c.Label }</p>
+						<p class="text-slate-400">{ c.Detail }</p>
+					</div>
+					if c.Revocable {
+						<form method="post" action="/id/account/credentials/revoke">
+							<input type="hidden" name="id" value={ c.ID }/>
+							<button type="submit" class="rounded-lg bg-slate-700 px-3 py-1.5 text-xs font-semibold text-white hover:bg-rose-600">Sign out</button>
+						</form>
+					}
+				</li>
+			}
+		</ul>
+		if v.PasskeysOn {
+			<h2 class="mt-8 text-sm font-semibold uppercase tracking-widest text-slate-500">Passkeys</h2>
+			<ul class="mt-2 divide-y divide-white/5">
+				for _, p := range v.Passkeys {
+					<li class="flex items-center justify-between gap-4 py-3 text-sm">
+						<div>
+							<p class="font-medium text-white">{ p.Label }</p>
+							<p class="text-slate-400">{ p.Detail }</p>
+						</div>
+						<form method="post" action="/id/account/passkeys/remove">
+							<input type="hidden" name="id" value={ p.ID }/>
+							<button type="submit" class="rounded-lg bg-slate-700 px-3 py-1.5 text-xs font-semibold text-white hover:bg-rose-600">Remove</button>
+						</form>
+					</li>
+				}
+			</ul>
+			<div class="mt-4 flex gap-3">
+				<input id="passkey-label" placeholder="This passkey's name" maxlength="100" class="block flex-1 rounded-lg bg-slate-800 px-3 py-2 text-sm text-slate-100 ring-1 ring-white/10 focus:outline-none focus:ring-2 focus:ring-sky-400"/>
+				<button id="passkey-add" type="button" data-begin="/id/account/passkeys/begin" data-finish="/id/account/passkeys/finish" class="rounded-xl bg-sky-500 px-4 py-2 text-sm font-semibold text-white transition hover:bg-sky-400 disabled:opacity-50">Add a passkey</button>
+			</div>
+		}
+		@statusLine()
+		<div class="mt-10 flex items-center justify-between border-t border-white/10 pt-6">
+			if v.Admin {
+				<a href="/id/admin" class="text-sm text-sky-400 hover:text-sky-300">Administration</a>
+			} else {
+				<span></span>
+			}
+			<form method="post" action="/id/logout">
+				<button type="submit" class="text-sm text-slate-400 hover:text-white">Sign out</button>
+			</form>
+		</div>
+	}
+}
+
+// AdminPage is the sync from the system of record: how it went, what waits, and the names
+// administrators set to resolve collisions.
+templ AdminPage(v AdminView) {
+	@page("Administration", v.Installation) {
+		@errorText(v.Error)
+		<div class="mt-8 rounded-xl bg-slate-800/60 px-4 py-4 text-sm ring-1 ring-white/5">
+			<p><span class="text-slate-500">System of record</span> <span class="text-white">{ v.Source }</span></p>
+			<p><span class="text-slate-500">Last sync</span> <span class="text-white">{ v.LastRun }</span></p>
+			if v.SyncError != "" {
+				<p class="mt-2 text-rose-300">{ v.SyncError }</p>
+			}
+		</div>
+		<form method="post" action="/id/admin/sync" class="mt-4">
+			<button type="submit" class="rounded-xl bg-sky-500 px-4 py-2 text-sm font-semibold text-white transition hover:bg-sky-400">Sync now</button>
+		</form>
+		if len(v.Changes) > 0 {
+			<h2 class="mt-8 text-sm font-semibold uppercase tracking-widest text-slate-500">The sync did</h2>
+			<ul class="mt-2 space-y-1 font-mono text-xs text-slate-300">
+				for _, c := range v.Changes {
+					<li>{ c }</li>
+				}
+			</ul>
+		}
+		<h2 class="mt-8 text-sm font-semibold uppercase tracking-widest text-slate-500">Waiting</h2>
+		if len(v.Waiting) == 0 {
+			<p class="mt-2 text-sm text-slate-400">Everyone the system of record holds is in the directory.</p>
+		}
+		<ul class="mt-2 divide-y divide-white/5">
+			for _, w := range v.Waiting {
+				<li class="py-3 text-sm">
+					<p class="text-slate-200">{ w.Reason }</p>
+					<form method="post" action="/id/admin/name" class="mt-2 flex gap-2">
+						<input type="hidden" name="external_id" value={ w.ExternalID }/>
+						<input type="hidden" name="group" value={ fmt.Sprint(w.Group) }/>
+						<input name="name" placeholder={ w.Placeholder } required class="block flex-1 rounded-lg bg-slate-800 px-3 py-1.5 font-mono text-slate-100 ring-1 ring-white/10 focus:outline-none focus:ring-2 focus:ring-sky-400"/>
+						<button type="submit" class="rounded-lg bg-slate-700 px-3 py-1.5 text-xs font-semibold text-white hover:bg-slate-600">Set</button>
+					</form>
+				</li>
+			}
+		</ul>
+		if len(v.Notes) > 0 {
+			<h2 class="mt-8 text-sm font-semibold uppercase tracking-widest text-slate-500">Notes</h2>
+			<ul class="mt-2 space-y-1 text-xs text-slate-400">
+				for _, n := range v.Notes {
+					<li>{ n }</li>
+				}
+			</ul>
+		}
+		<a href="/id/account" class="mt-8 inline-block text-sm text-sky-400 hover:text-sky-300">Your account</a>
+	}
+}

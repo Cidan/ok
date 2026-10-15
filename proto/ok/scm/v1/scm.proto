@@ -1,0 +1,1100 @@
+syntax = "proto3";
+
+package ok.scm.v1;
+
+option go_package = "github.com/Cidan/ok/proto/ok/scm/v1;scmpb";
+
+import "google/protobuf/timestamp.proto";
+import "proto/ok/v1/annotations.proto";
+
+// ─── Common ───
+
+// ObjectKind values are the canonical encoding's kind bytes (docs/scm.md).
+enum ObjectKind {
+  OBJECT_KIND_UNSPECIFIED = 0;
+  OBJECT_KIND_FILE = 1;
+  OBJECT_KIND_SYMLINK = 2;
+  OBJECT_KIND_TREE = 3;
+  OBJECT_KIND_COPY_HISTORY = 4;
+  OBJECT_KIND_COMMIT = 5;
+  OBJECT_KIND_OPERATION = 6;
+  OBJECT_KIND_VIEW = 7;
+  // Not an object: a tree's sizes record (encoding.EncodeTreeSizes), under the tree's ID, which
+  // ReadTreeClosure sends after each tree when asked (docs/scm.md, "Tree sizes").
+  OBJECT_KIND_TREE_SIZES = 32;
+}
+
+message ObjectRef {
+  ObjectKind kind = 1;
+  bytes id = 2;
+}
+
+// An object as its canonical body; id == BLAKE3-256(kind ‖ body). Files never travel this way.
+message EncodedObject {
+  ObjectKind kind = 1;
+  bytes id = 2;
+  bytes body = 3;
+}
+
+message ObjectResult {
+  oneof result {
+    EncodedObject object = 1;
+    ObjectRef not_found = 2;
+  }
+}
+
+// ─── Repositories ───
+
+service Repositories {
+  // People (jj) and ok's own roles: no other workload reads code.
+  option (ok.v1.callers) = CALLER_PEOPLE;
+  option (ok.v1.callers) = CALLER_CONTROL;
+  option (ok.v1.callers) = CALLER_AUTOMATION;
+  option (ok.v1.callers) = CALLER_WORKER;
+  option (ok.v1.callers) = CALLER_DEPLOY;
+  rpc CreateRepository(CreateRepositoryRequest) returns (Repository);
+  rpc RenameRepository(RenameRepositoryRequest) returns (Repository);
+  rpc GetRepository(GetRepositoryRequest) returns (Repository);
+  rpc ListRepositories(ListRepositoriesRequest) returns (ListRepositoriesResponse);
+}
+
+message Repository {
+  int64 id = 1;
+  string name = 2;
+  bytes head = 3;      // main; the root commit until the first landing
+  int64 head_seq = 4;  // head_log sequence of the head
+  google.protobuf.Timestamp created_at = 5;
+  string created_by = 6;  // the creating principal
+}
+
+message CreateRepositoryRequest {
+  string name = 1;
+  // The person the repository is created for, who becomes its creator: Review.CreateRepository's,
+  // which only ok control may call. Repositories.CreateRepository creates it for its caller, and
+  // refuses an actor.
+  string actor = 2;
+}
+message RenameRepositoryRequest {
+  int64 repository_id = 1;
+  string name = 2;
+}
+
+message GetRepositoryRequest {
+  oneof key {
+    int64 id = 1;
+    string name = 2;
+  }
+}
+
+message ListRepositoriesRequest {
+  int32 page_size = 1;
+  string page_token = 2;
+}
+message ListRepositoriesResponse {
+  repeated Repository repositories = 1;
+  string next_page_token = 2;
+}
+
+// ─── Store: jj's Backend, OpStore, and OpHeadsStore ───
+
+service Store {
+  // People (jj) and ok's own roles: no other workload reads code.
+  option (ok.v1.callers) = CALLER_PEOPLE;
+  option (ok.v1.callers) = CALLER_CONTROL;
+  option (ok.v1.callers) = CALLER_AUTOMATION;
+  option (ok.v1.callers) = CALLER_WORKER;
+  option (ok.v1.callers) = CALLER_DEPLOY;
+  // Backend.
+  rpc ReadObjects(ReadObjectsRequest) returns (stream ObjectResult);
+  rpc ReadFiles(ReadFilesRequest) returns (stream FileData);
+  rpc GetRelatedCopies(GetRelatedCopiesRequest) returns (GetRelatedCopiesResponse);
+  rpc GetCopyRecords(GetCopyRecordsRequest) returns (stream CopyRecord);
+  rpc PrefetchCommits(PrefetchCommitsRequest) returns (stream EncodedObject);
+  rpc ReadTreeClosure(ReadTreeClosureRequest) returns (stream EncodedObject);
+  // Each tree's sizes record (docs/scm.md, "Tree sizes"): what a stat in a virtual
+  // workspace needs, a directory at a time.
+  rpc ReadTreeSizes(ReadTreeSizesRequest) returns (stream TreeSizes);
+  // A dictionary of the repository's, which chunks sent as CHUNK_CODEC_ZSTD_DICT name
+  // (docs/scm.md, "Dictionaries").
+  rpc ReadDictionary(ReadDictionaryRequest) returns (Dictionary);
+
+  // OpStore and OpHeadsStore, on the operation log of one of the caller's workspaces in the
+  // repository (docs/scm.md, "Decisions", 3): each request names the workspace, and no
+  // workspace's log is ever read or changed from another. A workspace that does not exist is
+  // NOT_FOUND (CreateWorkspace makes one), and a request naming none is INVALID_ARGUMENT.
+  rpc GetOpHeads(GetOpHeadsRequest) returns (GetOpHeadsResponse);
+  rpc ReadOperations(ReadOperationsRequest) returns (stream ObjectResult);
+  // Operations in one stream: those reachable from want and not from have, each followed by
+  // its view (jj walks the log an operation at a time, its view after it).
+  rpc PrefetchOperations(PrefetchOperationsRequest) returns (stream EncodedObject);
+  rpc ResolveOperationPrefix(ResolveOperationPrefixRequest)
+      returns (ResolveOperationPrefixResponse);
+  rpc CollectOperations(CollectOperationsRequest) returns (CollectOperationsResponse);
+
+  // Every write.
+  rpc Publish(stream PublishRequest) returns (stream PublishResponse);
+}
+
+message ReadObjectsRequest {
+  int64 repository_id = 1;
+  repeated ObjectRef refs = 2;
+}
+
+message FileRange {
+  bytes file_id = 1;
+  uint64 offset = 2;
+  uint64 length = 3;  // 0 = to the end
+}
+
+message ReadFilesRequest {
+  int64 repository_id = 1;
+  repeated FileRange files = 2;
+  // Each file's manifest, not its contents: frames carry the file's size (on its first), each
+  // chunk's ID and offset, and no data. The ranges' offsets and lengths are ignored. okfs
+  // (docs/okfs.md) reads sizes and chunk lists in bulk this way, then only the chunks a read
+  // covers.
+  bool manifests_only = 3;
+  // Chunks as the SCM stores them — zstd-compressed where compressing paid — rather than
+  // decompressed: each frame names its codec and the chunk's raw length, and the client
+  // decompresses before it verifies. Unset, frames carry raw bytes.
+  bool stored = 4;
+  // With stored: the client decodes chunks compressed with one of the repository's
+  // dictionaries (CHUNK_CODEC_ZSTD_DICT), fetching each it lacks with ReadDictionary. Unset,
+  // such a chunk is sent raw.
+  bool dictionaries = 5;
+}
+
+// How a FileData frame's data encodes its chunk.
+enum ChunkCodec {
+  // The raw bytes: what a frame carries unless ReadFilesRequest.stored asked otherwise.
+  CHUNK_CODEC_UNSPECIFIED = 0;
+  // The raw bytes, as stored: compressing the chunk did not shrink it.
+  CHUNK_CODEC_RAW = 1;
+  // One zstd frame of the raw bytes.
+  CHUNK_CODEC_ZSTD = 2;
+  // One zstd frame of the raw bytes, compressed with a dictionary of the repository's, which the
+  // frame's header names (RFC 8878 §3.1.1.1.3): sent only with ReadFilesRequest.dictionaries.
+  CHUNK_CODEC_ZSTD_DICT = 3;
+}
+
+// Files stream as whole chunks, in order; the client verifies each chunk and, for a full read,
+// the file ID. A chunk is never empty, so a frame without data carries no chunk: a file with no
+// chunks (the empty file) is one frame with its size and last set.
+message FileData {
+  bytes file_id = 1;
+  uint64 size = 2;     // set on a file's first frame
+  bytes chunk_id = 3;  // empty when the frame carries no chunk
+  uint64 offset = 4;   // of this chunk within the file
+  bytes data = 5;
+  bool last = 6;  // the file's final frame
+  bool not_found = 7;
+  // With ReadFilesRequest.stored, on a frame that carries a chunk: how data encodes it, and its
+  // raw length.
+  ChunkCodec codec = 8;
+  uint32 raw_length = 9;
+}
+
+message GetRelatedCopiesRequest {
+  int64 repository_id = 1;
+  bytes copy_id = 2;
+}
+// Children before parents, deterministically ordered (jj's get_related_copies contract).
+message GetRelatedCopiesResponse {
+  repeated EncodedObject copies = 1;
+}
+
+message GetCopyRecordsRequest {
+  int64 repository_id = 1;
+  bool all_paths = 2;
+  repeated string paths = 3;
+  bytes root = 4;
+  bytes head = 5;
+}
+// Streamed in reverse topological order (jj's get_copy_records contract).
+message CopyRecord {
+  string target = 1;
+  bytes target_commit = 2;
+  string source = 3;
+  bytes source_file = 4;
+  bytes source_commit = 5;
+}
+
+// Every commit reachable from `want` (or, with op_log, from every commit the operation log of the
+// caller's workspace references) and not reachable from `have`.
+message PrefetchCommitsRequest {
+  int64 repository_id = 1;
+  repeated bytes want = 2;
+  repeated bytes have = 3;
+  bool op_log = 4;
+  int32 limit = 5;       // 0 = unlimited
+  string workspace = 6;  // whose operation log, with op_log
+}
+
+// The operations of the caller's log reachable from want — its heads when want is empty — and
+// not from have, nearest first, each followed by its view the first time one names it, at most
+// limit operations. A have the log does not hold is ignored.
+message PrefetchOperationsRequest {
+  int64 repository_id = 1;
+  repeated bytes want = 2;
+  repeated bytes have = 3;
+  int32 limit = 4;  // 0 = unlimited
+  string workspace = 5;
+}
+
+// Every tree, symlink, and copy history under a tree, limited to the given prefixes
+// (for sparse workspaces). File contents are then read with ReadFiles.
+message ReadTreeClosureRequest {
+  int64 repository_id = 1;
+  bytes tree_id = 2;
+  repeated string path_prefixes = 3;
+  // After each level of trees, their sizes records, as OBJECT_KIND_TREE_SIZES under each tree's ID.
+  bool with_sizes = 4;
+}
+
+// At most 100,000 trees; a tree the repository does not hold is left out of the answer.
+message ReadTreeSizesRequest {
+  int64 repository_id = 1;
+  repeated bytes tree_ids = 2;
+}
+
+message ReadDictionaryRequest {
+  int64 repository_id = 1;
+  // As a chunk's zstd frame names it.
+  uint32 id = 2;
+}
+
+// A zstd dictionary (RFC 8878 §5), whose header carries its ID. It holds pieces of the
+// repository's files, so it is read only through the repository.
+message Dictionary {
+  uint32 id = 1;
+  bytes body = 2;
+}
+
+message TreeSizes {
+  bytes tree_id = 1;
+  // encoding.EncodeTreeSizes: one size per entry of the tree, in its order — a file's length, a
+  // symlink target's, 0 for a subtree.
+  bytes record = 2;
+}
+
+message GetOpHeadsRequest {
+  int64 repository_id = 1;
+  string workspace = 2;
+}
+
+message ReadOperationsRequest {
+  int64 repository_id = 1;
+  repeated ObjectRef refs = 2;  // operations and views
+  string workspace = 3;
+}
+message GetOpHeadsResponse {
+  repeated bytes op_ids = 1;
+}  // never empty; the root op at first
+
+message ResolveOperationPrefixRequest {
+  int64 repository_id = 1;
+  bytes prefix = 2;  // whole bytes; an odd nibble sits in the high half of the last byte
+  bool odd_nibble = 3;
+  string workspace = 4;
+}
+message ResolveOperationPrefixResponse {
+  enum Resolution {
+    RESOLUTION_UNSPECIFIED = 0;
+    RESOLUTION_NO_MATCH = 1;
+    RESOLUTION_SINGLE = 2;
+    RESOLUTION_AMBIGUOUS = 3;
+  }
+  Resolution resolution = 1;
+  bytes op_id = 2;
+}
+
+message CollectOperationsRequest {
+  int64 repository_id = 1;
+  repeated bytes head_ids = 2;
+  google.protobuf.Timestamp keep_newer = 3;
+  string workspace = 4;
+}
+message CollectOperationsResponse {}
+
+message ChunkRef {
+  bytes id = 1;
+  uint32 length = 2;
+}
+
+message FileManifest {
+  bytes file_id = 1;
+  uint64 size = 2;
+  repeated ChunkRef chunks = 3;  // in file order
+  string path_hint = 4;          // the path it was written at; orders chunks in packs
+}
+
+message ChunkData {
+  bytes id = 1;
+  bytes data = 2;
+}
+
+message OpHeadsUpdate {
+  repeated bytes old_ids = 1;
+  bytes new_id = 2;
+}
+
+// begin → (missing) → object* chunk* → commit → (done)
+message PublishRequest {
+  message Begin {
+    int64 repository_id = 1;
+    repeated ObjectRef objects = 2;  // every staged object except files
+    repeated FileManifest files = 3;
+    // The workspace whose operation log the operations and views go to — named whenever the
+    // publish carries any, or moves the heads; objects alone are the repository's. Its views may
+    // name only its own working copy, and its operations only itself.
+    string workspace = 4;
+  }
+  message Commit {
+    OpHeadsUpdate op_heads = 1;  // unset: store the objects only
+  }
+  oneof step {
+    Begin begin = 1;
+    EncodedObject object = 2;
+    ChunkData chunk = 3;
+    Commit commit = 4;
+  }
+}
+
+message PublishResponse {
+  message Missing {
+    repeated ObjectRef objects = 1;
+    repeated bytes chunks = 2;
+  }
+  message Done {
+    repeated bytes op_heads = 1;
+  }
+  oneof step {
+    Missing missing = 1;
+    Done done = 2;
+  }
+}
+
+// Returned in the status details of a FAILED_PRECONDITION publish.
+message PublishRejection {
+  repeated ObjectRef missing = 1;  // referenced but neither stored nor sent
+  string message = 2;
+}
+
+// ─── ChangeLists ───
+
+// ChangeLists is uploads and reads, for people and ok's roles.
+service ChangeLists {
+  // People (jj) and ok's own roles: no other workload reads code.
+  option (ok.v1.callers) = CALLER_PEOPLE;
+  option (ok.v1.callers) = CALLER_CONTROL;
+  option (ok.v1.callers) = CALLER_AUTOMATION;
+  option (ok.v1.callers) = CALLER_WORKER;
+  option (ok.v1.callers) = CALLER_DEPLOY;
+  rpc Upload(UploadRequest) returns (UploadResponse);
+  rpc GetChangeList(GetChangeListRequest) returns (ChangeList);
+  rpc ListChangeLists(ListChangeListsRequest) returns (ListChangeListsResponse);
+  rpc LookupChanges(LookupChangesRequest) returns (LookupChangesResponse);
+}
+
+// Review is ok control's: what it does for the person it authorized — a CL's lifecycle and
+// rollbacks, and creating repositories.
+service Review {
+  option (ok.v1.callers) = CALLER_CONTROL;
+  // CreateRepository creates a repository for the person actor names, who becomes its creator.
+  rpc CreateRepository(CreateRepositoryRequest) returns (Repository);
+  rpc Transition(TransitionRequest) returns (TransitionResponse);
+  // Rollback creates a CL that rolls back a landed CL, and the CLs landed above it in its
+  // stack (docs/scm.md, "Rollbacks"), for the person ok control authorized.
+  rpc Rollback(RollbackRequest) returns (RollbackResponse);
+}
+
+// Landing is ok automation's landing queue, which alone moves main: candidates — the exact
+// commits post runs on — and landing them once post passes.
+service Landing {
+  option (ok.v1.callers) = CALLER_AUTOMATION;
+  rpc PrepareCandidate(PrepareCandidateRequest) returns (Candidate);
+  rpc DiscardCandidate(DiscardCandidateRequest) returns (DiscardCandidateResponse);
+  // A repository's pending candidates: automation discards those it no longer tracks.
+  rpc ListCandidates(ListCandidatesRequest) returns (ListCandidatesResponse);
+  rpc Land(LandRequest) returns (LandResponse);
+}
+
+// LandingChecks dry-runs a landing — what ok control's Submit button checks — changing nothing.
+service LandingChecks {
+  option (ok.v1.callers) = CALLER_CONTROL;
+  option (ok.v1.callers) = CALLER_AUTOMATION;
+  // DryRunLand is Land with dry_run set, whatever the request says.
+  rpc DryRunLand(LandRequest) returns (LandResponse);
+}
+
+enum ChangeListStatus {
+  CHANGE_LIST_STATUS_UNSPECIFIED = 0;
+  CHANGE_LIST_STATUS_DRAFT = 1;
+  CHANGE_LIST_STATUS_OPEN = 2;
+  CHANGE_LIST_STATUS_SUBMITTED = 3;
+  CHANGE_LIST_STATUS_ABANDONED = 4;
+}
+
+message Patchset {
+  int32 number = 1;
+  bytes commit_id = 2;
+  bytes base_commit_id = 3;
+  string uploaded_by = 4;
+  google.protobuf.Timestamp uploaded_at = 5;
+}
+
+message ChangeList {
+  int64 repository_id = 1;
+  int64 number = 2;
+  bytes change_id = 3;
+  string author = 4;  // principal
+  ChangeListStatus status = 5;
+  ChangeListStatus abandoned_from = 6;
+  int64 parent_number = 7;  // 0 = not stacked
+  int32 current_patchset = 8;
+  repeated Patchset patchsets = 9;
+  bytes landed_commit = 10;
+  string submitted_by = 11;
+  google.protobuf.Timestamp created_at = 12;
+  google.protobuf.Timestamp updated_at = 13;
+  string description = 14;  // the current patchset's; its first line is the title
+  Rollback rollback = 15;   // a rollback CL's; unset for any other CL
+}
+
+// What a rollback CL rolls back (docs/scm.md, "Rollbacks").
+message Rollback {
+  // The CLs it rolls back, in the order they landed: the one asked for, and those landed
+  // above it in its stack.
+  repeated int64 change_lists = 1;
+  repeated string paths = 2;  // the paths its first patchset rolled back
+  // The paths it left as main has them, because main changed them after the CLs landed: its
+  // author rolls them back by hand.
+  repeated string left = 3;
+}
+
+message RollbackRequest {
+  int64 repository_id = 1;
+  int64 number = 2;               // the landed CL
+  string actor = 3;               // who asked: the rollback CL's author
+  string reason = 4;              // why, which its description says
+  repeated string reviewers = 5;  // principals to assign
+}
+message RollbackResponse {
+  ChangeList change_list = 1;  // the rollback CL, open for review
+  int64 event_seq = 2;
+}
+
+// Why a rollback is refused: the detail of its FailedPrecondition.
+message RollbackRejection {
+  enum Reason {
+    REASON_UNSPECIFIED = 0;
+    REASON_NOT_LANDED = 1;
+    REASON_UNDERWAY = 2;      // an open or draft rollback CL already rolls it back
+    REASON_NOTHING_LEFT = 3;  // main has none of its changes
+    REASON_ALL_CHANGED = 4;   // main changed every path it changed, since
+  }
+  int64 number = 1;
+  Reason reason = 2;
+  string message = 3;
+  repeated string paths = 4;  // ALL_CHANGED: the paths main changed since
+}
+
+message UploadRequest {
+  enum Readiness {
+    // lint:ignore ENUM_ZERO_VALUE_SUFFIX the zero value means "leave readiness as it is", which
+    // UNSPECIFIED would not say
+    READINESS_UNCHANGED = 0;
+    READINESS_READY = 1;
+    READINESS_WIP = 2;
+  }
+  int64 repository_id = 1;
+  repeated bytes commit_ids = 2;  // bottom of the stack first
+  Readiness readiness = 3;
+  repeated string reviewers = 4;  // handles
+}
+
+message UploadResponse {
+  message Result {
+    enum Outcome {
+      OUTCOME_UNSPECIFIED = 0;
+      OUTCOME_CREATED = 1;
+      OUTCOME_NEW_PATCHSET = 2;
+      OUTCOME_UNCHANGED = 3;
+    }
+    bytes commit_id = 1;
+    int64 number = 2;
+    int32 patchset = 3;
+    Outcome outcome = 4;
+  }
+  repeated Result results = 1;
+}
+
+// Returned in the status details of a FAILED_PRECONDITION upload.
+message UploadRejection {
+  enum Reason {
+    REASON_UNSPECIFIED = 0;
+    REASON_MERGE_COMMIT = 1;
+    REASON_CONFLICTED = 2;
+    REASON_EMPTY_DESCRIPTION = 3;
+    REASON_EMPTY_CHANGE = 4;
+    REASON_UNKNOWN_BASE = 5;
+    REASON_STALE_BASE = 6;
+    REASON_NOT_AUTHOR = 7;
+    REASON_CLOSED = 8;
+    REASON_DIVERGENT_CHANGE = 9;
+    REASON_INVALID_OWNERS = 10;
+    REASON_UNKNOWN_REVIEWER = 11;
+    REASON_NO_NEW_CHANGES = 12;
+    REASON_INVALID_WORKFLOW = 13;
+  }
+  bytes commit_id = 1;
+  Reason reason = 2;
+  string message = 3;  // what to run to fix it
+  int64 number = 4;    // the CL concerned, when there is one
+  repeated string problems = 5;
+}
+
+message GetChangeListRequest {
+  int64 repository_id = 1;
+  int64 number = 2;
+}
+
+message ListChangeListsRequest {
+  int64 repository_id = 1;
+  repeated ChangeListStatus statuses = 2;
+  string author = 3;
+  int32 page_size = 4;
+  string page_token = 5;
+}
+message ListChangeListsResponse {
+  repeated ChangeList change_lists = 1;
+  string next_page_token = 2;
+}
+
+message LookupChangesRequest {
+  int64 repository_id = 1;
+  repeated bytes change_ids = 2;
+}
+message LookupChangesResponse {
+  repeated ChangeList change_lists = 1;  // only the change IDs that have a CL
+}
+
+message TransitionRequest {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    KIND_REQUEST_REVIEW = 1;
+    KIND_RETURN_TO_DRAFT = 2;
+    KIND_ABANDON = 3;
+    KIND_RESTORE = 4;
+  }
+  int64 repository_id = 1;
+  int64 number = 2;
+  Kind kind = 3;
+  string actor = 4;   // the human ok control authorized
+  string reason = 5;  // abandon only
+}
+// The CL after a transition, and the sequence number of the event it wrote: a caller
+// following the change feed has seen the transition once it has seen that event.
+message TransitionResponse {
+  ChangeList change_list = 1;
+  int64 event_seq = 2;
+}
+
+message PrepareCandidateRequest {
+  int64 repository_id = 1;
+  int64 number = 2;
+  int32 patchset = 3;
+  bytes base = 4;    // a main commit or another candidate
+  string actor = 5;  // the submitter; commits a spliced candidate
+}
+message Candidate {
+  bytes commit_id = 1;
+  bytes base = 2;
+  int64 number = 3;
+  int32 patchset = 4;
+  string prepared_by = 5;
+  google.protobuf.Timestamp prepared_at = 6;
+}
+message ListCandidatesRequest {
+  int64 repository_id = 1;
+}
+message ListCandidatesResponse {
+  repeated Candidate candidates = 1;  // oldest first
+}
+message DiscardCandidateRequest {
+  int64 repository_id = 1;
+  bytes commit_id = 2;
+}
+message DiscardCandidateResponse {}
+
+message LandRequest {
+  message Item {
+    int64 number = 1;
+    int32 patchset = 2;
+    bytes candidate = 3;  // optional
+  }
+  int64 repository_id = 1;
+  repeated Item items = 2;  // bottom of the stack first
+  string actor = 3;         // the submitter ok control authorized
+  bytes expected_head = 4;  // the head approval and automation were validated against
+  bool dry_run = 5;         // check and compute; write nothing
+}
+message LandResponse {
+  message Landed {
+    int64 number = 1;
+    bytes commit_id = 2;
+  }
+  repeated Landed landed = 1;
+  bytes head = 2;       // the new head (the would-be head on a dry run)
+  int64 event_seq = 3;  // the last event the landing wrote (0 on a dry run)
+}
+
+// Returned in the status details of a FAILED_PRECONDITION landing or candidate.
+message LandRejection {
+  enum Reason {
+    REASON_UNSPECIFIED = 0;
+    REASON_NOT_OPEN = 1;
+    REASON_STALE_PATCHSET = 2;
+    REASON_PARENT_NOT_SUBMITTED = 3;
+    REASON_CONFLICTED = 4;
+    REASON_PATH_CONFLICT = 5;
+    REASON_ALREADY_ON_MAIN = 6;
+    REASON_HEAD_MOVED = 7;
+    REASON_CANDIDATE_MISMATCH = 8;
+    REASON_UNKNOWN_BASE = 9;  // a candidate's base is neither on main nor a pending candidate
+  }
+  int64 number = 1;
+  Reason reason = 2;
+  repeated string paths = 3;
+  string message = 4;
+}
+
+// ─── Browse: code reads for ok control and automation ───
+
+service Browse {
+  // People (jj) and ok's own roles: no other workload reads code.
+  option (ok.v1.callers) = CALLER_PEOPLE;
+  option (ok.v1.callers) = CALLER_CONTROL;
+  option (ok.v1.callers) = CALLER_AUTOMATION;
+  option (ok.v1.callers) = CALLER_WORKER;
+  option (ok.v1.callers) = CALLER_DEPLOY;
+  rpc GetCommits(GetCommitsRequest) returns (GetCommitsResponse);
+  rpc Log(LogRequest) returns (LogResponse);
+  rpc ReadTree(ReadTreeRequest) returns (ReadTreeResponse);
+  rpc ReadFileAt(ReadFileAtRequest) returns (stream ReadFileAtResponse);
+  // Many paths of a commit at once — OWNERS along every changed file's directories, say: each
+  // path's value and the head of each file, or that the commit has nothing there.
+  rpc ReadFilesAt(ReadFilesAtRequest) returns (stream ReadFilesAtResponse);
+  rpc DiffTrees(DiffTreesRequest) returns (DiffTreesResponse);
+  rpc DiffFiles(DiffFilesRequest) returns (DiffFilesResponse);
+  rpc Annotate(AnnotateRequest) returns (AnnotateResponse);
+  rpc IsAncestor(IsAncestorRequest) returns (IsAncestorResponse);
+  rpc Export(ExportRequest) returns (stream ExportResponse);
+}
+
+message Signature {
+  string name = 1;
+  string email = 2;
+  int64 time_millis = 3;
+  int32 tz_offset_minutes = 4;
+}
+
+message Commit {
+  bytes id = 1;
+  repeated bytes parents = 2;
+  bytes change_id = 3;
+  string description = 4;
+  Signature author = 5;
+  Signature committer = 6;
+  repeated bytes root_tree = 7;  // Merge terms; one when resolved
+  bool conflicted = 8;
+  bool signed = 9;
+}
+
+message GetCommitsRequest {
+  int64 repository_id = 1;
+  repeated bytes commit_ids = 2;
+}
+message GetCommitsResponse {
+  repeated Commit commits = 1;
+}
+
+// main's history, newest first, optionally only the commits that changed one of the given
+// paths (a file, or a directory and anything in it).
+message LogRequest {
+  int64 repository_id = 1;
+  bytes from = 2;  // default: the head
+  repeated string path_prefixes = 3;
+  int32 page_size = 4;
+  string page_token = 5;  // either of a response's tokens
+}
+message LogResponse {
+  repeated Commit commits = 1;
+  string next_page_token = 2;  // older commits ("" when there are none)
+  string prev_page_token = 3;  // newer commits ("" when there are none)
+}
+
+enum EntryType {
+  ENTRY_TYPE_UNSPECIFIED = 0;
+  ENTRY_TYPE_FILE = 1;
+  ENTRY_TYPE_SYMLINK = 2;
+  ENTRY_TYPE_TREE = 3;
+}
+
+message TreeValue {
+  EntryType type = 1;
+  bytes id = 2;
+  bool executable = 3;
+  bytes copy_id = 4;
+  uint64 size = 5;  // files
+  string symlink_target = 6;
+}
+
+message TreeEntry {
+  string name = 1;
+  TreeValue value = 2;
+  bytes last_commit_id = 3;  // with ReadTreeRequest.last_commits
+}
+
+message ReadTreeRequest {
+  int64 repository_id = 1;
+  bytes commit_id = 2;
+  string path = 3;  // "" = the root
+  // For a commit on main: name each entry's last commit, the newest up to commit_id that
+  // changed it, and include those commits.
+  bool last_commits = 4;
+}
+message ReadTreeResponse {
+  bytes tree_id = 1;
+  repeated TreeEntry entries = 2;
+  repeated Commit commits = 3;  // the entries' last commits
+}
+
+message ReadFileAtRequest {
+  int64 repository_id = 1;
+  bytes commit_id = 2;
+  string path = 3;
+  uint64 offset = 4;
+  uint64 length = 5;  // at most; 0 = to the end
+}
+message ReadFileAtResponse {
+  TreeValue value = 1;  // first frame
+  bytes data = 2;
+}
+
+// One message per path, in the request's order. limit bounds the bytes read of each file, at most
+// 1 MiB, and limit times the paths at most 64 MiB; 0 reads none (each path's value alone).
+message ReadFilesAtRequest {
+  int64 repository_id = 1;
+  bytes commit_id = 2;
+  repeated string paths = 3;
+  uint64 limit = 4;
+}
+message ReadFilesAtResponse {
+  string path = 1;
+  TreeValue value = 2;  // unset when the commit has nothing at the path
+  bytes data = 3;       // a file's first bytes, up to the limit
+}
+
+message DiffTreesRequest {
+  int64 repository_id = 1;
+  bytes from_tree = 2;  // empty = the empty tree
+  bytes to_tree = 3;
+  repeated string path_prefixes = 4;
+  bool detect_renames = 5;  // by copy history, then content similarity
+  int32 rename_similarity_percent = 6;
+}
+message PathChange {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    KIND_ADDED = 1;
+    KIND_DELETED = 2;
+    KIND_MODIFIED = 3;
+    KIND_RENAMED = 4;
+    KIND_COPIED = 5;
+    KIND_TYPE_CHANGED = 6;
+  }
+  Kind kind = 1;
+  string path = 2;
+  string old_path = 3;  // renames and copies
+  TreeValue before = 4;
+  TreeValue after = 5;
+}
+message DiffTreesResponse {
+  repeated PathChange changes = 1;
+}
+
+message DiffFilesRequest {
+  message Pair {
+    bytes old_file = 1;  // empty = absent
+    bytes new_file = 2;
+  }
+  int64 repository_id = 1;
+  repeated Pair pairs = 2;
+  int32 context_lines = 3;
+  // Only how many lines each diff adds and removes: its hunks are left out.
+  bool stats_only = 4;
+}
+message DiffLine {
+  enum Op {
+    OP_UNSPECIFIED = 0;
+    OP_CONTEXT = 1;
+    OP_ADD = 2;
+    OP_DELETE = 3;
+  }
+  Op op = 1;
+  bytes text = 2;       // the line without its newline; files are bytes, not always UTF-8
+  bool no_newline = 3;  // the file's last line, with no terminating newline
+}
+message Hunk {
+  int32 old_start = 1;
+  int32 old_lines = 2;
+  int32 new_start = 3;
+  int32 new_lines = 4;
+  repeated DiffLine lines = 5;
+}
+message FileDiff {
+  bool binary = 1;
+  bool too_large = 2;
+  repeated Hunk hunks = 3;  // none when stats_only
+  int32 additions = 4;      // the lines the diff adds
+  int32 deletions = 5;      // and removes
+}
+message DiffFilesResponse {
+  repeated FileDiff diffs = 1;
+}
+
+message AnnotateRequest {
+  int64 repository_id = 1;
+  bytes commit_id = 2;
+  string path = 3;
+}
+message AnnotateResponse {
+  message Range {
+    int32 first_line = 1;
+    int32 line_count = 2;
+    bytes commit_id = 3;
+  }
+  repeated Range ranges = 1;
+}
+
+message IsAncestorRequest {
+  int64 repository_id = 1;
+  bytes ancestor = 2;
+  bytes descendant = 3;
+}
+message IsAncestorResponse {
+  bool is_ancestor = 1;
+}
+
+// A full checkout for automation workers: each entry's header, then its contents.
+message ExportRequest {
+  int64 repository_id = 1;
+  bytes commit_id = 2;
+  repeated string path_prefixes = 3;
+  // The entries alone, without contents: a worker that keeps a checkout lists the commit,
+  // then reads (ReadFiles) only the files it does not have.
+  bool entries_only = 4;
+}
+message ExportResponse {
+  oneof frame {
+    ExportEntry entry = 1;
+    bytes data = 2;
+  }
+}
+message ExportEntry {
+  string path = 1;
+  TreeValue value = 2;
+}
+
+// ─── Events ───
+
+service Events {
+  // ok control, ok automation, and ok's deployer follow the feed.
+  option (ok.v1.callers) = CALLER_CONTROL;
+  option (ok.v1.callers) = CALLER_AUTOMATION;
+  option (ok.v1.callers) = CALLER_DEPLOY;
+  rpc Watch(WatchRequest) returns (stream Event);
+}
+
+message WatchRequest {
+  int64 after_seq = 1;
+}
+
+message Event {
+  int64 seq = 1;
+  int64 repository_id = 2;
+  google.protobuf.Timestamp at = 3;
+  oneof kind {
+    ChangeListUploaded uploaded = 10;
+    ChangeListTransitioned transitioned = 11;
+    ChangeListLanded landed = 12;
+    HeadMoved head_moved = 13;
+    RepositoryCreated repository_created = 14;
+    RepositoryRenamed repository_renamed = 15;
+  }
+  reserved 16;
+  reserved "repository_deleted";
+}
+
+message ChangeListUploaded {
+  int64 number = 1;
+  int32 patchset = 2;
+  bool created = 3;
+  string uploader = 4;
+  repeated string reviewers = 5;  // principals to assign
+  ChangeListStatus status = 6;    // after ready/wip
+}
+message ChangeListTransitioned {
+  int64 number = 1;
+  ChangeListStatus from = 2;
+  ChangeListStatus to = 3;
+  string actor = 4;
+  string reason = 5;
+}
+message ChangeListLanded {
+  int64 number = 1;
+  int32 patchset = 2;
+  bytes commit_id = 3;
+  string submitter = 4;
+}
+message HeadMoved {
+  bytes old_head = 1;
+  bytes new_head = 2;
+  int64 head_seq = 3;
+}
+message RepositoryCreated {
+  string name = 1;
+  string created_by = 2;
+}
+message RepositoryRenamed {
+  string old_name = 1;
+  string name = 2;
+}
+
+// ─── Workspaces: each workspace's operation log, and okfs's leases and checkpoints ───
+
+// A person's workspaces of a repository, keyed by (repository, caller, workspace name): each its
+// own operation log (docs/scm.md, "Decisions", 3), which machine holds its lease, and its
+// checkpoints — what its working copy held, moment to moment, outside the operation log
+// (docs/okfs.md). Every call is about the caller's own workspaces.
+service Workspaces {
+  // People (jj) and ok's own roles: no other workload reads code.
+  option (ok.v1.callers) = CALLER_PEOPLE;
+  option (ok.v1.callers) = CALLER_CONTROL;
+  option (ok.v1.callers) = CALLER_AUTOMATION;
+  option (ok.v1.callers) = CALLER_WORKER;
+  option (ok.v1.callers) = CALLER_DEPLOY;
+  // Takes a workspace's lease for a machine. Held by another machine whose lease has not expired,
+  // it is refused — or, with takeover, the holder is asked to hand over and the call answers
+  // granted = false until it has (or its lease expires); call again.
+  rpc Attach(AttachRequest) returns (AttachResponse);
+  // Extends a lease. FAILED_PRECONDITION when the lease is no longer the caller's.
+  rpc Renew(RenewRequest) returns (RenewResponse);
+  rpc Release(ReleaseRequest) returns (ReleaseResponse);
+  // Records a checkpoint whose trees the SCM already holds (published first). It becomes the
+  // workspace's latest when the caller holds the current lease and its parent is the latest;
+  // otherwise it is kept as a fork.
+  rpc RecordCheckpoint(RecordCheckpointRequest) returns (Checkpoint);
+  rpc GetCheckpoint(GetCheckpointRequest) returns (Checkpoint);
+  rpc ListCheckpoints(ListCheckpointsRequest) returns (ListCheckpointsResponse);
+  rpc ListWorkspaces(ListWorkspacesRequest) returns (ListWorkspacesResponse);
+  // Makes a workspace of the caller's, with an operation log of its own that holds only the root
+  // operation. ALREADY_EXISTS when the caller has a workspace of that name.
+  rpc CreateWorkspace(CreateWorkspaceRequest) returns (WorkspaceState);
+}
+
+message CreateWorkspaceRequest {
+  int64 repository_id = 1;
+  string workspace = 2;
+}
+
+// A lease on a workspace: the machine holding it, and the epoch it was granted at — every grant
+// bumps the epoch, so a lease outlived by another grant is told apart from the current one.
+message Lease {
+  int64 repository_id = 1;
+  string workspace = 2;
+  string machine = 3;
+  int64 epoch = 4;
+  google.protobuf.Timestamp expires_at = 5;
+}
+
+message AttachRequest {
+  int64 repository_id = 1;
+  string workspace = 2;
+  string machine = 3;  // the attaching machine's ID
+  bool takeover = 4;   // ask the current holder to hand over
+}
+message AttachResponse {
+  bool granted = 1;
+  Lease lease = 2;    // when granted
+  string holder = 3;  // when not: the machine holding it
+  google.protobuf.Timestamp holder_expires_at = 4;
+  Checkpoint latest = 5;  // the workspace's latest checkpoint, if any
+}
+
+message RenewRequest {
+  Lease lease = 1;
+}
+message RenewResponse {
+  Lease lease = 1;
+  string takeover_by = 2;  // another machine has asked to take over: hand over
+}
+
+message ReleaseRequest {
+  Lease lease = 1;
+}
+message ReleaseResponse {}
+
+message Checkpoint {
+  int64 id = 1;
+  int64 repository_id = 2;
+  string workspace = 3;
+  string machine = 4;
+  int64 parent_id = 5;  // 0: none
+  repeated bytes tree_ids =
+      6;                     // the working copy's tree, as a merge's terms (a commit's root_tree)
+  bytes base_commit_id = 7;  // the working-copy commit it was taken on
+  bool fork = 8;             // recorded without the lease or off the latest
+  google.protobuf.Timestamp created_at = 9;
+}
+
+message RecordCheckpointRequest {
+  Lease lease = 1;
+  int64 parent_id = 2;  // 0: the workspace's first
+  repeated bytes tree_ids = 3;
+  bytes base_commit_id = 4;
+}
+
+message GetCheckpointRequest {
+  int64 repository_id = 1;
+  int64 id = 2;
+}
+
+message ListCheckpointsRequest {
+  int64 repository_id = 1;
+  string workspace = 2;
+  int64 before_id = 3;  // 0: from the newest
+  int32 limit = 4;      // 0: 50; at most 1,000
+}
+message ListCheckpointsResponse {
+  repeated Checkpoint checkpoints = 1;  // newest first
+}
+
+message ListWorkspacesRequest {
+  int64 repository_id = 1;
+}
+message ListWorkspacesResponse {
+  repeated WorkspaceState workspaces = 1;
+}
+message WorkspaceState {
+  string workspace = 1;
+  string holder = 2;  // "": not attached
+  int64 epoch = 3;
+  google.protobuf.Timestamp expires_at = 4;
+  string takeover_by = 5;
+  Checkpoint latest = 6;
+  // It has an operation log of its own. One without was recorded before each workspace had its
+  // own: it has no log left, and cannot be attached, only replaced by a new clone.
+  bool own_log = 7;
+}

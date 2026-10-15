@@ -1,0 +1,187 @@
+# A release, from a tag vX.Y.Z: ok for Linux and macOS, ok's jj built on each platform's own
+# runner, both images for amd64 and arm64, and the Helm chart — the binaries and their checksums on
+# the GitHub release, the images and the chart on ghcr.io.
+name: release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: read
+
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: v
+        name: The tag is the Cargo workspace's version
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          cargo_version=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
+          if [ "$version" != "$cargo_version" ]; then
+            echo "the tag says $version, and Cargo.toml's [workspace.package] says $cargo_version"; exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  ok:
+    needs: version
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Build
+        run: |
+          mkdir -p dist
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            os=${target%/*} arch=${target#*/}
+            dir="build/ok_${GITHUB_REF_NAME}_${os}_${arch}"
+            mkdir -p "$dir"
+            GOOS=$os GOARCH=$arch CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=$GITHUB_REF_NAME" -o "$dir/ok" ./cmd/ok
+            cp LICENSE README.md "$dir/"
+            tar -czf "dist/$(basename "$dir").tar.gz" -C build "$(basename "$dir")"
+          done
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ok
+          path: dist/*
+
+  jj:
+    needs: version
+    strategy:
+      matrix:
+        include:
+          - {runner: ubuntu-22.04, target: x86_64-unknown-linux-gnu, platform: linux_amd64}
+          - {runner: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu, platform: linux_arm64}
+          - {runner: macos-15, target: aarch64-apple-darwin, platform: darwin_arm64}
+          - {runner: macos-15-intel, target: x86_64-apple-darwin, platform: darwin_amd64}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build
+        run: |
+          rustup target add ${{ matrix.target }}
+          cargo build --release --locked -p ok-jj --target ${{ matrix.target }}
+          dir="build/jj_${GITHUB_REF_NAME}_${{ matrix.platform }}"
+          mkdir -p "$dir" dist
+          cp "target/${{ matrix.target }}/release/jj" LICENSE README.md "$dir/"
+          tar -czf "dist/$(basename "$dir").tar.gz" -C build "$(basename "$dir")"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: jj-${{ matrix.platform }}
+          path: dist/*
+
+  image:
+    needs: version
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        image: [ok, ok-runner]
+        platform:
+          - {runner: ubuntu-24.04, name: linux/amd64}
+          - {runner: ubuntu-24.04-arm, name: linux/arm64}
+    runs-on: ${{ matrix.platform.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: repo
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/${{ matrix.image }}" >> "$GITHUB_OUTPUT"
+      - id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: deploy/images/${{ matrix.image }}.Dockerfile
+          platforms: ${{ matrix.platform.name }}
+          build-args: VERSION=${{ github.ref_name }}
+          outputs: type=image,name=${{ steps.repo.outputs.name }},push-by-digest=true,name-canonical=true,push=true
+      - name: Keep the digest
+        run: |
+          mkdir -p digests
+          touch "digests/${DIGEST#sha256:}"
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: digests-${{ matrix.image }}-${{ strategy.job-index }}
+          path: digests/*
+
+  images:
+    needs: [version, image]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        image: [ok, ok-runner]
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: digests-${{ matrix.image }}-*
+          merge-multiple: true
+          path: digests
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: One tag for both architectures
+        working-directory: digests
+        run: |
+          repo="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/${{ matrix.image }}"
+          refs=()
+          for digest in *; do refs+=("$repo@sha256:$digest"); done
+          docker buildx imagetools create -t "$repo:${{ needs.version.outputs.version }}" -t "$repo:latest" "${refs[@]}"
+          docker buildx imagetools inspect "$repo:${{ needs.version.outputs.version }}"
+
+  chart:
+    needs: [version, images]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: azure/setup-helm@v5
+        with:
+          version: v4.1.1
+      - name: Package and push
+        run: |
+          v=${{ needs.version.outputs.version }}
+          helm package deploy/helm/ok --version "$v" --app-version "$v" -d dist
+          echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin
+          helm push "dist/ok-$v.tgz" "oci://ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/charts"
+
+  release:
+    needs: [ok, jj, images, chart]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: ok
+          path: dist
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: jj-*
+          merge-multiple: true
+          path: dist
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd dist
+          sha256sum -- *.tar.gz > SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes ./*.tar.gz SHA256SUMS

@@ -1,0 +1,111 @@
+# ok's checks on every change: the Go module and the Cargo workspace with every integration test
+# required (PostgreSQL, S3, Bazel, ok's jj, FUSE), the builds and unit tests on macOS, the Helm
+# chart, and both images.
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: okpass
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      PGHOST: 127.0.0.1
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGPASSWORD: okpass
+      AWS_ENDPOINT_URL_S3: http://127.0.0.1:59000
+      AWS_ACCESS_KEY_ID: okaccess
+      AWS_SECRET_ACCESS_KEY: oksecretkey
+      AWS_REGION: us-east-1
+      OK_TEST_INTEGRATION: require
+      OK_TEST_BAZEL: require
+      OK_TEST_JJ: require
+      USE_BAZEL_VERSION: 9.3.0
+      OK_BINARY: /tmp/ok
+      OK_JJ: ${{ github.workspace }}/target/debug/jj
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - run: rustup component add rustfmt clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/test-host
+      - name: Formatting
+        run: |
+          unformatted=$(git ls-files -z '*.go' | xargs -0 gofmt -l)
+          if [ -n "$unformatted" ]; then echo "gofmt would change:"; echo "$unformatted"; exit 1; fi
+          cargo fmt --check
+      - name: Build
+        run: |
+          go build -o /tmp/ok ./cmd/ok
+          cargo build --locked -p ok-jj
+      - name: Lint
+        run: |
+          go vet ./...
+          cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Go tests
+        run: go test ./...
+      - name: Rust tests
+        run: cargo test --locked --workspace
+
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: |
+          go build -o /tmp/ok ./cmd/ok
+          cargo build --locked -p ok-jj
+      - name: Tests needing no server
+        run: |
+          go vet ./...
+          go test ./...
+          cargo test --locked --workspace
+
+  chart:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - uses: azure/setup-helm@v5
+        with:
+          version: v4.1.1
+      - run: scripts/chart-check.sh
+
+  images:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        image: [ok, ok-runner]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: deploy/images/${{ matrix.image }}.Dockerfile
+          push: false
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}

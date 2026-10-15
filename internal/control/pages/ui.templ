@@ -1,0 +1,75 @@
+package pages
+
+// ok's UI primitives — the one way to draw a container, a header, a status chip, and a button.
+// Pages compose these instead of restyling ad hoc, so every surface shares one type scale
+// (text-sm), one case (Title Case), one border/radius vocabulary, and one header treatment.
+// The principles are documented app-neutrally in docs/web.md ("Visual design system").
+
+// panel is the one bordered container: a rounded, transparent surface. Its first child is a
+// panelHead (every panel is titled); its body follows.
+templ panel() {
+	<section class="overflow-hidden rounded-xl border border-zinc-800">
+		{ children... }
+	</section>
+}
+
+// panelFill is a panel that fills its column's height (the browser's Files panel): its header,
+// then a body the caller lets scroll (min-h-0 flex-1 overflow-y-auto).
+templ panelFill() {
+	<section class="flex min-h-0 flex-1 flex-col overflow-hidden rounded-xl border border-zinc-800">
+		{ children... }
+	</section>
+}
+
+// panelHead is a panel's header strip: fixed height, a hairline rule across the panel below it,
+// no background tint. Content is a panelTitle plus optional trailing meta/actions (push them
+// right with a flex-1 spacer), or a row of column labels for a tabular panel.
+templ panelHead() {
+	<div class="flex min-h-11 items-center gap-3 border-b border-zinc-800 px-4 py-1 text-sm font-medium text-zinc-400">
+		{ children... }
+	</div>
+}
+
+// panelTitle is the standard titled header: Title Case, the header weight/colour.
+templ panelTitle(title string) {
+	@panelHead() {
+		<h3>{ title }</h3>
+	}
+}
+
+// panelBody is the padded body for free-form panel content (definition lists, prose, chips).
+// List/table panels put their rows directly under the header instead.
+templ panelBody() {
+	<div class="px-4 py-3">
+		{ children... }
+	</div>
+}
+
+// panelEmpty is the empty state inside a panel (below its header).
+templ panelEmpty() {
+	<div class="px-4 py-8 text-center text-sm text-zinc-500">
+		{ children... }
+	</div>
+}
+
+// code is inline code/identifiers in prose (a command, a path, a ref). templ emits no space between
+// text and a following @code call, and always one space after it: write `text{ " " }` before the
+// call and continue the sentence with a word after it, never punctuation.
+templ code(s string) {
+	<span class="font-mono text-zinc-300">{ s }</span>
+}
+
+// statusDot is a chip's tone in a dot: the compact form of a status, for a list where a chip on
+// every row would crowd it (a group's services in the sub-nav, a group's row). title says what
+// the chip would.
+templ statusDot(tone, title string) {
+	<span class={ dotClass(tone) } title={ title }></span>
+}
+
+// chip is the one status/label chip: a single size (text-sm), Title Case, toned by meaning
+// (see chipClass). Content is the label, optionally with a leading icon.
+templ chip(tone string) {
+	<span class={ chipClass(tone) }>
+		{ children... }
+	</span>
+}

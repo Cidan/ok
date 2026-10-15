@@ -1,0 +1,537 @@
+syntax = "proto3";
+
+package ok.identity.v1;
+
+import "google/protobuf/timestamp.proto";
+import "proto/ok/v1/annotations.proto";
+
+option go_package = "github.com/Cidan/ok/proto/ok/identity/v1;identitypb";
+
+// Kind is what a principal is.
+enum Kind {
+  KIND_UNSPECIFIED = 0;
+  // A person, from the system of record.
+  KIND_HUMAN = 1;
+  // A workload: one of ok's roles, CI, a service; administrators make robots.
+  KIND_ROBOT = 2;
+}
+
+// Status is where a principal stands.
+enum Status {
+  STATUS_UNSPECIFIED = 0;
+  STATUS_ACTIVE = 1;
+  // Keeps its name and history, and does nothing: the system of record deactivated the person.
+  STATUS_SUSPENDED = 2;
+  // A tombstone: its name is retired for good.
+  STATUS_DELETED = 3;
+}
+
+// Principal is a person or a robot.
+message Principal {
+  // id is stable for the principal's life, across renames.
+  string id = 1;
+  // name is ada.human.<domain>, ci.robot.<domain>, or deploy.ok.robot.<domain>.
+  string name = 2;
+  Kind kind = 3;
+  Status status = 4;
+  string email = 5;
+  string display_name = 6;
+  // external_id is the system of record's ID for a person.
+  string external_id = 7;
+  google.protobuf.Timestamp created = 8;
+}
+
+enum SetKind {
+  SET_KIND_UNSPECIFIED = 0;
+  SET_KIND_GROUP = 1;
+  SET_KIND_ACL = 2;
+}
+
+// SetSource is where a set comes from.
+enum SetSource {
+  SET_SOURCE_UNSPECIFIED = 0;
+  // Declared by the groups-and-ACLs tree in a repository.
+  SET_SOURCE_TREE = 1;
+  // Mirrored from the system of record's groups.
+  SET_SOURCE_SYNCED = 2;
+}
+
+// Set is a group or an ACL.
+message Set {
+  // name is eng.group.<domain> or eng.acl.<domain>.
+  string name = 1;
+  SetKind kind = 2;
+  SetSource source = 3;
+  // owner is the ACL that owns a tree set; a synced group's is admins.acl.<domain>.
+  string owner = 4;
+  // path is a tree set's folder in its repository ("" for the root's).
+  string path = 5;
+  // members are full names, as declared.
+  repeated string members = 6;
+}
+
+// RetiredName is a name no principal or set will have again.
+message RetiredName {
+  string name = 1;
+  google.protobuf.Timestamp retired = 2;
+  string reason = 3;
+}
+
+// Directory answers who exists and who is in what. Anyone signed in may read it.
+service Directory {
+  option (ok.v1.callers) = CALLER_PEOPLE;
+  option (ok.v1.callers) = CALLER_ROBOTS;
+
+  // GetPrincipal returns a principal by name or ID, deleted ones too; NOT_FOUND for neither.
+  rpc GetPrincipal(GetPrincipalRequest) returns (GetPrincipalResponse);
+  // ListPrincipals pages through principals, by name.
+  rpc ListPrincipals(ListPrincipalsRequest) returns (ListPrincipalsResponse);
+  rpc ListRetiredNames(ListRetiredNamesRequest) returns (ListRetiredNamesResponse);
+  // GetSet returns a group or ACL by name; NOT_FOUND for none.
+  rpc GetSet(GetSetRequest) returns (GetSetResponse);
+  rpc ListSets(ListSetsRequest) returns (ListSetsResponse);
+  // ExpandSet returns every principal a set holds, through the sets it holds, active ones only.
+  rpc ExpandSet(ExpandSetRequest) returns (ExpandSetResponse);
+  // CheckMembership says whether a principal is in a set, and through what.
+  rpc CheckMembership(CheckMembershipRequest) returns (CheckMembershipResponse);
+  // CheckAdmin says whether an active principal administers ok: is in admins.acl.<domain>, or,
+  // before any tree is applied, is among the bootstrap administrators.
+  rpc CheckAdmin(CheckAdminRequest) returns (CheckAdminResponse);
+  // ListAdmins lists the active principals who administer ok, by name.
+  rpc ListAdmins(ListAdminsRequest) returns (ListAdminsResponse);
+}
+
+message ListAdminsRequest {}
+
+message ListAdminsResponse {
+  repeated string principals = 1;
+}
+
+message CheckAdminRequest {
+  string principal = 1;
+}
+
+message CheckAdminResponse {
+  bool admin = 1;
+}
+
+message GetPrincipalRequest {
+  oneof key {
+    string name = 1;
+    string id = 2;
+  }
+}
+
+message GetPrincipalResponse {
+  Principal principal = 1;
+}
+
+message ListPrincipalsRequest {
+  // kind, when set, lists only that kind.
+  Kind kind = 1;
+  // query, when set, lists only principals whose name, email, or display name contains it.
+  string query = 2;
+  // include_inactive lists suspended and deleted principals too.
+  bool include_inactive = 3;
+  int32 page_size = 4;
+  string page_token = 5;
+}
+
+message ListPrincipalsResponse {
+  repeated Principal principals = 1;
+  string next_page_token = 2;
+}
+
+message ListRetiredNamesRequest {}
+
+message ListRetiredNamesResponse {
+  repeated RetiredName names = 1;
+}
+
+message GetSetRequest {
+  string name = 1;
+}
+
+message GetSetResponse {
+  Set set = 1;
+}
+
+message ListSetsRequest {}
+
+message ListSetsResponse {
+  repeated Set sets = 1;
+}
+
+message ExpandSetRequest {
+  string name = 1;
+}
+
+message ExpandSetResponse {
+  repeated string principals = 1;
+}
+
+message CheckMembershipRequest {
+  string set = 1;
+  string principal = 2;
+}
+
+message CheckMembershipResponse {
+  bool member = 1;
+  // chain is how: the set, the sets between, and the principal.
+  repeated string chain = 2;
+}
+
+// Verify is how ok's other roles check what their callers present: a device credential, a
+// browser session.
+service Verify {
+  option (ok.v1.callers) = CALLER_SCM;
+  option (ok.v1.callers) = CALLER_CONTROL;
+  option (ok.v1.callers) = CALLER_AUTOMATION;
+  option (ok.v1.callers) = CALLER_WORKER;
+  option (ok.v1.callers) = CALLER_DEPLOY;
+
+  // GetCredential returns the principal a credential belongs to; active is false when the
+  // credential is revoked or the principal does not stand. NOT_FOUND for no such credential.
+  rpc GetCredential(GetCredentialRequest) returns (GetCredentialResponse);
+  // GetSession returns the principal a live browser session belongs to; NOT_FOUND for none.
+  rpc GetSession(GetSessionRequest) returns (GetSessionResponse);
+}
+
+message GetCredentialRequest {
+  string id = 1;
+}
+
+message GetCredentialResponse {
+  Principal principal = 1;
+  bool active = 2;
+}
+
+message GetSessionRequest {
+  // id is the session cookie's value.
+  string id = 1;
+}
+
+message GetSessionResponse {
+  Principal principal = 1;
+}
+
+// CA publishes the identity CA's certificates, which every role verifies credentials against.
+service CA {
+  option (ok.v1.callers) = CALLER_ANYONE;
+
+  rpc GetRoots(GetRootsRequest) returns (GetRootsResponse);
+}
+
+message GetRootsRequest {}
+
+message GetRootsResponse {
+  // certificates are the CA's, DER: the current one first, then any still trusted.
+  repeated bytes certificates = 1;
+}
+
+// Credential is a key's enrollment as a principal's: a machine's, or a robot's.
+message Credential {
+  string id = 1;
+  string principal = 2;
+  // label names the machine: "ada's laptop".
+  string label = 3;
+  google.protobuf.Timestamp created = 4;
+  google.protobuf.Timestamp last_issued = 5;
+  google.protobuf.Timestamp revoked = 6;
+}
+
+// Certificate is a credential's current certificate.
+message Certificate {
+  string credential = 1;
+  // chain is DER, the leaf first.
+  repeated bytes chain = 2;
+  google.protobuf.Timestamp not_after = 3;
+}
+
+// DeviceLogin is OAuth's device authorization grant (RFC 8628), for a command line: Start with the
+// key the machine made, show the person the code, and Poll until they approve it in a browser.
+service DeviceLogin {
+  option (ok.v1.callers) = CALLER_ANYONE;
+
+  rpc Start(StartRequest) returns (StartResponse);
+  rpc Poll(PollRequest) returns (PollResponse);
+}
+
+message StartRequest {
+  // public_key is the machine's key, PKIX DER: ECDSA P-256.
+  bytes public_key = 1;
+  // label names the machine.
+  string label = 2;
+}
+
+message StartResponse {
+  // device_code is the command line's secret, to poll with.
+  string device_code = 1;
+  // user_code is what the person types, or confirms, in the browser: XXXX-XXXX.
+  string user_code = 2;
+  string verification_uri = 3;
+  // verification_uri_complete carries the user code, for a link or a QR code.
+  string verification_uri_complete = 4;
+  int32 expires_in = 5;
+  // interval is how many seconds to wait between polls.
+  int32 interval = 6;
+}
+
+message PollRequest {
+  string device_code = 1;
+}
+
+// PollState is where a device login stands.
+enum PollState {
+  POLL_STATE_UNSPECIFIED = 0;
+  // Not yet approved: poll again after the interval.
+  POLL_STATE_PENDING = 1;
+  // Polling too fast: wait five seconds more than the interval.
+  POLL_STATE_SLOW_DOWN = 2;
+  POLL_STATE_DENIED = 3;
+  POLL_STATE_EXPIRED = 4;
+  // Approved: the certificate is issued.
+  POLL_STATE_APPROVED = 5;
+}
+
+message PollResponse {
+  PollState state = 1;
+  // certificate is set once approved.
+  Certificate certificate = 2;
+  // principal is who approved it.
+  string principal = 3;
+}
+
+// Credentials is a principal's own credentials: renewing the one it calls with, and seeing and
+// revoking the others.
+service Credentials {
+  option (ok.v1.callers) = CALLER_PEOPLE;
+  option (ok.v1.callers) = CALLER_ROBOTS;
+
+  // Renew issues a fresh certificate for the credential the caller calls with.
+  rpc Renew(RenewRequest) returns (RenewResponse);
+  // List lists the caller's credentials.
+  rpc List(ListCredentialsRequest) returns (ListCredentialsResponse);
+  // Revoke revokes one of the caller's credentials.
+  rpc Revoke(RevokeRequest) returns (RevokeResponse);
+  // Certify enrolls a key a robot holds, and issues its certificate: for a robot that signed in
+  // with a token its issuer signs (a Kubernetes ServiceAccount's), so that every other role checks
+  // only credentials. People sign in with DeviceLogin.
+  rpc Certify(CertifyRequest) returns (CertifyResponse);
+}
+
+message CertifyRequest {
+  // public_key is the robot's key, PKIX DER: ECDSA P-256.
+  bytes public_key = 1;
+  // label names the process: a pod's name.
+  string label = 2;
+}
+
+message CertifyResponse {
+  Certificate certificate = 1;
+}
+
+message RenewRequest {}
+
+message RenewResponse {
+  Certificate certificate = 1;
+}
+
+message ListCredentialsRequest {}
+
+message ListCredentialsResponse {
+  repeated Credential credentials = 1;
+}
+
+message RevokeRequest {
+  string id = 1;
+}
+
+message RevokeResponse {}
+
+// Waiting is a person or group of the system of record the directory cannot take yet.
+message Waiting {
+  string external_id = 1;
+  bool group = 2;
+  string reason = 3;
+}
+
+// Binding lets a robot sign in with a token another issuer signs: a Kubernetes ServiceAccount's,
+// a CI job's.
+message Binding {
+  // issuer is the token issuer's URL, as its tokens' iss claim says it.
+  string issuer = 1;
+  // subject is the tokens' sub claim: system:serviceaccount:<namespace>:<name>, or a CI system's.
+  string subject = 2;
+}
+
+// Robot is a robot with its bindings.
+message Robot {
+  Principal principal = 1;
+  repeated Binding bindings = 2;
+}
+
+// Admin is the administrators': the members of admins.acl.<domain>.
+service Admin {
+  option (ok.v1.callers) = CALLER_PEOPLE;
+
+  // Sync runs the sync from the system of record now, and returns what it did.
+  rpc Sync(SyncRequest) returns (SyncResponse);
+  // GetSyncStatus says when the sync last ran, how it ended, and what waits.
+  rpc GetSyncStatus(GetSyncStatusRequest) returns (GetSyncStatusResponse);
+  // SetName sets the handle a person gets, or the name a group gets, over the system of record's:
+  // how a collision is resolved. An empty name removes the override.
+  rpc SetName(SetNameRequest) returns (SetNameResponse);
+  rpc CreateRobot(CreateRobotRequest) returns (CreateRobotResponse);
+  // DeleteRobot deletes a robot: a tombstone, its name retired, its credentials revoked.
+  rpc DeleteRobot(DeleteRobotRequest) returns (DeleteRobotResponse);
+  rpc ListRobots(ListRobotsRequest) returns (ListRobotsResponse);
+  rpc Bind(BindRequest) returns (BindResponse);
+  rpc Unbind(UnbindRequest) returns (UnbindResponse);
+  // CertifyRobot enrolls a key a robot holds, and issues its first certificate: for a robot that
+  // runs where no issuer vouches for it.
+  rpc CertifyRobot(CertifyRobotRequest) returns (CertifyRobotResponse);
+  // RevokeCredential revokes anyone's credential.
+  rpc RevokeCredential(RevokeCredentialRequest) returns (RevokeCredentialResponse);
+  // ListCredentials lists a principal's credentials.
+  rpc ListCredentials(AdminListCredentialsRequest) returns (AdminListCredentialsResponse);
+}
+
+message SyncRequest {}
+
+message SyncResponse {
+  // changes are what the sync did, one line each.
+  repeated string changes = 1;
+  repeated Waiting waiting = 2;
+  repeated string notes = 3;
+}
+
+message GetSyncStatusRequest {}
+
+message GetSyncStatusResponse {
+  google.protobuf.Timestamp last_run = 1;
+  // error is how the last run failed; empty when it did not.
+  string error = 2;
+  repeated Waiting waiting = 3;
+  repeated string notes = 4;
+  // source names the system of record: "static", "google", "entra", "ldap", "scim".
+  string source = 5;
+}
+
+message SetNameRequest {
+  string external_id = 1;
+  bool group = 2;
+  // name is a handle (ada-l) or a group's name (eng-infra), a lowercase DNS label.
+  string name = 3;
+}
+
+message SetNameResponse {}
+
+message CreateRobotRequest {
+  // name is what comes before .robot.<domain>: ci, or deploy.ok.
+  string name = 1;
+}
+
+message CreateRobotResponse {
+  Principal principal = 1;
+}
+
+message DeleteRobotRequest {
+  string name = 1;
+}
+
+message DeleteRobotResponse {}
+
+message ListRobotsRequest {}
+
+message ListRobotsResponse {
+  repeated Robot robots = 1;
+}
+
+message BindRequest {
+  string robot = 1;
+  Binding binding = 2;
+}
+
+message BindResponse {}
+
+message UnbindRequest {
+  string robot = 1;
+  Binding binding = 2;
+}
+
+message UnbindResponse {}
+
+message CertifyRobotRequest {
+  string robot = 1;
+  // public_key is the robot's key, PKIX DER: ECDSA P-256.
+  bytes public_key = 2;
+  string label = 3;
+}
+
+message CertifyRobotResponse {
+  Certificate certificate = 1;
+}
+
+message RevokeCredentialRequest {
+  string id = 1;
+}
+
+message RevokeCredentialResponse {}
+
+message AdminListCredentialsRequest {
+  string principal = 1;
+}
+
+message AdminListCredentialsResponse {
+  repeated Credential credentials = 1;
+}
+
+// File is one file of the groups-and-ACLs tree, by its path from the tree's root.
+message File {
+  string path = 1;
+  bytes content = 2;
+}
+
+// Tree applies the groups-and-ACLs tree a repository declares: the deployer calls it when a landed
+// change touches the tree.
+service Tree {
+  option (ok.v1.callers) = CALLER_DEPLOY;
+
+  // Plan says how applying the tree would change the directory, applying nothing.
+  rpc Plan(PlanRequest) returns (PlanResponse);
+  // Apply makes the directory's tree sets the files', as of commit. An Apply of a commit older
+  // than the one applied, or a tree that would delete an ACL that still owns sets, is refused.
+  rpc Apply(ApplyRequest) returns (ApplyResponse);
+  // GetApplied says which commit's tree the directory holds.
+  rpc GetApplied(GetAppliedRequest) returns (GetAppliedResponse);
+}
+
+message PlanRequest {
+  repeated File files = 1;
+}
+
+message PlanResponse {
+  repeated string changes = 1;
+}
+
+message ApplyRequest {
+  // commit is the commit the files are at, in hex.
+  string commit = 1;
+  // sequence orders applies: the commit's position on the repository's main line. An apply whose
+  // sequence is below the applied one's is refused.
+  int64 sequence = 2;
+  repeated File files = 3;
+}
+
+message ApplyResponse {
+  repeated string changes = 1;
+}
+
+message GetAppliedRequest {}
+
+message GetAppliedResponse {
+  string commit = 1;
+  int64 sequence = 2;
+  google.protobuf.Timestamp applied = 3;
+}

@@ -1,0 +1,174 @@
+@import "tailwindcss" source(none);
+
+/* Class-bearing sources Tailwind must scan, relative to this file: the pages, and the shared
+   components they render (internal/web). A class that only appears in a file not listed here is
+   purged from app.css. */
+@source "page.templ";
+@source "repo.templ";
+@source "browse.templ";
+@source "cl.templ";
+@source "run.templ";
+@source "deploy.templ";
+@source "services.templ";
+@source "ui.templ";
+@source "web.go";
+@source "clcomments.js";
+@source "stars.js";
+@source "tree.js";
+@source "../../web/nav/nav.templ";
+@source "../../web/nav/nav.go";
+@source "../../web/layout/layout.templ";
+@source "../../web/infinitelist/infinitelist.templ";
+@source "../../web/breadcrumb/breadcrumb.templ";
+@source "../../web/clipboard/clipboard.templ";
+
+/* The browser's tree (browse.templ): a folder's chevron points down only while its own
+   <details> is open. A Tailwind group variant would follow any open folder above it. */
+[data-tree] details > summary > [data-tree-chevron] { rotate: -90deg; }
+[data-tree] details[open] > summary > [data-tree-chevron] { rotate: 0deg; }
+
+/* --- Rendered markup prose (`.markup`) ----------------------------------------------------
+   Styles for server-rendered, sanitized README/markdown HTML (ok renders markup on the
+   server; there is no client markdown lib). These target the element tree the markup service
+   emits, so they are plain CSS (not Tailwind utilities) and must not be purged. Dark zinc, as every page. */
+.markup {
+	color: #d4d4d8; /* zinc-300 */
+	font-size: 0.9375rem;
+	line-height: 1.7;
+	word-wrap: break-word;
+}
+.markup > *:first-child { margin-top: 0 !important; }
+.markup > *:last-child { margin-bottom: 0 !important; }
+.markup h1, .markup h2, .markup h3, .markup h4, .markup h5, .markup h6 {
+	margin-top: 1.75rem;
+	margin-bottom: 1rem;
+	font-weight: 600;
+	line-height: 1.3;
+	color: #fafafa; /* zinc-50 */
+	letter-spacing: -0.01em;
+}
+.markup h1 { font-size: 1.75rem; padding-bottom: 0.4em; border-bottom: 1px solid #27272a; }
+.markup h2 { font-size: 1.375rem; padding-bottom: 0.35em; border-bottom: 1px solid #27272a; }
+.markup h3 { font-size: 1.15rem; }
+.markup h4 { font-size: 1rem; }
+.markup h5 { font-size: 0.9rem; }
+.markup h6 { font-size: 0.85rem; color: #a1a1aa; }
+.markup p, .markup blockquote, .markup ul, .markup ol, .markup dl, .markup table, .markup pre, .markup details {
+	margin-top: 0; margin-bottom: 1rem;
+}
+.markup a { color: #7dd3fc; text-decoration: none; } /* sky-300 */
+.markup a:hover { text-decoration: underline; }
+.markup strong { color: #f4f4f5; font-weight: 600; }
+.markup ul, .markup ol { padding-left: 1.6em; }
+.markup ul { list-style: disc; }
+.markup ol { list-style: decimal; }
+.markup li { margin: 0.25em 0; }
+.markup li > ul, .markup li > ol { margin-top: 0.25em; margin-bottom: 0.25em; }
+.markup li.task-list-item { list-style: none; }
+.markup li.task-list-item input { margin: 0 0.4em 0 -1.4em; vertical-align: middle; }
+.markup blockquote {
+	padding: 0 1em;
+	color: #a1a1aa;
+	border-left: 0.25em solid #3f3f46;
+}
+.markup hr { height: 1px; margin: 1.75rem 0; background: #27272a; border: 0; }
+.markup code {
+	padding: 0.2em 0.4em;
+	margin: 0;
+	font-family: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+	font-size: 0.85em;
+	background: #27272a;
+	color: #e4e4e7;
+	border-radius: 6px;
+}
+.markup pre {
+	padding: 1rem 1.15rem;
+	overflow: auto;
+	font-size: 0.82rem;
+	line-height: 1.55;
+	background: #0c0c0f;
+	border: 1px solid #27272a;
+	border-radius: 10px;
+}
+.markup pre code {
+	display: inline;
+	padding: 0;
+	margin: 0;
+	font-size: inherit;
+	background: transparent;
+	border: 0;
+	border-radius: 0;
+	white-space: pre;
+}
+.markup table { display: block; width: max-content; max-width: 100%; overflow: auto; border-collapse: collapse; }
+.markup table th, .markup table td { padding: 0.5em 0.9em; border: 1px solid #27272a; }
+.markup table th { font-weight: 600; color: #f4f4f5; background: #18181b; }
+.markup table tr:nth-child(2n) td { background: #131316; }
+.markup img { max-width: 100%; border-radius: 8px; }
+.markup kbd {
+	padding: 0.15em 0.45em;
+	font-family: 'IBM Plex Mono', ui-monospace, monospace;
+	font-size: 0.78em;
+	color: #e4e4e7;
+	background: #27272a;
+	border: 1px solid #3f3f46;
+	border-radius: 6px;
+	box-shadow: inset 0 -1px 0 #3f3f46;
+}
+.markup .anchor { display: none; }
+
+/* --- Chroma dark syntax theme (`.chroma`) -------------------------------------------------
+   Token colors for server-highlighted code — both the standalone source file view (the
+   line-numbered table carries `.chroma`) and fenced code blocks inside rendered markup
+   (`.markup pre .chroma`, goldmark+chroma). One compact dark palette, purge-safe plain CSS. */
+.chroma { color: #e4e4e7; }
+.chroma .err { color: #f87171; }              /* error */
+.chroma .lntd, .chroma .ln { color: #52525b; }
+.chroma .c, .chroma .ch, .chroma .cm, .chroma .c1, .chroma .cs, .chroma .cp, .chroma .cpf { color: #6b7280; font-style: italic; } /* comment */
+.chroma .k, .chroma .kc, .chroma .kd, .chroma .kn, .chroma .kp, .chroma .kr { color: #c084fc; }  /* keyword — purple */
+.chroma .kt { color: #f0abfc; }               /* keyword.type */
+.chroma .o, .chroma .ow { color: #67e8f9; }   /* operator — cyan */
+.chroma .p { color: #a1a1aa; }                /* punctuation */
+.chroma .n, .chroma .nx { color: #e4e4e7; }   /* name */
+.chroma .na { color: #93c5fd; }               /* name.attribute */
+.chroma .nb, .chroma .bp { color: #5eead4; }  /* name.builtin */
+.chroma .nc, .chroma .nn { color: #fcd34d; }  /* class / namespace — amber */
+.chroma .nf, .chroma .fm { color: #60a5fa; }  /* function — blue */
+.chroma .nt { color: #f472b6; }               /* html/xml tag */
+.chroma .nd { color: #fcd34d; }               /* decorator */
+.chroma .nv, .chroma .vc, .chroma .vg, .chroma .vi { color: #fca5a5; } /* variable */
+.chroma .no { color: #fca5a5; }               /* constant */
+.chroma .s, .chroma .sa, .chroma .sb, .chroma .sc, .chroma .dl, .chroma .sd, .chroma .s2, .chroma .se, .chroma .sh, .chroma .si, .chroma .sx, .chroma .sr, .chroma .s1, .chroma .ss { color: #86efac; } /* string — green */
+.chroma .m, .chroma .mb, .chroma .mf, .chroma .mh, .chroma .mi, .chroma .il, .chroma .mo { color: #fdba74; } /* number — orange */
+.chroma .gd { color: #f87171; background: #2a1416; } /* diff delete */
+.chroma .gi { color: #86efac; background: #10231a; } /* diff insert */
+.chroma .gu { color: #c084fc; }
+.chroma .gh { color: #60a5fa; font-weight: 600; }
+.chroma .gp { color: #6b7280; }
+.chroma .ge { font-style: italic; }
+.chroma .gs { font-weight: 600; }
+
+/* --- Intra-line word diff (`.added-code` / `.removed-code`) --------------------------------
+   The single-commit diff renders each line via gitdiff's server-side highlighter, which wraps
+   the changed spans within an add/del line in these two classes. The whole-line background is a
+   Tailwind utility on the row; these emphasize the exact bytes that changed. Purge-safe. */
+.chroma .added-code { background: rgba(34, 197, 94, 0.28); border-radius: 2px; }
+.chroma .removed-code { background: rgba(239, 68, 68, 0.28); border-radius: 2px; }
+
+/* --- ChangeList review tabs (`.cl-tab`) ---------------------------------------------------
+   The Files / Comments / Checks tab bar switches panels client-side (clcomments.js toggles the
+   active button + the matching [data-tab-panel]); the active state is a JS-set class, so it is
+   defined here as plain purge-safe CSS rather than a Tailwind variant. */
+.cl-tab { cursor: pointer; margin-bottom: -1px; border-bottom: 2px solid transparent; padding-bottom: 0.5rem; color: #71717a; font-weight: 500; transition: color .12s ease; }
+.cl-tab:hover { color: #d4d4d8; }
+.cl-tab-active { border-bottom-color: #fafafa; color: #fafafa; }
+
+/* The Checks tab's groups (cl.templ): a group's chevron points down only while its own
+   <details> is open. */
+[data-check-group] > summary > [data-check-chevron] { rotate: -90deg; }
+[data-check-group][open] > summary > [data-check-chevron] { rotate: 0deg; }
+
+/* The inline-comment "+" gutter affordance on a diff line: hidden until the row is hovered, so
+   the diff stays clean. clcomments.js injects the composer row on click. */
+.cl-diff-row .cl-comment-add { visibility: hidden; }
+.cl-diff-row:hover .cl-comment-add { visibility: visible; }

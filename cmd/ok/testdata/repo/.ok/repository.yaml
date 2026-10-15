@@ -1,0 +1,4 @@
+build: bazel
+bazel:
+  flags: [--config=ci]
+identity: identity

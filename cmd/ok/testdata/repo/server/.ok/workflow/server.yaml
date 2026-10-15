@@ -1,0 +1,14 @@
+include:
+  - //.ok/workflow/common.yaml
+post:
+  e2e:
+    target: //server/e2e
+deploy:
+  server:
+    migrate:
+      - //server/schema:migrate
+    images:
+      server: //server:push
+    workload:
+      namespace: ok
+      deployment: server

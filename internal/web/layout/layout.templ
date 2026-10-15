@@ -1,0 +1,88 @@
+package layout
+
+import "github.com/Cidan/ok/internal/web/nav"
+
+// Shell renders a full HTML document for one view: head (the caller-supplied stylesheets +
+// deferred scripts, served by the consumer at /assets), the full-viewport dark body (h-dvh
+// overflow-hidden bg-zinc-950 text-zinc-100), and the chrome for the chosen Variant around
+// the page content (children). It is application-neutral — every /assets reference comes from
+// Props (Favicon/Styles/Scripts), so a consumer ships only the assets its pages need. It is
+// the persistent htmx SPA shell: in-app navigation htmx-GETs a route and swaps ONLY the
+// returned content fragment into <main id="content"> (see the consumer's fragment handler),
+// while the head assets and the nav rail persist across swaps; a direct/deep-link GET renders
+// this whole document. The LeftNav shell carries data-nav/data-open and the group/nav marker
+// that nav.LeftRail's collapse variants key off; nav.js flips data-open.
+templ Shell(p Props) {
+	<!DOCTYPE html>
+	<html lang="en" class="h-full">
+		<head>
+			<meta charset="UTF-8"/>
+			<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+			<meta name="theme-color" content="#09090b"/>
+			<title>{ p.Title }</title>
+			if p.Favicon != "" {
+				<link rel="icon" type="image/svg+xml" href={ templ.SafeURL(p.Favicon) }/>
+			}
+			for _, href := range p.Styles {
+				<link rel="stylesheet" href={ templ.SafeURL(href) }/>
+			}
+			<!-- Reveal is gated on hydration, not on a timer (see static/hydrate.js). Every
+			     [data-hydrate] boundary ships hidden (`hydrating` → opacity:0) so server-rendered
+			     inert markup is never shown before the client libraries process it; the runtime
+			     reveals it — a 120ms opacity fade — once hydration settles, on both the initial
+			     load and every htmx swap. Boundaries nest: a partial swap (e.g. #repo-main inside
+			     #content) fades ONLY that region. A no-JS override keeps content visible when
+			     scripts are off. The <body> keyframe fades the shell chrome in on a full load; the
+			     dark <html> bg + color-scheme avoid a white/grey flash. -->
+			<style>
+				/* color-scheme keeps the UA canvas, form controls, and scrollbars dark, so a full
+				   document load never flashes a light-grey frame/scrollbar before paint. */
+				html { background-color: #09090b; color-scheme: dark; } /* zinc-950 */
+				@keyframes shell-fade-in { from { opacity: 0 } to { opacity: 1 } }
+				body { animation: shell-fade-in 70ms ease-in-out both; }
+				[data-hydrate] { transition: opacity 120ms ease-in-out; }
+				[data-hydrate].hydrating { opacity: 0; transition: none; }
+				@media (prefers-reduced-motion: reduce) {
+					body { animation: none !important; }
+					[data-hydrate] { transition: none !important; }
+				}
+			</style>
+			<noscript>
+				<style>[data-hydrate].hydrating { opacity: 1 !important; }</style>
+			</noscript>
+			for _, src := range p.Scripts {
+				<script src={ templ.SafeURL(src) } defer></script>
+			}
+		</head>
+		<body class="preload h-dvh overflow-hidden bg-zinc-950 text-zinc-100 antialiased flex flex-col" style="font-family: 'IBM Plex Sans', sans-serif;">
+			<script>
+				// Suppress CSS transitions until webfonts are ready, so the async font-swap
+				// reflow can't animate transition-* elements (nav rail, main, composer) on load.
+				(function () {
+					function go() { if (document.body) document.body.classList.remove('preload'); }
+					(document.fonts && document.fonts.ready ? document.fonts.ready : Promise.resolve()).then(go);
+					setTimeout(go, 1500);
+				})();
+			</script>
+			if p.Variant == Navless {
+				<div class="flex-1 flex items-center justify-center p-6 overflow-y-auto">
+					{ children... }
+				</div>
+			} else if p.Variant == TopNav {
+				<div class="w-full h-full flex flex-col overflow-hidden">
+					@nav.TopBar(p.Nav)
+					<main id="content" data-hydrate hx-history-elt?={ p.HistoryRestore } class="hydrating flex-1 flex flex-col overflow-hidden">
+						{ children... }
+					</main>
+				</div>
+			} else {
+				<div data-nav="true" data-open="false" class="relative w-full h-full flex overflow-hidden group/nav">
+					@nav.LeftRail(p.Nav)
+					<main id="content" data-hydrate hx-history-elt?={ p.HistoryRestore } class="hydrating flex-1 flex flex-col h-full min-w-0 pl-0 md:pl-16">
+						{ children... }
+					</main>
+				</div>
+			}
+		</body>
+	</html>
+}

@@ -1,0 +1,94 @@
+{{- if .Values.worker.enabled }}
+# ok's workers: Bazel on each run's commit, as the robot worker.ok, which their ServiceAccount's
+# projected token certifies.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "ok.name" . }}-worker
+  labels: {{- include "ok.labels" . | nindent 4 }}
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "ok.name" . }}-worker
+  labels: {{- include "ok.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  replicas: {{ .Values.worker.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: worker
+  template:
+    metadata:
+      labels: {{- include "ok.labels" . | nindent 8 }}
+        app.kubernetes.io/component: worker
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: {{ include "ok.name" . }}-worker
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      # A worker shutting down gives its runs back: Bazel's grace, then the release.
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: worker
+          image: {{ include "ok.runnerImage" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: [worker, run, -config, /etc/ok/config/ok.yaml]
+          env:
+            - name: HOSTNAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            {{- if .Values.worker.dockerConfigSecret }}
+            - {name: DOCKER_CONFIG, value: /etc/ok/docker}
+            {{- end }}
+          ports:
+            - {name: http, containerPort: 8472}
+            - {name: metrics, containerPort: 8473}
+          # Ready while ok automation answers it. No liveness probe: an automation outage must not
+          # restart workers, whose caches take minutes to refill.
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+            periodSeconds: 10
+          securityContext: {{- toYaml .Values.worker.securityContext | nindent 12 }}
+          {{- with .Values.worker.resources }}
+          resources: {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            {{- include "ok.configMounts" . | nindent 12 }}
+            - {name: ok-token, mountPath: /var/run/secrets/ok, readOnly: true}
+            - {name: state, mountPath: /var/lib/ok}
+            - {name: tmp, mountPath: /tmp}
+            {{- if eq .Values.worker.checkout "virtual" }}
+            - {name: fuse, mountPath: /dev/fuse}
+            {{- end }}
+            {{- if .Values.worker.dockerConfigSecret }}
+            - {name: docker, mountPath: /etc/ok/docker, readOnly: true}
+            {{- end }}
+      volumes:
+        {{- include "ok.configVolumes" . | nindent 8 }}
+        {{- include "ok.tokenVolume" . | nindent 8 }}
+        - name: state
+          emptyDir: {sizeLimit: {{ .Values.worker.state.sizeLimit }}}
+        - name: tmp
+          emptyDir: {}
+        {{- if eq .Values.worker.checkout "virtual" }}
+        - name: fuse
+          hostPath: {path: /dev/fuse, type: CharDevice}
+        {{- end }}
+        {{- if .Values.worker.dockerConfigSecret }}
+        - name: docker
+          secret: {secretName: {{ .Values.worker.dockerConfigSecret }}}
+        {{- end }}
+      {{- with .Values.worker.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.worker.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.worker.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

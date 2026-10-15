@@ -1,0 +1,248 @@
+syntax = "proto3";
+
+// ok's deployer (docs/deploy.md): after a commit lands on main, it runs the migrations it changed,
+// has ok automation's workers push the images it changed, and rolls each affected long-lived
+// service in watched stages, in waves, rolling back what fails.
+package ok.deploy.v1;
+
+option go_package = "github.com/Cidan/ok/proto/ok/deploy/v1;deploypb";
+
+import "google/protobuf/timestamp.proto";
+import "proto/ok/v1/annotations.proto";
+
+// Deployments serves ok control and the deployer's administrators. ok control acts on
+// behalf of a person it has authorized, and names them (for_person); an administrator acts as
+// itself.
+service Deployments {
+  // Only ok control, acting for the people it authorized.
+  option (ok.v1.callers) = CALLER_CONTROL;
+  // ListDeployments lists a repository's deployments, newest first: those that cover a commit
+  // of main (a CL's landed commit), or the latest.
+  rpc ListDeployments(ListDeploymentsRequest) returns (ListDeploymentsResponse);
+  // GetDeployment reads one deployment, with its log.
+  rpc GetDeployment(GetDeploymentRequest) returns (Deployment);
+  // RetryDeployment runs a deployment that failed, was halted, or was canceled again, at its
+  // commit, as a new deployment. It must be its deploy's latest.
+  rpc RetryDeployment(RetryDeploymentRequest) returns (Deployment);
+  // HaltDeployment stops a deployment: one waiting is canceled at once, one running rolls back.
+  rpc HaltDeployment(HaltDeploymentRequest) returns (Deployment);
+  // AllowHazards allows the gated hazards a deployment's migration refused, and it applies the
+  // migration again with them.
+  rpc AllowHazards(AllowHazardsRequest) returns (Deployment);
+  // ListServices lists the services — deploys that roll a workload — by repository and name,
+  // each with what ok deployed and what runs in the cluster.
+  rpc ListServices(ListServicesRequest) returns (ListServicesResponse);
+  // GetService reads one service, with its recent deployments.
+  rpc GetService(GetServiceRequest) returns (Service);
+}
+
+message ListServicesRequest {
+  int64 repository_id = 1;  // 0: every repository's
+}
+
+message ListServicesResponse {
+  repeated Service services = 1;
+}
+
+message GetServiceRequest {
+  int64 id = 1;
+  int32 recent = 2;  // how many recent deployments; 0: 20, at most 200
+}
+
+// A service: a deploy that rolls a workload.
+message Service {
+  int64 id = 1;
+  int64 repository_id = 2;
+  string repository = 3;  // its name
+  string deploy = 4;      // //<file>:deploy:<name>
+  string name = 5;
+  Workload workload = 6;
+  bool declared = 7;        // main's latest plan of its repository declares it
+  Deployment deployed = 8;  // the latest deployment that succeeded: what ok deployed; unset: none
+  Deployment latest = 9;    // the latest deployment, whatever its status; unset: none
+  Running running = 10;     // the workload as the cluster runs it, as the deployer last read it
+  repeated Deployment recent = 11;  // GetService only: its latest deployments, newest first
+  // Its group on the Services pages (docs/deploy.md, "Services"), as main last declared
+  // it: one namespace across repositories, by name. "": a group of its own.
+  string group = 12;
+}
+
+// A workload as the cluster runs it, as the deployer's observer last read it (every ten seconds).
+message Running {
+  bool found = 1;      // the workload exists
+  string error = 2;    // the cluster could not be read
+  string live = 3;     // a Deployment's live copy: blue or green; "" for a StatefulSet
+  int32 replicas = 4;  // the live copy's wanted replicas
+  int32 ready = 5;     // its pods that are Ready and run its template's images
+  repeated ContainerImage images = 6;  // the live copy's template, by container
+  repeated Pod pods = 7;
+  reserved 8;
+  reserved "observed_at";
+}
+
+message ContainerImage {
+  string container = 1;
+  string image = 2;
+}
+
+// A pod of a workload.
+message Pod {
+  string name = 1;
+  string copy = 2;  // blue or green; "" for a StatefulSet's
+  bool ready = 3;
+  int32 restarts = 4;
+  string phase = 5;
+  string reason = 6;  // why it is not running: a waiting container's reason, or its failure
+  // What each container runs: the image digest the node pulled, once it has.
+  repeated ContainerImage images = 7;
+  google.protobuf.Timestamp started = 8;
+  bool terminating = 9;
+}
+
+message ListDeploymentsRequest {
+  int64 repository_id = 1;
+  bytes commit_id = 2;  // those covering this commit; empty: the latest
+  int32 limit = 3;      // 0: 50; at most 500
+}
+
+message ListDeploymentsResponse {
+  repeated Deployment deployments = 1;
+  // With a commit: a plan has reached it, so every deployment of it has been made (those that
+  // cover it are all there is). Before, its deployments are yet to be planned.
+  bool planned = 2;
+}
+
+message GetDeploymentRequest {
+  int64 id = 1;
+}
+
+message RetryDeploymentRequest {
+  int64 id = 1;
+  string for_person = 2;  // ok control only
+}
+
+message HaltDeploymentRequest {
+  int64 id = 1;
+  string for_person = 2;
+}
+
+message AllowHazardsRequest {
+  int64 id = 1;
+  string for_person = 2;
+}
+
+// A deployment: one deploy, at one commit of main.
+message Deployment {
+  enum Status {
+    STATUS_UNSPECIFIED = 0;
+    STATUS_WAITING = 1;  // for its turn: its wave, or another deployment of its deploy
+    STATUS_RUNNING = 2;
+    STATUS_SUCCEEDED = 3;
+    STATUS_FAILED = 4;
+    STATUS_HALTED = 5;    // stopped and rolled back: by a person, or because its plan failed
+    STATUS_CANCELED = 6;  // never ran: replaced by a newer commit's, or its plan failed first
+  }
+  enum Stage {
+    STAGE_UNSPECIFIED = 0;
+    STAGE_QUEUED = 1;
+    STAGE_PUSH = 2;
+    STAGE_MIGRATE = 3;
+    STAGE_HAZARD = 4;  // a migration waits for a repository admin to allow its hazards
+    STAGE_ROLL = 5;
+    STAGE_DONE = 6;
+  }
+  int64 id = 1;
+  int64 repository_id = 2;
+  int64 plan_id = 3;  // 0: a retry
+  int64 retry_of = 4;
+  string deploy = 5;  // //<file>:deploy:<name>
+  string name = 6;
+  bytes commit_id = 7;
+  // It covers main's commits after from_seq, up to to_seq.
+  int64 from_seq = 8;
+  int64 to_seq = 9;
+  string why = 10;
+  int32 wave = 11;
+  string requested_by = 12;
+  Workload workload = 13;  // unset for a deploy that only migrates
+  Status status = 14;
+  Stage stage = 15;
+  string reason = 16;
+  bool self = 17;       // it deploys the deployer
+  string halt_by = 18;  // who asked it to halt
+  google.protobuf.Timestamp created_at = 19;
+  google.protobuf.Timestamp started_at = 20;
+  google.protobuf.Timestamp finished_at = 21;
+  repeated Image images = 22;
+  repeated Migration migrations = 23;
+  Roll roll = 24;              // unset until it rolls
+  repeated Event events = 25;  // GetDeployment only
+}
+
+message Workload {
+  string namespace = 1;
+  string kind = 2;  // deployment or statefulset
+  string name = 3;
+}
+
+// A container a deployment rolls.
+message Image {
+  string container = 1;
+  string target = 2;     // the oci_push
+  int64 push_run = 3;    // ok automation's run that pushes it; 0 until it starts
+  string reference = 4;  // registry/repository@sha256:… once pushed
+}
+
+// A migration a deployment applies.
+message Migration {
+  enum Status {
+    STATUS_UNSPECIFIED = 0;
+    STATUS_PENDING = 1;
+    STATUS_APPLIED = 2;
+    STATUS_WAITING = 3;  // for an allowance of its refused hazards
+    STATUS_FAILED = 4;
+  }
+  string target = 1;
+  Status status = 2;
+  string output = 3;       // what the migration printed
+  MigrationPlan plan = 4;  // its plan, as the migrate protocol reports it
+  repeated string refused = 5;
+  repeated string allowed = 6;
+  string allowed_by = 7;
+}
+
+// A migration's plan: what a target speaking the migrate protocol prints when run with `plan`
+// (docs/deploy.md, "Migrations").
+message MigrationPlan {
+  message Hazard {
+    string class = 1;
+    string detail = 2;
+    bool gated = 3;
+  }
+  message Step {
+    string description = 1;
+    string sql = 2;
+    repeated Hazard hazards = 3;
+  }
+  string database = 1;
+  string server = 2;
+  repeated Step steps = 3;
+  bool executed = 4;
+  string error = 5;
+}
+
+// Where a deployment's roll is.
+message Roll {
+  string stage = 1;    // prepare, canary, full, rollback, done
+  string outcome = 2;  // unchanged, rolled, rolled back, stuck
+  string reason = 3;
+  string live = 4;  // a Deployment's copy that was live: blue or green
+  string new = 5;   // and the one that rolls
+  int32 replicas = 6;
+  google.protobuf.Timestamp stage_started = 7;
+}
+
+message Event {
+  google.protobuf.Timestamp at = 1;
+  string message = 2;
+}

@@ -1,0 +1,42 @@
+{{- $robots := list -}}
+{{- if .Values.worker.enabled -}}
+{{- $robots = append $robots (dict "name" "worker.ok" "bindings" (list (dict "issuer" .Values.identity.kubernetesIssuer "subject" (include "ok.subject" (dict "root" . "account" "worker"))))) -}}
+{{- end -}}
+{{- if .Values.deploy.enabled -}}
+{{- $robots = append $robots (dict "name" "deploy.ok" "bindings" (list (dict "issuer" .Values.identity.kubernetesIssuer "subject" (include "ok.subject" (dict "root" . "account" "deploy"))))) -}}
+{{- end -}}
+{{- $federation := list (dict "issuer" .Values.identity.kubernetesIssuer "audience" "ok" "jwks_url" "https://kubernetes.default.svc/openid/v1/jwks" "ca_file" "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt" "token_file" "/var/run/secrets/kubernetes.io/serviceaccount/token") -}}
+{{- $identity := dict "ca_dir" "/etc/ok/ca" "federation" (concat $federation .Values.identity.extraFederation) "robots" (concat $robots .Values.identity.extraRobots) -}}
+{{- with .Values.identity.bootstrapAdmins }}{{- $_ := set $identity "bootstrap_admins" . -}}{{- end }}
+{{- with .Values.identity.treeRepository }}{{- $_ := set $identity "tree_repository" . -}}{{- end }}
+{{- $services := dict "identity" (include "ok.serverAddr" .) "scm" (include "ok.serverAddr" .) "automation" (include "ok.serverAddr" .) -}}
+{{- if .Values.deploy.enabled }}{{- $_ := set $services "deploy" (include "ok.deployAddr" .) -}}{{- end }}
+{{- $cfg := dict
+  "domain" .Values.domain
+  "installation" .Values.installation
+  "public_url" .Values.publicURL
+  "listen" ":8472"
+  "metrics_listen" ":8473"
+  "database" (dict "url_file" "/etc/ok/secrets/database/url" "max_connections" .Values.database.maxConnections)
+  "roles" (dict "identity" "identity.ok" "scm" "scm.ok" "control" "control.ok" "automation" "automation.ok" "worker" "worker.ok" "deploy" "deploy.ok")
+  "services" $services
+  "workload" (dict "token_file" "/var/run/secrets/ok/token")
+  "identity" $identity
+-}}
+{{- if .Values.worker.enabled -}}
+{{- $_ := set $cfg "worker" (dict "state" "/var/lib/ok" "slots" .Values.worker.slots "run_memory_gib" .Values.worker.runMemoryGiB "checkout" .Values.worker.checkout "bazel_flags" .Values.worker.bazelFlags) -}}
+{{- end -}}
+{{- if .Values.deploy.enabled -}}
+{{- $env := dict -}}
+{{- range $name, $_ := .Values.deploy.migrationEnv }}{{- $_ := set $env $name (dict "file" (printf "/etc/ok/migration-env/%s/value" ($name | lower))) -}}{{- end }}
+{{- $_ := set $cfg "deploy" (dict "state" "/var/lib/ok" "checkout" .Values.deploy.checkout "bazel_flags" .Values.deploy.bazelFlags "migration_env" $env "self" (dict "namespace" .Release.Namespace "deployment" (printf "%s-deploy" (include "ok.name" .)))) -}}
+{{- end -}}
+{{- $cfg = mustMergeOverwrite $cfg (deepCopy .Values.config) -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "ok.name" . }}-config
+  labels: {{- include "ok.labels" . | nindent 4 }}
+data:
+  ok.yaml: |
+{{ toYaml $cfg | indent 4 }}

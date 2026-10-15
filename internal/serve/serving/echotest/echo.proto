@@ -1,0 +1,45 @@
+syntax = "proto3";
+
+package ok.echo.v1;
+
+import "proto/ok/v1/annotations.proto";
+
+option go_package = "github.com/Cidan/ok/internal/serve/serving/echotest;echotest";
+
+// Echo is a trivial service used to exercise the serving runtime end to end: gRPC
+// over h2c, and the REST surface served through the same server.
+service Echo {
+  option (ok.v1.callers) = CALLER_PEOPLE;
+  option (ok.v1.callers) = CALLER_CONTROL;
+
+  rpc Say(SayRequest) returns (SayResponse);
+  // Count streams the numbers 1 to n; from n = 100 it fails after the second.
+  rpc Count(CountRequest) returns (stream CountResponse);
+  // Collect joins the texts it is sent.
+  rpc Collect(stream SayRequest) returns (SayResponse);
+  // Fail fails with the given code.
+  rpc Fail(FailRequest) returns (SayResponse);
+}
+
+message SayRequest {
+  string text = 1;
+}
+
+message SayResponse {
+  string text = 1;
+  repeated string words = 2;
+  int32 word_count = 3;
+}
+
+message CountRequest {
+  int32 n = 1;
+}
+
+message CountResponse {
+  int32 n = 1;
+}
+
+message FailRequest {
+  int32 code = 1;
+  string message = 2;
+}

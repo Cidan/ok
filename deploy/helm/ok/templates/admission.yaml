@@ -1,0 +1,60 @@
+{{- if and .Values.deploy.enabled .Values.deploy.admissionPolicy.enabled }}
+# Holds the deployer to its grants (docs/deploy.md, "Grants"): it deletes nothing, creates only the
+# green copy of a Deployment it may update, runs a pod template only as an account a grant names,
+# never changes the account a workload runs as, and adds no host access but /dev/fuse.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ include "ok.name" . }}-deployer-scope
+  labels: {{- include "ok.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [apps]
+        apiVersions: ["*"]
+        operations: [CREATE, UPDATE, DELETE]
+        resources: [deployments, statefulsets]
+  matchConditions:
+    - name: the-deployer
+      expression: "request.userInfo.username == '{{ include "ok.subject" (dict "root" . "account" "deploy") }}'"
+  variables:
+    - {name: target, expression: "request.operation == 'DELETE' ? oldObject : object"}
+    - {name: name, expression: "variables.target.metadata.name"}
+    - {name: isGreen, expression: "request.kind.kind == 'Deployment' && variables.name.endsWith('-green')"}
+    - {name: blueName, expression: "variables.isGreen ? variables.name.substring(0, variables.name.size() - 6) : variables.name"}
+    - {name: pod, expression: "variables.target.spec.template.spec"}
+    - {name: account, expression: "has(variables.pod.serviceAccountName) && variables.pod.serviceAccountName != '' ? variables.pod.serviceAccountName : 'default'"}
+    - {name: oldAccount, expression: "request.operation != 'UPDATE' ? '' : (has(oldObject.spec.template.spec.serviceAccountName) && oldObject.spec.template.spec.serviceAccountName != '' ? oldObject.spec.template.spec.serviceAccountName : 'default')"}
+  validations:
+    - expression: "request.operation != 'DELETE'"
+      message: ok's deployer deletes no workload
+      reason: Forbidden
+    - expression: "request.operation != 'CREATE' || (variables.isGreen && authorizer.group('apps').resource('deployments').namespace(request.namespace).name(variables.blueName).check('update').allowed())"
+      message: ok's deployer creates only the green copy of a Deployment it may update
+      reason: Forbidden
+    - expression: "authorizer.group('').resource('serviceaccounts').namespace(request.namespace).name(variables.account).check('deploy').allowed()"
+      message: ok's deployer runs a workload only as a ServiceAccount a grant names
+      reason: Forbidden
+    - expression: "request.operation != 'UPDATE' || variables.account == variables.oldAccount"
+      message: ok's deployer never changes the account a workload runs as
+      reason: Forbidden
+    - expression: >-
+        !(has(variables.pod.hostNetwork) && variables.pod.hostNetwork) &&
+        !(has(variables.pod.hostPID) && variables.pod.hostPID) &&
+        !(has(variables.pod.hostIPC) && variables.pod.hostIPC) &&
+        (!has(variables.pod.volumes) || variables.pod.volumes.all(v, !has(v.hostPath) || v.hostPath.path == '/dev/fuse')) &&
+        variables.pod.containers.all(c, !has(c.securityContext) || !has(c.securityContext.privileged) || !c.securityContext.privileged) &&
+        (!has(variables.pod.initContainers) || variables.pod.initContainers.all(c, !has(c.securityContext) || !has(c.securityContext.privileged) || !c.securityContext.privileged))
+      message: no workload ok's deployer rolls may share the node's network, PID, or IPC, run privileged, or mount a host path but /dev/fuse
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "ok.name" . }}-deployer-scope
+  labels: {{- include "ok.labels" . | nindent 4 }}
+spec:
+  policyName: {{ include "ok.name" . }}-deployer-scope
+  validationActions: [Deny]
+{{- end }}

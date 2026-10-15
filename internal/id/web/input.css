@@ -1,0 +1,5 @@
+/* Tailwind's entry for the identity pages. The pages' class strings are literal in views.templ and
+   passkeys.js, which the scanner reads, and nothing else (source(none)). scripts/css.sh builds app.css from this. */
+@import "tailwindcss" source(none);
+@source "./views.templ";
+@source "./passkeys.js";

@@ -1,0 +1,36 @@
+// Package infinitelist is a reusable, windowed infinite-scroll container. The server renders
+// the first page of items as children; the client controller (infinite.js) lazily loads more
+// pages on scroll in BOTH directions, and unloads item batches scrolled far off-screen (into
+// spacer <div>s that preserve scroll position) so the DOM stays bounded no matter how far you
+// scroll. It is application-neutral: the consumer supplies the row markup and a fragment
+// endpoint returning rows for ?page=N.
+package infinitelist
+
+import "strconv"
+
+// Scroller renders the scroll container: the top/bottom spacers + sentinels the controller
+// keys off, and the initial page of rows (children) in the rows slot.
+//
+//   - url:       fragment endpoint returning the row markup for ?page=N
+//   - pageSize:  server page size (how many rows make one page/batch)
+//   - hasMore:   whether a page after the initial one exists
+//   - class:     extra classes for the scroll container (e.g. height/spacing)
+//   - rowsClass: classes for the rows container the batches are inserted into (each row must
+//                be a direct child, so the controller can add/remove them in page batches)
+templ Scroller(url string, pageSize int, hasMore bool, class, rowsClass string) {
+	<div
+		data-infinite
+		data-infinite-url={ url }
+		data-infinite-page-size={ strconv.Itoa(pageSize) }
+		data-infinite-has-more={ strconv.FormatBool(hasMore) }
+		class={ "overflow-y-auto", class }
+	>
+		<div data-infinite-top-spacer style="height:0"></div>
+		<div data-infinite-sentinel="top" class="h-px w-full"></div>
+		<div data-infinite-rows class={ rowsClass }>
+			{ children... }
+		</div>
+		<div data-infinite-sentinel="bottom" class="h-px w-full"></div>
+		<div data-infinite-bottom-spacer style="height:0"></div>
+	</div>
+}

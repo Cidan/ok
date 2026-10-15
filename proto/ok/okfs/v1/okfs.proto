@@ -1,0 +1,385 @@
+syntax = "proto3";
+
+// okfs (docs/okfs.md): the control protocol between ok's jj and the okfs daemon, and the
+// records the daemon keeps on disk.
+package ok.okfs.v1;
+
+option go_package = "github.com/Cidan/ok/proto/ok/okfs/v1;okfspb";
+
+// ─── Control ───
+//
+// jj reaches the daemon on $XDG_RUNTIME_DIR/okfs/control.sock. Every message is a 4-byte
+// big-endian length and then a Request (jj to the daemon) or a Response (back). One Request gets
+// one Response, except Subscribe, whose Responses (events) stream until the connection closes.
+
+message Request {
+  oneof request {
+    Hello hello = 1;
+    Mount mount = 2;
+    Unmount unmount = 3;
+    Forget forget = 4;
+    ListDir list_dir = 5;
+    RememberFiles remember_files = 6;
+    CheckOut check_out = 7;
+    SetRecorded set_recorded = 8;
+    SetSparse set_sparse = 9;
+    Status status = 10;
+    Prefetch prefetch = 11;
+    Subscribe subscribe = 12;
+    Flush flush = 13;
+    Present present = 14;
+  }
+}
+
+message Response {
+  string error = 1;  // the request failed: why; the rest is empty
+  // The request failed because of what it asked, not of the daemon or ok: asking again fails
+  // the same way (a commit with conflicts, which has no presentation).
+  bool refused = 11;
+  oneof response {
+    HelloReply hello = 2;
+    MountReply mount = 3;
+    Empty empty = 4;
+    ListDirReply list_dir = 5;
+    CheckOutReply check_out = 6;
+    StatusReply status = 7;
+    Event event = 8;
+    FlushReply flush = 9;
+    PresentReply present = 10;
+  }
+}
+
+message Empty {}
+
+// The daemon's version: jj restarts a daemon that is not its own build.
+message Hello {}
+message HelloReply {
+  string version = 1;
+  uint32 pid = 2;
+}
+
+// A tree, as a merge's terms: one ID when resolved (a commit's root_tree).
+message Tree {
+  repeated bytes ids = 1;
+}
+
+// Registers a workspace and mounts it (or, already registered, mounts it again). The mount point
+// must be an empty directory, or already this workspace's mount.
+message Mount {
+  string workspace_id = 1;  // the workspace's directory under ~/.local/share/ok/workspaces
+  string mount_point = 2;   // an absolute path
+  string repo_dir = 3;  // the jj repository it belongs to (shared by the repository's workspaces)
+  string workspace_name = 4;  // jj's name for it, which its lease and checkpoints are keyed by
+  // New workspaces only: the tree it starts with, its sparse patterns, and whether to attach
+  // (take over the workspace's lease from another machine) rather than start one.
+  Tree tree = 5;
+  repeated string sparse = 6;
+  bool attach = 7;
+}
+message MountReply {
+  // When attaching: the checkpoint the workspace was attached at, if it had one (its tree is the
+  // mount's base).
+  int64 checkpoint_id = 1;
+  Tree checkpoint_tree = 2;
+}
+
+message Unmount {
+  string workspace_id = 1;
+}
+
+// Unmounts a workspace and deletes its state, after recording its latest state as a checkpoint.
+message Forget {
+  string workspace_id = 1;
+}
+
+// A directory of a workspace as it stands, for a snapshot: its entries from the overlay, and
+// whether the rest comes unchanged from a tree.
+message ListDir {
+  string workspace_id = 1;
+  string path = 2;  // repo-relative, "/"-separated; "" is the root
+}
+message ListDirReply {
+  // The tree the directory's entries not listed here come from, unchanged (empty: all are listed).
+  // When the directory is not materialized at all, this is its whole content and entries is empty.
+  Tree source = 1;
+  bool materialized = 2;
+  repeated DirEntry entries = 3;  // the overlay's entries: written, moved, or deleted
+}
+message DirEntry {
+  bytes name = 1;
+  Kind kind = 2;
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    KIND_DELETED = 1;  // a whiteout: the source's entry of this name is gone
+    KIND_FILE = 2;
+    KIND_DIR = 3;
+    KIND_SYMLINK = 4;
+    KIND_OTHER = 5;  // a FIFO or socket: not snapshotted
+  }
+  // A file or symlink whose content is a tree value moved here unchanged (a rename): its value.
+  TreeValue value = 3;
+  // A written file: where its bytes are, its version (bumped by every change), its executable
+  // bit, and its content ID if the daemon knows it for this version.
+  string overlay_path = 4;
+  uint64 version = 5;
+  bool executable = 6;
+  bytes file_id = 7;
+  bytes symlink_target = 8;  // a written symlink
+  uint64 ino = 9;
+  // Written by the checkout that materialized a conflict, and unchanged since; with the length
+  // of the conflict markers it was written with.
+  bool checkout_conflict = 10;
+  uint64 size = 11;
+  uint32 conflict_marker_len = 12;
+  // A redirection (.ok/redirections): a symlink to local disk, never snapshotted.
+  bool redirect = 13;
+}
+
+// A file, symlink, or tree, as a tree holds it.
+message TreeValue {
+  enum Type {
+    TYPE_UNSPECIFIED = 0;
+    TYPE_FILE = 1;
+    TYPE_SYMLINK = 2;
+    TYPE_TREE = 3;
+  }
+  Type type = 1;
+  bytes id = 2;
+  bool executable = 3;
+  bytes copy_id = 4;
+}
+
+// Content IDs jj computed for written files, so the next snapshot need not read them again.
+message RememberFiles {
+  string workspace_id = 1;
+  repeated Remembered files = 2;
+}
+message Remembered {
+  uint64 ino = 1;
+  uint64 version = 2;
+  bytes file_id = 3;
+}
+
+// Moves a workspace to a new tree: everything written that the recorded tree holds is dropped and
+// comes from the new tree; what the recorded tree does not hold (untracked and ignored files)
+// stays. Conflicts in the new tree arrive materialized, as files.
+message CheckOut {
+  string workspace_id = 1;
+  Tree old_tree = 2;  // the tree the working copy recorded
+  Tree new_tree = 3;
+  repeated Materialized conflicts = 4;
+}
+message Materialized {
+  string path = 1;
+  bytes contents = 2;
+  bool executable = 3;
+  uint32 conflict_marker_len = 4;
+}
+message CheckOutReply {
+  repeated string skipped = 1;  // new tree paths an untracked file stood in the way of
+}
+
+// The tree jj recorded for the working copy (after a snapshot, reset, or recover). With
+// checkpoint, a snapshot's: the daemon records it as a checkpoint too.
+message SetRecorded {
+  string workspace_id = 1;
+  Tree tree = 2;
+  bytes commit_id = 3;  // the working-copy commit it belongs to
+  bool checkpoint = 4;
+}
+
+message SetSparse {
+  string workspace_id = 1;
+  repeated string patterns = 2;  // repo-relative prefixes; [""] is everything
+}
+
+message Status {}
+message StatusReply {
+  string version = 1;
+  uint32 pid = 2;
+  bool online = 3;  // ok is reachable
+  repeated WorkspaceStatus workspaces = 4;
+  repeated PresentationStatus presentations = 5;
+  // Since the daemon started: its RPCs to ok, by method, and its batched fetches, by kind
+  // (jj/store/calls.rs).
+  repeated CallStats calls = 6;
+  repeated FetchStats fetches = 7;
+}
+message CallStats {
+  string method = 1;  // Service/Method
+  uint64 calls = 2;
+  uint64 failures = 3;  // a status not OK, or a broken connection or stream
+  double seconds = 4;
+  double max_seconds = 5;
+  uint64 sent_bytes = 6;
+  uint64 received_bytes = 7;
+}
+message FetchStats {
+  string kind = 1;  // objects, commits, operations, files, manifests, chunks
+  uint64 batches = 2;
+  uint64 keys = 3;
+  double seconds = 4;
+}
+// Reads of files' contents and manifests that waited on ok, since the repository was opened.
+message WaitStats {
+  uint64 reads = 1;
+  double seconds = 2;
+  double max_seconds = 3;
+}
+message PresentationStatus {
+  string mount_point = 1;
+  int64 repository_id = 2;
+  bytes commit_id = 3;
+  uint64 fetched_files = 4;
+  uint64 fetched_bytes = 5;
+  uint64 prefetches = 6;
+  uint64 prefetched_files = 7;
+  WaitStats waits = 8;
+}
+message WorkspaceStatus {
+  string workspace_id = 1;
+  string mount_point = 2;
+  string workspace_name = 3;
+  string repo_dir = 4;
+  bool mounted = 5;
+  string lease = 6;  // "held", "lost: <why>", "acquiring"
+  int64 latest_checkpoint = 7;
+  uint64 materialized_files = 8;
+  uint64 overlay_bytes = 9;
+  uint64 fetched_files = 10;
+  uint64 fetched_bytes = 11;
+  uint64 prefetches = 12;        // directory prefetches started
+  uint64 prefetched_files = 13;  // the files they asked for
+  WaitStats waits = 14;
+}
+
+// Presents a commit read-only at a mount point (docs/okfs.md, "ok's roles"): the first
+// mounts it there; each later one moves it to the new commit at once. Nothing is written but the
+// files given, shown at the root beside the commit's until the next Present.
+message Present {
+  string mount_point = 1;  // an absolute path: an empty directory, or this daemon's presentation
+  string endpoint = 2;     // ok scm, as ok's jj names it (http:// in a pod, docs/okfs.md)
+  int64 repository_id = 3;
+  bytes commit_id = 4;
+  repeated PresentedFile files = 5;
+  // Globs of repository-relative paths (`*` within a name, `**` across directories) to have local
+  // before the reply, with the trees they are found through.
+  repeated string read_ahead = 6;
+}
+message PresentedFile {
+  string name = 1;  // a name at the root
+  bytes contents = 2;
+}
+message PresentReply {
+  Tree tree = 1;                // the commit's
+  bool mounted = 2;             // this request mounted it: the first, or after the daemon restarted
+  uint64 read_ahead_files = 3;  // read ahead: files fetched, and their bytes
+  uint64 read_ahead_bytes = 4;
+}
+
+// Reads the files under the given paths into the cache.
+message Prefetch {
+  string workspace_id = 1;
+  repeated string paths = 2;  // repo-relative files or directories ("" is everything)
+}
+
+// Streams what changes in a workspace: each event is a path the file system or a checkout
+// changed.
+message Subscribe {
+  string workspace_id = 1;
+}
+message Event {
+  uint64 seq = 1;
+  repeated string paths = 2;
+  bool checkout = 3;  // a checkout moved the workspace to another tree
+}
+
+// Takes a checkpoint of a workspace now, and waits for it.
+message Flush {
+  string workspace_id = 1;
+}
+message FlushReply {
+  int64 checkpoint_id = 1;
+}
+
+// ─── On disk ───
+//
+// A workspace's state directory holds its inodes as a log: a snapshot (`inodes.snap`) and the
+// records since (`inodes.log`), each a 4-byte big-endian length and a Record.
+
+message Record {
+  oneof record {
+    InodeRecord inode = 1;
+    uint64 drop = 2;  // an inode no longer exists
+    Base base = 3;
+    Whiteout whiteout = 4;
+    Unwhiteout unwhiteout = 5;
+  }
+}
+
+// The workspace's base tree (what unwritten paths show) and recorded tree.
+message Base {
+  Tree base = 1;
+  Tree recorded = 2;
+  repeated string sparse = 3;
+  bytes recorded_commit = 4;
+}
+
+message Whiteout {
+  uint64 dir = 1;
+  bytes name = 2;
+}
+message Unwhiteout {
+  uint64 dir = 1;
+  bytes name = 2;
+}
+
+// An inode, whole: written whenever any of it changes.
+message InodeRecord {
+  uint64 ino = 1;
+  uint64 parent = 2;
+  bytes name = 3;
+  repeated Link extra_links = 4;  // hard links beyond the first
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    KIND_DIR = 1;
+    KIND_FILE = 2;
+    KIND_SYMLINK = 3;
+    KIND_FIFO = 4;
+    KIND_SOCKET = 5;
+  }
+  Kind kind = 5;
+  enum State {
+    STATE_UNSPECIFIED = 0;
+    STATE_BASE = 1;          // follows the base tree at its path
+    STATE_FIXED = 2;         // a tree value moved here: value (a dir's under tree), unchanged
+    STATE_MATERIALIZED = 3;  // its content is the overlay's
+  }
+  State state = 6;
+  TreeValue value = 7;  // STATE_FIXED's value
+  Tree under = 8;       // a materialized directory's source for unlisted names (empty: none)
+  bool under_base = 9;  // ... or the base tree at its path
+  uint32 mode = 10;     // permission bits
+  int64 mtime_sec = 11;
+  uint32 mtime_nsec = 12;
+  int64 ctime_sec = 13;
+  uint32 ctime_nsec = 14;
+  int64 atime_sec = 15;
+  uint32 atime_nsec = 16;
+  bytes symlink_target = 17;  // a materialized symlink
+  bool checkout_conflict = 18;
+  repeated Xattr xattrs = 19;
+  // Listed in its parent's overlay (written, created, or moved there), not merely derived from
+  // the parent's source and looked up.
+  bool overlay = 20;
+  uint32 conflict_marker_len = 21;
+  bool redirect = 22;
+}
+message Link {
+  uint64 parent = 1;
+  bytes name = 2;
+}
+message Xattr {
+  bytes name = 1;
+  bytes value = 2;
+}
