@@ -224,8 +224,23 @@ fn start_identity() -> Server {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+    // The sync from the system of record runs as identity starts, after it listens: until it has
+    // made ada, she is no one identity knows.
+    let endpoint = format!("http://{addr}");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let resp = request_as(&endpoint, "GET", "/id/account", "ada.human.example.com", "");
+        if resp.starts_with("HTTP/1.1 200") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "ok identity never synced ada:\n{resp}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
     Server {
-        endpoint: format!("http://{addr}"),
+        endpoint,
         config,
         _child: child,
     }
@@ -234,21 +249,26 @@ fn start_identity() -> Server {
 /// Posts a form to a development server's page as `principal`, over HTTP/1.1, returning the
 /// response's status line and body.
 pub fn post_form_as(endpoint: &str, path: &str, principal: &str, form: &[(&str, &str)]) -> String {
-    use std::io::Write as _;
-    let addr = endpoint.trim_start_matches("http://");
     let body: Vec<String> = form
         .iter()
         .map(|(k, v)| format!("{}={}", url_encode(k), url_encode(v)))
         .collect();
-    let body = body.join("&");
+    request_as(endpoint, "POST", path, principal, &body.join("&"))
+}
+
+/// Makes a request of a development server's page as `principal`, over HTTP/1.1, returning the
+/// response's status line and body.
+fn request_as(endpoint: &str, method: &str, path: &str, principal: &str, body: &str) -> String {
+    use std::io::Write as _;
+    let addr = endpoint.trim_start_matches("http://");
     let mut s = TcpStream::connect(addr).expect("reach the development server");
     write!(
         s,
-        "POST {path} HTTP/1.1\r\nHost: {addr}\r\nOrigin: {endpoint}\r\nok-dev-principal: {principal}\r\n\
+        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nOrigin: {endpoint}\r\nok-dev-principal: {principal}\r\n\
          Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     )
-    .expect("send the form");
+    .expect("send the request");
     let mut out = String::new();
     s.read_to_string(&mut out).expect("read the response");
     out

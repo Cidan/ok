@@ -59,8 +59,10 @@ jobs:
         run: |
           go vet ./...
           cargo clippy --locked --workspace --all-targets -- -D warnings
+      # The automation e2e runs Bazel through pre, the queue, and workers: 5 minutes on a runner,
+      # twice that on a slow one, which go test's 10-minute default would fail.
       - name: Go tests
-        run: go test ./...
+        run: go test -timeout 25m ./...
       - name: Rust tests
         run: cargo test --locked --workspace
 
