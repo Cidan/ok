@@ -1,0 +1,7 @@
+# The people ok knows (docs/identity.md, "Systems of record"). Each signs in through Dex with the
+# same email: add them to dex.yaml's staticPasswords too. ok reads this file again every few
+# minutes, and on `ok admin sync`.
+people:
+  - {id: "1", email: admin@example.com, name: Admin}     # admin.human.example.com, an administrator
+groups:
+  - {id: eng, name: eng, members: ["1"]}

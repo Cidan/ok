@@ -303,6 +303,14 @@ func (c *Credential) Principal() string {
 	return p
 }
 
+// ID is the credential's ID, as its certificate names it.
+func (c *Credential) ID() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	id, _ := credential.ID(c.cert)
+	return id
+}
+
 // NotAfter is when the current certificate expires.
 func (c *Credential) NotAfter() time.Time {
 	c.mu.Lock()

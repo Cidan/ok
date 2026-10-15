@@ -22,6 +22,7 @@ import (
 	"github.com/Cidan/ok/internal/id/ca"
 	"github.com/Cidan/ok/internal/id/role"
 	"github.com/Cidan/ok/internal/id/signin/oidctest"
+	"github.com/Cidan/ok/internal/pgdb"
 	"github.com/Cidan/ok/internal/serve"
 	"github.com/Cidan/ok/internal/testdb"
 	identitypb "github.com/Cidan/ok/proto/ok/identity/v1"
@@ -226,5 +227,77 @@ identity:
 	creds, _ := r.Store.CredentialsOf(ctx, ada.ID)
 	if len(creds) != 1 || creds[0].Revoked.IsZero() {
 		t.Errorf("after logout: %+v", creds)
+	}
+}
+
+// ok identity certify makes a credential for a robot the configuration names from identity's
+// database and CA alone, which identity then accepts; run again, it keeps the credential.
+func TestIdentityCertify(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	dir := t.TempDir()
+	if err := ca.Init(filepath.Join(dir, "ca"), "Example"); err != nil {
+		t.Fatal(err)
+	}
+	dsn := testdb.Postgres(t)
+	os.WriteFile(filepath.Join(dir, "database-url"), []byte(dsn), 0o600)
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfgPath := filepath.Join(dir, "ok.yaml")
+	os.WriteFile(cfgPath, []byte(`
+domain: example.com
+public_url: http://`+lis.Addr().String()+`
+database: {url_file: `+filepath.Join(dir, "database-url")+`}
+roles: {identity: identity.ok, worker: worker.ok}
+services: {identity: `+lis.Addr().String()+`}
+identity: {ca_dir: `+filepath.Join(dir, "ca")+`}
+`), 0o644)
+	credDir := filepath.Join(dir, "worker-credential")
+	cmd := func(args ...string) (string, error) {
+		var out bytes.Buffer
+		err := run(args, strings.NewReader(""), &out)
+		return out.String(), err
+	}
+	if out, err := cmd("identity", "certify", "-config", cfgPath, "-dir", credDir, "worker.ok"); err != nil || !strings.Contains(out, "certified worker.ok.robot.example.com's key") {
+		t.Fatalf("certify: %v\n%s", err, out)
+	}
+	if out, err := cmd("identity", "certify", "-config", cfgPath, "-dir", credDir, "worker.ok"); err != nil || !strings.HasPrefix(out, "kept ") {
+		t.Errorf("certify again: %v\n%s", err, out)
+	}
+	if _, err := cmd("identity", "certify", "-config", cfgPath, "-dir", filepath.Join(dir, "x"), "stranger"); err == nil || !strings.Contains(err.Error(), "not a robot the configuration names") {
+		t.Errorf("certifying a robot the configuration does not name: %v", err)
+	}
+
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Identity's own tables, as it opens them without a pool given it.
+	pool, err := pgdb.Open(ctx, dsn, role.Schema, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	r, err := role.Build(ctx, cfg, role.Options{Pool: pool})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- serve.Run(ctx, r.Root, serve.WithAuthn(r.Resolver), serve.WithListener(lis)) }()
+	defer func() { cancel(); <-done }()
+	c, err := auth.Load(credDir)
+	if err != nil || c.Principal() != "worker.ok.robot.example.com" {
+		t.Fatalf("the credential: %v, %v", c, err)
+	}
+	srv, _ := auth.ParseServer("http://" + lis.Addr().String())
+	conn, err := srv.Dial(dial.Options{Credential: c})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := identitypb.NewDirectoryClient(conn).ListSets(ctx, &identitypb.ListSetsRequest{}); err != nil {
+		t.Errorf("the robot reading the directory with the certified credential: %v", err)
 	}
 }

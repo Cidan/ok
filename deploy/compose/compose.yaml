@@ -1,0 +1,93 @@
+# ok on one machine, to try it: `docker compose up -d` (or `podman compose up -d`) here, then
+# http://localhost:8080, signed in as admin@example.com with the password ok. README.md says what
+# runs and how to use it. Everything listens on 127.0.0.1 only, and every secret here is a fixed
+# value for this machine alone: not an installation for others (docs/install.md has the chart).
+name: ok
+
+x-ok-image: &ok-image ${OK_IMAGE:-ghcr.io/cidan/ok:1.0.0}
+x-runner-image: &runner-image ${OK_RUNNER_IMAGE:-ghcr.io/cidan/ok-runner:1.0.0}
+
+services:
+  postgres:
+    image: docker.io/library/postgres:18
+    environment: {POSTGRES_USER: ok, POSTGRES_PASSWORD: ok-local-only, POSTGRES_DB: ok}
+    volumes: [postgres:/var/lib/postgresql]
+    healthcheck: {test: [CMD, pg_isready, -U, ok, -d, ok], interval: 2s, timeout: 5s, retries: 60}
+    restart: unless-stopped
+
+  # S3 for file contents and logs: versitygw over a directory, each bucket one of its folders.
+  s3:
+    image: docker.io/versity/versitygw:v1.8.0
+    command: [--port, ":7070", posix, /data]
+    environment: {ROOT_ACCESS_KEY: ok, ROOT_SECRET_KEY: ok-local-only}
+    volumes: [s3:/data]
+    restart: unless-stopped
+
+  # Once each start: the buckets, the identity CA the first time, and a credential for the
+  # worker (ok identity certify), then every volume handed to ok's user.
+  setup:
+    image: *runner-image
+    user: "0"
+    entrypoint: [sh, /etc/ok/setup.sh]
+    volumes:
+      - ./ok.yaml:/etc/ok/ok.yaml:ro,z
+      - ./people.yaml:/etc/ok/people.yaml:ro,z
+      - ./setup.sh:/etc/ok/setup.sh:ro,z
+      - ./secrets:/etc/ok/secrets:ro,z
+      - s3:/var/lib/ok-s3
+      - ca:/var/lib/ok/ca
+      - worker-credential:/var/lib/ok/worker-credential
+      - worker-state:/var/lib/ok/state
+    depends_on:
+      postgres: {condition: service_healthy}
+
+  # Identity, the SCM, automation, and control — the web pages, review — in one process.
+  ok:
+    image: *ok-image
+    command: [serve, -config, /etc/ok/ok.yaml, -roles, "identity,scm,automation,control"]
+    ports:
+      - "127.0.0.1:8080:8472"   # ok
+      - "127.0.0.1:5556:5556"   # sign-in (Dex, in this container's network)
+    volumes:
+      - ./ok.yaml:/etc/ok/ok.yaml:ro,z
+      - ./people.yaml:/etc/ok/people.yaml:ro,z
+      - ./secrets:/etc/ok/secrets:ro,z
+      - ca:/var/lib/ok/ca:ro
+    depends_on:
+      setup: {condition: service_completed_successfully}
+      s3: {condition: service_started}
+    restart: unless-stopped
+
+  # Sign-in: Dex with one user, in ok's own network, so that its address, http://localhost:5556,
+  # is the same to your browser and to ok.
+  dex:
+    image: ghcr.io/dexidp/dex:v2.46.0
+    command: [dex, serve, /etc/dex/dex.yaml]
+    network_mode: service:ok
+    volumes:
+      - ./dex.yaml:/etc/dex/dex.yaml:ro,z
+    depends_on: [ok]
+    restart: unless-stopped
+
+  # A worker: Bazel on each run's commit, each run's programs in a sandbox (bubblewrap), which
+  # makes user namespaces and mounts — hence seccomp, AppArmor, and SELinux unconfined
+  # (README.md, "The worker").
+  worker:
+    image: *runner-image
+    command: [worker, run, -config, /etc/ok/ok.yaml]
+    security_opt: [seccomp=unconfined, apparmor=unconfined, label=disable]
+    volumes:
+      - ./ok.yaml:/etc/ok/ok.yaml:ro,z
+      - worker-credential:/var/lib/ok/worker-credential
+      - worker-state:/var/lib/ok/state
+    depends_on:
+      setup: {condition: service_completed_successfully}
+      ok: {condition: service_started}
+    restart: unless-stopped
+
+volumes:
+  postgres:
+  s3:
+  ca:
+  worker-credential:
+  worker-state:

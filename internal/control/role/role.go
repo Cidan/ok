@@ -85,6 +85,19 @@ func (u unavailable) NewStream(context.Context, *grpc.StreamDesc, string, ...grp
 	return nil, status.Errorf(codes.Unavailable, "%s is not configured (services)", u.what)
 }
 
+// noDeployer is the deployer of an installation that names none (services.deploy): one that
+// deploys nothing, so a landed CL has nothing to deploy and no repository a service — rather than a
+// deployer out of reach. What only a deployment could answer stays unavailable.
+type noDeployer struct{ deploypb.DeploymentsClient }
+
+func (noDeployer) ListDeployments(context.Context, *deploypb.ListDeploymentsRequest, ...grpc.CallOption) (*deploypb.ListDeploymentsResponse, error) {
+	return &deploypb.ListDeploymentsResponse{Planned: true}, nil
+}
+
+func (noDeployer) ListServices(context.Context, *deploypb.ListServicesRequest, ...grpc.CallOption) (*deploypb.ListServicesResponse, error) {
+	return &deploypb.ListServicesResponse{}, nil
+}
+
 // Build assembles ok control from its configuration.
 func Build(ctx context.Context, cfg *config.Config, opts Options) (*Role, error) {
 	r := &Role{}
@@ -181,7 +194,10 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (*Role, error)
 	dir := people.NewDirectory(identitypb.NewDirectoryClient(idConn))
 	sc := scm.New(scmConn)
 	runs := automationpb.NewRunsClient(autoConn)
-	deploys := deploypb.NewDeploymentsClient(deployConn)
+	var deploys deploypb.DeploymentsClient = deploypb.NewDeploymentsClient(deployConn)
+	if opts.Deploy == nil && cfg.Services.Deploy == "" {
+		deploys = noDeployer{deploys}
+	}
 	r.Review = review.New(d, sc, runs, dir, cfg.Identity.TreeRepository)
 	site := &site{handler: web.New(d, sc, runs, deploys, r.Review, dir).Handler()}
 	cl := api.New(d, sc, runs, deploys, r.Review, cfg.PublicURL)

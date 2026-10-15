@@ -174,7 +174,11 @@ identity:
 ```
 
 A role elsewhere uses a credential an administrator certified, `ok admin robot certify scm.ok -dir
-/etc/ok/credential` (`workload.credential_dir`).
+/etc/ok/credential` (`workload.credential_dir`). Before anyone can sign in — a first start, as
+[deploy/compose](../deploy/compose/README.md)'s setup is — the operator certifies one from identity's
+database and CA instead: `ok identity certify -config ok.yaml -dir /etc/ok/credential worker.ok`, for
+a robot the configuration names. Run again, it keeps a credential good for another hour, and
+otherwise certifies a new key and revokes the one it replaces; the role renews it as it runs.
 
 ## Administration
 

@@ -61,6 +61,18 @@ Every role reads one configuration file, and is reached at one public address:
 This repository is published from where ok is developed, one commit per change landed there. It
 does not take pull requests.
 
+## Trying it
+
+On one machine, with Docker Compose or Podman:
+
+```bash
+git clone https://github.com/Cidan/ok && cd ok/deploy/compose
+docker compose up -d     # or: podman compose up -d
+```
+
+Then <http://localhost:8080>, signed in as `admin@example.com` with the password `ok`.
+[deploy/compose/README.md](deploy/compose/README.md) takes you through your first CL.
+
 ## Installing
 
 The Helm chart, on Kubernetes: [docs/install.md](docs/install.md). Each release has `ok` and `jj`

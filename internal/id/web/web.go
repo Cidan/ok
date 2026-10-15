@@ -27,6 +27,7 @@ import (
 	"github.com/Cidan/ok/internal/id/store"
 	"github.com/Cidan/ok/internal/serve/authn"
 	"github.com/Cidan/ok/internal/serve/node"
+	"github.com/Cidan/ok/internal/web/static"
 	identitypb "github.com/Cidan/ok/proto/ok/identity/v1"
 )
 
@@ -83,6 +84,7 @@ func (w *Web) Mount(r *chi.Mux) (string, error) {
 		return "", err
 	}
 	r.Use(sameSite)
+	r.Handle("/assets/favicon.svg", http.StripPrefix("/id/assets/", static.Handler()))
 	r.Handle("/assets/*", http.StripPrefix("/id/assets/", http.FileServer(http.FS(sub))))
 	r.Get("/login", w.login)
 	r.Get("/login/oidc/callback", w.oidcCallback)

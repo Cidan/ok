@@ -34,6 +34,9 @@ Usage:
   ok identity serve [-config ok.yaml] [-dev]
                                            run the identity role
   ok identity ca init -dir DIR [-name N]   make the identity CA
+  ok identity certify [-config ok.yaml] -dir DIR ROBOT
+                                           certify a key for a robot the configuration names, from
+                                           identity's database and CA: a role where nothing vouches for it
   ok scm serve [-config ok.yaml] [-dev]    run the SCM role
   ok control serve [-config ok.yaml] [-dev]  run ok control: review and the web UI
   ok automation serve [-config ok.yaml] [-dev]
@@ -148,6 +151,8 @@ func run(args []string, stdin io.Reader, stdout io.Writer) error {
 		return authStatus(stdout)
 	case "auth logout":
 		return authLogout(stdout)
+	case "identity certify":
+		return identityCertify(args[2:], stdout)
 	case "identity check":
 		return identityCheck(args[2:], stdout)
 	case "owners check":

@@ -1,0 +1,17 @@
+# Dex, the sign-in for compose.yaml: one static client, ok, and a password per person. A hash is
+# bcrypt's: htpasswd -bnBC 10 "" 'the password' | tr -d ':\n', or any bcrypt tool.
+issuer: http://localhost:5556/dex
+storage: {type: memory}
+web: {http: 0.0.0.0:5556}
+oauth2: {skipApprovalScreen: true}
+enablePasswordDB: true
+staticClients:
+  - id: ok
+    name: ok
+    secret: ok-local-only
+    redirectURIs: [http://localhost:8080/id/login/oidc/callback]
+staticPasswords:
+  - email: admin@example.com
+    username: admin
+    userID: "1"
+    hash: "$2b$10$kCoQkalPPdNX2/0ZqSO4nuP.Gd0qTbGSkEKKA6tnIgQC6j3b6CgaS"   # ok

@@ -5,6 +5,9 @@ one Deployment (`ok serve`), the workers in another, and, optionally, the deploy
 they read is one configuration file, `ok.yaml`, which the chart renders from its values
 ([configuration.md](configuration.md) is its reference).
 
+To try ok first, on one machine, use Docker Compose or Podman instead:
+[deploy/compose](../deploy/compose/README.md).
+
 ## What it needs
 
 - **Kubernetes 1.30 or later.** The deployer's admission policy uses ValidatingAdmissionPolicy,
@@ -76,7 +79,7 @@ worker:
 ```
 
 ```bash
-helm install ok oci://ghcr.io/cidan/charts/ok --version 0.1.0 -n ok -f values.yaml
+helm install ok oci://ghcr.io/cidan/charts/ok --version 1.0.0 -n ok -f values.yaml
 kubectl -n ok rollout status deployment/ok-server
 ok config check -config ok.yaml   # the same check the roles make, on a file of your own
 ```
@@ -105,6 +108,10 @@ failing with what to change on the node if it cannot.
 
   — or set the sysctl to 0 on the nodes. Inside kind, whose nodes cannot use AppArmor profiles, set
   it on the machine that runs kind.
+- **SELinux** (Fedora, RHEL, openSUSE) runs containers as `container_t`, which refuses the sandbox
+  its own `/dev/pts`. Run workers and the deployer as `spc_t` —
+  `securityContext.seLinuxOptions: {type: spc_t}`; under podman or Docker, `--security-opt
+  label=disable` — as compose.yaml's worker does.
 - **A virtual checkout** (`worker.checkout: virtual`) also opens `/dev/fuse`, which a container
   runtime allows a pod only as a device plugin offers it. Run one that offers `/dev/fuse` —
   [generic-device-plugin](https://github.com/squat/generic-device-plugin), with a `fuse` device —

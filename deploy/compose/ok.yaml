@@ -1,0 +1,34 @@
+# ok's configuration for compose.yaml (docs/configuration.md): one machine, plain HTTP on
+# localhost, every role but the deployer, and Dex for sign-in.
+domain: example.com
+installation: ok on this machine
+public_url: http://localhost:8080
+listen: ":8472"
+metrics_listen: ":8473"
+database: {url_file: /etc/ok/secrets/database-url}
+roles: {identity: identity.ok, scm: scm.ok, control: control.ok, automation: automation.ok, worker: worker.ok}
+services: {identity: "ok:8472", scm: "ok:8472", automation: "ok:8472"}
+# The worker's credential, which setup certifies (ok identity certify) and the worker renews.
+workload: {credential_dir: /var/lib/ok/worker-credential}
+identity:
+  ca_dir: /var/lib/ok/ca
+  bootstrap_admins: [admin]
+  sign_in:
+    oidc:
+      - id: dex
+        name: Dex
+        issuer: http://localhost:5556/dex
+        client_id: ok
+        client_secret_file: /etc/ok/secrets/oidc-client-secret
+  # Who may sign in: people.yaml, by the email Dex vouches for.
+  system_of_record:
+    static: {file: /etc/ok/people.yaml}
+scm:
+  objects: {endpoint: "http://s3:7070", bucket: ok-scm, region: us-east-1, access_key_file: /etc/ok/secrets/s3-access-key, secret_key_file: /etc/ok/secrets/s3-secret-key}
+automation:
+  logs: {endpoint: "http://s3:7070", bucket: ok-logs, region: us-east-1, access_key_file: /etc/ok/secrets/s3-access-key, secret_key_file: /etc/ok/secrets/s3-secret-key}
+worker:
+  state: /var/lib/ok/state
+  slots: 2
+  run_memory_gib: 2
+  checkout: real

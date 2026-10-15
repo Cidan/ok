@@ -15,6 +15,7 @@ import (
 	"strings"
 	"syscall"
 	"text/tabwriter"
+	"time"
 
 	"github.com/Cidan/ok/internal/client/auth"
 	"github.com/Cidan/ok/internal/config"
@@ -22,6 +23,8 @@ import (
 	"github.com/Cidan/ok/internal/dial"
 	"github.com/Cidan/ok/internal/id/ca"
 	"github.com/Cidan/ok/internal/id/role"
+	idstore "github.com/Cidan/ok/internal/id/store"
+	"github.com/Cidan/ok/internal/pgdb"
 	"github.com/Cidan/ok/internal/serve"
 	identitypb "github.com/Cidan/ok/proto/ok/identity/v1"
 )
@@ -86,6 +89,103 @@ func caInit(args []string, stdout io.Writer) error {
 		return err
 	}
 	fmt.Fprintf(stdout, "made the identity CA in %s: keep tls.key secret, and back it up\n", *dir)
+	return nil
+}
+
+// identityCertify certifies a key for one of the robots the configuration names, from identity's
+// database and CA directly — an operator's command, for a role that runs where no issuer vouches
+// for it, before anyone has signed in (docker compose): what ok admin robot certify does, without
+// an administrator's credential. A credential in DIR that is the robot's and good for another hour
+// is kept; otherwise a new key is certified there and the one it replaces revoked. Identity need
+// not be running: the command makes its tables and the robot as identity does when it starts.
+func identityCertify(args []string, stdout io.Writer) error {
+	flags := flag.NewFlagSet("identity certify", flag.ContinueOnError)
+	path := flags.String("config", "ok.yaml", "the installation's configuration")
+	dir := flags.String("dir", "", "where the robot keeps its key and certificate: its workload.credential_dir")
+	if err := flags.Parse(args); err != nil {
+		return flagError(err)
+	}
+	if *dir == "" || flags.NArg() != 1 {
+		return usageError("ok identity certify [-config ok.yaml] -dir DIR ROBOT")
+	}
+	cfg, err := config.Load(*path)
+	if err != nil {
+		return err
+	}
+	names := cfg.Names()
+	short := flags.Arg(0)
+	name := names.Robot(short)
+	named := false
+	for _, r := range cfg.Roles.All() {
+		named = named || names.Robot(r) == name
+	}
+	for _, r := range cfg.Identity.Robots {
+		named = named || names.Robot(r.Name) == name
+	}
+	if !named {
+		return fmt.Errorf("%s is not a robot the configuration names (roles, identity.robots)", short)
+	}
+	old, err := auth.Load(*dir)
+	if err == nil && old.Principal() == name && time.Until(old.NotAfter()) > time.Hour {
+		fmt.Fprintf(stdout, "kept %s's credential in %s, good until %s\n", name, *dir, old.NotAfter().UTC().Format(time.RFC3339))
+		return nil
+	}
+
+	ctx := context.Background()
+	dsn, err := config.Secret(cfg.Database.URLFile)
+	if err != nil {
+		return fmt.Errorf("database.url_file: %w", err)
+	}
+	pool, err := pgdb.Open(ctx, dsn, role.Schema, 2)
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+	st, err := idstore.Open(ctx, pool, names)
+	if err != nil {
+		return fmt.Errorf("the identity store: %w", err)
+	}
+	authority, err := ca.Load(cfg.Identity.CADir)
+	if err != nil {
+		return fmt.Errorf("identity.ca_dir: %w (make one with: ok identity ca init)", err)
+	}
+	p, err := st.EnsureRobot(ctx, name)
+	if err != nil {
+		return err
+	}
+	if !p.Active() {
+		return fmt.Errorf("%s is not an active robot", name)
+	}
+	key, err := credential.NewKey()
+	if err != nil {
+		return err
+	}
+	spki, err := x509.MarshalPKIXPublicKey(&key.PublicKey)
+	if err != nil {
+		return err
+	}
+	c, err := st.EnrollKey(ctx, p.ID, short, spki)
+	if err != nil {
+		return err
+	}
+	chain, notAfter, err := authority.Issue(&key.PublicKey, name, c.ID)
+	if err != nil {
+		return err
+	}
+	if err := st.Issued(ctx, c.ID, notAfter); err != nil {
+		return err
+	}
+	if err := auth.Save(*dir, auth.Server{URL: cfg.PublicURL, Addr: cfg.Services.Identity, TLS: cfg.Services.TLS}, chain[0], key); err != nil {
+		return err
+	}
+	if old != nil && old.Principal() == name {
+		if id := old.ID(); id != "" && id != c.ID {
+			if err := st.Revoke(ctx, id); err != nil && !errors.Is(err, idstore.ErrNotFound) {
+				return fmt.Errorf("revoking the credential it replaces, %s: %w", id, err)
+			}
+		}
+	}
+	fmt.Fprintf(stdout, "certified %s's key in %s, good until %s; it renews itself\n", name, *dir, notAfter.UTC().Format(time.RFC3339))
 	return nil
 }
 
