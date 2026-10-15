@@ -145,12 +145,33 @@ func (s *Server) Mount(r chi.Router) {
 	})
 }
 
-// Handler is the site with cross-origin protection: a state-changing request must come
-// from ok's own pages.
+// Handler is the site with cross-origin protection — a state-changing request must come
+// from ok's own pages — and every response under securityHeaders.
 func (s *Server) Handler() http.Handler {
 	r := chi.NewRouter()
 	s.Mount(r)
-	return http.NewCrossOriginProtection().Handler(r)
+	return http.NewCrossOriginProtection().Handler(securityHeaders(r))
+}
+
+// pageCSP is every page's Content-Security-Policy: scripts, styles, and fonts from ok alone —
+// the pages hold no inline script or style — images from ok or any HTTPS host (a README's
+// badges), no plugins, no other site framing it, and forms posting to ok alone. A response that
+// sets its own (raw bytes, under a sandbox) replaces it.
+const pageCSP = "default-src 'self'; img-src 'self' https: data:; object-src 'none'; base-uri 'none'; " +
+	"frame-ancestors 'none'; form-action 'self'"
+
+// securityHeaders sets what every response carries: the policy above, framing refused for
+// browsers before frame-ancestors, no sniffing a response's type, and no full URL — a CL's, a
+// file path's — sent to the sites its links lead to.
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("Content-Security-Policy", pageCSP)
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("Referrer-Policy", "strict-origin-when-cross-origin")
+		next.ServeHTTP(w, r)
+	})
 }
 
 // fail renders an error: a missing thing as not found, a refusal as it reads, and

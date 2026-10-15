@@ -502,9 +502,19 @@ fn big_files(mode: Mode) {
             && out.contains("the maximum size allowed is 50.0MiB (52428800 bytes)"),
         "{out}"
     );
+    // Tracked anyway — the limit raised — it is refused as it is snapshotted, naming the file,
+    // and nothing of it is staged: once it is gone, the workspace publishes again.
     let raised = ["--config", "snapshot.max-new-file-size=60MiB"];
     let out = alice.fails("repo", &[&raised[..], &["cl"]].concat());
-    assert!(out.contains("ok holds files up to 50 MiB"), "{out}");
+    assert!(
+        out.contains("big.bin is larger than 50 MiB, the largest file ok holds"),
+        "{out}"
+    );
+    std::fs::remove_file(&big).unwrap();
+    std::fs::write(alice.home.path().join("repo/small.bin"), b"small\n").unwrap();
+    alice.ok("repo", &["describe", "-m", "small after all"]);
+    let out = alice.ok("repo", &["cl"]);
+    assert!(out.contains("CL 2 created"), "{out}");
 }
 
 impl Person {

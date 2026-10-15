@@ -1,0 +1,12 @@
+/* Every page's shell, before its own stylesheets apply (layout.templ). */
+/* color-scheme keeps the UA canvas, form controls, and scrollbars dark, so a full
+   document load never flashes a light-grey frame/scrollbar before paint. */
+html { background-color: #09090b; color-scheme: dark; } /* zinc-950 */
+@keyframes shell-fade-in { from { opacity: 0 } to { opacity: 1 } }
+body { animation: shell-fade-in 70ms ease-in-out both; }
+[data-hydrate] { transition: opacity 120ms ease-in-out; }
+[data-hydrate].hydrating { opacity: 0; transition: none; }
+@media (prefers-reduced-motion: reduce) {
+  body { animation: none !important; }
+  [data-hydrate] { transition: none !important; }
+}

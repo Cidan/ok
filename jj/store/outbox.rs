@@ -51,6 +51,9 @@ pub struct Outbox {
     dir: PathBuf,
     quarantine: PathBuf,
     state: Mutex<State>,
+    /// Held while this process takes the write lock: a snapshot writes files from several threads,
+    /// which queue here rather than each racing for the lock file.
+    writing: Mutex<()>,
 }
 
 /// The log as this process has read it.
@@ -158,6 +161,7 @@ impl Outbox {
             dir,
             quarantine,
             state: Mutex::new(State::default()),
+            writing: Mutex::new(()),
         };
         {
             let _w = this.write_lock()?;
@@ -176,6 +180,7 @@ impl Outbox {
             dir: dir.to_owned(),
             quarantine: PathBuf::new(),
             state: Mutex::new(State::default()),
+            writing: Mutex::new(()),
         }
     }
 
@@ -183,8 +188,10 @@ impl Outbox {
         self.dir.join("log")
     }
 
-    fn write_lock(&self) -> io::Result<FileLock> {
-        FileLock::lock(self.dir.join(".write")).map_err(io::Error::other)
+    fn write_lock(&self) -> io::Result<(std::sync::MutexGuard<'_, ()>, FileLock)> {
+        let local = self.writing.lock().unwrap();
+        let file = FileLock::lock(self.dir.join(".write")).map_err(io::Error::other)?;
+        Ok((local, file))
     }
 
     /// Serializes publishes from this machine's processes.
@@ -417,6 +424,20 @@ impl Outbox {
         self.append(&[(MANIFEST, 0, m.id, &m.encode())], true)
     }
 
+    /// Stages a file's chunks and then its manifest in one append, unsynced: the log is read in
+    /// order and every entry checks, so after a crash a manifest is there only with its chunks
+    /// before it; and the next durable append — the tree, commit, or checkpoint that names the
+    /// file — makes it durable.
+    pub fn stage_file_with(&self, chunks: &[(Id, &[u8])], m: &Manifest) -> io::Result<()> {
+        let manifest = m.encode();
+        let mut entries: Vec<(u8, u8, Id, &[u8])> = chunks
+            .iter()
+            .map(|(id, raw)| (CHUNK, 0, *id, *raw))
+            .collect();
+        entries.push((MANIFEST, 0, m.id, &manifest));
+        self.append(&entries, false)
+    }
+
     pub fn object(&self, key: Key) -> Option<Vec<u8>> {
         self.bytes(key.kind as u8, &key.id)
     }
@@ -585,6 +606,22 @@ impl Outbox {
             }
         }
         self.replace_log(&mut st, &buf)
+    }
+
+    /// Moves a file's manifest the server can never accept out of the way, as quarantine moves
+    /// an object. Returns where it went.
+    pub fn quarantine_file(&self, m: &Manifest) -> io::Result<PathBuf> {
+        fs::create_dir_all(&self.quarantine)?;
+        let to = self
+            .quarantine
+            .join(format!("file-{}", Key::new(Kind::File, m.id).hex()));
+        let mut tmp = tempfile::NamedTempFile::new_in(&self.quarantine)?;
+        tmp.write_all(&m.encode())?;
+        tmp.as_file().sync_all()?;
+        tmp.persist(&to).map_err(|e| e.error)?;
+        File::open(&self.quarantine)?.sync_all()?;
+        self.append(&[(MANIFEST, TOMBSTONE, m.id, &[])], true)?;
+        Ok(to)
     }
 
     /// Moves an object the server can never accept out of the way, keeping it for

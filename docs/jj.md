@@ -41,7 +41,9 @@ clone` makes another workspace. After that it is ordinary jj.
 
 Built-in configuration sets `trunk()` to `main@ok`, `ok.endpoint` (where new clones come from) to
 the ok the machine signed in to, `snapshot.max-new-file-size` to 50 MiB (the largest file the SCM
-holds; upstream stops at 1 MiB), and `user.name` and `user.email` to the person who signed in. A
+holds; upstream stops at 1 MiB; a larger file stays untracked, and one tracked anyway — the setting
+raised — is refused as it is snapshotted, naming it, and never staged), and `user.name` and
+`user.email` to the person who signed in. A
 clone's CL links point at the ok it came from, unless `ok.web-url` says otherwise.
 
 ChangeLists:

@@ -36,7 +36,7 @@ func automationServe(args []string) error {
 	path := flags.String("config", "ok.yaml", "the installation's configuration")
 	dev := flags.Bool("dev", false, "accept development principals (ok-dev-principal), on a loopback address only")
 	if err := flags.Parse(args); err != nil {
-		return usageError(err.Error())
+		return flagError(err)
 	}
 	cfg, err := config.Load(*path)
 	if err != nil {
@@ -84,7 +84,7 @@ func workerRun(args []string) error {
 	path := flags.String("config", "ok.yaml", "the installation's configuration")
 	dev := flags.String("dev-principal", "", "the principal to name to loopback development services (tests)")
 	if err := flags.Parse(args); err != nil {
-		return usageError(err.Error())
+		return flagError(err)
 	}
 	cfg, err := config.Load(*path)
 	if err != nil {

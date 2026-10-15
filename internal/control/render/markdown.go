@@ -5,8 +5,10 @@ import (
 	"net/url"
 	"path"
 	"regexp"
+	"sort"
 	"strings"
 
+	"github.com/alecthomas/chroma/v2"
 	chromahtml "github.com/alecthomas/chroma/v2/formatters/html"
 	"github.com/microcosm-cc/bluemonday"
 	"github.com/yuin/goldmark"
@@ -90,11 +92,27 @@ func (t transformer) Transform(doc *ast.Document, _ text.Reader, _ parser.Contex
 	})
 }
 
+// markupClasses matches a class attribute rendered markdown may keep: the highlighter's classes
+// (chroma's), a fenced block's language, and task lists'. Nothing else: the page's own
+// stylesheet would otherwise be the document's — a README's div of "fixed inset-0 z-50" laid
+// over the page, a sign-in prompt in it.
+var markupClasses = func() *regexp.Regexp {
+	names := []string{"task-list-item", `language-[A-Za-z0-9_+#.-]+`}
+	for _, c := range chroma.StandardTypes {
+		if c != "" {
+			names = append(names, regexp.QuoteMeta(c))
+		}
+	}
+	sort.Strings(names)
+	one := "(?:" + strings.Join(names, "|") + ")"
+	return regexp.MustCompile(`^` + one + `(?: ` + one + `)*$`)
+}()
+
 // policy sanitizes rendered markdown: user-generated content's elements and attributes,
 // the classes highlighting and task lists use, and task-list checkboxes.
 var policy = func() *bluemonday.Policy {
 	p := bluemonday.UGCPolicy()
-	p.AllowAttrs("class").Matching(regexp.MustCompile(`^[a-z0-9 _-]+$`)).OnElements("span", "code", "pre", "div", "li")
+	p.AllowAttrs("class").Matching(markupClasses).OnElements("span", "code", "pre", "div", "li")
 	p.AllowAttrs("type").Matching(regexp.MustCompile(`^checkbox$`)).OnElements("input")
 	p.AllowAttrs("checked", "disabled").OnElements("input")
 	p.AllowElements("details", "summary", "kbd", "sup", "sub")

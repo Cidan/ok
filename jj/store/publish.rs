@@ -64,7 +64,11 @@ impl From<Status> for PublishError {
 /// returns the heads after the publish. Runs on the store runtime; the caller holds the
 /// outbox lock.
 pub async fn publish(shared: Arc<Shared>, heads: Option<Heads>) -> Result<Vec<Id>, PublishError> {
-    let staged = shared.outbox.list()?;
+    let staged = set_aside_oversized(
+        &shared,
+        shared.outbox.list()?,
+        heads.as_ref().map(|h| h.new),
+    )?;
     let batches = plan(&shared, &staged);
     let last = batches.len() - 1;
     let mut heads = heads;
@@ -75,6 +79,77 @@ pub async fn publish(shared: Arc<Shared>, heads: Option<Heads>) -> Result<Vec<Id
     }
     shared.outbox.retire(&staged, &shared.cache)?;
     Ok(result)
+}
+
+/// Sets aside what the SCM can never accept from what is staged: every file larger than it holds
+/// (one an older jj staged; this one refuses them as they are written), and every object that
+/// reaches one — the trees, commits, views, and operations of a snapshot that failed for it. They
+/// are quarantined, and what is left publishes. An operation being recorded that reaches one is
+/// refused, saying which file.
+pub(crate) fn set_aside_oversized(
+    shared: &Shared,
+    mut staged: Staged,
+    recording: Option<Id>,
+) -> Result<Staged, PublishError> {
+    let oversized: Vec<Manifest> = staged
+        .files
+        .iter()
+        .filter(|m| m.size > crate::chunk::MAX_FILE)
+        .cloned()
+        .collect();
+    if oversized.is_empty() {
+        return Ok(staged);
+    }
+    let mut bad: HashSet<Key> = oversized
+        .iter()
+        .map(|m| Key::new(Kind::File, m.id))
+        .collect();
+    let refs: Vec<(Key, Vec<Key>)> = staged
+        .objects
+        .iter()
+        .map(|k| {
+            (
+                *k,
+                shared
+                    .outbox
+                    .object(*k)
+                    .map(|b| references(&b))
+                    .unwrap_or_default(),
+            )
+        })
+        .collect();
+    loop {
+        let before = bad.len();
+        for (k, r) in &refs {
+            if !bad.contains(k) && r.iter().any(|x| bad.contains(x)) {
+                bad.insert(*k);
+            }
+        }
+        if bad.len() == before {
+            break;
+        }
+    }
+    if let Some(op) = recording
+        && bad.contains(&Key::new(Kind::Operation, op))
+    {
+        let m = &oversized[0];
+        return Err(PublishError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{} is {} bytes, larger than the 50 MiB ok holds: remove it, or leave it untracked",
+                m.path_hint, m.size
+            ),
+        )));
+    }
+    for m in &oversized {
+        shared.outbox.quarantine_file(m)?;
+    }
+    for k in staged.objects.iter().filter(|k| bad.contains(k)) {
+        shared.outbox.quarantine(*k)?;
+    }
+    staged.files.retain(|m| m.size <= crate::chunk::MAX_FILE);
+    staged.objects.retain(|k| !bad.contains(k));
+    Ok(staged)
 }
 
 #[derive(Default)]

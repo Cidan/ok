@@ -109,7 +109,7 @@ func Scroller(url string, pageSize int, hasMore bool, class, rowsClass string) t
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
-		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 5, "\"><div data-infinite-top-spacer style=\"height:0\"></div><div data-infinite-sentinel=\"top\" class=\"h-px w-full\"></div>")
+		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 5, "\"><div data-infinite-top-spacer></div><div data-infinite-sentinel=\"top\" class=\"h-px w-full\"></div>")
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
@@ -139,7 +139,7 @@ func Scroller(url string, pageSize int, hasMore bool, class, rowsClass string) t
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
-		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 8, "</div><div data-infinite-sentinel=\"bottom\" class=\"h-px w-full\"></div><div data-infinite-bottom-spacer style=\"height:0\"></div></div>")
+		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 8, "</div><div data-infinite-sentinel=\"bottom\" class=\"h-px w-full\"></div><div data-infinite-bottom-spacer></div></div>")
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}

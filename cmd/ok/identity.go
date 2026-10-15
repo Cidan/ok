@@ -32,7 +32,7 @@ func identityServe(args []string) error {
 	path := flags.String("config", "ok.yaml", "the installation's configuration")
 	dev := flags.Bool("dev", false, "accept development principals (ok-dev-principal), on a loopback address only")
 	if err := flags.Parse(args); err != nil {
-		return usageError(err.Error())
+		return flagError(err)
 	}
 	cfg, err := config.Load(*path)
 	if err != nil {
@@ -77,7 +77,7 @@ func caInit(args []string, stdout io.Writer) error {
 	dir := flags.String("dir", "", "the directory to make the CA in: identity.ca_dir")
 	name := flags.String("name", "ok", "the installation's name, in the CA's")
 	if err := flags.Parse(args); err != nil {
-		return usageError(err.Error())
+		return flagError(err)
 	}
 	if *dir == "" {
 		return usageError("-dir is required")
@@ -96,7 +96,7 @@ func authLogin(args []string, stdout io.Writer) error {
 	label := flags.String("label", defaultLabel(), "what this machine is called on your account page")
 	noBrowser := flags.Bool("no-browser", false, "do not open a browser")
 	if err := flags.Parse(args); err != nil {
-		return usageError(err.Error())
+		return flagError(err)
 	}
 	if *server == "" {
 		return usageError("-server is required (or OK_SERVER)")

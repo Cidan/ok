@@ -24,7 +24,7 @@ func scmServe(args []string) error {
 	path := flags.String("config", "ok.yaml", "the installation's configuration")
 	dev := flags.Bool("dev", false, "accept development principals (ok-dev-principal), on a loopback address only")
 	if err := flags.Parse(args); err != nil {
-		return usageError(err.Error())
+		return flagError(err)
 	}
 	cfg, err := config.Load(*path)
 	if err != nil {
@@ -62,7 +62,7 @@ func scmStore(ctx context.Context, name string, args []string, extra func(*flag.
 		extra(flags)
 	}
 	if err := flags.Parse(args); err != nil {
-		return nil, store.Repository{}, nil, usageError(err.Error())
+		return nil, store.Repository{}, nil, flagError(err)
 	}
 	if flags.NArg() != 1 {
 		return nil, store.Repository{}, nil, usageError("ok " + name + " names one repository, by name or ID")

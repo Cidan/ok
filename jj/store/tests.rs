@@ -1435,3 +1435,101 @@ fn op_frontier_keeps_the_newest() {
     assert_eq!(kept.len(), crate::cache::FRONTIER_MAX);
     assert_eq!(kept, many[..crate::cache::FRONTIER_MAX].to_vec());
 }
+
+// A file larger than the SCM holds is refused as it is written, and nothing of it is staged as a
+// file — a staged file the SCM refuses would fail every publish after it.
+#[test]
+fn a_file_larger_than_the_scm_holds_is_refused_as_it_is_written() {
+    let (_dir, shared) = repo();
+    let size = chunk::MAX_FILE as usize + 1;
+    let data: Vec<u8> = (0..size)
+        .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+        .collect();
+    let mut reader = futures::io::Cursor::new(data);
+    let err = block_on(chunk::write_file(&shared, "big/blob.bin", &mut reader)).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(
+        err.to_string()
+            .contains("big/blob.bin is larger than 50 MiB"),
+        "{err}"
+    );
+    assert!(
+        shared.outbox.list().unwrap().files.is_empty(),
+        "a manifest was staged"
+    );
+    // One just under the limit is written.
+    let mut reader = futures::io::Cursor::new(vec![7u8; chunk::MAX_FILE as usize]);
+    block_on(chunk::write_file(&shared, "ok.bin", &mut reader)).unwrap();
+}
+
+// What an older jj staged for a file larger than the SCM holds — the file, and the tree, commit,
+// view, and operation of the snapshot that failed for it — is set aside, so the publishes after it
+// go through; recording an operation that reaches such a file is refused, naming it.
+#[test]
+fn what_reaches_an_oversized_file_is_set_aside() {
+    let (_dir, shared) = repo();
+    let big = Manifest {
+        id: id(9),
+        size: chunk::MAX_FILE + 1,
+        chunks: vec![(id(10), chunk::MAX_FILE as u32), (id(11), 1)],
+        path_hint: "blob.bin".into(),
+    };
+    let file = |fid: Id| TreeValue::File {
+        id: FileId::new(fid.to_vec()),
+        executable: false,
+        copy_id: CopyId::new(vec![]),
+    };
+    let (tree, tree_bytes) = tree_object(vec![("blob.bin", file(big.id))]);
+    let (c, c_bytes) = commit_object(&commit(vec![ROOT_ID], vec![], vec![tree.id]));
+    let mut view = View::make_root(CommitId::new(ROOT_ID.to_vec()));
+    view.head_ids = [CommitId::new(c.id.to_vec())].into();
+    let view_bytes = ok_encoding::encode_view(&view).unwrap();
+    let v = Key::new(Kind::View, ok_encoding::hash(&view_bytes));
+    let mut op = Operation::make_root(ViewId::new(v.id.to_vec()));
+    op.parents = vec![OperationId::new(ROOT_ID.to_vec())];
+    let op_bytes = ok_encoding::encode_operation(&op).unwrap();
+    let o = Key::new(Kind::Operation, ok_encoding::hash(&op_bytes));
+    let (fine, fine_bytes) = tree_object(vec![("README", file(id(3)))]);
+    let stage = || {
+        shared.outbox.stage_file(&big).unwrap();
+        for (k, b) in [
+            (tree, &tree_bytes),
+            (c, &c_bytes),
+            (v, &view_bytes),
+            (o, &op_bytes),
+            (fine, &fine_bytes),
+        ] {
+            shared.outbox.stage_object(k, b).unwrap();
+        }
+    };
+    stage();
+
+    // Recording the snapshot's own operation is refused, naming the file; nothing is set aside.
+    let err = match publish::set_aside_oversized(&shared, shared.outbox.list().unwrap(), Some(o.id))
+    {
+        Ok(_) => panic!("an operation reaching an oversized file was let through"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        err.contains("blob.bin is") && err.contains("50 MiB"),
+        "{err}"
+    );
+    assert_eq!(shared.outbox.list().unwrap().files.len(), 1);
+
+    // Recording another, or none, sets the whole failed snapshot aside, and leaves the rest.
+    let left = publish::set_aside_oversized(&shared, shared.outbox.list().unwrap(), None).unwrap();
+    assert!(
+        left.files.is_empty(),
+        "the oversized file is still to be published"
+    );
+    assert_eq!(
+        left.objects,
+        vec![fine],
+        "only what does not reach it is left"
+    );
+    let staged = shared.outbox.list().unwrap();
+    assert!(
+        staged.files.is_empty() && staged.objects == vec![fine],
+        "the outbox still holds it"
+    );
+}

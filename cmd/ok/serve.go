@@ -52,7 +52,7 @@ func serveRolesUntil(ctx context.Context, args []string) error {
 	list := flags.String("roles", "all", "the roles to run, comma-separated: identity, scm, automation, deploy, control; or all")
 	dev := flags.Bool("dev", false, "accept development principals (ok-dev-principal), on a loopback address only")
 	if err := flags.Parse(args); err != nil {
-		return usageError(err.Error())
+		return flagError(err)
 	}
 	run := map[string]bool{}
 	for _, r := range strings.Split(*list, ",") {

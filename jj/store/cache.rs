@@ -347,6 +347,28 @@ impl Cache {
     }
 
     /// Whether a chunk is cached (not read, nor checked).
+    /// Whether the cache holds a chunk, as far as it has seen: it may miss one another process
+    /// cached a moment ago. For staging, where a miss costs only staging it again.
+    pub fn holds_chunk(&self, id: &Id) -> bool {
+        self.decoded.lock().unwrap().contains(&(CHUNK, *id))
+            || self
+                .segments
+                .peek(id, &mut |e| e.kind == CHUNK || e.kind == WHOLE)
+                .is_some()
+    }
+
+    /// Whether the cache holds a file — whole, or its manifest and every chunk — as holds_chunk
+    /// sees.
+    pub fn holds_file(&self, id: &Id) -> bool {
+        if self.decoded.lock().unwrap().contains(&(WHOLE, *id))
+            || self.segments.peek(id, &mut |e| e.kind == WHOLE).is_some()
+        {
+            return true;
+        }
+        self.manifest_in(id, true)
+            .is_some_and(|m| m.chunks.iter().all(|(c, _)| self.holds_chunk(c)))
+    }
+
     pub fn has_chunk(&self, id: &Id) -> bool {
         self.decoded.lock().unwrap().contains(&(CHUNK, *id))
             || self
@@ -581,8 +603,13 @@ impl Cache {
     }
 
     fn stored_manifest(&self, id: &Id) -> Option<Manifest> {
+        self.manifest_in(id, false)
+    }
+
+    /// A manifest the segments hold: peeked (no look again on a miss) or got.
+    fn manifest_in(&self, id: &Id, peek: bool) -> Option<Manifest> {
         let mut found = None;
-        self.segments.get(id, &mut |e| {
+        let mut accept = |e: &crate::segments::Entry| {
             if e.kind != MANIFEST || e.key != Some(*id) {
                 return false;
             }
@@ -593,7 +620,12 @@ impl Cache {
                 }
                 None => false,
             }
-        })?;
+        };
+        if peek {
+            self.segments.peek(id, &mut accept)?;
+        } else {
+            self.segments.get(id, &mut accept)?;
+        }
         found
     }
 

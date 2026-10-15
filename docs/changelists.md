@@ -32,7 +32,10 @@ Naming is end to end: **`cl`** everywhere (routes `/cls` and `/cl/<n>`, the `jj 
    — except the files of a repository's groups-and-ACLs tree (the folder its
    `.ok/repository.yaml` names as `identity:`), which the ACLs owning what the change changes
    approve instead ([identity.md](identity.md), "Groups and ACLs").
-   `set allowself` in OWNERS lets the author's own grants count. As in Critique, a grant stays in
+   `set allowself` in OWNERS lets the author's own grants count, LGTM included, and so does a file no
+   OWNERS governs: OWNERS are opt-in, so in a repository with none, an author may LGTM and approve
+   their own change — add a root OWNERS (without `set allowself`) to require someone else. As in
+   Critique, a grant stays in
    force across later patchsets (a reviewer re-reviews by revoking), and a CL is approved only with
    an LGTM, every owner set's Approval, and no unresolved comments.
 2. **Client:** ok's **`jj`** only ([jj.md](jj.md)). It is the only way code enters ok: `jj cl`
@@ -113,7 +116,7 @@ jj cl rollback 87 -m 'broke prod'    # a new CL undoing a landed one
 | in review | pre passed; no LGTM, an owner set's Approval, or an unresolved thread | reviewers (and its author, for threads) |
 | submittable | approved and pre passed (`blocked` says what still stands in the way, a conflict with main say) | its author |
 | submitted | in the landing queue: post being planned or run | ok |
-| post failed | its submission failed: post failed, or the SCM refused it | its author |
+| submit failed | its submission failed: post failed, or the SCM refused it (a conflict with `main`) | its author |
 | landed | on main; the deployer has yet to plan its deployments | ok |
 | deploying | each deploy's latest deployment covering its commit is under way | ok, or a repository admin for a migration's hazards |
 | deployed | every one succeeded, or there were none | nobody |

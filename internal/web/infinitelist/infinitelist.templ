@@ -25,12 +25,12 @@ templ Scroller(url string, pageSize int, hasMore bool, class, rowsClass string) 
 		data-infinite-has-more={ strconv.FormatBool(hasMore) }
 		class={ "overflow-y-auto", class }
 	>
-		<div data-infinite-top-spacer style="height:0"></div>
+		<div data-infinite-top-spacer></div>
 		<div data-infinite-sentinel="top" class="h-px w-full"></div>
 		<div data-infinite-rows class={ rowsClass }>
 			{ children... }
 		</div>
 		<div data-infinite-sentinel="bottom" class="h-px w-full"></div>
-		<div data-infinite-bottom-spacer style="height:0"></div>
+		<div data-infinite-bottom-spacer></div>
 	</div>
 }

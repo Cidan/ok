@@ -1,0 +1,2 @@
+/* Without JavaScript, nothing hydrates: what waits to hydrate shows as it is. */
+[data-hydrate].hydrating { opacity: 1 !important; }

@@ -162,6 +162,15 @@ func TestRepositoriesAndBrowsing(t *testing.T) {
 		t.Errorf("browsing at a commit: %s", excerpt(at.body))
 	}
 
+	// Every page is under the site's policy: no inline script or style, no framing.
+	for _, path := range []string{"/", "/browse", "/browse/tree/main/svc", "/browse/cls"} {
+		h := e.get(bob, path).header
+		if csp := h.Get("Content-Security-Policy"); !strings.Contains(csp, "default-src 'self'") || !strings.Contains(csp, "frame-ancestors 'none'") ||
+			h.Get("X-Frame-Options") != "DENY" || h.Get("X-Content-Type-Options") != "nosniff" {
+			t.Errorf("%s's security headers: %v", path, h)
+		}
+	}
+
 	// Raw bytes: nothing a browser could run is served live.
 	for _, tc := range []struct{ path, ctype string }{
 		{"/browse/raw/main/page.html", "text/plain; charset=utf-8"},

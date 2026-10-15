@@ -15,7 +15,7 @@
 //     leaving no `$` delimiter behind). Lower priority runs first.
 //
 //   • Boundaries are regions whose reveal waits on hydration: they carry data-hydrate and
-//     ship hidden (the `hydrating` class → opacity:0, see the shell's <style>). Today that is
+//     ship hidden (the `hydrating` class → opacity:0, see static/shell.css). Today that is
 //     <main id="content">; any future swappable region opts in the same way.
 //
 // Race-free by construction: run() returns Promise.allSettled over the hydrators, and the

@@ -275,7 +275,7 @@ func leftRailBody(m Model) templ.Component {
 					return templ_7745c5c3_Err
 				}
 				if it.Unread {
-					templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 23, "<div class=\"absolute w-2 h-2 rounded-full bg-green-500\" style=\"left: 0; bottom: 1px;\"></div>")
+					templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 23, "<div class=\"absolute left-0 bottom-px w-2 h-2 rounded-full bg-green-500\"></div>")
 					if templ_7745c5c3_Err != nil {
 						return templ_7745c5c3_Err
 					}

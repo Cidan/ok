@@ -41,7 +41,7 @@ func deployServe(args []string) error {
 	color := flags.String("color", "", "the copy of the deployer this is, blue or green (default: $"+colorEnv+", else blue)")
 	devPrincipal := flags.String("dev-principal", "", "the principal to name to loopback development services (tests)")
 	if err := flags.Parse(args); err != nil {
-		return usageError(err.Error())
+		return flagError(err)
 	}
 	cfg, err := config.Load(*path)
 	if err != nil {

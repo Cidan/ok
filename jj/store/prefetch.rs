@@ -37,8 +37,10 @@ use crate::shared::from_wire;
 /// How many uncached ancestors a commit miss brings along.
 pub const ANCESTORS_PER_MISS: i32 = 1000;
 
-/// How many files are fetched concurrently while prefetching a tree.
-const CONCURRENT_FILES: usize = 64;
+/// How many files are fetched concurrently while prefetching a tree: enough to fill every batch
+/// the store keeps in flight. Fewer form one small batch at a time, a round trip each — a real
+/// clone of 30,000 small files took 470 of them, one after another.
+const CONCURRENT_FILES: usize = crate::shared::FILES_PER_READ * crate::batch::MAX_IN_FLIGHT;
 
 /// Streams commits into the cache: those reachable from `want` (or, with `op_log`, from
 /// everything the caller's operation log references) and not from `have`, at most `limit`

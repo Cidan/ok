@@ -96,7 +96,7 @@ func Shell(p Props) templ.Component {
 				return templ_7745c5c3_Err
 			}
 		}
-		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 7, "<!-- Reveal is gated on hydration, not on a timer (see static/hydrate.js). Every\n\t\t\t     [data-hydrate] boundary ships hidden (`hydrating` → opacity:0) so server-rendered\n\t\t\t     inert markup is never shown before the client libraries process it; the runtime\n\t\t\t     reveals it — a 120ms opacity fade — once hydration settles, on both the initial\n\t\t\t     load and every htmx swap. Boundaries nest: a partial swap (e.g. #repo-main inside\n\t\t\t     #content) fades ONLY that region. A no-JS override keeps content visible when\n\t\t\t     scripts are off. The <body> keyframe fades the shell chrome in on a full load; the\n\t\t\t     dark <html> bg + color-scheme avoid a white/grey flash. --><style>\n\t\t\t\t/* color-scheme keeps the UA canvas, form controls, and scrollbars dark, so a full\n\t\t\t\t   document load never flashes a light-grey frame/scrollbar before paint. */\n\t\t\t\thtml { background-color: #09090b; color-scheme: dark; } /* zinc-950 */\n\t\t\t\t@keyframes shell-fade-in { from { opacity: 0 } to { opacity: 1 } }\n\t\t\t\tbody { animation: shell-fade-in 70ms ease-in-out both; }\n\t\t\t\t[data-hydrate] { transition: opacity 120ms ease-in-out; }\n\t\t\t\t[data-hydrate].hydrating { opacity: 0; transition: none; }\n\t\t\t\t@media (prefers-reduced-motion: reduce) {\n\t\t\t\t\tbody { animation: none !important; }\n\t\t\t\t\t[data-hydrate] { transition: none !important; }\n\t\t\t\t}\n\t\t\t</style><noscript><style>[data-hydrate].hydrating { opacity: 1 !important; }</style></noscript>")
+		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 7, "<!-- Reveal is gated on hydration, not on a timer (see static/hydrate.js). Every\n\t\t\t     [data-hydrate] boundary ships hidden (`hydrating` → opacity:0) so server-rendered\n\t\t\t     inert markup is never shown before the client libraries process it; the runtime\n\t\t\t     reveals it — a 120ms opacity fade — once hydration settles, on both the initial\n\t\t\t     load and every htmx swap. Boundaries nest: a partial swap (e.g. #repo-main inside\n\t\t\t     #content) fades ONLY that region. A no-JS override keeps content visible when\n\t\t\t     scripts are off. The <body> keyframe fades the shell chrome in on a full load; the\n\t\t\t     dark <html> bg + color-scheme avoid a white/grey flash. These are static/shell.css:\n\t\t\t     render-blocking as an inline <style> was, which the pages' policy refuses. --><link rel=\"stylesheet\" href=\"/assets/shell.css\"><noscript><link rel=\"stylesheet\" href=\"/assets/noscript.css\"></noscript>")
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
@@ -108,7 +108,7 @@ func Shell(p Props) templ.Component {
 			var templ_7745c5c3_Var5 string
 			templ_7745c5c3_Var5, templ_7745c5c3_Err = templ.ResolveAttributeValue(templ.SafeURL(src))
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `layout/layout.templ`, Line: 54, Col: 36}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `layout/layout.templ`, Line: 43, Col: 36}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var5)
 			if templ_7745c5c3_Err != nil {
@@ -119,7 +119,7 @@ func Shell(p Props) templ.Component {
 				return templ_7745c5c3_Err
 			}
 		}
-		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 10, "</head><body class=\"preload h-dvh overflow-hidden bg-zinc-950 text-zinc-100 antialiased flex flex-col\" style=\"font-family: 'IBM Plex Sans', sans-serif;\"><script>\n\t\t\t\t// Suppress CSS transitions until webfonts are ready, so the async font-swap\n\t\t\t\t// reflow can't animate transition-* elements (nav rail, main, composer) on load.\n\t\t\t\t(function () {\n\t\t\t\t\tfunction go() { if (document.body) document.body.classList.remove('preload'); }\n\t\t\t\t\t(document.fonts && document.fonts.ready ? document.fonts.ready : Promise.resolve()).then(go);\n\t\t\t\t\tsetTimeout(go, 1500);\n\t\t\t\t})();\n\t\t\t</script>")
+		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 10, "</head><body class=\"preload h-dvh overflow-hidden bg-zinc-950 text-zinc-100 antialiased flex flex-col font-['IBM_Plex_Sans',sans-serif]\"><script src=\"/assets/preload.js\"></script>")
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}

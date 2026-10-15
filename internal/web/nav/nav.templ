@@ -57,7 +57,7 @@ templ leftRailBody(m Model) {
 							<a href={ it.url() } hx-get={ it.Href } hx-target="#content" hx-swap="innerHTML swap:70ms settle:1ms" hx-push-url="true" data-nav-link class={ m.sectionRowClass(it) }>
 								<span class="relative truncate text-sm pl-1">
 									if it.Unread {
-										<div class="absolute w-2 h-2 rounded-full bg-green-500" style="left: 0; bottom: 1px;"></div>
+										<div class="absolute left-0 bottom-px w-2 h-2 rounded-full bg-green-500"></div>
 									}
 									{ it.Label }
 								</span>

@@ -124,7 +124,7 @@ pub fn stage_word(s: Stage) -> &'static str {
         Stage::InReview => "in review",
         Stage::Submittable => "submittable",
         Stage::Submitted => "submitted",
-        Stage::PostFailed => "post failed",
+        Stage::PostFailed => "submit failed",
         Stage::Landed => "landed",
         Stage::Deploying => "deploying",
         Stage::Deployed => "deployed",

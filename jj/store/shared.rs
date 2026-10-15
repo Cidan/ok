@@ -128,7 +128,7 @@ impl std::hash::Hash for ChunkRead {
 /// How many objects one batched read asks for.
 const OBJECTS_PER_READ: usize = 1000;
 /// How many files one batched file read streams.
-const FILES_PER_READ: usize = 256;
+pub(crate) const FILES_PER_READ: usize = 256;
 /// How many manifests one manifest-only read asks for.
 pub(crate) const MANIFESTS_PER_READ: usize = 1000;
 /// How many trees one read of trees' sizes asks for.

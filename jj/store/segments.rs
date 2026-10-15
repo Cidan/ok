@@ -591,6 +591,9 @@ struct Side {
     seg: Option<u32>,
     read: u64,
     map: HashMap<u64, Vec<u32>>,
+    /// The side file, open while it is the active segment's: a lookup reads what was appended
+    /// since, without opening it again.
+    file: Option<File>,
 }
 
 /// An open segment: mapped once sealed; read with `pread` while it grows.
@@ -626,6 +629,9 @@ pub struct Segments {
     view: Mutex<Arc<View>>,
     /// Raised each time the view is read again: entries may have moved.
     epoch: std::sync::atomic::AtomicU64,
+    /// Set when this process appends: its own entries are seen by peek, which reads the view
+    /// again on a miss only then.
+    wrote: std::sync::atomic::AtomicBool,
 }
 
 /// What a segment's entries are found by, kept while the segment is written: its side records.
@@ -649,6 +655,7 @@ impl Segments {
         let this = Self {
             view: Mutex::new(Arc::new(View::empty())),
             epoch: std::sync::atomic::AtomicU64::new(0),
+            wrote: std::sync::atomic::AtomicBool::new(false),
             dir,
             opts,
         };
@@ -818,6 +825,32 @@ impl Segments {
         self.find(&view, id, accept)
     }
 
+    /// Finds an entry as get does, but on a miss does not look again at what other processes
+    /// wrote since: for a check whose miss costs only doing something again (staging what is
+    /// cached), where looking again would cost every miss a refresh.
+    pub fn peek(&self, id: &Id, accept: &mut dyn FnMut(&Entry) -> bool) -> Option<Entry> {
+        let view = self.current();
+        let stale = {
+            let mut checked = view.checked.lock().unwrap();
+            let stale = checked.elapsed() > REFRESH_EVERY;
+            if stale {
+                *checked = Instant::now();
+            }
+            stale
+        };
+        if stale {
+            let _ = self.refresh(false);
+        }
+        if let Some(e) = self.find(&self.current(), id, accept) {
+            return Some(e);
+        }
+        if self.wrote.swap(false, std::sync::atomic::Ordering::AcqRel) {
+            let _ = self.refresh(false);
+            return self.find(&self.current(), id, accept);
+        }
+        None
+    }
+
     fn find(&self, view: &View, id: &Id, accept: &mut dyn FnMut(&Entry) -> bool) -> Option<Entry> {
         for loc in self.candidates(view, id) {
             if let Some(e) = self.read_entry(view, loc)
@@ -838,9 +871,13 @@ impl Segments {
                 ..Side::default()
             };
         }
-        let Ok(file) = File::open(side_path(&self.dir, active)) else {
-            return;
-        };
+        if side.file.is_none() {
+            let Ok(f) = File::open(side_path(&self.dir, active)) else {
+                return;
+            };
+            side.file = Some(f);
+        }
+        let file = side.file.as_ref().unwrap();
         let Ok(len) = file.metadata().map(|m| m.len()) else {
             return;
         };
@@ -946,6 +983,7 @@ impl Segments {
         if entries.is_empty() {
             return Ok(());
         }
+        self.wrote.store(true, std::sync::atomic::Ordering::Release);
         let max_entry = self.opts.segment_bytes / MAX_ENTRY_SHARE;
         let _lock = self.lock()?;
         let mut meta = self

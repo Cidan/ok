@@ -33,37 +33,18 @@ templ Shell(p Props) {
 			     load and every htmx swap. Boundaries nest: a partial swap (e.g. #repo-main inside
 			     #content) fades ONLY that region. A no-JS override keeps content visible when
 			     scripts are off. The <body> keyframe fades the shell chrome in on a full load; the
-			     dark <html> bg + color-scheme avoid a white/grey flash. -->
-			<style>
-				/* color-scheme keeps the UA canvas, form controls, and scrollbars dark, so a full
-				   document load never flashes a light-grey frame/scrollbar before paint. */
-				html { background-color: #09090b; color-scheme: dark; } /* zinc-950 */
-				@keyframes shell-fade-in { from { opacity: 0 } to { opacity: 1 } }
-				body { animation: shell-fade-in 70ms ease-in-out both; }
-				[data-hydrate] { transition: opacity 120ms ease-in-out; }
-				[data-hydrate].hydrating { opacity: 0; transition: none; }
-				@media (prefers-reduced-motion: reduce) {
-					body { animation: none !important; }
-					[data-hydrate] { transition: none !important; }
-				}
-			</style>
+			     dark <html> bg + color-scheme avoid a white/grey flash. These are static/shell.css:
+			     render-blocking as an inline <style> was, which the pages' policy refuses. -->
+			<link rel="stylesheet" href="/assets/shell.css"/>
 			<noscript>
-				<style>[data-hydrate].hydrating { opacity: 1 !important; }</style>
+				<link rel="stylesheet" href="/assets/noscript.css"/>
 			</noscript>
 			for _, src := range p.Scripts {
 				<script src={ templ.SafeURL(src) } defer></script>
 			}
 		</head>
-		<body class="preload h-dvh overflow-hidden bg-zinc-950 text-zinc-100 antialiased flex flex-col" style="font-family: 'IBM Plex Sans', sans-serif;">
-			<script>
-				// Suppress CSS transitions until webfonts are ready, so the async font-swap
-				// reflow can't animate transition-* elements (nav rail, main, composer) on load.
-				(function () {
-					function go() { if (document.body) document.body.classList.remove('preload'); }
-					(document.fonts && document.fonts.ready ? document.fonts.ready : Promise.resolve()).then(go);
-					setTimeout(go, 1500);
-				})();
-			</script>
+		<body class="preload h-dvh overflow-hidden bg-zinc-950 text-zinc-100 antialiased flex flex-col font-['IBM_Plex_Sans',sans-serif]">
+			<script src="/assets/preload.js"></script>
 			if p.Variant == Navless {
 				<div class="flex-1 flex items-center justify-center p-6 overflow-y-auto">
 					{ children... }

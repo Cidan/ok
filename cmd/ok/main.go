@@ -62,6 +62,10 @@ Usage:
 
 func main() {
 	if err := run(os.Args[1:], os.Stdin, os.Stdout); err != nil {
+		// A command's -h printed its flags already.
+		if errors.Is(err, flag.ErrHelp) {
+			os.Exit(0)
+		}
 		fmt.Fprintln(os.Stderr, "ok:", err)
 		var u usageError
 		if errors.As(err, &u) {
@@ -79,6 +83,15 @@ type usageError string
 
 func (e usageError) Error() string { return string(e) }
 
+// flagError is a command's flags' parse error: help asked for (-h), which the flag set has
+// printed, as itself; anything else, a usage error.
+func flagError(err error) error {
+	if errors.Is(err, flag.ErrHelp) {
+		return err
+	}
+	return usageError(err.Error())
+}
+
 func run(args []string, stdin io.Reader, stdout io.Writer) error {
 	if len(args) == 1 && args[0] == "version" {
 		fmt.Fprintln(stdout, "ok", version)
@@ -94,12 +107,18 @@ func run(args []string, stdin io.Reader, stdout io.Writer) error {
 		}
 		return admin(args[1:], stdout)
 	}
+	help := func(a string) bool { return a == "help" || a == "-h" || a == "--help" }
 	if len(args) < 2 {
-		if len(args) == 1 && (args[0] == "help" || args[0] == "-h" || args[0] == "--help") {
+		if len(args) == 1 && help(args[0]) {
 			fmt.Fprint(stdout, usage)
 			return nil
 		}
 		return usageError("a command is two words, like ok identity check")
+	}
+	// A group's help (ok scm --help) is every command's.
+	if len(args) == 2 && help(args[1]) {
+		fmt.Fprint(stdout, usage)
+		return nil
 	}
 	if len(args) >= 3 && args[0] == "identity" && args[1] == "ca" && args[2] == "init" {
 		return caInit(args[3:], stdout)
@@ -159,7 +178,7 @@ func identityCheck(args []string, stdout io.Writer) error {
 	flags := flag.NewFlagSet("identity check", flag.ContinueOnError)
 	names := domainFlag(flags)
 	if err := flags.Parse(args); err != nil {
-		return usageError(err.Error())
+		return flagError(err)
 	}
 	if flags.NArg() != 1 {
 		return usageError("identity check takes the tree's folder")
@@ -185,7 +204,7 @@ func ownersCheck(args []string, stdout io.Writer) error {
 	names := domainFlag(flags)
 	tree := flags.String("identity", "", "the groups-and-ACLs tree's folder in the repository, for acl: owners (default: the repository's settings')")
 	if err := flags.Parse(args); err != nil {
-		return usageError(err.Error())
+		return flagError(err)
 	}
 	if flags.NArg() != 1 {
 		return usageError("owners check takes the repository's root")
@@ -270,7 +289,7 @@ func directoryPlan(args []string, stdout io.Writer) error {
 	names := domainFlag(flags)
 	static := flags.String("static", "", "the static system of record's file")
 	if err := flags.Parse(args); err != nil {
-		return usageError(err.Error())
+		return flagError(err)
 	}
 	if *static == "" {
 		return usageError("-static is required")
@@ -309,7 +328,7 @@ func affected(args []string, stdin io.Reader, stdout io.Writer) error {
 	bin := flags.String("bazel", "bazel", "bazel's path, or bazelisk's")
 	asJSON := flags.Bool("json", false, "answer in JSON")
 	if err := flags.Parse(args); err != nil {
-		return usageError(err.Error())
+		return flagError(err)
 	}
 	if *base == "" || *change == "" {
 		return usageError("-base and -change are required")
@@ -393,7 +412,7 @@ func configCheck(args []string, stdout io.Writer) error {
 	flags := flag.NewFlagSet("config check", flag.ContinueOnError)
 	path := flags.String("config", "ok.yaml", "the installation's configuration")
 	if err := flags.Parse(args); err != nil {
-		return usageError(err.Error())
+		return flagError(err)
 	}
 	cfg, err := config.Load(*path)
 	if err != nil {

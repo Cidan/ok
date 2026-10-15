@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"flag"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -185,5 +187,18 @@ func TestAffected(t *testing.T) {
 	}
 	if a.Global != "MODULE.bazel" || len(a.Affected) != 5 {
 		t.Errorf("affected -json: global %q, %d affected", a.Global, len(a.Affected))
+	}
+}
+
+// Help, asked for a group or a command, is help: printed, with no error to exit on.
+func TestHelp(t *testing.T) {
+	for _, args := range [][]string{{"--help"}, {"scm", "--help"}, {"identity", "-h"}, {"worker", "help"}} {
+		var out bytes.Buffer
+		if err := run(args, strings.NewReader(""), &out); err != nil || !strings.Contains(out.String(), "ok scm fsck") {
+			t.Errorf("ok %s: %v\n%s", strings.Join(args, " "), err, out.String())
+		}
+	}
+	if err := run([]string{"scm", "fsck", "-h"}, strings.NewReader(""), io.Discard); !errors.Is(err, flag.ErrHelp) {
+		t.Errorf("ok scm fsck -h: %v, want flag.ErrHelp (which exits 0)", err)
 	}
 }

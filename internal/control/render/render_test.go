@@ -78,6 +78,9 @@ func TestMarkdown(t *testing.T) {
 		"```",
 		"",
 		`<script>alert(1)</script><a href="javascript:alert(1)">x</a><img src="x" onerror="alert(1)">`,
+		"",
+		`<div class="fixed inset-0 z-50 bg-zinc-950"><a href="https://example.com/x">Sign in</a></div>`,
+		`<span class="k absolute">mixed</span><code class="language-go">x</code>`,
 	}, "\n")), links)
 	if err != nil {
 		t.Fatal(err)
@@ -92,12 +95,16 @@ func TestMarkdown(t *testing.T) {
 		`class="task-list-item"`,
 		`type="checkbox"`,
 		`<span class="kd">func</span>`,
+		`<code class="language-go">x</code>`,
+		`<pre class="chroma">`,
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("missing %s in\n%s", want, out)
 		}
 	}
-	for _, bad := range []string{"<script", "javascript:", "onerror"} {
+	// The page's own stylesheet is not the document's: a class it does not render is dropped,
+	// and so is a class attribute that mixes one in.
+	for _, bad := range []string{"<script", "javascript:", "onerror", "fixed", "inset-0", "absolute"} {
 		if strings.Contains(out, bad) {
 			t.Errorf("unsanitized %s in\n%s", bad, out)
 		}
