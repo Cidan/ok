@@ -30,7 +30,7 @@ import (
 // they name. The plan is the built-in jobs and the workflow jobs whose targets are affected, and
 // the change's footprint, which the landing queue decides by; anything wrong fails it, naming each
 // problem.
-func planChange(ctx context.Context, cfg Config, run *automationpb.Run, jc *workflow.Context, settings *workflow.Settings, env []string, log *logStream) outcome {
+func planChange(ctx context.Context, cfg Config, run *automationpb.Run, jc *workflow.Context, settings *workflow.Settings, env []string, tmp string, log *logStream) outcome {
 	if jc.Phase == workflow.Post {
 		log.Printf("planning post for CL %d, patchset %d, on its candidate %.10s over %.10s", jc.CL, jc.Patchset, jc.Commit, jc.Base)
 	} else {
@@ -90,7 +90,7 @@ func planChange(ctx context.Context, cfg Config, run *automationpb.Run, jc *work
 		}
 		log.Printf("%d OWNERS files: every set can be approved by its own people", configs)
 	}
-	d := cfg.driver(settings, env, log)
+	d := cfg.driver(settings, env, tmp, log)
 	changeGraph, err := graphAt(ctx, cfg, d, repo, run.GetCommitId(), cfg.checkout, log)
 	if ctx.Err() != nil {
 		return stopped(ctx, "")

@@ -60,13 +60,13 @@ func TestCommands(t *testing.T) {
 		"build": {jobInput{job: &automationpb.Job{Kind: automationpb.Job_KIND_BUILD, Targets: []string{"//a:a", "//b:b"}}},
 			[]string{"build --keep_going -- //a:a //b:b"}},
 		"tests, each its own command": {jobInput{job: &automationpb.Job{Kind: automationpb.Job_KIND_TEST, Targets: []string{"//a:test", "//b:test"}, Args: []string{"-test.v"}}},
-			[]string{"test --test_arg=-test.v -- //a:test", "test --test_arg=-test.v -- //b:test"}},
+			[]string{"test --test_output=errors --test_arg=-test.v -- //a:test", "test --test_output=errors --test_arg=-test.v -- //b:test"}},
 		"run, in the sandbox": {jobInput{job: &automationpb.Job{Kind: automationpb.Job_KIND_RUN, Targets: []string{"//a:bin"}, Args: []string{"{deleted_files}"}}, jc: jobContext(), sandbox: sb},
 			[]string{"run --run_under=/usr/bin/bwrap --unshare-net -- //a:bin docs/old.md gone.go"}},
 		"push, tagged with the commit": {jobInput{job: &automationpb.Job{Kind: automationpb.Job_KIND_PUSH, Targets: []string{"//a:push"}}, commit: []byte{0xab, 0xcd}},
 			[]string{"run -- //a:push --tag abcd"}},
 		"test expanding": {jobInput{job: &automationpb.Job{Kind: automationpb.Job_KIND_TEST, Targets: []string{"//a:test"}, Args: []string{"--cl={cl}", "{changed_files:**/*.go}"}}, jc: jobContext()},
-			[]string{"test --test_arg=--cl=7 --test_arg=a/a.go -- //a:test"}},
+			[]string{"test --test_output=errors --test_arg=--cl=7 --test_arg=a/a.go -- //a:test"}},
 		"lint: aspects over the rules that read the files, the formatter over the files": {
 			jobInput{job: &automationpb.Job{Kind: automationpb.Job_KIND_LINT, Targets: []string{"//gone:gone"}}, jc: jobContext(), settings: both, owners: []string{"//a:a", "//docs:docs"}, sandbox: sb},
 			[]string{"build --keep_going --aspects=//tools/lint:linters.bzl%eslint --@aspect_rules_lint//lint:fail_on_violation --output_groups=rules_lint_human -- //a:a //docs:docs //gone:gone",
@@ -86,7 +86,7 @@ func TestCommands(t *testing.T) {
 			[]string{"build --keep_going --aspects=//tools/lint:linters.bzl%eslint --@aspect_rules_lint//lint:fail_on_violation --output_groups=rules_lint_human -- //a:a"}},
 		"a manual test takes its arguments as they are": {
 			jobInput{job: &automationpb.Job{Kind: automationpb.Job_KIND_TEST, Targets: []string{"//a:test"}, Args: []string{"{literal}"}}},
-			[]string{"test --test_arg={literal} -- //a:test"}},
+			[]string{"test --test_output=errors --test_arg={literal} -- //a:test"}},
 	} {
 		tc.in.driver, tc.in.dir = d, t.TempDir()
 		got, err := commands(tc.in)

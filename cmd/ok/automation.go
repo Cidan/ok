@@ -116,7 +116,17 @@ func workerRun(args []string) error {
 	if err != nil {
 		return fmt.Errorf("bubblewrap: %w", err)
 	}
-	proc, err := worker.CheckSandbox(bwrap)
+	// What a change's build and tests run never sees: the secrets the configuration names, the
+	// configuration itself, and the okfs daemon's state, its credential among it.
+	configPath, err := filepath.Abs(*path)
+	if err != nil {
+		return err
+	}
+	secrets := append(cfg.SecretPaths(), configPath, filepath.Join(w.State, "okfs"))
+	if err := os.MkdirAll(filepath.Join(w.State, "okfs"), 0o700); err != nil {
+		return err
+	}
+	proc, err := worker.CheckSandbox(bwrap, secrets)
 	if err != nil {
 		return err
 	}
@@ -236,6 +246,7 @@ func workerRun(args []string) error {
 		BazelFlags:     w.BazelFlags,
 		Bwrap:          bwrap,
 		Proc:           proc,
+		Secrets:        secrets,
 		Names:          cfg.Names(),
 		Directory:      identitypb.NewDirectoryClient(id),
 		TreeRepository: cfg.Identity.TreeRepository,

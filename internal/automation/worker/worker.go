@@ -64,8 +64,12 @@ type Config struct {
 	BazelFlags []string
 	Bwrap      string
 	Proc       []string
-	Env        []string
-	Scratch    string
+	// Secrets are what every Bazel command runs out of sight of (HideSecrets): the files and
+	// directories the worker's configuration names, and its okfs daemon's state and credential.
+	// With none, Bazel runs in the worker's own view (tests).
+	Secrets []string
+	Env     []string
+	Scratch string
 	// OutputBases is where each slot keeps its Bazel output bases — slot n's in n/ and n-base/ —
 	// outside every checkout, kept from run to run so a slot builds incrementally. Graphs is where
 	// commits' build graphs are kept, by commit, so each is queried once.
@@ -88,9 +92,11 @@ type Config struct {
 	// bound the runs.
 	Room func(starting int) bool
 
-	// A slot's: its checkouts and their output bases.
+	// A slot's: its checkouts and their output bases, and the other slots', which its runs do not
+	// see.
 	checkout, base             checkout.Checkout
 	outputBase, baseOutputBase string
+	others                     []string
 }
 
 // leaseWait is how long one Lease call waits for a run.
@@ -126,6 +132,12 @@ func Run(ctx context.Context, cfg Config) error {
 		sc.checkout, sc.base = co, cfg.Bases[i]
 		sc.outputBase = filepath.Join(cfg.OutputBases, strconv.Itoa(i+1))
 		sc.baseOutputBase = filepath.Join(cfg.OutputBases, strconv.Itoa(i+1)+"-base")
+		for j := range cfg.Checkouts {
+			if j != i {
+				sc.others = append(sc.others, cfg.Checkouts[j].Dir(), cfg.Bases[j].Dir(),
+					filepath.Join(cfg.OutputBases, strconv.Itoa(j+1)), filepath.Join(cfg.OutputBases, strconv.Itoa(j+1)+"-base"))
+			}
+		}
 		if len(cfg.Checkouts) > 1 {
 			sc.Name = fmt.Sprintf("%s/%d", cfg.Name, i+1)
 		}
@@ -310,6 +322,9 @@ func execute(ctx context.Context, cfg Config, files *changedFiles, run *automati
 	}()
 
 	result := perform(jobCtx, cfg, files, run, change, stream)
+	// The slot's Bazel server, which the run's code ran in, goes with the run: the next starts one
+	// afresh, keeping nothing of this run but what is on disk.
+	stopBazel(cfg)
 
 	kind, reason := st.get()
 	if !result.stopped && kind != automationpb.HeartbeatResponse_STOP_LEASE_LOST {
@@ -517,15 +532,78 @@ func sandbox(bwrap string, proc []string, tmp, contextFile string) []string {
 	return out
 }
 
-// CheckSandbox runs nothing in the sandbox runs' programs run in, once, and returns how it gives
-// the sandbox its /proc (Config.Proc): a fresh one where it can, else the pod's. A worker whose
-// node makes neither fails as it starts, saying why, instead of failing every run job and lint.
-func CheckSandbox(bwrap string) ([]string, error) {
+// HideSecrets is the prefix every Bazel command a worker runs runs under (bubblewrap): the worker's
+// own view of the file system and its network, but each of hidden covered — a directory with an
+// empty one, a file with an empty file, and a link with an empty directory over the directory
+// that holds it (a Kubernetes projected volume's files are links to the volume's own, renewed
+// in place) — so nothing a change's build, tests, or repository rules run can read it; then each
+// of kept, beneath a hidden directory, bound back. A path that does not exist is passed over.
+func HideSecrets(bwrap string, hidden, kept []string) []string {
+	out := []string{bwrap, "--dev-bind", "/", "/"}
+	for _, p := range hidden {
+		info, err := os.Lstat(p)
+		switch {
+		case err != nil:
+		case info.Mode()&os.ModeSymlink != 0:
+			out = append(out, "--tmpfs", filepath.Dir(p))
+		case info.IsDir():
+			out = append(out, "--tmpfs", p)
+		default:
+			out = append(out, "--ro-bind", "/dev/null", p)
+		}
+	}
+	for _, p := range kept {
+		if _, err := os.Stat(p); err == nil {
+			out = append(out, "--dev-bind", p, p)
+		}
+	}
+	return append(out, "--die-with-parent", "--")
+}
+
+// hide is the prefix a slot's Bazel commands run under (HideSecrets): the worker's secrets, the
+// other slots, and every run's scratch directory but tmp, this run's, out of sight. None without
+// secrets to hide.
+func (cfg Config) hide(tmp string) []string {
+	if len(cfg.Secrets) == 0 {
+		return nil
+	}
+	hidden := append(append(append([]string(nil), cfg.Secrets...), cfg.others...), cfg.Scratch)
+	var kept []string
+	if tmp != "" {
+		kept = []string{tmp}
+	}
+	return HideSecrets(cfg.Bwrap, hidden, kept)
+}
+
+// stopBazel stops the slot's Bazel server after a run, if one runs.
+func stopBazel(cfg Config) {
+	if _, err := os.Stat(filepath.Join(cfg.outputBase, "server", "server.pid.txt")); err != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	d := &bazel.Driver{Bazel: cfg.Bazel, Wrapper: cfg.hide(""), OutputBase: cfg.outputBase, Env: cfg.Env}
+	if err := d.Shutdown(ctx, cfg.checkout.Dir()); err != nil {
+		slog.Warn("stopping the slot's Bazel server", "output_base", cfg.outputBase, "err", err)
+	}
+}
+
+// CheckSandbox runs nothing in the sandbox runs' programs run in, and under the prefix that hides
+// secrets from Bazel (HideSecrets), once each, and returns how it gives the sandbox its /proc
+// (Config.Proc): a fresh one where it can, else the pod's. A worker whose node makes neither fails
+// as it starts, saying why, instead of failing every run job and lint.
+func CheckSandbox(bwrap string, secrets []string) ([]string, error) {
 	tmp, err := os.MkdirTemp("", "ok-sandbox-check-")
 	if err != nil {
 		return nil, err
 	}
 	defer os.RemoveAll(tmp)
+	if len(secrets) > 0 {
+		args := append(HideSecrets(bwrap, secrets, nil), "true")
+		if out, err := exec.Command(args[0], args[1:]...).CombinedOutput(); err != nil {
+			return nil, fmt.Errorf("bubblewrap cannot hide the worker's secrets from Bazel (%v: %s); %s", err, strings.TrimSpace(string(out)), checkout.UserNamespaces())
+		}
+	}
 	var failed []string
 	for _, proc := range [][]string{ProcFresh, ProcBound} {
 		args := append(sandbox(bwrap, proc, tmp, ""), "true")
@@ -631,12 +709,12 @@ func perform(ctx context.Context, cfg Config, files *changedFiles, run *automati
 		return outcome{status: automationpb.Run_STATUS_FAILED, reason: err.Error()}
 	}
 	if run.GetJob().GetKind() == automationpb.Job_KIND_PLAN {
-		return planChange(ctx, cfg, run, jc, settings, env, log)
+		return planChange(ctx, cfg, run, jc, settings, env, tmp, log)
 	}
 	if settings.Build == workflow.BuildNone {
 		return outcome{status: automationpb.Run_STATUS_FAILED, reason: "the repository is imported (" + workflow.SettingsFile + "): ok runs no Bazel in it"}
 	}
-	d := cfg.driver(settings, env, log)
+	d := cfg.driver(settings, env, tmp, log)
 	in := jobInput{job: run.GetJob(), jc: jc, settings: settings, driver: d, dir: cfg.checkout.Dir(), tree: tree,
 		sandbox: sandbox(cfg.Bwrap, cfg.Proc, tmp, contextFile), commit: run.GetCommitId()}
 	if run.GetJob().GetKind() == automationpb.Job_KIND_LINT && !wholeLint(run.GetJob()) && jc != nil {
@@ -660,7 +738,7 @@ func perform(ctx context.Context, cfg Config, files *changedFiles, run *automati
 		}
 		cmdline := strings.Join(append([]string{"bazel"}, argv[1:]...), " ")
 		log.Printf("$ %s", cmdline)
-		code, err := runCommand(ctx, cfg, argv, cfg.checkout.Dir(), env, log)
+		code, err := runCommand(ctx, cfg, append(cfg.hide(tmp), argv...), cfg.checkout.Dir(), env, log)
 		switch {
 		case err != nil && ctx.Err() == nil:
 			return outcome{status: automationpb.Run_STATUS_ERROR, reason: fmt.Sprintf("running %s: %v", cmdline, err)}
@@ -702,9 +780,10 @@ func readSettings(dir string) (*workflow.Settings, error) {
 
 // driver is Bazel as a slot runs it, for a repository's settings: the slot's own output base,
 // outside the checkout, the installation's flags and then the repository's.
-func (cfg Config) driver(settings *workflow.Settings, env []string, log *logStream) *bazel.Driver {
+func (cfg Config) driver(settings *workflow.Settings, env []string, tmp string, log *logStream) *bazel.Driver {
 	return &bazel.Driver{
 		Bazel:      cfg.Bazel,
+		Wrapper:    cfg.hide(tmp),
 		OutputBase: cfg.outputBase,
 		Flags:      append(append([]string(nil), cfg.BazelFlags...), settings.Bazel.Flags...),
 		Env:        env,

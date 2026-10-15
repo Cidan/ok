@@ -240,7 +240,7 @@ func TestDriverCommands(t *testing.T) {
 	got = d.Test(dir, "//a:test", []string{"-test.run", "TestX"})
 	want = []string{"bazel", "--output_base=/state/slot/1/bazel", "test", "--symlink_prefix=/", "--color=no", "--curses=no",
 		"--sandbox_default_allow_network=false", "--lockfile_mode=error", "--remote_cache=grpcs://cache.example.com",
-		"--test_arg=-test.run", "--test_arg=TestX", "--", "//a:test"}
+		"--test_output=errors", "--test_arg=-test.run", "--test_arg=TestX", "--", "//a:test"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("Test = %q", got)
 	}

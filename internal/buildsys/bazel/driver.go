@@ -16,6 +16,9 @@ type Driver struct {
 	// Bazel is bazel's path, or bazelisk's, which runs the version a checkout's .bazelversion
 	// names.
 	Bazel string
+	// Wrapper is a command prefix every Bazel process the driver starts itself runs under (a
+	// worker's, hiding its secrets); the commands it returns carry none — whoever runs them adds it.
+	Wrapper []string
 	// OutputBase is where Bazel keeps its outputs and its server for these checkouts: outside them,
 	// since a checkout is a read-only presentation of a commit. Empty leaves Bazel's own.
 	OutputBase string
@@ -38,7 +41,8 @@ func (d *Driver) Graph(ctx context.Context, dir string) (*Graph, error) {
 // ParseGraph to read again.
 func (d *Driver) GraphTo(ctx context.Context, dir string, w io.Writer) (*Graph, error) {
 	var stdout, stderr bytes.Buffer
-	cmd := exec.CommandContext(ctx, d.Bazel, append(d.startup(), append(append([]string(nil), QueryArgs...), lockfileMode(dir))...)...)
+	argv := d.wrapped(append([]string{d.Bazel}, append(d.startup(), append(append([]string(nil), QueryArgs...), lockfileMode(dir))...)...))
+	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	cmd.Dir = dir
 	cmd.Env = d.Env
 	cmd.Stdout = &stdout
@@ -57,9 +61,10 @@ func (d *Driver) Build(dir string, targets []string) []string {
 	return d.command(dir, "build", []string{"--keep_going"}, targets)
 }
 
-// Test is the command that runs a test target, its arguments given to the test.
+// Test is the command that runs a test target, its arguments given to the test, and a failing
+// test's log printed with Bazel's: a test.log on the worker is one no one can read.
 func (d *Driver) Test(dir, target string, args []string) []string {
-	var flags []string
+	flags := []string{"--test_output=errors"}
 	for _, a := range args {
 		flags = append(flags, "--test_arg="+a)
 	}
@@ -118,7 +123,8 @@ func (d *Driver) OutputFiles(ctx context.Context, dir, target string) ([]string,
 // output runs Bazel with args in dir and returns what it printed.
 func (d *Driver) output(ctx context.Context, dir string, args []string) ([]byte, error) {
 	var stdout, stderr bytes.Buffer
-	cmd := exec.CommandContext(ctx, d.Bazel, args...)
+	argv := d.wrapped(append([]string{d.Bazel}, args...))
+	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	cmd.Dir = dir
 	cmd.Env = d.Env
 	cmd.Stdout = &stdout
@@ -127,6 +133,18 @@ func (d *Driver) output(ctx context.Context, dir string, args []string) ([]byte,
 		return nil, fmt.Errorf("bazel %s: %w%s", strings.Join(args, " "), err, tail(stderr.String()))
 	}
 	return stdout.Bytes(), nil
+}
+
+// Shutdown stops the Bazel server of the checkouts' output base, if one runs: the next command
+// starts one afresh, which keeps nothing of the last run but what is on disk.
+func (d *Driver) Shutdown(ctx context.Context, dir string) error {
+	_, err := d.output(ctx, dir, append(d.startup(), "shutdown"))
+	return err
+}
+
+// wrapped is argv under the driver's Wrapper.
+func (d *Driver) wrapped(argv []string) []string {
+	return append(append([]string(nil), d.Wrapper...), argv...)
 }
 
 // runUnder is the --run_under flag of a sandbox prefix; none without one.

@@ -67,3 +67,35 @@ func TestSecret(t *testing.T) {
 		t.Error("a missing file was read")
 	}
 }
+
+// Every secret a configuration names is among SecretPaths, wherever it is nested; a CA's
+// certificate, which is no secret, is not.
+func TestSecretPaths(t *testing.T) {
+	cfg, err := Parse([]byte(`
+domain: example.com
+public_url: https://ok.example.com
+tls: {cert: /tls/tls.crt, key: /tls/tls.key}
+database: {url_file: /s/db}
+roles: {identity: identity.ok, worker: worker.ok}
+services: {tls: true, ca_file: /tls/ca.crt, identity: id:8472, scm: scm:8472, automation: a:8472}
+workload: {token_file: /var/run/secrets/ok/token}
+identity:
+  ca_dir: /etc/ok/ca
+  sign_in:
+    oidc: [{id: g, name: G, issuer: https://g.example.com, client_id: c, client_secret_file: /s/oidc, ca_file: /s/oidc-ca.crt}]
+  system_of_record: {static: {file: /s/people.yaml}}
+scm: {objects: {endpoint: https://s3, bucket: b, region: r, access_key_file: /s/ak, secret_key_file: /s/sk}}
+worker: {state: /var/lib/ok}
+deploy:
+  state: /var/lib/ok-deploy
+  migration_env: {APP_DB: {file: /s/app-db}, PLAIN: {value: x}}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Join(cfg.SecretPaths(), " ")
+	want := "/etc/ok/ca /s/ak /s/app-db /s/db /s/oidc /s/people.yaml /s/sk /tls/tls.key /var/run/secrets/ok/token"
+	if got != want {
+		t.Errorf("SecretPaths:\n got %s\nwant %s", got, want)
+	}
+}

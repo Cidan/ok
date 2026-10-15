@@ -413,15 +413,31 @@ A path conflict with main is refused, as in landing: `jj sync`, resolve, and upl
 - **Every Bazel command** a worker runs gets `--symlink_prefix=/` (no convenience symlinks in a
   read-only checkout), `--sandbox_default_allow_network=false` (actions and tests without network),
   the lockfile honored (`--lockfile_mode=error` when `MODULE.bazel.lock` exists), the installation's
-  flags (`worker.bazel_flags`: a remote cache, say), then the repository's (`bazel.flags`).
+  flags (`worker.bazel_flags`: a remote cache, say), then the repository's (`bazel.flags`). A test
+  command prints a failing test's log (`--test_output=errors`).
 - **The sandbox.** What a run job runs, and the formatter a lint runs, run under bubblewrap
   (`bazel run --run_under`): every file read-only but the run's own scratch directory, its
   `TMPDIR`; no network; no other process. A build's and a test's actions run in Bazel's own
   sandbox.
+- **What a change's code sees.** Bazel, and everything it runs — repository rules, actions,
+  tests — runs as the worker, with the worker's network: in a pod, Bazel's own sandbox often cannot
+  isolate actions (its `linux-sandbox` needs a fresh `/proc`, which a pod refuses), and repository
+  rules are never sandboxed. So every Bazel command runs in a mount namespace of its own in which
+  the worker's secrets are covered — every secret file its configuration names, the configuration
+  itself, the okfs daemon's state and credential, the worker's token — and so are the other slots'
+  checkouts and output bases and the other runs' scratch directories. The slot's Bazel server is
+  stopped after each run, so the next starts afresh.
+- **What persists.** A slot's output base and the worker's download cache stay on disk from run to
+  run, which is what makes builds incremental — so a change's code can affect what later runs on
+  that worker build. Every worker takes runs of every repository's changes: an installation's
+  workers run the code of everyone who uploads to it, so give them nothing a change's author
+  should not have (the chart mounts no database URL into them), and keep code you trust
+  differently in an installation of its own.
 - **Hermeticity is Bazel's.** A repository that pins its toolchains builds the same anywhere; one
   that uses the host's (a system compiler) builds with the worker's. ok checks what Bazel builds;
   it does not make a build hermetic.
 - **Identity.** Workers run as their robot (`roles.worker`); the SCM admits them to read code.
+  Its credential is the worker process's alone: out of sight of what Bazel runs, as above.
 - **Logs** stream live and are kept in the logs' bucket once a run finishes.
 - **Interactive.** Rerun, cancel, and "why did this run": which changed file resolved to which
   workflow directory, or which dependency chain made the target affected.
