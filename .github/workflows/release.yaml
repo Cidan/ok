@@ -112,7 +112,8 @@ jobs:
           DIGEST: ${{ steps.build.outputs.digest }}
       - uses: actions/upload-artifact@v7
         with:
-          name: digests-${{ matrix.image }}-${{ strategy.job-index }}
+          # The image's name, then a dot: "digests-ok-*" would match ok-runner's too.
+          name: digests-${{ matrix.image }}.${{ strategy.job-index }}
           path: digests/*
 
   images:
@@ -122,12 +123,13 @@ jobs:
       contents: read
       packages: write
     strategy:
+      fail-fast: false
       matrix:
         image: [ok, ok-runner]
     steps:
       - uses: actions/download-artifact@v8
         with:
-          pattern: digests-${{ matrix.image }}-*
+          pattern: digests-${{ matrix.image }}.*
           merge-multiple: true
           path: digests
       - uses: docker/setup-buildx-action@v4
