@@ -135,13 +135,6 @@ func (d *Driver) output(ctx context.Context, dir string, args []string) ([]byte,
 	return stdout.Bytes(), nil
 }
 
-// Shutdown stops the Bazel server of the checkouts' output base, if one runs: the next command
-// starts one afresh, which keeps nothing of the last run but what is on disk.
-func (d *Driver) Shutdown(ctx context.Context, dir string) error {
-	_, err := d.output(ctx, dir, append(d.startup(), "shutdown"))
-	return err
-}
-
 // wrapped is argv under the driver's Wrapper.
 func (d *Driver) wrapped(argv []string) []string {
 	return append(append([]string(nil), d.Wrapper...), argv...)

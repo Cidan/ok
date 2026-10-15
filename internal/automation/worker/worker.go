@@ -58,7 +58,7 @@ type Config struct {
 	Browse scmpb.BrowseClient
 	// Bazel is Bazel's path (or bazelisk's), BazelFlags the installation's flags for every
 	// command (a remote cache), Bwrap bubblewrap's path, and Env their whole environment; the
-	// worker adds TMPDIR, a directory of the run's own under Scratch. Proc is how the sandbox
+	// worker adds TMPDIR, a directory of the run's own in its slot's directory under Scratch. Proc is how the sandbox
 	// gets its /proc, as CheckSandbox found it can: ProcFresh when nil.
 	Bazel      string
 	BazelFlags []string
@@ -92,10 +92,11 @@ type Config struct {
 	// bound the runs.
 	Room func(starting int) bool
 
-	// A slot's: its checkouts and their output bases, and the other slots', which its runs do not
-	// see.
+	// A slot's: its checkouts and their output bases, its scratch (its runs' TMPDIRs), and the other
+	// slots', which its runs do not see.
 	checkout, base             checkout.Checkout
 	outputBase, baseOutputBase string
+	scratch                    string
 	others                     []string
 }
 
@@ -132,6 +133,10 @@ func Run(ctx context.Context, cfg Config) error {
 		sc.checkout, sc.base = co, cfg.Bases[i]
 		sc.outputBase = filepath.Join(cfg.OutputBases, strconv.Itoa(i+1))
 		sc.baseOutputBase = filepath.Join(cfg.OutputBases, strconv.Itoa(i+1)+"-base")
+		sc.scratch = filepath.Join(cfg.Scratch, strconv.Itoa(i+1))
+		if err := os.MkdirAll(sc.scratch, 0o755); err != nil {
+			return err
+		}
 		for j := range cfg.Checkouts {
 			if j != i {
 				sc.others = append(sc.others, cfg.Checkouts[j].Dir(), cfg.Bases[j].Dir(),
@@ -322,9 +327,6 @@ func execute(ctx context.Context, cfg Config, files *changedFiles, run *automati
 	}()
 
 	result := perform(jobCtx, cfg, files, run, change, stream)
-	// The slot's Bazel server, which the run's code ran in, goes with the run: the next starts one
-	// afresh, keeping nothing of this run but what is on disk.
-	stopBazel(cfg)
 
 	kind, reason := st.get()
 	if !result.stopped && kind != automationpb.HeartbeatResponse_STOP_LEASE_LOST {
@@ -561,31 +563,15 @@ func HideSecrets(bwrap string, hidden, kept []string) []string {
 }
 
 // hide is the prefix a slot's Bazel commands run under (HideSecrets): the worker's secrets, the
-// other slots, and every run's scratch directory but tmp, this run's, out of sight. None without
-// secrets to hide.
-func (cfg Config) hide(tmp string) []string {
+// other slots' checkouts, output bases, and scratch out of sight, and the slot's own in it. It is
+// the same for each of the slot's runs, so the Bazel server one starts — in its view — serves the
+// next. None without secrets to hide.
+func (cfg Config) hide() []string {
 	if len(cfg.Secrets) == 0 {
 		return nil
 	}
 	hidden := append(append(append([]string(nil), cfg.Secrets...), cfg.others...), cfg.Scratch)
-	var kept []string
-	if tmp != "" {
-		kept = []string{tmp}
-	}
-	return HideSecrets(cfg.Bwrap, hidden, kept)
-}
-
-// stopBazel stops the slot's Bazel server after a run, if one runs.
-func stopBazel(cfg Config) {
-	if _, err := os.Stat(filepath.Join(cfg.outputBase, "server", "server.pid.txt")); err != nil {
-		return
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
-	d := &bazel.Driver{Bazel: cfg.Bazel, Wrapper: cfg.hide(""), OutputBase: cfg.outputBase, Env: cfg.Env}
-	if err := d.Shutdown(ctx, cfg.checkout.Dir()); err != nil {
-		slog.Warn("stopping the slot's Bazel server", "output_base", cfg.outputBase, "err", err)
-	}
+	return HideSecrets(cfg.Bwrap, hidden, []string{cfg.scratch})
 }
 
 // CheckSandbox runs nothing in the sandbox runs' programs run in, and under the prefix that hides
@@ -669,7 +655,7 @@ func perform(ctx context.Context, cfg Config, files *changedFiles, run *automati
 		}
 		log.Printf("the lint is the whole repository's: its %d files", len(tree))
 	}
-	tmp := filepath.Join(cfg.Scratch, "run-"+strconv.FormatInt(run.GetId(), 10))
+	tmp := filepath.Join(cfg.scratch, "run-"+strconv.FormatInt(run.GetId(), 10))
 	// The job context is shown beside the commit's files until the next Sync.
 	var shown map[string][]byte
 	if contextFile != "" {
@@ -709,12 +695,12 @@ func perform(ctx context.Context, cfg Config, files *changedFiles, run *automati
 		return outcome{status: automationpb.Run_STATUS_FAILED, reason: err.Error()}
 	}
 	if run.GetJob().GetKind() == automationpb.Job_KIND_PLAN {
-		return planChange(ctx, cfg, run, jc, settings, env, tmp, log)
+		return planChange(ctx, cfg, run, jc, settings, env, log)
 	}
 	if settings.Build == workflow.BuildNone {
 		return outcome{status: automationpb.Run_STATUS_FAILED, reason: "the repository is imported (" + workflow.SettingsFile + "): ok runs no Bazel in it"}
 	}
-	d := cfg.driver(settings, env, tmp, log)
+	d := cfg.driver(settings, env, log)
 	in := jobInput{job: run.GetJob(), jc: jc, settings: settings, driver: d, dir: cfg.checkout.Dir(), tree: tree,
 		sandbox: sandbox(cfg.Bwrap, cfg.Proc, tmp, contextFile), commit: run.GetCommitId()}
 	if run.GetJob().GetKind() == automationpb.Job_KIND_LINT && !wholeLint(run.GetJob()) && jc != nil {
@@ -738,7 +724,7 @@ func perform(ctx context.Context, cfg Config, files *changedFiles, run *automati
 		}
 		cmdline := strings.Join(append([]string{"bazel"}, argv[1:]...), " ")
 		log.Printf("$ %s", cmdline)
-		code, err := runCommand(ctx, cfg, append(cfg.hide(tmp), argv...), cfg.checkout.Dir(), env, log)
+		code, err := runCommand(ctx, cfg, append(cfg.hide(), argv...), cfg.checkout.Dir(), env, log)
 		switch {
 		case err != nil && ctx.Err() == nil:
 			return outcome{status: automationpb.Run_STATUS_ERROR, reason: fmt.Sprintf("running %s: %v", cmdline, err)}
@@ -780,10 +766,10 @@ func readSettings(dir string) (*workflow.Settings, error) {
 
 // driver is Bazel as a slot runs it, for a repository's settings: the slot's own output base,
 // outside the checkout, the installation's flags and then the repository's.
-func (cfg Config) driver(settings *workflow.Settings, env []string, tmp string, log *logStream) *bazel.Driver {
+func (cfg Config) driver(settings *workflow.Settings, env []string, log *logStream) *bazel.Driver {
 	return &bazel.Driver{
 		Bazel:      cfg.Bazel,
-		Wrapper:    cfg.hide(tmp),
+		Wrapper:    cfg.hide(),
 		OutputBase: cfg.outputBase,
 		Flags:      append(append([]string(nil), cfg.BazelFlags...), settings.Bazel.Flags...),
 		Env:        env,

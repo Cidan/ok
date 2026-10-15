@@ -206,6 +206,11 @@ func (e *env) startWorkerAt(name string, slots int, auto string) *runningWorker 
 	}
 	home := filepath.Join(e.state, "home")
 	os.MkdirAll(home, 0o755)
+	// A secret as a worker's configuration names one, so every run's Bazel works as an
+	// installation's does: out of sight of it (worker.HideSecrets), one server a slot's runs share.
+	secret := filepath.Join(e.state, name, "secrets", "token")
+	os.MkdirAll(filepath.Dir(secret), 0o700)
+	os.WriteFile(secret, []byte("a worker's token\n"), 0o600)
 	cfg := worker.Config{
 		Name:        name,
 		Work:        automationpb.NewWorkClient(as(t, auto, workerBot)),
@@ -215,6 +220,7 @@ func (e *env) startWorkerAt(name string, slots int, auto string) *runningWorker 
 		Browse:      browse,
 		Bazel:       e.bazel,
 		Bwrap:       e.bwrap,
+		Secrets:     []string{filepath.Dir(secret)},
 		Names:       identity.MustNames("example.com"),
 		Directory:   identitypb.NewDirectoryClient(as(t, e.id, workerBot)),
 		Env:         []string{"PATH=" + os.Getenv("PATH"), "HOME=" + home, "LANG=C.UTF-8", "TZ=UTC"},
