@@ -553,7 +553,14 @@ fn quarantine_moves_an_object_aside() {
     shared.outbox.stage_object(key, &canonical).unwrap();
     assert_eq!(shared.outbox.operations(), vec![key.id]);
     let to = shared.outbox.quarantine(key).unwrap();
-    assert!(to.starts_with(dir.path().join("store/quarantine")));
+    // The store names its directory canonically: on macOS a temporary directory is under /var, a
+    // link to /private/var.
+    let root = dunce::canonicalize(dir.path()).unwrap();
+    assert!(
+        to.starts_with(root.join("store/quarantine")),
+        "{}",
+        to.display()
+    );
     assert_eq!(fs::read(&to).unwrap(), canonical);
     assert!(shared.outbox.list().unwrap().is_empty());
 }

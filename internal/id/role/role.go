@@ -165,7 +165,7 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (*Role, error)
 	svc := service.New(service.Config{Store: st, CA: authority, Syncer: syncerFor, PublicURL: cfg.PublicURL,
 		BootstrapAdmins: cfg.Identity.BootstrapAdmins, SessionIdle: cfg.Identity.Session.Idle})
 	r.Services = svc
-	nodes = append(nodes, services{svc})
+	nodes = append(nodes, services{s: svc, ca: authority})
 
 	wc := web.Config{Store: st, Services: svc, Installation: cfg.Installation, PublicURL: cfg.PublicURL,
 		SessionLifetime: cfg.Identity.Session.Lifetime, SessionIdle: cfg.Identity.Session.Idle}
@@ -280,13 +280,17 @@ func (a assembly) Dependencies() []node.Node  { return a.deps }
 func (assembly) Healthy(context.Context) bool { return true }
 func (assembly) Setup(context.Context) error  { return nil }
 
-// services is the gRPC services' node.
-type services struct{ s *service.Server }
+// services is the gRPC services' node, healthy while the CA can be read: without it, every
+// credential is refused.
+type services struct {
+	s  *service.Server
+	ca *ca.CA
+}
 
-func (services) Name() string                 { return "ok/identity/services" }
-func (services) Dependencies() []node.Node    { return nil }
-func (services) Healthy(context.Context) bool { return true }
-func (services) Setup(context.Context) error  { return nil }
+func (services) Name() string                   { return "ok/identity/services" }
+func (services) Dependencies() []node.Node      { return nil }
+func (n services) Healthy(context.Context) bool { return n.ca == nil || n.ca.Readable() == nil }
+func (services) Setup(context.Context) error    { return nil }
 func (n services) RegisterRPC(_ context.Context, r grpc.ServiceRegistrar) error {
 	n.s.Register(r)
 	return nil

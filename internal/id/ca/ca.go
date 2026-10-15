@@ -17,10 +17,12 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/big"
 	"net/url"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/Cidan/ok/internal/credential"
@@ -37,6 +39,9 @@ const clockSkew = 5 * time.Minute
 type CA struct {
 	dir string
 	now func() time.Time
+
+	mu      sync.Mutex
+	failing string // why the files last could not be read; "" while they can
 }
 
 // Load returns the CA in dir, checking its certificate and key are there, match, and may sign.
@@ -103,14 +108,43 @@ func (c *CA) Roots() ([]*x509.Certificate, error) {
 	return out, nil
 }
 
-// Pool is Roots as a pool, for a credential.Verifier; it is empty when the CA cannot be read.
+// Pool is Roots as a pool, for a credential.Verifier; it is empty when the CA cannot be read, so
+// every credential is refused — which it logs, once for each reason it cannot, and again when it
+// can.
 func (c *CA) Pool() *x509.CertPool {
 	p := x509.NewCertPool()
-	roots, _ := c.Roots()
+	roots, err := c.Roots()
+	c.note(err)
 	for _, r := range roots {
 		p.AddCert(r)
 	}
 	return p
+}
+
+// Readable reports whether the CA's files can be read: identity is not ready while they cannot.
+func (c *CA) Readable() error {
+	_, err := c.Roots()
+	c.note(err)
+	return err
+}
+
+// note logs a change in whether the CA's files can be read.
+func (c *CA) note(err error) {
+	why := ""
+	if err != nil {
+		why = err.Error()
+	}
+	c.mu.Lock()
+	changed := why != c.failing
+	c.failing = why
+	c.mu.Unlock()
+	switch {
+	case !changed:
+	case err != nil:
+		slog.Error("identity CA: its files cannot be read, so every credential is refused until they can", "dir", c.dir, "err", err)
+	default:
+		slog.Info("identity CA: its files can be read again", "dir", c.dir)
+	}
 }
 
 // Issue certifies a key — ECDSA P-256, as package credential requires — for a principal's

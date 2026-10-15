@@ -100,18 +100,34 @@ pub async fn run(
                 })?;
             let server = ok_credential::Server::parse(&url).map_err(credential_error)?;
             let label = args.label.unwrap_or_else(default_label);
-            let c = ok_credential::login(&server, &dir, &label, |a| {
-                let mut shown = format!(
-                    "To sign in, open {}\nand confirm the code {}\n",
-                    a.uri_complete, a.user_code
-                );
-                if !args.no_browser && open_browser(&a.uri_complete) {
-                    shown.push_str("(your browser is open there)\n");
+            // The login speaks gRPC and waits on timers, so it runs on the store's Tokio runtime:
+            // jj's own executor is no runtime. The code to approve comes back here, to be shown
+            // while the login waits for it.
+            let (code_tx, code_rx) =
+                futures::channel::oneshot::channel::<ok_credential::Approval>();
+            let login = ok_store::shared::run({
+                let dir = dir.clone();
+                async move {
+                    ok_credential::login(&server, &dir, &label, move |a| {
+                        let _ = code_tx.send(a.clone());
+                    })
+                    .await
                 }
-                let _ = write!(ui.stderr(), "{shown}");
-            })
-            .await
-            .map_err(credential_error)?;
+            });
+            let show = async {
+                if let Ok(a) = code_rx.await {
+                    let mut shown = format!(
+                        "To sign in, open {}\nand confirm the code {}\n",
+                        a.uri_complete, a.user_code
+                    );
+                    if !args.no_browser && open_browser(&a.uri_complete) {
+                        shown.push_str("(your browser is open there)\n");
+                    }
+                    let _ = write!(ui.stderr(), "{shown}");
+                }
+            };
+            let (c, ()) = futures::future::join(login, show).await;
+            let c = c.map_err(credential_error)?;
             writeln!(
                 ui.status(),
                 "Signed in to {} as {}",
@@ -134,7 +150,8 @@ pub async fn run(
             )?;
         }
         AuthCommand::Logout(_) => {
-            ok_credential::logout(&dir)
+            let dir = dir.clone();
+            ok_store::shared::run(async move { ok_credential::logout(&dir).await })
                 .await
                 .map_err(credential_error)?;
             writeln!(ui.status(), "Signed out")?;

@@ -80,7 +80,7 @@ jobs:
         run: |
           go vet ./...
           go test ./...
-          cargo test --locked --workspace
+          cargo test --locked --workspace --no-fail-fast
 
   chart:
     runs-on: ubuntu-24.04

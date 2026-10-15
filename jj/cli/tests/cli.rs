@@ -1203,3 +1203,97 @@ fn redirections_run() {
     assert!(home.join("w/web/package.json").exists());
     println!("redirections_run: scenario done");
 }
+
+/// `jj auth login` signs a machine in through ok identity — the browser's half, a form posted as
+/// ada to a development identity — and `jj auth logout` signs it out again. The login once ran on
+/// jj's own executor, which is no Tokio runtime, and panicked before it showed a code.
+#[test]
+fn auth_login_and_logout() {
+    if !ok_testscm::available() {
+        return;
+    }
+    let endpoint = ok_testscm::identity_endpoint();
+    let home = tempfile::tempdir().unwrap();
+    let jj = |args: &[&str]| {
+        let mut cmd = Command::new(jj_bin());
+        cmd.args(args)
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("HOME", home.path())
+            .env("OK_CONFIG_DIR", home.path().join("ok"))
+            .env("JJ_CONFIG", home.path().join("jj.toml"));
+        cmd
+    };
+    let mut login = jj(&[
+        "auth",
+        "login",
+        endpoint,
+        "--no-browser",
+        "--label",
+        "ada's laptop",
+    ])
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .expect("run jj auth login");
+    // The code, from the link it shows; the rest of what it says is read as it goes.
+    let (lines, said) = std::sync::mpsc::channel::<String>();
+    let stderr = login.stderr.take().unwrap();
+    let reader = std::thread::spawn(move || {
+        use std::io::BufRead as _;
+        for line in std::io::BufReader::new(stderr).lines() {
+            let Ok(line) = line else { break };
+            if lines.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let mut shown = String::new();
+    let code = loop {
+        let line = said
+            .recv_timeout(Duration::from_secs(60))
+            .unwrap_or_else(|e| panic!("jj auth login showed no code ({e}):\n{shown}"));
+        shown.push_str(&line);
+        shown.push('\n');
+        if let Some((_, rest)) = line.split_once("/id/device?code=") {
+            break rest.split_whitespace().next().unwrap().to_owned();
+        }
+    };
+    let resp = ok_testscm::post_form_as(
+        endpoint,
+        "/id/device",
+        "ada.human.example.com",
+        &[("code", &code), ("decision", "approve")],
+    );
+    assert!(resp.contains("Approved"), "approving the code:\n{resp}");
+    let out = login.wait_with_output().expect("wait for jj auth login");
+    reader.join().unwrap();
+    for line in said.try_iter() {
+        shown.push_str(&line);
+        shown.push('\n');
+    }
+    assert!(
+        out.status.success()
+            && shown.contains(&format!("Signed in to {endpoint} as ada.human.example.com")),
+        "jj auth login: {}\n{shown}",
+        out.status
+    );
+
+    let status = jj(&["auth", "status"]).output().unwrap();
+    assert!(
+        status.status.success()
+            && String::from_utf8_lossy(&status.stdout).contains("as ada.human.example.com"),
+        "jj auth status: {status:?}"
+    );
+    let logout = jj(&["auth", "logout"]).output().unwrap();
+    assert!(
+        logout.status.success() && String::from_utf8_lossy(&logout.stderr).contains("Signed out"),
+        "jj auth logout: {logout:?}"
+    );
+    let after = jj(&["auth", "status"]).output().unwrap();
+    assert!(
+        !after.status.success(),
+        "still signed in after logout: {after:?}"
+    );
+}

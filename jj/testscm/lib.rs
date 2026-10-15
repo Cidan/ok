@@ -49,6 +49,10 @@ struct Server {
 }
 
 static SERVER: OnceLock<Server> = OnceLock::new();
+static IDENTITY: OnceLock<Server> = OnceLock::new();
+
+/// The people the test identity knows, from its static system of record: ada.human.example.com.
+pub const IDENTITY_PEOPLE: &str = "people:\n  - {id: \"1\", email: ada@example.com, name: Ada}\n";
 
 fn var(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| {
@@ -153,6 +157,112 @@ fn write_config(port: u16) -> PathBuf {
     let path = dir.join("ok.yaml");
     std::fs::write(&path, config).expect("write the test SCM's configuration");
     path
+}
+
+/// A development ok identity's endpoint, `http://127.0.0.1:<port>`, starting it on first use, over
+/// the same PostgreSQL (its own schema) — for the tests of signing in (`jj auth`). It knows
+/// [`IDENTITY_PEOPLE`], and, being a development server, trusts the principal a request names in its
+/// `ok-dev-principal` header, its pages' included: the browser's half of a device login.
+pub fn identity_endpoint() -> &'static str {
+    &IDENTITY.get_or_init(start_identity).endpoint
+}
+
+fn start_identity() -> Server {
+    let port = TcpListener::bind("127.0.0.1:0")
+        .and_then(|l| l.local_addr())
+        .expect("find a free loopback port")
+        .port();
+    let dir = std::env::temp_dir().join(format!("ok-identity-{}-{port}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("make the test identity's directory");
+    let ca = dir.join("ca");
+    let made = ok()
+        .args(["identity", "ca", "init", "-dir"])
+        .arg(&ca)
+        .args(["-name", "Test"])
+        .output()
+        .expect("run ok identity ca init");
+    assert!(
+        made.status.success(),
+        "ok identity ca init: {}",
+        String::from_utf8_lossy(&made.stderr)
+    );
+    let people = dir.join("people.yaml");
+    std::fs::write(&people, IDENTITY_PEOPLE).expect("write the test identity's people");
+    let db = dir.join("database-url");
+    std::fs::write(&db, database_url()).expect("write the test identity's database URL");
+    let config = dir.join("ok.yaml");
+    std::fs::write(
+        &config,
+        format!(
+            "domain: example.com\npublic_url: http://127.0.0.1:{port}\nlisten: 127.0.0.1:{port}\nmetrics_listen: 127.0.0.1:0\n\
+             database: {{url_file: {db:?}}}\n\
+             identity:\n  ca_dir: {ca:?}\n  system_of_record: {{static: {{file: {people:?}}}}}\n"
+        ),
+    )
+    .expect("write the test identity's configuration");
+    let log = std::env::temp_dir().join(format!("ok-identity-{port}.log"));
+    let out = std::fs::File::create(&log).expect("create the ok identity log");
+    let mut cmd = ok();
+    cmd.args(["identity", "serve", "-dev", "-config"])
+        .arg(&config)
+        .stdin(Stdio::null())
+        .stdout(out.try_clone().expect("share the ok identity log"))
+        .stderr(out);
+    let mut child =
+        spawn_for_process(cmd).expect("start ok identity (is ok on the PATH, or OK_BINARY set?)");
+    let addr = format!("127.0.0.1:{port}");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if TcpStream::connect(&addr).is_ok() {
+            break;
+        }
+        let exited = child.try_wait().expect("check on ok identity");
+        if exited.is_some() || Instant::now() > deadline {
+            let mut text = String::new();
+            let _ = std::fs::File::open(&log).and_then(|mut f| f.read_to_string(&mut text));
+            panic!("ok identity did not start ({exited:?}):\n{text}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Server {
+        endpoint: format!("http://{addr}"),
+        config,
+        _child: child,
+    }
+}
+
+/// Posts a form to a development server's page as `principal`, over HTTP/1.1, returning the
+/// response's status line and body.
+pub fn post_form_as(endpoint: &str, path: &str, principal: &str, form: &[(&str, &str)]) -> String {
+    use std::io::Write as _;
+    let addr = endpoint.trim_start_matches("http://");
+    let body: Vec<String> = form
+        .iter()
+        .map(|(k, v)| format!("{}={}", url_encode(k), url_encode(v)))
+        .collect();
+    let body = body.join("&");
+    let mut s = TcpStream::connect(addr).expect("reach the development server");
+    write!(
+        s,
+        "POST {path} HTTP/1.1\r\nHost: {addr}\r\nOrigin: {endpoint}\r\nok-dev-principal: {principal}\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .expect("send the form");
+    let mut out = String::new();
+    s.read_to_string(&mut out).expect("read the response");
+    out
+}
+
+fn url_encode(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
 }
 
 /// Runs one garbage-collection pass over a repository (`ok scm gc`), returning its report.

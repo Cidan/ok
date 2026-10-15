@@ -1,11 +1,13 @@
 package ca
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/x509"
 	"encoding/pem"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -104,5 +106,44 @@ func TestLoadRefuses(t *testing.T) {
 	os.WriteFile(filepath.Join(leafDir, "tls.key"), pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}), 0o600)
 	if _, err := Load(leafDir); err == nil || !strings.Contains(err.Error(), "may not sign") {
 		t.Errorf("a leaf as the CA: %v", err)
+	}
+}
+
+// A CA whose files cannot be read verifies no credential: Pool is empty, Readable says why, and
+// the log says so once — not once a request — and once more when they can be read again.
+func TestUnreadableIsReported(t *testing.T) {
+	var logged bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logged, nil)))
+	defer slog.SetDefault(prev)
+	dir := t.TempDir()
+	if err := Init(dir, "Example"); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := filepath.Join(dir, "tls.key")
+	data, _ := os.ReadFile(key)
+	if err := os.Remove(key); err != nil {
+		t.Fatal(err)
+	}
+	for range 5 {
+		if !c.Pool().Equal(x509.NewCertPool()) {
+			t.Fatal("an unreadable CA's pool is not empty")
+		}
+	}
+	if err := c.Readable(); err == nil {
+		t.Error("an unreadable CA is readable")
+	}
+	if n := strings.Count(logged.String(), "cannot be read"); n != 1 {
+		t.Errorf("the failure was logged %d times:\n%s", n, logged.String())
+	}
+	if err := os.WriteFile(key, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if c.Readable() != nil || c.Pool().Equal(x509.NewCertPool()) || !strings.Contains(logged.String(), "can be read again") {
+		t.Errorf("after the key came back:\n%s", logged.String())
 	}
 }
