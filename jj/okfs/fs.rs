@@ -1,7 +1,8 @@
 //! A mounted workspace (docs/okfs.md, "The file system"): the FUSE operations, served from the
 //! model. The model's needs — trees, sizes, symlink targets, contents — are fetched outside its
 //! lock and the operation tried again; a file whose content is ok's is read by range, outside
-//! the lock too. Kernel notifications are sent once the lock is released.
+//! the lock too. Kernel notifications are sent once the lock is released. Over NFS (macOS), nfs.rs
+//! serves the same mount, and the kernel is told of changes through it (`nfs::Refresh`).
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -97,6 +98,8 @@ pub struct Mount {
     model: Mutex<Model>,
     fetch: Arc<dyn Fetch>,
     notifier: Mutex<Option<fuse::Notifier>>,
+    /// How the kernel's NFS client is told of changes, for a mount served over NFS.
+    refresh: Mutex<Option<Arc<crate::nfs::Refresh>>>,
     handles: Mutex<HashMap<u64, Handle>>,
     next_fh: AtomicU64,
     /// Where whole contents are fetched to, to materialize files.
@@ -128,6 +131,7 @@ impl Mount {
             model: Mutex::new(model),
             fetch,
             notifier: Mutex::new(None),
+            refresh: Mutex::new(None),
             handles: Mutex::new(HashMap::new()),
             next_fh: AtomicU64::new(1),
             staging,
@@ -157,7 +161,7 @@ impl Mount {
         self.closed.load(Ordering::SeqCst)
     }
 
-    fn writable(&self) -> fuse::Result<()> {
+    pub(crate) fn writable(&self) -> fuse::Result<()> {
         if self.read_only.load(Ordering::SeqCst) {
             return Err(libc::EROFS);
         }
@@ -241,7 +245,7 @@ impl Mount {
 
     /// Counts a first open of one of ok's files; the `SIBLINGS`th in a directory within
     /// `SIBLING_WINDOW` fetches the directory's other small files in the background.
-    fn sibling_opened(&self, ino: Ino) {
+    pub(crate) fn sibling_opened(&self, ino: Ino) {
         let (dir, seq) = {
             let m = self.model();
             (m.parent_of(ino), m.seq())
@@ -302,7 +306,7 @@ impl Mount {
     }
 
     /// Fetches the sizes a directory listing will need, together.
-    fn prefetch_sizes(&self, dir: Ino) {
+    pub(crate) fn prefetch_sizes(&self, dir: Ino) {
         if let Ok(ids) = self.with(|m| m.missing_sizes(dir)) {
             if ids.is_empty() {
                 return;
@@ -324,13 +328,13 @@ impl Mount {
     }
 
     /// Counts a reference the kernel now holds.
-    fn counted(&self, ino: Ino) {
+    pub(crate) fn counted(&self, ino: Ino) {
         if !self.is_closed() {
             let _ = self.model().lookup_count(ino);
         }
     }
 
-    fn changed(&self) {
+    pub(crate) fn changed(&self) {
         (self.on_change)();
     }
 
@@ -355,10 +359,35 @@ impl Mount {
         }
     }
 
-    /// Sends the kernel the invalidations a change made.
-    pub fn invalidate(&self, stale: &[Stale]) {
+    /// Serves the mount over NFS: changes are pushed to the kernel through `refresh`.
+    pub fn set_refresh(&self, refresh: Arc<crate::nfs::Refresh>) {
+        *self.refresh.lock().unwrap() = Some(refresh);
+    }
+
+    /// Bytes [offset, offset + len) of one of ok's files of `size` bytes, counted as fetched.
+    pub(crate) fn read_value(
+        &self,
+        id: &FileId,
+        size: u64,
+        offset: u64,
+        len: u64,
+    ) -> fuse::Result<Vec<u8>> {
+        let data = self.fetch.read(id, size, offset, len).map_err(to_errno)?;
+        self.stats
+            .fetched_bytes
+            .fetch_add(data.len() as u64, Ordering::Relaxed);
+        Ok(data)
+    }
+
+    /// Sends the kernel the invalidations a change made. Over NFS, it returns what the jj command
+    /// that asked for the change must ask the kernel about (`nfs::ask`); over FUSE, nothing.
+    pub fn invalidate(&self, stale: &[Stale]) -> Vec<crate::nfs::Target> {
+        let refresh = self.refresh.lock().unwrap().clone();
+        if let Some(r) = refresh {
+            return r.refresh(self, stale);
+        }
         let Some(n) = self.notifier.lock().unwrap().clone() else {
-            return;
+            return Vec::new();
         };
         for s in stale {
             let _ = match s {
@@ -366,21 +395,31 @@ impl Mount {
                 Stale::Inode(ino) => n.inval_inode(*ino, 0, 0),
             };
         }
+        Vec::new()
     }
 
-    /// Drops every entry the kernel cached, where it can be asked to (a sparse change).
-    pub fn invalidate_all(&self, dirs: &[(Ino, Vec<std::ffi::OsString>)]) {
+    /// Drops every entry the kernel cached, where it can be asked to (a sparse change). Over NFS,
+    /// returns what to ask the kernel about, as `invalidate` does.
+    pub fn invalidate_all(
+        &self,
+        dirs: &[(Ino, Vec<std::ffi::OsString>)],
+    ) -> Vec<crate::nfs::Target> {
+        let refresh = self.refresh.lock().unwrap().clone();
+        if let Some(r) = refresh {
+            return r.refresh_all(self);
+        }
         let Some(n) = self.notifier.lock().unwrap().clone() else {
-            return;
+            return Vec::new();
         };
         if n.inc_epoch().unwrap_or(false) {
-            return;
+            return Vec::new();
         }
         for (dir, names) in dirs {
             for name in names {
                 let _ = n.inval_entry(*dir, name);
             }
         }
+        Vec::new()
     }
 
     pub fn notifier(&self) -> Option<fuse::Notifier> {
@@ -690,8 +729,8 @@ impl fuse::Filesystem for Mount {
         self.handles.lock().unwrap().remove(&fh);
     }
 
-    fn statfs(&self, ctx: &fuse::Ctx, ino: u64) -> fuse::Result<fuse::Statfs> {
-        self.statfs_impl(ctx, ino)
+    fn statfs(&self, _: &fuse::Ctx, _: u64) -> fuse::Result<fuse::Statfs> {
+        self.statvfs()
     }
 
     fn setxattr(
@@ -722,7 +761,7 @@ impl fuse::Filesystem for Mount {
 
 impl Mount {
     /// A directory's entries as a listing serves them: `.`, `..`, then its names in order.
-    fn dir_entries(&self, ino: Ino) -> fuse::Result<Arc<Vec<(Listed, Ino)>>> {
+    pub(crate) fn dir_entries(&self, ino: Ino) -> fuse::Result<Arc<Vec<(Listed, Ino)>>> {
         let listed = self.with(|m| m.list(ino))?;
         let parent = self.model().parent_of(ino).unwrap_or(ROOT);
         let mut entries = vec![
@@ -835,7 +874,8 @@ impl Mount {
         Ok(())
     }
 
-    fn statfs_impl(&self, _: &fuse::Ctx, _: u64) -> fuse::Result<fuse::Statfs> {
+    /// The space and files left where the mount keeps what it writes.
+    pub(crate) fn statvfs(&self) -> fuse::Result<fuse::Statfs> {
         let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
         let path = std::ffi::CString::new(self.staging.as_os_str().as_encoded_bytes())
             .map_err(|_| libc::EINVAL)?;

@@ -1,6 +1,6 @@
 [package]
 name = "okfs"
-description = "okfs: a virtual workspace, served over FUSE"
+description = "okfs: a virtual workspace, served over FUSE or NFS"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,6 +10,7 @@ path = "lib.rs"
 
 [dependencies]
 async-trait.workspace = true
+blake3.workspace = true
 dunce.workspace = true
 futures.workspace = true
 globset.workspace = true
@@ -19,6 +20,7 @@ libc.workspace = true
 ok-proto.workspace = true
 ok-store.workspace = true
 okfs-fuse.workspace = true
+okfs-nfs.workspace = true
 prost.workspace = true
 serde.workspace = true
 tokio.workspace = true

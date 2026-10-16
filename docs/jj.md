@@ -8,11 +8,12 @@ whole lifecycle: `jj cl status [-f]`, `ready`, `draft`, `reviewers`, `review`, `
 only way code enters ok. Its design — stores, cache, outbox, commands — is [scm.md](scm.md), "The
 client".
 
-A workspace is **virtual** unless asked otherwise ([okfs.md](okfs.md)): a FUSE file system this
-binary serves, so a clone is ready at once, a file is read from ok the first time something reads
+A workspace is **virtual** unless asked otherwise ([okfs.md](okfs.md)): a file system this binary
+serves, so a clone is ready at once, a file is read from ok the first time something reads
 it, and every write is kept in ok as a checkpoint within about a second. `--real` makes a real
-checkout, every file on disk. Virtual workspaces are Linux's (okfs serves Linux's FUSE): on macOS,
-and anywhere else, every clone is a real checkout, and `--attach` is refused.
+checkout, every file on disk. Virtual workspaces are Linux's (over FUSE) and macOS's (over NFS,
+[okfs.md](okfs.md), "macOS"); anywhere else, every clone is a real checkout, and `--attach` is
+refused.
 
 ## Using it
 
@@ -118,15 +119,16 @@ read-only, moved to another commit at once (`Present`; `the roles' checkout`'s `
 "ok's services"); `jj fs status` lists presentations too.
 
 The daemon is this binary (`jj fs daemon`), one per user, run as the systemd user service
-`okfs.service` that the first virtual clone installs and enables (where there is no user
-manager, a detached process logging to `~/.local/share/ok/daemon.log`). A jj command that finds
-a daemon of another build restarts it; systemd keeps every mount's connection across the restart,
-so open files read on. Its state: `~/.local/share/ok/` — `workspaces/<id>/` (`repo/` is the
-workspace's own jj repository — stores, outbox, operation heads, index; `jj/` is the workspace's
-`.jj`, which the mount shows as a symlink; `overlay/` written files; `inodes.snap`/`inodes.log`),
-`workspaces.toml` (what to mount), `machine` (this machine's ID, for leases and checkpoints) — and
-the control socket in `$XDG_RUNTIME_DIR/okfs/`. `OKFS_STATE_DIR`, `OKFS_RUNTIME_DIR`, and
-`OKFS_DAEMON` (`spawn`: no systemd; `external`: only connect) override them, which the tests use.
+`okfs.service` that the first virtual clone installs and enables (on macOS, the launchd agent
+`ok.okfs`; where there is neither, a detached process logging to `~/.local/share/ok/daemon.log`). A
+jj command that finds a daemon of another build restarts it; systemd (or launchd) keeps every
+mount's connection across the restart, so open files read on. Its state: `~/.local/share/ok/` —
+`workspaces/<id>/` (`repo/` is the workspace's own jj repository — stores, outbox, operation heads,
+index; `jj/` is the workspace's `.jj`, which the mount shows as a symlink; `overlay/` written files;
+`inodes.snap`/`inodes.log`), `workspaces.toml` (what to mount), `machine` (this machine's ID, for
+leases and checkpoints) — and the control socket in `$XDG_RUNTIME_DIR/okfs/`. `OKFS_STATE_DIR`,
+`OKFS_RUNTIME_DIR`, and `OKFS_DAEMON` (`spawn`: no systemd; `external`: only connect) override them,
+which the tests use.
 
 A repository lists in `.ok/redirections` the paths (one a line) a virtual workspace presents as
 symlinks to directories on local disk — heavy ignored outputs like `node_modules/` — which are
@@ -151,8 +153,9 @@ The Cargo workspace at the repository's root; every crate is under `jj/`.
 | `jj/encoding` (`ok-encoding`) | The canonical object encoding over jj-lib's own types — encode, decode, BLAKE3-256 IDs, a streaming hasher, and commit signed data |
 | `jj/proto` (`ok-proto`) | ok's protocols, compiled from `proto/ok` with protox (no `protoc`): prost messages and tonic clients |
 | `jj/credential` (`ok-credential`) | The machine's credential: the device login, the files `ok auth login` writes, renewal, and the proof every request carries |
-| `jj/okfs` (`okfs`) | Virtual workspaces: the model (`model.rs`), its log (`persist.rs`), the FUSE operations (`fs.rs`), the snapshot walk (`snapshot.rs`), the daemon (`daemon.rs`) and finding or starting it (`client.rs`), the control socket (`control.rs`), systemd's protocol (`systemd.rs`), and the `okfs` working copy (`workingcopy.rs`) |
+| `jj/okfs` (`okfs`) | Virtual workspaces: the model (`model.rs`), its log (`persist.rs`), the FUSE operations (`fs.rs`), the NFS operations (`nfs.rs`) and macOS's NFS service (`nfsd.rs`), the snapshot walk (`snapshot.rs`), the daemon (`daemon.rs`) and finding or starting it (`client.rs`), the control socket (`control.rs`), systemd's protocol (`systemd.rs`), and the `okfs` working copy (`workingcopy.rs`) |
 | `jj/okfs/fuse` (`okfs-fuse`) | The FUSE kernel protocol over `/dev/fuse`, mounting (directly, or through `fusermount3`), a multithreaded session, notifications, and `testns` (a process in a user and mount namespace of its own, for tests) |
+| `jj/okfs/nfs` (`okfs-nfs`) | An NFSv3 server and its MOUNT protocol on one TCP port — XDR, ONC RPC, keyed handles, one-time mounts — for macOS, and a minimal client that tests call it with |
 | `jj/testscm` (`ok-testscm`) | An `ok scm` for the end-to-end tests (see *Tests*) |
 
 ## The stores on disk

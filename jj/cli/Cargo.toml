@@ -25,7 +25,6 @@ ok-review.workspace = true
 ok-store.workspace = true
 ok-working-copy.workspace = true
 okfs.workspace = true
-okfs-fuse.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tonic.workspace = true

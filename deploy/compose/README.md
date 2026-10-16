@@ -56,9 +56,9 @@ jj cl submit 1 --until landed
 jj sync
 ```
 
-On Linux, `jj create` and `jj clone` make a virtual workspace, its files read from ok as they are
-used; that needs FUSE (`/dev/fuse`, and `fusermount3`). `--real` writes every file instead, as jj
-does on macOS. [docs/jj.md](../../docs/jj.md) has the rest.
+`jj create` and `jj clone` make a virtual workspace, its files read from ok as they are used: on
+Linux over FUSE (`/dev/fuse`, and `fusermount3`), on macOS over NFS. `--real` writes every file
+instead. [docs/jj.md](../../docs/jj.md) has the rest.
 
 ## People
 

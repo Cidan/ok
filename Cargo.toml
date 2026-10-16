@@ -7,6 +7,7 @@ members = [
     "jj/encoding",
     "jj/okfs",
     "jj/okfs/fuse",
+    "jj/okfs/nfs",
     "jj/proto",
     "jj/review",
     "jj/store",
@@ -37,6 +38,7 @@ ok-testscm = { path = "jj/testscm" }
 ok-working-copy = { path = "jj/workingcopy" }
 okfs = { path = "jj/okfs" }
 okfs-fuse = { path = "jj/okfs/fuse" }
+okfs-nfs = { path = "jj/okfs/nfs" }
 
 async-trait = "0.1.92"
 base64 = "0.22"

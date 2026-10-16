@@ -175,8 +175,20 @@ message Materialized {
   bool executable = 3;
   uint32 conflict_marker_len = 4;
 }
+// A checkout's reply, and a sparse change's.
 message CheckOutReply {
   repeated string skipped = 1;  // new tree paths an untracked file stood in the way of
+  // Over NFS (macOS): what the jj command that asked must ask the kernel about, before it
+  // returns, for the kernel to see the change (docs/okfs.md, "macOS").
+  repeated Refresh refresh = 2;
+}
+
+// A path whose times a change moved on, which the kernel's NFS client is asked about through the
+// mount — a chmod to the mode it has — to drop what it cached of it. The daemon cannot ask: macOS
+// keeps network volumes from background processes.
+message Refresh {
+  string path = 1;  // absolute
+  uint32 mode = 2;
 }
 
 // The tree jj recorded for the working copy (after a snapshot, reset, or recover). With

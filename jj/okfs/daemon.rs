@@ -65,6 +65,7 @@ use crate::model::Stale;
 use crate::model::Terms;
 use crate::model::terms_in;
 use crate::model::terms_out;
+use crate::nfs::NfsMount;
 use crate::persist::FileLog;
 use crate::persist::MemLog;
 use crate::snapshot::FsView;
@@ -81,6 +82,8 @@ const AT_MOST: Duration = Duration::from_secs(10);
 const RENEW_EVERY: Duration = Duration::from_secs(10);
 /// How many threads serve each mount's requests.
 const FUSE_THREADS: usize = 8;
+/// How often an NFS mount's detached inodes are looked at.
+const SWEEP_EVERY: Duration = Duration::from_secs(60);
 
 /// A workspace the daemon serves, as the registry keeps it.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -119,16 +122,27 @@ fn save_registry(paths: &Paths, regs: &[Registered]) -> io::Result<()> {
 
 /// This build of the binary: a daemon of another build is restarted.
 pub fn build_id() -> String {
-    std::fs::metadata("/proc/self/exe")
-        .map(|m| {
-            format!(
-                "{}-{}-{}",
-                m.ino(),
-                m.mtime_nsec() + m.mtime() * 1_000_000_000,
-                m.size()
-            )
-        })
-        .unwrap_or_default()
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        // Linux names the binary this process runs even once its file is replaced; elsewhere the
+        // binary is read as the process first asks, before a newer build replaces it.
+        let exe = if cfg!(target_os = "linux") {
+            PathBuf::from("/proc/self/exe")
+        } else {
+            std::env::current_exe().unwrap_or_default()
+        };
+        std::fs::metadata(exe)
+            .map(|m| {
+                format!(
+                    "{}-{}-{}",
+                    m.ino(),
+                    m.mtime_nsec() + m.mtime() * 1_000_000_000,
+                    m.size()
+                )
+            })
+            .unwrap_or_default()
+    })
+    .clone()
 }
 
 /// This machine's ID, made once: what leases and checkpoints name.
@@ -456,7 +470,10 @@ struct Active {
     last_change: Arc<AtomicU64>,
     events: broadcast::Sender<pb::Event>,
     stop: Notify,
+    /// The FUSE session's thread.
     session: Mutex<Option<std::thread::JoinHandle<io::Result<()>>>>,
+    /// The workspace as NFS serves it (macOS).
+    nfs: Option<Arc<NfsMount>>,
 }
 
 pub struct Daemon {
@@ -472,6 +489,9 @@ pub struct Daemon {
     /// Commits presented for ok's roles, by mount point: each slot's lock orders the Presents
     /// at one mount point.
     presented: tokio::sync::Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<Option<Presentation>>>>>,
+    /// The NFS server every workspace is served by (macOS), from the daemon's start.
+    #[cfg(target_os = "macos")]
+    nfsd: Mutex<Option<Arc<crate::nfsd::Nfsd>>>,
 }
 
 /// A commit presented read-only for one of ok's roles (docs/okfs.md, "ok's roles").
@@ -535,7 +555,19 @@ impl Daemon {
             adoptable: Mutex::new(HashMap::new()),
             settings,
             presented: tokio::sync::Mutex::new(HashMap::new()),
+            #[cfg(target_os = "macos")]
+            nfsd: Mutex::new(None),
         })
+    }
+
+    /// The NFS server, which `serve` starts before mounting anything.
+    #[cfg(target_os = "macos")]
+    fn nfsd(&self) -> Result<Arc<crate::nfsd::Nfsd>, String> {
+        self.nfsd
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| "the NFS server has not started".to_owned())
     }
 
     fn now_ms(&self) -> u64 {
@@ -634,18 +666,27 @@ impl Daemon {
         if self.active.lock().await.contains_key(&reg.id) {
             return Ok(pb::MountReply::default());
         }
+        let started = Instant::now();
         let state = self.paths.workspace(&reg.id);
         private_dir(&state).map_err(|e| format!("{}: {e}", state.display()))?;
         let (store, shared) = self.store(&reg.repo_dir).map_err(|e| e.to_string())?;
+        let opened = started.elapsed();
         let attach = self.attach(&shared, &reg.workspace_name, takeover).await?;
+        let attached = started.elapsed();
         let (log, records) =
             FileLog::open(&state).map_err(|e| format!("{}: {e}", state.display()))?;
         let jj_target = state.join("jj").into_os_string().into_encoded_bytes();
         let adopted = self.adoptable.lock().unwrap().remove(&fdname(&reg.id));
         let mut reply = pb::MountReply::default();
-        let mut model = if records.is_empty()
-            || (takeover && attach.as_ref().is_some_and(|a| a.latest.is_some()))
-        {
+        let fresh_model =
+            records.is_empty() || (takeover && attach.as_ref().is_some_and(|a| a.latest.is_some()));
+        // A predecessor's NFS mount is served on, its handles naming the model's inodes — unless the
+        // model is made anew, whose inodes are numbered anew: then the mount is made anew too.
+        #[cfg(target_os = "macos")]
+        let nfs_adopt = !fresh_model && self.nfsd()?.adoptable(&reg.mount_point, &state);
+        #[cfg(not(target_os = "macos"))]
+        let nfs_adopt = false;
+        let mut model = if fresh_model {
             let mut base = first
                 .as_ref()
                 .map(|f| f.0.clone())
@@ -680,7 +721,7 @@ impl Daemon {
                 jj_target,
                 Box::new(log),
                 crate::model::now,
-                adopted.is_none(),
+                adopted.is_none() && !nfs_adopt,
             )
             .map_err(|e| e.to_string())?
         };
@@ -711,41 +752,40 @@ impl Daemon {
             )
             .map_err(|e| e.to_string())?,
         );
-        let negotiated_path = state.join("fuse");
-        let (fd, session) = match adopted {
-            Some(fd) => {
-                let negotiated = read_negotiated(&negotiated_path)
-                    .ok_or("an adopted connection without its INIT")?;
-                let fd = Arc::new(fd);
-                let dup = fd.try_clone().map_err(|e| e.to_string())?;
-                (fd, fuse::Session::adopt(dup, negotiated))
+        let loaded = started.elapsed();
+        #[cfg(target_os = "macos")]
+        let (thread, nfs) = {
+            let _ = adopted;
+            let refresh = Arc::new(crate::nfs::Refresh::new(reg.mount_point.clone()));
+            if nfs_adopt {
+                refresh.seed(mount.model().inos());
             }
-            None => {
-                prepare_mount_point(&reg.mount_point)?;
-                let fd = fuse::mount(&reg.mount_point, &fuse::MountOptions::default())
-                    .map_err(|e| format!("mounting {}: {e}", reg.mount_point.display()))?;
-                let fd = Arc::new(fd);
-                let dup = fd.try_clone().map_err(|e| e.to_string())?;
-                (fd, fuse::Session::new(dup))
-            }
+            let nfs = Arc::new(NfsMount::new(mount.clone(), refresh));
+            let nfsd = self.nfsd()?;
+            let (id, served, mount_point, st) = (
+                reg.id.clone(),
+                nfs.clone(),
+                reg.mount_point.clone(),
+                state.clone(),
+            );
+            tokio::task::spawn_blocking(move || {
+                nfsd.serve(&id, served, &mount_point, &st, nfs_adopt)
+            })
+            .await
+            .map_err(|e| e.to_string())??;
+            (None, Some(nfs))
         };
-        let _ = systemd::store_fd(&fdname(&reg.id), &fd);
-        let thread = {
-            let mount = mount.clone();
-            let path = negotiated_path.clone();
-            std::thread::Builder::new()
-                .name(format!("okfs-{}", reg.id))
-                .spawn(move || {
-                    session.run(mount, FUSE_THREADS, move |n| write_negotiated(&path, n))
-                })
-                .map_err(|e| e.to_string())?
-        };
-        // Requests a dead predecessor read and never answered are sent again.
-        if let Some(n) = mount.notifier()
-            && n.can_resend()
-        {
-            let _ = n.resend();
-        }
+        #[cfg(not(target_os = "macos"))]
+        let (thread, nfs) = self.serve_fuse(&reg, &state, &mount, adopted)?;
+        eprintln!(
+            "okfs: mounted {} at {} in {} ms (its store opened at {}, attached at {}, its model loaded at {})",
+            reg.workspace_name,
+            reg.mount_point.display(),
+            started.elapsed().as_millis(),
+            opened.as_millis(),
+            attached.as_millis(),
+            loaded.as_millis()
+        );
         let (events, _) = broadcast::channel(1024);
         let lease = LeaseState {
             lease: attach.as_ref().and_then(|a| a.lease.clone()),
@@ -777,7 +817,8 @@ impl Daemon {
             last_change,
             events,
             stop: Notify::new(),
-            session: Mutex::new(Some(thread)),
+            session: Mutex::new(thread),
+            nfs,
         });
         // What the overlay holds is checked against the latest checkpoint once, at once: a
         // restarted daemon records what its predecessor had not.
@@ -1066,6 +1107,61 @@ impl Daemon {
         })
     }
 
+    /// Serves a workspace's mount over FUSE: the connection systemd kept, adopted, or a new mount.
+    /// Returns the session's thread.
+    #[cfg(not(target_os = "macos"))]
+    #[allow(clippy::type_complexity)]
+    fn serve_fuse(
+        &self,
+        reg: &Registered,
+        state: &Path,
+        mount: &Arc<Mount>,
+        adopted: Option<OwnedFd>,
+    ) -> Result<
+        (
+            Option<std::thread::JoinHandle<io::Result<()>>>,
+            Option<Arc<NfsMount>>,
+        ),
+        String,
+    > {
+        let negotiated_path = state.join("fuse");
+        let (fd, session) = match adopted {
+            Some(fd) => {
+                let negotiated = read_negotiated(&negotiated_path)
+                    .ok_or("an adopted connection without its INIT")?;
+                let fd = Arc::new(fd);
+                let dup = fd.try_clone().map_err(|e| e.to_string())?;
+                (fd, fuse::Session::adopt(dup, negotiated))
+            }
+            None => {
+                prepare_mount_point(&reg.mount_point)?;
+                let fd = fuse::mount(&reg.mount_point, &fuse::MountOptions::default())
+                    .map_err(|e| format!("mounting {}: {e}", reg.mount_point.display()))?;
+                let fd = Arc::new(fd);
+                let dup = fd.try_clone().map_err(|e| e.to_string())?;
+                (fd, fuse::Session::new(dup))
+            }
+        };
+        let _ = systemd::store_fd(&fdname(&reg.id), &fd);
+        let thread = {
+            let mount = mount.clone();
+            let path = negotiated_path.clone();
+            std::thread::Builder::new()
+                .name(format!("okfs-{}", reg.id))
+                .spawn(move || {
+                    session.run(mount, FUSE_THREADS, move |n| write_negotiated(&path, n))
+                })
+                .map_err(|e| e.to_string())?
+        };
+        // Requests a dead predecessor read and never answered are sent again.
+        if let Some(n) = mount.notifier()
+            && n.can_resend()
+        {
+            let _ = n.resend();
+        }
+        Ok((Some(thread), None))
+    }
+
     /// Unmounts a workspace, leaving its state.
     async fn unmount(&self, id: &str) -> Result<(), String> {
         let Some(active) = self.active.lock().await.remove(id) else {
@@ -1079,6 +1175,19 @@ impl Daemon {
         // asked for this, whose working directory is in it — so it is not waited for: its thread
         // exits on its own.
         active.mount.close();
+        #[cfg(target_os = "macos")]
+        {
+            let nfsd = self.nfsd()?;
+            let (id, mount_point, state) = (
+                id.to_owned(),
+                active.reg.mount_point.clone(),
+                self.paths.workspace(id),
+            );
+            tokio::task::spawn_blocking(move || nfsd.unserve(&id, &mount_point, &state))
+                .await
+                .map_err(|e| e.to_string())??;
+        }
+        #[cfg(not(target_os = "macos"))]
         fuse::unmount(&active.reg.mount_point)
             .map_err(|e| format!("unmounting {}: {e}", active.reg.mount_point.display()))?;
         drop(active.session.lock().unwrap().take());
@@ -1202,8 +1311,11 @@ impl Daemon {
                     .mount
                     .with(|m| m.set_sparse(patterns.clone()))
                     .map_err(|e| e.to_string())?;
-                active.mount.invalidate_all(&[]);
-                A::Empty(pb::Empty {})
+                // A sparse change answers as a checkout does, with what to ask the kernel about.
+                A::CheckOut(pb::CheckOutReply {
+                    skipped: Vec::new(),
+                    refresh: refresh_out(active.mount.invalidate_all(&[])),
+                })
             }
             Q::Status(_) => {
                 let mut out = pb::StatusReply {
@@ -1338,6 +1450,7 @@ impl Daemon {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 fn read_negotiated(p: &Path) -> Option<fuse::Negotiated> {
     let s = std::fs::read_to_string(p).ok()?;
     let (minor, flags) = s.trim().split_once(' ')?;
@@ -1347,6 +1460,7 @@ fn read_negotiated(p: &Path) -> Option<fuse::Negotiated> {
     })
 }
 
+#[cfg(not(target_os = "macos"))]
 fn write_negotiated(p: &Path, n: fuse::Negotiated) {
     let _ = std::fs::write(p, format!("{} {}", n.minor, n.flags));
 }
@@ -1417,10 +1531,19 @@ async fn keep(daemon: Arc<Daemon>, active: Arc<Active>) {
     // After a failed checkpoint, the next waits (doubling, to 30 s), unless one succeeds first.
     let mut backoff = Duration::from_secs(1);
     let mut retry_at = Instant::now();
+    let mut last_sweep = Instant::now();
     loop {
         tokio::select! {
             _ = active.stop.notified() => return,
             _ = tick.tick() => {}
+        }
+        // Over NFS, the inodes a checkout left with no name, once their grace is over.
+        if let Some(nfs) = &active.nfs
+            && last_sweep.elapsed() >= SWEEP_EVERY
+        {
+            last_sweep = Instant::now();
+            let nfs = nfs.clone();
+            let _ = tokio::task::spawn_blocking(move || nfs.sweep()).await;
         }
         // The journal.
         let changed = active.mount.model().take_changed();
@@ -1599,7 +1722,7 @@ async fn checkpoint(active: &Arc<Active>, tree: Option<Terms>, force: bool) -> R
             let snap = tokio::task::spawn_blocking(move || {
                 let sparse = PrefixMatcher::new(&sparse);
                 let t = Tracking {
-                    base_ignores: GitIgnoreFile::empty(),
+                    base_ignores: crate::platform_ignores(&GitIgnoreFile::empty()),
                     start_tracking: &EverythingMatcher,
                     force_tracking: &NothingMatcher,
                     max_new_file_size: CHECKPOINT_MAX_NEW_FILE,
@@ -1725,7 +1848,7 @@ async fn check_out(active: &Arc<Active>, c: pb::CheckOut) -> Result<pb::CheckOut
     .await
     .map_err(|e| e.to_string())?
     .map_err(|e| format!("checking out: {}", io::Error::from_raw_os_error(e)))?;
-    active.mount.invalidate(&stale);
+    let refresh = refresh_out(active.mount.invalidate(&stale));
     for id in new.iter().flatten() {
         let (shared, id) = (active.shared.clone(), id.clone());
         tokio::spawn(async move {
@@ -1737,7 +1860,21 @@ async fn check_out(active: &Arc<Active>, c: pb::CheckOut) -> Result<pb::CheckOut
             .iter()
             .map(|p| p.as_internal_file_string().to_owned())
             .collect(),
+        refresh,
     })
+}
+
+/// What the jj command that asked for a change asks the kernel about, over NFS (`nfs::ask`).
+fn refresh_out(targets: Vec<crate::nfs::Target>) -> Vec<pb::Refresh> {
+    targets
+        .into_iter()
+        .filter_map(|(path, mode)| {
+            Some(pb::Refresh {
+                path: path.to_str()?.to_owned(),
+                mode,
+            })
+        })
+        .collect()
 }
 
 /// The file a repository declares its redirections in: one repo-relative path a line, `#`
@@ -1995,6 +2132,11 @@ pub fn run(paths: Paths) -> io::Result<()> {
 
 async fn serve(paths: Paths, stop: Arc<Notify>) -> io::Result<()> {
     let daemon = Arc::new(Daemon::new(paths.clone())?);
+    #[cfg(target_os = "macos")]
+    {
+        let nfsd = crate::nfsd::Nfsd::start(&paths.state)?;
+        *daemon.nfsd.lock().unwrap() = Some(Arc::new(nfsd));
+    }
     for (name, fd) in systemd::listen_fds() {
         daemon.adoptable.lock().unwrap().insert(name, fd);
     }
@@ -2013,6 +2155,10 @@ async fn serve(paths: Paths, stop: Arc<Notify>) -> io::Result<()> {
     for (name, _) in daemon.adoptable.lock().unwrap().drain() {
         let _ = systemd::remove_fd(&name);
     }
+    #[cfg(target_os = "macos")]
+    if let Ok(nfsd) = daemon.nfsd() {
+        nfsd.ready();
+    }
     let _ = systemd::notify("READY=1", &[]);
     loop {
         tokio::select! {
@@ -2025,7 +2171,8 @@ async fn serve(paths: Paths, stop: Arc<Notify>) -> io::Result<()> {
         }
     }
     let _ = systemd::notify("STOPPING=1", &[]);
-    let under_systemd = std::env::var_os("NOTIFY_SOCKET").is_some();
+    // Under systemd or launchd, mounts outlive the daemon: its successor serves them on.
+    let supervised = std::env::var_os("NOTIFY_SOCKET").is_some() || crate::client::under_launchd();
     let ids: Vec<String> = daemon.active.lock().await.keys().cloned().collect();
     for id in ids {
         let active = daemon.active(&id).await.ok();
@@ -2034,7 +2181,7 @@ async fn serve(paths: Paths, stop: Arc<Notify>) -> io::Result<()> {
             let mut m = a.mount.model();
             let _ = m.compact();
         }
-        if !under_systemd {
+        if !supervised {
             let _ = daemon.unmount(&id).await;
         }
     }

@@ -90,6 +90,19 @@ fn tree_pb(t: &MergedTree) -> pb::Tree {
     }
 }
 
+/// Asks the kernel about what a change through the daemon moved on, over NFS (macOS): this
+/// process, not the daemon, may reach the mount (nfs.rs, "No notifications").
+fn ask_kernel(refresh: &[pb::Refresh]) {
+    if refresh.is_empty() {
+        return;
+    }
+    let targets: Vec<crate::nfs::Target> = refresh
+        .iter()
+        .map(|r| (std::path::PathBuf::from(&r.path), r.mode))
+        .collect();
+    crate::nfs::ask(&targets);
+}
+
 impl State {
     fn read(state_path: &Path) -> Result<Self, WorkingCopyStateError> {
         let p = state_path.join(STATE);
@@ -608,6 +621,7 @@ impl LockedOkfsWorkingCopy {
             }
         };
         stats.skipped_files = reply.skipped.len() as u32;
+        ask_kernel(&reply.refresh);
         self.tree = new_tree.clone();
         Ok(stats)
     }
@@ -685,7 +699,7 @@ impl LockedWorkingCopy for LockedOkfsWorkingCopy {
         };
         let sparse = PrefixMatcher::new(&self.sparse);
         let t = Tracking {
-            base_ignores: options.base_ignores.clone(),
+            base_ignores: crate::platform_ignores(&options.base_ignores),
             start_tracking: options.start_tracking_matcher,
             force_tracking: options.force_tracking_matcher,
             max_new_file_size: options.max_new_file_size,
@@ -743,7 +757,7 @@ impl LockedWorkingCopy for LockedOkfsWorkingCopy {
         let removed = DifferenceMatcher::new(&old, &new);
         let added_files = self.tree.entries_matching(&added).count() as u32;
         let removed_files = self.tree.entries_matching(&removed).count() as u32;
-        call(pb::request::Request::SetSparse(pb::SetSparse {
+        let reply = call(pb::request::Request::SetSparse(pb::SetSparse {
             workspace_id: self.st.workspace_id.clone(),
             patterns: new_sparse_patterns
                 .iter()
@@ -751,6 +765,9 @@ impl LockedWorkingCopy for LockedOkfsWorkingCopy {
                 .collect(),
         }))
         .map_err(|e| checkout_err("setting sparse patterns through the okfs daemon", e))?;
+        if let pb::response::Response::CheckOut(r) = reply {
+            ask_kernel(&r.refresh);
+        }
         self.sparse = new_sparse_patterns;
         Ok(CheckoutStats {
             updated_files: 0,

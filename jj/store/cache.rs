@@ -191,6 +191,7 @@ impl Cache {
             dir,
             Options {
                 segment_bytes: SEGMENT_BYTES,
+                refresh_every: crate::segments::REFRESH_EVERY,
                 budget: BUDGET,
             },
         )

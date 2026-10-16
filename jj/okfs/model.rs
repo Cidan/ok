@@ -1064,6 +1064,39 @@ impl Model {
         let _ = self.flush();
     }
 
+    /// Inodes no name reaches, kept for a reference the kernel holds: what NFS, which never says
+    /// it is done with a handle, keeps until it lets them go (nfs.rs).
+    pub fn detached(&self) -> Vec<Ino> {
+        self.inodes
+            .iter()
+            .filter(|(ino, i)| **ino != ROOT && **ino != JJ && i.parent == 0 && i.extra.is_empty())
+            .map(|(ino, _)| *ino)
+            .collect()
+    }
+
+    /// Closes a file's overlay descriptor, unless a handle has the file open: one a write or
+    /// read over NFS, which has no close, opened.
+    pub fn close_idle(&mut self, ino: Ino) {
+        if self.inodes.get(&ino).is_some_and(|i| i.open == 0) {
+            self.files.remove(&ino);
+        }
+    }
+
+    /// Overlay files open.
+    #[cfg(test)]
+    pub fn overlay_fds(&self) -> usize {
+        self.files.len()
+    }
+
+    /// Every inode the model holds.
+    pub fn inos(&self) -> Vec<Ino> {
+        self.inodes.keys().copied().collect()
+    }
+
+    pub fn is_dir(&self, ino: Ino) -> bool {
+        self.inodes.get(&ino).is_some_and(|i| i.kind == Kind::Dir)
+    }
+
     /// Drops an inode no name, kernel reference, or handle holds any more.
     fn maybe_drop(&mut self, ino: Ino) {
         let Some(i) = self.inodes.get(&ino) else {

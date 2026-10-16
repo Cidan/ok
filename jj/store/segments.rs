@@ -130,6 +130,9 @@ pub struct Options {
     pub segment_bytes: u64,
     /// What the segments may hold in all; the oldest are retired past it.
     pub budget: u64,
+    /// How often a reader whose lookups all hit checks for another process's changes:
+    /// `REFRESH_EVERY`, but in tests.
+    pub refresh_every: Duration,
 }
 
 /// What retirement needs from the layer above: what pins an entry, and what an entry is found
@@ -169,7 +172,7 @@ const MAX_ENTRY_SHARE: u64 = 2;
 /// The most runs kept before the two newest are merged regardless of size.
 const MAX_RUNS: usize = 12;
 /// How often a reader whose lookups all hit checks for another process's changes.
-const REFRESH_EVERY: Duration = Duration::from_secs(1);
+pub const REFRESH_EVERY: Duration = Duration::from_secs(1);
 
 const FLAG_KEY: u8 = 1 << 2;
 const FLAG_TRAILER: u8 = 1 << 3;
@@ -807,7 +810,7 @@ impl Segments {
         let view = self.current();
         let stale = {
             let mut checked = view.checked.lock().unwrap();
-            let stale = checked.elapsed() > REFRESH_EVERY;
+            let stale = checked.elapsed() > self.opts.refresh_every;
             if stale {
                 *checked = Instant::now();
             }
@@ -832,7 +835,7 @@ impl Segments {
         let view = self.current();
         let stale = {
             let mut checked = view.checked.lock().unwrap();
-            let stale = checked.elapsed() > REFRESH_EVERY;
+            let stale = checked.elapsed() > self.opts.refresh_every;
             if stale {
                 *checked = Instant::now();
             }
@@ -1351,6 +1354,7 @@ pub(crate) mod tests {
         Options {
             segment_bytes: segment,
             budget,
+            refresh_every: REFRESH_EVERY,
         }
     }
 
@@ -1650,7 +1654,16 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("seg");
         let seg = 16 << 10;
-        let reader = Segments::open(path.clone(), opts(seg, 1 << 30)).unwrap();
+        // A reader that does not look again on its own however long the writes take: a loaded
+        // machine's (macOS, its syncs full) take longer than REFRESH_EVERY.
+        let reader = Segments::open(
+            path.clone(),
+            Options {
+                refresh_every: Duration::from_secs(3600),
+                ..opts(seg, 1 << 30)
+            },
+        )
+        .unwrap();
         let writer = Segments::open(path.clone(), opts(seg, 2 * seg)).unwrap();
         let a = id(1);
         let da = body(&a, 1000);

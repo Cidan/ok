@@ -160,14 +160,14 @@ pub async fn run(ui: &mut Ui, command: &CommandHelper, cmd: Command) -> Result<(
     }
 }
 
-/// Whether this platform has virtual workspaces: okfs serves Linux's FUSE alone. Elsewhere a
-/// clone without `--real` is real.
-const VIRTUAL_WORKSPACES: bool = cfg!(target_os = "linux");
+/// Whether this platform has virtual workspaces: okfs serves Linux's FUSE and macOS's NFS.
+/// Elsewhere a clone without `--real` is real.
+const VIRTUAL_WORKSPACES: bool = cfg!(any(target_os = "linux", target_os = "macos"));
 
 /// Refuses a virtual workspace where this machine cannot mount one, before anything is asked of
 /// ok.
 fn can_mount() -> Result<(), CommandError> {
-    okfs_fuse::can_mount().map_err(|why| {
+    okfs::can_mount().map_err(|why| {
         user_error(format!(
             "this machine cannot mount a virtual workspace: {why}"
         ))

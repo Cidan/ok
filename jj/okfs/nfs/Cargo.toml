@@ -1,0 +1,13 @@
+[package]
+name = "okfs-nfs"
+description = "An NFSv3 file system server, in Rust, on one TCP port"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+blake3.workspace = true
+libc.workspace = true

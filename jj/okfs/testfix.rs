@@ -3,7 +3,6 @@
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
-#[cfg(target_os = "linux")]
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -18,7 +17,6 @@ use jj_lib::object_id::ObjectId as _;
 use jj_lib::repo_path::RepoPathBuf;
 use jj_lib::repo_path::RepoPathComponentBuf;
 
-#[cfg(target_os = "linux")]
 use crate::fs::Fetch;
 use crate::model::Error;
 use crate::model::Ino;
@@ -256,15 +254,12 @@ pub fn path(s: &str) -> RepoPathBuf {
 
 /// The fixture as a mount's source; what it was asked to prefetch, in `prefetched`. Mounting is
 /// Linux's alone, so its tests are.
-#[cfg(target_os = "linux")]
 pub struct FixtureFetch(pub Arc<Fixture>, pub Arc<std::sync::Mutex<Vec<FileId>>>);
 
-#[cfg(target_os = "linux")]
 fn missing() -> io::Error {
     io::Error::from_raw_os_error(libc::EIO)
 }
 
-#[cfg(target_os = "linux")]
 impl Fetch for FixtureFetch {
     fn tree(&self, id: &TreeId) -> io::Result<Arc<BackendTree>> {
         self.0.trees.get(id).cloned().ok_or_else(missing)

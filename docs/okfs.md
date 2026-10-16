@@ -3,7 +3,8 @@
 okfs makes a jj workspace on ok a virtual file system: a clone is ready at once, whatever the
 repository's size, a file's contents come from ok the first time something reads it, every write
 is kept in ok as a checkpoint within a second, and a workspace can be attached on any machine. It
-is modelled on Google's CitC.
+is modelled on Google's CitC. On Linux the kernel reaches it over FUSE; on macOS, over NFS
+([macOS](#macos)).
 
 Related: [jj.md](jj.md) (ok's jj: its stores, cache, outbox, and working copy), [scm.md](scm.md)
 (the SCM: objects, the client, the protocol), [identity.md](identity.md) (the credential jj
@@ -97,6 +98,8 @@ thing to keep running. It is the `jj` binary itself, started as a hidden subcomm
 - lingering (`loginctl enable-linger`), offered on the first virtual clone, so mounts outlive the
   login session.
 
+On macOS it is the **launchd agent** `ok.okfs` instead ([macOS](#macos)).
+
 It talks to ok as the user, with the machine's credential (`jj/credential`),
 renewing the certificate as the CLI does, and reconnecting when a renewal replaces it.
 
@@ -118,7 +121,9 @@ starts the service and waits for it.
 | `~/.cache/ok/<host>/<repository id>/` | the repository's content-addressed cache — objects, operations, and views by their IDs — shared by every workspace of the repository on the machine |
 | `~/.local/share/ok/workspaces.toml` | every virtual workspace: its mount point, id, repository, and workspace name |
 | `~/.local/share/ok/machine` | this machine's id: random, made once, named in leases and checkpoints |
-| `$XDG_RUNTIME_DIR/okfs/` | the control socket |
+| `$XDG_RUNTIME_DIR/okfs/` (`/tmp/okfs-<uid>/` without one, as on macOS) | the control socket |
+| `~/.local/share/ok/nfs.toml` | macOS: the NFS server's port and handle key |
+| `~/.local/share/ok/workspaces/<id>/nfs-mount.toml` | macOS: what the workspace's mount was mounted from, and the export its handles name |
 
 A real checkout keeps today's layout (`.jj/repo` inside the workspace). A virtual workspace's
 repository is its own, in its state directory, and goes when the workspace is forgotten: every
@@ -415,6 +420,55 @@ One machine writes to a workspace at a time, so two never silently diverge:
   checkout; afterwards it is local. ok's code search, not the mount, is the tool for searching
   everything.
 
+## macOS
+
+macOS's kernel has no FUSE, and its replacement, FSKit, loads only file systems that Apple's paid
+developer program has signed (`com.apple.developer.fskit.fsmodule` is a restricted entitlement), so
+a binary anyone builds could not use it. Every Mac has an NFS client, so there okfs is an **NFSv3
+server** on 127.0.0.1 that the kernel mounts — as EdenFS does on macOS. The same model serves both:
+`fs.rs` answers FUSE, `nfs.rs` answers NFS, and nothing above them knows which.
+
+- **The protocol is ours** (`jj/okfs/nfs`, okfs-nfs), as the FUSE layer is ([Decisions](#decisions),
+  1): ONC RPC over TCP, the MOUNT protocol, and NFSv3's procedures, answered by a pool of threads in
+  any order.
+- **One server, one port**, for every workspace: the daemon's, on a port kept in `nfs.toml`. A
+  workspace is mounted with `mount_nfs` — no root — with `vers=3,tcp,locallocks,intr,nobrowse`:
+  locks kept by the kernel itself (as FUSE keeps them; `nolocks` would fail every `flock`), waits
+  that a signal interrupts, and no entry in the Finder's sidebar. Spotlight does not index it.
+- **Only the user, only the kernel.** The port is open to every local process, and NFS's
+  credentials say whatever a caller writes, so handles are what admit: each carries a keyed hash
+  (BLAKE3, the key kept in `nfs.toml`), and a process that was never given one cannot make one. The
+  first comes from `MNT`, which accepts a one-time path that the daemon's own `mount_nfs` uses up;
+  another caller's using it first fails that mount, and the workspace is then served under a new
+  export, whose handles no one else holds. A call on a good handle comes from the kernel, which
+  says truly whose process made it, and anyone but the user — root included, as FUSE refuses
+  others — is refused.
+- **No forget.** The kernel may use any handle it was given at any time, across daemon restarts, so
+  every inode it was given is kept: until it is removed, or for ten minutes after a checkout leaves
+  no name reaching it (a process may still have it open).
+- **Telling the kernel of a checkout.** NFS has no notifications. A checkout moves on the times of
+  the directories and files it changed that the kernel has, and each is asked for through the
+  mount with a chmod to the mode it has, which changes nothing here: the reply carries the new
+  times, and the kernel drops what it cached under them and looks again — the moment the jj
+  command returns, a changed file reads its new contents, even one an editor holds open. The jj
+  command that asked for the checkout makes those calls, not the daemon: macOS keeps network
+  volumes, a mount of 127.0.0.1 among them, from background processes.
+- **The daemon is a launchd agent**, `ok.okfs` (`~/Library/LaunchAgents/ok.okfs.plist`), in the
+  user's domain, so it runs with or without anyone logged in at the screen, kept alive, and as an
+  interactive process (programs wait on its answers). launchd holds its port's socket across
+  restarts: the kernel's mounts stay, the restarted daemon serves them on — handles and all — and a
+  read made meanwhile waits about a second for it. Upgrading ok's jj restarts the agent.
+- **What macOS writes beside files** — AppleDouble files holding extended attributes (`._name`;
+  NFSv3 has no extended attributes), the Finder's `.DS_Store`, and `.nfs.*`, NFS's name for a file
+  removed while still open — is ignored: never tracked or checkpointed, they stay where they are,
+  as build outputs do.
+- **Permission.** A terminal (or editor) reaching a workspace for the first time may be asked to
+  allow access to files on network volumes, as for any NFS mount.
+
+Measured on a Mac (M-series, macOS 26) with 13,880 files from ok across a LAN: a virtual clone in
+0.5 s against a real one's 3.1 s; `find` over every file and `grep -r` as fast as in a real
+checkout; reading every file again 0.5 s against 0.3 s; `jj st` 30 ms against 100 ms.
+
 ## Performance
 
 - The FUSE connection is read by one thread per CPU (`FUSE_DEV_IOC_CLONE` gives each its own
@@ -443,7 +497,9 @@ One machine writes to a workspace at a time, so two never silently diverge:
   against its ID, a file's chunks against the file's ID.
 - Checkpoints and leases are their owner's: ok scm admits only the principal they belong to.
   Their trees are ordinary objects, readable as every published object is.
-- No privilege anywhere: mounting is `fusermount3`, and nothing needs `CAP_SYS_ADMIN`.
+- No privilege anywhere: mounting is `fusermount3` (on macOS, `mount_nfs`), and nothing needs
+  `CAP_SYS_ADMIN`.
+- On macOS, NFS handles are unforgeable and calls from other users refused ([macOS](#macos)).
 
 ## ok's roles
 
@@ -492,6 +548,12 @@ nothing else.
   and mounts there, which needs no privilege (FUSE is mountable in a user namespace:
   `FS_USERNS_MOUNT`); `okfs_fuse::testns` runs a process there. On a real mount: POSIX behaviour,
   mmap, locks, and the daemon's restart and crash recovery.
+- **NFS.** okfs-nfs's server over TCP, called as the kernel's client calls it (`client.rs`), on
+  any platform: handles, one-time mounts, paged listings, retransmitted creates, and a starting
+  server holding calls for its exports. okfs's NFS adapter the same way, from the model's fixture
+  trees: writes, a SETATTR that changes nothing leaving the model as it was, a checkout's moved
+  times, and inodes let go. On macOS, a real `mount_nfs` of the fixture, driven by file-system
+  calls, including a checkout seen the moment it is asked for.
 - **The SCM.** `Workspaces` and the sizes-only read against PostgreSQL: leases, takeovers, forks,
   retention, and garbage collection keeping checkpoint trees.
 - **jj, both ways.** ok's jj suites run their scenarios in a real and a virtual workspace against
@@ -512,4 +574,6 @@ nothing else.
 6. **Watchers learn of checkouts through the journal subscription**; what editors still miss is
    measured once it runs.
 7. **Lingering is offered on the first virtual clone.**
+8. **macOS over NFS**, served by okfs itself: FSKit needs Apple's paid signing for every build,
+   and macFUSE a kernel extension ([macOS](#macos)).
 

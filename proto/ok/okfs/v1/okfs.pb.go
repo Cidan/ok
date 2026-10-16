@@ -189,7 +189,7 @@ func (x InodeRecord_Kind) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use InodeRecord_Kind.Descriptor instead.
 func (InodeRecord_Kind) EnumDescriptor() ([]byte, []int) {
-	return file_proto_ok_okfs_v1_okfs_proto_rawDescGZIP(), []int{40, 0}
+	return file_proto_ok_okfs_v1_okfs_proto_rawDescGZIP(), []int{41, 0}
 }
 
 type InodeRecord_State int32
@@ -241,7 +241,7 @@ func (x InodeRecord_State) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use InodeRecord_State.Descriptor instead.
 func (InodeRecord_State) EnumDescriptor() ([]byte, []int) {
-	return file_proto_ok_okfs_v1_okfs_proto_rawDescGZIP(), []int{40, 1}
+	return file_proto_ok_okfs_v1_okfs_proto_rawDescGZIP(), []int{41, 1}
 }
 
 type Request struct {
@@ -1722,9 +1722,13 @@ func (x *Materialized) GetConflictMarkerLen() uint32 {
 	return 0
 }
 
+// A checkout's reply, and a sparse change's.
 type CheckOutReply struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Skipped       []string               `protobuf:"bytes,1,rep,name=skipped,proto3" json:"skipped,omitempty"` // new tree paths an untracked file stood in the way of
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	Skipped []string               `protobuf:"bytes,1,rep,name=skipped,proto3" json:"skipped,omitempty"` // new tree paths an untracked file stood in the way of
+	// Over NFS (macOS): what the jj command that asked must ask the kernel about, before it
+	// returns, for the kernel to see the change (docs/okfs.md, "macOS").
+	Refresh       []*Refresh `protobuf:"bytes,2,rep,name=refresh,proto3" json:"refresh,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1766,6 +1770,68 @@ func (x *CheckOutReply) GetSkipped() []string {
 	return nil
 }
 
+func (x *CheckOutReply) GetRefresh() []*Refresh {
+	if x != nil {
+		return x.Refresh
+	}
+	return nil
+}
+
+// A path whose times a change moved on, which the kernel's NFS client is asked about through the
+// mount — a chmod to the mode it has — to drop what it cached of it. The daemon cannot ask: macOS
+// keeps network volumes from background processes.
+type Refresh struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Path          string                 `protobuf:"bytes,1,opt,name=path,proto3" json:"path,omitempty"` // absolute
+	Mode          uint32                 `protobuf:"varint,2,opt,name=mode,proto3" json:"mode,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Refresh) Reset() {
+	*x = Refresh{}
+	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[19]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Refresh) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Refresh) ProtoMessage() {}
+
+func (x *Refresh) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[19]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Refresh.ProtoReflect.Descriptor instead.
+func (*Refresh) Descriptor() ([]byte, []int) {
+	return file_proto_ok_okfs_v1_okfs_proto_rawDescGZIP(), []int{19}
+}
+
+func (x *Refresh) GetPath() string {
+	if x != nil {
+		return x.Path
+	}
+	return ""
+}
+
+func (x *Refresh) GetMode() uint32 {
+	if x != nil {
+		return x.Mode
+	}
+	return 0
+}
+
 // The tree jj recorded for the working copy (after a snapshot, reset, or recover). With
 // checkpoint, a snapshot's: the daemon records it as a checkpoint too.
 type SetRecorded struct {
@@ -1780,7 +1846,7 @@ type SetRecorded struct {
 
 func (x *SetRecorded) Reset() {
 	*x = SetRecorded{}
-	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[19]
+	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1792,7 +1858,7 @@ func (x *SetRecorded) String() string {
 func (*SetRecorded) ProtoMessage() {}
 
 func (x *SetRecorded) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[19]
+	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1805,7 +1871,7 @@ func (x *SetRecorded) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetRecorded.ProtoReflect.Descriptor instead.
 func (*SetRecorded) Descriptor() ([]byte, []int) {
-	return file_proto_ok_okfs_v1_okfs_proto_rawDescGZIP(), []int{19}
+	return file_proto_ok_okfs_v1_okfs_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *SetRecorded) GetWorkspaceId() string {
@@ -1846,7 +1912,7 @@ type SetSparse struct {
 
 func (x *SetSparse) Reset() {
 	*x = SetSparse{}
-	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[20]
+	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1858,7 +1924,7 @@ func (x *SetSparse) String() string {
 func (*SetSparse) ProtoMessage() {}
 
 func (x *SetSparse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[20]
+	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1871,7 +1937,7 @@ func (x *SetSparse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetSparse.ProtoReflect.Descriptor instead.
 func (*SetSparse) Descriptor() ([]byte, []int) {
-	return file_proto_ok_okfs_v1_okfs_proto_rawDescGZIP(), []int{20}
+	return file_proto_ok_okfs_v1_okfs_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *SetSparse) GetWorkspaceId() string {
@@ -1896,7 +1962,7 @@ type Status struct {
 
 func (x *Status) Reset() {
 	*x = Status{}
-	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[21]
+	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1908,7 +1974,7 @@ func (x *Status) String() string {
 func (*Status) ProtoMessage() {}
 
 func (x *Status) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[21]
+	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1921,7 +1987,7 @@ func (x *Status) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Status.ProtoReflect.Descriptor instead.
 func (*Status) Descriptor() ([]byte, []int) {
-	return file_proto_ok_okfs_v1_okfs_proto_rawDescGZIP(), []int{21}
+	return file_proto_ok_okfs_v1_okfs_proto_rawDescGZIP(), []int{22}
 }
 
 type StatusReply struct {
@@ -1941,7 +2007,7 @@ type StatusReply struct {
 
 func (x *StatusReply) Reset() {
 	*x = StatusReply{}
-	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[22]
+	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1953,7 +2019,7 @@ func (x *StatusReply) String() string {
 func (*StatusReply) ProtoMessage() {}
 
 func (x *StatusReply) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[22]
+	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1966,7 +2032,7 @@ func (x *StatusReply) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StatusReply.ProtoReflect.Descriptor instead.
 func (*StatusReply) Descriptor() ([]byte, []int) {
-	return file_proto_ok_okfs_v1_okfs_proto_rawDescGZIP(), []int{22}
+	return file_proto_ok_okfs_v1_okfs_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *StatusReply) GetVersion() string {
@@ -2033,7 +2099,7 @@ type CallStats struct {
 
 func (x *CallStats) Reset() {
 	*x = CallStats{}
-	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[23]
+	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2045,7 +2111,7 @@ func (x *CallStats) String() string {
 func (*CallStats) ProtoMessage() {}
 
 func (x *CallStats) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[23]
+	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2058,7 +2124,7 @@ func (x *CallStats) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CallStats.ProtoReflect.Descriptor instead.
 func (*CallStats) Descriptor() ([]byte, []int) {
-	return file_proto_ok_okfs_v1_okfs_proto_rawDescGZIP(), []int{23}
+	return file_proto_ok_okfs_v1_okfs_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *CallStats) GetMethod() string {
@@ -2122,7 +2188,7 @@ type FetchStats struct {
 
 func (x *FetchStats) Reset() {
 	*x = FetchStats{}
-	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[24]
+	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2134,7 +2200,7 @@ func (x *FetchStats) String() string {
 func (*FetchStats) ProtoMessage() {}
 
 func (x *FetchStats) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[24]
+	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2147,7 +2213,7 @@ func (x *FetchStats) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FetchStats.ProtoReflect.Descriptor instead.
 func (*FetchStats) Descriptor() ([]byte, []int) {
-	return file_proto_ok_okfs_v1_okfs_proto_rawDescGZIP(), []int{24}
+	return file_proto_ok_okfs_v1_okfs_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *FetchStats) GetKind() string {
@@ -2190,7 +2256,7 @@ type WaitStats struct {
 
 func (x *WaitStats) Reset() {
 	*x = WaitStats{}
-	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[25]
+	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2202,7 +2268,7 @@ func (x *WaitStats) String() string {
 func (*WaitStats) ProtoMessage() {}
 
 func (x *WaitStats) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[25]
+	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2215,7 +2281,7 @@ func (x *WaitStats) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WaitStats.ProtoReflect.Descriptor instead.
 func (*WaitStats) Descriptor() ([]byte, []int) {
-	return file_proto_ok_okfs_v1_okfs_proto_rawDescGZIP(), []int{25}
+	return file_proto_ok_okfs_v1_okfs_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *WaitStats) GetReads() uint64 {
@@ -2255,7 +2321,7 @@ type PresentationStatus struct {
 
 func (x *PresentationStatus) Reset() {
 	*x = PresentationStatus{}
-	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[26]
+	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2267,7 +2333,7 @@ func (x *PresentationStatus) String() string {
 func (*PresentationStatus) ProtoMessage() {}
 
 func (x *PresentationStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[26]
+	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2280,7 +2346,7 @@ func (x *PresentationStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PresentationStatus.ProtoReflect.Descriptor instead.
 func (*PresentationStatus) Descriptor() ([]byte, []int) {
-	return file_proto_ok_okfs_v1_okfs_proto_rawDescGZIP(), []int{26}
+	return file_proto_ok_okfs_v1_okfs_proto_rawDescGZIP(), []int{27}
 }
 
 func (x *PresentationStatus) GetMountPoint() string {
@@ -2361,7 +2427,7 @@ type WorkspaceStatus struct {
 
 func (x *WorkspaceStatus) Reset() {
 	*x = WorkspaceStatus{}
-	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[27]
+	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2373,7 +2439,7 @@ func (x *WorkspaceStatus) String() string {
 func (*WorkspaceStatus) ProtoMessage() {}
 
 func (x *WorkspaceStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[27]
+	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2386,7 +2452,7 @@ func (x *WorkspaceStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WorkspaceStatus.ProtoReflect.Descriptor instead.
 func (*WorkspaceStatus) Descriptor() ([]byte, []int) {
-	return file_proto_ok_okfs_v1_okfs_proto_rawDescGZIP(), []int{27}
+	return file_proto_ok_okfs_v1_okfs_proto_rawDescGZIP(), []int{28}
 }
 
 func (x *WorkspaceStatus) GetWorkspaceId() string {
@@ -2506,7 +2572,7 @@ type Present struct {
 
 func (x *Present) Reset() {
 	*x = Present{}
-	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[28]
+	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2518,7 +2584,7 @@ func (x *Present) String() string {
 func (*Present) ProtoMessage() {}
 
 func (x *Present) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[28]
+	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2531,7 +2597,7 @@ func (x *Present) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Present.ProtoReflect.Descriptor instead.
 func (*Present) Descriptor() ([]byte, []int) {
-	return file_proto_ok_okfs_v1_okfs_proto_rawDescGZIP(), []int{28}
+	return file_proto_ok_okfs_v1_okfs_proto_rawDescGZIP(), []int{29}
 }
 
 func (x *Present) GetMountPoint() string {
@@ -2586,7 +2652,7 @@ type PresentedFile struct {
 
 func (x *PresentedFile) Reset() {
 	*x = PresentedFile{}
-	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[29]
+	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[30]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2598,7 +2664,7 @@ func (x *PresentedFile) String() string {
 func (*PresentedFile) ProtoMessage() {}
 
 func (x *PresentedFile) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[29]
+	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[30]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2611,7 +2677,7 @@ func (x *PresentedFile) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PresentedFile.ProtoReflect.Descriptor instead.
 func (*PresentedFile) Descriptor() ([]byte, []int) {
-	return file_proto_ok_okfs_v1_okfs_proto_rawDescGZIP(), []int{29}
+	return file_proto_ok_okfs_v1_okfs_proto_rawDescGZIP(), []int{30}
 }
 
 func (x *PresentedFile) GetName() string {
@@ -2640,7 +2706,7 @@ type PresentReply struct {
 
 func (x *PresentReply) Reset() {
 	*x = PresentReply{}
-	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[30]
+	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[31]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2652,7 +2718,7 @@ func (x *PresentReply) String() string {
 func (*PresentReply) ProtoMessage() {}
 
 func (x *PresentReply) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[30]
+	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[31]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2665,7 +2731,7 @@ func (x *PresentReply) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PresentReply.ProtoReflect.Descriptor instead.
 func (*PresentReply) Descriptor() ([]byte, []int) {
-	return file_proto_ok_okfs_v1_okfs_proto_rawDescGZIP(), []int{30}
+	return file_proto_ok_okfs_v1_okfs_proto_rawDescGZIP(), []int{31}
 }
 
 func (x *PresentReply) GetTree() *Tree {
@@ -2707,7 +2773,7 @@ type Prefetch struct {
 
 func (x *Prefetch) Reset() {
 	*x = Prefetch{}
-	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[31]
+	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[32]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2719,7 +2785,7 @@ func (x *Prefetch) String() string {
 func (*Prefetch) ProtoMessage() {}
 
 func (x *Prefetch) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[31]
+	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[32]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2732,7 +2798,7 @@ func (x *Prefetch) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Prefetch.ProtoReflect.Descriptor instead.
 func (*Prefetch) Descriptor() ([]byte, []int) {
-	return file_proto_ok_okfs_v1_okfs_proto_rawDescGZIP(), []int{31}
+	return file_proto_ok_okfs_v1_okfs_proto_rawDescGZIP(), []int{32}
 }
 
 func (x *Prefetch) GetWorkspaceId() string {
@@ -2760,7 +2826,7 @@ type Subscribe struct {
 
 func (x *Subscribe) Reset() {
 	*x = Subscribe{}
-	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[32]
+	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[33]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2772,7 +2838,7 @@ func (x *Subscribe) String() string {
 func (*Subscribe) ProtoMessage() {}
 
 func (x *Subscribe) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[32]
+	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[33]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2785,7 +2851,7 @@ func (x *Subscribe) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Subscribe.ProtoReflect.Descriptor instead.
 func (*Subscribe) Descriptor() ([]byte, []int) {
-	return file_proto_ok_okfs_v1_okfs_proto_rawDescGZIP(), []int{32}
+	return file_proto_ok_okfs_v1_okfs_proto_rawDescGZIP(), []int{33}
 }
 
 func (x *Subscribe) GetWorkspaceId() string {
@@ -2806,7 +2872,7 @@ type Event struct {
 
 func (x *Event) Reset() {
 	*x = Event{}
-	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[33]
+	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[34]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2818,7 +2884,7 @@ func (x *Event) String() string {
 func (*Event) ProtoMessage() {}
 
 func (x *Event) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[33]
+	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[34]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2831,7 +2897,7 @@ func (x *Event) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Event.ProtoReflect.Descriptor instead.
 func (*Event) Descriptor() ([]byte, []int) {
-	return file_proto_ok_okfs_v1_okfs_proto_rawDescGZIP(), []int{33}
+	return file_proto_ok_okfs_v1_okfs_proto_rawDescGZIP(), []int{34}
 }
 
 func (x *Event) GetSeq() uint64 {
@@ -2865,7 +2931,7 @@ type Flush struct {
 
 func (x *Flush) Reset() {
 	*x = Flush{}
-	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[34]
+	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[35]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2877,7 +2943,7 @@ func (x *Flush) String() string {
 func (*Flush) ProtoMessage() {}
 
 func (x *Flush) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[34]
+	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[35]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2890,7 +2956,7 @@ func (x *Flush) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Flush.ProtoReflect.Descriptor instead.
 func (*Flush) Descriptor() ([]byte, []int) {
-	return file_proto_ok_okfs_v1_okfs_proto_rawDescGZIP(), []int{34}
+	return file_proto_ok_okfs_v1_okfs_proto_rawDescGZIP(), []int{35}
 }
 
 func (x *Flush) GetWorkspaceId() string {
@@ -2909,7 +2975,7 @@ type FlushReply struct {
 
 func (x *FlushReply) Reset() {
 	*x = FlushReply{}
-	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[35]
+	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[36]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2921,7 +2987,7 @@ func (x *FlushReply) String() string {
 func (*FlushReply) ProtoMessage() {}
 
 func (x *FlushReply) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[35]
+	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[36]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2934,7 +3000,7 @@ func (x *FlushReply) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FlushReply.ProtoReflect.Descriptor instead.
 func (*FlushReply) Descriptor() ([]byte, []int) {
-	return file_proto_ok_okfs_v1_okfs_proto_rawDescGZIP(), []int{35}
+	return file_proto_ok_okfs_v1_okfs_proto_rawDescGZIP(), []int{36}
 }
 
 func (x *FlushReply) GetCheckpointId() int64 {
@@ -2960,7 +3026,7 @@ type Record struct {
 
 func (x *Record) Reset() {
 	*x = Record{}
-	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[36]
+	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[37]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2972,7 +3038,7 @@ func (x *Record) String() string {
 func (*Record) ProtoMessage() {}
 
 func (x *Record) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[36]
+	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[37]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2985,7 +3051,7 @@ func (x *Record) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Record.ProtoReflect.Descriptor instead.
 func (*Record) Descriptor() ([]byte, []int) {
-	return file_proto_ok_okfs_v1_okfs_proto_rawDescGZIP(), []int{36}
+	return file_proto_ok_okfs_v1_okfs_proto_rawDescGZIP(), []int{37}
 }
 
 func (x *Record) GetRecord() isRecord_Record {
@@ -3087,7 +3153,7 @@ type Base struct {
 
 func (x *Base) Reset() {
 	*x = Base{}
-	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[37]
+	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[38]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3099,7 +3165,7 @@ func (x *Base) String() string {
 func (*Base) ProtoMessage() {}
 
 func (x *Base) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[37]
+	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[38]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3112,7 +3178,7 @@ func (x *Base) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Base.ProtoReflect.Descriptor instead.
 func (*Base) Descriptor() ([]byte, []int) {
-	return file_proto_ok_okfs_v1_okfs_proto_rawDescGZIP(), []int{37}
+	return file_proto_ok_okfs_v1_okfs_proto_rawDescGZIP(), []int{38}
 }
 
 func (x *Base) GetBase() *Tree {
@@ -3153,7 +3219,7 @@ type Whiteout struct {
 
 func (x *Whiteout) Reset() {
 	*x = Whiteout{}
-	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[38]
+	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[39]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3165,7 +3231,7 @@ func (x *Whiteout) String() string {
 func (*Whiteout) ProtoMessage() {}
 
 func (x *Whiteout) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[38]
+	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[39]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3178,7 +3244,7 @@ func (x *Whiteout) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Whiteout.ProtoReflect.Descriptor instead.
 func (*Whiteout) Descriptor() ([]byte, []int) {
-	return file_proto_ok_okfs_v1_okfs_proto_rawDescGZIP(), []int{38}
+	return file_proto_ok_okfs_v1_okfs_proto_rawDescGZIP(), []int{39}
 }
 
 func (x *Whiteout) GetDir() uint64 {
@@ -3205,7 +3271,7 @@ type Unwhiteout struct {
 
 func (x *Unwhiteout) Reset() {
 	*x = Unwhiteout{}
-	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[39]
+	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[40]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3217,7 +3283,7 @@ func (x *Unwhiteout) String() string {
 func (*Unwhiteout) ProtoMessage() {}
 
 func (x *Unwhiteout) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[39]
+	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[40]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3230,7 +3296,7 @@ func (x *Unwhiteout) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Unwhiteout.ProtoReflect.Descriptor instead.
 func (*Unwhiteout) Descriptor() ([]byte, []int) {
-	return file_proto_ok_okfs_v1_okfs_proto_rawDescGZIP(), []int{39}
+	return file_proto_ok_okfs_v1_okfs_proto_rawDescGZIP(), []int{40}
 }
 
 func (x *Unwhiteout) GetDir() uint64 {
@@ -3280,7 +3346,7 @@ type InodeRecord struct {
 
 func (x *InodeRecord) Reset() {
 	*x = InodeRecord{}
-	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[40]
+	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[41]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3292,7 +3358,7 @@ func (x *InodeRecord) String() string {
 func (*InodeRecord) ProtoMessage() {}
 
 func (x *InodeRecord) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[40]
+	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[41]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3305,7 +3371,7 @@ func (x *InodeRecord) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use InodeRecord.ProtoReflect.Descriptor instead.
 func (*InodeRecord) Descriptor() ([]byte, []int) {
-	return file_proto_ok_okfs_v1_okfs_proto_rawDescGZIP(), []int{40}
+	return file_proto_ok_okfs_v1_okfs_proto_rawDescGZIP(), []int{41}
 }
 
 func (x *InodeRecord) GetIno() uint64 {
@@ -3472,7 +3538,7 @@ type Link struct {
 
 func (x *Link) Reset() {
 	*x = Link{}
-	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[41]
+	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[42]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3484,7 +3550,7 @@ func (x *Link) String() string {
 func (*Link) ProtoMessage() {}
 
 func (x *Link) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[41]
+	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[42]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3497,7 +3563,7 @@ func (x *Link) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Link.ProtoReflect.Descriptor instead.
 func (*Link) Descriptor() ([]byte, []int) {
-	return file_proto_ok_okfs_v1_okfs_proto_rawDescGZIP(), []int{41}
+	return file_proto_ok_okfs_v1_okfs_proto_rawDescGZIP(), []int{42}
 }
 
 func (x *Link) GetParent() uint64 {
@@ -3524,7 +3590,7 @@ type Xattr struct {
 
 func (x *Xattr) Reset() {
 	*x = Xattr{}
-	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[42]
+	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[43]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3536,7 +3602,7 @@ func (x *Xattr) String() string {
 func (*Xattr) ProtoMessage() {}
 
 func (x *Xattr) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[42]
+	mi := &file_proto_ok_okfs_v1_okfs_proto_msgTypes[43]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3549,7 +3615,7 @@ func (x *Xattr) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Xattr.ProtoReflect.Descriptor instead.
 func (*Xattr) Descriptor() ([]byte, []int) {
-	return file_proto_ok_okfs_v1_okfs_proto_rawDescGZIP(), []int{42}
+	return file_proto_ok_okfs_v1_okfs_proto_rawDescGZIP(), []int{43}
 }
 
 func (x *Xattr) GetName() []byte {
@@ -3693,9 +3759,13 @@ const file_proto_ok_okfs_v1_okfs_proto_rawDesc = "" +
 	"\n" +
 	"executable\x18\x03 \x01(\bR\n" +
 	"executable\x12.\n" +
-	"\x13conflict_marker_len\x18\x04 \x01(\rR\x11conflictMarkerLen\")\n" +
+	"\x13conflict_marker_len\x18\x04 \x01(\rR\x11conflictMarkerLen\"X\n" +
 	"\rCheckOutReply\x12\x18\n" +
-	"\askipped\x18\x01 \x03(\tR\askipped\"\x93\x01\n" +
+	"\askipped\x18\x01 \x03(\tR\askipped\x12-\n" +
+	"\arefresh\x18\x02 \x03(\v2\x13.ok.okfs.v1.RefreshR\arefresh\"1\n" +
+	"\aRefresh\x12\x12\n" +
+	"\x04path\x18\x01 \x01(\tR\x04path\x12\x12\n" +
+	"\x04mode\x18\x02 \x01(\rR\x04mode\"\x93\x01\n" +
 	"\vSetRecorded\x12!\n" +
 	"\fworkspace_id\x18\x01 \x01(\tR\vworkspaceId\x12$\n" +
 	"\x04tree\x18\x02 \x01(\v2\x10.ok.okfs.v1.TreeR\x04tree\x12\x1b\n" +
@@ -3883,7 +3953,7 @@ func file_proto_ok_okfs_v1_okfs_proto_rawDescGZIP() []byte {
 }
 
 var file_proto_ok_okfs_v1_okfs_proto_enumTypes = make([]protoimpl.EnumInfo, 4)
-var file_proto_ok_okfs_v1_okfs_proto_msgTypes = make([]protoimpl.MessageInfo, 43)
+var file_proto_ok_okfs_v1_okfs_proto_msgTypes = make([]protoimpl.MessageInfo, 44)
 var file_proto_ok_okfs_v1_okfs_proto_goTypes = []any{
 	(DirEntry_Kind)(0),         // 0: ok.okfs.v1.DirEntry.Kind
 	(TreeValue_Type)(0),        // 1: ok.okfs.v1.TreeValue.Type
@@ -3908,30 +3978,31 @@ var file_proto_ok_okfs_v1_okfs_proto_goTypes = []any{
 	(*CheckOut)(nil),           // 20: ok.okfs.v1.CheckOut
 	(*Materialized)(nil),       // 21: ok.okfs.v1.Materialized
 	(*CheckOutReply)(nil),      // 22: ok.okfs.v1.CheckOutReply
-	(*SetRecorded)(nil),        // 23: ok.okfs.v1.SetRecorded
-	(*SetSparse)(nil),          // 24: ok.okfs.v1.SetSparse
-	(*Status)(nil),             // 25: ok.okfs.v1.Status
-	(*StatusReply)(nil),        // 26: ok.okfs.v1.StatusReply
-	(*CallStats)(nil),          // 27: ok.okfs.v1.CallStats
-	(*FetchStats)(nil),         // 28: ok.okfs.v1.FetchStats
-	(*WaitStats)(nil),          // 29: ok.okfs.v1.WaitStats
-	(*PresentationStatus)(nil), // 30: ok.okfs.v1.PresentationStatus
-	(*WorkspaceStatus)(nil),    // 31: ok.okfs.v1.WorkspaceStatus
-	(*Present)(nil),            // 32: ok.okfs.v1.Present
-	(*PresentedFile)(nil),      // 33: ok.okfs.v1.PresentedFile
-	(*PresentReply)(nil),       // 34: ok.okfs.v1.PresentReply
-	(*Prefetch)(nil),           // 35: ok.okfs.v1.Prefetch
-	(*Subscribe)(nil),          // 36: ok.okfs.v1.Subscribe
-	(*Event)(nil),              // 37: ok.okfs.v1.Event
-	(*Flush)(nil),              // 38: ok.okfs.v1.Flush
-	(*FlushReply)(nil),         // 39: ok.okfs.v1.FlushReply
-	(*Record)(nil),             // 40: ok.okfs.v1.Record
-	(*Base)(nil),               // 41: ok.okfs.v1.Base
-	(*Whiteout)(nil),           // 42: ok.okfs.v1.Whiteout
-	(*Unwhiteout)(nil),         // 43: ok.okfs.v1.Unwhiteout
-	(*InodeRecord)(nil),        // 44: ok.okfs.v1.InodeRecord
-	(*Link)(nil),               // 45: ok.okfs.v1.Link
-	(*Xattr)(nil),              // 46: ok.okfs.v1.Xattr
+	(*Refresh)(nil),            // 23: ok.okfs.v1.Refresh
+	(*SetRecorded)(nil),        // 24: ok.okfs.v1.SetRecorded
+	(*SetSparse)(nil),          // 25: ok.okfs.v1.SetSparse
+	(*Status)(nil),             // 26: ok.okfs.v1.Status
+	(*StatusReply)(nil),        // 27: ok.okfs.v1.StatusReply
+	(*CallStats)(nil),          // 28: ok.okfs.v1.CallStats
+	(*FetchStats)(nil),         // 29: ok.okfs.v1.FetchStats
+	(*WaitStats)(nil),          // 30: ok.okfs.v1.WaitStats
+	(*PresentationStatus)(nil), // 31: ok.okfs.v1.PresentationStatus
+	(*WorkspaceStatus)(nil),    // 32: ok.okfs.v1.WorkspaceStatus
+	(*Present)(nil),            // 33: ok.okfs.v1.Present
+	(*PresentedFile)(nil),      // 34: ok.okfs.v1.PresentedFile
+	(*PresentReply)(nil),       // 35: ok.okfs.v1.PresentReply
+	(*Prefetch)(nil),           // 36: ok.okfs.v1.Prefetch
+	(*Subscribe)(nil),          // 37: ok.okfs.v1.Subscribe
+	(*Event)(nil),              // 38: ok.okfs.v1.Event
+	(*Flush)(nil),              // 39: ok.okfs.v1.Flush
+	(*FlushReply)(nil),         // 40: ok.okfs.v1.FlushReply
+	(*Record)(nil),             // 41: ok.okfs.v1.Record
+	(*Base)(nil),               // 42: ok.okfs.v1.Base
+	(*Whiteout)(nil),           // 43: ok.okfs.v1.Whiteout
+	(*Unwhiteout)(nil),         // 44: ok.okfs.v1.Unwhiteout
+	(*InodeRecord)(nil),        // 45: ok.okfs.v1.InodeRecord
+	(*Link)(nil),               // 46: ok.okfs.v1.Link
+	(*Xattr)(nil),              // 47: ok.okfs.v1.Xattr
 }
 var file_proto_ok_okfs_v1_okfs_proto_depIdxs = []int32{
 	7,  // 0: ok.okfs.v1.Request.hello:type_name -> ok.okfs.v1.Hello
@@ -3941,22 +4012,22 @@ var file_proto_ok_okfs_v1_okfs_proto_depIdxs = []int32{
 	14, // 4: ok.okfs.v1.Request.list_dir:type_name -> ok.okfs.v1.ListDir
 	18, // 5: ok.okfs.v1.Request.remember_files:type_name -> ok.okfs.v1.RememberFiles
 	20, // 6: ok.okfs.v1.Request.check_out:type_name -> ok.okfs.v1.CheckOut
-	23, // 7: ok.okfs.v1.Request.set_recorded:type_name -> ok.okfs.v1.SetRecorded
-	24, // 8: ok.okfs.v1.Request.set_sparse:type_name -> ok.okfs.v1.SetSparse
-	25, // 9: ok.okfs.v1.Request.status:type_name -> ok.okfs.v1.Status
-	35, // 10: ok.okfs.v1.Request.prefetch:type_name -> ok.okfs.v1.Prefetch
-	36, // 11: ok.okfs.v1.Request.subscribe:type_name -> ok.okfs.v1.Subscribe
-	38, // 12: ok.okfs.v1.Request.flush:type_name -> ok.okfs.v1.Flush
-	32, // 13: ok.okfs.v1.Request.present:type_name -> ok.okfs.v1.Present
+	24, // 7: ok.okfs.v1.Request.set_recorded:type_name -> ok.okfs.v1.SetRecorded
+	25, // 8: ok.okfs.v1.Request.set_sparse:type_name -> ok.okfs.v1.SetSparse
+	26, // 9: ok.okfs.v1.Request.status:type_name -> ok.okfs.v1.Status
+	36, // 10: ok.okfs.v1.Request.prefetch:type_name -> ok.okfs.v1.Prefetch
+	37, // 11: ok.okfs.v1.Request.subscribe:type_name -> ok.okfs.v1.Subscribe
+	39, // 12: ok.okfs.v1.Request.flush:type_name -> ok.okfs.v1.Flush
+	33, // 13: ok.okfs.v1.Request.present:type_name -> ok.okfs.v1.Present
 	8,  // 14: ok.okfs.v1.Response.hello:type_name -> ok.okfs.v1.HelloReply
 	11, // 15: ok.okfs.v1.Response.mount:type_name -> ok.okfs.v1.MountReply
 	6,  // 16: ok.okfs.v1.Response.empty:type_name -> ok.okfs.v1.Empty
 	15, // 17: ok.okfs.v1.Response.list_dir:type_name -> ok.okfs.v1.ListDirReply
 	22, // 18: ok.okfs.v1.Response.check_out:type_name -> ok.okfs.v1.CheckOutReply
-	26, // 19: ok.okfs.v1.Response.status:type_name -> ok.okfs.v1.StatusReply
-	37, // 20: ok.okfs.v1.Response.event:type_name -> ok.okfs.v1.Event
-	39, // 21: ok.okfs.v1.Response.flush:type_name -> ok.okfs.v1.FlushReply
-	34, // 22: ok.okfs.v1.Response.present:type_name -> ok.okfs.v1.PresentReply
+	27, // 19: ok.okfs.v1.Response.status:type_name -> ok.okfs.v1.StatusReply
+	38, // 20: ok.okfs.v1.Response.event:type_name -> ok.okfs.v1.Event
+	40, // 21: ok.okfs.v1.Response.flush:type_name -> ok.okfs.v1.FlushReply
+	35, // 22: ok.okfs.v1.Response.present:type_name -> ok.okfs.v1.PresentReply
 	9,  // 23: ok.okfs.v1.Mount.tree:type_name -> ok.okfs.v1.Tree
 	9,  // 24: ok.okfs.v1.MountReply.checkpoint_tree:type_name -> ok.okfs.v1.Tree
 	9,  // 25: ok.okfs.v1.ListDirReply.source:type_name -> ok.okfs.v1.Tree
@@ -3968,32 +4039,33 @@ var file_proto_ok_okfs_v1_okfs_proto_depIdxs = []int32{
 	9,  // 31: ok.okfs.v1.CheckOut.old_tree:type_name -> ok.okfs.v1.Tree
 	9,  // 32: ok.okfs.v1.CheckOut.new_tree:type_name -> ok.okfs.v1.Tree
 	21, // 33: ok.okfs.v1.CheckOut.conflicts:type_name -> ok.okfs.v1.Materialized
-	9,  // 34: ok.okfs.v1.SetRecorded.tree:type_name -> ok.okfs.v1.Tree
-	31, // 35: ok.okfs.v1.StatusReply.workspaces:type_name -> ok.okfs.v1.WorkspaceStatus
-	30, // 36: ok.okfs.v1.StatusReply.presentations:type_name -> ok.okfs.v1.PresentationStatus
-	27, // 37: ok.okfs.v1.StatusReply.calls:type_name -> ok.okfs.v1.CallStats
-	28, // 38: ok.okfs.v1.StatusReply.fetches:type_name -> ok.okfs.v1.FetchStats
-	29, // 39: ok.okfs.v1.PresentationStatus.waits:type_name -> ok.okfs.v1.WaitStats
-	29, // 40: ok.okfs.v1.WorkspaceStatus.waits:type_name -> ok.okfs.v1.WaitStats
-	33, // 41: ok.okfs.v1.Present.files:type_name -> ok.okfs.v1.PresentedFile
-	9,  // 42: ok.okfs.v1.PresentReply.tree:type_name -> ok.okfs.v1.Tree
-	44, // 43: ok.okfs.v1.Record.inode:type_name -> ok.okfs.v1.InodeRecord
-	41, // 44: ok.okfs.v1.Record.base:type_name -> ok.okfs.v1.Base
-	42, // 45: ok.okfs.v1.Record.whiteout:type_name -> ok.okfs.v1.Whiteout
-	43, // 46: ok.okfs.v1.Record.unwhiteout:type_name -> ok.okfs.v1.Unwhiteout
-	9,  // 47: ok.okfs.v1.Base.base:type_name -> ok.okfs.v1.Tree
-	9,  // 48: ok.okfs.v1.Base.recorded:type_name -> ok.okfs.v1.Tree
-	45, // 49: ok.okfs.v1.InodeRecord.extra_links:type_name -> ok.okfs.v1.Link
-	2,  // 50: ok.okfs.v1.InodeRecord.kind:type_name -> ok.okfs.v1.InodeRecord.Kind
-	3,  // 51: ok.okfs.v1.InodeRecord.state:type_name -> ok.okfs.v1.InodeRecord.State
-	17, // 52: ok.okfs.v1.InodeRecord.value:type_name -> ok.okfs.v1.TreeValue
-	9,  // 53: ok.okfs.v1.InodeRecord.under:type_name -> ok.okfs.v1.Tree
-	46, // 54: ok.okfs.v1.InodeRecord.xattrs:type_name -> ok.okfs.v1.Xattr
-	55, // [55:55] is the sub-list for method output_type
-	55, // [55:55] is the sub-list for method input_type
-	55, // [55:55] is the sub-list for extension type_name
-	55, // [55:55] is the sub-list for extension extendee
-	0,  // [0:55] is the sub-list for field type_name
+	23, // 34: ok.okfs.v1.CheckOutReply.refresh:type_name -> ok.okfs.v1.Refresh
+	9,  // 35: ok.okfs.v1.SetRecorded.tree:type_name -> ok.okfs.v1.Tree
+	32, // 36: ok.okfs.v1.StatusReply.workspaces:type_name -> ok.okfs.v1.WorkspaceStatus
+	31, // 37: ok.okfs.v1.StatusReply.presentations:type_name -> ok.okfs.v1.PresentationStatus
+	28, // 38: ok.okfs.v1.StatusReply.calls:type_name -> ok.okfs.v1.CallStats
+	29, // 39: ok.okfs.v1.StatusReply.fetches:type_name -> ok.okfs.v1.FetchStats
+	30, // 40: ok.okfs.v1.PresentationStatus.waits:type_name -> ok.okfs.v1.WaitStats
+	30, // 41: ok.okfs.v1.WorkspaceStatus.waits:type_name -> ok.okfs.v1.WaitStats
+	34, // 42: ok.okfs.v1.Present.files:type_name -> ok.okfs.v1.PresentedFile
+	9,  // 43: ok.okfs.v1.PresentReply.tree:type_name -> ok.okfs.v1.Tree
+	45, // 44: ok.okfs.v1.Record.inode:type_name -> ok.okfs.v1.InodeRecord
+	42, // 45: ok.okfs.v1.Record.base:type_name -> ok.okfs.v1.Base
+	43, // 46: ok.okfs.v1.Record.whiteout:type_name -> ok.okfs.v1.Whiteout
+	44, // 47: ok.okfs.v1.Record.unwhiteout:type_name -> ok.okfs.v1.Unwhiteout
+	9,  // 48: ok.okfs.v1.Base.base:type_name -> ok.okfs.v1.Tree
+	9,  // 49: ok.okfs.v1.Base.recorded:type_name -> ok.okfs.v1.Tree
+	46, // 50: ok.okfs.v1.InodeRecord.extra_links:type_name -> ok.okfs.v1.Link
+	2,  // 51: ok.okfs.v1.InodeRecord.kind:type_name -> ok.okfs.v1.InodeRecord.Kind
+	3,  // 52: ok.okfs.v1.InodeRecord.state:type_name -> ok.okfs.v1.InodeRecord.State
+	17, // 53: ok.okfs.v1.InodeRecord.value:type_name -> ok.okfs.v1.TreeValue
+	9,  // 54: ok.okfs.v1.InodeRecord.under:type_name -> ok.okfs.v1.Tree
+	47, // 55: ok.okfs.v1.InodeRecord.xattrs:type_name -> ok.okfs.v1.Xattr
+	56, // [56:56] is the sub-list for method output_type
+	56, // [56:56] is the sub-list for method input_type
+	56, // [56:56] is the sub-list for extension type_name
+	56, // [56:56] is the sub-list for extension extendee
+	0,  // [0:56] is the sub-list for field type_name
 }
 
 func init() { file_proto_ok_okfs_v1_okfs_proto_init() }
@@ -4028,7 +4100,7 @@ func file_proto_ok_okfs_v1_okfs_proto_init() {
 		(*Response_Flush)(nil),
 		(*Response_Present)(nil),
 	}
-	file_proto_ok_okfs_v1_okfs_proto_msgTypes[36].OneofWrappers = []any{
+	file_proto_ok_okfs_v1_okfs_proto_msgTypes[37].OneofWrappers = []any{
 		(*Record_Inode)(nil),
 		(*Record_Drop)(nil),
 		(*Record_Base)(nil),
@@ -4041,7 +4113,7 @@ func file_proto_ok_okfs_v1_okfs_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_ok_okfs_v1_okfs_proto_rawDesc), len(file_proto_ok_okfs_v1_okfs_proto_rawDesc)),
 			NumEnums:      4,
-			NumMessages:   43,
+			NumMessages:   44,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

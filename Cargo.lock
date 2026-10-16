@@ -2311,6 +2311,7 @@ name = "okfs"
 version = "1.0.0"
 dependencies = [
  "async-trait",
+ "blake3",
  "dunce",
  "futures",
  "globset",
@@ -2320,6 +2321,7 @@ dependencies = [
  "ok-proto",
  "ok-store",
  "okfs-fuse",
+ "okfs-nfs",
  "prost",
  "serde",
  "tempfile",
@@ -2334,6 +2336,14 @@ version = "1.0.0"
 dependencies = [
  "libc",
  "tempfile",
+]
+
+[[package]]
+name = "okfs-nfs"
+version = "1.0.0"
+dependencies = [
+ "blake3",
+ "libc",
 ]
 
 [[package]]

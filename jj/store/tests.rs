@@ -364,6 +364,7 @@ fn retirement_keeps_what_is_read_and_what_an_outbox_pins() {
         crate::segments::Options {
             segment_bytes: seg,
             budget: 4 * seg,
+            refresh_every: crate::segments::REFRESH_EVERY,
         },
     )
     .unwrap();

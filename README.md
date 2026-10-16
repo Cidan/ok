@@ -77,8 +77,8 @@ Then <http://localhost:8080>, signed in as `admin@example.com` with the password
 
 The Helm chart, on Kubernetes: [docs/install.md](docs/install.md). Each release has `ok` and `jj`
 for Linux and macOS (amd64 and arm64), the images `ghcr.io/cidan/ok` and `ghcr.io/cidan/ok-runner`,
-and the chart at `oci://ghcr.io/cidan/charts/ok`. Virtual workspaces are Linux's; on macOS, `jj`
-makes real checkouts.
+and the chart at `oci://ghcr.io/cidan/charts/ok`. Virtual workspaces work on Linux (over FUSE) and
+macOS (over NFS).
 
 ## Building
 
