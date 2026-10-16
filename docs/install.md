@@ -79,7 +79,7 @@ worker:
 ```
 
 ```bash
-helm install ok oci://ghcr.io/cidan/charts/ok --version 1.0.0 -n ok -f values.yaml
+helm install ok oci://ghcr.io/cidan/charts/ok --version 1.1.0 -n ok -f values.yaml
 kubectl -n ok rollout status deployment/ok-server
 ok config check -config ok.yaml   # the same check the roles make, on a file of your own
 ```

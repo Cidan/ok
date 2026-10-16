@@ -4,8 +4,8 @@
 # value for this machine alone: not an installation for others (docs/install.md has the chart).
 name: ok
 
-x-ok-image: &ok-image ${OK_IMAGE:-ghcr.io/cidan/ok:1.0.0}
-x-runner-image: &runner-image ${OK_RUNNER_IMAGE:-ghcr.io/cidan/ok-runner:1.0.0}
+x-ok-image: &ok-image ${OK_IMAGE:-ghcr.io/cidan/ok:1.1.0}
+x-runner-image: &runner-image ${OK_RUNNER_IMAGE:-ghcr.io/cidan/ok-runner:1.1.0}
 
 services:
   postgres:

@@ -2153,7 +2153,7 @@ dependencies = [
 
 [[package]]
 name = "ok-cl"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "futures",
  "jj-lib",
@@ -2169,7 +2169,7 @@ dependencies = [
 
 [[package]]
 name = "ok-credential"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "base64",
  "http",
@@ -2188,7 +2188,7 @@ dependencies = [
 
 [[package]]
 name = "ok-encoding"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "blake3",
  "jj-lib",
@@ -2198,7 +2198,7 @@ dependencies = [
 
 [[package]]
 name = "ok-jj"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "chrono",
  "clap",
@@ -2226,7 +2226,7 @@ dependencies = [
 
 [[package]]
 name = "ok-proto"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "ok-encoding",
  "prost",
@@ -2239,7 +2239,7 @@ dependencies = [
 
 [[package]]
 name = "ok-review"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "bytes",
  "clap",
@@ -2255,7 +2255,7 @@ dependencies = [
 
 [[package]]
 name = "ok-store"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -2288,7 +2288,7 @@ dependencies = [
 
 [[package]]
 name = "ok-testscm"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "libc",
  "ok-proto",
@@ -2298,7 +2298,7 @@ dependencies = [
 
 [[package]]
 name = "ok-working-copy"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "async-trait",
  "jj-lib",
@@ -2308,7 +2308,7 @@ dependencies = [
 
 [[package]]
 name = "okfs"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -2332,7 +2332,7 @@ dependencies = [
 
 [[package]]
 name = "okfs-fuse"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "libc",
  "tempfile",
@@ -2340,7 +2340,7 @@ dependencies = [
 
 [[package]]
 name = "okfs-nfs"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "blake3",
  "libc",

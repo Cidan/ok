@@ -2,7 +2,7 @@ apiVersion: v2
 name: ok
 description: ok — source control, code review, and automation on Bazel, with ok's jj as the client
 type: application
-version: 1.0.0
-appVersion: "1.0.0"
+version: 1.1.0
+appVersion: "1.1.0"
 home: https://github.com/Cidan/ok
 sources: [https://github.com/Cidan/ok]
