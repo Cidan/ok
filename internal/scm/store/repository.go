@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"regexp"
 	"time"
 
 	"google.golang.org/protobuf/proto"
@@ -19,74 +18,34 @@ import (
 // landing), and CreatedBy the principal that created it.
 type Repository = backend.Repository
 
-// repositoryName is the flat, unique form of a repository name: lowercase letters, digits,
-// '.', '_', and '-', starting and ending with a letter or digit, at most 64 characters.
-var repositoryName = regexp.MustCompile(`^[a-z0-9]([a-z0-9._-]{0,62}[a-z0-9])?$`)
-
-// reservedNames are the paths ok's web site serves beside its
-// repositories, each of which is at /<name>.
-var reservedNames = map[string]bool{"assets": true, "id": true, "repositories": true, "services": true, "healthz": true, "readyz": true}
-
-func validName(name string) error {
-	if !repositoryName.MatchString(name) {
-		return invalid("repository name %q: use 1-64 lowercase letters, digits, '.', '_', '-', starting and ending with a letter or digit", name)
-	}
-	if reservedNames[name] {
-		return invalid("repository name %q is reserved for ok's own pages", name)
-	}
-	return nil
-}
-
-// CreateRepository registers a repository whose main is the root commit, created by the
-// principal createdBy.
-func (s *Store) CreateRepository(ctx context.Context, name, createdBy string) (Repository, error) {
-	if err := validName(name); err != nil {
-		return Repository{}, err
+// CreateRepository makes repository id, forked from none, the first of network — the ID and network
+// the directory chose — whose main is the root commit, created by the principal createdBy.
+func (s *Store) CreateRepository(ctx context.Context, id, network int64, createdBy string) (Repository, error) {
+	if id == 0 || network == 0 {
+		return Repository{}, invalid("a repository is made under the ID and network the directory chose")
 	}
 	var r Repository
-	err := s.inTx(ctx, func(tx *txn) error {
+	err := s.inTx(ctx, func(ctx context.Context, tx *txn) error {
+		net := backend.Network(network)
 		var err error
-		r, err = tx.InsertRepository(ctx, name, encoding.RootCommitID, createdBy)
+		r, err = tx.InsertRepository(ctx, id, net, encoding.RootCommitID, createdBy)
 		if errors.Is(err, backend.ErrDuplicate) {
 			return errors.Join(ErrAlreadyExists, err)
 		}
 		if err != nil {
 			return err
 		}
-		// Its content index starts empty: every file and chunk it gets is logged.
-		if err := tx.InsertContentIndex(ctx, r.ID, 1); err != nil {
+		// A repository forked from none is the first of its network: its content index and its
+		// network's start empty, and every file and chunk it gets, and where each chunk is, is
+		// logged.
+		if err := tx.InsertContentIndex(ctx, repoScope(r.ID), 1); err != nil {
+			return err
+		}
+		if err := tx.InsertContentIndex(ctx, backend.NetworkScope(net), 1); err != nil {
 			return err
 		}
 		return appendEvent(ctx, tx, r.ID, &scmpb.Event{Kind: &scmpb.Event_RepositoryCreated{
-			RepositoryCreated: &scmpb.RepositoryCreated{Name: name, CreatedBy: createdBy},
-		}})
-	})
-	return r, err
-}
-
-// RenameRepository gives a repository a new name.
-func (s *Store) RenameRepository(ctx context.Context, id int64, name string) (Repository, error) {
-	if err := validName(name); err != nil {
-		return Repository{}, err
-	}
-	var r Repository
-	err := s.inTx(ctx, func(tx *txn) error {
-		old, ok, err := tx.LockRepositoryName(ctx, id)
-		if err != nil {
-			return err
-		}
-		if !ok {
-			return notFound("repository %d", id)
-		}
-		r, err = tx.RenameRepository(ctx, id, name)
-		if errors.Is(err, backend.ErrDuplicate) {
-			return errors.Join(ErrAlreadyExists, err)
-		}
-		if err != nil || old == name {
-			return err
-		}
-		return appendEvent(ctx, tx, id, &scmpb.Event{Kind: &scmpb.Event_RepositoryRenamed{
-			RepositoryRenamed: &scmpb.RepositoryRenamed{OldName: old, Name: name},
+			RepositoryCreated: &scmpb.RepositoryCreated{CreatedById: createdBy},
 		}})
 	})
 	return r, err
@@ -94,38 +53,11 @@ func (s *Store) RenameRepository(ctx context.Context, id int64, name string) (Re
 
 // GetRepository returns a repository by ID.
 func (s *Store) GetRepository(ctx context.Context, id int64) (Repository, error) {
-	r, ok, err := s.b.Repository(ctx, id)
+	r, ok, err := s.ops(ctx).Repository(ctx, id)
 	if err == nil && !ok {
 		err = notFound("repository %d", id)
 	}
 	return r, err
-}
-
-// GetRepositoryByName returns a repository by name.
-func (s *Store) GetRepositoryByName(ctx context.Context, name string) (Repository, error) {
-	r, ok, err := s.b.RepositoryByName(ctx, name)
-	if err == nil && !ok {
-		err = notFound("repository %q", name)
-	}
-	return r, err
-}
-
-// ListRepositories returns up to pageSize repositories named after `after`, in name
-// order, and the name to continue after ("" at the end).
-func (s *Store) ListRepositories(ctx context.Context, pageSize int, after string) ([]Repository, string, error) {
-	if pageSize <= 0 || pageSize > 1000 {
-		pageSize = 1000
-	}
-	out, err := s.b.Repositories(ctx, after, pageSize+1)
-	if err != nil {
-		return nil, "", err
-	}
-	next := ""
-	if len(out) > pageSize {
-		out = out[:pageSize]
-		next = out[pageSize-1].Name
-	}
-	return out, next, nil
 }
 
 func (s *Store) repositoryExists(ctx context.Context, q backend.Ops, id int64) error {
@@ -158,6 +90,15 @@ func appendEvents(ctx context.Context, tx *txn, repositoryID int64, evs []*scmpb
 	last, err := tx.ReserveRepositoryEvents(ctx, repositoryID, len(evs))
 	if err != nil {
 		return err
+	}
+	// Main moved: its code is indexed again (codesearch.go).
+	for _, ev := range evs {
+		if ev.GetHeadMoved() != nil {
+			if err := tx.MarkWork(ctx, CodeSearchWork, repositoryID); err != nil {
+				return err
+			}
+			break
+		}
 	}
 	at := time.Now()
 	seqs := make([]int64, len(evs))

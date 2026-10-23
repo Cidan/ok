@@ -78,7 +78,7 @@ func TestChecks(t *testing.T) {
 	path := clPath("svc", n)
 
 	// Automation plans the patchset from the feed: the tab shows its plan queued, and refreshes
-	// itself. Only the author (or an admin) may act on it.
+	// itself. Whoever may land on the repository may act on it: in an installation, every member.
 	var rows []checkRow
 	var verdict string
 	var live bool
@@ -90,8 +90,8 @@ func TestChecks(t *testing.T) {
 		t.Fatalf("the planned patchset: %+v, %q, live %v", rows, verdict, live)
 	}
 	rows, _, _, _ = checks(t, e.get(bob, path))
-	if r := rows[0]; r.enabled || r.title != "Only the author or a repository admin can cancel this check" {
-		t.Errorf("the plan, to someone else: %+v", r)
+	if r := rows[0]; !r.enabled || r.action != "Cancel" {
+		t.Errorf("the plan, to another member, who may land: %+v", r)
 	}
 
 	// The worker takes the planning run, logs, and finishes it with a plan: a build, a test, and
@@ -178,11 +178,10 @@ func TestChecks(t *testing.T) {
 		t.Fatalf("after rerunning the build: %+v, %q", rows, verdict)
 	}
 	rebuilt := rowNamed(t, rows, "build").logHref
-	// Someone else's cancel changes nothing.
+	// Another member, who may land on the repository, may cancel it too (and does not here).
 	test := rowNamed(t, rows, "//lib:test")
-	rows, _, _, _ = checks(t, e.post(bob, test.logHref+"/cancel", nil))
-	if r := rowNamed(t, rows, "//lib:test"); r.status != "Queued" {
-		t.Errorf("bob canceled alice's test: %+v", r)
+	if rows, _, _, _ := checks(t, e.get(bob, path)); !rowNamed(t, rows, "//lib:test").enabled {
+		t.Errorf("alice's test, to another member: %+v", rowNamed(t, rows, "//lib:test"))
 	}
 
 	// A run's page: its status and its log, which grows while it runs, then its raw bytes.
@@ -293,9 +292,10 @@ func TestChecks(t *testing.T) {
 	if job.GetOrigin().GetJob() != "test //lib:test" {
 		t.Fatalf("post ran %q, which pre's pass carries", job.GetOrigin().GetJob())
 	}
+	// The job runs, and the queue notes it is testing: two writes, which the tab shows as each lands.
 	e.waitFor("the post job on the Checks tab", func() bool {
-		_, _, rows, _ := postOf(e.get(alice, checksPath))
-		return len(rows) == 3 && rows[2].status == "Running"
+		_, detail, rows, _ := postOf(e.get(alice, checksPath))
+		return len(rows) == 3 && rows[2].status == "Running" && detail == "Testing"
 	})
 	tab = e.get(alice, checksPath)
 	status, detail, prow, attempts := postOf(tab)
@@ -354,7 +354,7 @@ func TestChecks(t *testing.T) {
 	if n := notice(e.post(alice, twoPath+"/submit", nil)); n != "" {
 		t.Fatalf("submitting it again: %s", n)
 	}
-	if n := notice(e.post(bob, twoPath+"/cancel-submit", nil)); n != "Only the author or a repository admin can cancel the submission of this changelist" {
+	if n := notice(e.post(bob, twoPath+"/cancel-submit", nil)); n != "Only the author or a repository admin, who may land on it, can cancel the submission of this changelist" {
 		t.Errorf("bob canceling alice's submission: %q", n)
 	}
 	p = e.post(alice, twoPath+"/cancel-submit", nil)
@@ -371,6 +371,15 @@ func TestChecks(t *testing.T) {
 	other := uploaded(b.jj("svc", "cl"))[0]
 	if p := e.do(alice, http.MethodGet, strings.Replace(test.logHref, path, clPath("svc", other), 1), nil, nil); p.status != http.StatusNotFound {
 		t.Errorf("a run under another CL: %d", p.status)
+	}
+	// A draft's tab says it runs no pre, and offers whoever may land — every member — to run it
+	// by hand, which runs it.
+	if p := e.get(alice, clPath("svc", other)+"/checks"); !p.has("A draft runs no pre until it is sent for review.") || !p.has("Run pre") {
+		t.Errorf("a draft's Checks tab, to a member not its author:\n%s", p.body)
+	}
+	if p := e.do(bob, http.MethodPost, clPath("svc", other)+"/run-pre", url.Values{}, map[string]string{"HX-Request": "true", "HX-Target": "cl-checks"}); p.status != http.StatusOK ||
+		p.has("A draft runs no pre") {
+		t.Errorf("running a draft's pre by hand: %d\n%s", p.status, p.body)
 	}
 
 	// ok automation gone: the tab says so, and the page still renders.

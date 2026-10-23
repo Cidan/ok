@@ -148,7 +148,11 @@ func planChange(ctx context.Context, cfg Config, run *automationpb.Run, jc *work
 		}
 	}
 
-	pl := plan.New(plan.Input{Context: jc, Affected: aff, Main: main, Change: change, Standing: standing, SincePre: sincePre})
+	pool, err := mainPool(ctx, cfg.Source, repo, run.GetJob().GetWorkflowsCommit())
+	if err != nil {
+		return stopped(ctx, "reading main's "+workflow.SettingsFile+": "+err.Error())
+	}
+	pl := plan.New(plan.Input{Context: jc, Affected: aff, Main: main, Change: change, Standing: standing, SincePre: sincePre, Pool: pool})
 	for _, n := range pl.Notes() {
 		log.Printf("note: %s", n)
 	}
@@ -254,6 +258,26 @@ func standingOf(ctx context.Context, cfg Config, repo int64, base []byte, change
 		was = &workflow.Settings{Build: workflow.BuildBazel}
 	}
 	return workflow.StandingOf(change, was), nil
+}
+
+// mainPool is the pool main's settings name for the repository's jobs ("" for none).
+func mainPool(ctx context.Context, src checkout.Source, repo int64, commit []byte) (string, error) {
+	files, err := checkout.FilesAt(ctx, src, repo, commit, []string{workflow.SettingsFile})
+	if err != nil {
+		return "", err
+	}
+	data, err := fs.ReadFile(files, workflow.SettingsFile)
+	if errors.Is(err, fs.ErrNotExist) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	s, err := workflow.ParseSettings(data, true)
+	if err != nil {
+		return "", nil // settings on main that do not parse landed before uploads checked them
+	}
+	return s.Pool, nil
 }
 
 // readWorkflows reads a commit's workflow files: from the SCM, or — when co holds the commit —

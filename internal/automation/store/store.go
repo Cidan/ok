@@ -17,6 +17,8 @@ import (
 	"time"
 
 	"github.com/Cidan/ok/internal/blob"
+	"github.com/Cidan/ok/internal/bus"
+	"github.com/Cidan/ok/internal/workflow"
 )
 
 // Kind is what a job runs.
@@ -61,6 +63,9 @@ type Job struct {
 	Kind    Kind
 	Targets []string
 	Args    []string
+	// Pool is the pool of workers it runs in (docs/hosted.md, "Hosted automation, as built"): ""
+	// for the default one.
+	Pool string
 }
 
 // Origin is why a run exists: its phase, and the CL, patchset, and job it runs for.
@@ -73,13 +78,16 @@ type Origin struct {
 
 // Run is one job on one commit.
 type Run struct {
-	ID             int64
-	RepositoryID   int64
-	CommitID       []byte
-	Job            Job
-	Origin         Origin
-	Status         Status
-	RequestedBy    string
+	ID           int64
+	RepositoryID int64
+	CommitID     []byte
+	Job          Job
+	Origin       Origin
+	Status       Status
+	RequestedBy  string // a principal's stable ID
+	// CanceledBy is the stable ID of who canceled it, or asked its worker to stop it: "" for no
+	// one (the system), or a run not canceled.
+	CanceledBy     string
 	RerunOf        int64
 	Attempt        int32
 	Worker         string
@@ -100,6 +108,9 @@ type Run struct {
 	// CarriedFrom is, for a post run that never ran, the pre run whose pass it carries (0: it
 	// ran).
 	CarriedFrom int64
+	// LeaseKey is the key the claim that leased it minted, for its worker alone (docs/secrets.md,
+	// "Readers that are not people"): set by Lease, never stored — the run holds its hash.
+	LeaseKey []byte
 }
 
 // Pushed is an image a push run pushed: where it went, under which tags, and its manifest's
@@ -112,9 +123,17 @@ type Pushed struct {
 	Tags       []string
 }
 
-// deployPriority is a deployment's pushes' priority: they carry what landed into the cluster,
-// and go with post's before pre's.
-const deployPriority = 1
+// priorityOf is a run's priority among its account's, by its phase: post's runs, which main waits
+// on, and deploys', which carry what landed into the cluster, first; then pre's; then manual runs.
+func priorityOf(p Phase) int16 {
+	switch p {
+	case PhasePost, PhaseDeploy:
+		return 2
+	case PhasePre:
+		return 1
+	}
+	return 0
+}
 
 // Config tunes the store.
 type Config struct {
@@ -128,8 +147,16 @@ type Config struct {
 	Attempts int32
 	// MaxLog is the most log a run keeps; a longer log ends with a note saying so.
 	MaxLog int64
-	// Poll bounds every wait on a notification, so a missed one delays and never strands.
+	// Poll bounds every wait on a signal, so a missed one delays and never strands.
 	Poll time.Duration
+	// Signals carry the store's wake-ups between replicas (docs/hosted.md, "Signals"): the bus's.
+	// Nil is within the process (bus.NewLocal).
+	Signals bus.Signals
+	// PlanPool is the pool of workers planning runs run in: "" for the default one.
+	PlanPool string
+	// Quotas reads accounts' quotas of CI, for admission; nil admits every account, each of
+	// weight 1.
+	Quotas Quotas
 }
 
 // DefaultConfig is the service's configuration.
@@ -147,6 +174,7 @@ var (
 	ErrNotFound  = errors.New("no such run")
 	ErrLeaseLost = errors.New("the run's lease is not this worker's")
 	ErrLogFull   = errors.New("the run's log is full")
+	ErrSlotTaken = errors.New("another run holds the account's slot")
 )
 
 // InvalidError is a request the store refuses as malformed.
@@ -174,7 +202,129 @@ type Store struct {
 // New builds a store over a backend and the logs' bucket. Run Listen for prompt wake-ups;
 // without it every wait polls.
 func New(b Backend, blobs blob.Store, cfg Config) *Store {
+	if cfg.Signals == nil {
+		cfg.Signals = bus.NewLocal()
+	}
 	return &Store{b: b, blobs: blobs, cfg: cfg, notify: newNotifier()}
+}
+
+// txOps are a transaction's operations as the store hands them on: the backend's, and the signals
+// to send once it commits.
+type txOps struct {
+	Ops
+	pending *bus.Pending
+}
+
+// A transaction's locks of rows about a repository read the repository's move gate (Ops.Gate)
+// first: one about a repository whose network moves between cells is refused before it writes
+// (docs/hosted.md, "Cells, as built").
+
+func (t txOps) LockRun(ctx context.Context, id int64) (*Run, error) {
+	r, err := t.Ops.LockRun(ctx, id)
+	if err != nil {
+		return r, err
+	}
+	return r, t.Gate(ctx, r.RepositoryID)
+}
+
+func (t txOps) LockPlan(ctx context.Context, id int64) (*Plan, error) {
+	p, err := t.Ops.LockPlan(ctx, id)
+	if err != nil {
+		return p, err
+	}
+	return p, t.Gate(ctx, p.RepositoryID)
+}
+
+func (t txOps) LockSubmission(ctx context.Context, id int64) (*Submission, error) {
+	s, err := t.Ops.LockSubmission(ctx, id)
+	if err != nil {
+		return s, err
+	}
+	return s, t.Gate(ctx, s.RepositoryID)
+}
+
+func (t txOps) LockAttempt(ctx context.Context, id int64) (*Attempt, error) {
+	a, err := t.Ops.LockAttempt(ctx, id)
+	if err != nil {
+		return a, err
+	}
+	subs, err := t.Submissions(ctx, []int64{a.SubmissionID})
+	if err != nil {
+		return a, err
+	}
+	if len(subs) == 0 {
+		return a, fmt.Errorf("attempt %d's submission %d: %w", id, a.SubmissionID, ErrNotFound)
+	}
+	return a, t.Gate(ctx, subs[0].RepositoryID)
+}
+
+func (t txOps) LockCL(ctx context.Context, repo, cl int64) error {
+	if err := t.Gate(ctx, repo); err != nil {
+		return err
+	}
+	return t.Ops.LockCL(ctx, repo, cl)
+}
+
+// Every run is queued here, at its phase's priority (priorityOf), in its job's pool or the default.
+func (t txOps) InsertRun(ctx context.Context, r NewRun) (*Run, error) {
+	if err := t.Gate(ctx, r.RepositoryID); err != nil {
+		return nil, err
+	}
+	return t.Ops.InsertRun(ctx, queuedAs(r))
+}
+
+func (t txOps) InsertRuns(ctx context.Context, rs []NewRun) error {
+	gated := map[int64]bool{}
+	out := make([]NewRun, len(rs))
+	for i, r := range rs {
+		if !gated[r.RepositoryID] {
+			if err := t.Gate(ctx, r.RepositoryID); err != nil {
+				return err
+			}
+			gated[r.RepositoryID] = true
+		}
+		out[i] = queuedAs(r)
+	}
+	return t.Ops.InsertRuns(ctx, out)
+}
+
+// queuedAs is a run as it is queued: its phase's priority, and its pool named.
+func queuedAs(r NewRun) NewRun {
+	r.Priority = priorityOf(r.Origin.Phase)
+	if r.Job.Pool == "" {
+		r.Job.Pool = workflow.DefaultPool
+	}
+	return r
+}
+
+func (t txOps) FinishSubmission(ctx context.Context, id int64, status SubmissionStatus, reason, by string) (int64, bool, error) {
+	if _, err := t.LockSubmission(ctx, id); errors.Is(err, ErrNotFound) {
+		return 0, false, nil
+	} else if err != nil {
+		return 0, false, err
+	}
+	return t.Ops.FinishSubmission(ctx, id, status, reason, by)
+}
+
+func (t txOps) LockMain(ctx context.Context, repo int64) error {
+	if err := t.Gate(ctx, repo); err != nil {
+		return err
+	}
+	return t.Ops.LockMain(ctx, repo)
+}
+
+// txn runs fn in a read-write transaction (Backend.Txn), and sends the signals its committed
+// attempt recorded once it has committed.
+func (s *Store) txn(ctx context.Context, fn func(tx Ops) error) error {
+	var p bus.Pending
+	err := s.b.Txn(ctx, func(tx Ops) error {
+		p.Reset()
+		return fn(txOps{Ops: tx, pending: &p})
+	})
+	if err == nil {
+		p.Send(ctx, s.cfg.Signals)
+	}
+	return err
 }
 
 // leaseTTL is how long a lease lasts without renewal.
@@ -242,10 +392,7 @@ func (s *Store) List(ctx context.Context, q ListQuery) ([]*Run, error) {
 	case q.Limit > 1000:
 		q.Limit = 1000
 	}
-	before := q.BeforeID
-	if before <= 0 {
-		before = 1<<63 - 1
-	}
+	before := max(q.BeforeID, 0)
 	var out []*Run
 	var err error
 	if q.CLNumber > 0 {

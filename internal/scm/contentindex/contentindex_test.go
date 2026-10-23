@@ -62,6 +62,47 @@ func TestEncodings(t *testing.T) {
 	}
 }
 
+// EncodeLogs splits updates into rows of at most max bytes, an update too large for one in a row
+// of its own, which decode, one after another, to the updates in order.
+func TestEncodeLogs(t *testing.T) {
+	var updates []Update
+	for i := range 1000 {
+		updates = append(updates, Update{Op: Pin, ID: id(byte(i)), Entry: Entry{Kind: encoding.KindChunk}})
+	}
+	big := make([]FileChunk, 200)
+	for i := range big {
+		big[i] = FileChunk{id(byte(i)), 10}
+	}
+	updates = append(updates, Update{Op: Put, ID: id(1), Entry: fileEntry(1, big...)})
+	const max = 4096
+	rows := EncodeLogs(updates, max)
+	if len(rows) < 2 {
+		t.Fatalf("%d rows, want several of at most %d bytes", len(rows), max)
+	}
+	var got []Update
+	for i, row := range rows {
+		us, err := DecodeLog(row)
+		if err != nil {
+			t.Fatalf("row %d: %v", i, err)
+		}
+		if len(row) > max && len(us) != 1 {
+			t.Errorf("row %d: %d bytes of %d updates, over %d", i, len(row), len(us), max)
+		}
+		got = append(got, us...)
+	}
+	if len(got) != len(updates) {
+		t.Fatalf("%d updates, want %d", len(got), len(updates))
+	}
+	for i := range got {
+		if got[i].Op != updates[i].Op || got[i].ID != updates[i].ID || !got[i].entry().Equal(updates[i].entry()) {
+			t.Errorf("update %d: %+v, want %+v", i, got[i], updates[i])
+		}
+	}
+	if one := EncodeLogs(updates[:3], max); len(one) != 1 || !bytes.Equal(one[0], EncodeLog(updates[:3])) {
+		t.Errorf("a few updates: %d rows, want EncodeLog's one", len(one))
+	}
+}
+
 // Anything malformed is refused, never half read: truncations, trailing bytes, unknown kinds
 // and ops, a file whose chunks do not add up, a block out of order.
 func TestMalformed(t *testing.T) {
@@ -103,12 +144,12 @@ func TestMoveAndDrop(t *testing.T) {
 		{{Op: Put, ID: id(2), Entry: chunkEntry(3, 20, 100)}, {Op: Drop, ID: id(2), Entry: Entry{Kind: encoding.KindChunk}}},
 		{{Op: Put, ID: id(2), Entry: chunkEntry(5, 30, 101)}},
 	}
-	for i, us := range steps {
+	for _, us := range steps {
 		got, err := DecodeLog(EncodeLog(us))
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := x.ApplyLog(int64(i+1), EncodeLog(got)); err != nil {
+		if err := x.ApplyLog(EncodeLog(got)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -118,16 +159,70 @@ func TestMoveAndDrop(t *testing.T) {
 	if e, ok := x.Get(id(2)); !ok || e.Loc.Pack != 5 || e.Day != 101 {
 		t.Fatalf("a chunk dropped and stored anew: %+v %v", e, ok)
 	}
-	// A move of a chunk the index lacks — swept before compaction moved it — leaves it absent.
-	if err := x.ApplyLog(9, EncodeLog([]Update{{Op: Move, ID: id(7), Entry: Entry{Kind: encoding.KindChunk, Loc: Location{Pack: 9}}}})); err != nil {
-		t.Fatal(err)
+	// A move of a chunk the index lacks — its entry in a segment — creates no entry, and is kept as
+	// its location alone, the last logged; a drop clears it.
+	for _, pack := range []uint64{9, 11} {
+		if err := x.ApplyLog(EncodeLog([]Update{{Op: Move, ID: id(7), Entry: Entry{Kind: encoding.KindChunk, Loc: Location{Pack: pack}}}})); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if _, ok := x.Lookup(id(7)); ok {
 		t.Fatal("a move created a chunk")
 	}
+	if l, ok := x.Moved(id(7)); !ok || l.Pack != 11 {
+		t.Fatalf("the moved location of a chunk the index lacks: %+v, %v", l, ok)
+	}
+	if ids := x.MovedIDs(); len(ids) != 1 || ids[0] != id(7) {
+		t.Fatalf("moved IDs: %v", ids)
+	}
+	if _, ok := x.Moved(id(1)); ok {
+		t.Fatal("a move of a chunk the index holds was kept apart from its entry")
+	}
+	if err := x.ApplyLog(EncodeLog([]Update{{Op: Drop, ID: id(7), Entry: Entry{Kind: encoding.KindChunk}}})); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := x.Moved(id(7)); ok {
+		t.Fatal("a dropped chunk's move outlived the drop")
+	}
+	// A drop is remembered — hiding what a segment holds of it — until its entry is put again; a
+	// touch or a pin after it puts no body, and is no reason to forget it.
+	if !x.Dropped(id(7)) || x.Dropped(id(2)) {
+		t.Fatalf("dropped: chunk 7 %v, chunk 2 (stored anew) %v", x.Dropped(id(7)), x.Dropped(id(2)))
+	}
+	if err := x.ApplyLog(EncodeLog([]Update{{Op: Touch, ID: id(7), Entry: Entry{Kind: encoding.KindChunk, Day: 120}}})); err != nil {
+		t.Fatal(err)
+	}
+	if ds := x.DroppedIDs(); len(ds) != 1 || ds[0].ID != id(7) || ds[0].Entry.Kind != encoding.KindChunk {
+		t.Fatalf("dropped IDs after a touch: %v", ds)
+	}
+	if err := x.ApplyLog(EncodeLog([]Update{{Op: Move, ID: id(7), Entry: Entry{Kind: encoding.KindChunk, Loc: Location{Pack: 12}}}})); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := x.Moved(id(7)); ok {
+		t.Fatal("a move of a dropped chunk was kept")
+	}
+	if err := x.ApplyLog(EncodeLog([]Update{{Op: Put, ID: id(7), Entry: chunkEntry(6, 0, 121)}})); err != nil {
+		t.Fatal(err)
+	}
+	if x.Dropped(id(7)) {
+		t.Fatal("a chunk stored anew is still dropped")
+	}
 	bad := EncodeLog([]Update{{Op: Move, ID: id(1), Entry: Entry{Kind: encoding.KindFile}}})
 	if _, err := DecodeLog(bad); err == nil {
 		t.Fatal("a file's move decoded")
+	}
+}
+
+// An entry alone round-trips, and trailing bytes are refused.
+func TestEntryEncoding(t *testing.T) {
+	for _, e := range []Entry{chunkEntry(3, 99, 7), fileEntry(5, FileChunk{ID: id(1), Length: 10}, FileChunk{ID: id(2), Length: 20}), {Kind: encoding.KindFile, Day: 3}} {
+		got, err := DecodeEntry(EncodeEntry(e))
+		if err != nil || !got.Equal(e) {
+			t.Fatalf("%+v round-tripped to %+v (%v)", e, got, err)
+		}
+		if _, err := DecodeEntry(append(EncodeEntry(e), 0)); err == nil {
+			t.Fatalf("%+v with a byte after it decoded", e)
+		}
 	}
 }
 
@@ -157,7 +252,7 @@ func TestOrderDoesNotMatter(t *testing.T) {
 			if p.block {
 				err = x.ApplyBlock(p.body)
 			} else {
-				err = x.ApplyLog(p.log, p.body)
+				err = x.ApplyLog(p.body)
 			}
 			if err != nil {
 				t.Fatal(err)
@@ -182,7 +277,7 @@ func TestOrderDoesNotMatter(t *testing.T) {
 		if p.block {
 			_ = x.ApplyBlock(p.body)
 		} else {
-			_ = x.ApplyLog(p.log, p.body)
+			_ = x.ApplyLog(p.body)
 		}
 	}
 	if e, ok := x.Get(id(2)); !ok || e.Day != 140 || e.Size != 2100 {

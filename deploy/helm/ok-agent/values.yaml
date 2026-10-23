@@ -1,0 +1,44 @@
+# ok's deploy agent (docs/hosted.md, "Deploy agents, as built"; docs/deploy.md, "Deploy agents"): it
+# runs as one of its organization's robots, the one the organization designated its deploy agent,
+# and connects out to ok — nothing connects in.
+
+image:
+  repository: ghcr.io/cidan/ok-runner   # ok, with bazelisk for migrations
+  tag: ""                               # the chart's appVersion unless set
+  pullPolicy: IfNotPresent
+
+# Where ok is reached: its public address, host:port.
+address: ""
+# The CA ok's certificate is signed by, when not one the system trusts: a ConfigMap's key.
+caConfigMap: {name: "", key: ca.crt}
+
+# How its robot proves itself. A token: the cluster's ServiceAccount token, its audience the
+# organization's ID (ok identity's ListIssuers says it), from an issuer the organization trusts,
+# its subject — system:serviceaccount:<namespace>:<release>-agent — bound to the robot. Or a
+# credential: a Secret holding a key and certificate an owner certified for the robot.
+organizationID: ""
+credentialSecret: ""
+
+# The namespaces whose Deployments and StatefulSets ok rolls: each grants the agent what rolling
+# needs, and nothing more (docs/deploy.md, "Grants").
+namespaces: []
+
+# Migrations, run here with the agent's own environment — where they find their databases — from
+# commits on main of the organization's repositories, which the robot must be granted read on.
+migrations:
+  enabled: true
+  # The environment migrations run with: name to a Secret's key.
+  env: {}
+  #   APP_DATABASE_URL: {secret: shop-db, key: url}
+  storage: 20Gi
+
+resources:
+  requests: {cpu: 250m, memory: 512Mi}
+  limits: {memory: 4Gi}
+
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities: {drop: [ALL]}

@@ -22,6 +22,7 @@ import (
 	"github.com/Cidan/ok/internal/control/people"
 	"github.com/Cidan/ok/internal/control/review"
 	"github.com/Cidan/ok/internal/control/scm"
+	"github.com/Cidan/ok/internal/move"
 	"github.com/Cidan/ok/internal/owners"
 	"github.com/Cidan/ok/internal/scm/scmfeed"
 	"github.com/Cidan/ok/internal/workflow"
@@ -73,11 +74,11 @@ func (f *Follower) Run(ctx context.Context) error {
 	}
 }
 
-// applier is the follower as a follow.Applier and follow.Legacy.
+// applier is the follower as a follow.Applier.
 type applier struct{ *Follower }
 
-func (a applier) Cursor(ctx context.Context, repo int64) (int64, error) {
-	return a.db.FollowCursor(ctx, scmfeed.Topic, repo)
+func (a applier) Cursors(ctx context.Context, repos []int64) (map[int64]int64, error) {
+	return a.db.FollowCursors(ctx, scmfeed.Topic, repos)
 }
 
 func (a applier) Apply(ctx context.Context, e bus.Event) error {
@@ -88,15 +89,9 @@ func (a applier) Apply(ctx context.Context, e bus.Event) error {
 	return a.Follower.Apply(ctx, ev)
 }
 
-func (a applier) LegacyCursor(ctx context.Context) (int64, error) { return a.db.LegacyCursor(ctx) }
-func (a applier) Seed(ctx context.Context, repo, seq int64) error {
-	return a.db.SeedFollowCursor(ctx, scmfeed.Topic, repo, seq)
-}
-func (a applier) LeaveLegacy(ctx context.Context) error { return a.db.ForgetLegacyCursor(ctx) }
-
 // transitionEvent maps an SCM transition onto the change log.
 func transitionEvent(t *scmpb.ChangeListTransitioned) db.Event {
-	e := db.Event{Actor: t.GetActor(), From: db.Status(t.GetFrom()), To: db.Status(t.GetTo()), Message: t.GetReason()}
+	e := db.Event{Actor: t.GetActorId(), From: db.Status(t.GetFrom()), To: db.Status(t.GetTo()), Message: t.GetReason()}
 	switch {
 	case e.To == db.StatusAbandoned:
 		e.Kind = db.EventAbandoned
@@ -114,6 +109,7 @@ func transitionEvent(t *scmpb.ChangeListTransitioned) db.Event {
 // the approval of the CLs it can change.
 func (f *Follower) Apply(ctx context.Context, ev *scmpb.Event) error {
 	repo := ev.GetRepositoryId()
+	ctx = move.WithRepository(ctx, repo)
 	var number int64
 	var cl *scmpb.ChangeList
 	switch k := ev.GetKind().(type) {
@@ -130,6 +126,14 @@ func (f *Follower) Apply(ctx context.Context, ev *scmpb.Event) error {
 			return err
 		}
 		cl = c
+	}
+	// The people an upload assigns, decided before the transaction: asking ok identity holds no
+	// transaction open.
+	assignable := map[string]bool{}
+	if u := ev.GetUploaded(); u != nil {
+		for _, p := range u.GetReviewerIds() {
+			assignable[p] = p != cl.GetAuthorId() && people.IsHumanID(ctx, p)
+		}
 	}
 	var refresh [][2]int64
 	if moved := ev.GetHeadMoved(); moved != nil {
@@ -166,27 +170,27 @@ func (f *Follower) Apply(ctx context.Context, ev *scmpb.Event) error {
 		switch k := ev.GetKind().(type) {
 		case *scmpb.Event_Uploaded:
 			u := k.Uploaded
-			if err := tx.RecordEvent(ctx, repo, number, db.Event{At: at, Actor: u.GetUploader(), Kind: db.EventUploaded, Patchset: u.GetPatchset()}); err != nil {
+			if err := tx.RecordEvent(ctx, repo, number, db.Event{At: at, Actor: u.GetUploaderId(), Kind: db.EventUploaded, Patchset: u.GetPatchset()}); err != nil {
 				return err
 			}
 			// A rollback CL's creation shows on the CLs it rolls back.
 			if u.GetCreated() {
 				for _, n := range cl.GetRollback().GetChangeLists() {
-					if err := tx.RecordEvent(ctx, repo, n, db.Event{At: at, Actor: u.GetUploader(), Kind: db.EventRolledBack, Related: number}); err != nil {
+					if err := tx.RecordEvent(ctx, repo, n, db.Event{At: at, Actor: u.GetUploaderId(), Kind: db.EventRolledBack, Related: number}); err != nil {
 						return err
 					}
 				}
 			}
-			for _, p := range u.GetReviewers() {
-				if p == cl.GetAuthor() || !people.IsHuman(p) {
+			for _, p := range u.GetReviewerIds() {
+				if !assignable[p] {
 					continue
 				}
-				added, err := tx.AddReviewer(ctx, repo, number, p, u.GetUploader())
+				added, err := tx.AddReviewer(ctx, repo, number, p, u.GetUploaderId())
 				if err != nil {
 					return err
 				}
 				if added {
-					if err := tx.RecordEvent(ctx, repo, number, db.Event{At: at, Actor: u.GetUploader(), Kind: db.EventReviewerAdded, Subject: p, Patchset: u.GetPatchset()}); err != nil {
+					if err := tx.RecordEvent(ctx, repo, number, db.Event{At: at, Actor: u.GetUploaderId(), Kind: db.EventReviewerAdded, Subject: p, Patchset: u.GetPatchset()}); err != nil {
 						return err
 					}
 				}
@@ -203,19 +207,20 @@ func (f *Follower) Apply(ctx context.Context, ev *scmpb.Event) error {
 			}
 		case *scmpb.Event_Landed:
 			l := k.Landed
-			if err := tx.RecordEvent(ctx, repo, number, db.Event{At: at, Actor: l.GetSubmitter(), Kind: db.EventSubmitted, Patchset: l.GetPatchset(), Commit: l.GetCommitId()}); err != nil {
+			if err := tx.RecordEvent(ctx, repo, number, db.Event{At: at, Actor: l.GetSubmitterId(), Kind: db.EventSubmitted, Patchset: l.GetPatchset(), Commit: l.GetCommitId()}); err != nil {
 				return err
 			}
 		case *scmpb.Event_RepositoryCreated:
-			if err := tx.CreateRepository(ctx, db.Repository{ID: repo, Name: k.RepositoryCreated.GetName(), CreatedBy: k.RepositoryCreated.GetCreatedBy(), CreatedAt: at}); err != nil {
-				return err
-			}
-		case *scmpb.Event_RepositoryRenamed:
-			if err := tx.RenameRepository(ctx, repo, k.RepositoryRenamed.GetName()); err != nil {
+			// Its name is the directory's, whose events this follower's twin applies (Directory).
+			if err := tx.CreateRepository(ctx, db.Repository{ID: repo, CreatedBy: k.RepositoryCreated.GetCreatedById(), CreatedAt: at}); err != nil {
 				return err
 			}
 		case *scmpb.Event_HeadMoved:
 			if err := tx.MoveHead(ctx, repo, k.HeadMoved.GetHeadSeq(), at); err != nil {
+				return err
+			}
+			// For push webhooks (docs/hosted.md, "ok control at scale, as built").
+			if err := tx.QueueHeadMoved(ctx, repo, k.HeadMoved.GetHeadSeq(), k.HeadMoved.GetNewHead()); err != nil {
 				return err
 			}
 		}

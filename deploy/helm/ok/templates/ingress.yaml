@@ -20,6 +20,15 @@ spec:
     - host: {{ .Values.ingress.host }}
       http:
         paths:
+          {{- if .Values.secrets.enabled }}
+          # People's secrets service goes to ok secrets, which runs apart.
+          - path: /ok.secrets.v1.Secrets
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "ok.name" . }}-secrets
+                port: {name: http}
+          {{- end }}
           - path: /
             pathType: Prefix
             backend:

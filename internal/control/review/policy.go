@@ -6,6 +6,7 @@
 package review
 
 import (
+	"context"
 	"slices"
 	"strconv"
 	"strings"
@@ -28,7 +29,7 @@ type OwnerReq struct {
 // Status is a CL's review evaluation against its current patchset — Critique's scoring: an
 // LGTM, every owner set's Approval, and no unresolved comments.
 type Status struct {
-	LGTMBy          []string // reviewers whose LGTM grant counts
+	LGTMBy          []string // reviewers whose LGTM grant counts, by stable ID
 	LGTMSatisfied   bool
 	SelfLGTMAllowed bool // every governing OWNERS allows self, so the author's own LGTM counts
 	Owners          []OwnerReq
@@ -43,15 +44,24 @@ type Status struct {
 	// closed on it.
 	Identity    []IdentityReq
 	IdentityErr error
-	// acls are the members of each ACL an owner set names.
-	acls aclMembers
+	// owned are who the owner sets name.
+	owned owned
 }
 
-// aclMembers maps each ACL an owner set names, by its full name, to its principals.
-type aclMembers map[string]map[string]bool
+// owned are who owner sets name, by stable ID: each ACL's members, by the ACL's full name, and the
+// person each user: line's handle names now.
+type owned struct {
+	acls  map[string]map[string]bool
+	users map[string]string // handle -> the person's ID; absent: no such person
+}
 
 // ACLName is the full name of the ACL an acl: owner names: acl: admins is admins.acl.<domain>.
-func ACLName(o owners.Owner) string { return people.Names().Of(identity.ACL, o.Name) }
+func ACLName(o owners.Owner) string {
+	if name, ok := people.Names().ParseSet(o.Name); ok {
+		return name
+	}
+	return people.Names().Of(identity.ACL, o.Name)
+}
 
 // ApprovalSatisfied reports whether every owner set is satisfied, and every part of a change to
 // the groups-and-ACLs tree approved.
@@ -110,16 +120,20 @@ func (s *Status) BlockedReason() string {
 	return "Needs " + strings.Join(missing, ", ")
 }
 
-// CanApprove reports whether an Approval grant by principal would count toward any
+// CanApprove reports whether an Approval grant by principal (a stable ID) would count toward any
 // owner set, or any part of a change to the groups-and-ACLs tree.
-func (s *Status) CanApprove(principal, author string) bool {
+func (s *Status) CanApprove(ctx context.Context, principal, author string) bool {
 	for _, o := range s.Owners {
-		if grantCounts(o.Set, principal, author, s.acls) {
+		if grantCounts(o.Set, principal, author, s.owned) {
 			return true
 		}
 	}
+	if len(s.Identity) == 0 {
+		return false
+	}
+	name := people.Name(ctx, principal)
 	for _, r := range s.Identity {
-		if slices.Contains(r.Eligible, principal) {
+		if slices.Contains(r.Eligible, name) {
 			return true
 		}
 	}
@@ -139,16 +153,17 @@ func OwnersLabel(s *owners.Set) string {
 	return label
 }
 
-// ownerMatches reports whether principal is covered by owner o: a person by handle, or a member
-// of an ACL (docs/identity.md §9).
-func ownerMatches(o owners.Owner, principal string, acls aclMembers) bool {
+// ownerMatches reports whether principal (a stable ID) is covered by owner o: a person by
+// handle, or a member of an ACL (docs/identity.md §9).
+func ownerMatches(o owners.Owner, principal string, ow owned) bool {
 	switch o.Kind {
 	case owners.Anyone:
 		return true
 	case owners.User:
-		return people.IsHuman(principal) && o.Name == people.Handle(principal)
+		id, ok := ow.users[o.Name]
+		return ok && id == principal
 	case owners.ACL:
-		return acls[ACLName(o)][principal]
+		return ow.acls[ACLName(o)][principal]
 	default:
 		return false
 	}
@@ -157,9 +172,9 @@ func ownerMatches(o owners.Owner, principal string, acls aclMembers) bool {
 // authorIsListed reports whether the author is named in the set — by a user: line, or as a member
 // of an acl: line's ACL — the implicit-approval case. "*" does not make the author an implicit
 // approver.
-func authorIsListed(s *owners.Set, author string, acls aclMembers) bool {
+func authorIsListed(s *owners.Set, author string, ow owned) bool {
 	return slices.ContainsFunc(s.Owners, func(o owners.Owner) bool {
-		return (o.Kind == owners.User || o.Kind == owners.ACL) && ownerMatches(o, author, acls)
+		return (o.Kind == owners.User || o.Kind == owners.ACL) && ownerMatches(o, author, ow)
 	})
 }
 
@@ -173,17 +188,17 @@ func AllowsSelf(s *owners.Set) bool {
 // grantCounts reports whether an Approval by principal satisfies set s: the principal
 // must be covered by the set, and the author's own grant counts only where the set
 // allows self.
-func grantCounts(s *owners.Set, principal, author string, acls aclMembers) bool {
+func grantCounts(s *owners.Set, principal, author string, ow owned) bool {
 	if principal == author && !AllowsSelf(s) {
 		return false
 	}
-	return slices.ContainsFunc(s.Owners, func(o owners.Owner) bool { return ownerMatches(o, principal, acls) })
+	return slices.ContainsFunc(s.Owners, func(o owners.Owner) bool { return ownerMatches(o, principal, ow) })
 }
 
 // grant is one currently granted label.
 type grant struct {
 	label     db.Label
-	principal string
+	principal string // a stable ID
 }
 
 // evaluate applies the review policy to resolved owner sets and the current grants:
@@ -195,8 +210,8 @@ type grant struct {
 //   - Every review thread must be resolved.
 //   - A rollback's sets are those of the files its author edited by hand (none, for the
 //     inverse change the SCM computed), and its author's LGTM never counts.
-func evaluate(sets []*owners.Set, ownersErr error, grants []grant, author string, unresolved int64, rollback bool, acls aclMembers) *Status {
-	st := &Status{OwnersErr: ownersErr, Unresolved: unresolved, Rollback: rollback, acls: acls}
+func evaluate(sets []*owners.Set, ownersErr error, grants []grant, author string, unresolved int64, rollback bool, ow owned) *Status {
+	st := &Status{OwnersErr: ownersErr, Unresolved: unresolved, Rollback: rollback, owned: ow}
 	if ownersErr == nil {
 		for _, s := range sets {
 			st.Owners = append(st.Owners, OwnerReq{Set: s})
@@ -211,7 +226,7 @@ func evaluate(sets []*owners.Set, ownersErr error, grants []grant, author string
 			}
 		case db.LabelApproval:
 			for i := range st.Owners {
-				if grantCounts(st.Owners[i].Set, g.principal, author, acls) {
+				if grantCounts(st.Owners[i].Set, g.principal, author, ow) {
 					st.Owners[i].ApprovedBy = append(st.Owners[i].ApprovedBy, g.principal)
 				}
 			}
@@ -220,7 +235,7 @@ func evaluate(sets []*owners.Set, ownersErr error, grants []grant, author string
 	st.LGTMSatisfied = len(st.LGTMBy) > 0
 	for i := range st.Owners {
 		o := &st.Owners[i]
-		o.Implicit = authorIsListed(o.Set, author, acls)
+		o.Implicit = authorIsListed(o.Set, author, ow)
 		o.Satisfied = o.Implicit || len(o.ApprovedBy) > 0
 	}
 	return st

@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"strings"
 
@@ -18,8 +19,13 @@ type Config struct {
 	// URL is the server: ldaps://ldap.example.com, or ldap://… with StartTLS.
 	URL      string
 	StartTLS bool
-	// CAFile verifies the server's certificate, when it is not one the system trusts.
+	// CAFile verifies the server's certificate, when it is not one the system trusts; CAPEM is the
+	// same held in memory (an organization's, which gave it).
 	CAFile string
+	CAPEM  []byte
+	// Dialer, when set, makes the connection: an organization's directory is reached at a public
+	// address alone (internal/netguard).
+	Dialer *net.Dialer
 }
 
 // Conn is what ok asks of a connection.
@@ -40,19 +46,27 @@ func Dialer(cfg Config) (func() (Conn, error), error) {
 		return nil, errors.New("an LDAP directory is reached over TLS: ldaps://, or StartTLS")
 	}
 	tc := &tls.Config{MinVersion: tls.VersionTLS12}
+	pem, where := cfg.CAPEM, "the CA given"
 	if cfg.CAFile != "" {
-		pem, err := os.ReadFile(cfg.CAFile)
-		if err != nil {
+		var err error
+		if pem, err = os.ReadFile(cfg.CAFile); err != nil {
 			return nil, err
 		}
+		where = cfg.CAFile
+	}
+	if len(pem) > 0 {
 		pool := x509.NewCertPool()
 		if !pool.AppendCertsFromPEM(pem) {
-			return nil, fmt.Errorf("%s holds no certificate", cfg.CAFile)
+			return nil, fmt.Errorf("%s holds no certificate", where)
 		}
 		tc.RootCAs = pool
 	}
+	opts := []ldap.DialOpt{ldap.DialWithTLSConfig(tc)}
+	if cfg.Dialer != nil {
+		opts = append(opts, ldap.DialWithDialer(cfg.Dialer))
+	}
 	return func() (Conn, error) {
-		c, err := ldap.DialURL(cfg.URL, ldap.DialWithTLSConfig(tc))
+		c, err := ldap.DialURL(cfg.URL, opts...)
 		if err != nil {
 			return nil, err
 		}

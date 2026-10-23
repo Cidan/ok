@@ -10,6 +10,9 @@
 @source "run.templ";
 @source "deploy.templ";
 @source "services.templ";
+@source "notifications.templ";
+@source "webhooks.templ";
+@source "search.templ";
 @source "ui.templ";
 @source "web.go";
 @source "clcomments.js";

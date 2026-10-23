@@ -22,12 +22,14 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/Cidan/ok/internal/authz"
 	"github.com/Cidan/ok/internal/client/auth"
 	"github.com/Cidan/ok/internal/config"
 	"github.com/Cidan/ok/internal/credential"
 	"github.com/Cidan/ok/internal/dial"
 	"github.com/Cidan/ok/internal/serve/authn"
 	"github.com/Cidan/ok/internal/serve/node"
+	"github.com/Cidan/ok/internal/tenancy"
 	identitypb "github.com/Cidan/ok/proto/ok/identity/v1"
 	okpb "github.com/Cidan/ok/proto/ok/v1"
 )
@@ -37,6 +39,7 @@ import (
 var Callers = map[string]okpb.Caller{
 	"identity": okpb.Caller_CALLER_IDENTITY, "scm": okpb.Caller_CALLER_SCM, "control": okpb.Caller_CALLER_CONTROL,
 	"automation": okpb.Caller_CALLER_AUTOMATION, "worker": okpb.Caller_CALLER_WORKER, "deploy": okpb.Caller_CALLER_DEPLOY,
+	"edge": okpb.Caller_CALLER_EDGE, "secrets": okpb.Caller_CALLER_SECRETS,
 }
 
 // Roles are the robots the installation's roles run as, for an authn.Resolver.
@@ -83,7 +86,8 @@ func NewDirectory(conn grpc.ClientConnInterface) Directory {
 var _ authn.Directory = Directory{}
 
 func toPrincipal(p *identitypb.Principal, active bool) authn.Principal {
-	return authn.Principal{Name: p.GetName(), ID: p.GetId(), Human: p.GetKind() == identitypb.Kind_KIND_HUMAN, Active: active}
+	return authn.Principal{Name: p.GetName(), ID: p.GetId(), Human: p.GetKind() == identitypb.Kind_KIND_HUMAN, Org: p.GetKind() == identitypb.Kind_KIND_ORG,
+		Active: active}
 }
 
 func notFound(err error) error {
@@ -95,6 +99,14 @@ func notFound(err error) error {
 
 func (d Directory) Principal(ctx context.Context, name string) (authn.Principal, error) {
 	resp, err := d.dir.GetPrincipal(ctx, &identitypb.GetPrincipalRequest{Key: &identitypb.GetPrincipalRequest_Name{Name: name}})
+	if err != nil {
+		return authn.Principal{}, notFound(err)
+	}
+	return toPrincipal(resp.GetPrincipal(), resp.GetPrincipal().GetStatus() == identitypb.Status_STATUS_ACTIVE), nil
+}
+
+func (d Directory) PrincipalByID(ctx context.Context, id string) (authn.Principal, error) {
+	resp, err := d.dir.GetPrincipal(ctx, &identitypb.GetPrincipalRequest{Key: &identitypb.GetPrincipalRequest_Id{Id: id}})
 	if err != nil {
 		return authn.Principal{}, notFound(err)
 	}
@@ -115,6 +127,22 @@ func (d Directory) Session(ctx context.Context, id string) (authn.Principal, err
 		return authn.Principal{}, notFound(err)
 	}
 	return toPrincipal(resp.GetPrincipal(), true), nil
+}
+
+// Token returns whose a live token is — a person's personal token, an app's installation token —
+// and what it allows.
+func (d Directory) Token(ctx context.Context, secret string) (authn.Principal, error) {
+	resp, err := d.verify.GetToken(ctx, &identitypb.GetTokenRequest{Token: secret})
+	if err != nil {
+		return authn.Principal{}, notFound(err)
+	}
+	r, err := tenancy.ParseRole(resp.GetRole())
+	if err != nil {
+		return authn.Principal{}, err
+	}
+	p := toPrincipal(resp.GetPrincipal(), true)
+	p.Scope = &authz.Token{Role: r, Repositories: resp.GetRepositoryIds(), Owner: resp.GetOwnerId()}
+	return p, nil
 }
 
 // rootsEvery is how often Roots reads the CA's certificates again: a rotation's new certificate is

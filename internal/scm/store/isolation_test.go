@@ -159,9 +159,7 @@ func TestCreateWorkspace(t *testing.T) {
 		t.Errorf("creating it again: %v, want ErrAlreadyExists", err)
 	}
 	// Nor a workspace okfs recorded before workspaces had their own logs.
-	if _, err := poolOf(s).Exec(ctx, `INSERT INTO workspace (repository_id, principal, name) VALUES ($1, $2, 'old-vfs')`, repo, alice); err != nil {
-		t.Fatal(err)
-	}
+	dbOf(s).plantWorkspace(t, repo, alice, "old-vfs", false)
 	if _, err := s.CreateWorkspace(ctx, alice, repo, "old-vfs"); !errors.Is(err, ErrAlreadyExists) {
 		t.Errorf("creating a recorded workspace: %v, want ErrAlreadyExists", err)
 	}
@@ -198,12 +196,7 @@ func TestNoWorkspaceNoLog(t *testing.T) {
 	s := testStore(t)
 	repo := newRepo(t, s).ID
 	const alice, ghost = "alice.human.example.com", "ghost"
-	logs := func() (n int) {
-		if err := poolOf(s).QueryRow(ctx, `SELECT count(*) FROM op_log WHERE repository_id = $1`, repo).Scan(&n); err != nil {
-			t.Fatal(err)
-		}
-		return n
-	}
+	logs := func() int { return dbOf(s).count(t, "op_log", `repository_id = @repo`, map[string]any{"repo": repo}) }
 	before := logs()
 	nop := func(EncodedObject) error { return nil }
 	for name, err := range map[string]error{
@@ -337,9 +330,8 @@ func TestNoWorkspaceNamed(t *testing.T) {
 	if _, err := publishIn(ctx, s, repo, carol, "", newBuilder(t), &OpHeadsUpdate{New: encoding.ID{7}}); !errors.Is(err, ErrInvalid) {
 		t.Errorf("moving heads, naming no workspace: %v, want ErrInvalid", err)
 	}
-	var logs int
-	if err := poolOf(s).QueryRow(ctx, `SELECT count(*) FROM op_log WHERE repository_id = $1 AND principal = $2`, repo, carol).Scan(&logs); err != nil || logs != 0 {
-		t.Errorf("carol's operation logs: %d (%v), want none", logs, err)
+	if logs := dbOf(s).count(t, "op_log", `repository_id = @repo AND principal = @principal`, map[string]any{"repo": repo, "principal": carol}); logs != 0 {
+		t.Errorf("carol's operation logs: %d, want none", logs)
 	}
 }
 
@@ -355,33 +347,15 @@ func TestGCDeletesLogsOfNoWorkspace(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, op := workOf(t, s, repo, alice, "laptop")
-	var shared int64
-	if err := poolOf(s).QueryRow(ctx, `INSERT INTO op_log (repository_id, principal, workspace) VALUES ($1, $2, '') RETURNING id`, repo, alice).Scan(&shared); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := poolOf(s).Exec(ctx, `INSERT INTO op_head (op_log_id, op_id) VALUES ($1, $2)`, shared, encoding.RootOperationID[:]); err != nil {
-		t.Fatal(err)
-	}
+	shared := dbOf(s).plantSharedLog(t, repo, alice)
 	// And a workspace okfs recorded then, with no log of its own, and its checkpoint.
-	if _, err := poolOf(s).Exec(ctx, `INSERT INTO workspace (repository_id, principal, name) VALUES ($1, $2, 'old-vfs')`, repo, alice); err != nil {
-		t.Fatal(err)
+	dbOf(s).plantWorkspace(t, repo, alice, "old-vfs", true)
+	logs := func() int {
+		return dbOf(s).count(t, "op_log", `repository_id = @repo AND workspace = ''`, map[string]any{"repo": repo})
 	}
-	if _, err := poolOf(s).Exec(ctx, `INSERT INTO checkpoint (repository_id, principal, workspace, machine, tree_ids, base_commit_id, fork)
-		VALUES ($1, $2, 'old-vfs', 'm1', ARRAY[$3::bytea], $4, false)`, repo, alice, encoding.EmptyTreeID[:], encoding.RootCommitID[:]); err != nil {
-		t.Fatal(err)
-	}
-	logs := func() (n int) {
-		if err := poolOf(s).QueryRow(ctx, `SELECT count(*) FROM op_log WHERE repository_id = $1 AND workspace = ''`, repo).Scan(&n); err != nil {
-			t.Fatal(err)
-		}
-		return n
-	}
-
-	workspaces := func() (n int) {
-		if err := poolOf(s).QueryRow(ctx, `SELECT count(*) FROM workspace WHERE repository_id = $1 AND principal = $2 AND name = 'old-vfs'`, repo, alice).Scan(&n); err != nil {
-			t.Fatal(err)
-		}
-		return n
+	workspaces := func() int {
+		return dbOf(s).count(t, "workspace", `repository_id = @repo AND principal = @principal AND name = 'old-vfs'`,
+			map[string]any{"repo": repo, "principal": alice})
 	}
 
 	dry, err := s.GC(ctx, repo, time.Now(), GCOptions{DryRun: true})
@@ -395,18 +369,16 @@ func TestGCDeletesLogsOfNoWorkspace(t *testing.T) {
 	if !strings.Contains(r.String(), "deleted 1 operation logs of no workspace and 1 workspaces with no log") {
 		t.Errorf("the report: %s", r)
 	}
-	var checkpoints int
-	if err := poolOf(s).QueryRow(ctx, `SELECT count(*) FROM checkpoint WHERE repository_id = $1 AND workspace = 'old-vfs'`, repo).Scan(&checkpoints); err != nil || checkpoints != 0 {
-		t.Errorf("the deleted workspace's checkpoints: %d (%v)", checkpoints, err)
+	if checkpoints := dbOf(s).count(t, "checkpoint", `repository_id = @repo AND workspace = 'old-vfs'`, map[string]any{"repo": repo}); checkpoints != 0 {
+		t.Errorf("the deleted workspace's checkpoints: %d", checkpoints)
 	}
 	// Every workspace jj clone made is kept, with its log.
 	ws, err := s.ListWorkspaces(ctx, alice, repo)
 	if err != nil || len(ws) != 2 {
 		t.Errorf("alice's workspaces after the pass: %+v (%v)", ws, err)
 	}
-	var heads int
-	if err := poolOf(s).QueryRow(ctx, `SELECT count(*) FROM op_head WHERE op_log_id = $1`, shared).Scan(&heads); err != nil || heads != 0 {
-		t.Errorf("the deleted log's heads: %d (%v)", heads, err)
+	if heads := dbOf(s).count(t, "op_head", `op_log_id = @log`, map[string]any{"log": shared}); heads != 0 {
+		t.Errorf("the deleted log's heads: %d", heads)
 	}
 	if h, err := s.GetOpHeads(ctx, repo, alice, "laptop"); err != nil || len(h) != 1 || h[0] != op {
 		t.Errorf("laptop's heads after the pass: %v (%v)", h, err)
@@ -414,9 +386,10 @@ func TestGCDeletesLogsOfNoWorkspace(t *testing.T) {
 	if err := s.RecordGC(ctx, r, nil); err != nil {
 		t.Fatal(err)
 	}
-	var recorded int64
-	var recordedWorkspaces int64
-	if err := poolOf(s).QueryRow(ctx, `SELECT op_logs_deleted, workspaces_deleted FROM gc_pass WHERE repository_id = $1 ORDER BY started_at DESC LIMIT 1`, repo).Scan(&recorded, &recordedWorkspaces); err != nil || recorded != 1 || recordedWorkspaces != 1 {
-		t.Errorf("the recorded pass: %d logs, %d workspaces (%v)", recorded, recordedWorkspaces, err)
+	var recorded, recordedWorkspaces int64
+	dbOf(s).scan(t, `SELECT op_logs_deleted, workspaces_deleted FROM gc_pass WHERE repository_id = @repo ORDER BY started_at DESC LIMIT 1`,
+		map[string]any{"repo": repo}, &recorded, &recordedWorkspaces)
+	if recorded != 1 || recordedWorkspaces != 1 {
+		t.Errorf("the recorded pass: %d logs, %d workspaces", recorded, recordedWorkspaces)
 	}
 }

@@ -24,6 +24,7 @@ import (
 	"github.com/Cidan/ok/internal/control/people"
 	"github.com/Cidan/ok/internal/control/review"
 	"github.com/Cidan/ok/internal/control/scm"
+	"github.com/Cidan/ok/internal/move"
 	"github.com/Cidan/ok/internal/serve/authn"
 	automationpb "github.com/Cidan/ok/proto/ok/automation/v1"
 	controlpb "github.com/Cidan/ok/proto/ok/control/v1"
@@ -48,23 +49,27 @@ type API struct {
 	review  *review.Service
 	base    string // ok's public URL, for links: https://ok.example.com
 	poll    time.Duration
+	// installation is the installation's organization's handle, "" for a hosted service: its
+	// repositories' full names are their names alone.
+	installation string
 }
 
 // New returns the service over ok control's clients; base is its public address.
-func New(d db.Store, s *scm.Client, runs automationpb.RunsClient, deploys deploypb.DeploymentsClient, rv *review.Service, base string) *API {
-	return &API{db: d, scm: s, runs: runs, deploys: deploys, review: rv, base: strings.TrimRight(base, "/"), poll: Poll}
+func New(d db.Store, s *scm.Client, runs automationpb.RunsClient, deploys deploypb.DeploymentsClient, rv *review.Service, base, installation string) *API {
+	return &API{db: d, scm: s, runs: runs, deploys: deploys, review: rv, base: strings.TrimRight(base, "/"), poll: Poll, installation: installation}
 }
 
 // SetPoll sets how often a watch reads its CL (tests).
 func (a *API) SetPoll(d time.Duration) { a.poll = d }
 
-// caller is the person a request is for. Only a person acts here, and never from another site:
+// caller is the stable ID of the person a request is for. Only a person acts here, and never from
+// another site:
 // a browser sends a cross-site request with the person's session, so one carrying a foreign
 // Origin, or Sec-Fetch-Site other than same-origin or none, is refused — as the CL page's forms
 // refuse it.
 func (a *API) caller(ctx context.Context) (string, error) {
 	c, ok := authn.FromContext(ctx)
-	if !ok || !c.Human || !people.IsHuman(c.Principal) {
+	if !ok || !c.Human {
 		return "", status.Error(codes.PermissionDenied, "ok's ChangeLists serve people only")
 	}
 	if md, ok := metadata.FromIncomingContext(ctx); ok {
@@ -79,7 +84,7 @@ func (a *API) caller(ctx context.Context) (string, error) {
 			}
 		}
 	}
-	return c.Principal, nil
+	return c.ID, nil
 }
 
 func (a *API) sameOrigin(origin string) bool {
@@ -111,17 +116,19 @@ func toStatus(err error) error {
 
 func invalid(msg string) error { return status.Error(codes.InvalidArgument, msg) }
 
-// begin is how every method starts: the caller, and the CL the request names.
-func (a *API) begin(ctx context.Context, ref *controlpb.CLRef) (string, *target, error) {
+// begin is how every method starts: the caller, and the CL the request names; and ctx naming its
+// repository, which each write about it passes the repository's move gate under
+// (move.WithRepository).
+func (a *API) begin(ctx context.Context, ref *controlpb.CLRef) (context.Context, string, *target, error) {
 	me, err := a.caller(ctx)
 	if err != nil {
-		return "", nil, err
+		return ctx, "", nil, err
 	}
 	t, err := a.load(ctx, ref)
 	if err != nil {
-		return "", nil, toStatus(err)
+		return ctx, "", nil, toStatus(err)
 	}
-	return me, t, nil
+	return move.WithRepository(ctx, t.repo.GetId()), me, t, nil
 }
 
 // after answers an action with where its CL stands now, re-read.
@@ -172,30 +179,42 @@ func (a *API) Watch(req *controlpb.CLRef, stream grpc.ServerStreamingServer[cont
 
 // ─── Review ───
 
-// principals are the people a request names, as principals.
-func principals(names []string) []string {
+// principals are the stable IDs of the people a request names, by handle, address, or name.
+func principals(ctx context.Context, names []string) ([]string, error) {
 	var out []string
 	for _, n := range names {
-		if strings.TrimSpace(n) != "" {
-			out = append(out, people.Principal(n))
+		if strings.TrimSpace(n) == "" {
+			continue
 		}
+		id, err := people.ID(ctx, n)
+		switch {
+		case errors.Is(err, people.ErrUnknown):
+			return nil, status.Errorf(codes.FailedPrecondition, "%s is not someone who can review changes", strings.TrimSpace(n))
+		case err != nil:
+			return nil, status.Errorf(codes.Unavailable, "resolving %s: %v", n, err)
+		}
+		out = append(out, id)
 	}
-	return out
+	return out, nil
 }
 
 func (a *API) RequestReview(ctx context.Context, req *controlpb.ReviewersRequest) (*controlpb.CLStatus, error) {
-	me, t, err := a.begin(ctx, req.GetCl())
+	ctx, me, t, err := a.begin(ctx, req.GetCl())
 	if err != nil {
 		return nil, err
 	}
-	if err := a.review.RequestReview(ctx, t.repo, t.cl, me, principals(req.GetReviewers()), req.GetMessage()); err != nil {
+	reviewers, err := principals(ctx, req.GetReviewers())
+	if err != nil {
+		return nil, err
+	}
+	if err := a.review.RequestReview(ctx, t.repo, t.cl, me, reviewers, req.GetMessage()); err != nil {
 		return nil, toStatus(err)
 	}
 	return a.after(ctx, req.GetCl())
 }
 
 func (a *API) ReturnToDraft(ctx context.Context, req *controlpb.CLRef) (*controlpb.CLStatus, error) {
-	me, t, err := a.begin(ctx, req)
+	ctx, me, t, err := a.begin(ctx, req)
 	if err != nil {
 		return nil, err
 	}
@@ -206,28 +225,36 @@ func (a *API) ReturnToDraft(ctx context.Context, req *controlpb.CLRef) (*control
 }
 
 func (a *API) AddReviewers(ctx context.Context, req *controlpb.ReviewersRequest) (*controlpb.CLStatus, error) {
-	me, t, err := a.begin(ctx, req.GetCl())
+	ctx, me, t, err := a.begin(ctx, req.GetCl())
 	if err != nil {
 		return nil, err
 	}
 	if len(req.GetReviewers()) == 0 {
 		return nil, invalid("name the reviewers to add")
 	}
-	if err := a.review.AddReviewers(ctx, t.repo, t.cl, me, principals(req.GetReviewers()), req.GetMessage()); err != nil {
+	reviewers, err := principals(ctx, req.GetReviewers())
+	if err != nil {
+		return nil, err
+	}
+	if err := a.review.AddReviewers(ctx, t.repo, t.cl, me, reviewers, req.GetMessage()); err != nil {
 		return nil, toStatus(err)
 	}
 	return a.after(ctx, req.GetCl())
 }
 
 func (a *API) RemoveReviewers(ctx context.Context, req *controlpb.ReviewersRequest) (*controlpb.CLStatus, error) {
-	me, t, err := a.begin(ctx, req.GetCl())
+	ctx, me, t, err := a.begin(ctx, req.GetCl())
 	if err != nil {
 		return nil, err
 	}
 	if len(req.GetReviewers()) == 0 {
 		return nil, invalid("name the reviewers to remove")
 	}
-	for _, r := range principals(req.GetReviewers()) {
+	reviewers, err := principals(ctx, req.GetReviewers())
+	if err != nil {
+		return nil, err
+	}
+	for _, r := range reviewers {
 		if err := a.review.RemoveReviewer(ctx, t.repo, t.cl, me, r); err != nil {
 			return nil, toStatus(err)
 		}
@@ -236,7 +263,7 @@ func (a *API) RemoveReviewers(ctx context.Context, req *controlpb.ReviewersReque
 }
 
 func (a *API) Reply(ctx context.Context, req *controlpb.ReplyRequest) (*controlpb.CLStatus, error) {
-	me, t, err := a.begin(ctx, req.GetCl())
+	ctx, me, t, err := a.begin(ctx, req.GetCl())
 	if err != nil {
 		return nil, err
 	}
@@ -261,7 +288,7 @@ func (a *API) Reply(ctx context.Context, req *controlpb.ReplyRequest) (*controlp
 }
 
 func (a *API) Comment(ctx context.Context, req *controlpb.CommentRequest) (*controlpb.CLStatus, error) {
-	me, t, err := a.begin(ctx, req.GetCl())
+	ctx, me, t, err := a.begin(ctx, req.GetCl())
 	if err != nil {
 		return nil, err
 	}
@@ -289,7 +316,7 @@ func (a *API) Comment(ctx context.Context, req *controlpb.CommentRequest) (*cont
 }
 
 func (a *API) Resolve(ctx context.Context, req *controlpb.ResolveRequest) (*controlpb.CLStatus, error) {
-	_, t, err := a.begin(ctx, req.GetCl())
+	ctx, _, t, err := a.begin(ctx, req.GetCl())
 	if err != nil {
 		return nil, err
 	}
@@ -302,7 +329,7 @@ func (a *API) Resolve(ctx context.Context, req *controlpb.ResolveRequest) (*cont
 // ─── Lifecycle ───
 
 func (a *API) Submit(ctx context.Context, req *controlpb.SubmitRequest) (*controlpb.CLStatus, error) {
-	me, t, err := a.begin(ctx, req.GetCl())
+	ctx, me, t, err := a.begin(ctx, req.GetCl())
 	if err != nil {
 		return nil, err
 	}
@@ -313,7 +340,7 @@ func (a *API) Submit(ctx context.Context, req *controlpb.SubmitRequest) (*contro
 }
 
 func (a *API) CancelSubmit(ctx context.Context, req *controlpb.CLRef) (*controlpb.CLStatus, error) {
-	me, t, err := a.begin(ctx, req)
+	ctx, me, t, err := a.begin(ctx, req)
 	if err != nil {
 		return nil, err
 	}
@@ -324,7 +351,7 @@ func (a *API) CancelSubmit(ctx context.Context, req *controlpb.CLRef) (*controlp
 }
 
 func (a *API) Abandon(ctx context.Context, req *controlpb.AbandonRequest) (*controlpb.CLStatus, error) {
-	me, t, err := a.begin(ctx, req.GetCl())
+	ctx, me, t, err := a.begin(ctx, req.GetCl())
 	if err != nil {
 		return nil, err
 	}
@@ -335,7 +362,7 @@ func (a *API) Abandon(ctx context.Context, req *controlpb.AbandonRequest) (*cont
 }
 
 func (a *API) Restore(ctx context.Context, req *controlpb.CLRef) (*controlpb.CLStatus, error) {
-	me, t, err := a.begin(ctx, req)
+	ctx, me, t, err := a.begin(ctx, req)
 	if err != nil {
 		return nil, err
 	}
@@ -346,7 +373,7 @@ func (a *API) Restore(ctx context.Context, req *controlpb.CLRef) (*controlpb.CLS
 }
 
 func (a *API) Rollback(ctx context.Context, req *controlpb.RollbackRequest) (*controlpb.RollbackResponse, error) {
-	me, t, err := a.begin(ctx, req.GetCl())
+	ctx, me, t, err := a.begin(ctx, req.GetCl())
 	if err != nil {
 		return nil, err
 	}
@@ -374,7 +401,7 @@ func (a *API) run(ctx context.Context, t *target, id int64) (*automationpb.Run, 
 }
 
 func (a *API) Rerun(ctx context.Context, req *controlpb.RunsRequest) (*controlpb.CLStatus, error) {
-	me, t, err := a.begin(ctx, req.GetCl())
+	ctx, me, t, err := a.begin(ctx, req.GetCl())
 	if err != nil {
 		return nil, err
 	}
@@ -402,15 +429,29 @@ func (a *API) Rerun(ctx context.Context, req *controlpb.RunsRequest) (*controlpb
 		if err := a.review.MayRerun(ctx, t.repo, t.cl, me, r.GetOrigin().GetPatchset()); err != nil {
 			return nil, toStatus(err)
 		}
-		if _, err := a.runs.RerunRun(ctx, &automationpb.RerunRunRequest{Id: id, ForPerson: me}); err != nil && status.Code(err) != codes.FailedPrecondition {
+		if _, err := a.runs.RerunRun(ctx, &automationpb.RerunRunRequest{Id: id, ForPersonId: me}); err != nil && status.Code(err) != codes.FailedPrecondition {
 			return nil, err
 		}
 	}
 	return a.after(ctx, req.GetCl())
 }
 
+func (a *API) RunPre(ctx context.Context, req *controlpb.CLRef) (*controlpb.CLStatus, error) {
+	ctx, me, t, err := a.begin(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	if err := a.review.MayRunPre(ctx, t.repo, t.cl, me); err != nil {
+		return nil, toStatus(err)
+	}
+	if _, err := a.runs.StartPre(ctx, &automationpb.StartPreRequest{RepositoryId: t.repo.GetId(), ClNumber: t.cl.Number, ForPersonId: me}); err != nil {
+		return nil, err
+	}
+	return a.after(ctx, req)
+}
+
 func (a *API) CancelRuns(ctx context.Context, req *controlpb.RunsRequest) (*controlpb.CLStatus, error) {
-	me, t, err := a.begin(ctx, req.GetCl())
+	ctx, me, t, err := a.begin(ctx, req.GetCl())
 	if err != nil {
 		return nil, err
 	}
@@ -424,8 +465,7 @@ func (a *API) CancelRuns(ctx context.Context, req *controlpb.RunsRequest) (*cont
 		if _, err := a.run(ctx, t, id); err != nil {
 			return nil, err
 		}
-		if _, err := a.runs.CancelRun(ctx, &automationpb.CancelRunRequest{Id: id, ForPerson: me,
-			Reason: "canceled by " + people.Handle(me)}); err != nil && status.Code(err) != codes.FailedPrecondition {
+		if _, err := a.runs.CancelRun(ctx, &automationpb.CancelRunRequest{Id: id, ForPersonId: me}); err != nil && status.Code(err) != codes.FailedPrecondition {
 			return nil, err
 		}
 	}
@@ -434,7 +474,7 @@ func (a *API) CancelRuns(ctx context.Context, req *controlpb.RunsRequest) (*cont
 
 func (a *API) ReadLog(req *controlpb.ReadLogRequest, stream grpc.ServerStreamingServer[controlpb.LogChunk]) error {
 	ctx := stream.Context()
-	_, t, err := a.begin(ctx, req.GetCl())
+	ctx, _, t, err := a.begin(ctx, req.GetCl())
 	if err != nil {
 		return err
 	}
@@ -485,7 +525,7 @@ func (a *API) AllowHazards(ctx context.Context, req *controlpb.DeploymentRequest
 // deploymentAction takes action on a deployment of the CL's landed commit, for a person allowed
 // it (review.MayActOnDeployment).
 func (a *API) deploymentAction(ctx context.Context, req *controlpb.DeploymentRequest, action string) (*controlpb.CLStatus, error) {
-	me, t, err := a.begin(ctx, req.GetCl())
+	ctx, me, t, err := a.begin(ctx, req.GetCl())
 	if err != nil {
 		return nil, err
 	}
@@ -508,11 +548,11 @@ func (a *API) deploymentAction(ctx context.Context, req *controlpb.DeploymentReq
 	}
 	switch action {
 	case review.DeploymentRetry:
-		_, err = a.deploys.RetryDeployment(ctx, &deploypb.RetryDeploymentRequest{Id: req.GetDeployment(), ForPerson: me})
+		_, err = a.deploys.RetryDeployment(ctx, &deploypb.RetryDeploymentRequest{Id: req.GetDeployment(), ForPersonId: me})
 	case review.DeploymentHalt:
-		_, err = a.deploys.HaltDeployment(ctx, &deploypb.HaltDeploymentRequest{Id: req.GetDeployment(), ForPerson: me})
+		_, err = a.deploys.HaltDeployment(ctx, &deploypb.HaltDeploymentRequest{Id: req.GetDeployment(), ForPersonId: me})
 	case review.DeploymentAllow:
-		_, err = a.deploys.AllowHazards(ctx, &deploypb.AllowHazardsRequest{Id: req.GetDeployment(), ForPerson: me})
+		_, err = a.deploys.AllowHazards(ctx, &deploypb.AllowHazardsRequest{Id: req.GetDeployment(), ForPersonId: me})
 	}
 	if err != nil {
 		return nil, err

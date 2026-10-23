@@ -122,17 +122,17 @@ func TestCommands(t *testing.T) {
 // The sandbox sees every file, writes only its own directory, and has no network; a run with a job
 // context is told where it is.
 func TestSandbox(t *testing.T) {
-	got := strings.Join(sandbox("/usr/bin/bwrap", nil, "/s/run-1", "/c/ok-context.json"), " ")
+	got := strings.Join(sandbox("/usr/bin/bwrap", nil, "/s/run-1", "/c/ok-context.json", ""), " ")
 	for _, want := range []string{"/usr/bin/bwrap --ro-bind / /", "--proc /proc", "--bind /s/run-1 /s/run-1", "--setenv TMPDIR /s/run-1", "--unshare-net", "--unshare-pid", "--die-with-parent", "--setenv OK_CONTEXT /c/ok-context.json"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("sandbox %q lacks %q", got, want)
 		}
 	}
-	if strings.Contains(strings.Join(sandbox("/usr/bin/bwrap", nil, "/s", ""), " "), "OK_CONTEXT") {
+	if strings.Contains(strings.Join(sandbox("/usr/bin/bwrap", nil, "/s", "", ""), " "), "OK_CONTEXT") {
 		t.Error("a run without a job context was told of one")
 	}
 	// Where a fresh /proc is refused, the pod's is bound, and the sandbox is otherwise the same.
-	bound := strings.Join(sandbox("/usr/bin/bwrap", ProcBound, "/s", ""), " ")
+	bound := strings.Join(sandbox("/usr/bin/bwrap", ProcBound, "/s", "", ""), " ")
 	if !strings.Contains(bound, "--ro-bind /proc /proc") || strings.Contains(bound, "--proc /proc") || !strings.Contains(bound, "--unshare-pid") {
 		t.Errorf("the sandbox with the pod's /proc: %q", bound)
 	}

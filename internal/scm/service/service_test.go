@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"slices"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -15,19 +16,22 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
+	"github.com/Cidan/ok/internal/authz"
 	"github.com/Cidan/ok/internal/identity"
+	"github.com/Cidan/ok/internal/names"
 	"github.com/Cidan/ok/internal/scm/encoding"
 	"github.com/Cidan/ok/internal/scm/pack"
+	"github.com/Cidan/ok/internal/scm/scmtest"
 	"github.com/Cidan/ok/internal/scm/store"
 	scmpostgres "github.com/Cidan/ok/internal/scm/store/postgres"
 	"github.com/Cidan/ok/internal/serve/authn"
+	"github.com/Cidan/ok/internal/tenancy"
 	"github.com/Cidan/ok/internal/testdb"
 	"github.com/Cidan/ok/internal/testdb/testobjects"
 	identitypb "github.com/Cidan/ok/proto/ok/identity/v1"
@@ -60,6 +64,15 @@ func (directory) Principal(_ context.Context, name string) (authn.Principal, err
 	return authn.Principal{Name: name, ID: "id-" + name, Human: strings.Contains(name, ".human."), Active: true}, nil
 }
 
+// PrincipalByID answers for "id-" and a principal's name, the stable ID Principal gives it.
+func (d directory) PrincipalByID(ctx context.Context, id string) (authn.Principal, error) {
+	name, ok := strings.CutPrefix(id, "id-")
+	if !ok {
+		return authn.Principal{}, authn.ErrNotFound
+	}
+	return d.Principal(ctx, name)
+}
+
 func (directory) Credential(context.Context, string) (authn.Principal, error) {
 	return authn.Principal{}, authn.ErrNotFound
 }
@@ -68,8 +81,44 @@ func (directory) Session(context.Context, string) (authn.Principal, error) {
 	return authn.Principal{}, authn.ErrNotFound
 }
 
+// Token answers for a personal token that says what it allows, okp_<role>_<repository>_<name>, and
+// an app's installation token, oki_<role>_<owner>_<robot>.
+func (d directory) Token(ctx context.Context, secret string) (authn.Principal, error) {
+	if rest, ok := strings.CutPrefix(secret, "oki_"); ok {
+		parts := strings.SplitN(rest, "_", 3)
+		if len(parts) != 3 {
+			return authn.Principal{}, authn.ErrNotFound
+		}
+		role, err := tenancy.ParseRole(parts[0])
+		if err != nil {
+			return authn.Principal{}, authn.ErrNotFound
+		}
+		p, err := d.Principal(ctx, parts[2])
+		p.Scope = &authz.Token{Role: role, Owner: parts[1]}
+		return p, err
+	}
+	parts := strings.SplitN(strings.TrimPrefix(secret, "okp_"), "_", 3)
+	if len(parts) != 3 {
+		return authn.Principal{}, authn.ErrNotFound
+	}
+	role, err := tenancy.ParseRole(parts[0])
+	repo, perr := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil || perr != nil {
+		return authn.Principal{}, authn.ErrNotFound
+	}
+	p, err := d.Principal(ctx, parts[2])
+	p.Scope = &authz.Token{Role: role, Repositories: []int64{repo}}
+	return p, err
+}
+
 func (directory) GetPrincipal(_ context.Context, in *identitypb.GetPrincipalRequest, _ ...grpc.CallOption) (*identitypb.GetPrincipalResponse, error) {
 	name := in.GetName()
+	if id := in.GetId(); id != "" {
+		var ok bool
+		if name, ok = strings.CutPrefix(id, "id-"); !ok {
+			return nil, status.Error(codes.NotFound, "no such principal")
+		}
+	}
 	if unknown(name) {
 		return nil, status.Error(codes.NotFound, "no such principal")
 	}
@@ -77,7 +126,7 @@ func (directory) GetPrincipal(_ context.Context, in *identitypb.GetPrincipalRequ
 	if strings.Contains(name, ".human.") {
 		kind = identitypb.Kind_KIND_HUMAN
 	}
-	return &identitypb.GetPrincipalResponse{Principal: &identitypb.Principal{Name: name, Kind: kind, Status: identitypb.Status_STATUS_ACTIVE}}, nil
+	return &identitypb.GetPrincipalResponse{Principal: &identitypb.Principal{Id: "id-" + name, Name: name, Kind: kind, Status: identitypb.Status_STATUS_ACTIVE}}, nil
 }
 
 func (directory) GetSet(_ context.Context, in *identitypb.GetSetRequest, _ ...grpc.CallOption) (*identitypb.GetSetResponse, error) {
@@ -97,6 +146,11 @@ type clients struct {
 	browse  scmpb.BrowseClient
 	events  scmpb.EventsClient
 	ws      scmpb.WorkspacesClient
+	// ten is the directory the SCM names repositories through, and st the SCM's store.
+	ten *tenancyDir
+	st  *store.Store
+	// access decides people's requests; a test drops what it keeps, as the directory's events do.
+	access *access
 }
 
 // testServer serves the services over a store on a new database and a new S3 bucket on the
@@ -105,17 +159,14 @@ type clients struct {
 func testServer(t *testing.T) clients {
 	t.Helper()
 	ctx := context.Background()
-	pool, err := pgxpool.New(ctx, testdb.Postgres(t))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(pool.Close)
+	pool := testdb.Pool(t)
 	blobs := testobjects.Store(t)
 	b, err := scmpostgres.Open(ctx, pool)
 	if err != nil {
 		t.Fatal(err)
 	}
-	s, err := store.New(b, blobs, store.Config{Names: testNames, ObjectCacheBytes: 8 << 20, ChunkCacheBytes: 8 << 20})
+	s, err := store.New(b, blobs, store.Config{Names: testNames, ObjectCacheBytes: 8 << 20, ChunkCacheBytes: 8 << 20,
+		Principals: names.New(names.Client{Dir: directory{}})})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,16 +176,9 @@ func testServer(t *testing.T) clients {
 		okpb.Caller_CALLER_WORKER: workerPrincipal, okpb.Caller_CALLER_DEPLOY: followerPrincipal,
 	}})
 	srv := grpc.NewServer(grpc.ChainUnaryInterceptor(callers.UnaryInterceptor()), grpc.ChainStreamInterceptor(callers.StreamInterceptor()))
-	svc := New(s, directory{})
-	scmpb.RegisterRepositoriesServer(srv, svc.Repositories)
-	scmpb.RegisterStoreServer(srv, svc.Store)
-	scmpb.RegisterChangeListsServer(srv, svc.ChangeLists)
-	scmpb.RegisterReviewServer(srv, svc.Review)
-	scmpb.RegisterLandingServer(srv, svc.Landing)
-	scmpb.RegisterLandingChecksServer(srv, svc.LandingChecks)
-	scmpb.RegisterBrowseServer(srv, svc.Browse)
-	scmpb.RegisterEventsServer(srv, svc.Events)
-	scmpb.RegisterWorkspacesServer(srv, svc.Workspaces)
+	ten := newTenancy()
+	svc := New(s, directory{}, ten, ten)
+	svc.Register(srv)
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -149,7 +193,7 @@ func testServer(t *testing.T) clients {
 	return clients{repos: scmpb.NewRepositoriesClient(conn), store: scmpb.NewStoreClient(conn),
 		cls: scmpb.NewChangeListsClient(conn), review: scmpb.NewReviewClient(conn), landing: scmpb.NewLandingClient(conn),
 		checks: scmpb.NewLandingChecksClient(conn), browse: scmpb.NewBrowseClient(conn), events: scmpb.NewEventsClient(conn),
-		ws: scmpb.NewWorkspacesClient(conn)}
+		ws: scmpb.NewWorkspacesClient(conn), ten: ten, st: s, access: svc.access}
 }
 
 // as is a request from a principal, named as a development server accepts.
@@ -208,126 +252,6 @@ func drain[T any](s grpc.ServerStreamingClient[T], err error) ([]*T, error) {
 	}
 }
 
-// objects builds canonical objects the way jj's client stages them.
-type objects struct {
-	t      *testing.T
-	seq    int
-	order  []*scmpb.EncodedObject
-	files  map[encoding.ID][]byte
-	chunks map[encoding.ID][]byte
-	// workspace is whose operation log a publish's operations and views go to.
-	workspace string
-}
-
-func newObjects(t *testing.T) *objects {
-	return &objects{t: t, files: map[encoding.ID][]byte{}, chunks: map[encoding.ID][]byte{}}
-}
-
-func (b *objects) add(o encoding.Object) encoding.ID {
-	b.t.Helper()
-	canonical, err := encoding.Encode(o)
-	if err != nil {
-		b.t.Fatal(err)
-	}
-	id := encoding.Hash(canonical)
-	b.order = append(b.order, &scmpb.EncodedObject{Kind: scmpb.ObjectKind(o.Kind()), Id: id[:], Body: canonical[1:]})
-	return id
-}
-
-func (b *objects) file(contents []byte) encoding.ID {
-	h := encoding.NewHasher(encoding.KindFile)
-	h.Write(contents)
-	id := h.Sum()
-	b.files[id] = contents
-	return id
-}
-
-func (b *objects) commit(tree encoding.ID, desc string, parents ...encoding.ID) encoding.ID {
-	b.seq++
-	sig := encoding.Signature{Name: "t", Email: "t@example.com", Time: encoding.Timestamp{Millis: 1_790_000_000_000 + int64(b.seq)}}
-	var change encoding.ChangeID
-	copy(change[:], fmt.Sprintf("svc-change-%05d", b.seq))
-	return b.add(&encoding.Commit{
-		Parents: parents, RootTree: encoding.Merge[encoding.ID]{tree}, ConflictLabels: encoding.Merge[string]{""},
-		ChangeID: change, Description: desc, Author: sig, Committer: sig,
-	})
-}
-
-func (b *objects) operation(view encoding.ID, parents ...encoding.ID) encoding.ID {
-	b.seq++
-	return b.add(&encoding.Operation{
-		ViewID: view, Parents: parents,
-		Metadata: encoding.OperationMetadata{
-			Start: encoding.Timestamp{Millis: int64(b.seq)}, End: encoding.Timestamp{Millis: int64(b.seq)},
-			Description: "op", Hostname: "test", Username: "t",
-		},
-		CommitPredecessors: map[encoding.ID][]encoding.ID{},
-	})
-}
-
-const chunkSize = 64 << 10
-
-func (b *objects) manifests() []*scmpb.FileManifest {
-	var out []*scmpb.FileManifest
-	for id, contents := range b.files {
-		m := &scmpb.FileManifest{FileId: id[:], Size: uint64(len(contents)), PathHint: "f"}
-		for off := 0; off < len(contents); off += chunkSize {
-			c := contents[off:min(off+chunkSize, len(contents))]
-			cid := pack.ChunkID(c)
-			b.chunks[cid] = c
-			m.Chunks = append(m.Chunks, &scmpb.ChunkRef{Id: cid[:], Length: uint32(len(c))})
-		}
-		out = append(out, m)
-	}
-	return out
-}
-
-func (b *objects) begin(repo int64) *scmpb.PublishRequest {
-	refs := make([]*scmpb.ObjectRef, len(b.order))
-	for i, o := range b.order {
-		refs[i] = &scmpb.ObjectRef{Kind: o.Kind, Id: o.Id}
-	}
-	return &scmpb.PublishRequest{Step: &scmpb.PublishRequest_Begin_{Begin: &scmpb.PublishRequest_Begin{RepositoryId: repo, Objects: refs, Files: b.manifests(), Workspace: b.workspace}}}
-}
-
-// publish runs a whole Publish exchange, sending exactly what the server reports missing.
-func (b *objects) publish(ctx context.Context, c clients, repo int64, heads *scmpb.OpHeadsUpdate) ([][]byte, *scmpb.PublishResponse_Missing, error) {
-	stream, err := c.store.Publish(ctx)
-	if err != nil {
-		return nil, nil, err
-	}
-	if err := stream.Send(b.begin(repo)); err != nil {
-		return nil, nil, err
-	}
-	resp, err := stream.Recv()
-	if err != nil {
-		return nil, nil, err
-	}
-	missing := resp.GetMissing()
-	byID := map[string]*scmpb.EncodedObject{}
-	for _, o := range b.order {
-		byID[string(o.Id)] = o
-	}
-	for _, r := range missing.GetObjects() {
-		if err := stream.Send(&scmpb.PublishRequest{Step: &scmpb.PublishRequest_Object{Object: byID[string(r.GetId())]}}); err != nil {
-			return nil, missing, err
-		}
-	}
-	for _, cid := range missing.GetChunks() {
-		if err := stream.Send(&scmpb.PublishRequest{Step: &scmpb.PublishRequest_Chunk{Chunk: &scmpb.ChunkData{Id: cid, Data: b.chunks[encoding.ID(cid)]}}}); err != nil {
-			return nil, missing, err
-		}
-	}
-	if err := stream.Send(&scmpb.PublishRequest{Step: &scmpb.PublishRequest_Commit_{Commit: &scmpb.PublishRequest_Commit{OpHeads: heads}}}); err != nil {
-		return nil, missing, err
-	}
-	done, err := stream.Recv()
-	if err != nil {
-		return nil, missing, err
-	}
-	return done.GetDone().GetOpHeads(), missing, nil
-}
-
 func TestAuthorization(t *testing.T) {
 	c := testServer(t)
 	anon := context.Background()
@@ -370,58 +294,84 @@ func TestAuthorization(t *testing.T) {
 	wantCode(t, err, codes.InvalidArgument)
 	_, err = c.repos.GetRepository(alice, &scmpb.GetRepositoryRequest{Key: &scmpb.GetRepositoryRequest_Name{Name: r.GetName() + "-absent"}})
 	wantCode(t, err, codes.NotFound)
+	_, err = c.repos.GetRepository(alice, &scmpb.GetRepositoryRequest{Key: &scmpb.GetRepositoryRequest_Name{Name: "not/a/name"}})
+	wantCode(t, err, codes.NotFound)
 
-	found, token := false, ""
-	for {
-		page, err := c.repos.ListRepositories(alice, &scmpb.ListRepositoriesRequest{PageSize: 2, PageToken: token})
-		if err != nil {
-			t.Fatal(err)
-		}
-		for _, x := range page.GetRepositories() {
-			found = found || x.GetId() == r.GetId()
-		}
-		if token = page.GetNextPageToken(); token == "" {
-			break
-		}
-	}
-	if !found {
-		t.Fatal("list never returned the repository")
-	}
-
-	// Anyone may rename any repository.
+	// The directory names repositories: a person's own are under their handle, and no one makes
+	// another's; a full name that is none is refused.
 	bob := human("bob.human.example.com")
-	renamed, err := c.repos.RenameRepository(bob, &scmpb.RenameRepositoryRequest{RepositoryId: r.GetId(), Name: r.GetName() + "-renamed"})
-	if err != nil || renamed.GetName() != r.GetName()+"-renamed" || renamed.GetCreatedBy() != "alice.human.example.com" {
-		t.Fatalf("rename: %v %v", renamed, err)
+	own, err := c.repos.CreateRepository(bob, &scmpb.CreateRepositoryRequest{Name: "bob/notes"})
+	if err != nil || own.GetName() != "bob/notes" || own.GetCreatedById() != "id-bob.human.example.com" {
+		t.Fatalf("bob's own repository: %v, %v", own, err)
 	}
-	_, err = c.repos.RenameRepository(anon, &scmpb.RenameRepositoryRequest{RepositoryId: r.GetId(), Name: "anon"})
-	wantCode(t, err, codes.Unauthenticated)
+	_, err = c.repos.CreateRepository(bob, &scmpb.CreateRepositoryRequest{Name: "alice/notes"})
+	wantCode(t, err, codes.PermissionDenied)
+	_, err = c.repos.CreateRepository(bob, &scmpb.CreateRepositoryRequest{Name: "Bad Name"})
+	wantCode(t, err, codes.InvalidArgument)
+	// Renamed in the directory, it is found by its new name, under it.
+	c.ten.rename(own.GetId(), "journal")
+	byNew, err := c.repos.GetRepository(bob, &scmpb.GetRepositoryRequest{Key: &scmpb.GetRepositoryRequest_Name{Name: "bob/journal"}})
+	if err != nil || byNew.GetId() != own.GetId() || byNew.GetName() != "bob/journal" {
+		t.Fatalf("after the directory renamed it: %v, %v", byNew, err)
+	}
+	// A creation a stopped replica left half done — the entry reserved, or its storage made too —
+	// resumes when its maker asks again, under the same ID; anyone else finds the name taken.
+	half, err := c.ten.ReserveRepository(context.Background(), &identitypb.ReserveRepositoryRequest{Owner: "bob", Name: "half", ForPersonId: "id-bob.human.example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	made, err := c.ten.ReserveRepository(context.Background(), &identitypb.ReserveRepositoryRequest{Owner: "bob", Name: "made", ForPersonId: "id-bob.human.example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.st.CreateRepository(context.Background(), made.GetId(), made.GetNetworkId(), "id-bob.human.example.com"); err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range []*identitypb.RepositoryEntry{half, made} {
+		got, err := c.repos.CreateRepository(bob, &scmpb.CreateRepositoryRequest{Name: e.GetFullName()})
+		if err != nil || got.GetId() != e.GetId() || got.GetName() != e.GetFullName() {
+			t.Errorf("resuming %s = %v, %v; want ID %d", e.GetFullName(), got, err, e.GetId())
+		}
+	}
+	other, err := c.ten.ReserveRepository(context.Background(), &identitypb.ReserveRepositoryRequest{Name: "pending", ForPersonId: "id-bob.human.example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = c.repos.CreateRepository(alice, &scmpb.CreateRepositoryRequest{Name: "pending"})
+	wantCode(t, err, codes.AlreadyExists)
+	if _, err := c.st.GetRepository(context.Background(), other.GetId()); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("another's half-made entry got storage: %v", err)
+	}
+
+	// ok's roles make repositories only for a person.
+	_, err = c.repos.CreateRepository(control(), &scmpb.CreateRepositoryRequest{Name: "robots"})
+	wantCode(t, err, codes.PermissionDenied)
 }
 
 func TestPublishAndRead(t *testing.T) {
 	c := testServer(t)
 	alice, bob := human("alice.human.example.com"), human("bob.human.example.com")
 	repo := newRepo(t, c).GetId()
-	b := newObjects(t)
+	b := scmtest.NewObjects(t)
 	contents := bytes.Repeat([]byte("ok's scm\n"), 12_000) // two chunks
-	file := b.file(contents)
-	empty := b.file(nil)
-	cp := b.add(&encoding.CopyHistory{CurrentPath: "a.txt"})
-	tree := b.add(&encoding.Tree{Entries: []encoding.TreeEntry{
+	file := b.File(contents)
+	empty := b.File(nil)
+	cp := b.Add(&encoding.CopyHistory{CurrentPath: "a.txt"})
+	tree := b.Add(&encoding.Tree{Entries: []encoding.TreeEntry{
 		{Name: "a.txt", Value: encoding.TreeValue{Kind: encoding.TreeValueFile, ID: file, CopyID: &cp}},
 		{Name: "empty", Value: encoding.TreeValue{Kind: encoding.TreeValueFile, ID: empty}},
 	}})
-	commit := b.commit(tree, "first\n", encoding.RootCommitID)
-	view := b.add(&encoding.View{HeadIDs: []encoding.ID{commit}, WCCommitIDs: map[string]encoding.ID{"default": commit}})
-	op := b.operation(view, encoding.RootOperationID)
+	commit := b.Commit(tree, "first\n", encoding.RootCommitID)
+	view := b.Add(&encoding.View{HeadIDs: []encoding.ID{commit}, WCCommitIDs: map[string]encoding.ID{"default": commit}})
+	op := b.Operation(view, encoding.RootOperationID)
 	for _, who := range []context.Context{alice, bob} {
 		if _, err := c.ws.CreateWorkspace(who, &scmpb.CreateWorkspaceRequest{RepositoryId: repo, Workspace: "default"}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	b.workspace = "default"
+	b.Workspace = "default"
 
-	heads, missing, err := b.publish(alice, c, repo, &scmpb.OpHeadsUpdate{OldIds: [][]byte{encoding.RootOperationID[:]}, NewId: op[:]})
+	heads, missing, err := b.Publish(alice, c.store, repo, &scmpb.OpHeadsUpdate{OldIds: [][]byte{encoding.RootOperationID[:]}, NewId: op[:]})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -472,7 +422,7 @@ func TestPublishAndRead(t *testing.T) {
 	if err != nil || len(objs) != 3 {
 		t.Fatalf("read objects: %v %v", objs, err)
 	}
-	for i, want := range []*scmpb.EncodedObject{b.order[1], b.order[2]} {
+	for i, want := range []*scmpb.EncodedObject{b.Order[1], b.Order[2]} {
 		if o := objs[i].GetObject(); o == nil || !bytes.Equal(o.GetBody(), want.GetBody()) || !bytes.Equal(o.GetId(), want.GetId()) {
 			t.Fatalf("object %d: %v", i, objs[i])
 		}
@@ -549,7 +499,7 @@ func TestPublishAndRead(t *testing.T) {
 		}
 		chunks++
 	}
-	if frames[0].GetSize() != uint64(len(contents)) || !frames[len(frames)-3].GetLast() || chunks != (len(contents)+chunkSize-1)/chunkSize {
+	if frames[0].GetSize() != uint64(len(contents)) || !frames[len(frames)-3].GetLast() || chunks != (len(contents)+scmtest.ChunkSize-1)/scmtest.ChunkSize {
 		t.Fatalf("the file's manifest: %d frames, size %d", chunks, frames[0].GetSize())
 	}
 	if e := frames[len(frames)-2]; !bytes.Equal(e.GetFileId(), empty[:]) || !e.GetLast() || e.GetChunkId() != nil {
@@ -599,16 +549,16 @@ func TestPublishAndRead(t *testing.T) {
 
 	// Republishing sends only what the caller's workspace lacks: nothing for alice's; for bob's,
 	// whose operation log is its own, the operation and the view.
-	again := newObjects(t)
-	again.order, again.files, again.workspace = b.order, b.files, "default"
-	_, missing, err = again.publish(alice, c, repo, nil)
+	again := scmtest.NewObjects(t)
+	again.Order, again.Files, again.Workspace = b.Order, b.Files, "default"
+	_, missing, err = again.Publish(alice, c.store, repo, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(missing.GetObjects()) != 0 || len(missing.GetChunks()) != 0 {
 		t.Fatalf("alice's republish missing %v", missing)
 	}
-	_, missing, err = again.publish(bob, c, repo, nil)
+	_, missing, err = again.Publish(bob, c.store, repo, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -632,10 +582,10 @@ func TestPublishRefusals(t *testing.T) {
 	repo := newRepo(t, c).GetId()
 
 	// A commit whose parent is neither stored nor sent is refused, naming the parent.
-	b := newObjects(t)
+	b := scmtest.NewObjects(t)
 	absent := encoding.ID{0x77}
-	orphan := b.commit(encoding.EmptyTreeID, "orphan\n", absent)
-	_, _, err := b.publish(alice, c, repo, nil)
+	orphan := b.Commit(encoding.EmptyTreeID, "orphan\n", absent)
+	_, _, err := b.Publish(alice, c.store, repo, nil)
 	wantCode(t, err, codes.FailedPrecondition)
 	var rej *scmpb.PublishRejection
 	for _, d := range status.Convert(err).Details() {
@@ -652,13 +602,13 @@ func TestPublishRefusals(t *testing.T) {
 	}
 
 	// A publish that ends before commit makes nothing visible.
-	b = newObjects(t)
-	tree := b.add(&encoding.Tree{Entries: []encoding.TreeEntry{{Name: "x", Value: encoding.TreeValue{Kind: encoding.TreeValueSymlink, ID: b.add(&encoding.Symlink{Target: "y"})}}}})
+	b = scmtest.NewObjects(t)
+	tree := b.Add(&encoding.Tree{Entries: []encoding.TreeEntry{{Name: "x", Value: encoding.TreeValue{Kind: encoding.TreeValueSymlink, ID: b.Add(&encoding.Symlink{Target: "y"})}}}})
 	stream, err := c.store.Publish(alice)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := stream.Send(b.begin(repo)); err != nil {
+	if err := stream.Send(b.Begin(repo)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := stream.Recv(); err != nil {
@@ -705,9 +655,9 @@ func TestPublishRefusals(t *testing.T) {
 // TestCallers pins who may call each service: each declares its callers (ok.v1.callers), which
 // the serving runtime enforces before the service sees a request.
 func TestCallers(t *testing.T) {
-	people, control, automation := okpb.Caller_CALLER_PEOPLE, okpb.Caller_CALLER_CONTROL, okpb.Caller_CALLER_AUTOMATION
+	people, robots, control, automation := okpb.Caller_CALLER_PEOPLE, okpb.Caller_CALLER_ROBOTS, okpb.Caller_CALLER_CONTROL, okpb.Caller_CALLER_AUTOMATION
 	workers, deployer := okpb.Caller_CALLER_WORKER, okpb.Caller_CALLER_DEPLOY
-	code := []okpb.Caller{people, control, automation, workers, deployer}
+	code := []okpb.Caller{people, robots, control, automation, workers, deployer}
 	for svc, want := range map[string][]okpb.Caller{
 		"ok.scm.v1.Repositories":  code,
 		"ok.scm.v1.Store":         code,
@@ -754,5 +704,74 @@ func TestUnreachableIsUnavailable(t *testing.T) {
 		if got := status.Code(toStatus(c.err)); got != c.want {
 			t.Errorf("%s: %s, want %s", c.name, got, c.want)
 		}
+	}
+}
+
+// A creation whose entry expired before its storage was made — the directory refuses to make it
+// active — leaves no storage behind, and says why.
+func TestCreateExpired(t *testing.T) {
+	c := testServer(t)
+	c.ten.slow = true
+	_, err := c.repos.CreateRepository(human("alice.human.example.com"), &scmpb.CreateRepositoryRequest{Name: "slow"})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("an expired creation: %v", err)
+	}
+	c.ten.mu.Lock()
+	var id int64
+	for i, e := range c.ten.byID {
+		if e.GetName() == "slow" {
+			id = i
+		}
+	}
+	c.ten.mu.Unlock()
+	if id == 0 {
+		t.Fatal("no entry was reserved")
+	}
+	if _, err := c.st.GetRepository(context.Background(), id); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("an expired creation's storage: %v", err)
+	}
+}
+
+// Forking through the SCM: a person forks a repository they may read into their own name, its
+// upstream answered; the fork syncs, its main the upstream's; a repository that is no fork does
+// not; nor may someone who cannot write to the fork, nor fork what they cannot see.
+func TestForkAndSync(t *testing.T) {
+	c := testServer(t)
+	alice, bob := human("alice.human.example.com"), human("bob.human.example.com")
+	up, err := c.repos.CreateRepository(alice, &scmpb.CreateRepositoryRequest{Name: "app"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fork, err := c.repos.ForkRepository(bob, &scmpb.ForkRepositoryRequest{Parent: "app", Name: "bob/app"})
+	if err != nil || fork.GetName() != "bob/app" || fork.GetParentId() != up.GetId() || fork.GetParent() != "app" ||
+		!bytes.Equal(fork.GetHead(), up.GetHead()) {
+		t.Fatalf("ForkRepository = %v, %v", fork, err)
+	}
+	if again, err := c.repos.GetRepository(bob, &scmpb.GetRepositoryRequest{Key: &scmpb.GetRepositoryRequest_Id{Id: fork.GetId()}}); err != nil || again.GetParent() != "app" {
+		t.Errorf("the fork, read again = %v, %v", again, err)
+	}
+	if r, err := c.repos.SyncFork(bob, &scmpb.SyncForkRequest{RepositoryId: fork.GetId()}); err != nil || r.GetMoved() || !bytes.Equal(r.GetHead(), up.GetHead()) {
+		t.Errorf("syncing a fork with nothing new = %v, %v", r, err)
+	}
+	if _, err := c.repos.SyncFork(alice, &scmpb.SyncForkRequest{RepositoryId: up.GetId()}); status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("syncing a repository that is no fork: %v", err)
+	}
+	if _, err := c.repos.SyncFork(human("carol.human.example.com"), &scmpb.SyncForkRequest{RepositoryId: fork.GetId()}); status.Code(err) != codes.NotFound &&
+		status.Code(err) != codes.PermissionDenied {
+		t.Errorf("syncing another's fork: %v", err)
+	}
+	if _, err := c.repos.CreateRepository(alice, &scmpb.CreateRepositoryRequest{Name: "alice/private"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.repos.ForkRepository(bob, &scmpb.ForkRepositoryRequest{Parent: "alice/private", Name: "bob/private"}); status.Code(err) != codes.NotFound {
+		t.Errorf("forking a repository one cannot see: %v", err)
+	}
+	if _, err := c.repos.ForkRepository(bob, &scmpb.ForkRepositoryRequest{Parent: "app", Name: "bob/app", ActorId: "id-alice.human.example.com"}); status.Code(err) != codes.InvalidArgument {
+		t.Errorf("forking for another through Repositories: %v", err)
+	}
+	// A personal token reaching another repository forks nothing.
+	tok := metadata.AppendToOutgoingContext(context.Background(), "authorization", fmt.Sprintf("Bearer okp_read_%d_bob.human.example.com", fork.GetId()))
+	if _, err := c.repos.ForkRepository(tok, &scmpb.ForkRepositoryRequest{Parent: "app", Name: "bob/app2"}); status.Code(err) != codes.NotFound {
+		t.Errorf("forking through a token for another repository: %v", err)
 	}
 }

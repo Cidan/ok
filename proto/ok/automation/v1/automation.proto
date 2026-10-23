@@ -12,7 +12,7 @@ import "proto/ok/v1/annotations.proto";
 // ─── Runs: ok control's view and control of automation ───
 
 // Runs serves ok control, acting on behalf of a person it has authorized, whom each request
-// that changes something names (for_person).
+// that changes something names, by stable ID (for_person_id).
 service Runs {
   option (ok.v1.callers) = CALLER_CONTROL;
   // Submit hands the landing queue a CL, or a stack of them bottom first, to land once post
@@ -44,6 +44,10 @@ service Runs {
   // GetPre returns a patchset's pre: its plan, the latest run of each job the plan selected,
   // the workflow jobs it left to main, and whether pre has passed.
   rpc GetPre(GetPreRequest) returns (Pre);
+  // StartPre runs pre by hand on a CL's current patchset — a draft, or a CL under its stack's
+  // top — over everything under it, as at a stack's top (docs/automation.md, "pre"); or, when it
+  // is planned already, resumes the jobs a stop canceled. It returns that pre.
+  rpc StartPre(StartPreRequest) returns (Pre);
 }
 
 // ─── Pushes: the deployer's side ───
@@ -118,6 +122,10 @@ message Job {
   // nothing changed for between it and the candidate (PlannedJob.unchanged_since_pre). Empty
   // when the patchset has no pre.
   bytes pre_commit = 7;
+  // The pool of workers it runs in (docs/hosted.md, "Hosted automation, as built"): a workflow
+  // job's own, else its repository's, else default — as the plan read them; a planning run's is
+  // automation.plan_pool. Empty is default.
+  string pool = 8;
 }
 
 // Why a run exists: its phase, and the CL, patchset, and job it runs for.
@@ -155,8 +163,7 @@ message Run {
   Job job = 4;
   Origin origin = 5;
   Status status = 6;
-  string requested_by = 7;  // the principal the run was started or rerun for
-  int64 rerun_of = 8;       // 0: none
+  int64 rerun_of = 8;  // 0: none
   // 1, or 2 once a lost worker's run is queued again.
   int32 attempt = 9;
   string worker = 10;
@@ -175,6 +182,14 @@ message Run {
   // A post run that never ran: the pre run whose pass it carries, on the CL's patchset, where
   // the job had the same inputs (docs/automation.md, "post"). 0: it ran.
   int64 carried_from = 20;
+  // The stable ID of the principal the run was started or rerun for (docs/hosted.md, "Tenancy,
+  // as built"): ok automation serves ok's roles, which name principals by ID.
+  string requested_by_id = 21;
+  // Who canceled it, or asked its worker to stop it, by stable ID; empty for no one (ok itself),
+  // or a run not canceled. Its reason never names a person.
+  string canceled_by_id = 22;
+  reserved 7;
+  reserved "requested_by";
 }
 
 // An image a push run pushed: where it went, and the digest of its manifest.
@@ -192,7 +207,9 @@ message StartRunRequest {
   Job job = 3;
   Origin origin = 4;
   int32 timeout_seconds = 5;  // 0: the service's default
-  string for_person = 6;      // ok control only
+  string for_person_id = 7;   // ok control only: the stable ID of the person it acts for
+  reserved 6;
+  reserved "for_person";
 }
 
 message GetRunRequest {
@@ -216,12 +233,16 @@ message ListRunsResponse {
 message CancelRunRequest {
   int64 id = 1;
   string reason = 2;
-  string for_person = 3;  // ok control only
+  string for_person_id = 4;  // ok control only
+  reserved 3;
+  reserved "for_person";
 }
 
 message RerunRunRequest {
   int64 id = 1;
-  string for_person = 2;  // ok control only
+  string for_person_id = 3;  // ok control only
+  reserved 2;
+  reserved "for_person";
 }
 
 message ReadLogRequest {
@@ -240,17 +261,25 @@ message LogChunk {
 message LeaseRequest {
   string worker = 1;  // the worker's name, unique among the workers (its pod's)
   int32 wait_seconds = 2;
+  string pool = 3;  // the pool it serves (worker.pool); empty is default
 }
 
 message LeaseResponse {
   Run run = 1;
   // How often to renew the lease: it lapses after three missed renewals.
   int32 heartbeat_seconds = 2;
+  // ok automation serves a remote cache, which the run's Bazel reaches through its worker, naming
+  // the run (docs/hosted.md, "Hosted automation, as built").
+  bool cache = 4;
   // The run's change (docs/automation.md, "The job context"), as JSON: the job context
   // but its changed files, which the worker reads from the SCM and adds before writing the
   // context into the checkout as ok-context.json. Empty for a run that has none (a manual
   // run's).
   bytes context = 3;
+  // The lease's key, minted for this lease and given to this worker alone: what proves to ok
+  // secrets that a request for a post run's secrets is this lease's (docs/secrets.md, "Readers
+  // that are not people").
+  bytes run_key = 5;
 }
 
 message HeartbeatRequest {
@@ -330,6 +359,12 @@ message GetPreRequest {
   int32 patchset = 3;
 }
 
+message StartPreRequest {
+  int64 repository_id = 1;
+  int64 cl_number = 2;
+  string for_person_id = 3;  // ok control only: the stable ID of the person it acts for
+}
+
 // A patchset's pre.
 message Pre {
   enum Verdict {
@@ -356,13 +391,17 @@ message SubmitRequest {
   }
   int64 repository_id = 1;
   repeated CL cls = 2;  // bottom first: a stack lands whole, in this order
-  string for_person = 3;
+  string for_person_id = 4;
+  reserved 3;
+  reserved "for_person";
 }
 
 message CancelSubmissionRequest {
   int64 id = 1;
   string reason = 2;
-  string for_person = 3;  // ok control only
+  string for_person_id = 4;  // ok control only
+  reserved 3;
+  reserved "for_person";
 }
 
 message GetSubmissionRequest {
@@ -396,7 +435,10 @@ message Submission {
   int64 id = 1;
   int64 repository_id = 2;
   repeated CL cls = 3;
-  string submitted_by = 4;
+  string submitted_by_id = 11;  // the submitter's stable ID
+  string canceled_by_id = 12;   // who canceled it, by stable ID; empty for no one
+  reserved 4;
+  reserved "submitted_by";
   Status status = 5;
   string reason = 6;  // why it failed or was canceled
   string note = 7;    // what the queue is waiting for, while it is active
@@ -456,3 +498,17 @@ message ReleaseRequest {
 }
 
 message ReleaseResponse {}
+
+// SecretRuns is ok secrets': whether a request for a post run's secrets is the run's current
+// lease's (docs/secrets.md, "Readers that are not people").
+service SecretRuns {
+  option (ok.v1.callers) = CALLER_SECRETS;
+  // CheckRun is the run, while it is running under the lease the key was minted for: NOT_FOUND
+  // otherwise.
+  rpc CheckRun(CheckRunRequest) returns (Run);
+}
+
+message CheckRunRequest {
+  int64 run_id = 1;
+  bytes run_key = 2;
+}

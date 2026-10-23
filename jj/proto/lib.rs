@@ -25,4 +25,9 @@ pub mod ok {
             tonic::include_proto!("ok.okfs.v1");
         }
     }
+    pub mod secrets {
+        pub mod v1 {
+            tonic::include_proto!("ok.secrets.v1");
+        }
+    }
 }

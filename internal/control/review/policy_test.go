@@ -1,6 +1,7 @@
 package review
 
 import (
+	"context"
 	"errors"
 	"slices"
 	"testing"
@@ -30,6 +31,13 @@ func users(names ...string) []owners.Owner {
 func set(config string, allowSelf bool, names ...string) *owners.Set {
 	return &owners.Set{File: config, Owners: users(names...), AllowSelf: allowSelf, Files: []string{config + ".file"}}
 }
+
+// named are who the tests' OWNERS handles name: each person's ID, which is their name here (no
+// resolver is configured).
+var named = owned{users: map[string]string{"alice": alice, "bob": bob, "carol": carol}}
+
+// withACLs are named, and ACLs' members.
+func withACLs(acls map[string]map[string]bool) owned { return owned{acls: acls, users: named.users} }
 
 func lgtm(p string) grant     { return grant{label: db.LabelLGTM, principal: p} }
 func approval(p string) grant { return grant{label: db.LabelApproval, principal: p} }
@@ -133,7 +141,7 @@ func TestEvaluate(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			st := evaluate(tc.sets, tc.ownersErr, tc.grants, alice, tc.unresolved, false, nil)
+			st := evaluate(tc.sets, tc.ownersErr, tc.grants, alice, tc.unresolved, false, named)
 			if st.LGTMSatisfied != tc.wantLGTM {
 				t.Errorf("LGTMSatisfied = %v, want %v", st.LGTMSatisfied, tc.wantLGTM)
 			}
@@ -158,20 +166,20 @@ func TestEvaluate(t *testing.T) {
 }
 
 func TestCanApprove(t *testing.T) {
-	st := evaluate([]*owners.Set{set("a/OWNERS", false, "bob"), set("b/OWNERS", false, "*")}, nil, nil, alice, 0, false, nil)
-	if !st.CanApprove(bob, alice) || !st.CanApprove(carol, alice) {
+	st := evaluate([]*owners.Set{set("a/OWNERS", false, "bob"), set("b/OWNERS", false, "*")}, nil, nil, alice, 0, false, named)
+	if !st.CanApprove(context.Background(), bob, alice) || !st.CanApprove(context.Background(), carol, alice) {
 		t.Error("bob (owner) and carol (under *) should be able to approve")
 	}
-	if st.CanApprove(alice, alice) {
+	if st.CanApprove(context.Background(), alice, alice) {
 		t.Error("the author must not approve OWNERS-governed files without allowself")
 	}
-	if !evaluate([]*owners.Set{set("", false, "*")}, nil, nil, alice, 0, false, nil).CanApprove(alice, alice) {
+	if !evaluate([]*owners.Set{set("", false, "*")}, nil, nil, alice, 0, false, named).CanApprove(context.Background(), alice, alice) {
 		t.Error("the author may approve files no OWNERS governs")
 	}
 }
 
 func TestBlockedReasonNamesOwners(t *testing.T) {
-	st := evaluate([]*owners.Set{set("a/OWNERS", false, "bob"), set("", false, "*")}, nil, []grant{lgtm(bob)}, alice, 2, false, nil)
+	st := evaluate([]*owners.Set{set("a/OWNERS", false, "bob"), set("", false, "*")}, nil, []grant{lgtm(bob)}, alice, 2, false, named)
 	want := "Needs Approval from //a/OWNERS, Approval from anyone (no OWNERS), no unresolved comments (2 unresolved)"
 	if got := st.BlockedReason(); got != want {
 		t.Errorf("BlockedReason() = %q, want %q", got, want)
@@ -179,7 +187,7 @@ func TestBlockedReasonNamesOwners(t *testing.T) {
 }
 
 func TestOwnersNameHumansByHandle(t *testing.T) {
-	st := evaluate([]*owners.Set{set("a/OWNERS", false, "bob")}, nil, []grant{approval("bob.robot.example.com")}, alice, 0, false, nil)
+	st := evaluate([]*owners.Set{set("a/OWNERS", false, "bob")}, nil, []grant{approval("bob.robot.example.com")}, alice, 0, false, named)
 	if st.Owners[0].Satisfied {
 		t.Error("a robot whose name starts like an owner's handle counts as the owner")
 	}
@@ -189,26 +197,26 @@ func TestOwnersNameHumansByHandle(t *testing.T) {
 // LGTM from anyone but its author and no unresolved comments are all it needs — and its
 // author's LGTM never counts, even where every OWNERS allows self.
 func TestEvaluateRollback(t *testing.T) {
-	st := evaluate(nil, nil, []grant{lgtm(alice)}, alice, 0, true, nil)
+	st := evaluate(nil, nil, []grant{lgtm(alice)}, alice, 0, true, named)
 	if !st.Rollback || st.SelfLGTMAllowed || st.LGTMSatisfied || !st.ApprovalSatisfied() || st.Satisfied() {
 		t.Errorf("the author's own LGTM on a rollback: %+v", st)
 	}
 	if got := st.BlockedReason(); got != "Needs LGTM" {
 		t.Errorf("blocked: %q", got)
 	}
-	st = evaluate(nil, nil, []grant{lgtm(bob)}, alice, 0, true, nil)
+	st = evaluate(nil, nil, []grant{lgtm(bob)}, alice, 0, true, named)
 	if !st.Satisfied() {
 		t.Errorf("a rollback with another's LGTM: %+v", st)
 	}
-	if evaluate(nil, nil, []grant{lgtm(bob)}, alice, 1, true, nil).Satisfied() {
+	if evaluate(nil, nil, []grant{lgtm(bob)}, alice, 1, true, named).Satisfied() {
 		t.Error("a rollback with an unresolved comment is satisfied")
 	}
 	// A file edited by hand needs its owners' Approval, and self never counts for LGTM.
-	st = evaluate([]*owners.Set{set("a/OWNERS", true, "alice", "carol")}, nil, []grant{lgtm(bob)}, alice, 0, true, nil)
+	st = evaluate([]*owners.Set{set("a/OWNERS", true, "alice", "carol")}, nil, []grant{lgtm(bob)}, alice, 0, true, named)
 	if st.SelfLGTMAllowed || !st.Satisfied() || !st.Owners[0].Implicit {
 		t.Errorf("a hand edit its author owns: %+v", st)
 	}
-	st = evaluate([]*owners.Set{set("a/OWNERS", false, "carol")}, nil, []grant{lgtm(bob)}, alice, 0, true, nil)
+	st = evaluate([]*owners.Set{set("a/OWNERS", false, "carol")}, nil, []grant{lgtm(bob)}, alice, 0, true, named)
 	if st.Satisfied() || st.BlockedReason() != "Needs Approval from //a/OWNERS" {
 		t.Errorf("a hand edit without its owners' Approval: %q", st.BlockedReason())
 	}
@@ -216,10 +224,10 @@ func TestEvaluateRollback(t *testing.T) {
 
 func TestEvaluateACLOwners(t *testing.T) {
 	sets := []*owners.Set{{File: "auth/OWNERS", Owners: []owners.Owner{{Kind: owners.ACL, Name: "admins"}}, Files: []string{"auth/x.yaml"}}}
-	acls := aclMembers{"admins.acl.example.com": {bob: true, alice: true}}
+	acls := withACLs(map[string]map[string]bool{"admins.acl.example.com": {bob: true, alice: true}})
 	// carol, no member, approves: it does not count.
-	st := evaluate(sets, nil, []grant{lgtm(carol), approval(carol)}, alice, 0, false, aclMembers{"admins.acl.example.com": {bob: true}})
-	if st.ApprovalSatisfied() || st.CanApprove(carol, alice) || !st.CanApprove(bob, alice) {
+	st := evaluate(sets, nil, []grant{lgtm(carol), approval(carol)}, alice, 0, false, withACLs(map[string]map[string]bool{"admins.acl.example.com": {bob: true}}))
+	if st.ApprovalSatisfied() || st.CanApprove(context.Background(), carol, alice) || !st.CanApprove(context.Background(), bob, alice) {
 		t.Errorf("carol's approval: %+v", st.Owners)
 	}
 	// bob, a member, approves.
@@ -233,7 +241,7 @@ func TestEvaluateACLOwners(t *testing.T) {
 		t.Errorf("the author a member: %+v", st.Owners)
 	}
 	// An ACL not resolved matches nobody.
-	if st := evaluate(sets, nil, []grant{lgtm(alice), approval(bob)}, carol, 0, false, nil); st.ApprovalSatisfied() {
+	if st := evaluate(sets, nil, []grant{lgtm(alice), approval(bob)}, carol, 0, false, named); st.ApprovalSatisfied() {
 		t.Error("an unresolved ACL matched")
 	}
 	if ACLName(owners.Owner{Kind: owners.ACL, Name: "eng"}) != "eng.acl.example.com" {

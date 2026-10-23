@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,6 +22,7 @@ import (
 	"github.com/Cidan/ok/internal/checkout"
 	"github.com/Cidan/ok/internal/deploy/plan"
 	"github.com/Cidan/ok/internal/proc"
+	"github.com/Cidan/ok/internal/secrets"
 	"github.com/Cidan/ok/migrate"
 )
 
@@ -124,8 +126,10 @@ func (b *Bazel) Describe(ctx context.Context, repo int64, commit []byte, targets
 }
 
 // Migrate is `bazel run <target> -- apply [--allow-hazard C]...` at the checkout: the report the
-// migration prints on its standard output, and everything printed.
-func (b *Bazel) Migrate(ctx context.Context, target string, allow []string) (Applied, error) {
+// migration prints on its standard output, and everything printed. Its secrets are files in a
+// directory of their own on a memory file system ($OK_SECRETS_DIR), removed when it ends, and
+// redacted from what it printed.
+func (b *Bazel) Migrate(ctx context.Context, target string, allow []string, values map[string][]byte) (Applied, error) {
 	d, err := b.driver()
 	if err != nil {
 		return Applied{}, err
@@ -134,10 +138,20 @@ func (b *Bazel) Migrate(ctx context.Context, target string, allow []string) (App
 	for _, h := range allow {
 		args = append(args, "--allow-hazard", h)
 	}
-	stdout, all, code, err := run(ctx, b.Checkout.Dir(), b.Env, d.Run(b.Checkout.Dir(), target, args, nil))
+	dir, remove, err := secrets.TempDir(values)
+	if err != nil {
+		return Applied{}, fmt.Errorf("writing %s's secrets: %w", target, err)
+	}
+	defer remove()
+	env := b.Env
+	if dir != "" {
+		env = append(slices.Clone(b.Env), secrets.DirEnv+"="+dir)
+	}
+	stdout, all, code, err := run(ctx, b.Checkout.Dir(), env, d.Run(b.Checkout.Dir(), target, args, nil))
 	if err != nil {
 		return Applied{}, fmt.Errorf("running %s: %w", target, err)
 	}
+	stdout, all = secrets.Redacted(stdout, values), secrets.Redacted(all, values)
 	a := Applied{Output: string(all)}
 	var r migrate.Report
 	if report := bytes.TrimSpace(stdout); json.Unmarshal(report, &r) == nil {

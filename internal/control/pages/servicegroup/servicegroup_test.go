@@ -3,6 +3,7 @@ package servicegroup
 import (
 	"reflect"
 	"testing"
+	"time"
 )
 
 // Services group by their deploy's group, across repositories; a service with no group is a group
@@ -77,9 +78,12 @@ func TestGroupStatus(t *testing.T) {
 	}
 }
 
-// The newest deployment of a group is the one okGroup made last, among its services.
+// The newest deployment of a group is the one ok made last, among its services — by when, not by
+// ID, which is random.
 func TestGroupNewest(t *testing.T) {
-	g := Of([]Service{{ID: 1, Name: "a", Group: "g", DeployedID: 7}, {ID: 2, Name: "b", Group: "g", DeployedID: 9}, {ID: 3, Name: "c", Group: "g"}})[0]
+	t0 := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+	g := Of([]Service{{ID: 1, Name: "a", Group: "g", DeployedID: 9, DeployedAt: t0}, {ID: 2, Name: "b", Group: "g", DeployedID: 7, DeployedAt: t0.Add(time.Minute)},
+		{ID: 3, Name: "c", Group: "g"}})[0]
 	if sv, ok := g.Newest(); !ok || sv.ID != 2 {
 		t.Errorf("newest %v %v", sv.ID, ok)
 	}

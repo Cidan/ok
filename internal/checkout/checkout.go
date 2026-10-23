@@ -5,7 +5,8 @@
 // (docs/okfs.md, "ok's roles"): the commit's tree is mounted read-only at once, a Sync
 // moves it to another commit at once, and each file is read from the SCM the first time
 // something reads it, so a fresh service plans or builds without first writing the whole tree.
-// The service runs in a user and mount namespace of its own (Isolate), where the mount is made.
+// The service is started in a user and mount namespace of its own (RequireIsolated), where the
+// mount is made.
 package checkout
 
 import (

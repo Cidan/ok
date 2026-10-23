@@ -1,0 +1,65 @@
+package pages
+
+import (
+	"strconv"
+
+	"github.com/Cidan/ok/internal/web/layout"
+	"github.com/Cidan/ok/internal/web/nav"
+)
+
+// SearchPage is a repository's code search (docs/hosted.md, "ok control at scale, as built"): main's
+// files, as their latest index says.
+templ SearchPage(n nav.Model, v SearchView) {
+	@layout.Shell(shell("Search · "+v.Chrome.Name+" · "+Brand, layout.LeftNav, n)) {
+		@SearchContent(v)
+	}
+}
+
+templ SearchContent(v SearchView) {
+	<div class="flex h-full flex-1 flex-col overflow-hidden">
+		<div class="shrink-0">
+			@PageHead(v.Chrome.Name, v.Chrome.Subtitle, "") {
+				@changesLink(v.Chrome.ChangesHref, "#repo-main")
+				@codeButton(v.Chrome.Clone)
+			}
+		</div>
+		<div id="repo-main" class="flex-1 overflow-y-auto">
+			<div class="mx-auto w-full max-w-5xl space-y-6 px-6 pb-16 sm:px-10">
+				<form method="get" action={ templ.SafeURL(v.Action) } class="space-y-3">
+					<div class="flex gap-3">
+						<input name="q" type="text" value={ v.Query } required autofocus autocomplete="off" spellcheck="false" placeholder="Search main's code…" class="min-w-0 flex-1 rounded-lg border border-zinc-800 bg-zinc-900/50 px-3.5 py-2.5 font-mono text-sm text-zinc-100 placeholder:text-zinc-600 transition-colors focus:border-zinc-600 focus:outline-none"/>
+						<input name="path" type="text" value={ v.Path } autocomplete="off" spellcheck="false" placeholder="Path: *.go, api/" class="w-48 rounded-lg border border-zinc-800 bg-zinc-900/50 px-3.5 py-2.5 font-mono text-sm text-zinc-100 placeholder:text-zinc-600 transition-colors focus:border-zinc-600 focus:outline-none"/>
+						<button type="submit" class={ btnClass(btnInverse) }>Search</button>
+					</div>
+					<div class="flex gap-5 text-sm text-zinc-400">
+						<label class="flex items-center gap-2"><input type="checkbox" name="regexp" value="1" checked?={ v.Regexp } class="accent-zinc-300"/> Regular expression</label>
+						<label class="flex items-center gap-2"><input type="checkbox" name="case" value="1" checked?={ v.CaseSensitive } class="accent-zinc-300"/> Match case</label>
+					</div>
+				</form>
+				if v.Notice != "" {
+					<div id="search-notice" class="rounded-lg border border-zinc-800 bg-zinc-900/30 px-4 py-3 text-sm text-zinc-400">{ v.Notice }</div>
+				}
+				if v.Error != "" {
+					<div class="rounded-lg border border-red-900/50 bg-red-950/20 px-4 py-3 text-sm text-red-400">{ v.Error }</div>
+				}
+				if v.Query != "" && v.Error == "" && v.Notice == "" && len(v.Files) == 0 {
+					<div class="py-10 text-center text-sm text-zinc-500">Nothing in main matches.</div>
+				}
+				for _, f := range v.Files {
+					<section data-search-file class="overflow-hidden rounded-lg border border-zinc-800 bg-zinc-900/40">
+						<a href={ templ.SafeURL(f.Href) } class="block border-b border-zinc-800/70 px-4 py-2 font-mono text-sm text-sky-400 hover:text-sky-300">{ f.Path }</a>
+						for _, l := range f.Lines {
+							<a href={ templ.SafeURL(l.Href) } data-search-line class="flex gap-4 px-4 py-1 font-mono text-xs hover:bg-zinc-800/40">
+								<span class="w-10 shrink-0 text-right text-zinc-600">{ strconv.Itoa(l.Number) }</span>
+								<span class="min-w-0 flex-1 truncate whitespace-pre text-zinc-300">{ l.Before }<mark class="rounded-sm bg-amber-400/25 text-amber-200">{ l.Match }</mark>{ l.After }</span>
+							</a>
+						}
+					</section>
+				}
+				if v.Truncated {
+					<div class="text-center text-xs text-zinc-500">The first { strconv.Itoa(v.Shown) } lines: narrow the search for the rest.</div>
+				}
+			</div>
+		</div>
+	</div>
+}

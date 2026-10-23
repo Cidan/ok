@@ -8,6 +8,9 @@ import (
 	"context"
 	"strings"
 	"time"
+
+	"github.com/Cidan/ok/internal/move"
+	"github.com/Cidan/ok/internal/work"
 )
 
 // Store is ok control's database.
@@ -16,6 +19,12 @@ type Store interface {
 	// Txn runs fn in one read-write transaction, again if the database aborts it to break a
 	// deadlock or a conflict; fn has no effects outside the transaction.
 	Txn(ctx context.Context, fn func(tx Ops) error) error
+	// Moves are its rows about repositories, for a move between cells (docs/hosted.md, "Cells, as
+	// built"); every write transaction about a repository named in ctx (move.WithRepository)
+	// reads its gate first.
+	Moves() move.Rows
+	// Work is its keyed work's store: the outboxes' draining (OutboxWork).
+	Work() work.Store
 }
 
 // Ops are the store's reads and writes. Outside a transaction each is its own; inside Txn they
@@ -46,27 +55,28 @@ type Ops interface {
 	// SetApproved stores the approved projection, reporting whether it changed.
 	SetApproved(ctx context.Context, repo, number int64, approved bool) (bool, error)
 
-	// LegacyCursor is the last event of the SCM's feed the projection applied before it followed
-	// each repository's log (0: none); ForgetLegacyCursor forgets it.
-	LegacyCursor(ctx context.Context) (int64, error)
-	ForgetLegacyCursor(ctx context.Context) error
 	// FollowCursor is the last place in key's log on topic applied (0: none). LockFollowCursor
 	// reads it and, in a transaction, holds it against every other writer until the transaction
-	// ends: the feed's appliers take it before applying an event. SetFollowCursor records it;
-	// SeedFollowCursor sets it if there is none.
+	// ends: the feed's appliers take it before applying an event. SetFollowCursor records it.
 	FollowCursor(ctx context.Context, topic string, key int64) (int64, error)
+	// FollowCursors are FollowCursor's of keys, at once; a key with none is absent.
+	FollowCursors(ctx context.Context, topic string, keys []int64) (map[int64]int64, error)
 	LockFollowCursor(ctx context.Context, topic string, key int64) (int64, error)
 	SetFollowCursor(ctx context.Context, topic string, key, seq int64) error
-	SeedFollowCursor(ctx context.Context, topic string, key, seq int64) error
 
-	// CreateRepository records a repository the SCM created. The request that created it and
-	// the change-feed follower both record it, often at once, so a repository already recorded —
-	// by its ID, or by its name — is left as it is, without an error. The feed applies events in
-	// the SCM's order, so a name another repository still holds here (renamed in the SCM, the
-	// rename not yet applied) is recorded when the feed reaches the creation.
+	// CreateRepository records a repository the SCM created. The request that created it, the
+	// change-feed follower, and the directory's follower each record it, often at once, so a
+	// repository already recorded is left as it is, without an error — but for its name, which
+	// the change feed does not know: one recorded with none takes the name given here, the one it
+	// was created with, so the request that created it lists it at once. Its name after is the
+	// directory's (NameRepository).
 	CreateRepository(ctx context.Context, r Repository) error
-	// RenameRepository records a rename.
-	RenameRepository(ctx context.Context, id int64, name string) error
+	// NameRepository records a repository as the directory's events say it is: its full name, and
+	// whether it is deleted — recording it, from its creator and creation, if it is not.
+	NameRepository(ctx context.Context, r Repository) error
+	// DropRepository forgets a repository the directory purged: its CLs — their reviewers, labels,
+	// comments, and events — its favorites, and its row.
+	DropRepository(ctx context.Context, id int64) error
 	// MoveHead records main moving forward: its commit count and when.
 	MoveHead(ctx context.Context, id, headSeq int64, at time.Time) error
 	// RepositoryByName reads a repository's projection by its name.
@@ -74,6 +84,9 @@ type Ops interface {
 	// ListRepositories lists the repositories whose name contains keyword literally (all of them
 	// for ""), a page at a time: principal's favorites first, then the most recently updated.
 	ListRepositories(ctx context.Context, principal, keyword string, offset, limit int) ([]Repository, error)
+	// RepositoriesByID are those of ids this cell holds and has not deleted — their names "" until
+	// the directory's events name them — each with whether it is principal's favorite, in no order.
+	RepositoriesByID(ctx context.Context, principal string, ids []int64) ([]Repository, error)
 
 	// Reviewers lists a CL's reviewers in the order they were added.
 	Reviewers(ctx context.Context, repo, number int64) ([]Reviewer, error)
@@ -105,8 +118,42 @@ type Ops interface {
 	// CL-level comments are messages, not threads.
 	UnresolvedThreads(ctx context.Context, repo, number int64) (int64, error)
 
-	// RecordEvent appends to a CL's history. A zero At is now.
+	// RecordEvent appends to a CL's history. A zero At is now. It and CreateComment put what they
+	// record in the repository's outbox, and mark its keyed work (OutboxWork), in what they write.
 	RecordEvent(ctx context.Context, repo, number int64, e Event) error
+	// Outbox are up to limit of a repository's outbox's entries, oldest first; DoneOutbox removes
+	// those done. OutboxRepositories are the repositories with entries waiting.
+	Outbox(ctx context.Context, repo int64, limit int) ([]OutboxEntry, error)
+	DoneOutbox(ctx context.Context, repo int64, ids []int64) error
+	OutboxRepositories(ctx context.Context) ([]int64, error)
+	// GetEvent is one of a CL's events.
+	GetEvent(ctx context.Context, repo, number, id int64) (Event, bool, error)
+	// QueueHeadMoved puts main's move to a head, the repository's head_seq'th, in its outbox, and
+	// marks its work.
+	QueueHeadMoved(ctx context.Context, repo, seq int64, head []byte) error
+
+	// ─── Webhooks (docs/hosted.md, "ok control at scale, as built") ───
+
+	// CreateWebhook records a webhook; Webhooks are a repository's, oldest first; DeleteWebhook
+	// removes one and its deliveries.
+	CreateWebhook(ctx context.Context, w Webhook) error
+	Webhooks(ctx context.Context, repo int64) ([]Webhook, error)
+	DeleteWebhook(ctx context.Context, repo, id int64) error
+	// QueueDeliveries queues deliveries and marks the repository's webhooks' work (WebhookWork).
+	QueueDeliveries(ctx context.Context, repo int64, ds []Delivery) error
+	// DueDeliveries are up to limit of a repository's waiting deliveries due by a time, oldest
+	// first; NextDelivery is when its next waiting one is due (zero: none).
+	DueDeliveries(ctx context.Context, repo int64, before time.Time, limit int) ([]Delivery, error)
+	NextDelivery(ctx context.Context, repo int64) (time.Time, error)
+	// WaitingDeliveries are the repositories with deliveries waiting.
+	WaitingDeliveries(ctx context.Context) ([]int64, error)
+	// UpdateDelivery writes a delivery's state, attempts, next try, and last answer.
+	UpdateDelivery(ctx context.Context, d Delivery) error
+	// Deliveries are a webhook's latest, up to limit; GetDelivery is one; PruneDeliveries removes
+	// all but its latest keep that are done.
+	Deliveries(ctx context.Context, repo, webhook int64, limit int) ([]Delivery, error)
+	GetDelivery(ctx context.Context, repo, id int64) (Delivery, bool, error)
+	PruneDeliveries(ctx context.Context, repo, webhook int64, keep int) error
 	// Events lists a CL's history, oldest first.
 	Events(ctx context.Context, repo, number int64) ([]Event, error)
 	// LastAbandon is a CL's most recent abandonment, if any.
@@ -183,10 +230,100 @@ func ParseFilter(s string) Filter {
 // Repository is the projection of an SCM repository.
 type Repository struct {
 	ID        int64
-	Name      string
+	Name      string // its full name, as the directory's events say; "" before they do
+	Deleted   bool
 	CreatedBy string
 	CreatedAt time.Time
 	HeadSeq   int64
 	UpdatedAt time.Time
 	Favorite  bool // for the principal the listing is for
+}
+
+// OutboxWork is the keyed work that drains a repository's outbox.
+const OutboxWork = "outbox"
+
+// OutboxEntry is what waits in a repository's outbox: an event of one of its CLs' histories, or a
+// comment.
+type OutboxEntry struct {
+	ID        int64
+	Number    int64 // 0: main's move, of no CL
+	QueuedAt  time.Time
+	EventID   int64
+	CommentID int64
+	// HeadSeq and Head are main's move's: the repository's head_seq'th head, and its commit.
+	HeadSeq int64
+	Head    []byte
+}
+
+// WebhookWork is the keyed work that sends a repository's webhooks' deliveries.
+const WebhookWork = "webhooks"
+
+// Webhook events, a bit each.
+const (
+	WebhookCL   = 1 << 0 // a CL's events and comments
+	WebhookPush = 1 << 1 // main moved
+)
+
+// Webhook is a repository's endpoint for its events.
+type Webhook struct {
+	Repository int64
+	ID         int64
+	URL        string
+	Events     int64
+	Secret     []byte // sealed
+	CreatedBy  string
+	CreatedAt  time.Time
+}
+
+// Delivery states.
+const (
+	DeliveryWaiting   = 0
+	DeliveryDelivered = 1
+	DeliveryDead      = 2
+)
+
+// Delivery is an event sent, or to be sent, to a webhook.
+type Delivery struct {
+	Repository int64
+	ID         int64
+	Webhook    int64
+	Event      string // cl, push, ping
+	Payload    []byte
+	State      int
+	Attempts   int
+	NextTry    time.Time
+	LastStatus int
+	LastError  string
+	CreatedAt  time.Time
+}
+
+// PreAt is the CL whose pre covers a CL's — the top of its stack in review, the lowest numbered of
+// them where the stack branches — when that is another CL; 0 otherwise. Pre runs at a stack's
+// top, over every CL of it (docs/automation.md, "pre").
+func PreAt(ctx context.Context, o Ops, repo, number int64) (int64, error) {
+	stack, err := o.Stack(ctx, repo, number)
+	if err != nil {
+		return 0, err
+	}
+	// Its descendants follow it, each after its parent.
+	var above []ChangeList
+	for i, c := range stack {
+		if c.Number == number {
+			above = stack[i+1:]
+			break
+		}
+	}
+	stackedOn := map[int64]bool{} // a CL in review is stacked on it
+	for _, c := range above {
+		if c.Status == StatusOpen {
+			stackedOn[c.ParentNumber] = true
+		}
+	}
+	var top int64
+	for _, c := range above {
+		if c.Status == StatusOpen && !stackedOn[c.Number] && (top == 0 || c.Number < top) {
+			top = c.Number
+		}
+	}
+	return top, nil
 }

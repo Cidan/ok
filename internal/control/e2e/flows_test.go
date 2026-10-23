@@ -1,6 +1,8 @@
 package e2e
 
 import (
+	"context"
+	"fmt"
 	"net/http"
 	"net/url"
 	"path/filepath"
@@ -9,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/Cidan/ok/internal/control/db"
+	identitypb "github.com/Cidan/ok/proto/ok/identity/v1"
 )
 
 // chip reports whether a page has a status chip reading label.
@@ -35,7 +38,7 @@ func TestRepositoriesAndBrowsing(t *testing.T) {
 
 	// Creating in the web makes the person the repository's creator.
 	p := e.post(alice, "/repositories/new", url.Values{"name": {"browse"}})
-	if p.status != http.StatusSeeOther || p.header.Get("Location") != "/browse" {
+	if p.status != http.StatusSeeOther || p.header.Get("Location") != "/example/browse" {
 		t.Fatalf("create: %d to %q", p.status, p.header.Get("Location"))
 	}
 	if p := e.post(bob, "/repositories/new", url.Values{"name": {"browse"}}); !p.has("A repository named browse already exists") {
@@ -44,8 +47,89 @@ func TestRepositoriesAndBrowsing(t *testing.T) {
 	if p := e.post(bob, "/repositories/new", url.Values{"name": {"assets"}}); !p.has("reserved for ok's own pages") {
 		t.Errorf("a reserved name: %s", excerpt(p.body))
 	}
+	// The form offers the installation's organization, then the person themselves; a repository
+	// of one's own is at one's handle, and another's handle is refused.
+	if p := e.get(bob, "/repositories/new"); !p.has(`<option value="example" selected>`) || !p.has(`<option value="bob">`) {
+		t.Errorf("the form's owners: %s", excerpt(p.body))
+	}
+	if p := e.post(bob, "/repositories/new", url.Values{"owner": {"bob"}, "name": {"notes"}}); p.status != http.StatusSeeOther || p.header.Get("Location") != "/bob/notes" {
+		t.Errorf("bob's own repository: %d to %q: %s", p.status, p.header.Get("Location"), excerpt(p.body))
+	}
+	if p := e.post(bob, "/repositories/new", url.Values{"owner": {"alice"}, "name": {"notes"}}); !p.has("makes repositories of their own") {
+		t.Errorf("a repository of another's: %s", excerpt(p.body))
+	}
+	// An installation's repository at its bare name redirects to its path, the rest of the path
+	// and the query with it.
+	for from, to := range map[string]string{"/browse": "/example/browse", "/browse/cls?status=open": "/example/browse/cls?status=open"} {
+		if p := e.do(alice, http.MethodGet, from, nil, nil); p.status != http.StatusFound || p.header.Get("Location") != to {
+			t.Errorf("%s: %d to %q, want %s", from, p.status, p.header.Get("Location"), to)
+		}
+	}
+	// Renamed in the directory, its old name's pages redirect to its new one, and a form posted to
+	// the old name is refused; its maker administers it, and renames it back.
+	ten := e.tenancy(alice)
+	entry, err := ten.ResolveRepository(context.Background(), &identitypb.ResolveRepositoryRequest{Name: "browse"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ten.RenameRepository(context.Background(), &identitypb.RenameRepositoryEntryRequest{Id: entry.GetId(), Name: "browsing"}); err != nil {
+		t.Fatal(err)
+	}
+	e.waitFor("the rename", func() bool {
+		p := e.do(alice, http.MethodGet, "/example/browse/cls", nil, nil)
+		return p.status == http.StatusFound && p.header.Get("Location") == "/example/browsing/cls"
+	})
+	if p := e.do(bob, http.MethodPost, "/example/browse/action/star", url.Values{}, nil); p.status != http.StatusNotFound {
+		t.Errorf("a form posted to a name it had: %d", p.status)
+	}
+	if _, err := ten.RenameRepository(context.Background(), &identitypb.RenameRepositoryEntryRequest{Id: entry.GetId(), Name: "browse"}); err != nil {
+		t.Fatal(err)
+	}
+	e.waitFor("the rename back", func() bool { return e.do(alice, http.MethodGet, "/example/browse", nil, nil).status == http.StatusOK })
+
+	// What a person cannot see is not there, however asked: bob's own repository, private, is not
+	// in alice's finder; renamed, its old name redirects bob and tells alice nothing. Made public, it
+	// reads to anyone, signed in or not; a form posted to it needs a person.
+	if p := e.do(alice, http.MethodGet, "/bob/notes", nil, nil); p.status != http.StatusNotFound {
+		t.Errorf("another's private repository: %d", p.status)
+	}
+	bobTen := e.tenancy(bob)
+	notes, err := bobTen.ResolveRepository(context.Background(), &identitypb.ResolveRepositoryRequest{Owner: "bob", Name: "notes"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.waitFor("bob's repository in his finder", func() bool { return e.get(bob, "/repositories/list?q=notes").has(`href="/bob/notes"`) })
+	if p := e.get(alice, "/repositories/list?q=notes"); p.has(`/bob/notes`) {
+		t.Errorf("another's private repository in the finder: %s", excerpt(p.body))
+	}
+	if _, err := bobTen.RenameRepository(context.Background(), &identitypb.RenameRepositoryEntryRequest{Id: notes.GetId(), Name: "journal"}); err != nil {
+		t.Fatal(err)
+	}
+	e.waitFor("bob's rename", func() bool {
+		p := e.do(bob, http.MethodGet, "/bob/notes", nil, nil)
+		return p.status == http.StatusFound && p.header.Get("Location") == "/bob/journal"
+	})
+	if p := e.do(alice, http.MethodGet, "/bob/notes", nil, nil); p.status != http.StatusNotFound || p.header.Get("Location") != "" {
+		t.Errorf("a private repository's old name, to another: %d to %q", p.status, p.header.Get("Location"))
+	}
+	if p := e.do("", http.MethodGet, "/bob/journal", nil, nil); p.status != http.StatusSeeOther || !strings.HasPrefix(p.header.Get("Location"), "/id/login") {
+		t.Errorf("a private repository, to no one signed in: %d to %q", p.status, p.header.Get("Location"))
+	}
+	if p := e.do("", http.MethodGet, "/example/browse", nil, nil); p.status != http.StatusSeeOther || !strings.HasPrefix(p.header.Get("Location"), "/id/login") {
+		t.Errorf("an internal repository, to no one signed in: %d to %q", p.status, p.header.Get("Location"))
+	}
+	if _, err := bobTen.UpdateRepository(context.Background(), &identitypb.UpdateRepositoryRequest{Id: notes.GetId(), Visibility: "public"}); err != nil {
+		t.Fatal(err)
+	}
+	e.waitFor("the repository made public", func() bool { return e.do("", http.MethodGet, "/bob/journal", nil, nil).status == http.StatusOK })
+	if p := e.get(alice, "/bob/journal"); p.status != http.StatusOK {
+		t.Errorf("a public repository, to another: %d", p.status)
+	}
+	if p := e.do("", http.MethodPost, "/bob/journal/action/star", url.Values{}, nil); p.status != http.StatusUnauthorized {
+		t.Errorf("a form posted to a public repository by no one signed in: %d", p.status)
+	}
 	// Every stylesheet, script, and icon a page references is served, as what it is.
-	for _, page := range []string{"/", "/browse"} {
+	for _, page := range []string{"/", "/example/browse"} {
 		body := e.get(alice, page).body
 		refs := regexp.MustCompile(`(?:href|src)="(/(?:assets/[^"]+|favicon\.svg))"`).FindAllStringSubmatch(body, -1)
 		if len(refs) < 5 {
@@ -64,7 +148,7 @@ func TestRepositoriesAndBrowsing(t *testing.T) {
 		t.Errorf("a font: %d", p.status)
 	}
 
-	home := e.get(alice, "/browse")
+	home := e.get(alice, "/example/browse")
 	if !home.has("Created by alice") || !home.has("Nothing has landed on main yet") || !home.has("jj clone browse") {
 		t.Fatalf("a new repository: %s", excerpt(home.body))
 	}
@@ -84,21 +168,21 @@ func TestRepositoriesAndBrowsing(t *testing.T) {
 
 	// The repository view: entries with their last commits, the README rendered with its
 	// links resolved, the latest commit.
-	home = e.get(bob, "/browse")
-	for _, want := range []string{">svc<", ">README.md<", "a first change", `href="/browse/tree/main/svc/main.go"`, `src="/browse/raw/main/img/logo.svg"`, ">1</span> commit"} {
+	home = e.get(bob, "/example/browse")
+	for _, want := range []string{">svc<", ">README.md<", "a first change", `href="/example/browse/tree/main/svc/main.go"`, `src="/example/browse/raw/main/img/logo.svg"`, ">1</span> commit"} {
 		if !home.has(want) {
 			t.Errorf("repository view lacks %s:\n%s", want, excerpt(home.body))
 		}
 	}
-	dir := e.get(bob, "/browse/tree/main/svc")
+	dir := e.get(bob, "/example/browse/tree/main/svc")
 	if !dir.has(">main.go<") {
 		t.Errorf("a directory: %s", excerpt(dir.body))
 	}
-	file := e.get(bob, "/browse/tree/main/svc/main.go")
+	file := e.get(bob, "/example/browse/tree/main/svc/main.go")
 	if !file.has(`<span class="cm">   spanning lines */</span>`) || !file.has("Blame") || !file.has("History") {
 		t.Errorf("a source file (highlighted across lines): %s", excerpt(file.body))
 	}
-	blame := e.get(bob, "/browse/blame/main/svc/main.go")
+	blame := e.get(bob, "/example/browse/blame/main/svc/main.go")
 	if !blame.has("a first change") || !blame.has(">alice<") {
 		t.Errorf("blame: %s", excerpt(blame.body))
 	}
@@ -113,7 +197,7 @@ func TestRepositoriesAndBrowsing(t *testing.T) {
 	if !file.has(`data-path="svc/main.go" aria-current="page"`) || !blame.has(`data-browse-kind="blame"`) {
 		t.Errorf("the browser's path: %s", excerpt(file.body))
 	}
-	if !dir.has(`hx-get="/browse/tree-children/main/img"`) {
+	if !dir.has(`hx-get="/example/browse/tree-children/main/img"`) {
 		t.Errorf("a folder off the path is fetched on opening: %s", excerpt(dir.body))
 	}
 	if home.has("data-browser") {
@@ -122,48 +206,48 @@ func TestRepositoriesAndBrowsing(t *testing.T) {
 	// A navigation within the browser swaps the pane alone; any other, the content region; a
 	// history restore gets the whole document.
 	nav := map[string]string{"HX-Request": "true"}
-	pane := e.do(bob, http.MethodGet, "/browse/tree/main/svc", nil, map[string]string{"HX-Request": "true", "HX-Target": "div#browse-main"})
+	pane := e.do(bob, http.MethodGet, "/example/browse/tree/main/svc", nil, map[string]string{"HX-Request": "true", "HX-Target": "div#browse-main"})
 	if !strings.HasPrefix(pane.body, `<div data-browse-path="svc" data-browse-kind="dir"`) || pane.has("data-browser") {
 		t.Errorf("the pane alone: %s", excerpt(pane.body))
 	}
-	if content := e.do(bob, http.MethodGet, "/browse/tree/main/svc", nil, nav); !strings.HasPrefix(content.body, "<div data-browser") {
+	if content := e.do(bob, http.MethodGet, "/example/browse/tree/main/svc", nil, nav); !strings.HasPrefix(content.body, "<div data-browser") {
 		t.Errorf("the content region: %s", excerpt(content.body))
 	}
-	restore := e.do(bob, http.MethodGet, "/browse/tree/main/svc", nil, map[string]string{"HX-Request": "true", "HX-History-Restore-Request": "true", "HX-Target": "main#content"})
+	restore := e.do(bob, http.MethodGet, "/example/browse/tree/main/svc", nil, map[string]string{"HX-Request": "true", "HX-History-Restore-Request": "true", "HX-Target": "main#content"})
 	if !strings.HasPrefix(strings.ToLower(restore.body), "<!doctype html>") || !restore.has("hx-history-elt") {
 		t.Errorf("a history restore: %s", excerpt(restore.body))
 	}
-	children := e.do(bob, http.MethodGet, "/browse/tree-children/main/img", nil, nav)
+	children := e.do(bob, http.MethodGet, "/example/browse/tree-children/main/img", nil, nav)
 	if !strings.HasPrefix(children.body, `<li role="treeitem" aria-level="2">`) || !children.has(`data-path="img/logo.svg"`) || children.has("data-browser") {
 		t.Errorf("a folder's rows: %s", excerpt(children.body))
 	}
-	if p := e.do(bob, http.MethodGet, "/browse/tree-children/main/nowhere", nil, nav); p.status != http.StatusNotFound {
+	if p := e.do(bob, http.MethodGet, "/example/browse/tree-children/main/nowhere", nil, nav); p.status != http.StatusNotFound {
 		t.Errorf("the rows of a folder that is not there: %d", p.status)
 	}
-	history := e.get(bob, "/browse/commits?path=svc")
+	history := e.get(bob, "/example/browse/commits?path=svc")
 	if !history.has("a first change") || !history.has("CL 1") {
 		t.Errorf("history of a directory: %s", excerpt(history.body))
 	}
-	if p := e.get(bob, "/browse/commits?path=nowhere"); !p.has("No commits found") {
+	if p := e.get(bob, "/example/browse/commits?path=nowhere"); !p.has("No commits found") {
 		t.Errorf("history of a path nothing changed: %s", excerpt(p.body))
 	}
-	m := regexp.MustCompile(`href="/browse/commit/([0-9a-f]{64})"`).FindStringSubmatch(history.body)
+	m := regexp.MustCompile(`href="/example/browse/commit/([0-9a-f]{64})"`).FindStringSubmatch(history.body)
 	if m == nil {
 		t.Fatalf("no commit link in %s", excerpt(history.body))
 	}
-	commit := e.get(bob, "/browse/commit/"+m[1])
+	commit := e.get(bob, "/example/browse/commit/"+m[1])
 	for _, want := range []string{"a first change", "CL 1", "svc/main.go", "README.md", "+5"} {
 		if !commit.has(want) {
 			t.Errorf("the commit page lacks %s: %s", want, excerpt(commit.body))
 		}
 	}
-	at := e.get(bob, "/browse/tree/"+m[1]+"/svc")
+	at := e.get(bob, "/example/browse/tree/"+m[1]+"/svc")
 	if !at.has("Back to main") {
 		t.Errorf("browsing at a commit: %s", excerpt(at.body))
 	}
 
 	// Every page is under the site's policy: no inline script or style, no framing.
-	for _, path := range []string{"/", "/browse", "/browse/tree/main/svc", "/browse/cls"} {
+	for _, path := range []string{"/", "/example/browse", "/example/browse/tree/main/svc", "/example/browse/cls"} {
 		h := e.get(bob, path).header
 		if csp := h.Get("Content-Security-Policy"); !strings.Contains(csp, "default-src 'self'") || !strings.Contains(csp, "frame-ancestors 'none'") ||
 			h.Get("X-Frame-Options") != "DENY" || h.Get("X-Content-Type-Options") != "nosniff" {
@@ -173,9 +257,9 @@ func TestRepositoriesAndBrowsing(t *testing.T) {
 
 	// Raw bytes: nothing a browser could run is served live.
 	for _, tc := range []struct{ path, ctype string }{
-		{"/browse/raw/main/page.html", "text/plain; charset=utf-8"},
-		{"/browse/raw/main/img/logo.svg", "image/svg+xml"},
-		{"/browse/raw/main/svc/main.go", "text/plain; charset=utf-8"},
+		{"/example/browse/raw/main/page.html", "text/plain; charset=utf-8"},
+		{"/example/browse/raw/main/img/logo.svg", "image/svg+xml"},
+		{"/example/browse/raw/main/svc/main.go", "text/plain; charset=utf-8"},
 	} {
 		p := e.get(bob, tc.path)
 		if got := p.header.Get("Content-Type"); got != tc.ctype {
@@ -192,7 +276,7 @@ func TestRepositoriesAndBrowsing(t *testing.T) {
 	if !list.has(">zebra<") || list.has(">browse<") {
 		t.Errorf("search: %s", excerpt(list.body))
 	}
-	if p := e.do(bob, http.MethodPost, "/browse/action/star", url.Values{}, nil); p.status != http.StatusNoContent {
+	if p := e.do(bob, http.MethodPost, "/example/browse/action/star", url.Values{}, nil); p.status != http.StatusNoContent {
 		t.Fatalf("favorite: %d", p.status)
 	}
 	rows := e.get(bob, "/").body
@@ -204,10 +288,10 @@ func TestRepositoriesAndBrowsing(t *testing.T) {
 	if p := e.do(bob, http.MethodGet, "/nowhere", nil, nil); p.status != http.StatusNotFound {
 		t.Errorf("an unknown repository: %d", p.status)
 	}
-	if p := e.do("", http.MethodGet, "/browse", nil, nil); p.status != http.StatusSeeOther || p.header.Get("Location") != "/id/login?next=%2Fbrowse" {
+	if p := e.do("", http.MethodGet, "/example/browse", nil, nil); p.status != http.StatusSeeOther || p.header.Get("Location") != "/id/login?next=%2Fexample%2Fbrowse" {
 		t.Errorf("a request from no one signed in: %d, to %q", p.status, p.header.Get("Location"))
 	}
-	if p := e.do(bob, http.MethodPost, "/browse/action/unstar", url.Values{}, map[string]string{"Sec-Fetch-Site": "cross-site"}); p.status != http.StatusForbidden {
+	if p := e.do(bob, http.MethodPost, "/example/browse/action/unstar", url.Values{}, map[string]string{"Sec-Fetch-Site": "cross-site"}); p.status != http.StatusForbidden {
 		t.Errorf("a cross-site post: %d", p.status)
 	}
 }
@@ -234,10 +318,10 @@ func TestChangeListLifecycle(t *testing.T) {
 	a.write("svc/lib/lib.go", "package lib\n\nfunc One() int { return 1 }\n\nfunc Two() int { return 2 }\n")
 	cl := uploaded(a.jj("svc", "cl"))[0]
 	path := clPath("svc", cl)
-	// Submit is never hidden: greyed, with the reason, for everyone.
+	// Submit is never hidden: greyed, with the reason, for everyone. Another member may triage it.
 	p := e.get(bob, path)
-	if !chip(p, "Draft") || submitTitle(p, "Submit") != "Request review first: a draft can't be submitted" || canSubmit(p, "submit") || p.has("/request-review") {
-		t.Fatalf("a draft seen by someone else: %s", excerpt(p.body))
+	if !chip(p, "Draft") || submitTitle(p, "Submit") != "Request review first: a draft can't be submitted" || canSubmit(p, "submit") || !p.has("/request-review") {
+		t.Fatalf("a draft seen by another member: %s", excerpt(p.body))
 	}
 	if n := strings.Count(p.body, "two from lib"); n != 2 {
 		t.Errorf("the title shows as the heading and the message's first line, %d times in all", n)
@@ -247,18 +331,15 @@ func TestChangeListLifecycle(t *testing.T) {
 		t.Errorf("a draft's author: submit %q", got)
 	}
 	// The review dialog offers bob, lib's owner, pre-selected.
-	if !regexp.MustCompile(`name="reviewer" value="bob.human.example.com"[^>]*checked`).MatchString(p.body) || !p.has("//lib/OWNERS") {
+	if !regexp.MustCompile(`name="reviewer" value="`+regexp.QuoteMeta(e.id(bob))+`"[^>]*checked`).MatchString(p.body) || !p.has("//lib/OWNERS") {
 		t.Errorf("the review dialog: %s", excerpt(p.body))
 	}
-	if p := e.do(carol, http.MethodGet, path+"/reviewers/search?q=car", nil, nil); !p.has(`data-id="carol.human.example.com"`) {
+	if p := e.do(carol, http.MethodGet, path+"/reviewers/search?q=car", nil, nil); !p.has(`data-id="` + e.id(carol) + `"`) {
 		t.Errorf("reviewer search: %s", excerpt(p.body))
-	}
-	if n := notice(e.post(carol, path+"/request-review", url.Values{})); n != "Only the author or a repository admin can request review on this changelist" {
-		t.Errorf("someone else requesting review: %q", n)
 	}
 
 	// Request review, with bob and a message.
-	p = e.post(alice, path+"/request-review", url.Values{"reviewer": {bob}, "message": {"please look"}})
+	p = e.post(alice, path+"/request-review", url.Values{"reviewer": {e.id(bob)}, "message": {"please look"}})
 	if !chip(p, "Open") || !logged(p, "alice", "requested review") || !logged(p, "alice", "added reviewer bob") || !p.has("please look") {
 		t.Fatalf("request review: %s", excerpt(p.body))
 	}
@@ -300,7 +381,7 @@ func TestChangeListLifecycle(t *testing.T) {
 		t.Errorf("bob's grants: %s", excerpt(p.body))
 	}
 	e.waitFor("approval", func() bool { return e.hasEvent("svc", cl, db.EventApproved) })
-	if list := e.get(alice, "/svc/cls"); !chip(list, "Approved") {
+	if list := e.get(alice, "/example/svc/cls"); !chip(list, "Approved") {
 		t.Errorf("the finder's approved CL: %s", excerpt(list.body))
 	}
 	if n := notice(e.post(carol, path+"/submit", nil)); n != "Only the author or a repository admin can submit this changelist" {
@@ -316,21 +397,25 @@ func TestChangeListLifecycle(t *testing.T) {
 	if !logged(p, "alice", "sent it to the landing queue") || !logged(p, "alice", "submitted to main as") {
 		t.Fatalf("submit: %s", excerpt(p.body))
 	}
-	if h := e.get(bob, "/svc/commits"); !h.has("two from lib") || !h.has("CL 2") {
+	if h := e.get(bob, "/example/svc/commits"); !h.has("two from lib") || !h.has("CL 2") {
 		t.Errorf("history: %s", excerpt(h.body))
 	}
 	if n := notice(e.post(alice, path+"/reply", grant("LGTM"))); !strings.Contains(n, "submitted") {
 		t.Errorf("a grant on a submitted CL: %q", n)
 	}
 
-	// Abandon and restore; an admin may, someone else may not.
+	// Abandon and restore: its author, an admin, and anyone who may triage the repository — in an
+	// installation, every member — may.
 	b.jj("", "clone", "svc")
 	b.write("svc/notes.txt", "notes\n")
 	b.jj("svc", "describe", "-m", "notes")
 	nb := uploaded(b.jj("svc", "cl"))[0]
 	bpath := clPath("svc", nb)
-	if n := notice(e.post(carol, bpath+"/abandon", url.Values{})); n != "Only the author or a repository admin can abandon this changelist" {
-		t.Errorf("someone else abandoning: %q", n)
+	if p := e.post(carol, bpath+"/abandon", url.Values{}); !chip(p, "Abandoned") || !logged(p, "carol", "abandoned the change") {
+		t.Fatalf("a member, who may triage, abandoning bob's CL: %s", excerpt(p.body))
+	}
+	if p := e.post(carol, bpath+"/restore", nil); !chip(p, "Draft") {
+		t.Fatalf("a member restoring it: %s", excerpt(p.body))
 	}
 	p = e.post(bob, bpath+"/abandon", url.Values{"reason": {"not needed"}})
 	if !chip(p, "Abandoned") || !p.has("not needed") || !regexp.MustCompile(`jj abandon [k-z]{32}`).MatchString(p.body) {
@@ -384,10 +469,13 @@ func TestStacksConflictsAndOwners(t *testing.T) {
 		e.post(bob, p+"/reply", grant("LGTM"))
 		e.post(alice, p+"/reply", grant("Approval"))
 	}
-	e.prePassed("stack", stack[0])
+	// Pre runs at the stack's top, over both: the bottom runs none of its own.
 	e.prePassed("stack", stack[1])
+	if p := e.get(alice, bottom+"/checks"); !p.has(fmt.Sprintf("Pre runs at CL %d, the top of this changelist's stack", stack[1])) {
+		t.Errorf("the bottom's Checks tab: %s", excerpt(p.body))
+	}
 	p := e.get(alice, top)
-	if got := submitTitle(p, "Submit"); got != "Submit the parent changelist (CL "+strings.TrimPrefix(bottom, "/stack/cl/")+") first, or submit the stack" {
+	if got := submitTitle(p, "Submit"); got != "Submit the parent changelist (CL "+strings.TrimPrefix(bottom, "/example/stack/cl/")+") first, or submit the stack" {
 		t.Errorf("the top of a stack alone: %q", got)
 	}
 	if !canSubmit(p, "submit-stack") || !p.has("Submit Stack (2)") {
@@ -429,10 +517,10 @@ func TestStacksConflictsAndOwners(t *testing.T) {
 
 	// Reviewers: removing one revokes their grants.
 	p = e.get(alice, clPath("stack", nc))
-	if !p.has("reviewers/remove?principal=bob.human.example.com") {
+	if !p.has("reviewers/remove?" + url.Values{"principal": {e.id(bob)}}.Encode()) {
 		t.Fatalf("no way to remove bob: %s", excerpt(p.body))
 	}
-	p = e.post(alice, clPath("stack", nc)+"/reviewers/remove?principal=bob.human.example.com", nil)
+	p = e.post(alice, clPath("stack", nc)+"/reviewers/remove?"+url.Values{"principal": {e.id(bob)}}.Encode(), nil)
 	if !logged(p, "alice", "removed reviewer bob") || !strings.Contains(submitTitle(p, "Submit"), "LGTM") {
 		t.Errorf("removing a reviewer revokes their grants: %q\n%s", submitTitle(p, "Submit"), excerpt(p.body))
 	}

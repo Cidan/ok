@@ -1,4 +1,4 @@
-// Command ok is ok's one binary: its roles' servers (ok identity serve, ok scm serve, ok control serve, ok automation serve, ok worker run, ok deploy serve), signing a machine in (ok
+// Command ok is ok's one binary: its roles' servers (ok identity serve, ok scm serve, ok control serve, ok automation serve, ok worker run, ok deploy serve, ok secrets serve), signing a machine in (ok
 // auth), administering (ok admin), and checks of what a repository declares — its groups-and-ACLs
 // tree, OWNERS files, workflow files — and what a change affects in a Bazel workspace.
 package main
@@ -17,6 +17,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/Cidan/ok/internal/automation/microvm"
 	"github.com/Cidan/ok/internal/buildsys/bazel"
 	"github.com/Cidan/ok/internal/config"
 	"github.com/Cidan/ok/internal/directory"
@@ -29,7 +30,7 @@ const usage = `ok — source control and code review, with automation on Bazel
 
 Usage:
   ok version                               the release this ok is
-  ok serve [-config ok.yaml] [-roles all|identity,scm,automation,deploy,control] [-dev]
+  ok serve [-config ok.yaml] [-roles all|identity,scm,automation,deploy,control,secrets] [-dev]
                                            run several server roles in one process, on one port
   ok identity serve [-config ok.yaml] [-dev]
                                            run the identity role
@@ -37,13 +38,30 @@ Usage:
   ok identity certify [-config ok.yaml] -dir DIR ROBOT
                                            certify a key for a robot the configuration names, from
                                            identity's database and CA: a role where nothing vouches for it
+  ok identity move-in [-config ok.yaml] [-organization HANDLE]
+                                           move the installation in as an organization of a hosted
+                                           service, from identity's database, ok's roles stopped
   ok scm serve [-config ok.yaml] [-dev]    run the SCM role
   ok control serve [-config ok.yaml] [-dev]  run ok control: review and the web UI
   ok automation serve [-config ok.yaml] [-dev]
                                            run ok automation: pre, post, and the landing queue
   ok worker run [-config ok.yaml]          run an automation worker: Bazel on each run's commit
   ok deploy serve [-config ok.yaml] [-color blue|green]
+  ok deploy agent -address host:port (-token-file F | -credential-dir D) [-state DIR] [-kubeconfig F]
+  ok load run -address host:port [-repositories N] [-speed S] [-duration D] [-report F]
+  ok load cost -report F -measured F -prices F
+  ok load merge [-report F] REPORT...
+  ok load people -n N -hash-file F [-dir D]
                                            run the deployer: migrations, rolls, and the tree
+  ok secrets serve [-config ok.yaml] [-dev]
+                                           run ok secrets: repositories' secrets, sealed under their own keys
+  ok secrets rotate REPOSITORY             make a repository's next key version
+  ok secrets rewrap REPOSITORY             wrap its data keys again under its newest key, retiring the rest
+  ok secrets transfer -to STORE REPOSITORY move its secrets' sealed values into another store
+  ok secrets audit [-limit N] REPOSITORY   print every decision about its secrets
+  ok secrets keyring -id ID                print a new key for a keyring root (secrets.root: keyring:FILE)
+  ok edge serve [-config ok.yaml] [-dev]   run the edge in front of a deployment's cells: authenticates,
+                                           limits, and routes each request to its repository's cell
   ok scm fsck [-repair] REPOSITORY         verify a repository against the SCM's invariants
   ok scm gc [-dry-run] REPOSITORY          run a garbage-collection pass over a repository now
   ok auth login -server URL                sign this machine in, in a browser
@@ -69,6 +87,11 @@ func main() {
 		if errors.Is(err, flag.ErrHelp) {
 			os.Exit(0)
 		}
+		// A command run elsewhere ended so (ok worker vm-exec).
+		var es exitStatus
+		if errors.As(err, &es) {
+			os.Exit(int(es))
+		}
 		fmt.Fprintln(os.Stderr, "ok:", err)
 		var u usageError
 		if errors.As(err, &u) {
@@ -81,6 +104,11 @@ func main() {
 
 // version is ok's release, stamped at build (-ldflags "-X main.version=…").
 var version = "dev"
+
+// exitStatus is a command's exit status, as another command it ran ended.
+type exitStatus int
+
+func (e exitStatus) Error() string { return fmt.Sprintf("exit status %d", int(e)) }
 
 type usageError string
 
@@ -131,14 +159,42 @@ func run(args []string, stdin io.Reader, stdout io.Writer) error {
 		return identityServe(args[2:])
 	case "scm serve":
 		return scmServe(args[2:])
+	case "edge serve":
+		return edgeServe(args[2:])
 	case "control serve":
 		return controlServe(args[2:])
 	case "automation serve":
 		return automationServe(args[2:])
 	case "worker run":
 		return workerRun(args[2:])
+	case "worker guest":
+		return microvm.Guest()
+	case "worker vm-exec":
+		return workerVMExec(args[2:])
 	case "deploy serve":
 		return deployServe(args[2:])
+	case "deploy agent":
+		return deployAgent(args[2:])
+	case "secrets serve":
+		return secretsServe(args[2:])
+	case "secrets rotate":
+		return secretsRotate(args[2:], stdout)
+	case "secrets rewrap":
+		return secretsRewrap(args[2:], stdout)
+	case "secrets transfer":
+		return secretsTransfer(args[2:], stdout)
+	case "secrets audit":
+		return secretsAudit(args[2:], stdout)
+	case "secrets keyring":
+		return secretsKeyring(args[2:], stdout)
+	case "load run":
+		return loadRun(args[2:], stdout)
+	case "load cost":
+		return loadCost(args[2:], stdout)
+	case "load merge":
+		return loadMerge(args[2:], stdout)
+	case "load people":
+		return loadPeople(args[2:], stdout)
 	case "config check":
 		return configCheck(args[2:], stdout)
 	case "scm fsck":
@@ -155,6 +211,8 @@ func run(args []string, stdin io.Reader, stdout io.Writer) error {
 		return identityCertify(args[2:], stdout)
 	case "identity check":
 		return identityCheck(args[2:], stdout)
+	case "identity move-in":
+		return identityMoveIn(args[2:], stdout)
 	case "owners check":
 		return ownersCheck(args[2:], stdout)
 	case "workflow check":

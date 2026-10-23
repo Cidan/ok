@@ -21,10 +21,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Cidan/ok/internal/bus/bustest"
+	"github.com/Cidan/ok/internal/work"
+
 	"github.com/jackc/pgx/v5/pgxpool"
 	"google.golang.org/grpc"
 
 	"github.com/Cidan/ok/internal/automation/role"
+	"github.com/Cidan/ok/internal/automation/store"
 	"github.com/Cidan/ok/internal/automation/worker"
 	"github.com/Cidan/ok/internal/blob"
 	"github.com/Cidan/ok/internal/checkout"
@@ -35,15 +39,18 @@ import (
 	"github.com/Cidan/ok/internal/identity"
 	"github.com/Cidan/ok/internal/pgdb"
 	scmrole "github.com/Cidan/ok/internal/scm/role"
+	"github.com/Cidan/ok/internal/secrets/keys/keystest"
+	secretsrole "github.com/Cidan/ok/internal/secrets/role"
 	"github.com/Cidan/ok/internal/serve"
 	"github.com/Cidan/ok/internal/serve/node"
 	"github.com/Cidan/ok/internal/testbazel"
-	"github.com/Cidan/ok/internal/testdb"
+	"github.com/Cidan/ok/internal/testdb/roledb"
 	"github.com/Cidan/ok/internal/testdb/testobjects"
 	"github.com/Cidan/ok/internal/testjj"
 	automationpb "github.com/Cidan/ok/proto/ok/automation/v1"
 	identitypb "github.com/Cidan/ok/proto/ok/identity/v1"
 	scmpb "github.com/Cidan/ok/proto/ok/scm/v1"
+	secretspb "github.com/Cidan/ok/proto/ok/secrets/v1"
 )
 
 const (
@@ -52,19 +59,27 @@ const (
 	automation = "automation.ok.robot.example.com"
 	workerBot  = "worker.ok.robot.example.com"
 	scmBot     = "scm.ok.robot.example.com"
+	secretsBot = "secrets.ok.robot.example.com"
+	deployBot  = "deploy.ok.robot.example.com"
 )
 
 // env is one test's ok: its roles' addresses, and clients as the roles that call them.
 type env struct {
-	t     *testing.T
-	ctx   context.Context
-	scm   string // the SCM's address, host:port
-	auto  string // ok automation's
-	id    string // ok identity's
-	runs  automationpb.RunsClient
-	jj    string
-	bazel string
-	bwrap string
+	t    *testing.T
+	ctx  context.Context
+	scm  string // the SCM's address, host:port
+	auto string // ok automation's
+	id   string // ok identity's
+	// secrets is ok secrets' address, when the test runs it (startWithSecrets): "" otherwise.
+	secrets string
+	adaID   string // ada's stable ID, as ok identity minted it
+	runs    automationpb.RunsClient
+	// automation is ok automation's store, which a test reaches past its services: to hold a
+	// repository's landing queue.
+	automation *store.Store
+	jj         string
+	bazel      string
+	bwrap      string
 	// state holds the workers' slots, output bases, and kept graphs, as one machine's disk.
 	state string
 }
@@ -72,10 +87,21 @@ type env struct {
 // serveRole runs a role's root on a loopback port until the test ends.
 func serveRole(t *testing.T, ctx context.Context, root node.Node, opts ...serve.Option) string {
 	t.Helper()
+	return serveOn(t, ctx, listen(t), root, opts...)
+}
+
+func listen(t *testing.T) net.Listener {
+	t.Helper()
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
+	return lis
+}
+
+// serveOn runs a role's root on lis until the test ends.
+func serveOn(t *testing.T, ctx context.Context, lis net.Listener, root node.Node, opts ...serve.Option) string {
+	t.Helper()
 	ctx, cancel := context.WithCancel(ctx)
 	done := make(chan error, 1)
 	go func() { done <- serve.Run(ctx, root, append(opts, serve.WithListener(lis))...) }()
@@ -101,7 +127,19 @@ func bucket(t *testing.T) blob.Store {
 }
 
 // start runs ok identity, the SCM, and ok automation for a test.
-func start(t *testing.T) *env {
+func start(t *testing.T, opts ...func(*config.Config)) *env {
+	t.Helper()
+	return startAll(t, false, opts...)
+}
+
+// startWithSecrets runs ok secrets beside them, under a keyring (docs/secrets.md), its workers
+// reaching it; ok identity's tree declares ops (ada).
+func startWithSecrets(t *testing.T, opts ...func(*config.Config)) *env {
+	t.Helper()
+	return startAll(t, true, opts...)
+}
+
+func startAll(t *testing.T, withSecrets bool, opts ...func(*config.Config)) *env {
 	t.Helper()
 	jj := testjj.Path(t)
 	e := &env{t: t, jj: jj, bazel: testbazel.Bazel(t), bwrap: testbazel.Bwrap(t), state: t.TempDir()}
@@ -113,20 +151,34 @@ func start(t *testing.T) *env {
 		t.Fatal(err)
 	}
 	os.WriteFile(filepath.Join(dir, "people.yaml"), []byte("people:\n  - {id: \"1\", email: ada@example.com, name: Ada}\n"), 0o644)
-	cfg, err := config.Parse([]byte(`
+	text := `
 domain: example.com
 public_url: http://127.0.0.1:1
-roles: {identity: identity.ok, scm: scm.ok, control: control.ok, automation: automation.ok, worker: worker.ok}
+roles: {identity: identity.ok, scm: scm.ok, control: control.ok, automation: automation.ok, worker: worker.ok, deploy: deploy.ok, secrets: secrets.ok}
 identity:
   ca_dir: ` + filepath.Join(dir, "ca") + `
   system_of_record: {static: {file: ` + filepath.Join(dir, "people.yaml") + `}}
-`))
+`
+	if withSecrets {
+		text += "secrets: {root: \"" + keystest.Keyring(t, 1) + "\"}\n"
+	}
+	cfg, err := config.Parse([]byte(text))
 	if err != nil {
 		t.Fatal(err)
 	}
-	url := testdb.Postgres(t)
+	cfg.Bus = bustest.Config(t)
+	for _, o := range opts {
+		o(cfg)
+	}
+	// The roles' databases (roledb, as OK_TEST_DATABASE names them): on Spanner each role opens its
+	// own as cfg says, and no pool.
+	dbs := roledb.New(t)
+	dbs.Configure(cfg)
 	open := func(schema string) *pgxpool.Pool {
-		p, err := pgdb.Open(ctx, url, schema, 0)
+		if dbs.OnSpanner() {
+			return nil
+		}
+		p, err := pgdb.Open(ctx, dbs.URL(), schema, 0)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -140,7 +192,8 @@ identity:
 	idAddr := serveRole(t, ctx, id.Root, serve.WithAuthn(id.Resolver))
 	e.id = idAddr
 	for i := 0; ; i++ {
-		if _, err := id.Store.Principal(ctx, ada); err == nil {
+		if p, err := id.Store.Principal(ctx, ada); err == nil {
+			e.adaID = p.ID
 			break
 		}
 		if i == 200 {
@@ -148,7 +201,16 @@ identity:
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	scm, err := scmrole.Build(ctx, cfg, scmrole.Options{Dev: true, Pool: open(scmrole.Schema), Blobs: bucket(t), Identity: as(t, idAddr, scmBot)})
+	// ok secrets listens first: the SCM asks it about uploads' secrets, and it asks the SCM and ok
+	// automation in turn.
+	var secLis net.Listener
+	var scmSecrets grpc.ClientConnInterface
+	if withSecrets {
+		secLis = listen(t)
+		scmSecrets = as(t, secLis.Addr().String(), scmBot)
+	}
+	scm, err := scmrole.Build(ctx, cfg, scmrole.Options{Dev: true, Pool: open(scmrole.Schema), Blobs: bucket(t), Identity: as(t, idAddr, scmBot),
+		Secrets: scmSecrets})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -160,8 +222,25 @@ identity:
 		t.Fatal(err)
 	}
 	t.Cleanup(auto.Close)
+	e.automation = auto.Store
 	e.auto = serveRole(t, ctx, auto.Root, serve.WithAuthn(auto.Resolver))
 	e.runs = automationpb.NewRunsClient(as(t, e.auto, control))
+	if withSecrets {
+		sec, err := secretsrole.Build(ctx, cfg, secretsrole.Options{Dev: true, Pool: open(secretsrole.Schema), Identity: as(t, idAddr, secretsBot),
+			SCM: as(t, e.scm, secretsBot), Automation: as(t, e.auto, secretsBot)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(sec.Close)
+		e.secrets = serveOn(t, ctx, secLis, sec.Root, serve.WithAuthn(sec.Resolver))
+		file := func(path, members string) *identitypb.File {
+			return &identitypb.File{Path: path, Content: []byte("members: [" + members + "]\n")}
+		}
+		if _, err := identitypb.NewTreeClient(as(t, idAddr, deployBot)).Apply(ctx, &identitypb.ApplyRequest{Commit: "seed", Sequence: 1,
+			Files: []*identitypb.File{file("acl.yaml", ada), file("ops/acl.yaml", ada)}}); err != nil {
+			t.Fatal(err)
+		}
+	}
 	return e
 }
 
@@ -210,6 +289,7 @@ func (e *env) startWorkerAt(name string, slots int, auto string) *runningWorker 
 	cfg := worker.Config{
 		Name:        name,
 		Work:        automationpb.NewWorkClient(as(t, auto, workerBot)),
+		Automation:  as(t, auto, workerBot),
 		Checkouts:   checkouts,
 		Bases:       bases,
 		Source:      src,
@@ -226,6 +306,9 @@ func (e *env) startWorkerAt(name string, slots int, auto string) *runningWorker 
 		Grace:       10 * time.Second,
 		Log:         slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Contact:     &worker.Contact{},
+	}
+	if e.secrets != "" {
+		cfg.RunSecrets = secretspb.NewRunSecretsClient(as(t, e.secrets, workerBot))
 	}
 	ctx, cancel := context.WithCancel(e.ctx)
 	done := make(chan error, 1)
@@ -340,6 +423,17 @@ func (e *env) cl(repo, number int64) *scmpb.ChangeList {
 	return c
 }
 
+// parentsOf reads a commit's parents, as ada.
+func (e *env) parentsOf(repo int64, commit []byte) [][]byte {
+	e.t.Helper()
+	resp, err := scmpb.NewBrowseClient(as(e.t, e.scm, ada)).GetCommits(e.ctx, &scmpb.GetCommitsRequest{RepositoryId: repo,
+		CommitIds: [][]byte{commit}})
+	if err != nil || len(resp.GetCommits()) != 1 {
+		e.t.Fatalf("reading commit %x: %v, %v", commit, resp, err)
+	}
+	return resp.GetCommits()[0].GetParents()
+}
+
 // land lands a CL's patchset on main, as the landing queue does once post passes: a test's base,
 // landed without post.
 func (e *env) land(repo, cl int64, ps int32) {
@@ -349,7 +443,7 @@ func (e *env) land(repo, cl int64, ps int32) {
 	if err != nil {
 		e.t.Fatal(err)
 	}
-	if _, err := scmpb.NewLandingClient(conn).Land(e.ctx, &scmpb.LandRequest{RepositoryId: repo, Actor: ada, ExpectedHead: r.GetHead(),
+	if _, err := scmpb.NewLandingClient(conn).Land(e.ctx, &scmpb.LandRequest{RepositoryId: repo, ActorId: e.adaID, ExpectedHead: r.GetHead(),
 		Items: []*scmpb.LandRequest_Item{{Number: cl, Patchset: ps}}}); err != nil {
 		e.t.Fatalf("landing CL %d: %v", cl, err)
 	}
@@ -413,4 +507,15 @@ func (e *env) describe(p *automationpb.Pre) string {
 		b.WriteString("job " + j.GetOrigin().GetJob() + ": " + j.GetStatus().String() + " (" + j.GetReason() + ")\n" + e.logOf(j.GetId()) + "\n")
 	}
 	return b.String()
+}
+
+// holdQueue holds a repository's landing queue, as a replica running it does: ok automation's
+// queue does nothing for it until let go, and runs again within a few seconds after.
+func (e *env) holdQueue(repo int64) (letGo func()) {
+	e.t.Helper()
+	_, release, ok, err := work.Claim(e.ctx, e.automation.Work(), store.QueueWork, repo, "the test", 3*time.Second)
+	if err != nil || !ok {
+		e.t.Fatalf("holding repository %d's queue: %v, %v", repo, ok, err)
+	}
+	return release
 }

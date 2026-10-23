@@ -1,6 +1,7 @@
 package service_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/x509"
@@ -9,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -18,6 +18,9 @@ import (
 	"github.com/Cidan/ok/internal/dial"
 	"github.com/Cidan/ok/internal/directory"
 	"github.com/Cidan/ok/internal/id/ca"
+	"github.com/Cidan/ok/internal/id/enterprise"
+	"github.com/Cidan/ok/internal/id/federation"
+	"github.com/Cidan/ok/internal/id/seal"
 	"github.com/Cidan/ok/internal/id/service"
 	"github.com/Cidan/ok/internal/id/store"
 	idpostgres "github.com/Cidan/ok/internal/id/store/postgres"
@@ -27,6 +30,7 @@ import (
 	"github.com/Cidan/ok/internal/serve/interceptor"
 	"github.com/Cidan/ok/internal/serve/node"
 	"github.com/Cidan/ok/internal/serve/serving"
+	"github.com/Cidan/ok/internal/tenancy"
 	"github.com/Cidan/ok/internal/testdb"
 	identitypb "github.com/Cidan/ok/proto/ok/identity/v1"
 	okpb "github.com/Cidan/ok/proto/ok/v1"
@@ -35,10 +39,14 @@ import (
 var names = identity.MustNames("example.com")
 
 const (
-	ada     = "ada.human.example.com"
-	bea     = "bea.human.example.com"
-	deploy  = "deploy.ok.robot.example.com"
-	control = "control.ok.robot.example.com"
+	ada        = "ada.human.example.com"
+	bea        = "bea.human.example.com"
+	deploy     = "deploy.ok.robot.example.com"
+	control    = "control.ok.robot.example.com"
+	scm        = "scm.ok.robot.example.com"
+	automation = "automation.ok.robot.example.com"
+	secretsBot = "secrets.ok.robot.example.com"
+	edgeBot    = "edge.ok.robot.example.com"
 )
 
 type svcNode struct{ s *service.Server }
@@ -65,16 +73,17 @@ type env struct {
 	addr  string
 	store *store.Store
 	ca    *ca.CA
+	// installation is the installation's organization; nil for a hosted service.
+	installation *store.Organization
 }
 
-func newEnv(t *testing.T) *env {
+// newEnv is an installation, whose organization is example.
+func newEnv(t *testing.T) *env { return newEnvWith(t, false) }
+
+func newEnvWith(t *testing.T, hosted bool) *env {
 	t.Helper()
 	ctx := context.Background()
-	pool, err := pgxpool.New(ctx, testdb.Postgres(t))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(pool.Close)
+	pool := testdb.Pool(t)
 	b, err := idpostgres.Open(ctx, pool)
 	st := store.New(b, names)
 	if err != nil {
@@ -100,17 +109,40 @@ func newEnv(t *testing.T) *env {
 	if _, err := directory.Sync(ctx, names, source{snap}, st, opts); err != nil {
 		t.Fatal(err)
 	}
-	for _, r := range []string{deploy, control} {
+	for _, r := range []string{deploy, control, scm, automation} {
 		if _, err := st.CreateRobot(ctx, r); err != nil {
 			t.Fatal(err)
 		}
 	}
-	srv := service.New(service.Config{Store: st, CA: authority, PublicURL: "https://ok.example.com/", BootstrapAdmins: []string{"ada"}})
+	roles := authn.Roles{okpb.Caller_CALLER_DEPLOY: deploy, okpb.Caller_CALLER_CONTROL: control, okpb.Caller_CALLER_SCM: scm,
+		okpb.Caller_CALLER_AUTOMATION: automation, okpb.Caller_CALLER_SECRETS: secretsBot, okpb.Caller_CALLER_EDGE: edgeBot}
+	sealer, err := seal.New(bytes.Repeat([]byte{9}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := service.Config{Store: st, CA: authority, PublicURL: "https://ok.example.com/", Passkeys: true, BootstrapAdmins: []string{"ada"}, Hosted: hosted, Roles: roles,
+		PlaintextIssuers: true, Enterprise: &enterprise.Syncer{Store: st, Sealer: sealer, AllowPrivate: true}}
+	var installation *store.Organization
+	if !hosted {
+		o, err := st.EnsureOrganization(ctx, "example", store.OrganizationSettings{BaseRole: tenancy.Write, MembersCreate: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		installation, cfg.Installation = &o, o.ID
+		st.SetInstallation(o.ID)
+	}
+	srv := service.New(cfg)
+	// A development server's: organizations' issuers on loopback, over plaintext.
+	tokens, err := federation.New(ctx, nil, st, federation.Options{AllowPrivate: true})
+	if err != nil {
+		t.Fatal(err)
+	}
 	resolver := authn.NewResolver(authn.Config{
 		Directory:   service.Directory{Store: st},
 		Credentials: credential.NewVerifier(authority.Pool),
+		Tokens:      tokens,
 		Dev:         true,
-		Roles:       authn.Roles{okpb.Caller_CALLER_DEPLOY: deploy, okpb.Caller_CALLER_CONTROL: control},
+		Roles:       roles,
 	})
 	chain := interceptor.New()
 	chain.UseUnary(resolver.UnaryInterceptor())
@@ -128,7 +160,7 @@ func newEnv(t *testing.T) *env {
 		})
 	}()
 	t.Cleanup(func() { cancel(); <-done })
-	return &env{t: t, addr: lis.Addr().String(), store: st, ca: authority}
+	return &env{t: t, addr: lis.Addr().String(), store: st, ca: authority, installation: installation}
 }
 
 // as dials the server as a principal ("" for no one).
@@ -184,8 +216,13 @@ func TestDirectoryAndCallers(t *testing.T) {
 			break
 		}
 	}
-	if want := []string{ada, bea, "cal.human.example.com", control, deploy}; !reflect.DeepEqual(all, want) {
+	// The installation's organization is a principal too.
+	if want := []string{ada, automation, bea, "cal.human.example.com", control, deploy, "example.org.example.com", scm}; !reflect.DeepEqual(all, want) {
 		t.Errorf("paged = %v, want %v", all, want)
+	}
+	if orgs, err := d.ListPrincipals(ctx, &identitypb.ListPrincipalsRequest{Kind: identitypb.Kind_KIND_ORG}); err != nil ||
+		len(orgs.Principals) != 1 || orgs.Principals[0].Kind != identitypb.Kind_KIND_ORG {
+		t.Errorf("the organizations = %v, %v", orgs, err)
 	}
 	humans, _ := d.ListPrincipals(ctx, &identitypb.ListPrincipalsRequest{Kind: identitypb.Kind_KIND_ROBOT, Query: "deploy"})
 	if len(humans.Principals) != 1 || humans.Principals[0].Name != deploy {
@@ -201,9 +238,23 @@ func TestDirectoryAndCallers(t *testing.T) {
 	if err != nil || len(roots.Certificates) != 1 {
 		t.Errorf("GetRoots = %v, %v", roots, err)
 	}
-	// Verify is the roles', and Tree the deployer's.
+	// Verify is the roles', and Tree the deployer's. Every role that serves callers resolves them
+	// through Verify (idclient.Directory), as does the edge in front of them.
 	if _, err := identitypb.NewVerifyClient(e.as(ada)).GetSession(ctx, &identitypb.GetSessionRequest{Id: "x"}); code(err) != codes.PermissionDenied {
 		t.Errorf("a person verifying sessions: %v", err)
+	}
+	for _, r := range []string{secretsBot, edgeBot} {
+		if _, err := e.store.CreateRobot(ctx, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, role := range []string{scm, control, automation, deploy, secretsBot, edgeBot} {
+		if _, err := identitypb.NewVerifyClient(e.as(role)).GetSession(ctx, &identitypb.GetSessionRequest{Id: "x"}); code(err) == codes.PermissionDenied {
+			t.Errorf("%s resolving its callers: %v", role, err)
+		}
+		if _, err := identitypb.NewCellsClient(e.as(role)).ListCells(ctx, &identitypb.ListCellsRequest{}); code(err) == codes.PermissionDenied {
+			t.Errorf("%s reaching other cells: %v", role, err)
+		}
 	}
 	if _, err := identitypb.NewTreeClient(e.as(control)).GetApplied(ctx, &identitypb.GetAppliedRequest{}); code(err) != codes.PermissionDenied {
 		t.Errorf("control applying trees: %v", err)
@@ -239,7 +290,7 @@ func TestTreeAndAdmins(t *testing.T) {
 	}
 	isAdmin := func(who string) bool {
 		t.Helper()
-		resp, err := identitypb.NewDirectoryClient(e.as(control)).CheckAdmin(ctx, &identitypb.CheckAdminRequest{Principal: who})
+		resp, err := identitypb.NewDirectoryClient(e.as(control)).CheckAdmin(ctx, &identitypb.CheckAdminRequest{Key: &identitypb.CheckAdminRequest_Principal{Principal: who}})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -258,6 +309,18 @@ func TestTreeAndAdmins(t *testing.T) {
 	}
 	if got := listAdmins(); !reflect.DeepEqual(got, []string{ada}) {
 		t.Errorf("ListAdmins before a tree = %v", got)
+	}
+	adaP, err := identitypb.NewDirectoryClient(e.as(control)).GetPrincipal(ctx, &identitypb.GetPrincipalRequest{Key: &identitypb.GetPrincipalRequest_Name{Name: ada}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	byID, err := identitypb.NewDirectoryClient(e.as(control)).CheckAdmin(ctx, &identitypb.CheckAdminRequest{Key: &identitypb.CheckAdminRequest_PrincipalId{PrincipalId: adaP.GetPrincipal().GetId()}})
+	if err != nil || !byID.Admin {
+		t.Errorf("CheckAdmin by ada's ID: %v, %v", byID, err)
+	}
+	if resp, err := identitypb.NewDirectoryClient(e.as(control)).ListAdmins(ctx, &identitypb.ListAdminsRequest{}); err != nil ||
+		!reflect.DeepEqual(resp.PrincipalIds, []string{adaP.GetPrincipal().GetId()}) {
+		t.Errorf("ListAdmins' IDs before a tree = %v, %v", resp, err)
 	}
 
 	tree := identitypb.NewTreeClient(e.as(deploy))
@@ -289,7 +352,7 @@ func TestTreeAndAdmins(t *testing.T) {
 		t.Errorf("a bootstrap admin after the tree: %v", err)
 	}
 	robots, err := adminBea.ListRobots(ctx, &identitypb.ListRobotsRequest{})
-	if err != nil || len(robots.Robots) != 3 {
+	if err != nil || len(robots.Robots) != 5 {
 		t.Errorf("ListRobots = %v, %v", robots, err)
 	}
 	if isAdmin(ada) || !isAdmin(bea) {
@@ -300,13 +363,27 @@ func TestTreeAndAdmins(t *testing.T) {
 	}
 
 	d := identitypb.NewDirectoryClient(e.as(ada))
-	ex, err := d.ExpandSet(ctx, &identitypb.ExpandSetRequest{Name: "eng.acl.example.com"})
-	if err != nil || !reflect.DeepEqual(ex.Principals, []string{"cal.human.example.com"}) {
-		t.Errorf("ExpandSet through a synced group = %v, %v", ex, err)
+	cal, err := d.GetPrincipal(ctx, &identitypb.GetPrincipalRequest{Key: &identitypb.GetPrincipalRequest_Name{Name: "cal.human.example.com"}})
+	if err != nil {
+		t.Fatal(err)
 	}
-	m, err := d.CheckMembership(ctx, &identitypb.CheckMembershipRequest{Set: "eng.acl.example.com", Principal: "cal.human.example.com"})
-	if err != nil || !m.Member || len(m.Chain) != 3 {
-		t.Errorf("CheckMembership = %v, %v", m, err)
+	calID := cal.GetPrincipal().GetId()
+	ex, err := d.ExpandSet(ctx, &identitypb.ExpandSetRequest{Name: "eng.acl.example.com"})
+	if err != nil || !reflect.DeepEqual(ex.Principals, []string{"cal.human.example.com"}) || !reflect.DeepEqual(ex.PrincipalIds, []string{calID}) {
+		t.Errorf("ExpandSet through a synced group = %v, %v; want cal, %s", ex, err, calID)
+	}
+	for _, req := range []*identitypb.CheckMembershipRequest{
+		{Set: "eng.acl.example.com", Key: &identitypb.CheckMembershipRequest_Principal{Principal: "cal.human.example.com"}},
+		{Set: "eng.acl.example.com", Key: &identitypb.CheckMembershipRequest_PrincipalId{PrincipalId: calID}},
+	} {
+		m, err := d.CheckMembership(ctx, req)
+		if err != nil || !m.Member || len(m.Chain) != 3 {
+			t.Errorf("CheckMembership(%v) = %v, %v", req, m, err)
+		}
+	}
+	if m, err := d.CheckMembership(ctx, &identitypb.CheckMembershipRequest{Set: "eng.acl.example.com",
+		Key: &identitypb.CheckMembershipRequest_PrincipalId{PrincipalId: "prn_nobody"}}); err != nil || m.Member {
+		t.Errorf("CheckMembership of an ID no one has = %v, %v", m, err)
 	}
 	set, err := d.GetSet(ctx, &identitypb.GetSetRequest{Name: "it.group.example.com"})
 	if err != nil || set.Set.Source != identitypb.SetSource_SET_SOURCE_SYNCED {
@@ -315,6 +392,40 @@ func TestTreeAndAdmins(t *testing.T) {
 	set, err = d.GetSet(ctx, &identitypb.GetSetRequest{Name: "eng.group.example.com"})
 	if err != nil || set.Set.Owner != "eng.acl.example.com" || set.Set.Path != "eng" {
 		t.Errorf("a tree group = %v, %v", set, err)
+	}
+
+	// An organization's teams are sets: expanded through the teams below them, members checked by
+	// name or ID, listed as the organization's.
+	acme, err := e.store.CreateOrganization(ctx, "acme", adaP.GetPrincipal().GetId(), store.OrganizationSettings{BaseRole: tenancy.Read})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.store.SetMember(ctx, acme.ID, calID, tenancy.Member); err != nil {
+		t.Fatal(err)
+	}
+	eng, err := e.store.CreateTeam(ctx, acme.ID, "eng", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	web, err := e.store.CreateTeam(ctx, acme.ID, "web", eng.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.store.AddTeamMember(ctx, web.Name, calID); err != nil {
+		t.Fatal(err)
+	}
+	if ex, err := d.ExpandSet(ctx, &identitypb.ExpandSetRequest{Name: eng.Name}); err != nil ||
+		!reflect.DeepEqual(ex.Principals, []string{"cal.human.example.com"}) || !reflect.DeepEqual(ex.PrincipalIds, []string{calID}) {
+		t.Errorf("ExpandSet of a team = %v, %v", ex, err)
+	}
+	if m, err := d.CheckMembership(ctx, &identitypb.CheckMembershipRequest{Set: eng.Name,
+		Key: &identitypb.CheckMembershipRequest_PrincipalId{PrincipalId: calID}}); err != nil || !m.Member ||
+		!reflect.DeepEqual(m.Chain, []string{eng.Name, web.Name, "cal.human.example.com"}) {
+		t.Errorf("CheckMembership through a team below = %v, %v", m, err)
+	}
+	if set, err := d.GetSet(ctx, &identitypb.GetSetRequest{Name: web.Name}); err != nil || set.Set.Source != identitypb.SetSource_SET_SOURCE_TEAM ||
+		set.Set.Owner != "acme.org.example.com" {
+		t.Errorf("a team = %v, %v", set, err)
 	}
 }
 

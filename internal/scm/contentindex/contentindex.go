@@ -98,8 +98,9 @@ const (
 	Touch Op = 2
 	// Pin records that it became pinned.
 	Pin Op = 3
-	// Move records a chunk's new location: compaction rewrote it. A chunk the index lacks stays
-	// absent.
+	// Move records a chunk's new location: compaction rewrote it. Of a chunk the index lacks —
+	// pinned, its entry in a segment, or dropped — the index keeps only the location (Moved), for a
+	// reader to apply to the segment's entry; a dropped chunk, in no segment, stays absent.
 	Move Op = 4
 	// Drop records that it is gone: a sweep deleted it.
 	Drop Op = 5
@@ -271,24 +272,56 @@ func (r *reader) entry() Entry {
 	return e
 }
 
-// EncodeLog encodes a transaction's updates as one log row's body.
+// EncodeLog encodes updates as one log row's body.
 func EncodeLog(updates []Update) []byte {
 	b := []byte{logVersion}
 	b = binary.AppendUvarint(b, uint64(len(updates)))
 	for _, u := range updates {
-		b = append(b, byte(u.Op))
-		b = append(b, u.ID[:]...)
-		switch u.Op {
-		case Put:
-			b = appendEntry(b, u.entry())
-		case Touch:
-			b = append(b, byte(u.Entry.Kind))
-			b = binary.AppendUvarint(b, uint64(u.Entry.Day))
-		case Pin, Drop:
-			b = append(b, byte(u.Entry.Kind))
-		case Move:
-			b = appendEntry(b, Entry{Kind: u.Entry.Kind, Body: true, Loc: u.Entry.Loc})
+		b = appendUpdate(b, u)
+	}
+	return b
+}
+
+// EncodeLogs encodes updates as log rows of at most max bytes each — an update larger than max in
+// a row of its own — in their order: applied one after another, as their rows' IDs order them, they
+// are EncodeLog's one row. A row's value has a size limit (Spanner's is 10 MiB); a transaction's
+// updates, pinning a large tree's files, may be more.
+func EncodeLogs(updates []Update, max int) [][]byte {
+	var out [][]byte
+	var row []byte
+	n := 0
+	flush := func() {
+		if n > 0 {
+			b := append([]byte{logVersion}, binary.AppendUvarint(nil, uint64(n))...)
+			out = append(out, append(b, row...))
+			row, n = nil, 0
 		}
+	}
+	for _, u := range updates {
+		enc := appendUpdate(nil, u)
+		if n > 0 && 1+binary.MaxVarintLen64+len(row)+len(enc) > max {
+			flush()
+		}
+		row, n = append(row, enc...), n+1
+	}
+	flush()
+	return out
+}
+
+// appendUpdate appends an update's encoding in a log row.
+func appendUpdate(b []byte, u Update) []byte {
+	b = append(b, byte(u.Op))
+	b = append(b, u.ID[:]...)
+	switch u.Op {
+	case Put:
+		b = appendEntry(b, u.entry())
+	case Touch:
+		b = append(b, byte(u.Entry.Kind))
+		b = binary.AppendUvarint(b, uint64(u.Entry.Day))
+	case Pin, Drop:
+		b = append(b, byte(u.Entry.Kind))
+	case Move:
+		b = appendEntry(b, Entry{Kind: u.Entry.Kind, Body: true, Loc: u.Entry.Loc})
 	}
 	return b
 }
@@ -342,6 +375,19 @@ func DecodeLog(b []byte) ([]Update, error) {
 		return nil, fmt.Errorf("%w log: %d bytes after its updates", errMalformed, len(r.b))
 	}
 	return out, nil
+}
+
+// EncodeEntry encodes an entry alone: a segment's value.
+func EncodeEntry(e Entry) []byte { return appendEntry(nil, e) }
+
+// DecodeEntry decodes EncodeEntry's encoding.
+func DecodeEntry(b []byte) (Entry, error) {
+	r := &reader{b: b}
+	e := r.entry()
+	if r.err != nil || len(r.b) != 0 {
+		return Entry{}, fmt.Errorf("%w entry", errMalformed)
+	}
+	return e, nil
 }
 
 // Keyed is an entry with its ID.

@@ -9,6 +9,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/Cidan/ok/internal/scm/encoding"
+	"github.com/Cidan/ok/internal/scm/scmtest"
 	scmpb "github.com/Cidan/ok/proto/ok/scm/v1"
 )
 
@@ -19,27 +20,27 @@ func TestBrowseService(t *testing.T) {
 
 	// ok control creates a repository for a human, who becomes its creator, through Review;
 	// Repositories creates it for its caller and names no one else.
-	r, err := c.review.CreateRepository(control(), &scmpb.CreateRepositoryRequest{Name: "browse-svc", Actor: "alice.human.example.com"})
-	if err != nil || r.GetCreatedBy() != "alice.human.example.com" {
+	r, err := c.review.CreateRepository(control(), &scmpb.CreateRepositoryRequest{Name: "browse-svc", ActorId: "id-alice.human.example.com"})
+	if err != nil || r.GetCreatedBy() != "alice.human.example.com" || r.GetCreatedById() != "id-alice.human.example.com" {
 		t.Fatalf("control creating for alice: %v, %v", r, err)
 	}
 	_, err = c.review.CreateRepository(control(), &scmpb.CreateRepositoryRequest{Name: "browse-svc-2"})
 	wantCode(t, err, codes.InvalidArgument)
-	_, err = c.repos.CreateRepository(alice, &scmpb.CreateRepositoryRequest{Name: "browse-svc-2", Actor: "bob.human.example.com"})
+	_, err = c.repos.CreateRepository(alice, &scmpb.CreateRepositoryRequest{Name: "browse-svc-2", ActorId: "id-bob.human.example.com"})
 	wantCode(t, err, codes.InvalidArgument)
 	repo := r.GetId()
 
-	b := newObjects(t)
+	b := scmtest.NewObjects(t)
 	contents := []byte("hello\nworld\n")
-	tree := b.add(&encoding.Tree{Entries: []encoding.TreeEntry{{Name: "f", Value: encoding.TreeValue{Kind: encoding.TreeValueFile, ID: b.file(contents)}}}})
-	commit := b.commit(tree, "one", encoding.RootCommitID)
-	if _, _, err := b.publish(alice, c, repo, nil); err != nil {
+	tree := b.Add(&encoding.Tree{Entries: []encoding.TreeEntry{{Name: "f", Value: encoding.TreeValue{Kind: encoding.TreeValueFile, ID: b.File(contents)}}}})
+	commit := b.Commit(tree, "one", encoding.RootCommitID)
+	if _, _, err := b.Publish(alice, c.store, repo, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := c.cls.Upload(alice, &scmpb.UploadRequest{RepositoryId: repo, CommitIds: [][]byte{commit[:]}, Readiness: scmpb.UploadRequest_READINESS_READY}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.landing.Land(automation(), &scmpb.LandRequest{RepositoryId: repo, Items: []*scmpb.LandRequest_Item{{Number: 1, Patchset: 1}}, Actor: "alice.human.example.com", ExpectedHead: encoding.RootCommitID[:]}); err != nil {
+	if _, err := c.landing.Land(automation(), &scmpb.LandRequest{RepositoryId: repo, Items: []*scmpb.LandRequest_Item{{Number: 1, Patchset: 1}}, ActorId: "id-alice.human.example.com", ExpectedHead: encoding.RootCommitID[:]}); err != nil {
 		t.Fatal(err)
 	}
 

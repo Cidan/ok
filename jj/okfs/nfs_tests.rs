@@ -14,12 +14,12 @@ use okfs_nfs::client::Client;
 use crate::fs::Mount;
 use crate::model::ROOT;
 use crate::model::resolved_terms;
-use crate::model_tests::base_tree;
 use crate::nfs::NfsMount;
 use crate::nfs::Refresh;
 use crate::testfix::Entry;
 use crate::testfix::Fixture;
 use crate::testfix::FixtureFetch;
+use crate::testfix::base_tree;
 
 const EXPORT: u64 = 1;
 

@@ -127,7 +127,7 @@ func TestPre(t *testing.T) {
 	// and the workflow job whose tool reads it, in the sandbox.
 	a.jj("pre", "new", "main@ok", "-m", "hello, world")
 	write(t, a.dir("pre"), map[string]*string{"lib/a.txt": ptr("hello, world\n")})
-	cl := uploaded(a.jj("pre", "cl"))[0]
+	cl := uploaded(a.jj("pre", "cl", "--ready"))[0]
 	p := e.settled(repo, cl, 1)
 	js := jobs(p)
 	if p.GetVerdict() != automationpb.Pre_VERDICT_PASSED {
@@ -147,6 +147,10 @@ func TestPre(t *testing.T) {
 	if log := e.logOf(p.GetPlan().GetId()); !strings.Contains(log, "the change affects") {
 		t.Errorf("the plan's log:\n%s", log)
 	}
+	// The plan is for its uploader, whom ok automation records by stable ID.
+	if by := p.GetPlan().GetRequestedById(); by != e.adaID {
+		t.Errorf("the plan was requested by %q; want ada's ID, %q", by, e.adaID)
+	}
 
 	// Its next patchset breaks the test: pre fails, on that job.
 	write(t, a.dir("pre"), map[string]*string{"lib/a.txt": ptr("goodbye\n")})
@@ -162,6 +166,11 @@ func TestPre(t *testing.T) {
 	a.jj("pre", "new", "main@ok", "-m", "notes")
 	write(t, a.dir("pre"), map[string]*string{"docs/notes.md": ptr("UNFORMATTED\n")})
 	cl = uploaded(a.jj("pre", "cl"))[0]
+	// A draft, which runs no pre until it is sent for review: run by hand.
+	if started, err := e.runs.StartPre(e.ctx, &automationpb.StartPreRequest{RepositoryId: repo, ClNumber: cl, ForPersonId: e.adaID}); err != nil ||
+		started.GetPlan().GetWhy() != "run by hand" {
+		t.Fatalf("running a draft's pre by hand: %v, %v", started, err)
+	}
 	p = e.settled(repo, cl, 1)
 	js = jobs(p)
 	if p.GetVerdict() != automationpb.Pre_VERDICT_FAILED || len(js) != 1 || js["lint"].GetStatus() != automationpb.Run_STATUS_FAILED {
@@ -174,7 +183,7 @@ func TestPre(t *testing.T) {
 	// A workflow edit naming a target that does not exist fails the plan.
 	a.jj("pre", "new", "main@ok", "-m", "a missing target")
 	write(t, a.dir("pre"), map[string]*string{".ok/workflow/ci.yaml": ptr("pre:\n  nope:\n    target: //nope:nope\n")})
-	cl = uploaded(a.jj("pre", "cl"))[0]
+	cl = uploaded(a.jj("pre", "cl", "--ready"))[0]
 	p = e.settled(repo, cl, 1)
 	if p.GetVerdict() != automationpb.Pre_VERDICT_FAILED || !strings.Contains(p.GetPlan().GetReason(), "target //nope:nope does not exist at this change") {
 		t.Fatalf("a workflow edit naming a missing target: %s", e.describe(p))
@@ -184,7 +193,7 @@ func TestPre(t *testing.T) {
 	// could ever be approved. Naming everyone (*) with set allowself passes.
 	a.jj("pre", "new", "main@ok", "-m", "a lone owner")
 	write(t, a.dir("pre"), map[string]*string{"lib/OWNERS": ptr("user: ada\n")})
-	cl = uploaded(a.jj("pre", "cl"))[0]
+	cl = uploaded(a.jj("pre", "cl", "--ready"))[0]
 	p = e.settled(repo, cl, 1)
 	if p.GetVerdict() != automationpb.Pre_VERDICT_FAILED || !strings.Contains(p.GetPlan().GetReason(), "ada alone owns these files") {
 		t.Fatalf("an unapprovable OWNERS file: %s", e.describe(p))
@@ -199,7 +208,7 @@ func TestPre(t *testing.T) {
 	// A BUILD file that does not parse leaves no graph: the plan fails, saying so.
 	a.jj("pre", "new", "main@ok", "-m", "broken")
 	write(t, a.dir("pre"), map[string]*string{"app/BUILD.bazel": ptr("script_test(\n")})
-	cl = uploaded(a.jj("pre", "cl"))[0]
+	cl = uploaded(a.jj("pre", "cl", "--ready"))[0]
 	p = e.settled(repo, cl, 1)
 	if p.GetVerdict() != automationpb.Pre_VERDICT_FAILED || !strings.Contains(p.GetPlan().GetReason(), "the change leaves no build graph Bazel can load") {
 		t.Fatalf("a broken BUILD file: %s", e.describe(p))

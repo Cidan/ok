@@ -895,7 +895,7 @@ func (x *GetDeploymentRequest) GetId() int64 {
 type RetryDeploymentRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Id            int64                  `protobuf:"varint,1,opt,name=id,proto3" json:"id,omitempty"`
-	ForPerson     string                 `protobuf:"bytes,2,opt,name=for_person,json=forPerson,proto3" json:"for_person,omitempty"` // ok control only
+	ForPersonId   string                 `protobuf:"bytes,3,opt,name=for_person_id,json=forPersonId,proto3" json:"for_person_id,omitempty"` // ok control only
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -937,9 +937,9 @@ func (x *RetryDeploymentRequest) GetId() int64 {
 	return 0
 }
 
-func (x *RetryDeploymentRequest) GetForPerson() string {
+func (x *RetryDeploymentRequest) GetForPersonId() string {
 	if x != nil {
-		return x.ForPerson
+		return x.ForPersonId
 	}
 	return ""
 }
@@ -947,7 +947,7 @@ func (x *RetryDeploymentRequest) GetForPerson() string {
 type HaltDeploymentRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Id            int64                  `protobuf:"varint,1,opt,name=id,proto3" json:"id,omitempty"`
-	ForPerson     string                 `protobuf:"bytes,2,opt,name=for_person,json=forPerson,proto3" json:"for_person,omitempty"`
+	ForPersonId   string                 `protobuf:"bytes,3,opt,name=for_person_id,json=forPersonId,proto3" json:"for_person_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -989,9 +989,9 @@ func (x *HaltDeploymentRequest) GetId() int64 {
 	return 0
 }
 
-func (x *HaltDeploymentRequest) GetForPerson() string {
+func (x *HaltDeploymentRequest) GetForPersonId() string {
 	if x != nil {
-		return x.ForPerson
+		return x.ForPersonId
 	}
 	return ""
 }
@@ -999,7 +999,7 @@ func (x *HaltDeploymentRequest) GetForPerson() string {
 type AllowHazardsRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Id            int64                  `protobuf:"varint,1,opt,name=id,proto3" json:"id,omitempty"`
-	ForPerson     string                 `protobuf:"bytes,2,opt,name=for_person,json=forPerson,proto3" json:"for_person,omitempty"`
+	ForPersonId   string                 `protobuf:"bytes,3,opt,name=for_person_id,json=forPersonId,proto3" json:"for_person_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1041,9 +1041,9 @@ func (x *AllowHazardsRequest) GetId() int64 {
 	return 0
 }
 
-func (x *AllowHazardsRequest) GetForPerson() string {
+func (x *AllowHazardsRequest) GetForPersonId() string {
 	if x != nil {
-		return x.ForPerson
+		return x.ForPersonId
 	}
 	return ""
 }
@@ -1063,13 +1063,11 @@ type Deployment struct {
 	ToSeq         int64                  `protobuf:"varint,9,opt,name=to_seq,json=toSeq,proto3" json:"to_seq,omitempty"`
 	Why           string                 `protobuf:"bytes,10,opt,name=why,proto3" json:"why,omitempty"`
 	Wave          int32                  `protobuf:"varint,11,opt,name=wave,proto3" json:"wave,omitempty"`
-	RequestedBy   string                 `protobuf:"bytes,12,opt,name=requested_by,json=requestedBy,proto3" json:"requested_by,omitempty"`
 	Workload      *Workload              `protobuf:"bytes,13,opt,name=workload,proto3" json:"workload,omitempty"` // unset for a deploy that only migrates
 	Status        Deployment_Status      `protobuf:"varint,14,opt,name=status,proto3,enum=ok.deploy.v1.Deployment_Status" json:"status,omitempty"`
 	Stage         Deployment_Stage       `protobuf:"varint,15,opt,name=stage,proto3,enum=ok.deploy.v1.Deployment_Stage" json:"stage,omitempty"`
 	Reason        string                 `protobuf:"bytes,16,opt,name=reason,proto3" json:"reason,omitempty"`
-	Self          bool                   `protobuf:"varint,17,opt,name=self,proto3" json:"self,omitempty"`                  // it deploys the deployer
-	HaltBy        string                 `protobuf:"bytes,18,opt,name=halt_by,json=haltBy,proto3" json:"halt_by,omitempty"` // who asked it to halt
+	Self          bool                   `protobuf:"varint,17,opt,name=self,proto3" json:"self,omitempty"` // it deploys the deployer
 	CreatedAt     *timestamppb.Timestamp `protobuf:"bytes,19,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
 	StartedAt     *timestamppb.Timestamp `protobuf:"bytes,20,opt,name=started_at,json=startedAt,proto3" json:"started_at,omitempty"`
 	FinishedAt    *timestamppb.Timestamp `protobuf:"bytes,21,opt,name=finished_at,json=finishedAt,proto3" json:"finished_at,omitempty"`
@@ -1077,6 +1075,9 @@ type Deployment struct {
 	Migrations    []*Migration           `protobuf:"bytes,23,rep,name=migrations,proto3" json:"migrations,omitempty"`
 	Roll          *Roll                  `protobuf:"bytes,24,opt,name=roll,proto3" json:"roll,omitempty"`     // unset until it rolls
 	Events        []*Event               `protobuf:"bytes,25,rep,name=events,proto3" json:"events,omitempty"` // GetDeployment only
+	RequestedById string                 `protobuf:"bytes,26,opt,name=requested_by_id,json=requestedById,proto3" json:"requested_by_id,omitempty"`
+	HaltById      string                 `protobuf:"bytes,27,opt,name=halt_by_id,json=haltById,proto3" json:"halt_by_id,omitempty"`     // who asked it to halt
+	HaltReason    string                 `protobuf:"bytes,28,opt,name=halt_reason,json=haltReason,proto3" json:"halt_reason,omitempty"` // why ok asked it to halt, itself: another deployment of its plan failed
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1188,13 +1189,6 @@ func (x *Deployment) GetWave() int32 {
 	return 0
 }
 
-func (x *Deployment) GetRequestedBy() string {
-	if x != nil {
-		return x.RequestedBy
-	}
-	return ""
-}
-
 func (x *Deployment) GetWorkload() *Workload {
 	if x != nil {
 		return x.Workload
@@ -1228,13 +1222,6 @@ func (x *Deployment) GetSelf() bool {
 		return x.Self
 	}
 	return false
-}
-
-func (x *Deployment) GetHaltBy() string {
-	if x != nil {
-		return x.HaltBy
-	}
-	return ""
 }
 
 func (x *Deployment) GetCreatedAt() *timestamppb.Timestamp {
@@ -1284,6 +1271,27 @@ func (x *Deployment) GetEvents() []*Event {
 		return x.Events
 	}
 	return nil
+}
+
+func (x *Deployment) GetRequestedById() string {
+	if x != nil {
+		return x.RequestedById
+	}
+	return ""
+}
+
+func (x *Deployment) GetHaltById() string {
+	if x != nil {
+		return x.HaltById
+	}
+	return ""
+}
+
+func (x *Deployment) GetHaltReason() string {
+	if x != nil {
+		return x.HaltReason
+	}
+	return ""
 }
 
 type Workload struct {
@@ -1424,7 +1432,7 @@ type Migration struct {
 	Plan          *MigrationPlan         `protobuf:"bytes,4,opt,name=plan,proto3" json:"plan,omitempty"`     // its plan, as the migrate protocol reports it
 	Refused       []string               `protobuf:"bytes,5,rep,name=refused,proto3" json:"refused,omitempty"`
 	Allowed       []string               `protobuf:"bytes,6,rep,name=allowed,proto3" json:"allowed,omitempty"`
-	AllowedBy     string                 `protobuf:"bytes,7,opt,name=allowed_by,json=allowedBy,proto3" json:"allowed_by,omitempty"`
+	AllowedById   string                 `protobuf:"bytes,8,opt,name=allowed_by_id,json=allowedById,proto3" json:"allowed_by_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1501,9 +1509,9 @@ func (x *Migration) GetAllowed() []string {
 	return nil
 }
 
-func (x *Migration) GetAllowedBy() string {
+func (x *Migration) GetAllowedById() string {
 	if x != nil {
-		return x.AllowedBy
+		return x.AllowedById
 	}
 	return ""
 }
@@ -1731,6 +1739,822 @@ func (x *Event) GetMessage() string {
 	return ""
 }
 
+// AgentUp is what an agent sends.
+type AgentUp struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Types that are valid to be assigned to Kind:
+	//
+	//	*AgentUp_Hello
+	//	*AgentUp_Kube
+	//	*AgentUp_Migration
+	Kind          isAgentUp_Kind `protobuf_oneof:"kind"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *AgentUp) Reset() {
+	*x = AgentUp{}
+	mi := &file_proto_ok_deploy_v1_deploy_proto_msgTypes[20]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *AgentUp) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*AgentUp) ProtoMessage() {}
+
+func (x *AgentUp) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_ok_deploy_v1_deploy_proto_msgTypes[20]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use AgentUp.ProtoReflect.Descriptor instead.
+func (*AgentUp) Descriptor() ([]byte, []int) {
+	return file_proto_ok_deploy_v1_deploy_proto_rawDescGZIP(), []int{20}
+}
+
+func (x *AgentUp) GetKind() isAgentUp_Kind {
+	if x != nil {
+		return x.Kind
+	}
+	return nil
+}
+
+func (x *AgentUp) GetHello() *AgentHello {
+	if x != nil {
+		if x, ok := x.Kind.(*AgentUp_Hello); ok {
+			return x.Hello
+		}
+	}
+	return nil
+}
+
+func (x *AgentUp) GetKube() *KubeResponseFrame {
+	if x != nil {
+		if x, ok := x.Kind.(*AgentUp_Kube); ok {
+			return x.Kube
+		}
+	}
+	return nil
+}
+
+func (x *AgentUp) GetMigration() *MigrationResult {
+	if x != nil {
+		if x, ok := x.Kind.(*AgentUp_Migration); ok {
+			return x.Migration
+		}
+	}
+	return nil
+}
+
+type isAgentUp_Kind interface {
+	isAgentUp_Kind()
+}
+
+type AgentUp_Hello struct {
+	Hello *AgentHello `protobuf:"bytes,1,opt,name=hello,proto3,oneof"`
+}
+
+type AgentUp_Kube struct {
+	Kube *KubeResponseFrame `protobuf:"bytes,2,opt,name=kube,proto3,oneof"`
+}
+
+type AgentUp_Migration struct {
+	Migration *MigrationResult `protobuf:"bytes,3,opt,name=migration,proto3,oneof"`
+}
+
+func (*AgentUp_Hello) isAgentUp_Kind() {}
+
+func (*AgentUp_Kube) isAgentUp_Kind() {}
+
+func (*AgentUp_Migration) isAgentUp_Kind() {}
+
+// AgentDown is what a deployer sends an agent.
+type AgentDown struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Types that are valid to be assigned to Kind:
+	//
+	//	*AgentDown_Welcome
+	//	*AgentDown_Kube
+	//	*AgentDown_Migration
+	//	*AgentDown_Cancel
+	Kind          isAgentDown_Kind `protobuf_oneof:"kind"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *AgentDown) Reset() {
+	*x = AgentDown{}
+	mi := &file_proto_ok_deploy_v1_deploy_proto_msgTypes[21]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *AgentDown) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*AgentDown) ProtoMessage() {}
+
+func (x *AgentDown) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_ok_deploy_v1_deploy_proto_msgTypes[21]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use AgentDown.ProtoReflect.Descriptor instead.
+func (*AgentDown) Descriptor() ([]byte, []int) {
+	return file_proto_ok_deploy_v1_deploy_proto_rawDescGZIP(), []int{21}
+}
+
+func (x *AgentDown) GetKind() isAgentDown_Kind {
+	if x != nil {
+		return x.Kind
+	}
+	return nil
+}
+
+func (x *AgentDown) GetWelcome() *AgentWelcome {
+	if x != nil {
+		if x, ok := x.Kind.(*AgentDown_Welcome); ok {
+			return x.Welcome
+		}
+	}
+	return nil
+}
+
+func (x *AgentDown) GetKube() *KubeRequestFrame {
+	if x != nil {
+		if x, ok := x.Kind.(*AgentDown_Kube); ok {
+			return x.Kube
+		}
+	}
+	return nil
+}
+
+func (x *AgentDown) GetMigration() *MigrationRequest {
+	if x != nil {
+		if x, ok := x.Kind.(*AgentDown_Migration); ok {
+			return x.Migration
+		}
+	}
+	return nil
+}
+
+func (x *AgentDown) GetCancel() int64 {
+	if x != nil {
+		if x, ok := x.Kind.(*AgentDown_Cancel); ok {
+			return x.Cancel
+		}
+	}
+	return 0
+}
+
+type isAgentDown_Kind interface {
+	isAgentDown_Kind()
+}
+
+type AgentDown_Welcome struct {
+	Welcome *AgentWelcome `protobuf:"bytes,1,opt,name=welcome,proto3,oneof"`
+}
+
+type AgentDown_Kube struct {
+	Kube *KubeRequestFrame `protobuf:"bytes,2,opt,name=kube,proto3,oneof"`
+}
+
+type AgentDown_Migration struct {
+	Migration *MigrationRequest `protobuf:"bytes,3,opt,name=migration,proto3,oneof"`
+}
+
+type AgentDown_Cancel struct {
+	// cancel ends a request the deployer no longer waits on.
+	Cancel int64 `protobuf:"varint,4,opt,name=cancel,proto3,oneof"`
+}
+
+func (*AgentDown_Welcome) isAgentDown_Kind() {}
+
+func (*AgentDown_Kube) isAgentDown_Kind() {}
+
+func (*AgentDown_Migration) isAgentDown_Kind() {}
+
+func (*AgentDown_Cancel) isAgentDown_Kind() {}
+
+type AgentHello struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Version       string                 `protobuf:"bytes,1,opt,name=version,proto3" json:"version,omitempty"` // the agent's ok version
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *AgentHello) Reset() {
+	*x = AgentHello{}
+	mi := &file_proto_ok_deploy_v1_deploy_proto_msgTypes[22]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *AgentHello) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*AgentHello) ProtoMessage() {}
+
+func (x *AgentHello) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_ok_deploy_v1_deploy_proto_msgTypes[22]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use AgentHello.ProtoReflect.Descriptor instead.
+func (*AgentHello) Descriptor() ([]byte, []int) {
+	return file_proto_ok_deploy_v1_deploy_proto_rawDescGZIP(), []int{22}
+}
+
+func (x *AgentHello) GetVersion() string {
+	if x != nil {
+		return x.Version
+	}
+	return ""
+}
+
+type AgentWelcome struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	AccountId     string                 `protobuf:"bytes,1,opt,name=account_id,json=accountId,proto3" json:"account_id,omitempty"` // the organization it is the agent of
+	Cell          string                 `protobuf:"bytes,2,opt,name=cell,proto3" json:"cell,omitempty"`                            // the deployer's cell
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *AgentWelcome) Reset() {
+	*x = AgentWelcome{}
+	mi := &file_proto_ok_deploy_v1_deploy_proto_msgTypes[23]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *AgentWelcome) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*AgentWelcome) ProtoMessage() {}
+
+func (x *AgentWelcome) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_ok_deploy_v1_deploy_proto_msgTypes[23]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use AgentWelcome.ProtoReflect.Descriptor instead.
+func (*AgentWelcome) Descriptor() ([]byte, []int) {
+	return file_proto_ok_deploy_v1_deploy_proto_rawDescGZIP(), []int{23}
+}
+
+func (x *AgentWelcome) GetAccountId() string {
+	if x != nil {
+		return x.AccountId
+	}
+	return ""
+}
+
+func (x *AgentWelcome) GetCell() string {
+	if x != nil {
+		return x.Cell
+	}
+	return ""
+}
+
+type RelayDown struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	AccountId     string                 `protobuf:"bytes,1,opt,name=account_id,json=accountId,proto3" json:"account_id,omitempty"` // the first message's alone
+	Down          *AgentDown             `protobuf:"bytes,2,opt,name=down,proto3" json:"down,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RelayDown) Reset() {
+	*x = RelayDown{}
+	mi := &file_proto_ok_deploy_v1_deploy_proto_msgTypes[24]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RelayDown) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RelayDown) ProtoMessage() {}
+
+func (x *RelayDown) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_ok_deploy_v1_deploy_proto_msgTypes[24]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RelayDown.ProtoReflect.Descriptor instead.
+func (*RelayDown) Descriptor() ([]byte, []int) {
+	return file_proto_ok_deploy_v1_deploy_proto_rawDescGZIP(), []int{24}
+}
+
+func (x *RelayDown) GetAccountId() string {
+	if x != nil {
+		return x.AccountId
+	}
+	return ""
+}
+
+func (x *RelayDown) GetDown() *AgentDown {
+	if x != nil {
+		return x.Down
+	}
+	return nil
+}
+
+type Header struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	Values        []string               `protobuf:"bytes,2,rep,name=values,proto3" json:"values,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Header) Reset() {
+	*x = Header{}
+	mi := &file_proto_ok_deploy_v1_deploy_proto_msgTypes[25]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Header) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Header) ProtoMessage() {}
+
+func (x *Header) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_ok_deploy_v1_deploy_proto_msgTypes[25]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Header.ProtoReflect.Descriptor instead.
+func (*Header) Descriptor() ([]byte, []int) {
+	return file_proto_ok_deploy_v1_deploy_proto_rawDescGZIP(), []int{25}
+}
+
+func (x *Header) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *Header) GetValues() []string {
+	if x != nil {
+		return x.Values
+	}
+	return nil
+}
+
+// KubeRequestFrame is a piece of a request to the cluster's API server: its first frame carries
+// its method, path and query, and headers; every frame a piece of its body; its last sets end.
+type KubeRequestFrame struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Id            int64                  `protobuf:"varint,1,opt,name=id,proto3" json:"id,omitempty"`
+	Method        string                 `protobuf:"bytes,2,opt,name=method,proto3" json:"method,omitempty"`
+	Url           string                 `protobuf:"bytes,3,opt,name=url,proto3" json:"url,omitempty"` // the path and query: /apis/apps/v1/namespaces/web/deployments/api?timeout=30s
+	Headers       []*Header              `protobuf:"bytes,4,rep,name=headers,proto3" json:"headers,omitempty"`
+	Body          []byte                 `protobuf:"bytes,5,opt,name=body,proto3" json:"body,omitempty"`
+	End           bool                   `protobuf:"varint,6,opt,name=end,proto3" json:"end,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *KubeRequestFrame) Reset() {
+	*x = KubeRequestFrame{}
+	mi := &file_proto_ok_deploy_v1_deploy_proto_msgTypes[26]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *KubeRequestFrame) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*KubeRequestFrame) ProtoMessage() {}
+
+func (x *KubeRequestFrame) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_ok_deploy_v1_deploy_proto_msgTypes[26]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use KubeRequestFrame.ProtoReflect.Descriptor instead.
+func (*KubeRequestFrame) Descriptor() ([]byte, []int) {
+	return file_proto_ok_deploy_v1_deploy_proto_rawDescGZIP(), []int{26}
+}
+
+func (x *KubeRequestFrame) GetId() int64 {
+	if x != nil {
+		return x.Id
+	}
+	return 0
+}
+
+func (x *KubeRequestFrame) GetMethod() string {
+	if x != nil {
+		return x.Method
+	}
+	return ""
+}
+
+func (x *KubeRequestFrame) GetUrl() string {
+	if x != nil {
+		return x.Url
+	}
+	return ""
+}
+
+func (x *KubeRequestFrame) GetHeaders() []*Header {
+	if x != nil {
+		return x.Headers
+	}
+	return nil
+}
+
+func (x *KubeRequestFrame) GetBody() []byte {
+	if x != nil {
+		return x.Body
+	}
+	return nil
+}
+
+func (x *KubeRequestFrame) GetEnd() bool {
+	if x != nil {
+		return x.End
+	}
+	return false
+}
+
+// KubeResponseFrame is a piece of the answer: its first frame carries its status and headers,
+// every frame a piece of its body, its last sets end — or error, when the agent could not ask or
+// refused to (status 0).
+type KubeResponseFrame struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Id            int64                  `protobuf:"varint,1,opt,name=id,proto3" json:"id,omitempty"`
+	Status        int32                  `protobuf:"varint,2,opt,name=status,proto3" json:"status,omitempty"`
+	Headers       []*Header              `protobuf:"bytes,3,rep,name=headers,proto3" json:"headers,omitempty"`
+	Body          []byte                 `protobuf:"bytes,4,opt,name=body,proto3" json:"body,omitempty"`
+	End           bool                   `protobuf:"varint,5,opt,name=end,proto3" json:"end,omitempty"`
+	Error         string                 `protobuf:"bytes,6,opt,name=error,proto3" json:"error,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *KubeResponseFrame) Reset() {
+	*x = KubeResponseFrame{}
+	mi := &file_proto_ok_deploy_v1_deploy_proto_msgTypes[27]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *KubeResponseFrame) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*KubeResponseFrame) ProtoMessage() {}
+
+func (x *KubeResponseFrame) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_ok_deploy_v1_deploy_proto_msgTypes[27]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use KubeResponseFrame.ProtoReflect.Descriptor instead.
+func (*KubeResponseFrame) Descriptor() ([]byte, []int) {
+	return file_proto_ok_deploy_v1_deploy_proto_rawDescGZIP(), []int{27}
+}
+
+func (x *KubeResponseFrame) GetId() int64 {
+	if x != nil {
+		return x.Id
+	}
+	return 0
+}
+
+func (x *KubeResponseFrame) GetStatus() int32 {
+	if x != nil {
+		return x.Status
+	}
+	return 0
+}
+
+func (x *KubeResponseFrame) GetHeaders() []*Header {
+	if x != nil {
+		return x.Headers
+	}
+	return nil
+}
+
+func (x *KubeResponseFrame) GetBody() []byte {
+	if x != nil {
+		return x.Body
+	}
+	return nil
+}
+
+func (x *KubeResponseFrame) GetEnd() bool {
+	if x != nil {
+		return x.End
+	}
+	return false
+}
+
+func (x *KubeResponseFrame) GetError() string {
+	if x != nil {
+		return x.Error
+	}
+	return ""
+}
+
+// MigrationRequest asks an agent to run a deployment's migration in its cluster: the target at a
+// commit of a repository of its organization's, allowing the gated hazard classes allow.
+type MigrationRequest struct {
+	state        protoimpl.MessageState `protogen:"open.v1"`
+	Id           int64                  `protobuf:"varint,1,opt,name=id,proto3" json:"id,omitempty"`
+	RepositoryId int64                  `protobuf:"varint,2,opt,name=repository_id,json=repositoryId,proto3" json:"repository_id,omitempty"`
+	CommitId     []byte                 `protobuf:"bytes,3,opt,name=commit_id,json=commitId,proto3" json:"commit_id,omitempty"`
+	Target       string                 `protobuf:"bytes,4,opt,name=target,proto3" json:"target,omitempty"`
+	Allow        []string               `protobuf:"bytes,5,rep,name=allow,proto3" json:"allow,omitempty"`
+	// The secrets the deploy's stanza names, which ok secrets gave the deployer for this commit of
+	// main (docs/secrets.md, "Readers that are not people"): the agent writes them on a memory file
+	// system for the migration alone, and redacts them from what it reports.
+	Secrets       []*SecretValue `protobuf:"bytes,6,rep,name=secrets,proto3" json:"secrets,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *MigrationRequest) Reset() {
+	*x = MigrationRequest{}
+	mi := &file_proto_ok_deploy_v1_deploy_proto_msgTypes[28]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *MigrationRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*MigrationRequest) ProtoMessage() {}
+
+func (x *MigrationRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_ok_deploy_v1_deploy_proto_msgTypes[28]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use MigrationRequest.ProtoReflect.Descriptor instead.
+func (*MigrationRequest) Descriptor() ([]byte, []int) {
+	return file_proto_ok_deploy_v1_deploy_proto_rawDescGZIP(), []int{28}
+}
+
+func (x *MigrationRequest) GetId() int64 {
+	if x != nil {
+		return x.Id
+	}
+	return 0
+}
+
+func (x *MigrationRequest) GetRepositoryId() int64 {
+	if x != nil {
+		return x.RepositoryId
+	}
+	return 0
+}
+
+func (x *MigrationRequest) GetCommitId() []byte {
+	if x != nil {
+		return x.CommitId
+	}
+	return nil
+}
+
+func (x *MigrationRequest) GetTarget() string {
+	if x != nil {
+		return x.Target
+	}
+	return ""
+}
+
+func (x *MigrationRequest) GetAllow() []string {
+	if x != nil {
+		return x.Allow
+	}
+	return nil
+}
+
+func (x *MigrationRequest) GetSecrets() []*SecretValue {
+	if x != nil {
+		return x.Secrets
+	}
+	return nil
+}
+
+type SecretValue struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Path          string                 `protobuf:"bytes,1,opt,name=path,proto3" json:"path,omitempty"` // secret/prod/db-password
+	Value         []byte                 `protobuf:"bytes,2,opt,name=value,proto3" json:"value,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SecretValue) Reset() {
+	*x = SecretValue{}
+	mi := &file_proto_ok_deploy_v1_deploy_proto_msgTypes[29]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SecretValue) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SecretValue) ProtoMessage() {}
+
+func (x *SecretValue) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_ok_deploy_v1_deploy_proto_msgTypes[29]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SecretValue.ProtoReflect.Descriptor instead.
+func (*SecretValue) Descriptor() ([]byte, []int) {
+	return file_proto_ok_deploy_v1_deploy_proto_rawDescGZIP(), []int{29}
+}
+
+func (x *SecretValue) GetPath() string {
+	if x != nil {
+		return x.Path
+	}
+	return ""
+}
+
+func (x *SecretValue) GetValue() []byte {
+	if x != nil {
+		return x.Value
+	}
+	return nil
+}
+
+// MigrationResult is what the migration did: its report (ok's migrate protocol, JSON), the
+// classes it refused, everything it printed, and why it failed; or error, when the agent could not
+// run it — worth asking again.
+type MigrationResult struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Id            int64                  `protobuf:"varint,1,opt,name=id,proto3" json:"id,omitempty"`
+	Report        []byte                 `protobuf:"bytes,2,opt,name=report,proto3" json:"report,omitempty"`
+	Refused       []string               `protobuf:"bytes,3,rep,name=refused,proto3" json:"refused,omitempty"`
+	Output        string                 `protobuf:"bytes,4,opt,name=output,proto3" json:"output,omitempty"`
+	Failed        string                 `protobuf:"bytes,5,opt,name=failed,proto3" json:"failed,omitempty"`
+	Error         string                 `protobuf:"bytes,6,opt,name=error,proto3" json:"error,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *MigrationResult) Reset() {
+	*x = MigrationResult{}
+	mi := &file_proto_ok_deploy_v1_deploy_proto_msgTypes[30]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *MigrationResult) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*MigrationResult) ProtoMessage() {}
+
+func (x *MigrationResult) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_ok_deploy_v1_deploy_proto_msgTypes[30]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use MigrationResult.ProtoReflect.Descriptor instead.
+func (*MigrationResult) Descriptor() ([]byte, []int) {
+	return file_proto_ok_deploy_v1_deploy_proto_rawDescGZIP(), []int{30}
+}
+
+func (x *MigrationResult) GetId() int64 {
+	if x != nil {
+		return x.Id
+	}
+	return 0
+}
+
+func (x *MigrationResult) GetReport() []byte {
+	if x != nil {
+		return x.Report
+	}
+	return nil
+}
+
+func (x *MigrationResult) GetRefused() []string {
+	if x != nil {
+		return x.Refused
+	}
+	return nil
+}
+
+func (x *MigrationResult) GetOutput() string {
+	if x != nil {
+		return x.Output
+	}
+	return ""
+}
+
+func (x *MigrationResult) GetFailed() string {
+	if x != nil {
+		return x.Failed
+	}
+	return ""
+}
+
+func (x *MigrationResult) GetError() string {
+	if x != nil {
+		return x.Error
+	}
+	return ""
+}
+
 type MigrationPlan_Hazard struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Class         string                 `protobuf:"bytes,1,opt,name=class,proto3" json:"class,omitempty"`
@@ -1742,7 +2566,7 @@ type MigrationPlan_Hazard struct {
 
 func (x *MigrationPlan_Hazard) Reset() {
 	*x = MigrationPlan_Hazard{}
-	mi := &file_proto_ok_deploy_v1_deploy_proto_msgTypes[20]
+	mi := &file_proto_ok_deploy_v1_deploy_proto_msgTypes[31]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1754,7 +2578,7 @@ func (x *MigrationPlan_Hazard) String() string {
 func (*MigrationPlan_Hazard) ProtoMessage() {}
 
 func (x *MigrationPlan_Hazard) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_deploy_v1_deploy_proto_msgTypes[20]
+	mi := &file_proto_ok_deploy_v1_deploy_proto_msgTypes[31]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1802,7 +2626,7 @@ type MigrationPlan_Step struct {
 
 func (x *MigrationPlan_Step) Reset() {
 	*x = MigrationPlan_Step{}
-	mi := &file_proto_ok_deploy_v1_deploy_proto_msgTypes[21]
+	mi := &file_proto_ok_deploy_v1_deploy_proto_msgTypes[32]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1814,7 +2638,7 @@ func (x *MigrationPlan_Step) String() string {
 func (*MigrationPlan_Step) ProtoMessage() {}
 
 func (x *MigrationPlan_Step) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_deploy_v1_deploy_proto_msgTypes[21]
+	mi := &file_proto_ok_deploy_v1_deploy_proto_msgTypes[32]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1908,19 +2732,20 @@ const file_proto_ok_deploy_v1_deploy_proto_rawDesc = "" +
 	"\vdeployments\x18\x01 \x03(\v2\x18.ok.deploy.v1.DeploymentR\vdeployments\x12\x18\n" +
 	"\aplanned\x18\x02 \x01(\bR\aplanned\"&\n" +
 	"\x14GetDeploymentRequest\x12\x0e\n" +
-	"\x02id\x18\x01 \x01(\x03R\x02id\"G\n" +
+	"\x02id\x18\x01 \x01(\x03R\x02id\"^\n" +
 	"\x16RetryDeploymentRequest\x12\x0e\n" +
-	"\x02id\x18\x01 \x01(\x03R\x02id\x12\x1d\n" +
-	"\n" +
-	"for_person\x18\x02 \x01(\tR\tforPerson\"F\n" +
+	"\x02id\x18\x01 \x01(\x03R\x02id\x12\"\n" +
+	"\rfor_person_id\x18\x03 \x01(\tR\vforPersonIdJ\x04\b\x02\x10\x03R\n" +
+	"for_person\"]\n" +
 	"\x15HaltDeploymentRequest\x12\x0e\n" +
-	"\x02id\x18\x01 \x01(\x03R\x02id\x12\x1d\n" +
-	"\n" +
-	"for_person\x18\x02 \x01(\tR\tforPerson\"D\n" +
+	"\x02id\x18\x01 \x01(\x03R\x02id\x12\"\n" +
+	"\rfor_person_id\x18\x03 \x01(\tR\vforPersonIdJ\x04\b\x02\x10\x03R\n" +
+	"for_person\"[\n" +
 	"\x13AllowHazardsRequest\x12\x0e\n" +
-	"\x02id\x18\x01 \x01(\x03R\x02id\x12\x1d\n" +
+	"\x02id\x18\x01 \x01(\x03R\x02id\x12\"\n" +
+	"\rfor_person_id\x18\x03 \x01(\tR\vforPersonIdJ\x04\b\x02\x10\x03R\n" +
+	"for_person\"\x81\n" +
 	"\n" +
-	"for_person\x18\x02 \x01(\tR\tforPerson\"\xb3\t\n" +
 	"\n" +
 	"Deployment\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\x03R\x02id\x12#\n" +
@@ -1934,14 +2759,12 @@ const file_proto_ok_deploy_v1_deploy_proto_rawDesc = "" +
 	"\x06to_seq\x18\t \x01(\x03R\x05toSeq\x12\x10\n" +
 	"\x03why\x18\n" +
 	" \x01(\tR\x03why\x12\x12\n" +
-	"\x04wave\x18\v \x01(\x05R\x04wave\x12!\n" +
-	"\frequested_by\x18\f \x01(\tR\vrequestedBy\x122\n" +
+	"\x04wave\x18\v \x01(\x05R\x04wave\x122\n" +
 	"\bworkload\x18\r \x01(\v2\x16.ok.deploy.v1.WorkloadR\bworkload\x127\n" +
 	"\x06status\x18\x0e \x01(\x0e2\x1f.ok.deploy.v1.Deployment.StatusR\x06status\x124\n" +
 	"\x05stage\x18\x0f \x01(\x0e2\x1e.ok.deploy.v1.Deployment.StageR\x05stage\x12\x16\n" +
 	"\x06reason\x18\x10 \x01(\tR\x06reason\x12\x12\n" +
-	"\x04self\x18\x11 \x01(\bR\x04self\x12\x17\n" +
-	"\ahalt_by\x18\x12 \x01(\tR\x06haltBy\x129\n" +
+	"\x04self\x18\x11 \x01(\bR\x04self\x129\n" +
 	"\n" +
 	"created_at\x18\x13 \x01(\v2\x1a.google.protobuf.TimestampR\tcreatedAt\x129\n" +
 	"\n" +
@@ -1953,7 +2776,12 @@ const file_proto_ok_deploy_v1_deploy_proto_rawDesc = "" +
 	"migrations\x18\x17 \x03(\v2\x17.ok.deploy.v1.MigrationR\n" +
 	"migrations\x12&\n" +
 	"\x04roll\x18\x18 \x01(\v2\x12.ok.deploy.v1.RollR\x04roll\x12+\n" +
-	"\x06events\x18\x19 \x03(\v2\x13.ok.deploy.v1.EventR\x06events\"\x99\x01\n" +
+	"\x06events\x18\x19 \x03(\v2\x13.ok.deploy.v1.EventR\x06events\x12&\n" +
+	"\x0frequested_by_id\x18\x1a \x01(\tR\rrequestedById\x12\x1c\n" +
+	"\n" +
+	"halt_by_id\x18\x1b \x01(\tR\bhaltById\x12\x1f\n" +
+	"\vhalt_reason\x18\x1c \x01(\tR\n" +
+	"haltReason\"\x99\x01\n" +
 	"\x06Status\x12\x16\n" +
 	"\x12STATUS_UNSPECIFIED\x10\x00\x12\x12\n" +
 	"\x0eSTATUS_WAITING\x10\x01\x12\x12\n" +
@@ -1972,7 +2800,7 @@ const file_proto_ok_deploy_v1_deploy_proto_rawDesc = "" +
 	"\n" +
 	"STAGE_ROLL\x10\x05\x12\x0e\n" +
 	"\n" +
-	"STAGE_DONE\x10\x06\"P\n" +
+	"STAGE_DONE\x10\x06J\x04\b\f\x10\rJ\x04\b\x12\x10\x13R\frequested_byR\ahalt_by\"P\n" +
 	"\bWorkload\x12\x1c\n" +
 	"\tnamespace\x18\x01 \x01(\tR\tnamespace\x12\x12\n" +
 	"\x04kind\x18\x02 \x01(\tR\x04kind\x12\x12\n" +
@@ -1981,22 +2809,22 @@ const file_proto_ok_deploy_v1_deploy_proto_rawDesc = "" +
 	"\tcontainer\x18\x01 \x01(\tR\tcontainer\x12\x16\n" +
 	"\x06target\x18\x02 \x01(\tR\x06target\x12\x19\n" +
 	"\bpush_run\x18\x03 \x01(\x03R\apushRun\x12\x1c\n" +
-	"\treference\x18\x04 \x01(\tR\treference\"\xe8\x02\n" +
+	"\treference\x18\x04 \x01(\tR\treference\"\xff\x02\n" +
 	"\tMigration\x12\x16\n" +
 	"\x06target\x18\x01 \x01(\tR\x06target\x126\n" +
 	"\x06status\x18\x02 \x01(\x0e2\x1e.ok.deploy.v1.Migration.StatusR\x06status\x12\x16\n" +
 	"\x06output\x18\x03 \x01(\tR\x06output\x12/\n" +
 	"\x04plan\x18\x04 \x01(\v2\x1b.ok.deploy.v1.MigrationPlanR\x04plan\x12\x18\n" +
 	"\arefused\x18\x05 \x03(\tR\arefused\x12\x18\n" +
-	"\aallowed\x18\x06 \x03(\tR\aallowed\x12\x1d\n" +
-	"\n" +
-	"allowed_by\x18\a \x01(\tR\tallowedBy\"o\n" +
+	"\aallowed\x18\x06 \x03(\tR\aallowed\x12\"\n" +
+	"\rallowed_by_id\x18\b \x01(\tR\vallowedById\"o\n" +
 	"\x06Status\x12\x16\n" +
 	"\x12STATUS_UNSPECIFIED\x10\x00\x12\x12\n" +
 	"\x0eSTATUS_PENDING\x10\x01\x12\x12\n" +
 	"\x0eSTATUS_APPLIED\x10\x02\x12\x12\n" +
 	"\x0eSTATUS_WAITING\x10\x03\x12\x11\n" +
-	"\rSTATUS_FAILED\x10\x04\"\xf5\x02\n" +
+	"\rSTATUS_FAILED\x10\x04J\x04\b\a\x10\bR\n" +
+	"allowed_by\"\xf5\x02\n" +
 	"\rMigrationPlan\x12\x1a\n" +
 	"\bdatabase\x18\x01 \x01(\tR\bdatabase\x12\x16\n" +
 	"\x06server\x18\x02 \x01(\tR\x06server\x126\n" +
@@ -2021,7 +2849,63 @@ const file_proto_ok_deploy_v1_deploy_proto_rawDesc = "" +
 	"\rstage_started\x18\a \x01(\v2\x1a.google.protobuf.TimestampR\fstageStarted\"M\n" +
 	"\x05Event\x12*\n" +
 	"\x02at\x18\x01 \x01(\v2\x1a.google.protobuf.TimestampR\x02at\x12\x18\n" +
-	"\amessage\x18\x02 \x01(\tR\amessage2\xd1\x04\n" +
+	"\amessage\x18\x02 \x01(\tR\amessage\"\xb9\x01\n" +
+	"\aAgentUp\x120\n" +
+	"\x05hello\x18\x01 \x01(\v2\x18.ok.deploy.v1.AgentHelloH\x00R\x05hello\x125\n" +
+	"\x04kube\x18\x02 \x01(\v2\x1f.ok.deploy.v1.KubeResponseFrameH\x00R\x04kube\x12=\n" +
+	"\tmigration\x18\x03 \x01(\v2\x1d.ok.deploy.v1.MigrationResultH\x00R\tmigrationB\x06\n" +
+	"\x04kind\"\xdb\x01\n" +
+	"\tAgentDown\x126\n" +
+	"\awelcome\x18\x01 \x01(\v2\x1a.ok.deploy.v1.AgentWelcomeH\x00R\awelcome\x124\n" +
+	"\x04kube\x18\x02 \x01(\v2\x1e.ok.deploy.v1.KubeRequestFrameH\x00R\x04kube\x12>\n" +
+	"\tmigration\x18\x03 \x01(\v2\x1e.ok.deploy.v1.MigrationRequestH\x00R\tmigration\x12\x18\n" +
+	"\x06cancel\x18\x04 \x01(\x03H\x00R\x06cancelB\x06\n" +
+	"\x04kind\"&\n" +
+	"\n" +
+	"AgentHello\x12\x18\n" +
+	"\aversion\x18\x01 \x01(\tR\aversion\"A\n" +
+	"\fAgentWelcome\x12\x1d\n" +
+	"\n" +
+	"account_id\x18\x01 \x01(\tR\taccountId\x12\x12\n" +
+	"\x04cell\x18\x02 \x01(\tR\x04cell\"W\n" +
+	"\tRelayDown\x12\x1d\n" +
+	"\n" +
+	"account_id\x18\x01 \x01(\tR\taccountId\x12+\n" +
+	"\x04down\x18\x02 \x01(\v2\x17.ok.deploy.v1.AgentDownR\x04down\"4\n" +
+	"\x06Header\x12\x12\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x12\x16\n" +
+	"\x06values\x18\x02 \x03(\tR\x06values\"\xa2\x01\n" +
+	"\x10KubeRequestFrame\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\x03R\x02id\x12\x16\n" +
+	"\x06method\x18\x02 \x01(\tR\x06method\x12\x10\n" +
+	"\x03url\x18\x03 \x01(\tR\x03url\x12.\n" +
+	"\aheaders\x18\x04 \x03(\v2\x14.ok.deploy.v1.HeaderR\aheaders\x12\x12\n" +
+	"\x04body\x18\x05 \x01(\fR\x04body\x12\x10\n" +
+	"\x03end\x18\x06 \x01(\bR\x03end\"\xa7\x01\n" +
+	"\x11KubeResponseFrame\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\x03R\x02id\x12\x16\n" +
+	"\x06status\x18\x02 \x01(\x05R\x06status\x12.\n" +
+	"\aheaders\x18\x03 \x03(\v2\x14.ok.deploy.v1.HeaderR\aheaders\x12\x12\n" +
+	"\x04body\x18\x04 \x01(\fR\x04body\x12\x10\n" +
+	"\x03end\x18\x05 \x01(\bR\x03end\x12\x14\n" +
+	"\x05error\x18\x06 \x01(\tR\x05error\"\xc7\x01\n" +
+	"\x10MigrationRequest\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\x03R\x02id\x12#\n" +
+	"\rrepository_id\x18\x02 \x01(\x03R\frepositoryId\x12\x1b\n" +
+	"\tcommit_id\x18\x03 \x01(\fR\bcommitId\x12\x16\n" +
+	"\x06target\x18\x04 \x01(\tR\x06target\x12\x14\n" +
+	"\x05allow\x18\x05 \x03(\tR\x05allow\x123\n" +
+	"\asecrets\x18\x06 \x03(\v2\x19.ok.deploy.v1.SecretValueR\asecrets\"7\n" +
+	"\vSecretValue\x12\x12\n" +
+	"\x04path\x18\x01 \x01(\tR\x04path\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\fR\x05value\"\x99\x01\n" +
+	"\x0fMigrationResult\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\x03R\x02id\x12\x16\n" +
+	"\x06report\x18\x02 \x01(\fR\x06report\x12\x18\n" +
+	"\arefused\x18\x03 \x03(\tR\arefused\x12\x16\n" +
+	"\x06output\x18\x04 \x01(\tR\x06output\x12\x16\n" +
+	"\x06failed\x18\x05 \x01(\tR\x06failed\x12\x14\n" +
+	"\x05error\x18\x06 \x01(\tR\x05error2\xd1\x04\n" +
 	"\vDeployments\x12^\n" +
 	"\x0fListDeployments\x12$.ok.deploy.v1.ListDeploymentsRequest\x1a%.ok.deploy.v1.ListDeploymentsResponse\x12M\n" +
 	"\rGetDeployment\x12\".ok.deploy.v1.GetDeploymentRequest\x1a\x18.ok.deploy.v1.Deployment\x12Q\n" +
@@ -2030,7 +2914,12 @@ const file_proto_ok_deploy_v1_deploy_proto_rawDesc = "" +
 	"\fAllowHazards\x12!.ok.deploy.v1.AllowHazardsRequest\x1a\x18.ok.deploy.v1.Deployment\x12U\n" +
 	"\fListServices\x12!.ok.deploy.v1.ListServicesRequest\x1a\".ok.deploy.v1.ListServicesResponse\x12D\n" +
 	"\n" +
-	"GetService\x12\x1f.ok.deploy.v1.GetServiceRequest\x1a\x15.ok.deploy.v1.Service\x1a\x05\xc2\xf3\x18\x01\fB1Z/github.com/Cidan/ok/proto/ok/deploy/v1;deploypbb\x06proto3"
+	"GetService\x12\x1f.ok.deploy.v1.GetServiceRequest\x1a\x15.ok.deploy.v1.Service\x1a\x05\xc2\xf3\x18\x01\f2N\n" +
+	"\x06Agents\x12=\n" +
+	"\aConnect\x12\x15.ok.deploy.v1.AgentUp\x1a\x17.ok.deploy.v1.AgentDown(\x010\x01\x1a\x05\xc2\xf3\x18\x01\x032S\n" +
+	"\n" +
+	"AgentRelay\x12>\n" +
+	"\bExchange\x12\x17.ok.deploy.v1.RelayDown\x1a\x15.ok.deploy.v1.AgentUp(\x010\x01\x1a\x05\xc2\xf3\x18\x01\x0fB1Z/github.com/Cidan/ok/proto/ok/deploy/v1;deploypbb\x06proto3"
 
 var (
 	file_proto_ok_deploy_v1_deploy_proto_rawDescOnce sync.Once
@@ -2045,7 +2934,7 @@ func file_proto_ok_deploy_v1_deploy_proto_rawDescGZIP() []byte {
 }
 
 var file_proto_ok_deploy_v1_deploy_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
-var file_proto_ok_deploy_v1_deploy_proto_msgTypes = make([]protoimpl.MessageInfo, 22)
+var file_proto_ok_deploy_v1_deploy_proto_msgTypes = make([]protoimpl.MessageInfo, 33)
 var file_proto_ok_deploy_v1_deploy_proto_goTypes = []any{
 	(Deployment_Status)(0),          // 0: ok.deploy.v1.Deployment.Status
 	(Deployment_Stage)(0),           // 1: ok.deploy.v1.Deployment.Stage
@@ -2070,9 +2959,20 @@ var file_proto_ok_deploy_v1_deploy_proto_goTypes = []any{
 	(*MigrationPlan)(nil),           // 20: ok.deploy.v1.MigrationPlan
 	(*Roll)(nil),                    // 21: ok.deploy.v1.Roll
 	(*Event)(nil),                   // 22: ok.deploy.v1.Event
-	(*MigrationPlan_Hazard)(nil),    // 23: ok.deploy.v1.MigrationPlan.Hazard
-	(*MigrationPlan_Step)(nil),      // 24: ok.deploy.v1.MigrationPlan.Step
-	(*timestamppb.Timestamp)(nil),   // 25: google.protobuf.Timestamp
+	(*AgentUp)(nil),                 // 23: ok.deploy.v1.AgentUp
+	(*AgentDown)(nil),               // 24: ok.deploy.v1.AgentDown
+	(*AgentHello)(nil),              // 25: ok.deploy.v1.AgentHello
+	(*AgentWelcome)(nil),            // 26: ok.deploy.v1.AgentWelcome
+	(*RelayDown)(nil),               // 27: ok.deploy.v1.RelayDown
+	(*Header)(nil),                  // 28: ok.deploy.v1.Header
+	(*KubeRequestFrame)(nil),        // 29: ok.deploy.v1.KubeRequestFrame
+	(*KubeResponseFrame)(nil),       // 30: ok.deploy.v1.KubeResponseFrame
+	(*MigrationRequest)(nil),        // 31: ok.deploy.v1.MigrationRequest
+	(*SecretValue)(nil),             // 32: ok.deploy.v1.SecretValue
+	(*MigrationResult)(nil),         // 33: ok.deploy.v1.MigrationResult
+	(*MigrationPlan_Hazard)(nil),    // 34: ok.deploy.v1.MigrationPlan.Hazard
+	(*MigrationPlan_Step)(nil),      // 35: ok.deploy.v1.MigrationPlan.Step
+	(*timestamppb.Timestamp)(nil),   // 36: google.protobuf.Timestamp
 }
 var file_proto_ok_deploy_v1_deploy_proto_depIdxs = []int32{
 	6,  // 0: ok.deploy.v1.ListServicesResponse.services:type_name -> ok.deploy.v1.Service
@@ -2084,43 +2984,57 @@ var file_proto_ok_deploy_v1_deploy_proto_depIdxs = []int32{
 	8,  // 6: ok.deploy.v1.Running.images:type_name -> ok.deploy.v1.ContainerImage
 	9,  // 7: ok.deploy.v1.Running.pods:type_name -> ok.deploy.v1.Pod
 	8,  // 8: ok.deploy.v1.Pod.images:type_name -> ok.deploy.v1.ContainerImage
-	25, // 9: ok.deploy.v1.Pod.started:type_name -> google.protobuf.Timestamp
+	36, // 9: ok.deploy.v1.Pod.started:type_name -> google.protobuf.Timestamp
 	16, // 10: ok.deploy.v1.ListDeploymentsResponse.deployments:type_name -> ok.deploy.v1.Deployment
 	17, // 11: ok.deploy.v1.Deployment.workload:type_name -> ok.deploy.v1.Workload
 	0,  // 12: ok.deploy.v1.Deployment.status:type_name -> ok.deploy.v1.Deployment.Status
 	1,  // 13: ok.deploy.v1.Deployment.stage:type_name -> ok.deploy.v1.Deployment.Stage
-	25, // 14: ok.deploy.v1.Deployment.created_at:type_name -> google.protobuf.Timestamp
-	25, // 15: ok.deploy.v1.Deployment.started_at:type_name -> google.protobuf.Timestamp
-	25, // 16: ok.deploy.v1.Deployment.finished_at:type_name -> google.protobuf.Timestamp
+	36, // 14: ok.deploy.v1.Deployment.created_at:type_name -> google.protobuf.Timestamp
+	36, // 15: ok.deploy.v1.Deployment.started_at:type_name -> google.protobuf.Timestamp
+	36, // 16: ok.deploy.v1.Deployment.finished_at:type_name -> google.protobuf.Timestamp
 	18, // 17: ok.deploy.v1.Deployment.images:type_name -> ok.deploy.v1.Image
 	19, // 18: ok.deploy.v1.Deployment.migrations:type_name -> ok.deploy.v1.Migration
 	21, // 19: ok.deploy.v1.Deployment.roll:type_name -> ok.deploy.v1.Roll
 	22, // 20: ok.deploy.v1.Deployment.events:type_name -> ok.deploy.v1.Event
 	2,  // 21: ok.deploy.v1.Migration.status:type_name -> ok.deploy.v1.Migration.Status
 	20, // 22: ok.deploy.v1.Migration.plan:type_name -> ok.deploy.v1.MigrationPlan
-	24, // 23: ok.deploy.v1.MigrationPlan.steps:type_name -> ok.deploy.v1.MigrationPlan.Step
-	25, // 24: ok.deploy.v1.Roll.stage_started:type_name -> google.protobuf.Timestamp
-	25, // 25: ok.deploy.v1.Event.at:type_name -> google.protobuf.Timestamp
-	23, // 26: ok.deploy.v1.MigrationPlan.Step.hazards:type_name -> ok.deploy.v1.MigrationPlan.Hazard
-	10, // 27: ok.deploy.v1.Deployments.ListDeployments:input_type -> ok.deploy.v1.ListDeploymentsRequest
-	12, // 28: ok.deploy.v1.Deployments.GetDeployment:input_type -> ok.deploy.v1.GetDeploymentRequest
-	13, // 29: ok.deploy.v1.Deployments.RetryDeployment:input_type -> ok.deploy.v1.RetryDeploymentRequest
-	14, // 30: ok.deploy.v1.Deployments.HaltDeployment:input_type -> ok.deploy.v1.HaltDeploymentRequest
-	15, // 31: ok.deploy.v1.Deployments.AllowHazards:input_type -> ok.deploy.v1.AllowHazardsRequest
-	3,  // 32: ok.deploy.v1.Deployments.ListServices:input_type -> ok.deploy.v1.ListServicesRequest
-	5,  // 33: ok.deploy.v1.Deployments.GetService:input_type -> ok.deploy.v1.GetServiceRequest
-	11, // 34: ok.deploy.v1.Deployments.ListDeployments:output_type -> ok.deploy.v1.ListDeploymentsResponse
-	16, // 35: ok.deploy.v1.Deployments.GetDeployment:output_type -> ok.deploy.v1.Deployment
-	16, // 36: ok.deploy.v1.Deployments.RetryDeployment:output_type -> ok.deploy.v1.Deployment
-	16, // 37: ok.deploy.v1.Deployments.HaltDeployment:output_type -> ok.deploy.v1.Deployment
-	16, // 38: ok.deploy.v1.Deployments.AllowHazards:output_type -> ok.deploy.v1.Deployment
-	4,  // 39: ok.deploy.v1.Deployments.ListServices:output_type -> ok.deploy.v1.ListServicesResponse
-	6,  // 40: ok.deploy.v1.Deployments.GetService:output_type -> ok.deploy.v1.Service
-	34, // [34:41] is the sub-list for method output_type
-	27, // [27:34] is the sub-list for method input_type
-	27, // [27:27] is the sub-list for extension type_name
-	27, // [27:27] is the sub-list for extension extendee
-	0,  // [0:27] is the sub-list for field type_name
+	35, // 23: ok.deploy.v1.MigrationPlan.steps:type_name -> ok.deploy.v1.MigrationPlan.Step
+	36, // 24: ok.deploy.v1.Roll.stage_started:type_name -> google.protobuf.Timestamp
+	36, // 25: ok.deploy.v1.Event.at:type_name -> google.protobuf.Timestamp
+	25, // 26: ok.deploy.v1.AgentUp.hello:type_name -> ok.deploy.v1.AgentHello
+	30, // 27: ok.deploy.v1.AgentUp.kube:type_name -> ok.deploy.v1.KubeResponseFrame
+	33, // 28: ok.deploy.v1.AgentUp.migration:type_name -> ok.deploy.v1.MigrationResult
+	26, // 29: ok.deploy.v1.AgentDown.welcome:type_name -> ok.deploy.v1.AgentWelcome
+	29, // 30: ok.deploy.v1.AgentDown.kube:type_name -> ok.deploy.v1.KubeRequestFrame
+	31, // 31: ok.deploy.v1.AgentDown.migration:type_name -> ok.deploy.v1.MigrationRequest
+	24, // 32: ok.deploy.v1.RelayDown.down:type_name -> ok.deploy.v1.AgentDown
+	28, // 33: ok.deploy.v1.KubeRequestFrame.headers:type_name -> ok.deploy.v1.Header
+	28, // 34: ok.deploy.v1.KubeResponseFrame.headers:type_name -> ok.deploy.v1.Header
+	32, // 35: ok.deploy.v1.MigrationRequest.secrets:type_name -> ok.deploy.v1.SecretValue
+	34, // 36: ok.deploy.v1.MigrationPlan.Step.hazards:type_name -> ok.deploy.v1.MigrationPlan.Hazard
+	10, // 37: ok.deploy.v1.Deployments.ListDeployments:input_type -> ok.deploy.v1.ListDeploymentsRequest
+	12, // 38: ok.deploy.v1.Deployments.GetDeployment:input_type -> ok.deploy.v1.GetDeploymentRequest
+	13, // 39: ok.deploy.v1.Deployments.RetryDeployment:input_type -> ok.deploy.v1.RetryDeploymentRequest
+	14, // 40: ok.deploy.v1.Deployments.HaltDeployment:input_type -> ok.deploy.v1.HaltDeploymentRequest
+	15, // 41: ok.deploy.v1.Deployments.AllowHazards:input_type -> ok.deploy.v1.AllowHazardsRequest
+	3,  // 42: ok.deploy.v1.Deployments.ListServices:input_type -> ok.deploy.v1.ListServicesRequest
+	5,  // 43: ok.deploy.v1.Deployments.GetService:input_type -> ok.deploy.v1.GetServiceRequest
+	23, // 44: ok.deploy.v1.Agents.Connect:input_type -> ok.deploy.v1.AgentUp
+	27, // 45: ok.deploy.v1.AgentRelay.Exchange:input_type -> ok.deploy.v1.RelayDown
+	11, // 46: ok.deploy.v1.Deployments.ListDeployments:output_type -> ok.deploy.v1.ListDeploymentsResponse
+	16, // 47: ok.deploy.v1.Deployments.GetDeployment:output_type -> ok.deploy.v1.Deployment
+	16, // 48: ok.deploy.v1.Deployments.RetryDeployment:output_type -> ok.deploy.v1.Deployment
+	16, // 49: ok.deploy.v1.Deployments.HaltDeployment:output_type -> ok.deploy.v1.Deployment
+	16, // 50: ok.deploy.v1.Deployments.AllowHazards:output_type -> ok.deploy.v1.Deployment
+	4,  // 51: ok.deploy.v1.Deployments.ListServices:output_type -> ok.deploy.v1.ListServicesResponse
+	6,  // 52: ok.deploy.v1.Deployments.GetService:output_type -> ok.deploy.v1.Service
+	24, // 53: ok.deploy.v1.Agents.Connect:output_type -> ok.deploy.v1.AgentDown
+	23, // 54: ok.deploy.v1.AgentRelay.Exchange:output_type -> ok.deploy.v1.AgentUp
+	46, // [46:55] is the sub-list for method output_type
+	37, // [37:46] is the sub-list for method input_type
+	37, // [37:37] is the sub-list for extension type_name
+	37, // [37:37] is the sub-list for extension extendee
+	0,  // [0:37] is the sub-list for field type_name
 }
 
 func init() { file_proto_ok_deploy_v1_deploy_proto_init() }
@@ -2128,15 +3042,26 @@ func file_proto_ok_deploy_v1_deploy_proto_init() {
 	if File_proto_ok_deploy_v1_deploy_proto != nil {
 		return
 	}
+	file_proto_ok_deploy_v1_deploy_proto_msgTypes[20].OneofWrappers = []any{
+		(*AgentUp_Hello)(nil),
+		(*AgentUp_Kube)(nil),
+		(*AgentUp_Migration)(nil),
+	}
+	file_proto_ok_deploy_v1_deploy_proto_msgTypes[21].OneofWrappers = []any{
+		(*AgentDown_Welcome)(nil),
+		(*AgentDown_Kube)(nil),
+		(*AgentDown_Migration)(nil),
+		(*AgentDown_Cancel)(nil),
+	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_ok_deploy_v1_deploy_proto_rawDesc), len(file_proto_ok_deploy_v1_deploy_proto_rawDesc)),
 			NumEnums:      3,
-			NumMessages:   22,
+			NumMessages:   33,
 			NumExtensions: 0,
-			NumServices:   1,
+			NumServices:   3,
 		},
 		GoTypes:           file_proto_ok_deploy_v1_deploy_proto_goTypes,
 		DependencyIndexes: file_proto_ok_deploy_v1_deploy_proto_depIdxs,

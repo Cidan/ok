@@ -10,9 +10,11 @@ import (
 	"github.com/Cidan/ok/internal/identity"
 )
 
-// Load reads the directory's state as the sync decides it — every principal, robots too (whose
-// names the sync must not give), the synced groups, and the retired names — and the snapshot of
-// the system of record it last followed (nil before the first sync).
+// Load reads the directory's state as the sync decides it — every principal, robots and
+// organizations too (whose names the sync must not give), the synced groups, and the retired names
+// — and the snapshot of the system of record it last followed (nil before the first sync). People
+// and organizations share one namespace of handles, so an organization's handle, held or retired,
+// is retired for people too.
 func (s *Store) Load(ctx context.Context) (*directory.State, *directory.Snapshot, error) {
 	st := directory.NewState()
 	all, err := s.Principals(ctx, Filter{IncludeInactive: true})
@@ -39,6 +41,12 @@ func (s *Store) Load(ctx context.Context) (*directory.State, *directory.Snapshot
 	for _, r := range retired {
 		st.Retired[r.Name] = true
 	}
+	for name := range st.Principals {
+		s.retireAsPerson(st, name)
+	}
+	for _, r := range retired {
+		s.retireAsPerson(st, r.Name)
+	}
 	raw, _, _, _, _, err := s.b.SyncState(ctx)
 	if err != nil {
 		return nil, nil, err
@@ -53,9 +61,28 @@ func (s *Store) Load(ctx context.Context) (*directory.State, *directory.Snapshot
 	return st, &mirror, nil
 }
 
-// Apply carries out a sync's plan in one transaction, with the snapshot it followed: people made,
-// changed, renamed (the old name retired), suspended (their sessions ended), and deleted (their
-// name retired, their credentials revoked, their sessions ended); groups likewise.
+// applyChunk bounds the changes a sync applies in one transaction: a directory of any size, in
+// transactions a database takes.
+const applyChunk = 100
+
+// inChunks runs fn over items, at most applyChunk at a time, each in a transaction of its own.
+func inChunks[T any](ctx context.Context, s *Store, items []T, fn func(tx Ops, chunk []T) error) error {
+	for len(items) > 0 {
+		chunk := items[:min(len(items), applyChunk)]
+		if err := s.txn(ctx, func(tx Ops) error { return fn(tx, chunk) }); err != nil {
+			return err
+		}
+		items = items[len(chunk):]
+	}
+	return nil
+}
+
+// Apply carries out a sync's plan — people made, changed, renamed (the old name retired), suspended
+// (their sessions ended), and deleted (their name retired, their credentials revoked, their
+// sessions ended); groups likewise — a chunk of it at a time, each in a transaction of its own,
+// then records the snapshot it followed. A sync cut short leaves what it applied, and the next,
+// planned against the directory as it is, does the rest: the plan is the directory's distance from
+// the source, and the snapshot only where the source's changes are read from next.
 func (s *Store) Apply(ctx context.Context, plan *directory.Plan, mirror *directory.Snapshot) error {
 	raw, err := json.Marshal(mirror)
 	if err != nil {
@@ -63,20 +90,29 @@ func (s *Store) Apply(ctx context.Context, plan *directory.Plan, mirror *directo
 	}
 	waiting, _ := json.Marshal(nonNil(plan.Waiting))
 	notes, _ := json.Marshal(nonNil(plan.Notes))
-	return s.b.Txn(ctx, func(tx Ops) error {
+	if err := inChunks(ctx, s, plan.Humans, func(tx Ops, chunk []directory.HumanChange) error {
 		if err := tx.LockNames(ctx); err != nil {
 			return err
 		}
-		for _, c := range plan.Humans {
+		for _, c := range chunk {
 			a := c.After
-			if c.Before == nil {
+			if c.Before == nil || c.Before.Name != a.Name {
+				// An organization may have taken the handle since the plan was made.
 				held, err := tx.NameHeld(ctx, a.Name)
 				if err != nil {
 					return err
 				}
+				if h, ok := s.names.HandleOf(a.Name); ok && !held {
+					held, err = tx.NameHeld(ctx, s.names.Org(h))
+					if err != nil {
+						return err
+					}
+				}
 				if held {
 					return ErrTaken
 				}
+			}
+			if c.Before == nil {
 				if _, err := tx.InsertPrincipal(ctx, Principal{ID: newID("prn_"), Name: a.Name, Kind: Human, Status: a.Status,
 					ExternalID: a.ExternalID, Email: a.Email, DisplayName: a.DisplayName}); err != nil {
 					return err
@@ -89,6 +125,9 @@ func (s *Store) Apply(ctx context.Context, plan *directory.Plan, mirror *directo
 			}
 			if c.Before.Name != a.Name {
 				if err := tx.RetireName(ctx, c.Before.Name, "renamed to "+a.Name); err != nil {
+					return err
+				}
+				if err := s.logOwnerRenamed(ctx, tx, id, c.Before.Name); err != nil {
 					return err
 				}
 			}
@@ -106,7 +145,15 @@ func (s *Store) Apply(ctx context.Context, plan *directory.Plan, mirror *directo
 				}
 			}
 		}
-		for _, c := range plan.Groups {
+		return nil
+	}); err != nil {
+		return err
+	}
+	if err := inChunks(ctx, s, plan.Groups, func(tx Ops, chunk []directory.GroupChange) error {
+		if err := tx.LockNames(ctx); err != nil {
+			return err
+		}
+		for _, c := range chunk {
 			a := c.After
 			if a.Members == nil {
 				a.Members = []string{}
@@ -131,8 +178,11 @@ func (s *Store) Apply(ctx context.Context, plan *directory.Plan, mirror *directo
 				}
 			}
 		}
-		return tx.PutSyncState(ctx, raw, waiting, notes)
-	})
+		return nil
+	}); err != nil {
+		return err
+	}
+	return s.txn(ctx, func(tx Ops) error { return tx.PutSyncState(ctx, raw, waiting, notes) })
 }
 
 func nonNil[T any](s []T) []T {
@@ -224,4 +274,12 @@ func (s *Store) SyncedGroups(ctx context.Context) (map[string][]string, error) {
 		}
 	}
 	return out, nil
+}
+
+// retireAsPerson marks the person's name with an organization's handle taken.
+func (s *Store) retireAsPerson(st *directory.State, name string) {
+	if k, ok := s.names.KindOf(name); ok && k == identity.Org {
+		h, _ := s.names.HandleOf(name)
+		st.Retired[s.names.Human(h)] = true
+	}
 }

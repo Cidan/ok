@@ -18,6 +18,7 @@ hex.workspace = true
 jj-lib.workspace = true
 libc.workspace = true
 ok-proto.workspace = true
+ok-secret.workspace = true
 ok-store.workspace = true
 okfs-fuse.workspace = true
 okfs-nfs.workspace = true
@@ -26,7 +27,21 @@ serde.workspace = true
 tokio.workspace = true
 toml.workspace = true
 tonic.workspace = true
+# testfix's, for the kernel test (the testkit feature).
+tempfile = { workspace = true, optional = true }
+
+[features]
+# okfs's test fixtures (testfix), for its kernel test: a binary of its own harness, which sees the
+# crate as any other does. Only okfs's own tests enable it (its dev-dependency on itself).
+testkit = ["dep:tempfile"]
 
 [dev-dependencies]
+okfs = { path = ".", features = ["testkit"] }
 tempfile.workspace = true
 
+# The kernel test enters a user and mount namespace of its own first thing in main, which only a
+# single-threaded process may: it has a harness of its own (okfs_fuse::testns::run).
+[[test]]
+name = "kernel"
+path = "tests/kernel.rs"
+harness = false

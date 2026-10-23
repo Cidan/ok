@@ -12,8 +12,9 @@ import (
 	"errors"
 	"time"
 
-	"github.com/Cidan/ok/internal/lock"
 	"github.com/Cidan/ok/internal/scm/encoding"
+	"github.com/Cidan/ok/internal/scm/segment"
+	okpb "github.com/Cidan/ok/proto/ok/v1"
 )
 
 // ErrDuplicate is a write a uniqueness constraint refused: a repository's name, a CL's number.
@@ -30,21 +31,44 @@ type Backend interface {
 	Retryable(err error) bool
 	// Snapshot runs fn in one read-only transaction that sees the database as of one moment.
 	Snapshot(ctx context.Context, fn func(tx Ops) error) error
-	// Lead runs fn holding the lock named role ("gc") that one replica holds at a time, with a
-	// context that ends if the lock is lost, giving it up when fn returns. It returns
-	// lock.ErrNotAcquired when another replica holds it, and otherwise fn's error.
-	Lead(ctx context.Context, role string, fn lock.LockFn) error
-	// Listen delivers every notification sent on channels, from any replica, to deliver, until
-	// ctx ends or the connection fails (its error); ready is called each time it starts listening,
-	// after which nothing sent is missed until it returns.
-	Listen(ctx context.Context, channels []string, ready func(), deliver func(channel, payload string)) error
 	// Ping reports whether the database answers.
 	Ping(ctx context.Context) error
 	// RelayEvents hands publish up to limit events no relay has published, by repository and
 	// place in its log, then forgets them — unless publish fails, when they stay to be published
 	// again. Relays beside it take other events. It returns how many it published.
 	RelayEvents(ctx context.Context, limit int, publish func([]Event) error) (int, error)
+
+	// ─── Moves (docs/hosted.md, "Cells, as built") ───
+
+	// MoveTables are the tables that hold a network's rows, parents first.
+	MoveTables(ctx context.Context) ([]string, error)
+	// ExportRows is up to limit of a table's rows about a network and its repositories, after a
+	// row by key, each named by PostgreSQL's columns.
+	ExportRows(ctx context.Context, m Moving, table string, after *okpb.Row, limit int) ([]*okpb.Row, error)
+	// ImportRows writes a table's rows of a network moving here, over any of the same key.
+	ImportRows(ctx context.Context, m Moving, table string, rows []*okpb.Row) error
+	// FinishImport moves what numbers a network's rows past those an import brought; the network
+	// stays as its row came — frozen — until it opens (SetNetworkMove).
+	FinishImport(ctx context.Context, m Moving) error
+	// DropNetworkRows deletes up to limit of a network's rows, children first, and returns how
+	// many.
+	DropNetworkRows(ctx context.Context, m Moving, limit int) (int64, error)
+	// SetNetworkMove sets a network's move: "" (none), frozen, or moved to cell; its commit waits
+	// for every write transaction about the network under way (NetworkMove).
+	SetNetworkMove(ctx context.Context, net Network, state, cell string) error
 }
+
+// Moving is a network that moves, and its repositories.
+type Moving struct {
+	Network      Network
+	Repositories []int64
+}
+
+// A network's move states.
+const (
+	MoveFrozen = "frozen"
+	MoveMoved  = "moved"
+)
 
 // Walk is what a freshness walk does to each row it reaches (the store's touch, refresh, and
 // pin).
@@ -63,22 +87,55 @@ const (
 // the transaction's, and a Lock… read holds what it read against other writers until it ends.
 // "Today" is the database's current day.
 type Ops interface {
-	// Notify sends a notification on channel: at once outside a transaction, at commit inside.
-	Notify(ctx context.Context, channel, payload string) error
+	// NetworkMove is a network's move state, and the cell it moved to: a write transaction about
+	// the network reads it first, holding the row in share mode, so a move's freeze waits for it.
+	NetworkMove(ctx context.Context, net Network) (state, cell string, err error)
 
 	// ─── Repositories ───
 
-	// InsertRepository records a repository whose main is head; ErrDuplicate for a name taken.
-	InsertRepository(ctx context.Context, name string, head encoding.ID, createdBy string) (Repository, error)
-	// LockRepositoryName reads a repository's name, held; ok is false when there is none.
-	LockRepositoryName(ctx context.Context, id int64) (name string, ok bool, err error)
-	// RenameRepository renames a repository; ErrDuplicate for a name taken.
-	RenameRepository(ctx context.Context, id int64, name string) (Repository, error)
-	// Repository and RepositoryByName read a repository; ok is false when there is none.
+	// InsertRepository records repository id in network net, whose main is head — and the network,
+	// if it is new, with id training its dictionaries; ErrDuplicate for an ID recorded.
+	InsertRepository(ctx context.Context, id int64, net Network, head encoding.ID, createdBy string) (Repository, error)
+	// InsertFork records repository id, a fork of parent in its network whose main is parent's
+	// main at its place; ErrDuplicate for an ID recorded.
+	InsertFork(ctx context.Context, id int64, parent Repository, createdBy string) (Repository, error)
+	// SetParent makes parent a fork's upstream (Store.Sync), in the same network.
+	SetParent(ctx context.Context, id, parent int64) error
+	// SetParentSeq records the place in its parent's main history a fork's follows up to.
+	SetParentSeq(ctx context.Context, id, seq int64) error
+	// DeleteRepository deletes a repository's row and its tail — every row keyed by it but its
+	// content index and segment references, which a deletion record (repository_deletion) keeps
+	// for FinishDeletion — clears its forks' parent, hands its network's dictionary training to the
+	// network's oldest other repository, and returns its network; ok is false when there is none.
+	DeleteRepository(ctx context.Context, id int64) (net Network, ok bool, err error)
+	// DeleteRepositoryTail deletes up to limit of the rows DeleteRepository deletes of a repository
+	// but its row and its keyed work — children before their parents — and returns how many: the
+	// store calls it, each in a transaction of its own, until it deletes fewer than limit, so the
+	// transaction that deletes the repository's row holds little.
+	DeleteRepositoryTail(ctx context.Context, id int64, limit int) (int64, error)
+	// DeleteContentIndexTail deletes up to limit of a content index's blocks and log rows, and
+	// returns how many: what FinishDeletion deletes of them, a transaction at a time beforehand.
+	DeleteContentIndexTail(ctx context.Context, scope Scope, limit int) (int64, error)
+	// DeleteNetworkTail deletes up to limit of the rows DeleteNetwork deletes of a network — its
+	// segment rows, packs, chunk releases, dictionaries, and its unfinished deletions' and its own
+	// content indexes' blocks and log rows — but its row, its deletion records, content indexes'
+	// rows, and counters, and returns how many: a transaction at a time beforehand.
+	DeleteNetworkTail(ctx context.Context, net Network, limit int) (int64, error)
+	// PendingDeletions are up to limit of the deletions not yet finished, oldest first.
+	PendingDeletions(ctx context.Context, limit int) ([]Deletion, error)
+	// FinishDeletion retires a deleted repository's segment references, deletes its content index,
+	// and deletes its deletion record.
+	FinishDeletion(ctx context.Context, id int64) error
+	// DeleteNetwork deletes a network's rows, and every content index and segment row in it — its
+	// repositories' whose deletions are not finished too.
+	DeleteNetwork(ctx context.Context, net Network) error
+	// NetworkRepositories are a network's repositories, by ID.
+	NetworkRepositories(ctx context.Context, net Network) ([]int64, error)
+	// LockRepository holds a repository's row, so it is not deleted meanwhile; ok is false when
+	// there is none.
+	LockRepository(ctx context.Context, id int64) (ok bool, err error)
+	// Repository reads a repository; ok is false when there is none.
 	Repository(ctx context.Context, id int64) (Repository, bool, error)
-	RepositoryByName(ctx context.Context, name string) (Repository, bool, error)
-	// Repositories are up to limit repositories named after after, by name.
-	Repositories(ctx context.Context, after string, limit int) ([]Repository, error)
 	// RepositoryExists reports whether a repository is recorded.
 	RepositoryExists(ctx context.Context, id int64) (bool, error)
 	// Head is a repository's main and its place in main's history — held, with lock; ok is false
@@ -99,70 +156,85 @@ type Ops interface {
 	// order.
 	RepositoryEvents(ctx context.Context, repo, after int64, limit int) ([]Event, error)
 	// LogHeads are, for up to limit repositories with IDs above after, by ID, the last place in
-	// each one's log — now, or (asOf > 0) as of the old feed's sequence number asOf; a repository
-	// with no event by then is left out.
-	LogHeads(ctx context.Context, asOf, after int64, limit int) ([][2]int64, error)
+	// each one's log; a repository with no event is left out.
+	LogHeads(ctx context.Context, after int64, limit int) ([][2]int64, error)
 
 	// ─── The content index ───
 
-	// InsertContentIndex records a repository's content index at generation gen.
-	InsertContentIndex(ctx context.Context, repo, gen int64) error
-	// ShareContentIndex holds a repository's content index in share mode — writers that commute
-	// with each other run beside it; a sweep or a compaction does not — and returns today. ok is
-	// false when the repository has no content index.
-	ShareContentIndex(ctx context.Context, repo int64) (today time.Time, ok bool, err error)
-	// LockContentIndex holds a repository's content index alone and returns its generation.
-	LockContentIndex(ctx context.Context, repo int64) (gen int64, err error)
-	// ContentIndexGeneration is a repository's content index's generation; ok is false when it
-	// has none.
-	ContentIndexGeneration(ctx context.Context, repo int64) (gen int64, ok bool, err error)
-	// SetContentIndexGeneration moves a repository's content index to generation gen.
-	SetContentIndexGeneration(ctx context.Context, repo, gen int64) error
+	// A content index is a repository's — the files and chunks it holds — or a network's — where
+	// its chunks are — as its scope says.
+
+	// InsertContentIndex records a content index at generation gen.
+	InsertContentIndex(ctx context.Context, scope Scope, gen int64) error
+	// ShareContentIndex holds a content index in share mode — writers that commute with each other
+	// run beside it; a sweep or a compaction does not — and returns today. ok is false when there is
+	// no such content index.
+	ShareContentIndex(ctx context.Context, scope Scope) (today time.Time, ok bool, err error)
+	// LockContentIndex holds a content index alone and returns its generation.
+	LockContentIndex(ctx context.Context, scope Scope) (gen int64, err error)
+	// ContentIndexGeneration is a content index's generation, and where in its log the fold that
+	// made it read to (nil: nowhere — the generation folded no log); ok is false when it has none.
+	ContentIndexGeneration(ctx context.Context, scope Scope) (gen int64, folded LogPlace, ok bool, err error)
+	// SetContentIndexGeneration moves a content index to generation gen, which folded its log to
+	// folded.
+	SetContentIndexGeneration(ctx context.Context, scope Scope, gen int64, folded LogPlace) error
 	// IndexBlocks are a generation's blocks' bodies.
-	IndexBlocks(ctx context.Context, repo, gen int64) ([][]byte, error)
+	IndexBlocks(ctx context.Context, scope Scope, gen int64) ([][]byte, error)
 	// InsertIndexBlocks records a generation's blocks, each by its first entry's ID.
-	InsertIndexBlocks(ctx context.Context, repo, gen int64, firsts []encoding.ID, bodies [][]byte) error
+	InsertIndexBlocks(ctx context.Context, scope Scope, gen int64, firsts []encoding.ID, bodies [][]byte) error
 	// DeleteIndexBlocks deletes a generation's blocks.
-	DeleteIndexBlocks(ctx context.Context, repo, gen int64) error
-	// ContentLogIDs are a repository's content log rows' IDs.
-	ContentLogIDs(ctx context.Context, repo int64) ([]int64, error)
-	// ContentLogs are a repository's content log rows among ids, by ID.
-	ContentLogs(ctx context.Context, repo int64, ids []int64) ([]ContentLog, error)
-	// InsertContentLog records a content log row and returns its ID.
-	InsertContentLog(ctx context.Context, repo int64, body []byte) (int64, error)
-	// DeleteContentLogs deletes a repository's content log rows among ids.
-	DeleteContentLogs(ctx context.Context, repo int64, ids []int64) error
+	DeleteIndexBlocks(ctx context.Context, scope Scope, gen int64) error
+	// DeleteOtherIndexBlocks deletes up to limit of an index's blocks of every generation but keep,
+	// and returns how many: a fold's, a transaction at a time, of what a fold that stopped short
+	// left and of the generation it replaced.
+	DeleteOtherIndexBlocks(ctx context.Context, scope Scope, keep int64, limit int) (int64, error)
+	// ContentLogSince are a content index's log rows the snapshot sees — the operation's, which
+	// must be one (Snapshot) — that a reader at since has not (nil: every one), in the order they
+	// apply, and the snapshot's place in the log. A reader goes on from that place: nothing
+	// committed since is before it, so it reads only what committed after.
+	ContentLogSince(ctx context.Context, scope Scope, since LogPlace) ([]ContentLog, LogPlace, error)
+	// InsertContentLog records a content log row, applied after the transaction's earlier ones.
+	InsertContentLog(ctx context.Context, scope Scope, body []byte) error
+	// DeleteFoldedContentLogs deletes up to limit of the log rows a fold read to folded — which its
+	// generation holds — and of the rows of transactions that never committed, and returns how many:
+	// after a fold, a transaction at a time.
+	DeleteFoldedContentLogs(ctx context.Context, scope Scope, folded LogPlace, limit int) (int64, error)
 
 	// ─── Packs ───
 
+	// Packs are a network's.
+
 	// PutPack records a pack a publish wrote — again, its size updated, if it is recorded — and
 	// returns its number.
-	PutPack(ctx context.Context, repo int64, id encoding.ID, size int64) (uint64, error)
+	PutPack(ctx context.Context, net Network, id encoding.ID, size int64) (uint64, error)
 	// InsertPack records a pack compaction wrote, with the dictionary it considered (nil: none),
 	// and returns its number.
-	InsertPack(ctx context.Context, repo int64, id encoding.ID, size int64, dictionary *int64) (uint64, error)
-	// PackNumbers are a repository's packs' IDs, retired ones too, by number.
-	PackNumbers(ctx context.Context, repo int64) (map[uint64]encoding.ID, error)
-	// LivePacks are a repository's packs not retired, oldest first.
-	LivePacks(ctx context.Context, repo int64) ([]Pack, error)
-	// RetiredPackIDs are a repository's retired packs' IDs.
-	RetiredPackIDs(ctx context.Context, repo int64) ([]encoding.ID, error)
-	// PackIDs are every one of a repository's packs' IDs.
-	PackIDs(ctx context.Context, repo int64) ([]encoding.ID, error)
+	InsertPack(ctx context.Context, net Network, id encoding.ID, size int64, dictionary *int64) (uint64, error)
+	// PackNumbers are a network's packs' IDs, retired ones too, by number.
+	PackNumbers(ctx context.Context, net Network) (map[uint64]encoding.ID, error)
+	// LivePacks are a network's packs not retired, oldest first.
+	LivePacks(ctx context.Context, net Network) ([]Pack, error)
+	// RetiredPackIDs are a network's retired packs' IDs.
+	RetiredPackIDs(ctx context.Context, net Network) ([]encoding.ID, error)
+	// PackIDs are every one of a network's packs' IDs.
+	PackIDs(ctx context.Context, net Network) ([]encoding.ID, error)
 	// SetPacksDictionary records the dictionary that considered packs.
-	SetPacksDictionary(ctx context.Context, repo int64, ids []encoding.ID, dictionary int64) error
+	SetPacksDictionary(ctx context.Context, net Network, ids []encoding.ID, dictionary int64) error
 	// RetirePack retires a pack, now.
-	RetirePack(ctx context.Context, repo int64, id encoding.ID) error
+	RetirePack(ctx context.Context, net Network, id encoding.ID) error
 	// LivePackNumbers are the numbers of the packs among ids not retired, by ID.
-	LivePackNumbers(ctx context.Context, repo int64, ids []encoding.ID) (map[encoding.ID]uint64, error)
+	LivePackNumbers(ctx context.Context, net Network, ids []encoding.ID) (map[encoding.ID]uint64, error)
 	// RetirePacks retires the packs among ids not retired, now — or, dry, only counts them — and
 	// returns how many and their total size.
-	RetirePacks(ctx context.Context, repo int64, ids []encoding.ID, dry bool) (int, int64, error)
-	// RetiredPacksBefore are the packs retired before t, of one repository or (repo nil) every
-	// one, by repository and ID.
-	RetiredPacksBefore(ctx context.Context, t time.Time, repo *int64) ([]RetiredPack, error)
+	RetirePacks(ctx context.Context, net Network, ids []encoding.ID, dry bool) (int, int64, error)
+	// RepositoriesRetiringBefore are the first repository of each network with a pack retired
+	// before packs or a segment row retired before segments, by ID: their collections delete them.
+	RepositoriesRetiringBefore(ctx context.Context, packs, segments time.Time) ([]int64, error)
+	// RetiredPacksBefore are the packs retired before t, of one network or (net nil) every one, by
+	// network and ID.
+	RetiredPacksBefore(ctx context.Context, t time.Time, net *Network) ([]RetiredPack, error)
 	// DeleteRetiredPack deletes a retired pack's row, reporting whether it did.
-	DeleteRetiredPack(ctx context.Context, repo int64, id encoding.ID) (bool, error)
+	DeleteRetiredPack(ctx context.Context, net Network, id encoding.ID) (bool, error)
 
 	// ─── Objects and commits ───
 
@@ -204,12 +276,14 @@ type Ops interface {
 	// not touched since cutoff — or, dry, count them — and return how many.
 	SweepObjects(ctx context.Context, repo int64, ids []encoding.ID, cutoff time.Time, dry bool) (int64, error)
 	SweepCommits(ctx context.Context, repo int64, ids []encoding.ID, cutoff time.Time, dry bool) (int64, error)
-	// CopyRelatives are the copy histories related to id — its ancestors, and everything
-	// descending from one of them — with their bodies.
-	CopyRelatives(ctx context.Context, repo int64, id encoding.ID) (map[encoding.ID][]byte, error)
-	// Ancestry is the parent edges of from and of every ancestor down to generation minGen: for
-	// each commit reached, its parents in order and their generations.
-	Ancestry(ctx context.Context, repo int64, from []encoding.ID, minGen int64) ([]Ancestor, error)
+	// CopyChildren are the copy histories the tail records each of parents as a parent of, as
+	// (copy, parent) edges.
+	CopyChildren(ctx context.Context, repo int64, parents []encoding.ID) ([][2]encoding.ID, error)
+	// TailAncestry walks the tail's commits: those of from it holds, and every ancestor it holds
+	// down to generation minGen, each with its generation and parents (wherever they are).
+	TailAncestry(ctx context.Context, repo int64, from []encoding.ID, minGen int64) ([]GraphCommit, error)
+	// TailGraph is the generation and parents of each of ids the tail holds.
+	TailGraph(ctx context.Context, repo int64, ids []encoding.ID) ([]GraphCommit, error)
 	// AllObjects, AllCopyParents, AllCommits, and AllCommitParents are a repository's every row of
 	// each, for fsck: objects by ID, commit parents by commit and order.
 	AllObjects(ctx context.Context, repo int64) ([]Object, error)
@@ -221,6 +295,63 @@ type Ops interface {
 	// InsertTreeSizes keeps trees' sizes records, once each.
 	InsertTreeSizes(ctx context.Context, repo int64, ids []encoding.ID, bodies [][]byte) error
 
+	// ─── Segments ───
+
+	// Segments are a scope's live segments of kind, newest first by age.
+	Segments(ctx context.Context, scope Scope, kind segment.Kind) ([]Segment, error)
+	// InsertSegments records written segments live.
+	InsertSegments(ctx context.Context, segs []Segment) error
+	// RetireSegments retires a scope's live segments of kind among ids, those it inherited aside,
+	// reporting how many it retired.
+	RetireSegments(ctx context.Context, scope Scope, kind segment.Kind, ids []encoding.ID) (int64, error)
+	// RetiredSegmentsBefore are the segment rows retired before t, of every scope of one network or
+	// (net nil) every network.
+	RetiredSegmentsBefore(ctx context.Context, t time.Time, net *Network) ([]Segment, error)
+	// AllSegments are a scope's segments, live and retired.
+	AllSegments(ctx context.Context, scope Scope) ([]Segment, error)
+	// NetworkSegments are every segment row of a network, of every scope, live and retired.
+	NetworkSegments(ctx context.Context, net Network) ([]Segment, error)
+	// SegmentNamed reports whether any of a network's segment rows but scope's names a segment
+	// object — live, or retired since.
+	SegmentNamed(ctx context.Context, net Network, scope Scope, kind segment.Kind, id encoding.ID, since time.Time) (bool, error)
+	// SetInherited makes segs the live segments a repository inherits — each recorded inherited,
+	// with its bound, live again if it was retired — and retires the rest it inherited, reporting
+	// how many.
+	SetInherited(ctx context.Context, repo int64, segs []Segment) (int64, error)
+
+	// ─── Chunk releases ───
+
+	// ReleaseChunks records that a repository no longer holds chunks, for its network's collection.
+	ReleaseChunks(ctx context.Context, net Network, ids []encoding.ID) error
+	// ReleasedChunks are up to limit of a network's released chunks, by ID.
+	ReleasedChunks(ctx context.Context, net Network, limit int) ([]encoding.ID, error)
+	// DeleteReleases deletes a network's releases of chunks among ids.
+	DeleteReleases(ctx context.Context, net Network, ids []encoding.ID) error
+	// DeleteSegment deletes a retired segment's row.
+	DeleteSegment(ctx context.Context, scope Scope, kind segment.Kind, id encoding.ID) error
+	// PinnedPaths are up to limit of the tail's rows of main's path history — every one is main's,
+	// so pinned — by path, generation, and commit.
+	PinnedPaths(ctx context.Context, repo int64, limit int) ([]PathRow, error)
+	// SettledEvents are up to limit of the tail's events the relay has published, by place.
+	SettledEvents(ctx context.Context, repo int64, limit int) ([]Event, error)
+	// SettledChangeLists are up to limit of the tail's landed CLs, by number, each with its
+	// patchsets and its landing: nothing changes a CL once it has landed.
+	SettledChangeLists(ctx context.Context, repo int64, limit int) ([]SettledChangeList, error)
+	// PinnedCommits are up to limit of the tail's pinned commits, by ID.
+	PinnedCommits(ctx context.Context, repo int64, limit int) ([]PinnedCommit, error)
+	// PinnedObjects are up to limit of the tail's pinned objects, by ID.
+	PinnedObjects(ctx context.Context, repo int64, limit int) ([]Object, error)
+	// PinnedTreeSizes are up to limit of the tail's sizes records of trees that are pinned —
+	// pinned in the tail, or gone from it into a segment — by tree ID, each as an Object.
+	PinnedTreeSizes(ctx context.Context, repo int64, limit int) ([]Object, error)
+	// PinnedCopyEdges are up to limit of the tail's (copy, parent) edges of copies that are
+	// pinned, likewise, by parent then copy.
+	PinnedCopyEdges(ctx context.Context, repo int64, limit int) ([][2]encoding.ID, error)
+	// DeleteCompacted deletes from the tail what a compaction moved into segments: the objects
+	// among it still pinned, which nothing undoes; the sizes records and edges; and the CLs among
+	// it still landed, which nothing undoes either, with their patchsets and main's moves.
+	DeleteCompacted(ctx context.Context, repo int64, c Compacted) error
+
 	// ─── Main's history ───
 
 	// InsertHeadLog records one move of main.
@@ -231,17 +362,23 @@ type Ops interface {
 	// HeadSeqOf is the place in main's history where main moved to commit; ok is false when it
 	// never did.
 	HeadSeqOf(ctx context.Context, repo int64, commit encoding.ID) (seq int64, ok bool, err error)
+	// InsertPathIndex records a landing whose path history is written after its transaction
+	// (InsertCommitPaths), a bounded transaction at a time; PathIndexes are a repository's, by
+	// generation; DeletePathIndex records one written.
+	InsertPathIndex(ctx context.Context, repo int64, p PathIndex) error
+	PathIndexes(ctx context.Context, repo int64) ([]PathIndex, error)
+	DeletePathIndex(ctx context.Context, repo, gen int64) error
 	// InsertCommitPaths records the paths a commit on main at generation gen changed, once each.
 	InsertCommitPaths(ctx context.Context, repo, gen int64, commit encoding.ID, paths []string) error
 	// PathCommits are up to limit of the commits of main that changed any of paths, at
 	// generations from to to, once each, newest first unless ascending.
 	PathCommits(ctx context.Context, repo int64, paths []string, from, to int64, ascending bool, limit int) ([]GenCommit, error)
 	// LastPathCommits are, for each of paths, the newest commit of main at or below generation gen
-	// that changed it (absent: none), by its index in paths.
-	LastPathCommits(ctx context.Context, repo, gen int64, paths []string) (map[int]encoding.ID, error)
-	// PathHistory is the commits of main at or below generation gen that changed path, newest
-	// first.
-	PathHistory(ctx context.Context, repo int64, path string, gen int64) ([]encoding.ID, error)
+	// that changed it (absent: none), with its generation, by its index in paths.
+	LastPathCommits(ctx context.Context, repo, gen int64, paths []string) (map[int]GenCommit, error)
+	// PathHistory is the commits of main at or below generation gen that changed path, with their
+	// generations, newest first.
+	PathHistory(ctx context.Context, repo int64, path string, gen int64) ([]GenCommit, error)
 
 	// ─── Operation logs ───
 
@@ -273,30 +410,50 @@ type Ops interface {
 	// views so.
 	PutOperations(ctx context.Context, log int64, ops []Operation) error
 	PutViews(ctx context.Context, log int64, views []Object) error
-	// TouchOps touches the operations or views (kind) among ids, now.
-	TouchOps(ctx context.Context, log int64, kind encoding.Kind, ids []encoding.ID) error
-	// CollectOps deletes a log's operations among doomed last touched before before, then its
-	// views last touched before before that no operation names — or, dry, counts what it would
-	// delete — and returns how many of each.
-	CollectOps(ctx context.Context, log int64, doomed []encoding.ID, before time.Time, dry bool) (ops, views int64, err error)
+	// TouchOps touches the tail's operations or views (kind) among ids, now, returning those it
+	// touched.
+	TouchOps(ctx context.Context, log int64, kind encoding.Kind, ids []encoding.ID) ([]encoding.ID, error)
+	// CollectOps deletes the tail's operations of a log among doomed last touched before before,
+	// then its views last touched before before that no operation in the tail names and that are
+	// not among keep — or, dry, counts what it would delete — and returns how many of each.
+	CollectOps(ctx context.Context, log int64, doomed, keep []encoding.ID, before time.Time, dry bool) (ops, views int64, err error)
+	// TombstoneOps records tombstones of a log's operations or views (kind) among ids the tail
+	// holds no row or tombstone of — or, dry, counts them — and returns how many.
+	TombstoneOps(ctx context.Context, log int64, kind encoding.Kind, ids []encoding.ID, dry bool) (int64, error)
+	// TailOpTombstones are the tombstones the tail holds of a log's operations or views (kind)
+	// among ids.
+	TailOpTombstones(ctx context.Context, log int64, kind encoding.Kind, ids []encoding.ID) (map[encoding.ID]bool, error)
+	// RepositoryOpTombstones are every tombstone the tail holds of a repository's logs.
+	RepositoryOpTombstones(ctx context.Context, repo int64) ([]OpKey, error)
+	// TailOpViewRefs are the views the tail's operations of a log name, but for operations among
+	// doomed touched before before.
+	TailOpViewRefs(ctx context.Context, log int64, doomed []encoding.ID, before time.Time) (map[encoding.ID]bool, error)
+	// AllOpLogs are a repository's operation logs, by ID.
+	AllOpLogs(ctx context.Context, repo int64) ([]int64, error)
+	// SettledOps are up to limit of the tail's operations, and up to limit of its views, of a
+	// repository's logs last touched before before, by log, kind, and ID.
+	SettledOps(ctx context.Context, repo int64, before time.Time, limit int) ([]OpRecord, error)
+	// OpTombstones are up to limit of the tail's tombstones of a repository's logs, by log, kind,
+	// and ID.
+	OpTombstones(ctx context.Context, repo int64, limit int) ([]OpKey, error)
 	// WorkspaceOpLogs are a repository's workspaces' operation logs, by ID.
 	WorkspaceOpLogs(ctx context.Context, repo int64) ([]int64, error)
 	// DeleteOrphanOpLogs deletes a repository's operation logs of no workspace, and
 	// DeleteOrphanWorkspaces its workspaces with no operation log — or, dry, counts them.
 	DeleteOrphanOpLogs(ctx context.Context, repo int64, dry bool) (int64, error)
 	DeleteOrphanWorkspaces(ctx context.Context, repo int64, dry bool) (int64, error)
-	// RepositoryOperations and RepositoryViews are every operation and view of a repository's
-	// operation logs.
-	RepositoryOperations(ctx context.Context, repo int64) ([]Object, error)
-	RepositoryViews(ctx context.Context, repo int64) ([]Object, error)
+	// RepositoryOperations and RepositoryViews are every operation and view the tail holds of a
+	// repository's operation logs.
+	RepositoryOperations(ctx context.Context, repo int64) ([]OpRecord, error)
+	RepositoryViews(ctx context.Context, repo int64) ([]OpRecord, error)
 
 	// ─── ChangeLists ───
 
 	// ChangeLists are a repository's CLs numbered numbers, by number — held, with lock.
 	ChangeLists(ctx context.Context, repo int64, numbers []int64, lock bool) ([]ChangeList, error)
 	// ListChangeLists are up to limit of a repository's CLs numbered below before (0: any), in
-	// statuses (none: any), by author ("": any), newest first.
-	ListChangeLists(ctx context.Context, repo, before int64, statuses []int16, author string, limit int) ([]ChangeList, error)
+	// statuses (none: any), by author ("": any), stacked on parent (0: any), newest first.
+	ListChangeLists(ctx context.Context, repo, before int64, statuses []int16, author string, parent int64, limit int) ([]ChangeList, error)
 	// ChangeListsOfChanges are a repository's CLs of change IDs, by number.
 	ChangeListsOfChanges(ctx context.Context, repo int64, changes [][]byte) ([]ChangeList, error)
 	// Patchsets are the patchsets of a repository's CLs, by CL and number.
@@ -320,9 +477,11 @@ type Ops interface {
 	// RollingBack is a draft or open CL rolling back any of numbers, the lowest; ok is false when
 	// none.
 	RollingBack(ctx context.Context, repo int64, numbers []int64, statuses []int16) (int64, bool, error)
-	// StackLandings are the landings of a submitted CL and of every submitted CL stacked above it
-	// — one with a patchset uploaded on it, or on one above it — by their place in main's history.
-	StackLandings(ctx context.Context, repo, number int64, submitted int16) ([]Landing, error)
+	// StackedOn are the tail's CLs with a patchset uploaded stacked on one of parents, as (parent,
+	// CL) pairs.
+	StackedOn(ctx context.Context, repo int64, parents []int64) ([][2]int64, error)
+	// TailLandings are the tail's moves of main that landed cls.
+	TailLandings(ctx context.Context, repo int64, cls []int64) ([]HeadMove, error)
 
 	// ─── Candidates ───
 
@@ -339,25 +498,48 @@ type Ops interface {
 
 	// ─── Dictionaries ───
 
-	// DictionaryBody is a trained dictionary's body, of whichever repository; ok is false when
-	// none is trained with the ID.
-	DictionaryBody(ctx context.Context, id int64) ([]byte, bool, error)
-	// RepositoryDictionary is a repository's trained dictionary's body.
-	RepositoryDictionary(ctx context.Context, repo, id int64) ([]byte, bool, error)
-	// NewestDictionary is a repository's newest trained dictionary; ok is false when none.
-	NewestDictionary(ctx context.Context, repo int64) (id int64, body []byte, at time.Time, ok bool, err error)
-	// InsertDictionary records a dictionary being trained on samples files, and returns its ID.
-	InsertDictionary(ctx context.Context, repo int64, samples int) (int64, error)
+	// NetworkDictionary is a network's trained dictionary's body, and who trained it; ok is false
+	// when none is trained with the ID. A dictionary's ID is its network's: a frame names it, and a
+	// network keeps its IDs wherever it moves.
+	NetworkDictionary(ctx context.Context, net Network, id int64) (body []byte, trainer int64, ok bool, err error)
+	// NetworkTrainer is the repository that trains a network's dictionaries.
+	NetworkTrainer(ctx context.Context, net Network) (int64, error)
+	// DictionaryGrants are, for each trainer, the newest of its dictionaries a repository may read
+	// besides its own.
+	DictionaryGrants(ctx context.Context, repo int64) (map[int64]int64, error)
+	// SetDictionaryGrants replaces a repository's grants.
+	SetDictionaryGrants(ctx context.Context, repo int64, grants map[int64]int64) error
+	// NewestDictionaryOf is the newest trained dictionary a trainer trained, by ID; ok is false
+	// when none.
+	NewestDictionaryOf(ctx context.Context, trainer int64) (id int64, ok bool, err error)
+	// NewestDictionary is a network's newest trained dictionary; ok is false when none.
+	NewestDictionary(ctx context.Context, net Network) (id int64, body []byte, at time.Time, ok bool, err error)
+	// InsertDictionary records a dictionary trainer is training on samples files, and returns its
+	// ID.
+	InsertDictionary(ctx context.Context, net Network, trainer int64, samples int) (int64, error)
 	// SetDictionaryBody records a dictionary's trained body.
-	SetDictionaryBody(ctx context.Context, id int64, body []byte) error
+	SetDictionaryBody(ctx context.Context, net Network, id int64, body []byte) error
 	// DeleteDictionary deletes a dictionary.
-	DeleteDictionary(ctx context.Context, id int64) error
+	DeleteDictionary(ctx context.Context, net Network, id int64) error
 
 	// ─── Garbage collection ───
 
 	// DueForGC are the repositories whose last successful pass began before scheduled and whose
-	// last failure, if any, is not after retry, by ID.
+	// last failure, if any, is not after retry, by ID; RepositoryDueForGC reports whether a
+	// repository is one.
 	DueForGC(ctx context.Context, scheduled, retry time.Time) ([]int64, error)
+	RepositoryDueForGC(ctx context.Context, repo int64, scheduled, retry time.Time) (bool, error)
+
+	// ─── Keyed work ───
+
+	// MarkWork, TakeWork, RenewWork, ReleaseWork, and DueWork are the SCM's keyed work's
+	// (internal/work's Store).
+	MarkWork(ctx context.Context, kind string, key int64) error
+	MarkWorkAt(ctx context.Context, kind string, key int64, at time.Time) error
+	TakeWork(ctx context.Context, kind string, key int64, holder string, ttl time.Duration) (bool, error)
+	RenewWork(ctx context.Context, kind string, key int64, holder string, ttl time.Duration) (bool, error)
+	ReleaseWork(ctx context.Context, kind string, key int64, holder string) (bool, error)
+	DueWork(ctx context.Context, kind string, limit int) ([]int64, error)
 	// InsertGCPass records a pass, once.
 	InsertGCPass(ctx context.Context, p GCPass) error
 
@@ -386,10 +568,14 @@ type Ops interface {
 	// PrincipalCheckpoint reads one of a principal's checkpoints; ok is false when it is none of
 	// theirs.
 	PrincipalCheckpoint(ctx context.Context, repo int64, principal string, id int64) (Checkpoint, bool, error)
-	// Checkpoints are up to limit of a workspace's checkpoints below before, newest first.
+	// Checkpoints are up to limit of a workspace's checkpoints made before the checkpoint before (0:
+	// from the newest), newest first.
 	Checkpoints(ctx context.Context, repo int64, principal, workspace string, before int64, limit int) ([]Checkpoint, error)
 	// Workspaces are a principal's workspaces of a repository, by name.
 	Workspaces(ctx context.Context, repo int64, principal string) ([]Workspace, error)
+	// WorkspaceNames are up to limit of a repository's workspaces after one, by principal and name
+	// (the zero WorkspaceKey: from the first).
+	WorkspaceNames(ctx context.Context, repo int64, after WorkspaceKey, limit int) ([]WorkspaceKey, error)
 	// ThinCheckpoints deletes — or, dry, counts — a repository's checkpoints created before
 	// every, except each workspace's latest that is not a fork: before daily, every one; before
 	// hourly, all but the last of each day; otherwise all but the last of each hour (UTC).

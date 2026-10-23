@@ -7,55 +7,96 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/Cidan/ok/internal/data"
+	"github.com/Cidan/ok/internal/data/pgdata"
 	"github.com/Cidan/ok/internal/scm/encoding"
 	"github.com/Cidan/ok/internal/scm/store/backend"
 )
 
 // ─── Dictionaries ───
 
-func (x queries) DictionaryBody(ctx context.Context, id int64) ([]byte, bool, error) {
+func (x queries) NetworkDictionary(ctx context.Context, net backend.Network, id int64) ([]byte, int64, bool, error) {
 	var body []byte
-	err := x.q.QueryRow(ctx, `SELECT body FROM dictionary WHERE id = $1 AND length(body) > 0`, id).Scan(&body)
+	var trainer int64
+	err := x.q.QueryRow(ctx, `SELECT body, coalesce(trainer_id, 0) FROM dictionary WHERE network_id = $1 AND id = $2 AND length(body) > 0`,
+		net, id).Scan(&body, &trainer)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, false, nil
+		return nil, 0, false, nil
 	}
-	return body, err == nil, err
+	return body, trainer, err == nil, err
 }
 
-func (x queries) RepositoryDictionary(ctx context.Context, repo, id int64) ([]byte, bool, error) {
-	var body []byte
-	err := x.q.QueryRow(ctx, `SELECT body FROM dictionary WHERE repository_id = $1 AND id = $2 AND length(body) > 0`, repo, id).Scan(&body)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, false, nil
-	}
-	return body, err == nil, err
+func (x queries) NetworkTrainer(ctx context.Context, net backend.Network) (int64, error) {
+	var trainer int64
+	err := x.q.QueryRow(ctx, `SELECT coalesce(trainer_id, 0) FROM network WHERE id = $1`, net).Scan(&trainer)
+	return trainer, err
 }
 
-func (x queries) NewestDictionary(ctx context.Context, repo int64) (int64, []byte, time.Time, bool, error) {
+func (x queries) DictionaryGrants(ctx context.Context, repo int64) (map[int64]int64, error) {
+	rows, err := x.q.Query(ctx, `SELECT trainer_id, up_to FROM dictionary_grant WHERE repository_id = $1`, repo)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[int64]int64{}
+	for rows.Next() {
+		var trainer, upTo int64
+		if err := rows.Scan(&trainer, &upTo); err != nil {
+			return nil, err
+		}
+		out[trainer] = upTo
+	}
+	return out, rows.Err()
+}
+
+func (x queries) SetDictionaryGrants(ctx context.Context, repo int64, grants map[int64]int64) error {
+	if _, err := x.q.Exec(ctx, `DELETE FROM dictionary_grant WHERE repository_id = $1`, repo); err != nil {
+		return err
+	}
+	for trainer, upTo := range grants {
+		if _, err := x.q.Exec(ctx, `INSERT INTO dictionary_grant (repository_id, trainer_id, up_to) VALUES ($1, $2, $3)`,
+			repo, trainer, upTo); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (x queries) NewestDictionaryOf(ctx context.Context, trainer int64) (int64, bool, error) {
+	var id int64
+	err := x.q.QueryRow(ctx, `SELECT id FROM dictionary WHERE trainer_id = $1 AND length(body) > 0 ORDER BY id DESC LIMIT 1`, trainer).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, false, nil
+	}
+	return id, err == nil, err
+}
+
+func (x queries) NewestDictionary(ctx context.Context, net backend.Network) (int64, []byte, time.Time, bool, error) {
 	var id int64
 	var body []byte
 	var at time.Time
 	err := x.q.QueryRow(ctx, `SELECT id, body, created_at FROM dictionary
-		WHERE repository_id = $1 AND length(body) > 0 ORDER BY id DESC LIMIT 1`, repo).Scan(&id, &body, &at)
+		WHERE network_id = $1 AND length(body) > 0 ORDER BY id DESC LIMIT 1`, net).Scan(&id, &body, &at)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return 0, nil, time.Time{}, false, nil
 	}
 	return id, body, at, err == nil, err
 }
 
-func (x queries) InsertDictionary(ctx context.Context, repo int64, samples int) (int64, error) {
+func (x queries) InsertDictionary(ctx context.Context, net backend.Network, trainer int64, samples int) (int64, error) {
 	var id int64
-	err := x.q.QueryRow(ctx, `INSERT INTO dictionary (repository_id, body, samples) VALUES ($1, '', $2) RETURNING id`, repo, samples).Scan(&id)
+	err := x.q.QueryRow(ctx, `INSERT INTO dictionary (network_id, trainer_id, body, samples) VALUES ($1, $2, '', $3) RETURNING id`,
+		net, trainer, samples).Scan(&id)
 	return id, err
 }
 
-func (x queries) SetDictionaryBody(ctx context.Context, id int64, body []byte) error {
-	_, err := x.q.Exec(ctx, `UPDATE dictionary SET body = $2 WHERE id = $1`, id, body)
+func (x queries) SetDictionaryBody(ctx context.Context, net backend.Network, id int64, body []byte) error {
+	_, err := x.q.Exec(ctx, `UPDATE dictionary SET body = $3 WHERE network_id = $1 AND id = $2`, net, id, body)
 	return err
 }
 
-func (x queries) DeleteDictionary(ctx context.Context, id int64) error {
-	_, err := x.q.Exec(ctx, `DELETE FROM dictionary WHERE id = $1`, id)
+func (x queries) DeleteDictionary(ctx context.Context, net backend.Network, id int64) error {
+	_, err := x.q.Exec(ctx, `DELETE FROM dictionary WHERE network_id = $1 AND id = $2`, net, id)
 	return err
 }
 
@@ -66,6 +107,41 @@ func (x queries) DueForGC(ctx context.Context, scheduled, retry time.Time) ([]in
 		WHERE NOT EXISTS (SELECT 1 FROM gc_pass g WHERE g.repository_id = r.id AND g.started_at >= $1 AND g.error IS NULL)
 		  AND NOT EXISTS (SELECT 1 FROM gc_pass g WHERE g.repository_id = r.id AND g.error IS NOT NULL AND g.started_at > $2)
 		ORDER BY r.id`, scheduled, retry))
+}
+
+func (x queries) RepositoryDueForGC(ctx context.Context, repo int64, scheduled, retry time.Time) (bool, error) {
+	var due bool
+	err := x.q.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM repository r WHERE r.id = $1
+		AND NOT EXISTS (SELECT 1 FROM gc_pass g WHERE g.repository_id = r.id AND g.started_at >= $2 AND g.error IS NULL)
+		AND NOT EXISTS (SELECT 1 FROM gc_pass g WHERE g.repository_id = r.id AND g.error IS NOT NULL AND g.started_at > $3))`,
+		repo, scheduled, retry).Scan(&due)
+	return due, err
+}
+
+// ─── Keyed work ───
+
+func (x queries) MarkWork(ctx context.Context, kind string, key int64) error {
+	return pgdata.MarkWork(ctx, x.q, kind, key)
+}
+
+func (x queries) MarkWorkAt(ctx context.Context, kind string, key int64, at time.Time) error {
+	return pgdata.MarkWorkAt(ctx, x.q, kind, key, at)
+}
+
+func (x queries) TakeWork(ctx context.Context, kind string, key int64, holder string, ttl time.Duration) (bool, error) {
+	return pgdata.TakeWork(ctx, x.q, kind, key, holder, ttl)
+}
+
+func (x queries) RenewWork(ctx context.Context, kind string, key int64, holder string, ttl time.Duration) (bool, error) {
+	return pgdata.RenewWork(ctx, x.q, kind, key, holder, ttl)
+}
+
+func (x queries) ReleaseWork(ctx context.Context, kind string, key int64, holder string) (bool, error) {
+	return pgdata.ReleaseWork(ctx, x.q, kind, key, holder)
+}
+
+func (x queries) DueWork(ctx context.Context, kind string, limit int) ([]int64, error) {
+	return pgdata.DueWork(ctx, x.q, kind, limit)
 }
 
 func (x queries) InsertGCPass(ctx context.Context, p backend.GCPass) error {
@@ -150,9 +226,10 @@ func (x queries) CheckpointOf(ctx context.Context, id, repo int64, principal, wo
 func (x queries) InsertCheckpoint(ctx context.Context, principal string, c backend.Checkpoint) (int64, time.Time, error) {
 	var id int64
 	var at time.Time
-	err := x.q.QueryRow(ctx, `INSERT INTO checkpoint (repository_id, principal, workspace, machine, parent_id, tree_ids, base_commit_id, fork)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id, created_at`,
-		c.Repo, principal, c.Workspace, c.Machine, nullable(c.ParentID), ids(c.Trees), c.BaseCommit[:], c.Fork).Scan(&id, &at)
+	err := x.q.QueryRow(ctx, `INSERT INTO checkpoint (id, repository_id, principal, workspace, machine, parent_id, tree_ids, base_commit_id, fork,
+			created_at)
+		VALUES ($9, $1, $2, $3, $4, $5, $6, $7, $8, clock_timestamp()) RETURNING id, created_at`,
+		c.Repo, principal, c.Workspace, c.Machine, nullable(c.ParentID), ids(c.Trees), c.BaseCommit[:], c.Fork, data.NewID()).Scan(&id, &at)
 	return id, at, err
 }
 
@@ -190,7 +267,7 @@ func oneCheckpoint(row pgx.Row) (backend.Checkpoint, bool, error) {
 
 func (x queries) LatestCheckpoint(ctx context.Context, repo int64, principal, workspace string) (backend.Checkpoint, bool, error) {
 	return oneCheckpoint(x.q.QueryRow(ctx, `SELECT `+checkpointColumns+` FROM checkpoint
-		WHERE repository_id = $1 AND principal = $2 AND workspace = $3 AND NOT fork ORDER BY id DESC LIMIT 1`, repo, principal, workspace))
+		WHERE repository_id = $1 AND principal = $2 AND workspace = $3 AND NOT fork ORDER BY created_at DESC, id DESC LIMIT 1`, repo, principal, workspace))
 }
 
 func (x queries) PrincipalCheckpoint(ctx context.Context, repo int64, principal string, id int64) (backend.Checkpoint, bool, error) {
@@ -200,7 +277,9 @@ func (x queries) PrincipalCheckpoint(ctx context.Context, repo int64, principal 
 
 func (x queries) Checkpoints(ctx context.Context, repo int64, principal, workspace string, before int64, limit int) ([]backend.Checkpoint, error) {
 	rows, err := x.q.Query(ctx, `SELECT `+checkpointColumns+` FROM checkpoint
-		WHERE repository_id = $1 AND principal = $2 AND workspace = $3 AND id < $4 ORDER BY id DESC LIMIT $5`,
+		WHERE repository_id = $1 AND principal = $2 AND workspace = $3
+			AND ($4::bigint = 0 OR (created_at, id) < (SELECT created_at, id FROM checkpoint WHERE id = $4))
+		ORDER BY created_at DESC, id DESC LIMIT $5`,
 		repo, principal, workspace, before, limit)
 	if err != nil {
 		return nil, err
@@ -238,15 +317,35 @@ func (x queries) Workspaces(ctx context.Context, repo int64, principal string) (
 	return out, rows.Err()
 }
 
+func (x queries) WorkspaceNames(ctx context.Context, repo int64, after backend.WorkspaceKey, limit int) ([]backend.WorkspaceKey, error) {
+	rows, err := x.q.Query(ctx, `SELECT principal, name FROM workspace WHERE repository_id = $1 AND (principal, name) > ($2, $3)
+		ORDER BY principal, name LIMIT $4`, repo, after.Principal, after.Name, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []backend.WorkspaceKey
+	for rows.Next() {
+		var k backend.WorkspaceKey
+		if err := rows.Scan(&k.Principal, &k.Name); err != nil {
+			return nil, err
+		}
+		out = append(out, k)
+	}
+	return out, rows.Err()
+}
+
 func (x queries) ThinCheckpoints(ctx context.Context, repo int64, every, hourly, daily time.Time, dry bool) (int64, error) {
 	query := `WITH old AS (
 			SELECT id, created_at,
-				row_number() OVER (PARTITION BY principal, workspace, date_trunc('hour', created_at AT TIME ZONE 'UTC') ORDER BY id DESC) AS in_hour,
-				row_number() OVER (PARTITION BY principal, workspace, date_trunc('day', created_at AT TIME ZONE 'UTC') ORDER BY id DESC) AS in_day
+				row_number() OVER (PARTITION BY principal, workspace, date_trunc('hour', created_at AT TIME ZONE 'UTC')
+					ORDER BY created_at DESC, id DESC) AS in_hour,
+				row_number() OVER (PARTITION BY principal, workspace, date_trunc('day', created_at AT TIME ZONE 'UTC')
+					ORDER BY created_at DESC, id DESC) AS in_day
 			FROM checkpoint WHERE repository_id = $1 AND created_at < $2
 		), latest AS (
 			SELECT DISTINCT ON (principal, workspace) id FROM checkpoint
-			WHERE repository_id = $1 AND NOT fork ORDER BY principal, workspace, id DESC
+			WHERE repository_id = $1 AND NOT fork ORDER BY principal, workspace, created_at DESC, id DESC
 		), doomed AS (
 			SELECT id FROM old WHERE id NOT IN (SELECT id FROM latest) AND (
 				created_at < $4

@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -51,11 +50,7 @@ identity:
 	if err != nil {
 		t.Fatal(err)
 	}
-	pool, err := pgxpool.New(ctx, testdb.Postgres(t))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer pool.Close()
+	pool := testdb.Pool(t)
 	r, err := role.Build(ctx, cfg, role.Options{Pool: pool})
 	if err != nil {
 		t.Fatal(err)
@@ -175,11 +170,7 @@ identity:
 	if err != nil {
 		t.Fatal(err)
 	}
-	pool, err := pgxpool.New(ctx, testdb.Postgres(t))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer pool.Close()
+	pool := testdb.Pool(t)
 	r, err := role.Build(ctx, cfg, role.Options{Pool: pool})
 	if err != nil {
 		t.Fatal(err)

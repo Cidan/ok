@@ -21,6 +21,7 @@ type options struct {
 	stopTimeout      time.Duration
 	maxRecv, maxSend int
 	metricsAddr      string
+	profiling        bool
 	listener         net.Listener
 	reflection       bool
 	tls              *tls.Config
@@ -83,4 +84,9 @@ func WithMaxMessageSize(recv, send int) Option {
 // so roles a test runs side by side do not collide; an installation names ":8473").
 func WithMetricsAddr(addr string) Option {
 	return func(o *options) { o.metricsAddr = addr }
+}
+
+// WithProfiling serves Go's profiles (/debug/pprof/) beside the metrics.
+func WithProfiling(on bool) Option {
+	return func(o *options) { o.profiling = on }
 }

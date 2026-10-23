@@ -51,7 +51,7 @@ per-file secrets/**=file: //infra/SECURITY_OWNERS
 file: ../TEAM_OWNERS
 include /shared/OWNERS_common
 `))
-	wantProblems := []string{`4: "USER: cal" is not an owner (user: <handle>, acl: <name>, or *), a per-file rule, a set option, or an import`}
+	wantProblems := []string{`4: "USER: cal" is not an owner (user: <handle>, acl: <name>, acl: @<organization>/<team>, or *), a per-file rule, a set option, or an import`}
 	if got := problemLines(problems); !reflect.DeepEqual(got, wantProblems) {
 		t.Errorf("problems = %v", got)
 	}
@@ -102,6 +102,27 @@ func problemLines(ps []Problem) []string {
 	return out
 }
 
+// A hosted service's forms parse as an installation's do: user: @ada is ada, acl: @acme/eng
+// acme's team eng, shown as written.
+func TestParseHostedForms(t *testing.T) {
+	f, problems := Parse("OWNERS", []byte("user: @Ada\nacl: @acme/eng\nacl: acme/web\nacl: platform\n"))
+	if len(problems) != 0 {
+		t.Fatalf("problems: %v", problems)
+	}
+	want := []Owner{{Kind: User, Name: "ada"}, {Kind: ACL, Name: "acme/eng"}, {Kind: ACL, Name: "acme/web"}, {Kind: ACL, Name: "platform"}}
+	if len(f.Owners) != len(want) {
+		t.Fatalf("owners: %+v", f.Owners)
+	}
+	for i, o := range f.Owners {
+		if o.Value != want[i] {
+			t.Errorf("owner %d = %+v, want %+v", i, o.Value, want[i])
+		}
+	}
+	if got := f.Owners[1].Value.String(); got != "acl: @acme/eng" {
+		t.Errorf("a team shown as %q", got)
+	}
+}
+
 func TestParseRefuses(t *testing.T) {
 	for _, tc := range []struct{ line, want string }{
 		{"bea", `"bea" is not an owner`},
@@ -109,6 +130,8 @@ func TestParseRefuses(t *testing.T) {
 		{"user: -ada", `"-ada" is not a handle`},
 		{"user: bea@example.com", `"bea@example.com" is not a handle`},
 		{"acl: eng team", `"eng team" is not an ACL's name`},
+		{"acl: @acme/", `"@acme/" is not an organization's team`},
+		{"acl: @/eng", `"@/eng" is not an organization's team`},
 		{"file: //a/OWNERS x", `"//a/OWNERS x" is not one path`},
 		{"set inherit", `unknown option "inherit"`},
 		{"per-file *.go", "a per-file rule is <globs>=<owners>"},
@@ -329,10 +352,10 @@ func TestValidate(t *testing.T) {
 		{"noparent beside a failing import", "a/OWNERS", "user: ada\nper-file x/**=set noparent\nper-file x/**=file: //gone/OWNERS\n",
 			[]string{"a/OWNERS:3: gone/OWNERS does not exist"}},
 		{"every line of a broken import", "a/OWNERS", "user: ada\nfile: //bad/TWO_OWNERS\n",
-			[]string{`bad/TWO_OWNERS:1: "x" is not an owner (user: <handle>, acl: <name>, or *), a per-file rule, a set option, or an import`, `bad/TWO_OWNERS:2: "y" is not an owner (user: <handle>, acl: <name>, or *), a per-file rule, a set option, or an import`}},
+			[]string{`bad/TWO_OWNERS:1: "x" is not an owner (user: <handle>, acl: <name>, acl: @<organization>/<team>, or *), a per-file rule, a set option, or an import`, `bad/TWO_OWNERS:2: "y" is not an owner (user: <handle>, acl: <name>, acl: @<organization>/<team>, or *), a per-file rule, a set option, or an import`}},
 		{"a missing import", "a/OWNERS", "user: ada\nfile: //b/OWNERS\n", []string{"a/OWNERS:2: b/OWNERS does not exist"}},
 		{"an import with problems", "a/OWNERS", "user: ada\nfile: //bad/BAD_OWNERS\n",
-			[]string{`bad/BAD_OWNERS:1: "user ada" is not an owner (user: <handle>, acl: <name>, or *), a per-file rule, a set option, or an import`}},
+			[]string{`bad/BAD_OWNERS:1: "user ada" is not an owner (user: <handle>, acl: <name>, acl: @<organization>/<team>, or *), a per-file rule, a set option, or an import`}},
 		{"an import back to itself", "a/OWNERS", "user: ada\ninclude //teams/LOOP_OWNERS\n",
 			[]string{"teams/LOOP_OWNERS:1: imports go round: a/OWNERS → teams/LOOP_OWNERS → a/OWNERS"}},
 	} {

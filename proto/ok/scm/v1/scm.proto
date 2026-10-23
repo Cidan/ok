@@ -45,61 +45,107 @@ message ObjectResult {
 
 // ─── Repositories ───
 
+// The directory names repositories (docs/hosted.md, "Tenancy, as built"): the SCM makes one under
+// the entry it asks ok identity for, and finds one by its full name through it. Renaming,
+// transferring, and who reads what are the directory's (identity's Tenancy).
+// Cells is how one cell's SCM asks another's (docs/hosted.md, "Cells, as built").
+service Cells {
+  option (ok.v1.callers) = CALLER_SCM;
+
+  // MakeRepository makes a repository another cell's SCM reserved for a person and the directory
+  // placed in this cell, and has the directory activate it: a creation asked of a cell the
+  // directory did not place it in, resumed here as a creation asked again is.
+  rpc MakeRepository(MakeRepositoryRequest) returns (Repository);
+}
+
+message MakeRepositoryRequest {
+  string full_name = 1;
+  string for_person_id = 2;
+}
+
 service Repositories {
-  // People (jj) and ok's own roles: no other workload reads code.
+  // People (jj), robots — the installation's and organizations', CI — and ok's own roles; what a
+  // person or a robot may do to a repository, Authorize decides.
   option (ok.v1.callers) = CALLER_PEOPLE;
+  option (ok.v1.callers) = CALLER_ROBOTS;
   option (ok.v1.callers) = CALLER_CONTROL;
   option (ok.v1.callers) = CALLER_AUTOMATION;
   option (ok.v1.callers) = CALLER_WORKER;
   option (ok.v1.callers) = CALLER_DEPLOY;
   rpc CreateRepository(CreateRepositoryRequest) returns (Repository);
-  rpc RenameRepository(RenameRepositoryRequest) returns (Repository);
   rpc GetRepository(GetRepositoryRequest) returns (Repository);
-  rpc ListRepositories(ListRepositoriesRequest) returns (ListRepositoriesResponse);
+  // ForkRepository forks a repository the caller may fork (docs/hosted.md, "GitHub's rules") into
+  // an owner they may make repositories of: in its network, its main the upstream's, holding all
+  // the upstream holds — by reference, costing no copy.
+  rpc ForkRepository(ForkRepositoryRequest) returns (Repository);
+  // SyncFork brings a fork its upstream's newer work: main moves to the upstream's if the fork has
+  // landed nothing of its own since it forked or last synced, and otherwise stays. It needs write
+  // on the fork, and the upstream readable.
+  rpc SyncFork(SyncForkRequest) returns (SyncForkResponse);
 }
 
 message Repository {
   int64 id = 1;
+  // Its full name, as ok shows it now: its name alone for the installation's organization's, else
+  // its owner's handle and its name, acme/app.
   string name = 2;
   bytes head = 3;      // main; the root commit until the first landing
   int64 head_seq = 4;  // head_log sequence of the head
   google.protobuf.Timestamp created_at = 5;
-  string created_by = 6;  // the creating principal
+  string created_by = 6;     // the creating principal's name
+  string created_by_id = 7;  // and stable ID
+  // A fork's upstream, as the directory names it now: its ID and full name; 0 and empty for a
+  // repository that is no fork, or stands alone.
+  int64 parent_id = 8;
+  string parent = 9;
+}
+
+message ForkRepositoryRequest {
+  // The upstream's full name, as the person may see it.
+  string parent = 1;
+  // The fork's full name: ada/app.
+  string name = 2;
+  // The person the fork is made for: Review.ForkRepository's. Repositories.ForkRepository forks for
+  // its caller, and refuses an actor.
+  string actor_id = 3;
+}
+
+message SyncForkRequest {
+  int64 repository_id = 1;
+  string actor_id = 2;  // Review.SyncFork's
+}
+
+message SyncForkResponse {
+  bool moved = 1;  // main moved to the upstream's
+  bytes head = 2;
+  int64 head_seq = 3;
 }
 
 message CreateRepositoryRequest {
+  // Its full name: app for the installation's organization's, acme/app for an owner's.
   string name = 1;
-  // The person the repository is created for, who becomes its creator: Review.CreateRepository's,
-  // which only ok control may call. Repositories.CreateRepository creates it for its caller, and
-  // refuses an actor.
-  string actor = 2;
+  // The stable ID of the person the repository is created for, who becomes its creator:
+  // Review.CreateRepository's, which only ok control may call. Repositories.CreateRepository
+  // creates it for its caller, and refuses an actor.
+  string actor_id = 3;
+  reserved 2;
+  reserved "actor";
 }
-message RenameRepositoryRequest {
-  int64 repository_id = 1;
-  string name = 2;
-}
-
 message GetRepositoryRequest {
   oneof key {
     int64 id = 1;
+    // Its full name, or one it had, which the directory answers for.
     string name = 2;
   }
-}
-
-message ListRepositoriesRequest {
-  int32 page_size = 1;
-  string page_token = 2;
-}
-message ListRepositoriesResponse {
-  repeated Repository repositories = 1;
-  string next_page_token = 2;
 }
 
 // ─── Store: jj's Backend, OpStore, and OpHeadsStore ───
 
 service Store {
-  // People (jj) and ok's own roles: no other workload reads code.
+  // People (jj), robots — the installation's and organizations', CI — and ok's own roles; what a
+  // person or a robot may do to a repository, Authorize decides.
   option (ok.v1.callers) = CALLER_PEOPLE;
+  option (ok.v1.callers) = CALLER_ROBOTS;
   option (ok.v1.callers) = CALLER_CONTROL;
   option (ok.v1.callers) = CALLER_AUTOMATION;
   option (ok.v1.callers) = CALLER_WORKER;
@@ -348,6 +394,10 @@ message PublishRequest {
     // publish carries any, or moves the heads; objects alone are the repository's. Its views may
     // name only its own working copy, and its operations only itself.
     string workspace = 4;
+    // guards_secrets: the client refuses to store a file under secret/ that is not a pointer, an
+    // acl.yaml, or an OWNERS file (docs/secrets.md, "Clients"). A repository that keeps secrets
+    // refuses a publish without it.
+    bool guards_secrets = 5;
   }
   message Commit {
     OpHeadsUpdate op_heads = 1;  // unset: store the objects only
@@ -384,8 +434,10 @@ message PublishRejection {
 
 // ChangeLists is uploads and reads, for people and ok's roles.
 service ChangeLists {
-  // People (jj) and ok's own roles: no other workload reads code.
+  // People (jj), robots — the installation's and organizations', CI — and ok's own roles; what a
+  // person or a robot may do to a repository, Authorize decides.
   option (ok.v1.callers) = CALLER_PEOPLE;
+  option (ok.v1.callers) = CALLER_ROBOTS;
   option (ok.v1.callers) = CALLER_CONTROL;
   option (ok.v1.callers) = CALLER_AUTOMATION;
   option (ok.v1.callers) = CALLER_WORKER;
@@ -402,6 +454,9 @@ service Review {
   option (ok.v1.callers) = CALLER_CONTROL;
   // CreateRepository creates a repository for the person actor names, who becomes its creator.
   rpc CreateRepository(CreateRepositoryRequest) returns (Repository);
+  // ForkRepository and SyncFork, for the person actor names.
+  rpc ForkRepository(ForkRepositoryRequest) returns (Repository);
+  rpc SyncFork(SyncForkRequest) returns (SyncForkResponse);
   rpc Transition(TransitionRequest) returns (TransitionResponse);
   // Rollback creates a CL that rolls back a landed CL, and the CLs landed above it in its
   // stack (docs/scm.md, "Rollbacks"), for the person ok control authorized.
@@ -439,15 +494,16 @@ message Patchset {
   int32 number = 1;
   bytes commit_id = 2;
   bytes base_commit_id = 3;
-  string uploaded_by = 4;
+  string uploaded_by = 4;  // the uploader's name
   google.protobuf.Timestamp uploaded_at = 5;
+  string uploaded_by_id = 6;  // and stable ID
 }
 
 message ChangeList {
   int64 repository_id = 1;
   int64 number = 2;
   bytes change_id = 3;
-  string author = 4;  // principal
+  string author = 4;  // its author's name; author_id their stable ID
   ChangeListStatus status = 5;
   ChangeListStatus abandoned_from = 6;
   int64 parent_number = 7;  // 0 = not stacked
@@ -459,6 +515,8 @@ message ChangeList {
   google.protobuf.Timestamp updated_at = 13;
   string description = 14;  // the current patchset's; its first line is the title
   Rollback rollback = 15;   // a rollback CL's; unset for any other CL
+  string author_id = 16;
+  string submitted_by_id = 17;
 }
 
 // What a rollback CL rolls back (docs/scm.md, "Rollbacks").
@@ -474,10 +532,12 @@ message Rollback {
 
 message RollbackRequest {
   int64 repository_id = 1;
-  int64 number = 2;               // the landed CL
-  string actor = 3;               // who asked: the rollback CL's author
-  string reason = 4;              // why, which its description says
-  repeated string reviewers = 5;  // principals to assign
+  int64 number = 2;                  // the landed CL
+  string reason = 4;                 // why, which its description says
+  string actor_id = 6;               // who asked, by stable ID: the rollback CL's author
+  repeated string reviewer_ids = 7;  // principals to assign, by stable ID
+  reserved 3, 5;
+  reserved "actor", "reviewers";
 }
 message RollbackResponse {
   ChangeList change_list = 1;  // the rollback CL, open for review
@@ -494,6 +554,8 @@ message RollbackRejection {
     REASON_UNDERWAY = 2;      // an open or draft rollback CL already rolls it back
     REASON_NOTHING_LEFT = 3;  // main has none of its changes
     REASON_ALL_CHANGED = 4;   // main changed every path it changed, since
+    REASON_NOT_WRITER =
+        5;  // it would change a secret, and the person rolling back writes none there
   }
   int64 number = 1;
   Reason reason = 2;
@@ -531,6 +593,36 @@ message UploadResponse {
   repeated Result results = 1;
 }
 
+// SecretReferences is ok secrets': the pointers a repository still holds, which its collection
+// keeps (docs/secrets.md, "The SCM").
+service SecretReferences {
+  option (ok.v1.callers) = CALLER_SECRETS;
+  // ListSecretReferences are the pointers main's head, every open or draft CL's current patchset,
+  // and every workspace's latest checkpoint hold under //secret.
+  rpc ListSecretReferences(ListSecretReferencesRequest) returns (ListSecretReferencesResponse);
+}
+
+message ListSecretReferencesRequest {
+  int64 repository_id = 1;
+}
+
+message ListSecretReferencesResponse {
+  enum State {
+    STATE_UNSPECIFIED = 0;
+    STATE_ACTIVE = 1;
+    // PURGED: the SCM holds the repository no more, and never will again.
+    STATE_PURGED = 2;
+  }
+  State state = 1;
+  repeated SecretPointer pointers = 2;
+}
+
+// A pointer a tree holds: a secret's path, and the digest its pointer names.
+message SecretPointer {
+  string path = 1;
+  bytes digest = 2;
+}
+
 // Returned in the status details of a FAILED_PRECONDITION upload.
 message UploadRejection {
   enum Reason {
@@ -548,6 +640,9 @@ message UploadRejection {
     REASON_UNKNOWN_REVIEWER = 11;
     REASON_NO_NEW_CHANGES = 12;
     REASON_INVALID_WORKFLOW = 13;
+    // INVALID_SECRETS: the commit's //secret breaks its rules, names a version ok secrets does
+    // not keep, or changes a secret its uploader may not write (docs/secrets.md, "The SCM").
+    REASON_INVALID_SECRETS = 14;
   }
   bytes commit_id = 1;
   Reason reason = 2;
@@ -564,9 +659,12 @@ message GetChangeListRequest {
 message ListChangeListsRequest {
   int64 repository_id = 1;
   repeated ChangeListStatus statuses = 2;
-  string author = 3;
+  string author = 3;  // a principal's name: their CLs only
   int32 page_size = 4;
   string page_token = 5;
+  // Only the CLs stacked on this one (their parent_number); 0 for any. A server that predates it
+  // ignores it: a caller checks each CL's parent_number.
+  int64 parent_number = 6;
 }
 message ListChangeListsResponse {
   repeated ChangeList change_lists = 1;
@@ -592,8 +690,10 @@ message TransitionRequest {
   int64 repository_id = 1;
   int64 number = 2;
   Kind kind = 3;
-  string actor = 4;   // the human ok control authorized
-  string reason = 5;  // abandon only
+  string reason = 5;    // abandon only
+  string actor_id = 6;  // the stable ID of the human ok control authorized
+  reserved 4;
+  reserved "actor";
 }
 // The CL after a transition, and the event it wrote, by its place in the repository's log: a
 // caller following the SCM's events has seen the transition once it has seen that event.
@@ -608,16 +708,19 @@ message PrepareCandidateRequest {
   int64 repository_id = 1;
   int64 number = 2;
   int32 patchset = 3;
-  bytes base = 4;    // a main commit or another candidate
-  string actor = 5;  // the submitter; commits a spliced candidate
+  bytes base = 4;       // a main commit or another candidate
+  string actor_id = 6;  // the submitter's stable ID; commits a spliced candidate
+  reserved 5;
+  reserved "actor";
 }
 message Candidate {
   bytes commit_id = 1;
   bytes base = 2;
   int64 number = 3;
   int32 patchset = 4;
-  string prepared_by = 5;
+  string prepared_by = 5;  // the preparer's name
   google.protobuf.Timestamp prepared_at = 6;
+  string prepared_by_id = 7;  // and stable ID
 }
 message ListCandidatesRequest {
   int64 repository_id = 1;
@@ -636,12 +739,17 @@ message LandRequest {
     int64 number = 1;
     int32 patchset = 2;
     bytes candidate = 3;  // optional
+    // Its submitter, when not the request's: a landing of several submissions at once — the
+    // landing queue's batch — names each one's.
+    string actor_id = 4;
   }
   int64 repository_id = 1;
   repeated Item items = 2;  // bottom of the stack first
-  string actor = 3;         // the submitter ok control authorized
   bytes expected_head = 4;  // the head approval and automation were validated against
   bool dry_run = 5;         // check and compute; write nothing
+  string actor_id = 6;      // the stable ID of the submitter ok control authorized
+  reserved 3;
+  reserved "actor";
 }
 message LandResponse {
   message Landed {
@@ -679,8 +787,10 @@ message LandRejection {
 // ─── Browse: code reads for ok control and automation ───
 
 service Browse {
-  // People (jj) and ok's own roles: no other workload reads code.
+  // People (jj), robots — the installation's and organizations', CI — and ok's own roles; what a
+  // person or a robot may do to a repository, Authorize decides.
   option (ok.v1.callers) = CALLER_PEOPLE;
+  option (ok.v1.callers) = CALLER_ROBOTS;
   option (ok.v1.callers) = CALLER_CONTROL;
   option (ok.v1.callers) = CALLER_AUTOMATION;
   option (ok.v1.callers) = CALLER_WORKER;
@@ -697,6 +807,42 @@ service Browse {
   rpc Annotate(AnnotateRequest) returns (AnnotateResponse);
   rpc IsAncestor(IsAncestorRequest) returns (IsAncestorResponse);
   rpc Export(ExportRequest) returns (stream ExportResponse);
+}
+
+// ─── Search: a repository's code (docs/hosted.md, "ok control at scale, as built") ───
+
+service Search {
+  option (ok.v1.callers) = CALLER_PEOPLE;
+  option (ok.v1.callers) = CALLER_ROBOTS;
+  option (ok.v1.callers) = CALLER_CONTROL;
+  // Code searches main's files, as the latest index of them says: UNAVAILABLE while a repository
+  // has none, which asking builds.
+  rpc Code(CodeSearchRequest) returns (CodeSearchResponse);
+}
+
+message CodeSearchRequest {
+  int64 repository_id = 1;
+  string pattern = 2;
+  bool regexp = 3;  // pattern is a regular expression (RE2), not literal text
+  bool case_sensitive = 4;
+  string path = 5;  // a glob of a file's path or name, or a directory ending in /
+  int32 limit = 6;  // lines: 100 unless set, at most 1000
+}
+
+message CodeSearchResponse {
+  bytes commit_id = 1;  // the commit of main the index is of
+  bool stale = 2;       // main has moved since: its index is being built
+  repeated CodeMatch matches = 3;
+  int32 candidates = 4;  // the files the index left to read
+  bool truncated = 5;    // the limit was reached
+}
+
+message CodeMatch {
+  string path = 1;
+  int32 line = 2;
+  string text = 3;  // the line, cut at 500 bytes
+  int32 start = 4;  // the match's bytes within text
+  int32 end = 5;
 }
 
 message Signature {
@@ -926,8 +1072,7 @@ service Events {
   // Read returns up to limit of a repository's events after a place in its log, in order: a
   // follower of the bus's stream fills what the stream has not yet brought it from here.
   rpc Read(ReadEventsRequest) returns (ReadEventsResponse);
-  // Heads lists how far each repository's log reaches, a page at a time by repository: now, or
-  // as of a place in the feed that numbered every repository's events together before. A follower
+  // Heads lists how far each repository's log reaches, a page at a time by repository. A follower
   // of the stream catches up from them as it starts.
   rpc Heads(HeadsRequest) returns (HeadsResponse);
 }
@@ -935,9 +1080,8 @@ service Events {
 message HeadsRequest {
   int64 after_repository_id = 1;  // the page after this repository (0: from the first)
   int32 limit = 2;                // 0: the most the SCM returns at once, 1,000
-  // A place in the old feed (0: now): what a follower of it applied through, for the events
-  // written while there was one.
-  int64 as_of_seq = 3;
+  reserved 3;
+  reserved "as_of_seq";
 }
 message HeadsResponse {
   message Head {
@@ -976,36 +1120,47 @@ message Event {
   reserved "repository_deleted";
 }
 
+// Events name principals by stable ID (docs/hosted.md, "Tenancy, as built").
 message ChangeListUploaded {
   int64 number = 1;
   int32 patchset = 2;
   bool created = 3;
-  string uploader = 4;
-  repeated string reviewers = 5;  // principals to assign
-  ChangeListStatus status = 6;    // after ready/wip
+  ChangeListStatus status = 6;  // after ready/wip
+  string uploader_id = 7;
+  repeated string reviewer_ids = 8;  // principals to assign
+  reserved 4, 5;
+  reserved "uploader", "reviewers";
 }
 message ChangeListTransitioned {
   int64 number = 1;
   ChangeListStatus from = 2;
   ChangeListStatus to = 3;
-  string actor = 4;
   string reason = 5;
+  string actor_id = 6;
+  reserved 4;
+  reserved "actor";
 }
 message ChangeListLanded {
   int64 number = 1;
   int32 patchset = 2;
   bytes commit_id = 3;
-  string submitter = 4;
+  string submitter_id = 5;
+  reserved 4;
+  reserved "submitter";
 }
 message HeadMoved {
   bytes old_head = 1;
   bytes new_head = 2;
   int64 head_seq = 3;
 }
+// A repository made: its names are the directory's, whose events carry them.
 message RepositoryCreated {
-  string name = 1;
-  string created_by = 2;
+  string created_by_id = 3;
+  reserved 1, 2;
+  reserved "name", "created_by";
 }
+// A repository renamed, before the directory named repositories: its log may hold one, which no
+// longer happens here.
 message RepositoryRenamed {
   string old_name = 1;
   string name = 2;
@@ -1018,8 +1173,10 @@ message RepositoryRenamed {
 // checkpoints — what its working copy held, moment to moment, outside the operation log
 // (docs/okfs.md). Every call is about the caller's own workspaces.
 service Workspaces {
-  // People (jj) and ok's own roles: no other workload reads code.
+  // People (jj), robots — the installation's and organizations', CI — and ok's own roles; what a
+  // person or a robot may do to a repository, Authorize decides.
   option (ok.v1.callers) = CALLER_PEOPLE;
+  option (ok.v1.callers) = CALLER_ROBOTS;
   option (ok.v1.callers) = CALLER_CONTROL;
   option (ok.v1.callers) = CALLER_AUTOMATION;
   option (ok.v1.callers) = CALLER_WORKER;

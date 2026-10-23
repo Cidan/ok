@@ -1,5 +1,5 @@
 -- The locks of package lock: garbage collection runs on one replica at a time.
-CREATE TABLE locks (
+CREATE TABLE IF NOT EXISTS locks (
     bucket       text NOT NULL,
     id           text NOT NULL,
     owner        text NOT NULL,

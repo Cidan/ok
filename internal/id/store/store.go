@@ -16,6 +16,7 @@ import (
 	"github.com/Cidan/ok/internal/directory"
 	"github.com/Cidan/ok/internal/identity"
 	"github.com/Cidan/ok/internal/lock"
+	"github.com/Cidan/ok/internal/work"
 )
 
 // Errors the store answers with.
@@ -57,12 +58,119 @@ type Store struct {
 	b     Backend
 	names identity.Names
 	now   func() time.Time
+	// relayWake tells this replica's relay there may be events to publish.
+	relayWake chan struct{}
+	// installation is the installation's organization, by ID; "" for a hosted service.
+	installation string
+	// movedIn is the organization an installation moved in as; "" for none.
+	movedIn string
+	// cells are the cells repositories are placed in, and defaultRegion where an owner's go when it
+	// names no region (SetCells).
+	cells         []Cell
+	defaultRegion string
+	// defaultQuota is an account's quota of CI when it has none of its own (SetDefaultQuota).
+	defaultQuota Quota
+}
+
+// Cell is a cell repositories are placed in (docs/hosted.md, "Cells, as built"): its region, and
+// whether it is open to new ones.
+type Cell struct {
+	Name   string
+	Region string
+	Open   bool
+}
+
+// SetCells names the cells repositories are placed in, the first holding those made before there
+// were cells, and the region an owner's are placed in when it names none ("" for any). Call it
+// before the store serves; with none, entries name no cell.
+func (s *Store) SetCells(cells []Cell, defaultRegion string) {
+	s.cells, s.defaultRegion = cells, defaultRegion
+}
+
+// CellOf is the cell holding a repository: its entry's, or the first cell for one made before there
+// were cells.
+func (s *Store) CellOf(r Repository) string {
+	if r.Cell == "" && len(s.cells) > 0 {
+		return s.cells[0].Name
+	}
+	return r.Cell
+}
+
+// place is the cell an owner's new repository goes to: of the open cells in the region it is
+// placed in (PlacedIn) — any open cell when none is open there — the one holding the fewest,
+// counted outside any transaction — a count read in one would lock every entry it counts, and
+// placement needs no exact count — the first of them on a tie. "" with no cells.
+func (s *Store) place(ctx context.Context, owner string) (string, error) {
+	if len(s.cells) == 0 {
+		return "", nil
+	}
+	region, err := s.PlacedIn(ctx, owner)
+	if err != nil {
+		return "", err
+	}
+	counts, err := s.b.RepositoryCellCounts(ctx)
+	if err != nil {
+		return "", err
+	}
+	counts[s.cells[0].Name] += counts[""]
+	pick := func(inRegion bool) string {
+		best, fewest := "", int64(-1)
+		for _, c := range s.cells {
+			if c.Open && (!inRegion || c.Region == region) && (fewest < 0 || counts[c.Name] < fewest) {
+				best, fewest = c.Name, counts[c.Name]
+			}
+		}
+		return best
+	}
+	if region != "" {
+		if c := pick(true); c != "" {
+			return c, nil
+		}
+	}
+	return pick(false), nil
+}
+
+// PlacedIn is the region an owner's (by ID) new repositories go to: the one it named, or the
+// directory's default; "" for any.
+func (s *Store) PlacedIn(ctx context.Context, owner string) (string, error) {
+	region, err := s.b.OwnerRegion(ctx, owner)
+	if err != nil || region != "" {
+		return region, err
+	}
+	return s.defaultRegion, nil
+}
+
+// OwnerRegion is the region an owner (by ID) named for its new repositories; "" for none.
+func (s *Store) OwnerRegion(ctx context.Context, owner string) (string, error) {
+	return s.b.OwnerRegion(ctx, owner)
+}
+
+// SetOwnerRegion names the region an owner's (by ID) new repositories go to — one a cell is in —
+// or, with "", forgets it.
+func (s *Store) SetOwnerRegion(ctx context.Context, owner, region string) error {
+	if region != "" {
+		known := false
+		for _, c := range s.cells {
+			known = known || c.Region == region
+		}
+		if !known {
+			return invalid("no cell is in region %s", region)
+		}
+	}
+	return s.b.SetOwnerRegion(ctx, owner, region)
 }
 
 // New is a store over a backend, its principals and sets named under names.
 func New(b Backend, names identity.Names) *Store {
-	return &Store{b: b, names: names, now: time.Now}
+	return &Store{b: b, names: names, now: time.Now, relayWake: make(chan struct{}, 1)}
 }
+
+// SetInstallation names the installation's organization (EnsureOrganization), whose repositories'
+// full names are their names alone. Call it before the store serves.
+func (s *Store) SetInstallation(org string) { s.installation = org }
+
+// Installation is the installation's organization, by ID; "" for a hosted service.
+func (s *Store) Installation() string { return s.installation }
 
 // SetClock replaces the store's clock, which times device logins, sessions, and ceremonies: for
 // tests.
@@ -80,6 +188,12 @@ func (s *Store) LockSync(ctx context.Context, wait time.Duration, fn lock.LockFn
 	return s.b.Lock(ctx, "identity", "sync", wait, fn)
 }
 
+// LockOrganizationSync runs fn holding an organization's sync's lock, as LockSync does the
+// installation's.
+func (s *Store) LockOrganizationSync(ctx context.Context, org string, wait time.Duration, fn lock.LockFn) error {
+	return s.b.Lock(ctx, "identity", "sync:"+org, wait, fn)
+}
+
 // newID makes an ID: prefix and 26 random base32 characters.
 func newID(prefix string) string {
 	var b [16]byte
@@ -89,7 +203,14 @@ func newID(prefix string) string {
 
 // Principal returns the principal with a name.
 func (s *Store) Principal(ctx context.Context, name string) (Principal, error) {
-	return s.b.PrincipalByName(ctx, name)
+	p, err := s.b.PrincipalByName(ctx, name)
+	if errors.Is(err, ErrNotFound) {
+		// A name a move gave up names what took its place.
+		if to, aerr := s.b.Alias(ctx, name); aerr == nil {
+			return s.b.PrincipalByName(ctx, to)
+		}
+	}
+	return p, err
 }
 
 // PrincipalByID returns the principal with an ID.
@@ -202,6 +323,9 @@ func (s *Store) DeleteRobot(ctx context.Context, name string) error {
 
 // Binding names a robot by the tokens another issuer signs for it.
 type Binding struct {
+	// Organization is the organization whose robot it names, by ID; "" for the installation's — an
+	// issuer the configuration names.
+	Organization    string
 	Issuer, Subject string
 }
 
@@ -217,6 +341,12 @@ func (s *Store) Bind(ctx context.Context, robot string, b Binding) error {
 	if p.Kind != Robot || !p.Active() {
 		return fmt.Errorf("%s is not an active robot", robot)
 	}
+	if _, err := s.b.RobotOrganization(ctx, p.ID); err == nil {
+		return fmt.Errorf("%s is an organization's robot: its organization binds it, to an issuer it trusts", robot)
+	} else if !errors.Is(err, ErrNotFound) {
+		return err
+	}
+	b.Organization = ""
 	if err := s.b.InsertBinding(ctx, p.ID, b); errors.Is(err, ErrBindingTaken) {
 		return fmt.Errorf("issuer %s's subject %s already names a robot", b.Issuer, b.Subject)
 	} else if err != nil {
@@ -297,3 +427,6 @@ func (s *Store) EnsureBinding(ctx context.Context, robot string, b Binding) erro
 	}
 	return s.Bind(ctx, robot, b)
 }
+
+// Work is identity's keyed work's store.
+func (s *Store) Work() work.Store { return s.b.Work() }

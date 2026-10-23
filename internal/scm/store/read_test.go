@@ -13,6 +13,7 @@ import (
 	"github.com/Cidan/ok/internal/scm/contentindex"
 	"github.com/Cidan/ok/internal/scm/encoding"
 	"github.com/Cidan/ok/internal/scm/pack"
+	"github.com/Cidan/ok/internal/scm/store/backend"
 )
 
 func TestGetRelatedCopies(t *testing.T) {
@@ -210,9 +211,7 @@ func TestReadFilesAfterRepack(t *testing.T) {
 	mustPublish(t, s, repo, "alice", b, nil)
 
 	var oldPack []byte
-	if err := poolOf(s).QueryRow(ctx, `SELECT id FROM pack WHERE repository_id = $1`, repo).Scan(&oldPack); err != nil {
-		t.Fatal(err)
-	}
+	dbOf(s).scan(t, `SELECT id FROM pack WHERE network_id = @net`, map[string]any{"net": int64(netOf(t, s, repo))}, &oldPack)
 	repack := func() {
 		// Write every chunk of the file into a new pack, move them, delete the old one.
 		spool, err := os.CreateTemp("", "repack-*")
@@ -234,17 +233,17 @@ func TestReadFilesAfterRepack(t *testing.T) {
 			t.Fatal(err)
 		}
 		spool.Seek(0, 0)
-		if err := s.blobs.Put(ctx, packKey(repo, id), spool, size); err != nil {
+		if err := s.blobs.Put(ctx, packKey(netOf(t, s, repo), id), spool, size); err != nil {
 			t.Fatal(err)
 		}
 		// As compaction moves chunks.
-		if err := s.inTx(ctx, func(tx *txn) error {
-			num, err := tx.InsertPack(ctx, repo, id, size, nil)
+		if err := s.inTx(ctx, func(ctx context.Context, tx *txn) error {
+			num, err := tx.InsertPack(ctx, netOf(t, s, repo), id, size, nil)
 			if err != nil {
 				return err
 			}
 			for cid, loc := range locs {
-				s.logIndex(tx, repo, contentindex.Update{Op: contentindex.Move, ID: cid, Entry: contentindex.Entry{Kind: encoding.KindChunk,
+				s.logIndex(tx, backend.NetworkScope(netOf(t, s, repo)), contentindex.Update{Op: contentindex.Move, ID: cid, Entry: contentindex.Entry{Kind: encoding.KindChunk,
 					Loc: contentindex.Location{Pack: num, Offset: loc.Offset, Stored: loc.StoredLength, Raw: loc.RawLength, Codec: uint8(loc.Codec)}}})
 			}
 			return nil
@@ -255,7 +254,7 @@ func TestReadFilesAfterRepack(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := s.blobs.Delete(ctx, packKey(repo, old)); err != nil {
+		if err := s.blobs.Delete(ctx, packKey(netOf(t, s, repo), old)); err != nil {
 			t.Fatal(err)
 		}
 	}

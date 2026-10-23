@@ -1,10 +1,12 @@
 package store
 
 import (
+	"cmp"
 	"context"
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"sort"
 	"strings"
@@ -12,6 +14,7 @@ import (
 
 	"github.com/Cidan/ok/internal/scm/encoding"
 	"github.com/Cidan/ok/internal/scm/store/backend"
+	"github.com/Cidan/ok/internal/secrets"
 	scmpb "github.com/Cidan/ok/proto/ok/scm/v1"
 )
 
@@ -23,6 +26,7 @@ const (
 	RollbackUnderway    RollbackReason = 2 // an open or draft rollback CL already rolls it back
 	RollbackNothingLeft RollbackReason = 3 // main has none of its changes
 	RollbackAllChanged  RollbackReason = 4 // main changed every path it changed since
+	RollbackNotWriter   RollbackReason = 5 // it changes a secret, and the person rolling back writes none there
 )
 
 // RollbackRejection is a rollback the SCM refuses.
@@ -65,8 +69,12 @@ func (s *Store) Rollback(ctx context.Context, repo, number int64, actor, reason 
 	case reason == "":
 		return nil, invalid("a rollback says why")
 	}
+	author, err := s.personOf(ctx, actor)
+	if err != nil {
+		return nil, err
+	}
 	var out *RollbackResult
-	err := s.inTx(ctx, func(tx *txn) error {
+	err = s.inTx(ctx, func(ctx context.Context, tx *txn) error {
 		out = nil
 		if err := s.repositoryExists(ctx, tx, repo); err != nil {
 			return err
@@ -79,9 +87,9 @@ func (s *Store) Rollback(ctx context.Context, repo, number int64, actor, reason 
 		for i, l := range landed {
 			numbers[i] = l.number
 		}
-		// The CLs rolled back are locked, so two rollbacks of one CL are ordered and the
-		// second finds the first.
-		if _, err := lockChangeLists(ctx, tx, repo, numbers); err != nil {
+		// The repository's row is locked, so two rollbacks of one CL are ordered and the second
+		// finds the first: the CLs rolled back are landed, and may be in segments, with no row.
+		if _, _, _, err := tx.Head(ctx, repo, true); err != nil {
 			return err
 		}
 		underway, ok, err := tx.RollingBack(ctx, repo, numbers, []int16{int16(StatusDraft), int16(StatusOpen)})
@@ -123,6 +131,9 @@ func (s *Store) Rollback(ctx context.Context, repo, number int64, actor, reason 
 			return &RollbackRejection{Number: number, Reason: RollbackNothingLeft,
 				Message: fmt.Sprintf("main has none of %s's changes to roll back", clNames(numbers))}
 		}
+		if err := s.rollbackSecrets(ctx, repo, number, actor, paths); err != nil {
+			return err
+		}
 
 		var change encoding.ChangeID
 		if _, err := rand.Read(change[:]); err != nil {
@@ -135,21 +146,21 @@ func (s *Store) Rollback(ctx context.Context, repo, number int64, actor, reason 
 			ConflictLabels: encoding.Merge[string]{""},
 			ChangeID:       change,
 			Description:    rollbackDescription(landed, reason),
-			Author:         s.actorSignature(actor, at),
-			Committer:      s.actorSignature(actor, at),
+			Author:         author.signature(at),
+			Committer:      author.signature(at),
 		}
 		id, err := encoding.IDOf(commit)
 		if err != nil {
 			return err
 		}
-		gen, err := generation(ctx, tx, repo, head)
+		gen, err := s.generation(ctx, repo, head)
 		if err != nil {
 			return err
 		}
 		if err := ts.insert(ctx, tx, []encoding.ID{tree}); err != nil {
 			return err
 		}
-		if err := s.insertCommits(ctx, tx, repo, []*encoding.Commit{commit}, []int64{gen + 1}, actor); err != nil {
+		if err := s.insertCommits(ctx, tx, repo, []*encoding.Commit{commit}, []int64{gen + 1}, []string{actor}); err != nil {
 			return err
 		}
 		if err := s.pin(ctx, tx, repo, []ref{{table: tCommit, id: id}}); err != nil {
@@ -188,12 +199,12 @@ func (s *Store) Rollback(ctx context.Context, repo, number int64, actor, reason 
 			}
 		}
 		ev := &scmpb.Event{Kind: &scmpb.Event_Uploaded{Uploaded: &scmpb.ChangeListUploaded{
-			Number: cl, Patchset: 1, Created: true, Uploader: actor, Reviewers: assign, Status: StatusOpen.proto(),
+			Number: cl, Patchset: 1, Created: true, UploaderId: actor, ReviewerIds: assign, Status: StatusOpen.proto(),
 		}}}
 		if err := appendEvents(ctx, tx, repo, []*scmpb.Event{ev}); err != nil {
 			return err
 		}
-		created, err := readChangeLists(ctx, tx, repo, []int64{cl}, false)
+		created, err := s.readChangeLists(ctx, tx, repo, []int64{cl}, false)
 		if err != nil {
 			return err
 		}
@@ -207,7 +218,7 @@ func (s *Store) Rollback(ctx context.Context, repo, number int64, actor, reason 
 // every landed CL above it in its stack — one with a patchset uploaded stacked on it, or on one
 // above it. main never keeps a stack's top without its bottom.
 func (s *Store) rollbackStack(ctx context.Context, tx *txn, repo, number int64) ([]landedCommit, error) {
-	st, err := clStatus(ctx, tx, repo, number)
+	st, err := s.clStatus(ctx, tx, repo, number)
 	if err != nil {
 		return nil, err
 	}
@@ -215,7 +226,7 @@ func (s *Store) rollbackStack(ctx context.Context, tx *txn, repo, number int64) 
 		return nil, &RollbackRejection{Number: number, Reason: RollbackNotLanded,
 			Message: fmt.Sprintf("CL %d is %s: only a landed CL is rolled back", number, st)}
 	}
-	landings, err := tx.StackLandings(ctx, repo, number, int16(StatusSubmitted))
+	landings, err := s.stackLandings(ctx, tx, repo, number)
 	if err != nil {
 		return nil, err
 	}
@@ -227,6 +238,71 @@ func (s *Store) rollbackStack(ctx context.Context, tx *txn, repo, number int64) 
 	if len(out) == 0 || out[0].number != number {
 		return nil, fmt.Errorf("CL %d is submitted but main's history has no landing of it", number)
 	}
+	return out, nil
+}
+
+// stackLandings are the landings of a landed CL and of every landed CL stacked above it — one with
+// a patchset uploaded on it, or on one above it — by their place in main's history, from the tail
+// and the segments.
+func (s *Store) stackLandings(ctx context.Context, tx *txn, repo, number int64) ([]backend.Landing, error) {
+	above := map[int64]bool{number: true}
+	frontier := []int64{number}
+	for len(frontier) > 0 {
+		tail, err := tx.StackedOn(ctx, repo, frontier)
+		if err != nil {
+			return nil, err
+		}
+		settled, err := s.settledStackedOn(ctx, repo, frontier)
+		if err != nil {
+			return nil, err
+		}
+		frontier = nil
+		for _, p := range append(tail, settled...) {
+			if !above[p[1]] {
+				above[p[1]] = true
+				frontier = append(frontier, p[1])
+			}
+		}
+	}
+	numbers := slices.Sorted(maps.Keys(above))
+	cls, err := s.readChangeLists(ctx, tx, repo, numbers, false)
+	if err != nil {
+		return nil, err
+	}
+	// A landed CL's landing is in its record once compacted, and in the tail's log before.
+	var out []backend.Landing
+	var inTail []int64
+	for _, n := range numbers {
+		if c := cls[n]; c != nil && c.Status == StatusSubmitted {
+			inTail = append(inTail, n)
+		}
+	}
+	moves, err := tx.TailLandings(ctx, repo, inTail)
+	if err != nil {
+		return nil, err
+	}
+	landed := map[int64]backend.HeadMove{}
+	for _, m := range moves {
+		landed[m.CL] = m
+	}
+	var rest []int64
+	for _, n := range inTail {
+		if _, ok := landed[n]; !ok {
+			rest = append(rest, n)
+		}
+	}
+	settled, err := s.settledChangeLists(ctx, repo, rest)
+	if err != nil {
+		return nil, err
+	}
+	for n, sc := range settled {
+		landed[n] = sc.Landing
+	}
+	for n, m := range landed {
+		c := cls[n]
+		out = append(out, backend.Landing{Number: n, Seq: m.Seq, Commit: m.New, Parent: m.Old, Description: c.Description, Author: c.Author})
+	}
+	slices.SortFunc(out, func(a, b backend.Landing) int { return cmp.Compare(a.Seq, b.Seq) })
 	return out, nil
 }
 
@@ -421,4 +497,44 @@ func clNames(numbers []int64) string {
 // shortID is a commit ID's first ten hex digits, as ok shows it.
 func shortID(id encoding.ID) string {
 	return id.String()[:10]
+}
+
+// rollbackSecrets refuses a rollback that would change a secret, in a repository that keeps them,
+// unless the person rolling back is a writer of its folder on main (docs/secrets.md, "The SCM").
+func (s *Store) rollbackSecrets(ctx context.Context, repo, number int64, actor string, paths []string) error {
+	var touched, folders []string
+	for _, p := range paths {
+		if secrets.IsSecret(p) {
+			touched = append(touched, p)
+			if f := secrets.Folder(p); !slices.Contains(folders, f) {
+				folders = append(folders, f)
+			}
+		}
+	}
+	if len(touched) == 0 {
+		return nil
+	}
+	keeps, err := s.KeepsSecrets(ctx, repo)
+	if err != nil || !keeps {
+		return err
+	}
+	if s.secrets == nil {
+		return &RollbackRejection{Number: number, Reason: RollbackNotWriter, Paths: touched,
+			Message: "it changes secrets, and this installation runs no ok secrets (services.secrets) to say who writes them"}
+	}
+	writers, err := s.secrets.Writers(ctx, repo, actor, folders)
+	if err != nil {
+		return fmt.Errorf("asking ok secrets who writes //%s: %w", secrets.Dir, err)
+	}
+	var refused []string
+	for _, p := range touched {
+		if !writers[slices.Index(folders, secrets.Folder(p))] {
+			refused = append(refused, p)
+		}
+	}
+	if len(refused) == 0 {
+		return nil
+	}
+	return &RollbackRejection{Number: number, Reason: RollbackNotWriter, Paths: refused,
+		Message: fmt.Sprintf("it changes %s, and only a writer of their folders on main rolls back a secret: ask one", strings.Join(refused, ", "))}
 }

@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"strconv"
 	"time"
 )
@@ -16,13 +17,24 @@ const (
 	chanSubmission = "ok_automation_submission"
 )
 
-// notify sends a notification about a run or a repository, delivered when tx commits.
-func notify(ctx context.Context, tx Ops, channel string, id int64) error {
-	return tx.Notify(ctx, channel, strconv.FormatInt(id, 10))
+// notify signals a run's or a repository's channel once tx commits.
+func notify(_ context.Context, tx Ops, channel string, id int64) error {
+	return signalOn(tx, channel, strconv.FormatInt(id, 10))
 }
 
-// queued wakes the workers waiting for a run, when tx commits.
-func queued(ctx context.Context, tx Ops) error { return tx.Notify(ctx, chanQueue, "") }
+// queued wakes the workers waiting for a run, once tx commits.
+func queued(_ context.Context, tx Ops) error { return signalOn(tx, chanQueue, "") }
+
+// signalOn records a signal to send once tx commits. tx is the store's (Store.txn): a signal
+// recorded anywhere else would never be sent, so it fails the transaction instead.
+func signalOn(tx Ops, channel, payload string) error {
+	t, ok := tx.(txOps)
+	if !ok {
+		return errors.New("automation: a signal outside the store's transaction (Store.txn)")
+	}
+	t.pending.Add(channel, payload)
+	return nil
+}
 
 // StartRequest is a job to run on a commit.
 type StartRequest struct {
@@ -54,10 +66,6 @@ func (s *Store) Start(ctx context.Context, req StartRequest) (*Run, error) {
 	if (req.Job.Kind == KindPush) != (req.Origin.Phase == PhaseDeploy) {
 		return nil, invalid("a push is a deployment's, and a deployment's run is a push")
 	}
-	var priority int16
-	if req.Origin.Phase == PhaseDeploy {
-		priority = deployPriority
-	}
 	if req.RequestedBy == "" {
 		return nil, invalid("a run is requested by someone")
 	}
@@ -69,11 +77,11 @@ func (s *Store) Start(ctx context.Context, req StartRequest) (*Run, error) {
 		return nil, invalid("a timeout is between a second and %s", s.cfg.MaxTimeout)
 	}
 	var run *Run
-	err := s.b.Txn(ctx, func(tx Ops) error {
+	err := s.txn(ctx, func(tx Ops) error {
 		var err error
 		run, err = tx.InsertRun(ctx, NewRun{
 			RepositoryID: req.RepositoryID, CommitID: req.CommitID, Job: req.Job, Origin: req.Origin,
-			RequestedBy: req.RequestedBy, Status: StatusQueued, TimeoutSeconds: int32(timeout / time.Second), Priority: priority,
+			RequestedBy: req.RequestedBy, Status: StatusQueued, TimeoutSeconds: int32(timeout / time.Second),
 		})
 		if err != nil {
 			return err
@@ -85,11 +93,11 @@ func (s *Store) Start(ctx context.Context, req StartRequest) (*Run, error) {
 
 // Cancel ends a queued run at once, and asks a running run's worker to stop it; a finished
 // run is returned as it is. A post run is its submission's: canceling the submission stops it.
-func (s *Store) Cancel(ctx context.Context, id int64, reason string) (*Run, error) {
+func (s *Store) Cancel(ctx context.Context, id int64, reason, by string) (*Run, error) {
 	if reason == "" {
 		reason = "canceled"
 	}
-	err := s.b.Txn(ctx, func(tx Ops) error {
+	err := s.txn(ctx, func(tx Ops) error {
 		r, err := tx.Run(ctx, id)
 		if err != nil {
 			return err
@@ -97,7 +105,7 @@ func (s *Store) Cancel(ctx context.Context, id int64, reason string) (*Run, erro
 		if r.Origin.Phase == PhasePost {
 			return &ConflictError{Message: "a post run is its submission's: cancel the submission"}
 		}
-		return cancelRun(ctx, tx, id, reason)
+		return cancelRun(ctx, tx, id, reason, by)
 	})
 	if err != nil {
 		return nil, err
@@ -105,17 +113,22 @@ func (s *Store) Cancel(ctx context.Context, id int64, reason string) (*Run, erro
 	return s.Get(ctx, id)
 }
 
-// cancelRun ends a queued run canceled, or asks a running run's worker to stop it.
-func cancelRun(ctx context.Context, tx Ops, id int64, reason string) error {
+// cancelRun ends a queued run canceled, or asks a running run's worker to stop it, for by (a
+// stable ID; "" for no one).
+func cancelRun(ctx context.Context, tx Ops, id int64, reason, by string) error {
+	// Held, through its repository's move gate.
+	if _, err := tx.LockRun(ctx, id); err != nil {
+		return err
+	}
 	// A queued run has no log: it is stored, empty, as it ends.
-	ended, err := tx.CancelQueuedRun(ctx, id, reason)
+	ended, err := tx.CancelQueuedRun(ctx, id, reason, by)
 	if err != nil {
 		return err
 	}
 	if ended {
 		return notify(ctx, tx, chanDone, id)
 	}
-	return tx.RequestStop(ctx, id, reason)
+	return tx.RequestStop(ctx, id, reason, by)
 }
 
 // rerunOf is a new run of prev's job on its commit, requested by by: a rerun of it.
@@ -133,7 +146,7 @@ func (s *Store) Rerun(ctx context.Context, id int64, requestedBy string) (*Run, 
 		return nil, invalid("a run is requested by someone")
 	}
 	var run *Run
-	err := s.b.Txn(ctx, func(tx Ops) error {
+	err := s.txn(ctx, func(tx Ops) error {
 		prev, err := tx.Run(ctx, id)
 		if err != nil {
 			return err

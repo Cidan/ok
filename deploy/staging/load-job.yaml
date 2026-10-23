@@ -1,0 +1,43 @@
+# ok load against staging (README.md): the generator in the cluster, as the load's person — a
+# credential its sign-in made, in the Secret ok-load-person — and, for its synthetic workers, as
+# worker.ok, with its ServiceAccount's token. PROJECT and TAG are the image's, as values.yaml's;
+# REPOSITORIES, SPEED, and DURATION the run's. Its report is the last of its log: the JSON after the summary.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ok-load
+  namespace: ok
+automountServiceAccountToken: false
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ok-load
+  namespace: ok
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      serviceAccountName: ok-load
+      restartPolicy: Never
+      # The image's user (distroless's nonroot), whose group owns the mounted credential and token.
+      securityContext: {runAsUser: 65532, runAsGroup: 65532, fsGroup: 65532, runAsNonRoot: true}
+      containers:
+        - name: load
+          image: us-central1-docker.pkg.dev/PROJECT/ok/ok:TAG
+          args: [load, run, -address, "ok-server.ok.svc:8472", -insecure,
+                 -credential-dir, /etc/ok/load/person, -worker-token-file, /var/run/secrets/ok/token/token,
+                 -repositories, "REPOSITORIES", -speed, "SPEED", -duration, DURATION, -drain, 10m,
+                 -workers, "64", -run-time, 30s, -report, /dev/stdout]
+          resources:
+            requests: {cpu: "4", memory: 8Gi}
+          volumeMounts:
+            - {name: person, mountPath: /etc/ok/load/person}
+            - {name: token, mountPath: /var/run/secrets/ok/token, readOnly: true}
+      volumes:
+        - name: person
+          secret: {secretName: ok-load-person, defaultMode: 0440}
+        - name: token
+          projected:
+            sources:
+              - serviceAccountToken: {audience: ok, expirationSeconds: 3600, path: token}

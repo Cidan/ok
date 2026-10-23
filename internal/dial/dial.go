@@ -55,12 +55,17 @@ type Options struct {
 	// Insecure allows plaintext to an address that is not loopback: a network the installation
 	// trusts, such as a service mesh's.
 	Insecure bool
+	// WaitForReady has a call wait for a connection, for as long as its context allows, rather than
+	// fail while there is none — while the service's replicas roll, say; the call is sent once,
+	// when there is one. For a client with its own deadline that would rather wait a restart out:
+	// a role calling another fails at once instead, and serves what it can without it.
+	WaitForReady bool
 }
 
 // Dial connects to the service at addr.
 func Dial(addr string, o Options) (*grpc.ClientConn, error) {
 	opts := []grpc.DialOption{
-		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(MaxMessage), grpc.MaxCallSendMsgSize(MaxMessage)),
+		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(MaxMessage), grpc.MaxCallSendMsgSize(MaxMessage), grpc.WaitForReady(o.WaitForReady)),
 		metrics.DialOption(),
 	}
 	loopback := isLoopback(addr)

@@ -40,3 +40,7 @@ deploy:
     - {namespace: shop, deployment: api, accounts: [api]}
     - {namespace: shop, statefulset: db}
   admissionPolicy: {enabled: true}
+secrets:
+  enabled: true
+  keyringSecret: {name: ok-secrets-keyring, key: keyring}
+  databaseSecret: {name: ok-secrets-database, key: url}

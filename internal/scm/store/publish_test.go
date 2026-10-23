@@ -9,7 +9,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/Cidan/ok/internal/scm/contentindex"
 	"github.com/Cidan/ok/internal/scm/encoding"
@@ -104,8 +103,8 @@ func TestPublishRoundTrip(t *testing.T) {
 	}
 
 	var gen int64
-	if err := poolOf(s).QueryRow(ctx, `SELECT generation FROM commit WHERE repository_id = $1 AND id = $2`, repo.ID, c2[:]).Scan(&gen); err != nil || gen != 2 {
-		t.Fatalf("c2 generation = %d, %v", gen, err)
+	if dbOf(s).scan(t, `SELECT generation FROM commit WHERE repository_id = @repo AND id = @id`, map[string]any{"repo": repo.ID, "id": c2[:]}, &gen); gen != 2 {
+		t.Fatalf("c2 generation = %d", gen)
 	}
 	report, err := s.Fsck(ctx, repo.ID, false)
 	if err != nil || len(report.Problems) != 0 {
@@ -312,17 +311,11 @@ func TestConcurrentPublishers(t *testing.T) {
 	for err := range errs {
 		t.Error(err)
 	}
-	var commits, heads int
-	if err := poolOf(s).QueryRow(ctx, `SELECT count(*) FROM commit WHERE repository_id = $1`, repo.ID).Scan(&commits); err != nil {
-		t.Fatal(err)
-	}
+	commits := dbOf(s).count(t, "commit", `repository_id = @repo`, map[string]any{"repo": repo.ID})
 	if commits != writers+1 {
 		t.Errorf("%d commits stored, want %d", commits, writers+1)
 	}
-	if err := poolOf(s).QueryRow(ctx, `SELECT count(*) FROM op_head h JOIN op_log l ON l.id = h.op_log_id
-		WHERE l.repository_id = $1 AND l.principal IN ('p0', 'p1', 'p2')`, repo.ID).Scan(&heads); err != nil {
-		t.Fatal(err)
-	}
+	heads := dbOf(s).opHeadsOf(t, repo.ID, "p0", "p1", "p2")
 	// Each of three logs saw four or so root->op updates, all divergent: every new op is
 	// a head and the root is gone.
 	if heads != writers/2 {
@@ -348,15 +341,15 @@ func TestDeadlockRetry(t *testing.T) {
 	locked.Add(2)
 	var once [2]sync.Once
 	lockPair := func(side int, first, second int64) error {
-		return s.inTx(ctx, func(tx *txn) error {
-			if _, _, err := tx.LockRepositoryName(ctx, first); err != nil {
+		return s.inTx(ctx, func(ctx context.Context, tx *txn) error {
+			if _, err := tx.LockRepository(ctx, first); err != nil {
 				return err
 			}
 			once[side].Do(func() {
 				locked.Done()
 				locked.Wait() // both hold their first lock before either asks for its second
 			})
-			_, _, err := tx.LockRepositoryName(ctx, second)
+			_, err := tx.LockRepository(ctx, second)
 			return err
 		})
 	}
@@ -375,25 +368,16 @@ func TestDeadlockRetry(t *testing.T) {
 
 func touchedToday(t *testing.T, s *Store, repo int64, tableName string, id encoding.ID) bool {
 	t.Helper()
+	today := dbOf(s).today(t)
 	if tableName == "file" || tableName == "chunk" {
-		var day time.Time
-		if err := poolOf(s).QueryRow(context.Background(), `SELECT current_date`).Scan(&day); err != nil {
-			t.Fatal(err)
-		}
 		e, ok := indexOf(t, s, repo).Get(id)
-		return ok && e.Day == contentindex.DayOf(day)
+		return ok && e.Day == contentindex.DayOf(today)
 	}
-	var today bool
-	if err := poolOf(s).QueryRow(context.Background(),
-		`SELECT touched_at = current_date FROM `+tableName+` WHERE repository_id = $1 AND id = $2`, repo, id[:]).Scan(&today); err != nil {
-		t.Fatal(err)
-	}
-	return today
+	return dbOf(s).touched(t, tableName, repo, id).Equal(today)
 }
 
 func TestTouchIsTransitiveAndStopsAtPinned(t *testing.T) {
 	s := testStore(t)
-	ctx := context.Background()
 	repo := newRepo(t, s)
 	b := newBuilder(t)
 	f := b.file([]byte("leaf\n"))
@@ -412,9 +396,7 @@ func TestTouchIsTransitiveAndStopsAtPinned(t *testing.T) {
 			})
 			return
 		}
-		if _, err := poolOf(s).Exec(ctx, `UPDATE `+tableName+` SET touched_at = current_date - 20 WHERE repository_id = $1 AND id = $2`, repo.ID, id[:]); err != nil {
-			t.Fatal(err)
-		}
+		dbOf(s).ageRow(t, tableName, repo.ID, id, 20)
 	}
 	for _, x := range []struct {
 		table string
@@ -422,9 +404,7 @@ func TestTouchIsTransitiveAndStopsAtPinned(t *testing.T) {
 	}{{"object", outer}, {"object", inner}, {"object", pinnedTree}, {"file", f}, {"file", pinnedFile}} {
 		age(x.table, x.id)
 	}
-	if _, err := poolOf(s).Exec(ctx, `UPDATE object SET pinned = true WHERE repository_id = $1 AND id = $2`, repo.ID, pinnedTree[:]); err != nil {
-		t.Fatal(err)
-	}
+	dbOf(s).exec(t, `UPDATE object SET pinned = true WHERE repository_id = @repo AND id = @id`, map[string]any{"repo": repo.ID, "id": pinnedTree[:]})
 	// A new commit referencing the outer tree touches it and everything unpinned beneath.
 	nb := newBuilder(t)
 	nb.commit(outer, "touch\n", encoding.RootCommitID)

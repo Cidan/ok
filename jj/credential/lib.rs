@@ -532,6 +532,22 @@ pub enum Auth {
     Machine(Arc<Source>),
     /// With a credential as it is.
     Static(Arc<Credential>),
+    /// With a personal token (`okp_…`), as a bearer: what a machine with no credential — a CI
+    /// job — signs in with ([`TOKEN`]).
+    Token(Arc<str>),
+}
+
+/// The variable holding a personal token, which a machine signs in with in place of its
+/// credential.
+pub const TOKEN: &str = "OK_TOKEN";
+
+/// The personal token the environment holds, if any.
+pub fn env_token() -> Option<Arc<str>> {
+    std::env::var(TOKEN)
+        .ok()
+        .map(|t| t.trim().to_owned())
+        .filter(|t| !t.is_empty())
+        .map(Into::into)
 }
 
 /// A channel whose every request carries its caller's credential and a fresh proof.
@@ -575,6 +591,12 @@ where
                 Auth::None => None,
                 Auth::Machine(src) => Some(src.current().await?),
                 Auth::Static(c) => Some((**c).clone()),
+                Auth::Token(t) => {
+                    let mut v = http::HeaderValue::from_str(&format!("Bearer {t}"))?;
+                    v.set_sensitive(true);
+                    req.headers_mut().insert(http::header::AUTHORIZATION, v);
+                    None
+                }
             };
             if let Some(c) = cred {
                 let proof = c.proof(req.uri().path(), SystemTime::now());
@@ -590,10 +612,14 @@ where
     }
 }
 
-/// Dials ok at `endpoint` (its public URL) as this machine's credential.
+/// Dials ok at `endpoint` (its public URL) as this machine's credential — or, when the environment
+/// holds a personal token ([`TOKEN`]), with that.
 pub async fn channel(endpoint: &str) -> Result<Authed<Channel>, Error> {
-    let src = Source::open(dir()?)?;
+    let auth = match env_token() {
+        Some(t) => Auth::Token(t),
+        None => Auth::Machine(Arc::new(Source::open(dir()?)?)),
+    };
     let server = Server::parse(endpoint)?;
     let channel = server.connect().await?;
-    Ok(Authed::new(channel, Auth::Machine(Arc::new(src))))
+    Ok(Authed::new(channel, auth))
 }

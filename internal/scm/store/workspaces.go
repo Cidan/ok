@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -72,7 +73,7 @@ func (s *Store) CreateWorkspace(ctx context.Context, principal string, repo int6
 	if name == "" || len(name) > maxWorkspaceName {
 		return WorkspaceState{}, invalid("a workspace name is 1 to %d bytes", maxWorkspaceName)
 	}
-	err := s.inTx(ctx, func(tx *txn) error {
+	err := s.inTx(ctx, func(ctx context.Context, tx *txn) error {
 		if err := s.repositoryExists(ctx, tx, repo); err != nil {
 			return err
 		}
@@ -130,7 +131,7 @@ func (s *Store) Attach(ctx context.Context, principal string, repo int64, name, 
 	}
 	now = now.UTC()
 	var out Attachment
-	err := s.inTx(ctx, func(tx *txn) error {
+	err := s.inTx(ctx, func(ctx context.Context, tx *txn) error {
 		out = Attachment{}
 		if err := s.repositoryExists(ctx, tx, repo); err != nil {
 			return err
@@ -180,7 +181,7 @@ func (s *Store) Renew(ctx context.Context, principal string, l Lease, now time.T
 	now = now.UTC()
 	var out Lease
 	var takeoverBy string
-	err := s.inTx(ctx, func(tx *txn) error {
+	err := s.inTx(ctx, func(ctx context.Context, tx *txn) error {
 		w, found, err := lockWorkspace(ctx, tx, principal, l.Repo, l.Workspace)
 		if err != nil {
 			return err
@@ -201,7 +202,9 @@ func (s *Store) Release(ctx context.Context, principal string, l Lease) error {
 	if err := checkWorkspace(l.Workspace, l.Machine); err != nil {
 		return err
 	}
-	return s.b.ReleaseLease(ctx, l.Repo, principal, l.Workspace, l.Machine, l.Epoch)
+	return s.inTx(ctx, func(ctx context.Context, tx *txn) error {
+		return tx.ReleaseLease(ctx, l.Repo, principal, l.Workspace, l.Machine, l.Epoch)
+	})
 }
 
 // RecordCheckpoint records a checkpoint under a lease. Its trees must be in the repository —
@@ -215,8 +218,12 @@ func (s *Store) RecordCheckpoint(ctx context.Context, principal string, l Lease,
 	if len(trees) == 0 || len(trees)%2 == 0 {
 		return Checkpoint{}, invalid("a checkpoint's tree is a merge's terms: an odd number of tree IDs, not %d", len(trees))
 	}
+	// A secret's value under //secret is refused; a tree not yet published is refused below.
+	if err := s.checkSecretValues(ctx, l.Repo, s.pendingTrees(ctx, l.Repo), s.storedFiles(ctx, l.Repo), trees); err != nil && !errors.Is(err, ErrNotFound) {
+		return Checkpoint{}, err
+	}
 	var out Checkpoint
-	err := s.inTx(ctx, func(tx *txn) error {
+	err := s.inTx(ctx, func(ctx context.Context, tx *txn) error {
 		w, found, err := lockWorkspace(ctx, tx, principal, l.Repo, l.Workspace)
 		if err != nil {
 			return err
@@ -283,7 +290,7 @@ func latestCheckpoint(ctx context.Context, q backend.Ops, principal string, repo
 
 // GetCheckpoint reads one of the principal's checkpoints.
 func (s *Store) GetCheckpoint(ctx context.Context, principal string, repo, id int64) (*Checkpoint, error) {
-	c, ok, err := s.b.PrincipalCheckpoint(ctx, repo, principal, id)
+	c, ok, err := s.ops(ctx).PrincipalCheckpoint(ctx, repo, principal, id)
 	if err != nil {
 		return nil, err
 	}
@@ -296,22 +303,19 @@ func (s *Store) GetCheckpoint(ctx context.Context, principal string, repo, id in
 // ListCheckpoints lists a workspace's checkpoints, newest first, before a checkpoint (0: from
 // the newest).
 func (s *Store) ListCheckpoints(ctx context.Context, principal string, repo int64, name string, before int64, limit int) ([]Checkpoint, error) {
-	if before == 0 {
-		before = 1<<63 - 1
-	}
-	return s.b.Checkpoints(ctx, repo, principal, name, before, limit)
+	return s.ops(ctx).Checkpoints(ctx, repo, principal, name, before, limit)
 }
 
 // ListWorkspaces lists the principal's workspaces of a repository, by name.
 func (s *Store) ListWorkspaces(ctx context.Context, principal string, repo int64) ([]WorkspaceState, error) {
-	rows, err := s.b.Workspaces(ctx, repo, principal)
+	rows, err := s.ops(ctx).Workspaces(ctx, repo, principal)
 	if err != nil {
 		return nil, err
 	}
 	out := make([]WorkspaceState, len(rows))
 	for i, w := range rows {
 		out[i] = WorkspaceState{Name: w.Name, Holder: w.Holder, Epoch: w.Epoch, ExpiresAt: w.ExpiresAt, TakeoverBy: w.TakeoverBy, OwnLog: w.OwnLog}
-		if out[i].Latest, err = latestCheckpoint(ctx, s.b, principal, repo, w.Name); err != nil {
+		if out[i].Latest, err = latestCheckpoint(ctx, s.ops(ctx), principal, repo, w.Name); err != nil {
 			return nil, err
 		}
 	}
@@ -322,7 +326,7 @@ func (s *Store) ListWorkspaces(ctx context.Context, principal string, repo int64
 // CheckpointsAll, all but the last of each hour; past CheckpointsHourly, all but the last of
 // each day; past CheckpointsDaily, all. A workspace's latest is always kept.
 func (s *Store) thinCheckpoints(ctx context.Context, repo int64, now time.Time, dryRun bool) (int64, error) {
-	n, err := s.b.ThinCheckpoints(ctx, repo, now.Add(-CheckpointsAll), now.Add(-CheckpointsHourly), now.Add(-CheckpointsDaily), dryRun)
+	n, err := s.ops(ctx).ThinCheckpoints(ctx, repo, now.Add(-CheckpointsAll), now.Add(-CheckpointsHourly), now.Add(-CheckpointsDaily), dryRun)
 	if err != nil {
 		return 0, fmt.Errorf("thinning checkpoints: %w", err)
 	}
@@ -332,7 +336,7 @@ func (s *Store) thinCheckpoints(ctx context.Context, repo int64, now time.Time, 
 // checkpointTrees are the trees of a repository's checkpoints, roots of garbage collection's
 // mark.
 func (s *Store) checkpointTrees(ctx context.Context, repo int64) ([]encoding.ID, error) {
-	trees, err := s.b.CheckpointTrees(ctx, repo)
+	trees, err := s.ops(ctx).CheckpointTrees(ctx, repo)
 	if err != nil {
 		return nil, err
 	}

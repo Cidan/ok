@@ -25,8 +25,11 @@ import (
 )
 
 // colorEnv names the copy of the deployer a process runs in: its pod's color label, through the
-// downward API.
-const colorEnv = "OK_DEPLOY_COLOR"
+// downward API. addressEnv is where its cell's other replicas reach it: its pod's address and port.
+const (
+	colorEnv   = "OK_DEPLOY_COLOR"
+	addressEnv = "OK_DEPLOY_ADDRESS"
+)
 
 // planningReads are what planning reads of a commit, which a virtual checkout's Sync has local
 // before it returns: the build graph Bazel loads, the repository's settings, and the workflow
@@ -48,7 +51,7 @@ func deployServe(args []string) error {
 		return err
 	}
 	if cfg.Deploy.Checkout == "virtual" {
-		if err := checkout.Isolate(); err != nil {
+		if err := checkout.RequireIsolated(); err != nil {
 			return err
 		}
 	}
@@ -77,12 +80,12 @@ func deployServe(args []string) error {
 	}
 	defer parts.close()
 	r, err := role.Build(ctx, cfg, role.Options{Dev: *devPrincipal != "", Color: deployColor(*color), Checkout: parts.checkout, Source: parts.source,
-		Bazel: parts.bazel, Env: parts.env, SCM: scm})
+		Bazel: parts.bazel, Env: parts.env, SCM: scm, Address: os.Getenv(addressEnv)})
 	if err != nil {
 		return err
 	}
 	defer r.Close()
-	opts := []serve.Option{serve.WithAuthn(r.Resolver), serve.WithListenAddr(cfg.Listen), serve.WithMetricsAddr(cfg.MetricsListen),
+	opts := []serve.Option{serve.WithAuthn(r.Resolver), serve.WithListenAddr(cfg.Listen), serve.WithMetricsAddr(cfg.MetricsListen), serve.WithProfiling(cfg.Profiling),
 		serve.WithStopTimeout(workerStopTimeout)}
 	if cfg.TLS != nil {
 		tc, err := serve.LoadTLS(cfg.TLS.Cert, cfg.TLS.Key)

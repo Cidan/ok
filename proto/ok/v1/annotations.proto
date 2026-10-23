@@ -23,6 +23,11 @@ enum Caller {
   CALLER_AUTOMATION = 13;
   CALLER_WORKER = 14;
   CALLER_DEPLOY = 15;
+  // ok's edge, which authenticates and routes people's requests to the cells (docs/hosted.md,
+  // "Cells, as built").
+  CALLER_EDGE = 16;
+  // ok secrets, which holds repositories' secrets' values (docs/secrets.md).
+  CALLER_SECRETS = 17;
 }
 
 extend google.protobuf.ServiceOptions {

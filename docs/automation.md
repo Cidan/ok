@@ -12,7 +12,10 @@ share), [configuration.md](configuration.md) (the role and its workers).
 ## Vocabulary
 
 - **Submit** lands a CL on `main`, the only line of history.
-- **pre** — jobs that run on every patchset of a CL. They always block submit.
+- **pre** — jobs that run on a CL in review: on a stack, once, at its top, over every CL of it.
+  They always block submit.
+- **The top of a stack** — a CL in review that no CL in review is stacked on. A CL stacked on
+  nothing is its own stack, and its own top.
 - **post** — jobs that run at submit on the CL's **candidate**, the exact commit that would land,
   before `main` moves. `main` advances only once they pass.
 - **Job** — one Bazel target that must succeed, with optional arguments.
@@ -150,11 +153,12 @@ pre:
 post:
   e2e:
     target: //services/api/e2e:e2e_test
+    pool: large                          # the pool of workers it runs in
 ```
 
 - The keys are `include`, `pre`, `post`, and `deploy` ([deploy.md](deploy.md), "The stanza"); a
-  job's are `target` (a Bazel label, `//package:name`) and `args` (a list of strings). Anything
-  else is an error, as is a key given twice. Deploys are not selected through directories or
+  job's are `target` (a Bazel label, `//package:name`), `args` (a list of strings), and `pool`.
+  Anything else is an error, as is a key given twice. Deploys are not selected through directories or
   includes: every deploy in every workflow file counts once.
 - Jobs are keyed by name: lowercase letters, digits, and `_.-`, at most 64, starting with a letter
   or digit. A job's identity is (defining file, phase, name), written
@@ -163,6 +167,13 @@ post:
   target runs its tests, a runnable target (a `*_binary`) is run with `args`, in the sandbox ([Execution](#execution)), and anything else
   must build.
 - `args` are the job's arguments, with [placeholders](#the-job-context) expanded.
+- `pool` is the pool of workers the job runs in (`worker.pool`; [hosted.md](hosted.md), "Hosted
+  automation, as built"): lowercase letters, digits, and `-`. A job that names none runs in its
+  repository's (`pool:` in `.ok/repository.yaml` on main), else `default`; so do the built-in jobs.
+- `secrets`, a post job's alone, are the secrets its binary reads, `//secret/<path>`, which its
+  folder's `acl.yaml` must give the job (`runs:`): files in `$OK_SECRETS_DIR` within its sandbox,
+  read with its lease's key ([secrets.md](secrets.md), "Readers that are not people"). Its target
+  must be a binary: a test's and a build's actions are cached.
 
 ### The job context
 
@@ -202,9 +213,21 @@ Every job knows the change it runs for:
 
 ### pre
 
-- Runs on every uploaded patchset, against the patchset's commit.
+- **Runs at the top of a stack**, against the top's current patchset, over the stack's whole
+  change: its diff from where the stack leaves `main` — the base of the stack's lowest unsubmitted
+  CL — so every path any CL of the stack changes is planned, tested, and linted once, at the top.
+  The CLs under the top run no pre of their own: the top's tree holds every one of their changes,
+  and a stack lands whole (post, below).
+- **Not in draft.** A draft runs no pre until it is sent for review. `jj cl pre` runs it by hand,
+  on any draft or CL in review — the same plan, over everything under it (ok control's `RunPre`,
+  automation's `Runs.StartPre`).
+- **The top moves.** A CL sent for review stacked on the top becomes the top: the old top's
+  unfinished pre is canceled. When the top is abandoned or returns to draft, the CL under it, if
+  in review, is the top again, and its pre is planned — or resumed, where it was canceled.
+  `jj cl ready` sends a stack for review top first, so no CL about to be stacked on is planned.
 - Always blocks submit: Submit is enabled only when every selected pre job has passed on the
-  current patchset.
+  current patchset of the top of what is submitted. Submitting part of a stack — a CL others are
+  stacked on — starts pre on that CL, if it has none, and is refused until it passes.
 - A new patchset cancels the previous patchset's running jobs.
 
 ### post
@@ -230,7 +253,11 @@ Every job knows the change it runs for:
   one of them, since an affected target unchanged since pre was affected in pre too — and
   `build since pre` builds the rest. A pass in pre is as good as a cached result, which is what
   running the job again would replay; like that cache, it holds for the Bazel of the time.
-- A stack submits through the same pipeline, each CL's candidate built on the one below it.
+- A stack submits through the same pipeline, each CL's candidate built on the one below it, and
+  post is planned once, on the top's candidate, over the submission's whole change: from the
+  commit its lowest candidate is prepared on to the top's. The candidates under it land with it,
+  each its own commit, and run nothing of their own: the top's candidate holds their changes, and
+  carries what the top's pre proved.
 
 ### Deploy
 
@@ -307,6 +334,7 @@ bazel:
   lint:
     aspects: ["//tools/lint:linters.bzl%eslint", "//tools/lint:linters.bzl%golangci_lint"]
     format: //tools/format:format     # a rules_lint format_multirun
+pool: default                         # the pool of workers its jobs run in, unless a job names one
 ```
 
 - **Aspects** ([rules_lint](https://github.com/aspect-build/rules_lint)'s, or any aspect with a
@@ -336,8 +364,9 @@ automation (`internal/automation/queue`):
 - **An attempt** is a submission's candidates (`PrepareCandidate`) on one arrangement of main:
   main's head when it was prepared, and the earlier submissions it **speculates** land first (its
   chain), each chain CL's candidate prepared on the one before it and the submission's own on
-  the last. Each own candidate gets a post plan, planned on a worker like pre's; a stack's every
-  CL is its own commit on main, so each is tested.
+  the last. Its top's candidate gets a post plan, over the whole submission, planned on a worker
+  like pre's; a stack's every CL lands as its own commit on main, the top tested over all of
+  them.
 - **A footprint** is what a change can alter and what that rests on, from its post plan: its affected targets, their upstream, and the paths it touches. Two changes
   **conflict** when a target either affects is one the other affects or builds on — so an edge
   either adds, removes, or changes shows up on both sides — or either touches a file in a package
@@ -370,6 +399,15 @@ automation (`internal/automation/queue`):
   conflicting commit — or one landed without the queue, whose footprint it cannot know — sends it
   back to be tested on the new head. The SCM's refusal (a path conflict, a CL no longer open)
   fails it with the SCM's words.
+- **Batches.** The queue lands, in one `Land` — one transaction in the SCM, main moved once — the
+  submissions it would land one after another: the first that may land, then each next that the
+  queue, decided again as it would stand once the ones before had landed (`Snapshot.AfterLanding`),
+  would land next — so a landing whose footprint interacts with the next ends the batch, and the
+  next is tested again on top of it as it would be anyway. Each CL is committed for its own
+  submitter (`LandRequest.Item.actor_id`). `automation.landing_batch` bounds a batch (32), and
+  the SCM's 1,000 CLs a landing do too. A batch the SCM refuses lands its first submission alone,
+  which says whose the refusal is. `ok_automation_landings_total` and
+  `ok_automation_landed_submissions_total` count landings and what they landed.
 - **Hot spots** — the repository's settings (which conflict with everything), `MODULE.bazel`,
   root configuration — conflict with nearly everything, so they form one long chain, each tested at its position: a batch whose every
   commit has passed, bisected by the rebases a failure causes. Testing only a batch's top would
@@ -381,14 +419,18 @@ automation (`internal/automation/queue`):
 - **Crash safety.** Every decision is taken again from the database on each pass, so a restart
   resumes. Candidates no active attempt holds are discarded (`ListCandidates`) — one prepared
   just before a crash, after a grace period — and a CL main has though the queue lost the record
-  of landing it is adopted when its attempt had passed.
+  of landing it is adopted when its attempt had passed. A batch lands whole or not at all, so a
+  crash or a deploy between its landing and its records leaves every one of its submissions
+  adoptable.
 
 Each repository's queue is keyed work (`internal/work`; hosted.md, "Work without leaders"): a row
-marked whenever a submission, a post plan, a post run, or a commit on main changes what it acts on,
-done by one replica at a time — whichever takes it first — and by every replica between them, the
-queue's repositories shared among them. Every replica looks for marked work as each mark's
-notification arrives, and at least every ten seconds, when it also marks every repository with
-work in the queue, for what time decides. A submission has one active attempt at a time:
+marked, in the same transaction, by everything that changes what it acts on — a submission, an
+attempt made, released, or discarded, a post plan, a post run's end however it ends (finished,
+released canceled, or lost with its worker), a commit on main — and done by one replica at a time,
+whichever takes it first, and by every replica between them. The one thing time decides, a
+candidate no attempt holds coming of age to be discarded, is a mark for that time. Every replica
+looks for marked work as each mark's signal arrives (the bus's, sent once the mark commits), and at
+least every ten seconds. A submission has one active attempt at a time:
 the store refuses another while one is active, so its post never runs twice. Each submission
 says what it waits for (its note: testing on top of which CLs, waiting for which to land).
 
@@ -397,11 +439,11 @@ A path conflict with main is refused, as in landing: `jj sync`, resolve, and upl
 ## Execution
 
 - **ok automation** is a role of its own (`ok automation serve`), beside ok control and the SCM. It
-  follows the SCM's change feed, plans each patchset's pre and each submission's post, dispatches
+  follows the SCM's change feed, plans each stack's pre at its top and each submission's post, dispatches
   jobs, runs the landing queue — preparing candidates and landing them through the SCM, which
-  admits it to both — and records every job, run, submission, and log in its tables, the logs of
-  finished runs in its bucket (`automation.logs`). ok control shows what it records and asks it to
-  submit, rerun, and cancel.
+  admits it to both — and records every job, run, and submission in its tables, and every run's
+  log in its bucket (`automation.logs`). ok control shows what it records and asks it to submit,
+  rerun, and cancel.
 - **Planning is a job too.** Computing the affected set and reading the workflows needs a checkout
   and Bazel, so a patchset's first job, on a worker, plans the rest.
 - **Workers** (`ok worker run`) take runs, each in a **slot**: a checkout of its own, and Bazel
@@ -443,7 +485,13 @@ A path conflict with main is refused, as in landing: `jj sync`, resolve, and upl
   it does not make a build hermetic.
 - **Identity.** Workers run as their robot (`roles.worker`); the SCM admits them to read code.
   Its credential is the worker process's alone: out of sight of what Bazel runs, as above.
-- **Logs** stream live and are kept in the logs' bucket once a run finishes.
+- **Logs** stream live into the logs' bucket, never the database. A worker sends what its run
+  writes every second, or at once when a megabyte is waiting; each request ok automation takes is
+  an object of its own, a segment, under the run's lease, and the run's row records how long the
+  log is — moved past a segment only once the segment is written, so a reader that sees a length
+  finds every segment before it. A request that wrote its segment and lost a race to its own
+  resend leaves the worker's bytes there, which the next append takes as they are. When the run
+  finishes, its segments are gathered into one object and deleted.
 - **Interactive.** Rerun, cancel, and "why did this run": which changed file resolved to which
   workflow directory, or which dependency chain made the target affected.
 

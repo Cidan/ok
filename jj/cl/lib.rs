@@ -270,6 +270,12 @@ fn rebase_options() -> RebaseOptions {
     }
 }
 
+/// Brings the repository, a fork, its upstream's newer work on ok (`jj sync --upstream`): true
+/// when its main moved to the upstream's.
+pub async fn sync_fork(repo: &dyn Repo) -> Result<bool, ClError> {
+    Ok(changelists::sync_fork(&shared(repo)?).await?)
+}
+
 /// `jj sync` (docs/scm.md, "Commands"), in the caller's transaction:
 ///
 /// 1. `main@ok` moves to the SCM's head, with main's new commits fetched.

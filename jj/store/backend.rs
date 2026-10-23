@@ -222,9 +222,37 @@ impl Backend for OkBackend {
         path: &RepoPath,
         contents: &mut (dyn AsyncRead + Send + Unpin),
     ) -> BackendResult<FileId> {
-        let id = chunk::write_file(&self.shared, path.as_internal_file_string(), contents)
+        let p = path.as_internal_file_string();
+        let keeps = ok_secret::is_secret(p) && {
+            let shared = self.shared.clone();
+            shared::run(async move { shared.keeps_secrets().await }).await
+        };
+        let id = if keeps {
+            // A secret's value is never stored (docs/secrets.md): only its pointer.
+            let mut head = Vec::with_capacity(ok_secret::POINTER_LEN + 1);
+            futures::AsyncReadExt::read_to_end(
+                &mut futures::AsyncReadExt::take(&mut *contents, ok_secret::POINTER_LEN as u64 + 1),
+                &mut head,
+            )
             .await
             .map_err(|e| write_error(Kind::File, e))?;
+            if ok_secret::parse_pointer(&head).is_none() {
+                head.fill(0);
+                return Err(write_error(
+                    Kind::File,
+                    format!(
+                        "{p} holds a value, not a pointer: ok's jj never stores a secret's value. \
+                         Write it with jj secret write //{p}, or in a virtual workspace, which keep \
+                         it in ok secrets; or restore its pointer (jj restore {p}), or delete it \
+                         (docs/secrets.md)"
+                    ),
+                ));
+            }
+            chunk::write_file(&self.shared, p, &mut futures::io::Cursor::new(head)).await
+        } else {
+            chunk::write_file(&self.shared, p, contents).await
+        }
+        .map_err(|e| write_error(Kind::File, e))?;
         Ok(FileId::new(id.to_vec()))
     }
 

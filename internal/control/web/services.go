@@ -18,6 +18,7 @@ import (
 
 	pages "github.com/Cidan/ok/internal/control/pages"
 	"github.com/Cidan/ok/internal/control/pages/servicegroup"
+	"github.com/Cidan/ok/internal/control/people"
 	"github.com/Cidan/ok/internal/control/review"
 	"github.com/Cidan/ok/internal/control/scm"
 	deploypb "github.com/Cidan/ok/proto/ok/deploy/v1"
@@ -98,27 +99,34 @@ func (s *Server) groupFailed(w http.ResponseWriter, r *http.Request, err error) 
 	fail(w, r, err)
 }
 
-// serviceGroups reads every service from the deployer, as the Services pages group them.
+// serviceGroups reads the services of the repositories the person a request is for may read from
+// the deployer, as the Services pages group them.
 func (s *Server) serviceGroups(ctx context.Context) ([]servicegroup.Group, error) {
 	resp, err := s.deploys.ListServices(ctx, &deploypb.ListServicesRequest{})
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", errDeployer, err)
 	}
-	cls, err := s.landedCLs(ctx, resp.GetServices())
+	var services []*deploypb.Service
+	for _, sv := range resp.GetServices() {
+		if s.readable(ctx, sv.GetRepositoryId()) {
+			services = append(services, sv)
+		}
+	}
+	cls, err := s.landedCLs(ctx, services)
 	if err != nil {
 		return nil, err
 	}
-	sums := make([]servicegroup.Service, 0, len(resp.GetServices()))
-	for _, sv := range resp.GetServices() {
-		sums = append(sums, serviceSummary(sv, cls))
+	sums := make([]servicegroup.Service, 0, len(services))
+	for _, sv := range services {
+		sums = append(sums, serviceSummary(ctx, sv, cls))
 	}
 	return servicegroup.Of(sums), nil
 }
 
 // serviceSummary is a service as a group holds it: its status, what ok deployed, and how many
 // of its pods are Ready.
-func serviceSummary(sv *deploypb.Service, cls map[int64]map[string]int64) servicegroup.Service {
-	st := serviceStatus(sv)
+func serviceSummary(ctx context.Context, sv *deploypb.Service, cls map[int64]map[string]int64) servicegroup.Service {
+	st := serviceStatus(ctx, sv)
 	run := sv.GetRunning()
 	out := servicegroup.Service{
 		ID: sv.GetId(), Name: sv.GetName(), Group: sv.GetGroup(), Repository: sv.GetRepository(), RepositoryHref: repoLink(sv.GetRepository()),
@@ -130,7 +138,7 @@ func serviceSummary(sv *deploypb.Service, cls map[int64]map[string]int64) servic
 		for _, im := range d.GetImages() {
 			versions = append(versions, shortImage(im.GetReference()))
 		}
-		out.Version, out.DeployedID = strings.Join(versions, ", "), d.GetId()
+		out.Version, out.DeployedID, out.DeployedAt = strings.Join(versions, ", "), d.GetId(), d.GetCreatedAt().AsTime()
 		out.Commit, out.CommitHref = scm.Short(d.GetCommitId()), commitHref(sv.GetRepository(), d.GetCommitId())
 		if n := cls[sv.GetRepositoryId()][string(d.GetCommitId())]; n != 0 {
 			out.CL, out.CLHref = n, clHref(sv.GetRepository(), n)
@@ -178,7 +186,7 @@ func (s *Server) groupRecent(ctx context.Context, g servicegroup.Group) ([]pages
 	slices.SortFunc(all, func(a, b dep) int { return cmp.Compare(b.d.GetId(), a.d.GetId()) })
 	out := make([]pages.ServiceDeployment, 0, min(len(all), groupRecentLimit))
 	for _, x := range all[:min(len(all), groupRecentLimit)] {
-		out = append(out, serviceDeployment(x.sv, x.d, cls))
+		out = append(out, serviceDeployment(ctx, x.sv, x.d, cls))
 	}
 	return out, nil
 }
@@ -205,10 +213,10 @@ func (s *Server) serveService(w http.ResponseWriter, r *http.Request, g serviceg
 		if d == nil {
 			return nil
 		}
-		out := serviceDeployment(sv, d, cls)
+		out := serviceDeployment(r.Context(), sv, d, cls)
 		return &out
 	}
-	st := serviceStatus(sv)
+	st := serviceStatus(ctx, sv)
 	run := sv.GetRunning()
 	v := pages.ServiceView{
 		ID: sv.GetId(), Name: sv.GetName(), Deploy: sv.GetDeploy(), Repository: sv.GetRepository(), RepositoryHref: repoLink(sv.GetRepository()),
@@ -243,11 +251,11 @@ func (s *Server) serveService(w http.ResponseWriter, r *http.Request, g serviceg
 
 // serviceDeployment is a deployment of a service: its status, stage, and why; the commit it
 // deployed and the CL that landed it.
-func serviceDeployment(sv *deploypb.Service, d *deploypb.Deployment, cls map[int64]map[string]int64) pages.ServiceDeployment {
+func serviceDeployment(ctx context.Context, sv *deploypb.Service, d *deploypb.Deployment, cls map[int64]map[string]int64) pages.ServiceDeployment {
 	repo := sv.GetRepository()
 	label, kind := deploymentStatus(d)
 	out := pages.ServiceDeployment{ID: d.GetId(), Service: sv.GetName(), Href: deploymentHref(repo, d.GetId(), 0), StatusLabel: label, StatusKind: kind,
-		Stage: stageLabel(d), Reason: d.GetReason(), Commit: scm.Short(d.GetCommitId()), CommitHref: commitHref(repo, d.GetCommitId())}
+		Stage: stageLabel(d), Reason: people.HaltReason(ctx, d.GetReason(), d.GetHaltById()), Commit: scm.Short(d.GetCommitId()), CommitHref: commitHref(repo, d.GetCommitId())}
 	if n := cls[sv.GetRepositoryId()][string(d.GetCommitId())]; n != 0 {
 		out.CL, out.CLHref = n, clHref(repo, n)
 	}
@@ -283,7 +291,7 @@ type serviceState struct{ label, kind, reason string }
 // serviceStatus derives a service's status, the first that holds: a deployment under way, the
 // last deployment failed, never deployed, the cluster unreadable, too few Ready pods (or no
 // workload), images other than those ok deployed, or healthy.
-func serviceStatus(sv *deploypb.Service) serviceState {
+func serviceStatus(ctx context.Context, sv *deploypb.Service) serviceState {
 	run, latest, deployed := sv.GetRunning(), sv.GetLatest(), sv.GetDeployed()
 	switch {
 	case latest != nil && (latest.GetStatus() == deploypb.Deployment_STATUS_WAITING || latest.GetStatus() == deploypb.Deployment_STATUS_RUNNING):
@@ -294,7 +302,7 @@ func serviceStatus(sv *deploypb.Service) serviceState {
 		return serviceState{"Deploying", "deploying", why}
 	case latest != nil && latest.GetId() != deployed.GetId() &&
 		(latest.GetStatus() == deploypb.Deployment_STATUS_FAILED || latest.GetStatus() == deploypb.Deployment_STATUS_HALTED):
-		return serviceState{"Last Deploy Failed", "failed", "Deployment " + strconv.FormatInt(latest.GetId(), 10) + ": " + latest.GetReason()}
+		return serviceState{"Last Deploy Failed", "failed", "Deployment " + strconv.FormatInt(latest.GetId(), 10) + ": " + people.HaltReason(ctx, latest.GetReason(), latest.GetHaltById())}
 	case deployed == nil:
 		return serviceState{"Not Deployed Yet", "undeployed", ""}
 	case run.GetError() != "":

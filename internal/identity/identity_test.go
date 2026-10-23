@@ -237,6 +237,8 @@ func TestKindOf(t *testing.T) {
 		"ci.robot.example.com":          Robot,
 		"eng.group.example.com":         GroupMember,
 		"admins.acl.example.com":        ACLMember,
+		"acme.org.example.com":          Org,
+		"eng.acme.team.example.com":     TeamMember,
 	}
 	for name, want := range cases {
 		if got, ok := testNames.KindOf(name); !ok || got != want {
@@ -246,6 +248,7 @@ func TestKindOf(t *testing.T) {
 	for _, bad := range []string{
 		"", "other.net", "human.example.com", "a.b.human.example.com", "a.b.c.robot.example.com", "a.b.group.example.com",
 		"a.svc.example.com", "A.human.example.com", "a.human.other.com", "-a.human.example.com", "a..robot.example.com",
+		"a.b.org.example.com", "eng.team.example.com", "a.b.c.team.example.com",
 	} {
 		if k, ok := testNames.KindOf(bad); ok {
 			t.Errorf("testNames.KindOf(%q) = %v; want it refused", bad, k)
@@ -364,5 +367,44 @@ func TestSyncedGroups(t *testing.T) {
 	}
 	if d := Authorize(before, after, []string{"dee.human.example.com"}); !d.Approved {
 		t.Errorf("a synced group's member could not approve: %+v", d.Refused())
+	}
+}
+
+// People and organizations share a namespace of handles; teams are named under their organization.
+func TestOrgsAndTeams(t *testing.T) {
+	if testNames.Org("acme") != "acme.org.example.com" || testNames.Team("eng", "acme") != "eng.acme.team.example.com" {
+		t.Errorf("Org, Team: %s, %s", testNames.Org("acme"), testNames.Team("eng", "acme"))
+	}
+	for name, want := range map[string]string{"ada.human.example.com": "ada", "acme.org.example.com": "acme"} {
+		if h, ok := testNames.HandleOf(name); !ok || h != want {
+			t.Errorf("HandleOf(%q) = %q, %v", name, h, ok)
+		}
+	}
+	for _, bad := range []string{"ci.robot.example.com", "eng.acme.team.example.com", "eng.group.example.com"} {
+		if h, ok := testNames.HandleOf(bad); ok {
+			t.Errorf("HandleOf(%q) = %q; want none", bad, h)
+		}
+	}
+	// A team holds people and its teams below, as a synced group does; an ACL may hold a team, never
+	// an organization.
+	teams := WithSynced(map[string][]string{
+		"eng.acme.team.example.com": {"dee.human.example.com", "web.acme.team.example.com"},
+		"web.acme.team.example.com": {"eve.human.example.com"},
+	})
+	files := estate()
+	files["eng/infra/acl.yaml"] = members(cal, "eng.acme.team.example.com")
+	tr, err := Load(testNames, fsOf(files), teams)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := tr.Expand("infra.acl.example.com"), []string{cal, "dee.human.example.com", "eve.human.example.com"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("Expand through teams = %v, want %v", got, want)
+	}
+	if _, err := Load(testNames, fsOf(files)); err == nil || !strings.Contains(err.Error(), "eng.acme.team.example.com is not declared") {
+		t.Errorf("a team the directory has no: %v", err)
+	}
+	files["eng/infra/acl.yaml"] = members(cal, "acme.org.example.com")
+	if _, err := Load(testNames, fsOf(files), teams); err == nil || !strings.Contains(err.Error(), "is an organization, which is in no set") {
+		t.Errorf("an organization in an ACL: %v", err)
 	}
 }

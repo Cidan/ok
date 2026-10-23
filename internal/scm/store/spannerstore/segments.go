@@ -1,0 +1,326 @@
+package spannerstore
+
+import (
+	"context"
+	"time"
+
+	"cloud.google.com/go/spanner"
+
+	"github.com/Cidan/ok/internal/data/spannerdata"
+	"github.com/Cidan/ok/internal/scm/encoding"
+	"github.com/Cidan/ok/internal/scm/segment"
+	"github.com/Cidan/ok/internal/scm/store/backend"
+)
+
+// ─── Segments ───
+
+const segmentColumns = `scope, owner_id, network_id, kind, id, level, records, size, created_at, age, inherited, bound`
+
+func (x queries) segments(ctx context.Context, sql string, params map[string]any) ([]backend.Segment, error) {
+	var out []backend.Segment
+	err := x.rows(ctx, sql, params, func() { out = nil }, func(row *spanner.Row) error {
+		var s backend.Segment
+		var idb []byte
+		var scope, net, kind, level int64
+		var bound spanner.NullInt64
+		if err := row.Columns(&scope, &s.Scope.ID, &net, &kind, &idb, &level, &s.Records, &s.Size, &s.CreatedAt, &s.Age,
+			&s.Inherited, &bound); err != nil {
+			return err
+		}
+		s.Scope.Network, s.Net, s.Kind, s.Level = scope == 1, backend.Network(net), segment.Kind(kind), int16(level)
+		s.Bound = backend.NoBound
+		if bound.Valid {
+			s.Bound = bound.Int64
+		}
+		var err error
+		if s.ID, err = toID(idb); err != nil {
+			return err
+		}
+		out = append(out, s)
+		return nil
+	})
+	return out, err
+}
+
+// boundOf is a segment's bound as its column holds it: NULL when it is read whole.
+func boundOf(s backend.Segment) spanner.NullInt64 {
+	return spanner.NullInt64{Int64: s.Bound, Valid: s.Bound != backend.NoBound}
+}
+
+func (x queries) Segments(ctx context.Context, sc backend.Scope, kind segment.Kind) ([]backend.Segment, error) {
+	p := scopeParams(sc)
+	p["kind"] = int64(kind)
+	return x.segments(ctx, `SELECT `+segmentColumns+` FROM segment
+		WHERE scope = @scope AND owner_id = @owner AND kind = @kind AND retired_at IS NULL ORDER BY age DESC`, p)
+}
+
+// segmentParams are a segment's columns as parameters.
+func segmentParams(s backend.Segment) map[string]any {
+	scope, owner := scopeOf(s.Scope)
+	return map[string]any{"scope": scope, "owner": owner, "net": int64(s.Net), "kind": int64(s.Kind), "id": s.ID[:], "level": int64(s.Level),
+		"records": s.Records, "size": s.Size, "age": s.Age, "inherited": s.Inherited, "bound": boundOf(s)}
+}
+
+const insertSegment = `INSERT INTO segment (scope, owner_id, network_id, kind, id, level, records, size, created_at, age, inherited, bound)
+	VALUES (@scope, @owner, @net, @kind, @id, @level, @records, @size, ` + now + `, @age, @inherited, @bound)`
+
+// InsertSegments records segments live, one written from the tail (Age 0) under its network's
+// counter's next age.
+func (x queries) InsertSegments(ctx context.Context, segs []backend.Segment) error {
+	return x.write(ctx, func(tx *spanner.ReadWriteTransaction) error {
+		for _, s := range segs {
+			if s.Age == 0 {
+				var err error
+				if s.Age, err = x.next(ctx, ageCounter, int64(s.Net), 1); err != nil {
+					return err
+				}
+			}
+			if _, err := spannerdata.Update(ctx, tx, insertSegment, segmentParams(s)); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// segmentKey is a segment's kind and ID, as a STRUCT parameter.
+type segmentKey struct {
+	K int64  `spanner:"k"`
+	I []byte `spanner:"i"`
+}
+
+// SetInherited records segs inherited: one recorded is live again with its bound, as PostgreSQL's
+// upsert has it, keeping the rest of its row.
+func (x queries) SetInherited(ctx context.Context, repo int64, segs []backend.Segment) (int64, error) {
+	var retired int64
+	err := x.write(ctx, func(tx *spanner.ReadWriteTransaction) error {
+		keep := make([]segmentKey, 0, len(segs))
+		for _, s := range segs {
+			s.Scope, s.Inherited = backend.RepositoryScope(repo), true
+			p := segmentParams(s)
+			n, err := spannerdata.Update(ctx, tx, `UPDATE segment SET retired_at = NULL, bound = @bound
+				WHERE scope = @scope AND owner_id = @owner AND kind = @kind AND id = @id`, p)
+			if err != nil {
+				return err
+			}
+			if n == 0 {
+				if _, err := spannerdata.Update(ctx, tx, insertSegment, p); err != nil {
+					return err
+				}
+			}
+			keep = append(keep, segmentKey{int64(s.Kind), s.ID[:]})
+		}
+		var err error
+		retired, err = spannerdata.Update(ctx, tx, `UPDATE segment SET retired_at = `+now+`
+			WHERE scope = 0 AND owner_id = @repo AND inherited AND retired_at IS NULL
+			  AND STRUCT<k INT64, i BYTES>(kind, id) NOT IN UNNEST(@keep)`, map[string]any{"repo": repo, "keep": keep})
+		return err
+	})
+	return retired, err
+}
+
+func (x queries) RetireSegments(ctx context.Context, sc backend.Scope, kind segment.Kind, members []encoding.ID) (int64, error) {
+	p := scopeParams(sc)
+	p["kind"], p["ids"] = int64(kind), ids(members)
+	return x.execIn(ctx, `UPDATE segment SET retired_at = `+now+`
+		WHERE scope = @scope AND owner_id = @owner AND kind = @kind AND id IN UNNEST(@ids) AND retired_at IS NULL AND NOT inherited`, p,
+		[]string{"ids"}, nil)
+}
+
+func (x queries) RetiredSegmentsBefore(ctx context.Context, t time.Time, net *backend.Network) ([]backend.Segment, error) {
+	return x.segments(ctx, `SELECT `+segmentColumns+` FROM segment
+		WHERE retired_at < @t AND (@net IS NULL OR network_id = @net) ORDER BY network_id, scope, owner_id, kind, id`,
+		map[string]any{"t": t, "net": optionalNetwork(net)})
+}
+
+func (x queries) AllSegments(ctx context.Context, sc backend.Scope) ([]backend.Segment, error) {
+	return x.segments(ctx, `SELECT `+segmentColumns+` FROM segment WHERE scope = @scope AND owner_id = @owner`, scopeParams(sc))
+}
+
+func (x queries) NetworkSegments(ctx context.Context, net backend.Network) ([]backend.Segment, error) {
+	return x.segments(ctx, `SELECT `+segmentColumns+` FROM segment WHERE network_id = @net`, map[string]any{"net": int64(net)})
+}
+
+func (x queries) SegmentNamed(ctx context.Context, net backend.Network, sc backend.Scope, kind segment.Kind, id encoding.ID, since time.Time) (bool, error) {
+	p := scopeParams(sc)
+	p["net"], p["kind"], p["id"], p["since"] = int64(net), int64(kind), id[:], since
+	var named bool
+	_, err := x.one(ctx, `SELECT EXISTS (SELECT 1 FROM segment
+		WHERE network_id = @net AND kind = @kind AND id = @id AND NOT (scope = @scope AND owner_id = @owner)
+		  AND (retired_at IS NULL OR retired_at >= @since))`, p, &named)
+	return named, err
+}
+
+func (x queries) DeleteSegment(ctx context.Context, sc backend.Scope, kind segment.Kind, id encoding.ID) error {
+	p := scopeParams(sc)
+	p["kind"], p["id"] = int64(kind), id[:]
+	_, err := x.exec(ctx, `DELETE FROM segment WHERE scope = @scope AND owner_id = @owner AND kind = @kind AND id = @id AND retired_at IS NOT NULL`, p)
+	return err
+}
+
+func (x queries) PinnedPaths(ctx context.Context, repo int64, limit int) ([]backend.PathRow, error) {
+	var out []backend.PathRow
+	err := x.rows(ctx, `SELECT path, generation, commit_id FROM commit_path WHERE repository_id = @repo
+		ORDER BY path, generation, commit_id LIMIT @limit`, map[string]any{"repo": repo, "limit": int64(limit)}, func() { out = nil },
+		func(row *spanner.Row) error {
+			var p backend.PathRow
+			var idb []byte
+			if err := row.Columns(&p.Path, &p.Generation, &idb); err != nil {
+				return err
+			}
+			var err error
+			if p.Commit, err = toID(idb); err != nil {
+				return err
+			}
+			out = append(out, p)
+			return nil
+		})
+	return out, err
+}
+
+func (x queries) SettledEvents(ctx context.Context, repo int64, limit int) ([]backend.Event, error) {
+	return x.events(ctx, `SELECT e.repository_id, e.repository_seq, e.body FROM event e
+		WHERE e.repository_id = @repo AND NOT EXISTS (SELECT 1 FROM event_pending p
+			WHERE p.repository_id = e.repository_id AND p.repository_seq = e.repository_seq)
+		ORDER BY e.repository_seq LIMIT @limit`, map[string]any{"repo": repo, "limit": int64(limit)})
+}
+
+func (x queries) PinnedCommits(ctx context.Context, repo int64, limit int) ([]backend.PinnedCommit, error) {
+	var out []backend.PinnedCommit
+	err := x.rows(ctx, `SELECT c.id, c.generation, `+commitParents+`, c.body FROM commit c
+		WHERE c.repository_id = @repo AND c.pinned ORDER BY c.id LIMIT @limit`, map[string]any{"repo": repo, "limit": int64(limit)},
+		func() { out = nil }, func(row *spanner.Row) error {
+			var c backend.PinnedCommit
+			g, err := scanGraphCommit(row, &c.Body)
+			if err != nil {
+				return err
+			}
+			c.GraphCommit = g
+			out = append(out, c)
+			return nil
+		})
+	return out, err
+}
+
+func (x queries) PinnedObjects(ctx context.Context, repo int64, limit int) ([]backend.Object, error) {
+	return x.kindedObjects(ctx, `SELECT id, kind, body FROM object WHERE repository_id = @repo AND pinned ORDER BY id LIMIT @limit`,
+		map[string]any{"repo": repo, "limit": int64(limit)})
+}
+
+func (x queries) PinnedTreeSizes(ctx context.Context, repo int64, limit int) ([]backend.Object, error) {
+	return x.objects(ctx, `SELECT ts.tree_id, ts.body FROM tree_sizes ts
+		LEFT JOIN object o ON o.repository_id = ts.repository_id AND o.id = ts.tree_id
+		WHERE ts.repository_id = @repo AND (o.id IS NULL OR o.pinned) ORDER BY ts.tree_id LIMIT @limit`,
+		map[string]any{"repo": repo, "limit": int64(limit)}, encoding.KindTree)
+}
+
+func (x queries) PinnedCopyEdges(ctx context.Context, repo int64, limit int) ([][2]encoding.ID, error) {
+	return x.pairs(ctx, `SELECT cp.copy_id, cp.parent_id FROM copy_parent cp
+		LEFT JOIN object o ON o.repository_id = cp.repository_id AND o.id = cp.copy_id
+		WHERE cp.repository_id = @repo AND (o.id IS NULL OR o.pinned) ORDER BY cp.parent_id, cp.copy_id LIMIT @limit`,
+		map[string]any{"repo": repo, "limit": int64(limit)})
+}
+
+// pathKey is a row of main's path history's key, as a STRUCT parameter.
+type pathKey struct {
+	P string `spanner:"p"`
+	G int64  `spanner:"g"`
+	C []byte `spanner:"c"`
+}
+
+// opKey is an operation's or a view's key in its log, as a STRUCT parameter; opKindKey a
+// tombstone's.
+type opKey struct {
+	L int64  `spanner:"l"`
+	I []byte `spanner:"i"`
+}
+
+type opKindKey struct {
+	L int64  `spanner:"l"`
+	K int64  `spanner:"k"`
+	I []byte `spanner:"i"`
+}
+
+// DeleteCompacted deletes what a compaction moved, each kind's keys a chunk at a time.
+func (x queries) DeleteCompacted(ctx context.Context, repo int64, c backend.Compacted) error {
+	type stmt struct {
+		sql   string
+		p     map[string]any
+		array string
+	}
+	var stmts []stmt
+	add := func(sql, array string, keys any) {
+		stmts = append(stmts, stmt{sql, map[string]any{"repo": repo, array: keys}, array})
+	}
+	if len(c.Objects) > 0 {
+		add(`DELETE FROM object WHERE repository_id = @repo AND id IN UNNEST(@ids) AND pinned`, "ids", ids(c.Objects))
+	}
+	if len(c.Commits) > 0 {
+		// Its parent edges go with it (commit_parent's foreign key).
+		add(`DELETE FROM commit WHERE repository_id = @repo AND id IN UNNEST(@ids) AND pinned`, "ids", ids(c.Commits))
+	}
+	if len(c.Paths) > 0 {
+		keys := make([]pathKey, len(c.Paths))
+		for i, p := range c.Paths {
+			keys[i] = pathKey{p.Path, p.Generation, p.Commit[:]}
+		}
+		add(`DELETE FROM commit_path WHERE repository_id = @repo
+			AND STRUCT<p STRING, g INT64, c BYTES>(path, generation, commit_id) IN UNNEST(@keys)`, "keys", keys)
+	}
+	if len(c.Events) > 0 {
+		// Only what the relay has published: nothing makes an event pending again.
+		add(`DELETE FROM event AS e WHERE e.repository_id = @repo AND e.repository_seq IN UNNEST(@seqs)
+			AND NOT EXISTS (SELECT 1 FROM event_pending p WHERE p.repository_id = e.repository_id AND p.repository_seq = e.repository_seq)`,
+			"seqs", c.Events)
+	}
+	for _, kind := range []encoding.Kind{encoding.KindOperation, encoding.KindView} {
+		var keys []opKey
+		for _, o := range c.Ops {
+			if o.Kind == kind {
+				keys = append(keys, opKey{o.Log, o.ID[:]})
+			}
+		}
+		if len(keys) > 0 {
+			// A row touched since compaction read it — re-published — stays: it supersedes the segment's.
+			add(`DELETE FROM `+opTable(kind)+` WHERE STRUCT<l INT64, i BYTES>(op_log_id, id) IN UNNEST(@keys) AND touched_at < @before`, "keys", keys)
+			stmts[len(stmts)-1].p["before"] = c.OpsBefore
+		}
+	}
+	if len(c.OpTombstones) > 0 {
+		keys := make([]opKindKey, len(c.OpTombstones))
+		for i, k := range c.OpTombstones {
+			keys[i] = opKindKey{k.Log, int64(k.Kind), k.ID[:]}
+		}
+		add(`DELETE FROM op_tombstone WHERE STRUCT<l INT64, k INT64, i BYTES>(op_log_id, kind, id) IN UNNEST(@keys)`, "keys", keys)
+	}
+	if len(c.TreeSizes) > 0 {
+		add(`DELETE FROM tree_sizes WHERE repository_id = @repo AND tree_id IN UNNEST(@ids)`, "ids", ids(c.TreeSizes))
+	}
+	if len(c.CopyEdges) > 0 {
+		edges := make([]idPair, len(c.CopyEdges))
+		for i, e := range c.CopyEdges {
+			edges[i] = idPair{e[0][:], e[1][:]}
+		}
+		add(`DELETE FROM copy_parent WHERE repository_id = @repo AND STRUCT<a BYTES, b BYTES>(copy_id, parent_id) IN UNNEST(@edges)`, "edges", edges)
+	}
+	if len(c.ChangeLists) > 0 {
+		// Their patchsets go first: deleted with them (patchset's foreign key), they would count in the
+		// CLs' statement.
+		add(`DELETE FROM patchset WHERE repository_id = @repo AND cl_number IN UNNEST(@numbers)
+			AND cl_number IN (SELECT number FROM changelist WHERE repository_id = @repo AND status = @settled)`, "numbers", c.ChangeLists)
+		stmts[len(stmts)-1].p["settled"] = int64(settledStatus)
+		add(`DELETE FROM changelist WHERE repository_id = @repo AND number IN UNNEST(@numbers) AND status = @settled`, "numbers", c.ChangeLists)
+		stmts[len(stmts)-1].p["settled"] = int64(settledStatus)
+	}
+	if len(c.MainLog) > 0 {
+		add(`DELETE FROM head_log WHERE repository_id = @repo AND seq IN UNNEST(@seqs)`, "seqs", c.MainLog)
+	}
+	return x.write(ctx, func(tx *spanner.ReadWriteTransaction) error {
+		for _, s := range stmts {
+			if _, err := updateIn(ctx, tx, s.sql, s.p, []string{s.array}, nil); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}

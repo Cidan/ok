@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/Cidan/ok/internal/scm/encoding"
+	"github.com/Cidan/ok/internal/testdb/testobjects"
 )
 
 func TestFsck(t *testing.T) {
@@ -54,14 +56,10 @@ func TestFsck(t *testing.T) {
 		}
 		t.Fatalf("no problem mentions %q:\n%s", parts, r)
 	}
-	exec := func(sql string, args ...any) {
+	exec := func(sql string, args map[string]any) {
 		t.Helper()
-		tag, err := poolOf(s).Exec(ctx, sql, args...)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if tag.RowsAffected() != 1 {
-			t.Fatalf("%s: %d rows", sql, tag.RowsAffected())
+		if n := dbOf(s).exec(t, sql, args); n != 1 {
+			t.Fatalf("%s: %d rows", sql, n)
 		}
 	}
 
@@ -73,9 +71,7 @@ func TestFsck(t *testing.T) {
 		t.Fatalf("fresh repository counts: %+v", r)
 	}
 	var packB []byte
-	if err := poolOf(s).QueryRow(ctx, `SELECT id FROM pack WHERE repository_id = $1`, repo).Scan(&packB); err != nil {
-		t.Fatal(err)
-	}
+	dbOf(s).scan(t, `SELECT id FROM pack WHERE network_id = @net`, map[string]any{"net": int64(netOf(t, s, repo))}, &packB)
 	packID := encoding.ID(packB)
 	var lost encoding.ID
 	for _, m := range b.manifests() {
@@ -106,7 +102,7 @@ func TestFsck(t *testing.T) {
 	})
 
 	t.Run("orphan pack", func(t *testing.T) {
-		key := packKey(repo, encoding.ID{0xee})
+		key := packKey(netOf(t, s, repo), encoding.ID{0xee})
 		if err := s.blobs.Put(ctx, key, strings.NewReader("x"), 1); err != nil {
 			t.Fatal(err)
 		}
@@ -125,21 +121,23 @@ func TestFsck(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		exec(`UPDATE object SET body = $3 WHERE repository_id = $1 AND id = $2`, repo, root[:], other)
+		exec(`UPDATE object SET body = @body WHERE repository_id = @repo AND id = @id`, map[string]any{"repo": repo, "id": root[:], "body": other})
 		wantProblem(fsck(false), root.String())
-		exec(`UPDATE object SET body = $3 WHERE repository_id = $1 AND id = $2`, repo, root[:], b.body(ObjectRef{Kind: encoding.KindTree, ID: root}))
+		exec(`UPDATE object SET body = @body WHERE repository_id = @repo AND id = @id`,
+			map[string]any{"repo": repo, "id": root[:], "body": b.body(ObjectRef{Kind: encoding.KindTree, ID: root})})
 		requireClean("after restoring the tree")
 	})
 
 	t.Run("parent index", func(t *testing.T) {
-		exec(`DELETE FROM commit_parent WHERE repository_id = $1 AND commit_id = $2`, repo, c2[:])
+		exec(`DELETE FROM commit_parent WHERE repository_id = @repo AND commit_id = @commit`, map[string]any{"repo": repo, "commit": c2[:]})
 		wantProblem(fsck(false), c2.String())
-		exec(`INSERT INTO commit_parent (repository_id, commit_id, ord, parent_id) VALUES ($1, $2, 0, $3)`, repo, c2[:], c1[:])
+		exec(`INSERT INTO commit_parent (repository_id, commit_id, ord, parent_id) VALUES (@repo, @commit, 0, @parent)`,
+			map[string]any{"repo": repo, "commit": c2[:], "parent": c1[:]})
 		requireClean("after restoring the edge")
 	})
 
 	t.Run("pack bytes", func(t *testing.T) {
-		key := packKey(repo, packID)
+		key := packKey(netOf(t, s, repo), packID)
 		var orig bytes.Buffer
 		if _, err := s.blobs.Download(ctx, key, &orig); err != nil {
 			t.Fatal(err)
@@ -158,5 +156,43 @@ func TestFsck(t *testing.T) {
 
 	if _, err := s.Fsck(ctx, 1<<62, false); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("fsck of a missing repository: %v", err)
+	}
+}
+
+// fsck verifies a repository's files from its packs as it downloads each, once: however many files,
+// it reads from the bucket only the chunks a file has in another pack than its first chunk's.
+func TestFsckReadsEachPackOnce(t *testing.T) {
+	ctx := context.Background()
+	base := testStore(t)
+	slow := testobjects.NewSlow(base.blobs, 0)
+	s := mustOpen(t, dbOf(base), slow, Config{Signals: base.signals})
+	repo := newRepo(t, s).ID
+	// Two publishes, two packs of 300 files each; the second's last file begins with a chunk the
+	// first stored, so its chunks are in both.
+	shared := bytesOf(testChunk, 3)
+	for p := range 2 {
+		b := newBuilder(t)
+		var entries []encoding.TreeEntry
+		for i := range 300 {
+			entries = append(entries, fileEntry(fmt.Sprintf("f%03d", i), b.file([]byte(fmt.Sprintf("pack %d file %d\n", p, i)))))
+		}
+		if p == 0 {
+			entries = append(entries, fileEntry("shared", b.file(shared)))
+		} else {
+			entries = append(entries, fileEntry("both", b.file(append(bytes.Clone(shared), []byte("and more of its own\n")...))))
+		}
+		b.commit(b.tree(entries...), fmt.Sprint("pack ", p), encoding.RootCommitID)
+		mustPublish(t, s, repo, alice, b, nil)
+	}
+	downloads, ranges := slow.Count("download"), slow.Count("get-range")
+	r, err := s.Fsck(ctx, repo, false)
+	if err != nil || len(r.Problems) != 0 {
+		t.Fatalf("fsck: %v, %v", r, err)
+	}
+	if r.Files != 602 || r.Packs != 2 {
+		t.Fatalf("fsck counted %d files in %d packs", r.Files, r.Packs)
+	}
+	if d, g := slow.Count("download")-downloads, slow.Count("get-range")-ranges; d != 2 || g > 2 {
+		t.Errorf("fsck of 602 files in 2 packs downloaded %d times and read %d ranges", d, g)
 	}
 }

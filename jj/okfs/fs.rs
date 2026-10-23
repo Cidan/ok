@@ -3,6 +3,13 @@
 //! lock and the operation tried again; a file whose content is ok's is read by range, outside
 //! the lock too. Kernel notifications are sent once the lock is released. Over NFS (macOS), nfs.rs
 //! serves the same mount, and the kernel is told of changes through it (`nfs::Refresh`).
+//!
+//! A workspace's secrets (docs/secrets.md, "Clients") are files under `secret/` whose contents, as
+//! the tree and the overlay hold them, are pointers. Over FUSE the mount serves their values
+//! instead: a read-only open fetches its value from ok secrets, using one of the person's unseals,
+//! and holds it for that open alone; a write is held in memory — never in the overlay — until a
+//! snapshot seals it (`seal_secret`), storing the value in ok secrets and the pointer in the
+//! overlay. Over NFS, whose client caches file data, and in a presentation, secrets are pointers.
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -15,12 +22,16 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
+use std::time::Instant;
 
 use jj_lib::backend::FileId;
 use jj_lib::backend::SymlinkId;
 use jj_lib::backend::Tree as BackendTree;
 use jj_lib::backend::TreeId;
 use jj_lib::object_id::ObjectId as _;
+use ok_proto::ok::okfs::v1 as pb;
+use ok_secret::Digest;
+use ok_secret::SecretBuf;
 use okfs_fuse as fuse;
 
 use crate::model::Error;
@@ -64,6 +75,52 @@ pub trait Fetch: Send + Sync {
     fn prefetch(&self, _files: Vec<(FileId, Option<u64>)>, _max: u64) {}
 }
 
+/// What a workspace's mount asks ok secrets about its secrets (docs/secrets.md). Errors are the
+/// errno a file operation fails with: `EACCES` for what the caller may not do, or has not unsealed.
+pub trait SecretStore: Send + Sync {
+    /// Whether the repository keeps secrets: elsewhere `secret/` is an ordinary folder. When ok
+    /// secrets cannot say, it does.
+    fn keeps_secrets(&self) -> bool;
+    /// The value of the version at `path` a pointer's digest names, using one of the person's
+    /// unseals of `path`.
+    fn read(&self, path: &str, digest: &Digest) -> io::Result<SecretBuf>;
+    /// Keeps `value` as a new version of the secret at `path`, returning its digest.
+    fn write(&self, path: &str, value: &[u8]) -> io::Result<Digest>;
+    /// Whether the caller may write the secrets of `path`'s folder.
+    fn may_write(&self, path: &str) -> io::Result<bool>;
+}
+
+/// How long ok secrets' answer to whether the caller may write a folder's secrets is kept.
+const SECRET_ACCESS_TTL: Duration = Duration::from_secs(60);
+
+/// The repository's settings, whose `secrets:` stanza makes it keep secrets.
+const SETTINGS: &str = ".ok/repository.yaml";
+
+/// A version of the workspace's settings: written (its inode and content version), or ok's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SettingsAt {
+    Written(Ino, u64),
+    Ok(FileId),
+}
+
+/// The most of the settings read for their secrets stanza.
+const MAX_SETTINGS: u64 = 1 << 20;
+
+/// A secret's value the mount holds for writing: written since it was sealed, or held for the
+/// handles open to write it. A read-only open's value is its handle's alone.
+struct SecretFile {
+    value: SecretBuf,
+    /// The pointer the value is sealed as — the one the file holds — with the value's hash, which
+    /// tells a value rewritten as it was from a new one.
+    sealed: Option<(Digest, [u8; 32])>,
+    /// Written since it was sealed (or read).
+    dirty: bool,
+    /// Bumped by every write: a seal that raced one leaves the file dirty.
+    generation: u64,
+    /// The handles open to write it: once none is, and it is sealed, the value is dropped.
+    opens: u32,
+}
+
 /// A directory's first opens: when the count started, how many, and the model's change count when
 /// the directory was prefetched, if it was.
 type Siblings = (std::time::Instant, u32, Option<u64>);
@@ -80,8 +137,18 @@ const TTL: Duration = Duration::from_secs(3600);
 
 /// An open file or directory.
 enum Handle {
-    File { opened: Opened },
-    Dir { entries: Arc<Vec<(Listed, Ino)>> },
+    File {
+        opened: Opened,
+    },
+    Dir {
+        entries: Arc<Vec<(Listed, Ino)>>,
+    },
+    /// A secret. Opened to write, it is read and written in `secret_files` (`value` none); opened
+    /// to read, `value` is what that open fetched, for it alone.
+    Secret {
+        ino: Ino,
+        value: Option<SecretBuf>,
+    },
 }
 
 /// What a mount has fetched, for `jj fs status`.
@@ -113,6 +180,18 @@ pub struct Mount {
     pub stats: Stats,
     /// Called after every change to the file system: the checkpointer's and subscribers' cue.
     on_change: Box<dyn Fn() + Send + Sync>,
+    /// ok's secrets, for a workspace over FUSE; none for a presentation, or over NFS, which show
+    /// pointers.
+    secrets: Option<Arc<dyn SecretStore>>,
+    /// The secrets whose values the mount holds for writing, by inode: never on disk.
+    secret_files: Mutex<HashMap<Ino, SecretFile>>,
+    /// Whether the caller may write each folder's secrets, as ok secrets last said.
+    secret_access: Mutex<HashMap<String, (bool, Instant)>>,
+    /// Whether the workspace's settings keep secrets, for the version of them last read.
+    settings: Mutex<Option<(SettingsAt, bool)>>,
+    /// Held while a secret is sealed: jj's snapshot and the checkpointer's seal one at a time, so
+    /// a value is stored once.
+    sealing: Mutex<()>,
 }
 
 fn to_errno(e: io::Error) -> i32 {
@@ -140,7 +219,17 @@ impl Mount {
             siblings: Mutex::new(HashMap::new()),
             stats: Stats::default(),
             on_change,
+            secrets: None,
+            secret_files: Mutex::new(HashMap::new()),
+            secret_access: Mutex::new(HashMap::new()),
+            settings: Mutex::new(None),
+            sealing: Mutex::new(()),
         })
+    }
+
+    /// Serves the workspace's secrets through ok secrets (docs/secrets.md).
+    pub fn use_secrets(&mut self, secrets: Arc<dyn SecretStore>) {
+        self.secrets = Some(secrets);
     }
 
     pub fn model(&self) -> MutexGuard<'_, Model> {
@@ -318,12 +407,13 @@ impl Mount {
     }
 
     fn entry(&self, ino: Ino) -> fuse::Result<fuse::Entry> {
-        let attr = self.with(|m| m.attr(ino))?;
+        let mut attr = self.with(|m| m.attr(ino))?;
+        let attr_ttl = self.secret_attr(&mut attr);
         Ok(fuse::Entry {
             attr,
             generation: 0,
             entry_ttl: TTL,
-            attr_ttl: TTL,
+            attr_ttl,
         })
     }
 
@@ -466,13 +556,14 @@ impl fuse::Filesystem for Mount {
                 None => None,
             })
         })?;
-        Ok(found.map(|(ino, attr)| {
+        Ok(found.map(|(ino, mut attr)| {
             self.counted(ino);
+            let attr_ttl = self.secret_attr(&mut attr);
             fuse::Entry {
                 attr,
                 generation: 0,
                 entry_ttl: TTL,
-                attr_ttl: TTL,
+                attr_ttl,
             }
         }))
     }
@@ -489,7 +580,9 @@ impl fuse::Filesystem for Mount {
         ino: u64,
         _: Option<u64>,
     ) -> fuse::Result<(fuse::Attr, Duration)> {
-        Ok((self.with(|m| m.attr(ino))?, TTL))
+        let mut attr = self.with(|m| m.attr(ino))?;
+        let ttl = self.secret_attr(&mut attr);
+        Ok((attr, ttl))
     }
 
     fn setattr(
@@ -499,9 +592,32 @@ impl fuse::Filesystem for Mount {
         set: &fuse::SetAttr,
     ) -> fuse::Result<(fuse::Attr, Duration)> {
         self.writable()?;
-        self.with(|m| m.setattr(ino, set))?;
+        let mut set = *set;
+        if let (Some(size), Some(path)) = (set.size, self.secret_path(ino)) {
+            // A secret's size is its value's, which the overlay never holds.
+            self.check_write(&path)?;
+            if size != 0 && !self.secret_files.lock().unwrap().contains_key(&ino) {
+                let (value, sealed) = self.fetch_secret(ino, &path)?;
+                self.secret_files
+                    .lock()
+                    .unwrap()
+                    .entry(ino)
+                    .or_insert(SecretFile {
+                        value,
+                        sealed,
+                        dirty: false,
+                        generation: 0,
+                        opens: 0,
+                    });
+            }
+            self.write_secret(ino, |v| v.set_len(size as usize))?;
+            set.size = None;
+        }
+        self.with(|m| m.setattr(ino, &set))?;
         self.changed();
-        Ok((self.with(|m| m.attr(ino))?, TTL))
+        let mut attr = self.with(|m| m.attr(ino))?;
+        let ttl = self.secret_attr(&mut attr);
+        Ok((attr, ttl))
     }
 
     fn readlink(&self, _: &fuse::Ctx, ino: u64) -> fuse::Result<Vec<u8>> {
@@ -516,6 +632,7 @@ impl fuse::Filesystem for Mount {
         target: &[u8],
     ) -> fuse::Result<fuse::Entry> {
         self.writable()?;
+        self.only_files_in_secrets(parent, name)?;
         let ino = self.with(|m| m.create(parent, name, Kind::Symlink, 0o777, target))?;
         self.changed();
         self.entry(ino)
@@ -534,6 +651,7 @@ impl fuse::Filesystem for Mount {
         let kind = kind_of(mode)
             .filter(|k| *k != Kind::Dir)
             .ok_or(libc::EPERM)?;
+        self.only_files_in_secrets(parent, name)?;
         let ino = self.with(|m| m.create(parent, name, kind, mode & !umask, b""))?;
         self.changed();
         self.entry(ino)
@@ -548,6 +666,7 @@ impl fuse::Filesystem for Mount {
         umask: u32,
     ) -> fuse::Result<fuse::Entry> {
         self.writable()?;
+        self.utf8_in_secrets(parent, name)?;
         let ino = self.with(|m| m.create(parent, name, Kind::Dir, mode & !umask, b""))?;
         self.changed();
         self.entry(ino)
@@ -555,7 +674,10 @@ impl fuse::Filesystem for Mount {
 
     fn unlink(&self, _: &fuse::Ctx, parent: u64, name: &OsStr) -> fuse::Result<()> {
         self.writable()?;
-        self.with(|m| m.unlink(parent, name))?;
+        let ino = self.with(|m| m.unlink(parent, name))?;
+        if self.model().path_of(ino).is_none() {
+            self.secret_files.lock().unwrap().remove(&ino);
+        }
         self.changed();
         Ok(())
     }
@@ -577,6 +699,12 @@ impl fuse::Filesystem for Mount {
         flags: u32,
     ) -> fuse::Result<()> {
         self.writable()?;
+        self.utf8_in_secrets(newparent, newname)?;
+        // A secret's value is bound to its path: moving one is writing it anew, which `mv` and
+        // editors do when told the move crosses file systems.
+        if self.touches_secrets(parent, name) || self.touches_secrets(newparent, newname) {
+            return Err(libc::EXDEV);
+        }
         self.with(|m| m.rename(parent, name, newparent, newname, flags))?;
         self.changed();
         Ok(())
@@ -590,12 +718,19 @@ impl fuse::Filesystem for Mount {
         newname: &OsStr,
     ) -> fuse::Result<fuse::Entry> {
         self.writable()?;
+        self.utf8_in_secrets(newparent, newname)?;
+        if self.secret_path(ino).is_some() || self.touches_secrets(newparent, newname) {
+            return Err(libc::EXDEV);
+        }
         self.with(|m| m.link(ino, newparent, newname))?;
         self.changed();
         self.entry(ino)
     }
 
     fn open(&self, _: &fuse::Ctx, ino: u64, flags: i32) -> fuse::Result<fuse::Open> {
+        if let Some(path) = self.secret_path(ino) {
+            return self.open_secret(ino, &path, flags);
+        }
         if flags & libc::O_ACCMODE != libc::O_RDONLY || flags & libc::O_TRUNC != 0 {
             self.writable()?;
         }
@@ -623,6 +758,25 @@ impl fuse::Filesystem for Mount {
         flags: i32,
     ) -> fuse::Result<(fuse::Entry, fuse::Open)> {
         self.writable()?;
+        self.utf8_in_secrets(parent, name)?;
+        if let Some(path) = self.secret_child(parent, name) {
+            // A new secret: empty, and written in memory.
+            self.check_write(&path)?;
+            let ino = self.with(|m| m.create(parent, name, Kind::File, 0o600, b""))?;
+            self.with(|m| m.open(ino, flags & !libc::O_TRUNC))?;
+            self.write_secret(ino, |v| v.set_len(0))?;
+            if let Some(f) = self.secret_files.lock().unwrap().get_mut(&ino) {
+                f.opens += 1;
+            }
+            let fh = self.new_fh(Handle::Secret { ino, value: None });
+            return Ok((
+                self.entry(ino)?,
+                fuse::Open {
+                    fh,
+                    flags: fuse::abi::FOPEN_DIRECT_IO,
+                },
+            ));
+        }
         let ino = self.with(|m| m.create(parent, name, Kind::File, mode & !umask, b""))?;
         let opened = self.with(|m| m.open(ino, flags & !libc::O_TRUNC))?;
         self.changed();
@@ -648,6 +802,9 @@ impl fuse::Filesystem for Mount {
             Some(Handle::File { opened }) => Some(opened.clone()),
             _ => None,
         };
+        if let Some(path) = self.secret_path(ino) {
+            return self.read_secret(ino, fh, &path, offset, size);
+        }
         // A handle a previous daemon opened (it restarted): the file as it stands.
         let opened = match known {
             Some(o) => o,
@@ -679,13 +836,20 @@ impl fuse::Filesystem for Mount {
         _: u32,
     ) -> fuse::Result<u32> {
         self.writable()?;
+        if self.secret_path(ino).is_some() {
+            self.write_secret(ino, |v| v.write_at(offset as usize, data))?;
+            return Ok(data.len() as u32);
+        }
         let n = self.with(|m| m.write(ino, offset, data))?;
         self.changed();
         Ok(n)
     }
 
     fn release(&self, _: &fuse::Ctx, ino: u64, fh: u64, _: i32) {
-        self.handles.lock().unwrap().remove(&fh);
+        let h = self.handles.lock().unwrap().remove(&fh);
+        if let Some(h) = h {
+            self.release_secret(h);
+        }
         if !self.is_closed() {
             self.model().release(ino);
         }
@@ -821,6 +985,10 @@ impl Mount {
                         Err(_) => break,
                     }
                 };
+                let found = found.map(|(child, mut attr)| {
+                    self.secret_attr(&mut attr);
+                    (child, attr)
+                });
                 let Some((child, attr)) = found.or(if dot {
                     Some((*known, fuse::Attr::default()))
                 } else {
@@ -835,11 +1003,13 @@ impl Mount {
                     kind: l.kind.mode_bits(),
                     name: l.name.clone(),
                 };
+                let secret =
+                    attr.mode & libc::S_IFMT == libc::S_IFREG && self.secret_path(child).is_some();
                 let lookup = (!dot).then_some(fuse::Entry {
                     attr,
                     generation: 0,
                     entry_ttl: TTL,
-                    attr_ttl: TTL,
+                    attr_ttl: if secret { Duration::ZERO } else { TTL },
                 });
                 if !buf.push_plus(&fuse::DirEntryPlus { entry, lookup }) {
                     break;
@@ -892,4 +1062,456 @@ impl Mount {
             namelen: 255,
         })
     }
+}
+
+// ─── Secrets (docs/secrets.md, "Clients") ───
+
+impl Mount {
+    /// Whether this mount serves secrets: a workspace's, of a repository that keeps them — as ok
+    /// secrets says of main, or as the workspace's own settings do, so values stay off disk from
+    /// the moment a workspace starts keeping them (ok secrets refuses to store one before main
+    /// does, saying why). It may ask ok secrets: never call it holding the model's lock.
+    fn keeps(&self) -> bool {
+        let Some(store) = self.secrets.as_ref() else {
+            return false;
+        };
+        self.settings_keep() || store.keeps_secrets()
+    }
+
+    /// Whether the workspace's settings have a secrets stanza: a line starting `secrets:`. Ones
+    /// that cannot be read count as having one.
+    fn settings_keep(&self) -> bool {
+        let path = jj_lib::repo_path::RepoPathBuf::from_internal_string(SETTINGS).unwrap();
+        let ino = match self.with(|m| m.resolve(&path)) {
+            Ok(Some(ino)) => ino,
+            Ok(None) => return false,
+            Err(_) => return true,
+        };
+        if self.model().kind_of(ino) != Some(Kind::File) {
+            return false;
+        }
+        let at = match self.with(|m| m.current(ino)) {
+            Ok(Opened::Overlay) => match self.model().version_of(ino) {
+                Some(v) => SettingsAt::Written(ino, v),
+                None => return true,
+            },
+            Ok(Opened::Value { id, size }) => {
+                let at = SettingsAt::Ok(id.clone());
+                if let Some((known, keeps)) = self.settings.lock().unwrap().as_ref()
+                    && *known == at
+                {
+                    return *keeps;
+                }
+                let keeps = match self.fetch.read(&id, size, 0, size.min(MAX_SETTINGS)) {
+                    Ok(data) => keeps_secrets(&data),
+                    Err(_) => return true,
+                };
+                *self.settings.lock().unwrap() = Some((at, keeps));
+                return keeps;
+            }
+            Err(_) => return true,
+        };
+        if let Some((known, keeps)) = self.settings.lock().unwrap().as_ref()
+            && *known == at
+        {
+            return *keeps;
+        }
+        let keeps = match self.with(|m| m.read_overlay(ino, 0, MAX_SETTINGS as u32)) {
+            Ok(data) => keeps_secrets(&data),
+            Err(_) => return true,
+        };
+        *self.settings.lock().unwrap() = Some((at, keeps));
+        keeps
+    }
+
+    /// A secret's path, for an inode this mount serves as one: a regular file under `secret/`,
+    /// named neither `acl.yaml` nor as an OWNERS file, in a workspace of a repository that keeps
+    /// secrets.
+    fn secret_path(&self, ino: Ino) -> Option<String> {
+        self.secrets.as_ref()?;
+        let path = {
+            let m = self.model();
+            if !m.is_secret(ino) {
+                return None;
+            }
+            m.path_of(ino)?.as_internal_file_string().to_owned()
+        };
+        self.keeps().then_some(path)
+    }
+
+    /// The path a name in a directory has, as the repository names it.
+    fn child_path(&self, parent: Ino, name: &OsStr) -> Option<String> {
+        let dir = self.model().path_of(parent)?;
+        let name = name.to_str()?;
+        Some(if dir.is_root() {
+            name.to_owned()
+        } else {
+            format!("{}/{name}", dir.as_internal_file_string())
+        })
+    }
+
+    /// A name in a directory, as a secret's path: where a file made there is a secret.
+    fn secret_child(&self, parent: Ino, name: &OsStr) -> Option<String> {
+        self.secrets.as_ref()?;
+        self.child_path(parent, name)
+            .filter(|p| ok_secret::is_secret(p))
+            .filter(|_| self.keeps())
+    }
+
+    /// Whether a name in a directory is in the `secret/` tree, of a workspace of a repository that
+    /// keeps secrets.
+    fn touches_secrets(&self, parent: Ino, name: &OsStr) -> bool {
+        self.secrets.is_some()
+            && self
+                .child_path(parent, name)
+                .is_some_and(|p| ok_secret::in_tree(&p))
+            && self.keeps()
+    }
+
+    /// Refuses anything but a file or a folder in the `secret/` tree: a symlink, FIFO, or socket
+    /// there is no secret.
+    fn only_files_in_secrets(&self, parent: Ino, name: &OsStr) -> fuse::Result<()> {
+        self.utf8_in_secrets(parent, name)?;
+        if self.touches_secrets(parent, name) {
+            return Err(libc::EPERM);
+        }
+        Ok(())
+    }
+
+    /// Refuses a name in the `secret/` tree that no repository path can hold (one not UTF-8): the
+    /// mount could not tell whether a file of that name is a secret, to keep its bytes off disk.
+    fn utf8_in_secrets(&self, parent: Ino, name: &OsStr) -> fuse::Result<()> {
+        if self.secrets.is_some()
+            && name.to_str().is_none()
+            && self
+                .model()
+                .path_of(parent)
+                .is_some_and(|p| ok_secret::in_tree(p.as_internal_file_string()))
+            && self.keeps()
+        {
+            return Err(libc::EINVAL);
+        }
+        Ok(())
+    }
+
+    /// Shows a secret as its value: its size — what the mount holds for writing, else what an open
+    /// handle read, else 0 — and `0600`. Returns how long the kernel may keep the attributes: not
+    /// at all for a secret, whose size changes without the kernel seeing a write.
+    fn secret_attr(&self, attr: &mut fuse::Attr) -> Duration {
+        if attr.mode & libc::S_IFMT != libc::S_IFREG || self.secret_path(attr.ino).is_none() {
+            return TTL;
+        }
+        let held = self
+            .secret_files
+            .lock()
+            .unwrap()
+            .get(&attr.ino)
+            .map(|f| f.value.len() as u64);
+        attr.size = held.unwrap_or_else(|| {
+            self.handles
+                .lock()
+                .unwrap()
+                .values()
+                .find_map(|h| match h {
+                    Handle::Secret {
+                        ino,
+                        value: Some(v),
+                    } if *ino == attr.ino => Some(v.len() as u64),
+                    _ => None,
+                })
+                .unwrap_or(0)
+        });
+        attr.mode = (attr.mode & libc::S_IFMT) | 0o600;
+        Duration::ZERO
+    }
+
+    /// Refuses a write to a folder's secrets the caller may not make (`EACCES`), as ok secrets
+    /// says.
+    fn check_write(&self, path: &str) -> fuse::Result<()> {
+        let folder = path.rsplit_once('/').map_or(path, |(f, _)| f).to_owned();
+        if let Some((ok, at)) = self.secret_access.lock().unwrap().get(&folder)
+            && at.elapsed() < SECRET_ACCESS_TTL
+        {
+            return if *ok { Ok(()) } else { Err(libc::EACCES) };
+        }
+        let store = self.secrets.as_ref().ok_or(libc::EPERM)?;
+        let ok = store.may_write(path).map_err(to_errno)?;
+        self.secret_access
+            .lock()
+            .unwrap()
+            .insert(folder, (ok, Instant::now()));
+        if ok { Ok(()) } else { Err(libc::EACCES) }
+    }
+
+    /// A secret's value as the file holds it: what its pointer names, read from ok secrets with one
+    /// of the person's unseals, with the pointer and the value's hash; or, for a file holding no
+    /// pointer — one made and not yet written, or a conflict's markers — its bytes as they are.
+    fn fetch_secret(&self, ino: Ino, path: &str) -> fuse::Result<FetchedSecret> {
+        let held = match self.with(|m| m.current(ino))? {
+            Opened::Overlay => self.with(|m| m.read_overlay(ino, 0, u32::MAX))?,
+            Opened::Value { id, size } => self.fetch.read(&id, size, 0, size).map_err(to_errno)?,
+        };
+        match ok_secret::parse_pointer(&held) {
+            Some(d) => {
+                let store = self.secrets.as_ref().ok_or(libc::EPERM)?;
+                let value = store.read(path, &d).map_err(to_errno)?;
+                let hash = ok_secret::value_hash(value.as_slice());
+                Ok((value, Some((d, hash))))
+            }
+            None => Ok((SecretBuf::new(held), None)),
+        }
+    }
+
+    /// Holds a secret's value for a handle open to write it that keeps its contents: what the
+    /// mount holds already, or what the file holds, fetched.
+    fn hold_secret(&self, ino: Ino, path: &str) -> fuse::Result<()> {
+        if let Some(f) = self.secret_files.lock().unwrap().get_mut(&ino) {
+            f.opens += 1;
+            return Ok(());
+        }
+        let (value, sealed) = self.fetch_secret(ino, path)?;
+        let mut files = self.secret_files.lock().unwrap();
+        match files.get_mut(&ino) {
+            // Held meanwhile — written, or opened by another: that wins.
+            Some(f) => f.opens += 1,
+            None => {
+                files.insert(
+                    ino,
+                    SecretFile {
+                        value,
+                        sealed,
+                        dirty: false,
+                        generation: 0,
+                        opens: 1,
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Opens a secret. To write, it first asks ok secrets whether the caller may, and the value is
+    /// held in the mount's memory until a snapshot seals it; to read, the open fetches the value —
+    /// using an unseal, unless the mount holds a value written here — for itself alone. Reads and
+    /// writes go to the mount's memory, never the kernel's page cache (`FOPEN_DIRECT_IO`).
+    fn open_secret(&self, ino: Ino, path: &str, flags: i32) -> fuse::Result<fuse::Open> {
+        let writing = flags & libc::O_ACCMODE != libc::O_RDONLY || flags & libc::O_TRUNC != 0;
+        let handle = if writing {
+            self.writable()?;
+            self.check_write(path)?;
+            if flags & libc::O_TRUNC != 0 {
+                self.with(|m| m.open(ino, flags & !libc::O_TRUNC))?;
+                self.write_secret(ino, |v| v.set_len(0))?;
+                if let Some(f) = self.secret_files.lock().unwrap().get_mut(&ino) {
+                    f.opens += 1;
+                }
+            } else {
+                self.hold_secret(ino, path)?;
+                self.with(|m| m.open(ino, flags))?;
+            }
+            Handle::Secret { ino, value: None }
+        } else {
+            let held = self
+                .secret_files
+                .lock()
+                .unwrap()
+                .get(&ino)
+                .map(|f| f.value.clone());
+            let value = match held {
+                Some(v) => v,
+                None => self.fetch_secret(ino, path)?.0,
+            };
+            self.with(|m| m.open(ino, flags))?;
+            Handle::Secret {
+                ino,
+                value: Some(value),
+            }
+        };
+        let fh = self.new_fh(handle);
+        Ok(fuse::Open {
+            fh,
+            flags: fuse::abi::FOPEN_DIRECT_IO,
+        })
+    }
+
+    /// Reads a secret through a handle: its own value, opened to read; the mount's, opened to
+    /// write — fetched again if a checkout dropped it.
+    fn read_secret(
+        &self,
+        ino: Ino,
+        fh: u64,
+        path: &str,
+        offset: u64,
+        size: u32,
+    ) -> fuse::Result<Vec<u8>> {
+        let slice = |v: &[u8]| {
+            let start = (offset as usize).min(v.len());
+            let end = start.saturating_add(size as usize).min(v.len());
+            v[start..end].to_vec()
+        };
+        if let Some(Handle::Secret { value: Some(v), .. }) = self.handles.lock().unwrap().get(&fh) {
+            return Ok(slice(v.as_slice()));
+        }
+        if !self.secret_files.lock().unwrap().contains_key(&ino) {
+            self.hold_secret(ino, path)?;
+        }
+        let files = self.secret_files.lock().unwrap();
+        Ok(files
+            .get(&ino)
+            .map(|f| slice(f.value.as_slice()))
+            .unwrap_or_default())
+    }
+
+    /// Changes a secret's value in memory, and records the change in the model (whose overlay keeps
+    /// the pointer it had), so a snapshot or checkpoint seals it.
+    fn write_secret(&self, ino: Ino, f: impl FnOnce(&mut SecretBuf)) -> fuse::Result<()> {
+        {
+            let mut files = self.secret_files.lock().unwrap();
+            let file = files.entry(ino).or_insert_with(|| SecretFile {
+                value: SecretBuf::default(),
+                sealed: None,
+                dirty: false,
+                generation: 0,
+                opens: 0,
+            });
+            f(&mut file.value);
+            if file.value.len() > ok_secret::MAX_VALUE {
+                return Err(libc::EFBIG);
+            }
+            file.dirty = true;
+            file.generation += 1;
+        }
+        self.with(|m| m.secret_written(ino))?;
+        self.changed();
+        Ok(())
+    }
+
+    /// Lets go of a secret's handle: a read's value is dropped with it; a write's, once no handle
+    /// holds it and it is sealed.
+    fn release_secret(&self, h: Handle) {
+        if let Handle::Secret { ino, value: None } = h {
+            let mut files = self.secret_files.lock().unwrap();
+            if let Some(f) = files.get_mut(&ino) {
+                f.opens = f.opens.saturating_sub(1);
+                if f.opens == 0 && !f.dirty {
+                    files.remove(&ino);
+                }
+            }
+        }
+    }
+
+    /// A directory as a snapshot reads it (ListDir): the model's listing, with each secret that is
+    /// written and not sealed marked pending, and each whose value is gone — written by a daemon
+    /// that stopped before sealing it — marked lost.
+    pub fn list_dir(&self, path: &jj_lib::repo_path::RepoPath) -> fuse::Result<pb::ListDirReply> {
+        let mut reply = self.with(|m| m.list_dir(path))?;
+        let dir = path.as_internal_file_string();
+        if self.secrets.is_none() || !ok_secret::in_tree(dir) || !self.keeps() {
+            return Ok(reply);
+        }
+        let files = self.secret_files.lock().unwrap();
+        for e in &mut reply.entries {
+            let Ok(name) = std::str::from_utf8(&e.name) else {
+                continue;
+            };
+            if e.kind() != pb::dir_entry::Kind::File
+                || e.overlay_path.is_empty()
+                || !ok_secret::is_secret(&format!("{dir}/{name}"))
+            {
+                continue;
+            }
+            if files.get(&e.ino).is_some_and(|f| f.dirty) {
+                e.secret_pending = true;
+                continue;
+            }
+            let pointer = e.size == ok_secret::POINTER_LEN as u64
+                && std::fs::read(&e.overlay_path)
+                    .is_ok_and(|b| ok_secret::parse_pointer(&b).is_some());
+            if !pointer && !e.checkout_conflict {
+                e.secret_lost = true;
+            }
+        }
+        Ok(reply)
+    }
+
+    /// Seals a written secret for a snapshot that tracks it: its value is kept in ok secrets as a
+    /// new version — unless it is the value its pointer already names, or is itself a pointer,
+    /// which the file then holds (how a conflict over a secret is resolved) — and its pointer put
+    /// in the overlay; the value is dropped unless a handle open to write still holds it. Returns
+    /// the file's entry as a snapshot then reads it; None when it is not to be recorded: its name
+    /// is no secret's, or it is gone.
+    pub fn seal_secret(
+        &self,
+        path: &jj_lib::repo_path::RepoPath,
+    ) -> io::Result<Option<pb::DirEntry>> {
+        let p = path.as_internal_file_string();
+        let Some(store) = self.secrets.clone() else {
+            return Ok(None);
+        };
+        if !ok_secret::valid_path(p) || !self.keeps() {
+            return Ok(None);
+        }
+        let errno = io::Error::from_raw_os_error;
+        let _sealing = self.sealing.lock().unwrap();
+        let Some(ino) = self.with(|m| m.resolve(path)).map_err(errno)? else {
+            return Ok(None);
+        };
+        let pending = {
+            let files = self.secret_files.lock().unwrap();
+            files.get(&ino).filter(|f| f.dirty).map(|f| {
+                let hash = ok_secret::value_hash(f.value.as_slice());
+                let unchanged = f.sealed.filter(|(_, h)| *h == hash).map(|(d, _)| d);
+                (f.value.clone(), hash, f.generation, unchanged)
+            })
+        };
+        if let Some((value, hash, generation, unchanged)) = pending {
+            let digest = match (unchanged, ok_secret::parse_pointer(value.as_slice())) {
+                (Some(d), _) | (None, Some(d)) => d,
+                (None, None) => store.write(p, value.as_slice())?,
+            };
+            self.with(|m| m.put_contents(ino, &ok_secret::pointer(&digest)))
+                .map_err(errno)?;
+            let mut files = self.secret_files.lock().unwrap();
+            if let Some(f) = files.get_mut(&ino)
+                && f.generation == generation
+            {
+                f.dirty = false;
+                f.sealed = Some((digest, hash));
+                if f.opens == 0 {
+                    files.remove(&ino);
+                }
+            }
+        }
+        let (Some(dir), Some(name)) = (path.parent(), path.components().next_back()) else {
+            return Ok(None);
+        };
+        let listing = self.list_dir(dir).map_err(errno)?;
+        Ok(listing
+            .entries
+            .into_iter()
+            .find(|e| e.name == name.as_internal_str().as_bytes())
+            .map(|mut e| {
+                e.secret_pending = false;
+                e
+            }))
+    }
+
+    /// Drops the values the mount holds that were not written: after a checkout, a secret's
+    /// pointer may name another value, which the next read fetches. What was written and not
+    /// sealed stays, as does what a handle open to write holds.
+    pub fn forget_secrets(&self) {
+        self.secret_files
+            .lock()
+            .unwrap()
+            .retain(|_, f| f.dirty || f.opens > 0);
+    }
+}
+
+/// A secret's value as a file holds it, and the pointer and value hash it was read by.
+type FetchedSecret = (SecretBuf, Option<(Digest, [u8; 32])>);
+
+/// Whether the repository's settings have a secrets stanza: a top-level `secrets:` key.
+fn keeps_secrets(data: &[u8]) -> bool {
+    data.split(|b| *b == b'\n')
+        .any(|l| l.starts_with(b"secrets:"))
 }

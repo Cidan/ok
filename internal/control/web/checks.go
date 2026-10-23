@@ -16,6 +16,7 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	"github.com/Cidan/ok/internal/authz"
 	"github.com/Cidan/ok/internal/control/checks"
 	"github.com/Cidan/ok/internal/control/db"
 	pages "github.com/Cidan/ok/internal/control/pages"
@@ -61,7 +62,7 @@ func (s *Server) submissions(ctx context.Context, repo *scmpb.Repository, number
 // page's failure.
 func (s *Server) checks(ctx context.Context, repo *scmpb.Repository, cl db.ChangeList, patchset int32, me string, subs submissions) pages.CLChecks {
 	c := s.preChecks(ctx, repo, cl, patchset, me)
-	c.Post = s.post(repo, cl, subs)
+	c.Post = s.post(ctx, repo, cl, subs)
 	c.Live = c.Live || c.Post.Status == "Submitting"
 	return c
 }
@@ -88,17 +89,39 @@ func (s *Server) preChecks(ctx context.Context, repo *scmpb.Repository, cl db.Ch
 	case automationpb.Pre_VERDICT_PENDING:
 		c.Verdict, c.VerdictKind, c.Live = "Running", "running", true
 	default:
-		// Not planned yet: the change feed plans an active CL's current patchset shortly.
+		// Not planned yet: the change feed plans the current patchset of a CL in review at its
+		// stack's top shortly. A draft runs none until it is sent for review, and a CL under the
+		// top none of its own: either may have it run by hand (docs/automation.md, "pre").
 		c.Verdict, c.VerdictKind, c.Live = "Not Planned", "none", current
+		if !current {
+			break
+		}
+		at, err := db.PreAt(ctx, s.db, repo.GetId(), cl.Number)
+		if err != nil {
+			slog.Warn("ok control: reading a CL's stack", "repository", repo.GetName(), "cl", cl.Number, "err", err)
+			break
+		}
+		switch {
+		case at != 0:
+			c.NotRun = fmt.Sprintf("Pre runs at CL %d, the top of this changelist's stack, over every changelist of it.", at)
+		case cl.Status == db.StatusDraft:
+			c.NotRun = "A draft runs no pre until it is sent for review."
+		}
+		if c.NotRun != "" {
+			c.Live = false
+			if s.review.May(ctx, repo, me, authz.Land) {
+				c.RunPreHref = link + "/run-pre"
+			}
+		}
 	}
 	if pre.GetPlan() == nil {
 		return c
 	}
 	c.Planned = pre.GetPlan().GetStatus() == automationpb.Run_STATUS_PASSED
-	manage := s.review.CanManage(ctx, repo, cl, me)
-	c.Runs = append(c.Runs, s.checkRow(repo, cl, pre.GetPlan(), manage, current, c.Planned))
+	manage := s.review.May(ctx, repo, me, authz.Land)
+	c.Runs = append(c.Runs, s.checkRow(ctx, repo, cl, pre.GetPlan(), manage, current, c.Planned))
 	for _, r := range pre.GetJobs() {
-		c.Runs = append(c.Runs, s.checkRow(repo, cl, r, manage, current, false))
+		c.Runs = append(c.Runs, s.checkRow(ctx, repo, cl, r, manage, current, false))
 	}
 	for _, sk := range pre.GetSkipped() {
 		name, source := jobName(sk.GetJob())
@@ -109,7 +132,7 @@ func (s *Server) preChecks(ctx context.Context, repo *scmpb.Repository, cl db.Ch
 
 // post is the CL's post, from its latest submission: where it stands, and its runs on the attempt
 // that counts — the one testing, else the one it landed or failed on, else the newest.
-func (s *Server) post(repo *scmpb.Repository, cl db.ChangeList, subs submissions) pages.CLPost {
+func (s *Server) post(ctx context.Context, repo *scmpb.Repository, cl db.ChangeList, subs submissions) pages.CLPost {
 	if subs.err != nil {
 		return pages.CLPost{Status: "Unavailable", StatusKind: "unavailable",
 			Unavailable: "ok could not read this change's submissions. Reload to try again."}
@@ -118,7 +141,7 @@ func (s *Server) post(repo *scmpb.Repository, cl db.ChangeList, subs submissions
 	if sub == nil {
 		return pages.CLPost{}
 	}
-	p := pages.CLPost{Submitted: true, SubmittedBy: people.Handle(sub.GetSubmittedBy())}
+	p := pages.CLPost{Submitted: true, SubmittedBy: people.Handle(ctx, sub.GetSubmittedById())}
 	p.Age, p.AgeTitle = age(sub.GetCreatedAt().AsTime())
 	switch sub.GetStatus() {
 	case automationpb.Submission_STATUS_ACTIVE:
@@ -131,7 +154,7 @@ func (s *Server) post(repo *scmpb.Repository, cl db.ChangeList, subs submissions
 	case automationpb.Submission_STATUS_FAILED:
 		p.Status, p.StatusKind, p.Detail = "Failed", "failed", upperFirst(sub.GetReason())
 	default:
-		p.Status, p.StatusKind, p.Detail = "Canceled", "canceled", upperFirst(sub.GetReason())
+		p.Status, p.StatusKind, p.Detail = "Canceled", "canceled", upperFirst(people.Reason(ctx, sub.GetReason(), sub.GetCanceledById()))
 	}
 	attempts := sub.GetAttempts()
 	for i, a := range attempts {
@@ -146,10 +169,10 @@ func (s *Server) post(repo *scmpb.Repository, cl db.ChangeList, subs submissions
 	}
 	if c := checks.Candidate(checks.Counting(sub), cl.Number); c != nil {
 		if c.GetPlan() != nil {
-			p.Runs = append(p.Runs, postRow(repo, cl, c.GetPlan()))
+			p.Runs = append(p.Runs, postRow(ctx, repo, cl, c.GetPlan()))
 		}
 		for _, r := range c.GetJobs() {
-			p.Runs = append(p.Runs, postRow(repo, cl, r))
+			p.Runs = append(p.Runs, postRow(ctx, repo, cl, r))
 		}
 		for _, sk := range c.GetSkipped() {
 			name, source := jobName(sk.GetJob())
@@ -161,8 +184,8 @@ func (s *Server) post(repo *scmpb.Repository, cl db.ChangeList, subs submissions
 
 // postRow is one post run: its action is the submission's, so it is always disabled, saying so.
 // A run that carries pre's pass never ran: its log is the pre run's.
-func postRow(repo *scmpb.Repository, cl db.ChangeList, r *automationpb.Run) pages.CLCheck {
-	c := runCheck(r)
+func postRow(ctx context.Context, repo *scmpb.Repository, cl db.ChangeList, r *automationpb.Run) pages.CLCheck {
+	c := runCheck(ctx, r)
 	c.LogHref = runHref(repo.GetName(), cl.Number, r.GetId())
 	if from := r.GetCarriedFrom(); from > 0 {
 		c.LogHref = runHref(repo.GetName(), cl.Number, from)
@@ -224,8 +247,8 @@ func preRequirement(c pages.CLChecks) pages.CLSubmitReq {
 // running, Rerun once it has finished — which only the CL's author or a repository admin may
 // take, and which runs again only the checks of an active CL's current patchset, and not a plan
 // whose jobs are queued.
-func (s *Server) checkRow(repo *scmpb.Repository, cl db.ChangeList, r *automationpb.Run, manage, current, planned bool) pages.CLCheck {
-	c := runCheck(r)
+func (s *Server) checkRow(ctx context.Context, repo *scmpb.Repository, cl db.ChangeList, r *automationpb.Run, manage, current, planned bool) pages.CLCheck {
+	c := runCheck(ctx, r)
 	c.LogHref = runHref(repo.GetName(), cl.Number, r.GetId())
 	verb := "rerun"
 	if !finished(r) {
@@ -235,7 +258,7 @@ func (s *Server) checkRow(repo *scmpb.Repository, cl db.ChangeList, r *automatio
 	}
 	switch {
 	case !manage:
-		c.ActionTitle = fmt.Sprintf("Only the author or a repository admin can %s this check", verb)
+		c.ActionTitle = fmt.Sprintf("Only someone who may land on this repository can %s this check", verb)
 	case verb == "rerun" && !current:
 		c.ActionTitle = "Only an active change's current patchset runs its checks again"
 	case verb == "rerun" && planned:
@@ -247,9 +270,10 @@ func (s *Server) checkRow(repo *scmpb.Repository, cl db.ChangeList, r *automatio
 }
 
 // runCheck is a run as the Checks tab and its page show it.
-func runCheck(r *automationpb.Run) pages.CLCheck {
+func runCheck(ctx context.Context, r *automationpb.Run) pages.CLCheck {
 	name, source := jobName(r.GetOrigin().GetJob())
-	c := pages.CLCheck{Kind: checkKind(r.GetOrigin().GetJob()), Name: name, Source: source, Why: r.GetWhy(), Reason: r.GetReason()}
+	c := pages.CLCheck{Kind: checkKind(r.GetOrigin().GetJob()), Name: name, Source: source, Why: r.GetWhy(),
+		Reason: people.Reason(ctx, r.GetReason(), r.GetCanceledById())}
 	switch r.GetStatus() {
 	case automationpb.Run_STATUS_QUEUED:
 		c.StatusLabel, c.StatusKind = "Queued", "queued"
@@ -350,7 +374,7 @@ func (s *Server) runView(ctx context.Context, t *clTarget, run *automationpb.Run
 		CLNumber:   t.cl.Number,
 		CLHref:     clHref(repo.GetName(), t.cl.Number),
 		ID:         run.GetId(),
-		Check:      runCheck(run),
+		Check:      runCheck(ctx, run),
 		Patchset:   int64(run.GetOrigin().GetPatchset()),
 		Commit:     scm.Short(run.GetCommitId()),
 		Live:       !finished(run),
@@ -498,6 +522,26 @@ func (s *Server) runRaw(w http.ResponseWriter, r *http.Request) {
 // runAction reruns or cancels a run of a CL's checks for the author or a repository admin, then
 // shows the Checks tab of the run's patchset: a refusal meant for the person is not the page's
 // failure, but the tab as it stands.
+// clRunPre runs pre by hand on a CL's current patchset, for whoever may land on the repository,
+// then shows its Checks tab: a refusal meant for the person is not the page's failure, but the
+// tab as it stands.
+func (s *Server) clRunPre(w http.ResponseWriter, r *http.Request) {
+	t, err := s.loadCL(r)
+	if err != nil {
+		fail(w, r, err)
+		return
+	}
+	me := principal(r)
+	if s.review.MayRunPre(r.Context(), t.repo, t.cl, me) == nil {
+		_, err := s.runs.StartPre(r.Context(), &automationpb.StartPreRequest{RepositoryId: t.repo.GetId(), ClNumber: t.cl.Number, ForPersonId: me})
+		if err != nil && status.Code(err) != codes.FailedPrecondition {
+			fail(w, r, err)
+			return
+		}
+	}
+	pages.ServeCLChecks(w, r, s.checks(r.Context(), t.repo, t.cl, t.cl.CurrentPatchset, me, s.submissions(r.Context(), t.repo, t.cl.Number)))
+}
+
 func (s *Server) runAction(rerun bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		t, run, err := s.loadRun(r)
@@ -516,10 +560,9 @@ func (s *Server) runAction(rerun bool) http.HandlerFunc {
 			return
 		}
 		if rerun {
-			_, err = s.runs.RerunRun(r.Context(), &automationpb.RerunRunRequest{Id: run.GetId(), ForPerson: me})
+			_, err = s.runs.RerunRun(r.Context(), &automationpb.RerunRunRequest{Id: run.GetId(), ForPersonId: me})
 		} else {
-			_, err = s.runs.CancelRun(r.Context(), &automationpb.CancelRunRequest{Id: run.GetId(), ForPerson: me,
-				Reason: "canceled by " + people.Handle(me)})
+			_, err = s.runs.CancelRun(r.Context(), &automationpb.CancelRunRequest{Id: run.GetId(), ForPersonId: me})
 		}
 		switch status.Code(err) {
 		case codes.OK, codes.FailedPrecondition:

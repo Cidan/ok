@@ -61,8 +61,8 @@ func TestEvaluateTree(t *testing.T) {
 	if st.ApprovalSatisfied() || !strings.Contains(st.BlockedReason(), "Approval from a member of team.acl.example.com (change the members of team.group.example.com)") {
 		t.Errorf("blocked: %q", st.BlockedReason())
 	}
-	if !st.CanApprove(bob, alice) || st.CanApprove(carol, alice) {
-		t.Errorf("CanApprove: bob %v, carol %v", st.CanApprove(bob, alice), st.CanApprove(carol, alice))
+	if !st.CanApprove(context.Background(), bob, alice) || st.CanApprove(context.Background(), carol, alice) {
+		t.Errorf("CanApprove: bob %v, carol %v", st.CanApprove(context.Background(), bob, alice), st.CanApprove(context.Background(), carol, alice))
 	}
 
 	// bob approves.

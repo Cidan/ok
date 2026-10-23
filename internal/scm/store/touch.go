@@ -52,7 +52,8 @@ func (s *Store) pin(ctx context.Context, tx *txn, repo int64, roots []ref) error
 	if len(missing) > 0 {
 		return fmt.Errorf("%w: pinning reached %d missing objects, first %s", errMissing, len(missing), missing[0].objectRef())
 	}
-	return nil
+	// What it pinned is compaction's to move into segments.
+	return tx.MarkWork(ctx, SegmentWork, repo)
 }
 
 // refresh makes every unpinned object reachable from roots fresh today, recursing through
@@ -175,7 +176,7 @@ func (s *Store) walkGroup(ctx context.Context, tx *txn, repo int64, t table, kin
 // walkContent is walkGroup for files and chunks, in the transaction's content index: a file
 // it updates continues into its chunks.
 func (s *Store) walkContent(ctx context.Context, tx *txn, repo int64, t table, members []encoding.ID, mode walkMode) (map[encoding.ID][]ref, error) {
-	lg, err := s.txIndex(ctx, tx, repo)
+	lg, err := s.txIndex(ctx, tx, repoScope(repo))
 	if err != nil {
 		return nil, err
 	}
@@ -183,9 +184,26 @@ func (s *Store) walkContent(ctx context.Context, tx *txn, repo int64, t table, m
 	if t == tFile {
 		kind = encoding.KindFile
 	}
+	// A chunk pinned is pinned in its network's chunk index too, so its location folds into the
+	// network's segments as its entry folds into the repository's.
+	var net *txLog
+	var netScope backend.Scope
+	if kind == encoding.KindChunk && mode == pinWalk {
+		n, err := s.network(ctx, repo)
+		if err != nil {
+			return nil, err
+		}
+		netScope = backend.NetworkScope(n)
+		if net, err = s.txIndex(ctx, tx, netScope); err != nil {
+			return nil, err
+		}
+	}
 	out := map[encoding.ID][]ref{}
 	for _, id := range members {
-		e, ok := lg.has(kind, id)
+		e, ok, err := lg.has(ctx, kind, id)
+		if err != nil {
+			return nil, err
+		}
 		if !ok {
 			continue
 		}
@@ -194,17 +212,24 @@ func (s *Store) walkContent(ctx context.Context, tx *txn, repo int64, t table, m
 			if e.Pinned || e.Day >= lg.today || lg.touched[id] {
 				continue
 			}
-			s.logIndex(tx, repo, touchUpdate(kind, id, lg.today.Time()))
+			s.logIndex(tx, repoScope(repo), touchUpdate(kind, id, lg.today.Time()))
 		case refreshWalk:
 			if e.Pinned || lg.touched[id] {
 				continue
 			}
-			s.logIndex(tx, repo, touchUpdate(kind, id, lg.today.Time()))
+			s.logIndex(tx, repoScope(repo), touchUpdate(kind, id, lg.today.Time()))
 		case pinWalk:
 			if e.Pinned || lg.pinned[id] {
 				continue
 			}
-			s.logIndex(tx, repo, pinUpdate(kind, id))
+			s.logIndex(tx, repoScope(repo), pinUpdate(kind, id))
+			if net != nil {
+				if loc, ok, err := net.has(ctx, kind, id); err != nil {
+					return nil, err
+				} else if ok && !loc.Pinned && !net.pinned[id] {
+					s.logIndex(tx, netScope, pinUpdate(kind, id))
+				}
+			}
 		}
 		var kids []ref
 		for _, c := range e.Chunks {
@@ -228,18 +253,22 @@ func (s *Store) existing(ctx context.Context, q backend.Ops, repo int64, t table
 			kind = encoding.KindFile
 		}
 		if tx, ok := q.(*txn); ok {
-			lg, err := s.txIndex(ctx, tx, repo)
+			lg, err := s.txIndex(ctx, tx, repoScope(repo))
 			if err != nil {
 				return nil, err
 			}
 			for _, id := range members {
-				if _, ok := lg.has(kind, id); ok {
+				_, ok, err := lg.has(ctx, kind, id)
+				if err != nil {
+					return nil, err
+				}
+				if ok {
 					out[id] = true
 				}
 			}
 			return out, nil
 		}
-		_, entries, err := s.contentEntries(ctx, repo, kind, members)
+		_, entries, err := s.contentEntries(ctx, repoScope(repo), kind, members)
 		if err != nil {
 			return nil, err
 		}
@@ -250,9 +279,41 @@ func (s *Store) existing(ctx context.Context, q backend.Ops, repo int64, t table
 	}
 	switch t {
 	case tObject:
-		return q.ExistingObjects(ctx, repo, kind, members)
+		present, err := q.ExistingObjects(ctx, repo, kind, members)
+		if err != nil || len(present) == len(members) {
+			return present, err
+		}
+		// The rest are pinned, in segments, unless the repository lacks them.
+		var rest []encoding.ID
+		for _, id := range members {
+			if !present[id] {
+				rest = append(rest, id)
+			}
+		}
+		moved, err := s.segmentObjects(ctx, repo, kind, rest)
+		if err != nil {
+			return nil, err
+		}
+		for id := range moved {
+			present[id] = true
+		}
+		return present, nil
 	case tCommit:
-		return q.ExistingCommits(ctx, repo, members)
+		present, err := q.ExistingCommits(ctx, repo, members)
+		if err != nil || len(present) == len(members) {
+			return present, err
+		}
+		found := map[encoding.ID]backend.GraphCommit{}
+		for id := range present {
+			found[id] = backend.GraphCommit{ID: id}
+		}
+		if err := s.segmentGraph(ctx, repo, members, found); err != nil {
+			return nil, err
+		}
+		for id := range found {
+			present[id] = true
+		}
+		return present, nil
 	}
 	return nil, fmt.Errorf("existing: %v is not a repository object table", t)
 }

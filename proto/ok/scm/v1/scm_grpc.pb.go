@@ -19,10 +19,128 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
+	Cells_MakeRepository_FullMethodName = "/ok.scm.v1.Cells/MakeRepository"
+)
+
+// CellsClient is the client API for Cells service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+//
+// The directory names repositories (docs/hosted.md, "Tenancy, as built"): the SCM makes one under
+// the entry it asks ok identity for, and finds one by its full name through it. Renaming,
+// transferring, and who reads what are the directory's (identity's Tenancy).
+// Cells is how one cell's SCM asks another's (docs/hosted.md, "Cells, as built").
+type CellsClient interface {
+	// MakeRepository makes a repository another cell's SCM reserved for a person and the directory
+	// placed in this cell, and has the directory activate it: a creation asked of a cell the
+	// directory did not place it in, resumed here as a creation asked again is.
+	MakeRepository(ctx context.Context, in *MakeRepositoryRequest, opts ...grpc.CallOption) (*Repository, error)
+}
+
+type cellsClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewCellsClient(cc grpc.ClientConnInterface) CellsClient {
+	return &cellsClient{cc}
+}
+
+func (c *cellsClient) MakeRepository(ctx context.Context, in *MakeRepositoryRequest, opts ...grpc.CallOption) (*Repository, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(Repository)
+	err := c.cc.Invoke(ctx, Cells_MakeRepository_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// CellsServer is the server API for Cells service.
+// All implementations must embed UnimplementedCellsServer
+// for forward compatibility.
+//
+// The directory names repositories (docs/hosted.md, "Tenancy, as built"): the SCM makes one under
+// the entry it asks ok identity for, and finds one by its full name through it. Renaming,
+// transferring, and who reads what are the directory's (identity's Tenancy).
+// Cells is how one cell's SCM asks another's (docs/hosted.md, "Cells, as built").
+type CellsServer interface {
+	// MakeRepository makes a repository another cell's SCM reserved for a person and the directory
+	// placed in this cell, and has the directory activate it: a creation asked of a cell the
+	// directory did not place it in, resumed here as a creation asked again is.
+	MakeRepository(context.Context, *MakeRepositoryRequest) (*Repository, error)
+	mustEmbedUnimplementedCellsServer()
+}
+
+// UnimplementedCellsServer must be embedded to have
+// forward compatible implementations.
+//
+// NOTE: this should be embedded by value instead of pointer to avoid a nil
+// pointer dereference when methods are called.
+type UnimplementedCellsServer struct{}
+
+func (UnimplementedCellsServer) MakeRepository(context.Context, *MakeRepositoryRequest) (*Repository, error) {
+	return nil, status.Error(codes.Unimplemented, "method MakeRepository not implemented")
+}
+func (UnimplementedCellsServer) mustEmbedUnimplementedCellsServer() {}
+func (UnimplementedCellsServer) testEmbeddedByValue()               {}
+
+// UnsafeCellsServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to CellsServer will
+// result in compilation errors.
+type UnsafeCellsServer interface {
+	mustEmbedUnimplementedCellsServer()
+}
+
+func RegisterCellsServer(s grpc.ServiceRegistrar, srv CellsServer) {
+	// If the following call panics, it indicates UnimplementedCellsServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&Cells_ServiceDesc, srv)
+}
+
+func _Cells_MakeRepository_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(MakeRepositoryRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(CellsServer).MakeRepository(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Cells_MakeRepository_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(CellsServer).MakeRepository(ctx, req.(*MakeRepositoryRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// Cells_ServiceDesc is the grpc.ServiceDesc for Cells service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var Cells_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "ok.scm.v1.Cells",
+	HandlerType: (*CellsServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "MakeRepository",
+			Handler:    _Cells_MakeRepository_Handler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: "proto/ok/scm/v1/scm.proto",
+}
+
+const (
 	Repositories_CreateRepository_FullMethodName = "/ok.scm.v1.Repositories/CreateRepository"
-	Repositories_RenameRepository_FullMethodName = "/ok.scm.v1.Repositories/RenameRepository"
 	Repositories_GetRepository_FullMethodName    = "/ok.scm.v1.Repositories/GetRepository"
-	Repositories_ListRepositories_FullMethodName = "/ok.scm.v1.Repositories/ListRepositories"
+	Repositories_ForkRepository_FullMethodName   = "/ok.scm.v1.Repositories/ForkRepository"
+	Repositories_SyncFork_FullMethodName         = "/ok.scm.v1.Repositories/SyncFork"
 )
 
 // RepositoriesClient is the client API for Repositories service.
@@ -30,9 +148,15 @@ const (
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type RepositoriesClient interface {
 	CreateRepository(ctx context.Context, in *CreateRepositoryRequest, opts ...grpc.CallOption) (*Repository, error)
-	RenameRepository(ctx context.Context, in *RenameRepositoryRequest, opts ...grpc.CallOption) (*Repository, error)
 	GetRepository(ctx context.Context, in *GetRepositoryRequest, opts ...grpc.CallOption) (*Repository, error)
-	ListRepositories(ctx context.Context, in *ListRepositoriesRequest, opts ...grpc.CallOption) (*ListRepositoriesResponse, error)
+	// ForkRepository forks a repository the caller may fork (docs/hosted.md, "GitHub's rules") into
+	// an owner they may make repositories of: in its network, its main the upstream's, holding all
+	// the upstream holds — by reference, costing no copy.
+	ForkRepository(ctx context.Context, in *ForkRepositoryRequest, opts ...grpc.CallOption) (*Repository, error)
+	// SyncFork brings a fork its upstream's newer work: main moves to the upstream's if the fork has
+	// landed nothing of its own since it forked or last synced, and otherwise stays. It needs write
+	// on the fork, and the upstream readable.
+	SyncFork(ctx context.Context, in *SyncForkRequest, opts ...grpc.CallOption) (*SyncForkResponse, error)
 }
 
 type repositoriesClient struct {
@@ -53,16 +177,6 @@ func (c *repositoriesClient) CreateRepository(ctx context.Context, in *CreateRep
 	return out, nil
 }
 
-func (c *repositoriesClient) RenameRepository(ctx context.Context, in *RenameRepositoryRequest, opts ...grpc.CallOption) (*Repository, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(Repository)
-	err := c.cc.Invoke(ctx, Repositories_RenameRepository_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
 func (c *repositoriesClient) GetRepository(ctx context.Context, in *GetRepositoryRequest, opts ...grpc.CallOption) (*Repository, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(Repository)
@@ -73,10 +187,20 @@ func (c *repositoriesClient) GetRepository(ctx context.Context, in *GetRepositor
 	return out, nil
 }
 
-func (c *repositoriesClient) ListRepositories(ctx context.Context, in *ListRepositoriesRequest, opts ...grpc.CallOption) (*ListRepositoriesResponse, error) {
+func (c *repositoriesClient) ForkRepository(ctx context.Context, in *ForkRepositoryRequest, opts ...grpc.CallOption) (*Repository, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(ListRepositoriesResponse)
-	err := c.cc.Invoke(ctx, Repositories_ListRepositories_FullMethodName, in, out, cOpts...)
+	out := new(Repository)
+	err := c.cc.Invoke(ctx, Repositories_ForkRepository_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *repositoriesClient) SyncFork(ctx context.Context, in *SyncForkRequest, opts ...grpc.CallOption) (*SyncForkResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SyncForkResponse)
+	err := c.cc.Invoke(ctx, Repositories_SyncFork_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -88,9 +212,15 @@ func (c *repositoriesClient) ListRepositories(ctx context.Context, in *ListRepos
 // for forward compatibility.
 type RepositoriesServer interface {
 	CreateRepository(context.Context, *CreateRepositoryRequest) (*Repository, error)
-	RenameRepository(context.Context, *RenameRepositoryRequest) (*Repository, error)
 	GetRepository(context.Context, *GetRepositoryRequest) (*Repository, error)
-	ListRepositories(context.Context, *ListRepositoriesRequest) (*ListRepositoriesResponse, error)
+	// ForkRepository forks a repository the caller may fork (docs/hosted.md, "GitHub's rules") into
+	// an owner they may make repositories of: in its network, its main the upstream's, holding all
+	// the upstream holds — by reference, costing no copy.
+	ForkRepository(context.Context, *ForkRepositoryRequest) (*Repository, error)
+	// SyncFork brings a fork its upstream's newer work: main moves to the upstream's if the fork has
+	// landed nothing of its own since it forked or last synced, and otherwise stays. It needs write
+	// on the fork, and the upstream readable.
+	SyncFork(context.Context, *SyncForkRequest) (*SyncForkResponse, error)
 	mustEmbedUnimplementedRepositoriesServer()
 }
 
@@ -104,14 +234,14 @@ type UnimplementedRepositoriesServer struct{}
 func (UnimplementedRepositoriesServer) CreateRepository(context.Context, *CreateRepositoryRequest) (*Repository, error) {
 	return nil, status.Error(codes.Unimplemented, "method CreateRepository not implemented")
 }
-func (UnimplementedRepositoriesServer) RenameRepository(context.Context, *RenameRepositoryRequest) (*Repository, error) {
-	return nil, status.Error(codes.Unimplemented, "method RenameRepository not implemented")
-}
 func (UnimplementedRepositoriesServer) GetRepository(context.Context, *GetRepositoryRequest) (*Repository, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetRepository not implemented")
 }
-func (UnimplementedRepositoriesServer) ListRepositories(context.Context, *ListRepositoriesRequest) (*ListRepositoriesResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method ListRepositories not implemented")
+func (UnimplementedRepositoriesServer) ForkRepository(context.Context, *ForkRepositoryRequest) (*Repository, error) {
+	return nil, status.Error(codes.Unimplemented, "method ForkRepository not implemented")
+}
+func (UnimplementedRepositoriesServer) SyncFork(context.Context, *SyncForkRequest) (*SyncForkResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method SyncFork not implemented")
 }
 func (UnimplementedRepositoriesServer) mustEmbedUnimplementedRepositoriesServer() {}
 func (UnimplementedRepositoriesServer) testEmbeddedByValue()                      {}
@@ -152,24 +282,6 @@ func _Repositories_CreateRepository_Handler(srv interface{}, ctx context.Context
 	return interceptor(ctx, in, info, handler)
 }
 
-func _Repositories_RenameRepository_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(RenameRepositoryRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(RepositoriesServer).RenameRepository(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: Repositories_RenameRepository_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(RepositoriesServer).RenameRepository(ctx, req.(*RenameRepositoryRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
 func _Repositories_GetRepository_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(GetRepositoryRequest)
 	if err := dec(in); err != nil {
@@ -188,20 +300,38 @@ func _Repositories_GetRepository_Handler(srv interface{}, ctx context.Context, d
 	return interceptor(ctx, in, info, handler)
 }
 
-func _Repositories_ListRepositories_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(ListRepositoriesRequest)
+func _Repositories_ForkRepository_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ForkRepositoryRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(RepositoriesServer).ListRepositories(ctx, in)
+		return srv.(RepositoriesServer).ForkRepository(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: Repositories_ListRepositories_FullMethodName,
+		FullMethod: Repositories_ForkRepository_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(RepositoriesServer).ListRepositories(ctx, req.(*ListRepositoriesRequest))
+		return srv.(RepositoriesServer).ForkRepository(ctx, req.(*ForkRepositoryRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Repositories_SyncFork_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SyncForkRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RepositoriesServer).SyncFork(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Repositories_SyncFork_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RepositoriesServer).SyncFork(ctx, req.(*SyncForkRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -218,16 +348,16 @@ var Repositories_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _Repositories_CreateRepository_Handler,
 		},
 		{
-			MethodName: "RenameRepository",
-			Handler:    _Repositories_RenameRepository_Handler,
-		},
-		{
 			MethodName: "GetRepository",
 			Handler:    _Repositories_GetRepository_Handler,
 		},
 		{
-			MethodName: "ListRepositories",
-			Handler:    _Repositories_ListRepositories_Handler,
+			MethodName: "ForkRepository",
+			Handler:    _Repositories_ForkRepository_Handler,
+		},
+		{
+			MethodName: "SyncFork",
+			Handler:    _Repositories_SyncFork_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},
@@ -1095,6 +1225,8 @@ var ChangeLists_ServiceDesc = grpc.ServiceDesc{
 
 const (
 	Review_CreateRepository_FullMethodName = "/ok.scm.v1.Review/CreateRepository"
+	Review_ForkRepository_FullMethodName   = "/ok.scm.v1.Review/ForkRepository"
+	Review_SyncFork_FullMethodName         = "/ok.scm.v1.Review/SyncFork"
 	Review_Transition_FullMethodName       = "/ok.scm.v1.Review/Transition"
 	Review_Rollback_FullMethodName         = "/ok.scm.v1.Review/Rollback"
 )
@@ -1108,6 +1240,9 @@ const (
 type ReviewClient interface {
 	// CreateRepository creates a repository for the person actor names, who becomes its creator.
 	CreateRepository(ctx context.Context, in *CreateRepositoryRequest, opts ...grpc.CallOption) (*Repository, error)
+	// ForkRepository and SyncFork, for the person actor names.
+	ForkRepository(ctx context.Context, in *ForkRepositoryRequest, opts ...grpc.CallOption) (*Repository, error)
+	SyncFork(ctx context.Context, in *SyncForkRequest, opts ...grpc.CallOption) (*SyncForkResponse, error)
 	Transition(ctx context.Context, in *TransitionRequest, opts ...grpc.CallOption) (*TransitionResponse, error)
 	// Rollback creates a CL that rolls back a landed CL, and the CLs landed above it in its
 	// stack (docs/scm.md, "Rollbacks"), for the person ok control authorized.
@@ -1126,6 +1261,26 @@ func (c *reviewClient) CreateRepository(ctx context.Context, in *CreateRepositor
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(Repository)
 	err := c.cc.Invoke(ctx, Review_CreateRepository_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *reviewClient) ForkRepository(ctx context.Context, in *ForkRepositoryRequest, opts ...grpc.CallOption) (*Repository, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(Repository)
+	err := c.cc.Invoke(ctx, Review_ForkRepository_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *reviewClient) SyncFork(ctx context.Context, in *SyncForkRequest, opts ...grpc.CallOption) (*SyncForkResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SyncForkResponse)
+	err := c.cc.Invoke(ctx, Review_SyncFork_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1161,6 +1316,9 @@ func (c *reviewClient) Rollback(ctx context.Context, in *RollbackRequest, opts .
 type ReviewServer interface {
 	// CreateRepository creates a repository for the person actor names, who becomes its creator.
 	CreateRepository(context.Context, *CreateRepositoryRequest) (*Repository, error)
+	// ForkRepository and SyncFork, for the person actor names.
+	ForkRepository(context.Context, *ForkRepositoryRequest) (*Repository, error)
+	SyncFork(context.Context, *SyncForkRequest) (*SyncForkResponse, error)
 	Transition(context.Context, *TransitionRequest) (*TransitionResponse, error)
 	// Rollback creates a CL that rolls back a landed CL, and the CLs landed above it in its
 	// stack (docs/scm.md, "Rollbacks"), for the person ok control authorized.
@@ -1177,6 +1335,12 @@ type UnimplementedReviewServer struct{}
 
 func (UnimplementedReviewServer) CreateRepository(context.Context, *CreateRepositoryRequest) (*Repository, error) {
 	return nil, status.Error(codes.Unimplemented, "method CreateRepository not implemented")
+}
+func (UnimplementedReviewServer) ForkRepository(context.Context, *ForkRepositoryRequest) (*Repository, error) {
+	return nil, status.Error(codes.Unimplemented, "method ForkRepository not implemented")
+}
+func (UnimplementedReviewServer) SyncFork(context.Context, *SyncForkRequest) (*SyncForkResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method SyncFork not implemented")
 }
 func (UnimplementedReviewServer) Transition(context.Context, *TransitionRequest) (*TransitionResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Transition not implemented")
@@ -1219,6 +1383,42 @@ func _Review_CreateRepository_Handler(srv interface{}, ctx context.Context, dec 
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(ReviewServer).CreateRepository(ctx, req.(*CreateRepositoryRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Review_ForkRepository_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ForkRepositoryRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ReviewServer).ForkRepository(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Review_ForkRepository_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ReviewServer).ForkRepository(ctx, req.(*ForkRepositoryRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Review_SyncFork_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SyncForkRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ReviewServer).SyncFork(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Review_SyncFork_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ReviewServer).SyncFork(ctx, req.(*SyncForkRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -1269,6 +1469,14 @@ var Review_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "CreateRepository",
 			Handler:    _Review_CreateRepository_Handler,
+		},
+		{
+			MethodName: "ForkRepository",
+			Handler:    _Review_ForkRepository_Handler,
+		},
+		{
+			MethodName: "SyncFork",
+			Handler:    _Review_SyncFork_Handler,
 		},
 		{
 			MethodName: "Transition",
@@ -1609,6 +1817,118 @@ var LandingChecks_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "DryRunLand",
 			Handler:    _LandingChecks_DryRunLand_Handler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: "proto/ok/scm/v1/scm.proto",
+}
+
+const (
+	SecretReferences_ListSecretReferences_FullMethodName = "/ok.scm.v1.SecretReferences/ListSecretReferences"
+)
+
+// SecretReferencesClient is the client API for SecretReferences service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+//
+// SecretReferences is ok secrets': the pointers a repository still holds, which its collection
+// keeps (docs/secrets.md, "The SCM").
+type SecretReferencesClient interface {
+	// ListSecretReferences are the pointers main's head, every open or draft CL's current patchset,
+	// and every workspace's latest checkpoint hold under //secret.
+	ListSecretReferences(ctx context.Context, in *ListSecretReferencesRequest, opts ...grpc.CallOption) (*ListSecretReferencesResponse, error)
+}
+
+type secretReferencesClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewSecretReferencesClient(cc grpc.ClientConnInterface) SecretReferencesClient {
+	return &secretReferencesClient{cc}
+}
+
+func (c *secretReferencesClient) ListSecretReferences(ctx context.Context, in *ListSecretReferencesRequest, opts ...grpc.CallOption) (*ListSecretReferencesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListSecretReferencesResponse)
+	err := c.cc.Invoke(ctx, SecretReferences_ListSecretReferences_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// SecretReferencesServer is the server API for SecretReferences service.
+// All implementations must embed UnimplementedSecretReferencesServer
+// for forward compatibility.
+//
+// SecretReferences is ok secrets': the pointers a repository still holds, which its collection
+// keeps (docs/secrets.md, "The SCM").
+type SecretReferencesServer interface {
+	// ListSecretReferences are the pointers main's head, every open or draft CL's current patchset,
+	// and every workspace's latest checkpoint hold under //secret.
+	ListSecretReferences(context.Context, *ListSecretReferencesRequest) (*ListSecretReferencesResponse, error)
+	mustEmbedUnimplementedSecretReferencesServer()
+}
+
+// UnimplementedSecretReferencesServer must be embedded to have
+// forward compatible implementations.
+//
+// NOTE: this should be embedded by value instead of pointer to avoid a nil
+// pointer dereference when methods are called.
+type UnimplementedSecretReferencesServer struct{}
+
+func (UnimplementedSecretReferencesServer) ListSecretReferences(context.Context, *ListSecretReferencesRequest) (*ListSecretReferencesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListSecretReferences not implemented")
+}
+func (UnimplementedSecretReferencesServer) mustEmbedUnimplementedSecretReferencesServer() {}
+func (UnimplementedSecretReferencesServer) testEmbeddedByValue()                          {}
+
+// UnsafeSecretReferencesServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to SecretReferencesServer will
+// result in compilation errors.
+type UnsafeSecretReferencesServer interface {
+	mustEmbedUnimplementedSecretReferencesServer()
+}
+
+func RegisterSecretReferencesServer(s grpc.ServiceRegistrar, srv SecretReferencesServer) {
+	// If the following call panics, it indicates UnimplementedSecretReferencesServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&SecretReferences_ServiceDesc, srv)
+}
+
+func _SecretReferences_ListSecretReferences_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListSecretReferencesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SecretReferencesServer).ListSecretReferences(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SecretReferences_ListSecretReferences_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SecretReferencesServer).ListSecretReferences(ctx, req.(*ListSecretReferencesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// SecretReferences_ServiceDesc is the grpc.ServiceDesc for SecretReferences service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var SecretReferences_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "ok.scm.v1.SecretReferences",
+	HandlerType: (*SecretReferencesServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "ListSecretReferences",
+			Handler:    _SecretReferences_ListSecretReferences_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},
@@ -2074,6 +2394,112 @@ var Browse_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
+	Search_Code_FullMethodName = "/ok.scm.v1.Search/Code"
+)
+
+// SearchClient is the client API for Search service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+type SearchClient interface {
+	// Code searches main's files, as the latest index of them says: UNAVAILABLE while a repository
+	// has none, which asking builds.
+	Code(ctx context.Context, in *CodeSearchRequest, opts ...grpc.CallOption) (*CodeSearchResponse, error)
+}
+
+type searchClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewSearchClient(cc grpc.ClientConnInterface) SearchClient {
+	return &searchClient{cc}
+}
+
+func (c *searchClient) Code(ctx context.Context, in *CodeSearchRequest, opts ...grpc.CallOption) (*CodeSearchResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CodeSearchResponse)
+	err := c.cc.Invoke(ctx, Search_Code_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// SearchServer is the server API for Search service.
+// All implementations must embed UnimplementedSearchServer
+// for forward compatibility.
+type SearchServer interface {
+	// Code searches main's files, as the latest index of them says: UNAVAILABLE while a repository
+	// has none, which asking builds.
+	Code(context.Context, *CodeSearchRequest) (*CodeSearchResponse, error)
+	mustEmbedUnimplementedSearchServer()
+}
+
+// UnimplementedSearchServer must be embedded to have
+// forward compatible implementations.
+//
+// NOTE: this should be embedded by value instead of pointer to avoid a nil
+// pointer dereference when methods are called.
+type UnimplementedSearchServer struct{}
+
+func (UnimplementedSearchServer) Code(context.Context, *CodeSearchRequest) (*CodeSearchResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Code not implemented")
+}
+func (UnimplementedSearchServer) mustEmbedUnimplementedSearchServer() {}
+func (UnimplementedSearchServer) testEmbeddedByValue()                {}
+
+// UnsafeSearchServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to SearchServer will
+// result in compilation errors.
+type UnsafeSearchServer interface {
+	mustEmbedUnimplementedSearchServer()
+}
+
+func RegisterSearchServer(s grpc.ServiceRegistrar, srv SearchServer) {
+	// If the following call panics, it indicates UnimplementedSearchServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&Search_ServiceDesc, srv)
+}
+
+func _Search_Code_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CodeSearchRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SearchServer).Code(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Search_Code_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SearchServer).Code(ctx, req.(*CodeSearchRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// Search_ServiceDesc is the grpc.ServiceDesc for Search service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var Search_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "ok.scm.v1.Search",
+	HandlerType: (*SearchServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "Code",
+			Handler:    _Search_Code_Handler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: "proto/ok/scm/v1/scm.proto",
+}
+
+const (
 	Events_Read_FullMethodName  = "/ok.scm.v1.Events/Read"
 	Events_Heads_FullMethodName = "/ok.scm.v1.Events/Heads"
 )
@@ -2088,8 +2514,7 @@ type EventsClient interface {
 	// Read returns up to limit of a repository's events after a place in its log, in order: a
 	// follower of the bus's stream fills what the stream has not yet brought it from here.
 	Read(ctx context.Context, in *ReadEventsRequest, opts ...grpc.CallOption) (*ReadEventsResponse, error)
-	// Heads lists how far each repository's log reaches, a page at a time by repository: now, or
-	// as of a place in the feed that numbered every repository's events together before. A follower
+	// Heads lists how far each repository's log reaches, a page at a time by repository. A follower
 	// of the stream catches up from them as it starts.
 	Heads(ctx context.Context, in *HeadsRequest, opts ...grpc.CallOption) (*HeadsResponse, error)
 }
@@ -2132,8 +2557,7 @@ type EventsServer interface {
 	// Read returns up to limit of a repository's events after a place in its log, in order: a
 	// follower of the bus's stream fills what the stream has not yet brought it from here.
 	Read(context.Context, *ReadEventsRequest) (*ReadEventsResponse, error)
-	// Heads lists how far each repository's log reaches, a page at a time by repository: now, or
-	// as of a place in the feed that numbered every repository's events together before. A follower
+	// Heads lists how far each repository's log reaches, a page at a time by repository. A follower
 	// of the stream catches up from them as it starts.
 	Heads(context.Context, *HeadsRequest) (*HeadsResponse, error)
 	mustEmbedUnimplementedEventsServer()

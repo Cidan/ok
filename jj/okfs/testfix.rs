@@ -1,5 +1,6 @@
 //! Test support: trees and file contents made up in memory, answering the model's needs and
-//! serving a mount as its [`Fetch`].
+//! serving a mount as its [`Fetch`]. Compiled for okfs's own tests: its unit tests, and, through
+//! the `testkit` feature, its kernel test, a binary of its own harness (tests/kernel.rs).
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -293,4 +294,28 @@ impl Fetch for FixtureFetch {
             .unwrap()
             .extend(files.into_iter().map(|(id, _)| id));
     }
+}
+
+/// A small tree of every kind of entry: files, an executable, a symlink, and directories.
+pub fn base_tree(fx: &mut Fixture) -> TreeId {
+    fx.tree(vec![
+        ("README", Entry::File(b"readme\n")),
+        ("run.sh", Entry::Exec(b"#!/bin/sh\n")),
+        ("link", Entry::Link("README")),
+        (
+            "src",
+            Entry::Dir(vec![
+                ("a.rs", Entry::File(b"fn a() {}\n")),
+                ("b.rs", Entry::File(b"fn b() {}\n")),
+                (
+                    "deep",
+                    Entry::Dir(vec![("c.rs", Entry::File(b"fn c() {}\n"))]),
+                ),
+            ]),
+        ),
+        (
+            "docs",
+            Entry::Dir(vec![("guide.md", Entry::File(b"# guide\n"))]),
+        ),
+    ])
 }

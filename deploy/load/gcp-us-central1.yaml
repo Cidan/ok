@@ -1,0 +1,33 @@
+# List prices for ok load cost (docs/hosted.md, "Proof at scale, as built"): on-demand, us-central1,
+# USD, from the Cloud Billing Catalog API (cloudbilling.googleapis.com/v1/services/<id>/skus) on
+# 2026-10-19; Spanner's throughput and CPU ceiling from its documentation the same day.
+region: us-central1
+fetched: "2026-10-19"
+core_hour:
+  price: 0.031611
+  sku: BB77-5FDA-69D9 # Compute Engine: N2 Instance Core running in Americas
+memory_gib_hour:
+  price: 0.004237
+  sku: 5B01-D157-A097 # Compute Engine: N2 Instance Ram running in Americas
+memory_per_core_gib: 4 # N2 standard machine types: 4 GiB a vCPU
+object_gib_month:
+  price: 0.020
+  sku: E5F0-6A5D-7BAD # Cloud Storage: Standard Storage US Regional
+object_class_a:
+  price: 0.000005
+  sku: 4DBF-185F-A415 # Cloud Storage: Regional Standard Class A Operations
+object_class_b:
+  price: 0.0000004
+  sku: 7870-010B-2763 # Cloud Storage: Regional Standard Class B Operations
+spanner_node_hour:
+  price: 0.90 # three read-write replicas of a regional configuration
+  sku: 5D6F-CCD6-CB28 # Cloud Spanner: Read-Write Replica for Standard Edition in Iowa, 0.30 an hour
+spanner_gib_month:
+  price: 0.30
+  sku: E064-98D3-9720 # Cloud Spanner: Storage for Regional Configuration (United States)
+# A node at 100% CPU, regional, SSD, single 1 KB rows (cloud.google.com/spanner/docs/performance).
+spanner_node_reads: 22500
+spanner_node_writes: 3500
+# The high-priority CPU a regional instance should stay under, to survive a zone's loss
+# (cloud.google.com/spanner/docs/cpu-utilization).
+spanner_cpu_ceiling: 0.65

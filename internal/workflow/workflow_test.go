@@ -41,6 +41,7 @@ pre:
 post:
   e2e:
     target: //apps/server/e2e:e2e
+    pool: large
 `
 	f, errs := Parse("apps/server/.ok/workflow/server.yaml", []byte(src))
 	if len(errs) != 0 {
@@ -63,6 +64,10 @@ post:
 	}
 	if j := f.Jobs[1]; j.Target != "//tools/sdlcheck:sdlcheck" || !reflect.DeepEqual(j.Args, []string{"--require-comments", "{changed_files:**/*.sdl}"}) || j.Line != 6 {
 		t.Errorf("schema-comments = %+v", j)
+	}
+
+	if f.Jobs[0].Pool != "" || f.Jobs[2].Pool != "large" {
+		t.Errorf("pools: %q, %q", f.Jobs[0].Pool, f.Jobs[2].Pool)
 	}
 
 	if f, errs := Parse(".ok/workflow/empty.yaml", nil); len(errs) != 0 || len(f.Jobs) != 0 {
@@ -89,6 +94,8 @@ func TestParseErrors(t *testing.T) {
 		"job not mapping":     {"pre:\n  a: //a:b\n", 2, "job a is a mapping"},
 		"no target":           {"pre:\n  a:\n    args: [x]\n", 2, "job a has no target"},
 		"target not label":    {"pre:\n  a:\n    target: apps/a\n", 3, `target "apps/a" is not a Bazel label in the main repository`},
+		"pool not a name":     {"pre:\n  a:\n    target: //a:b\n    pool: Big_Machines\n", 4, `pool "Big_Machines" is lowercase letters, digits, and -`},
+		"pool not a scalar":   {"pre:\n  a:\n    target: //a:b\n    pool: [x]\n", 4, "pool is the name of a pool of workers"},
 		"target no name":      {"pre:\n  a:\n    target: '//apps/a:'\n", 3, "is not a Bazel label"},
 		"target elsewhere":    {"pre:\n  a:\n    target: '@other//apps/a:a'\n", 3, "is not a Bazel label in the main repository"},
 		"target bad chars":    {"pre:\n  a:\n    target: //apps/a b:c\n", 3, "is not a Bazel label"},
@@ -342,6 +349,44 @@ func TestCanonicalLabel(t *testing.T) {
 	} {
 		if got, err := CanonicalLabel(bad); err == nil {
 			t.Errorf("CanonicalLabel(%q) = %q, want it refused", bad, got)
+		}
+	}
+}
+
+// A post job and a deploy's migrations name the secrets they read; a pre job, and a deploy with no
+// migrations, name none.
+func TestStanzaSecrets(t *testing.T) {
+	f, errs := Parse(".ok/workflow/ci.yaml", []byte(`post:
+  push:
+    target: //images:push
+    secrets: [//secret/registry/token]
+deploy:
+  db:
+    migrate: [//db:migrate]
+    secrets:
+      - //secret/prod/db-password
+      - //secret/prod/tls/ca.pem
+`))
+	if len(errs) != 0 {
+		t.Fatal(errs)
+	}
+	if s := f.Jobs[0].Secrets; len(s) != 1 || s[0].Path != "secret/registry/token" {
+		t.Errorf("the post job's secrets: %+v", s)
+	}
+	if s := f.Deploys[0].Secrets; len(s) != 2 || s[1].Path != "secret/prod/tls/ca.pem" || s[1].Line != 10 {
+		t.Errorf("the deploy's secrets: %+v", s)
+	}
+	for name, src := range map[string]string{
+		"a pre job's":       "pre:\n  t:\n    target: //a:t\n    secrets: [//secret/x]\n",
+		"no migrations":     "deploy:\n  w:\n    images: {c: //a:push}\n    workload: {namespace: n, deployment: w}\n    secrets: [//secret/x]\n",
+		"not from the root": "post:\n  t:\n    target: //a:t\n    secrets: [secret/x]\n",
+		"an acl.yaml":       "post:\n  t:\n    target: //a:t\n    secrets: [//secret/acl.yaml]\n",
+		"outside //secret":  "post:\n  t:\n    target: //a:t\n    secrets: [//config/x]\n",
+		"twice":             "post:\n  t:\n    target: //a:t\n    secrets: [//secret/x, //secret/x]\n",
+		"an empty list":     "post:\n  t:\n    target: //a:t\n    secrets: []\n",
+	} {
+		if _, errs := Parse(".ok/workflow/ci.yaml", []byte(src)); len(errs) == 0 {
+			t.Errorf("%s: taken", name)
 		}
 	}
 }

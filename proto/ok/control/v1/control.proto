@@ -56,6 +56,10 @@ service ChangeLists {
   rpc Rerun(RunsRequest) returns (CLStatus);
   // CancelRuns cancels runs of the CL's checks.
   rpc CancelRuns(RunsRequest) returns (CLStatus);
+  // RunPre runs pre by hand on the CL's current patchset — a draft, which runs none until it is
+  // sent for review, or a CL under its stack's top — over everything under it
+  // (docs/automation.md, "pre"). Whoever may land on the repository.
+  rpc RunPre(CLRef) returns (CLStatus);
   // ReadLog streams a run of the CL's checks' log from an offset: what there is, then — with
   // follow — what is written, until the run finishes.
   rpc ReadLog(ReadLogRequest) returns (stream LogChunk);
@@ -96,6 +100,9 @@ message CLStatus {
   // What ok could not read just now (ok automation, the deployer): the rest stands, and the
   // stage is as much as could be told.
   repeated string unavailable = 11;
+  // The CL whose pre covers this one — the top of its stack in review — when that is another CL;
+  // 0 otherwise. Pre runs at a stack's top, over every CL of it: this CL's own does not count.
+  int64 pre_at = 12;
 }
 
 enum Stage {

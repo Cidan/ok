@@ -1,0 +1,10 @@
+ok's deploy agent connects out to {{ .Values.address }} as its organization's robot.
+
+{{- if not .Values.credentialSecret }}
+For its token to sign the robot in, the organization's owners trust this cluster's issuer and bind
+the robot to its subject (docs/identity.md, "An organization's robots"):
+  system:serviceaccount:{{ .Release.Namespace }}:{{ include "agent.name" . }}
+{{- end }}
+Then they designate the robot the organization's deploy agent (ok identity's
+DeployAgents.SetDeployAgent), and grant it read on the repositories whose migrations it runs.
+It rolls in: {{ if .Values.namespaces }}{{ join ", " .Values.namespaces }}{{ else }}no namespace yet (namespaces){{ end }}.

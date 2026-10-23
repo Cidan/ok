@@ -15,10 +15,12 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/Cidan/ok/internal/data"
 	"github.com/Cidan/ok/internal/data/pgdata"
 	"github.com/Cidan/ok/internal/deploy/store"
 	"github.com/Cidan/ok/internal/lock"
 	"github.com/Cidan/ok/internal/migrate"
+	"github.com/Cidan/ok/internal/move"
 	"github.com/Cidan/ok/internal/workflow"
 )
 
@@ -33,6 +35,7 @@ type Backend struct {
 	queries
 	pool  *pgxpool.Pool
 	locks *lock.Lock
+	moves *moveRows
 }
 
 var _ store.Backend = (*Backend)(nil)
@@ -42,28 +45,35 @@ func Open(ctx context.Context, pool *pgxpool.Pool) (*Backend, error) {
 	if _, err := migrate.Apply(ctx, pool, "deploy", Migrations); err != nil {
 		return nil, err
 	}
-	return &Backend{queries: queries{pool}, pool: pool, locks: lock.New(pool)}, nil
+	gated := move.GatedPool{Pool: pool, Tables: moveTableSet}
+	return &Backend{queries: queries{gated}, pool: pool, locks: lock.New(pool),
+		moves: &moveRows{PostgresRows: &move.PostgresRows{Pool: pool, Tables: moveTables, Where: moveWhere}, pool: pool}}, nil
 }
 
 // Txn runs fn in a transaction, again if PostgreSQL aborts it to break a deadlock or a
 // serialization conflict.
 func (b *Backend) Txn(ctx context.Context, fn func(store.Ops) error) error {
-	return pgdata.Txn(ctx, b.pool, func(tx pgx.Tx) error { return fn(queries{tx}) })
+	return pgdata.Txn(ctx, b.pool, func(tx pgx.Tx) error {
+		// What ctx's lease guards is written only while its holder holds it (data.Fence).
+		if err := pgdata.CheckFence(ctx, tx); err != nil {
+			return err
+		}
+		if err := move.PostgresGate(ctx, tx); err != nil {
+			return err
+		}
+		return fn(queries{&move.CheckedTx{Tx: tx, Tables: moveTableSet}})
+	})
 }
 
-func (b *Backend) Lead(ctx context.Context, role string, fn lock.LockFn) error {
-	return b.locks.LockFn(ctx, "leaders", role, 0, fn)
-}
-
-func (b *Backend) TryLockDeployment(ctx context.Context, id int64) (release func(), ok bool, err error) {
+func (b *Backend) TryLockDeployment(ctx context.Context, id int64) (fence data.Fence, release func(), ok bool, err error) {
 	key := strconv.FormatInt(id, 10)
 	held, cancel := context.WithCancel(context.WithoutCancel(ctx))
-	ok, err = b.locks.TryLock(held, "deployments", key)
+	fence, ok, err = b.locks.TryLockFenced(held, "deployments", key)
 	if err != nil || !ok {
 		cancel()
-		return nil, false, err
+		return data.Fence{}, nil, false, err
 	}
-	return func() {
+	return fence, func() {
 		unlockCtx, done := context.WithTimeout(context.Background(), 5*time.Second)
 		_ = b.locks.Unlock(unlockCtx, "deployments", key)
 		done()
@@ -82,15 +92,8 @@ type queries struct{ q querier }
 
 // ─── The feed ───
 
-func (x queries) LegacyCursor(ctx context.Context) (int64, error) {
-	var seq int64
-	err := x.q.QueryRow(ctx, `SELECT coalesce(max(seq), 0) FROM feed_cursor`).Scan(&seq)
-	return seq, err
-}
-
-func (x queries) ForgetLegacyCursor(ctx context.Context) error {
-	_, err := x.q.Exec(ctx, `DELETE FROM feed_cursor`)
-	return err
+func (x queries) FollowCursors(ctx context.Context, topic string, keys []int64) (map[int64]int64, error) {
+	return pgdata.Cursors(ctx, x.q, topic, keys)
 }
 
 func (x queries) FollowCursor(ctx context.Context, topic string, key int64) (int64, error) {
@@ -105,18 +108,51 @@ func (x queries) SetFollowCursor(ctx context.Context, topic string, key, seq int
 	return pgdata.SetCursor(ctx, x.q, topic, key, seq)
 }
 
-func (x queries) SeedFollowCursor(ctx context.Context, topic string, key, seq int64) error {
-	return pgdata.SeedCursor(ctx, x.q, topic, key, seq)
-}
-
-func (x queries) PutRepository(ctx context.Context, id int64, name string) error {
-	_, err := x.q.Exec(ctx, `INSERT INTO repository (id, name) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET name = $2`, id, name)
+func (x queries) DropRepository(ctx context.Context, id int64) error {
+	_, err := x.q.Exec(ctx, `DELETE FROM repository WHERE id = $1`, id) // the rest cascades
 	return err
 }
 
-func (x queries) RenameRepository(ctx context.Context, id int64, name string) error {
-	_, err := x.q.Exec(ctx, `UPDATE repository SET name = $2 WHERE id = $1`, id, name)
+func (x queries) NameRepository(ctx context.Context, id int64, name, owner string) error {
+	_, err := x.q.Exec(ctx, `INSERT INTO repository (id, name, owner_id) VALUES ($1, $2, $3)
+		ON CONFLICT (id) DO UPDATE SET name = $2, owner_id = CASE WHEN $3 = '' THEN repository.owner_id ELSE $3 END`, id, name, owner)
 	return err
+}
+
+func (x queries) RepositoryOwner(ctx context.Context, id int64) (string, error) {
+	var owner string
+	err := x.q.QueryRow(ctx, `SELECT owner_id FROM repository WHERE id = $1`, id).Scan(&owner)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	return owner, err
+}
+
+func (x queries) ClaimAgentSession(ctx context.Context, s store.AgentSession) error {
+	_, err := x.q.Exec(ctx, `INSERT INTO agent_session (account_id, holder, address, lease_until, connected_at) VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (account_id) DO UPDATE SET holder = $2, address = $3, lease_until = $4, connected_at = $5`,
+		s.Account, s.Holder, s.Address, s.LeaseUntil, s.ConnectedAt)
+	return err
+}
+
+func (x queries) RenewAgentSession(ctx context.Context, account, holder string, until time.Time) (bool, error) {
+	tag, err := x.q.Exec(ctx, `UPDATE agent_session SET lease_until = $3 WHERE account_id = $1 AND holder = $2`, account, holder, until)
+	return tag.RowsAffected() > 0, err
+}
+
+func (x queries) ReleaseAgentSession(ctx context.Context, account, holder string) error {
+	_, err := x.q.Exec(ctx, `DELETE FROM agent_session WHERE account_id = $1 AND holder = $2`, account, holder)
+	return err
+}
+
+func (x queries) AgentSession(ctx context.Context, account string) (store.AgentSession, bool, error) {
+	var s store.AgentSession
+	err := x.q.QueryRow(ctx, `SELECT account_id, holder, address, lease_until, connected_at FROM agent_session WHERE account_id = $1`, account).
+		Scan(&s.Account, &s.Holder, &s.Address, &s.LeaseUntil, &s.ConnectedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return store.AgentSession{}, false, nil
+	}
+	return s, err == nil, err
 }
 
 func (x queries) EnsureRepository(ctx context.Context, id int64) error {
@@ -144,8 +180,9 @@ func (x queries) MainCommit(ctx context.Context, repo int64, commit []byte) (seq
 }
 
 func (x queries) Unplanned(ctx context.Context) ([]store.Repository, error) {
+	// A repository the directory has not named yet waits: what is planned depends on its name.
 	rows, err := x.q.Query(ctx, `SELECT id, name, head, head_seq, planned_head, planned_seq FROM repository
-		WHERE head_seq > planned_seq ORDER BY id`)
+		WHERE head_seq > planned_seq AND name <> '' ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -166,8 +203,8 @@ func (x queries) LockPlannedSeq(ctx context.Context, repo int64) (int64, error) 
 
 func (x queries) InsertPlan(ctx context.Context, repo int64, head []byte, headSeq, baseSeq int64, notes []string) (int64, error) {
 	var id int64
-	err := x.q.QueryRow(ctx, `INSERT INTO plan (repository_id, head, head_seq, base_seq, notes) VALUES ($1, $2, $3, $4, $5) RETURNING id`,
-		repo, head, headSeq, baseSeq, notes).Scan(&id)
+	err := x.q.QueryRow(ctx, `INSERT INTO plan (id, repository_id, head, head_seq, base_seq, notes, created_at)
+		VALUES ($6, $1, $2, $3, $4, $5, clock_timestamp()) RETURNING id`, repo, head, headSeq, baseSeq, notes, data.NewID()).Scan(&id)
 	return id, err
 }
 
@@ -178,7 +215,7 @@ func (x queries) SetPlanned(ctx context.Context, repo int64, head []byte, seq in
 
 func (x queries) Plans(ctx context.Context, repo int64) ([]store.Plan, error) {
 	rows, err := x.q.Query(ctx, `SELECT id, repository_id, head, head_seq, base_seq, notes, created_at FROM plan
-		WHERE $1 = 0 OR repository_id = $1 ORDER BY id`, repo)
+		WHERE $1::bigint = 0 OR repository_id = $1 ORDER BY created_at, id`, repo)
 	if err != nil {
 		return nil, err
 	}
@@ -197,10 +234,10 @@ func (x queries) RecordServices(ctx context.Context, repo, seq int64, deploys []
 			continue
 		}
 		ids = append(ids, d.ID())
-		if _, err := x.q.Exec(ctx, `INSERT INTO service (repository_id, deploy, name, namespace, kind, workload, declared, declared_seq, group_name)
-			VALUES ($1, $2, $3, $4, $5, $6, true, $7, $8)
+		if _, err := x.q.Exec(ctx, `INSERT INTO service (id, repository_id, deploy, name, namespace, kind, workload, declared, declared_seq, group_name)
+			VALUES ($9, $1, $2, $3, $4, $5, $6, true, $7, $8)
 			ON CONFLICT (repository_id, deploy) DO UPDATE SET name = $3, namespace = $4, kind = $5, workload = $6, declared = true, declared_seq = $7, group_name = $8`,
-			repo, d.ID(), d.Name, w.Namespace, string(w.Kind), w.Name, seq, d.Group); err != nil {
+			repo, d.ID(), d.Name, w.Namespace, string(w.Kind), w.Name, seq, d.Group, data.NewID()); err != nil {
 			return err
 		}
 	}
@@ -229,11 +266,13 @@ func (x queries) InsertDeployment(ctx context.Context, d store.DeploymentRow) (i
 		finished = &now
 	}
 	var id int64
+	// Its creation time is the clock's, not the transaction's start, so a plan's deployments keep
+	// the order they were made in.
 	if err := x.q.QueryRow(ctx, `INSERT INTO deployment (repository_id, plan_id, retry_of, deploy, name, commit_id, from_seq, to_seq,
-			why, wave, requested_by, namespace, kind, workload, status, stage, reason, self, finished_at, alone)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20) RETURNING id`,
+			why, wave, requested_by, namespace, kind, workload, status, stage, reason, self, finished_at, alone, id, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, clock_timestamp()) RETURNING id`,
 		d.Repository, plan, retry, d.Deploy.ID(), d.Deploy.Name, d.Commit, d.FromSeq, d.ToSeq, d.Why, d.Wave, d.RequestedBy,
-		ns, kind, workload, d.Status, d.Stage, d.Reason, d.Self, finished, d.Deploy.Alone).Scan(&id); err != nil {
+		ns, kind, workload, d.Status, d.Stage, d.Reason, d.Self, finished, d.Deploy.Alone, data.NewID()).Scan(&id); err != nil {
 		return 0, err
 	}
 	for _, im := range d.Deploy.Images {
@@ -312,7 +351,7 @@ func sortIDs(ids []int64) {
 }
 
 func (x queries) HaltRunningIn(ctx context.Context, plan, except int64, wave int, reason string) error {
-	_, err := x.q.Exec(ctx, `UPDATE deployment SET halt_by = $3 WHERE id <> $2 AND status = $4 AND halt_by IS NULL
+	_, err := x.q.Exec(ctx, `UPDATE deployment SET halt_reason = $3 WHERE id <> $2 AND status = $4 AND halt_by IS NULL AND halt_reason IS NULL
 		AND (plan_id = $1 OR EXISTS (SELECT 1 FROM unnest(gate_plans, gate_waves) AS g(p, w) WHERE g.p = $1 AND g.w >= $5))`,
 		plan, except, reason, store.Running, wave)
 	return err
@@ -320,7 +359,7 @@ func (x queries) HaltRunningIn(ctx context.Context, plan, except int64, wave int
 
 const deploymentColumns = `id, repository_id, coalesce(plan_id, 0), coalesce(retry_of, 0), deploy, name, commit_id, from_seq, to_seq,
 	why, wave, gate_plans, gate_waves, requested_by, namespace, kind, workload, status, stage, reason, roll, self, coalesce(driver, ''), coalesce(halt_by, ''),
-	created_at, started_at, stage_at, finished_at, alone`
+	created_at, started_at, stage_at, finished_at, alone, coalesce(halt_reason, '')`
 
 func scanDeployment(row pgx.Row) (*store.Deployment, error) {
 	var d store.Deployment
@@ -330,7 +369,7 @@ func scanDeployment(row pgx.Row) (*store.Deployment, error) {
 	var gw []int32
 	if err := row.Scan(&d.ID, &d.Repository, &d.PlanID, &d.RetryOf, &d.Deploy, &d.Name, &d.Commit, &d.FromSeq, &d.ToSeq,
 		&d.Why, &d.Wave, &gp, &gw, &d.RequestedBy, &ns, &kind, &workload, &d.Status, &d.Stage, &d.Reason, &d.Roll, &d.Self, &d.Driver, &d.HaltBy,
-		&d.CreatedAt, &started, &stageAt, &finished, &d.Alone); err != nil {
+		&d.CreatedAt, &started, &stageAt, &finished, &d.Alone, &d.HaltReason); err != nil {
 		return nil, err
 	}
 	if ns != nil {
@@ -409,7 +448,7 @@ func (x queries) load(ctx context.Context, sql string, args ...any) ([]*store.De
 }
 
 func (x queries) Deployments(ctx context.Context, ids []int64) ([]*store.Deployment, error) {
-	return x.load(ctx, `SELECT `+deploymentColumns+` FROM deployment WHERE id = ANY($1) ORDER BY id`, ids)
+	return x.load(ctx, `SELECT `+deploymentColumns+` FROM deployment WHERE id = ANY($1) ORDER BY created_at, id`, ids)
 }
 
 func (x queries) LockDeployment(ctx context.Context, id int64) (*store.Deployment, error) {
@@ -421,31 +460,32 @@ func (x queries) LockDeployment(ctx context.Context, id int64) (*store.Deploymen
 }
 
 func (x queries) OpenDeployments(ctx context.Context) ([]*store.Deployment, error) {
-	return x.load(ctx, `SELECT `+deploymentColumns+` FROM deployment WHERE status IN ($1, $2) ORDER BY id`, store.Waiting, store.Running)
+	return x.load(ctx, `SELECT `+deploymentColumns+` FROM deployment WHERE status IN ($1, $2) ORDER BY created_at, id`, store.Waiting, store.Running)
 }
 
 func (x queries) RetiringDeployments(ctx context.Context) ([]*store.Deployment, error) {
 	return x.load(ctx, `SELECT `+deploymentColumns+` FROM deployment
-		WHERE self AND status = $1 AND (roll->>'retire')::boolean ORDER BY id`, store.Succeeded)
+		WHERE self AND status = $1 AND (roll->>'retire')::boolean ORDER BY created_at, id`, store.Succeeded)
 }
 
 func (x queries) CoveringDeployments(ctx context.Context, repo, seq int64) ([]*store.Deployment, error) {
 	return x.load(ctx, `SELECT `+deploymentColumns+` FROM deployment
-		WHERE repository_id = $1 AND from_seq < $2 AND to_seq >= $2 ORDER BY id DESC`, repo, seq)
+		WHERE repository_id = $1 AND from_seq < $2 AND to_seq >= $2 ORDER BY created_at DESC, id DESC`, repo, seq)
 }
 
 func (x queries) LatestDeployments(ctx context.Context, repo int64, limit int) ([]*store.Deployment, error) {
-	return x.load(ctx, `SELECT `+deploymentColumns+` FROM deployment WHERE repository_id = $1 ORDER BY id DESC LIMIT $2`, repo, limit)
+	return x.load(ctx, `SELECT `+deploymentColumns+` FROM deployment WHERE repository_id = $1 ORDER BY created_at DESC, id DESC LIMIT $2`, repo, limit)
 }
 
 func (x queries) DeployDeployments(ctx context.Context, repo int64, deploy string, limit int) ([]*store.Deployment, error) {
-	return x.load(ctx, `SELECT `+deploymentColumns+` FROM deployment WHERE repository_id = $1 AND deploy = $2 ORDER BY id DESC LIMIT $3`,
+	return x.load(ctx, `SELECT `+deploymentColumns+` FROM deployment WHERE repository_id = $1 AND deploy = $2 ORDER BY created_at DESC, id DESC LIMIT $3`,
 		repo, deploy, limit)
 }
 
 func (x queries) NewerOf(ctx context.Context, repo int64, deploy string, id int64) (int64, bool, error) {
 	var newer int64
-	err := x.q.QueryRow(ctx, `SELECT id FROM deployment WHERE repository_id = $1 AND deploy = $2 AND id > $3 ORDER BY id DESC LIMIT 1`,
+	err := x.q.QueryRow(ctx, `SELECT id FROM deployment WHERE repository_id = $1 AND deploy = $2
+		AND (created_at, id) > (SELECT created_at, id FROM deployment WHERE id = $3) ORDER BY created_at DESC, id DESC LIMIT 1`,
 		repo, deploy, id).Scan(&newer)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return 0, false, nil
@@ -472,12 +512,13 @@ func (x queries) PlanStatuses(ctx context.Context, plan int64) (map[int][]store.
 }
 
 func (x queries) AppendEvent(ctx context.Context, id int64, message string) error {
-	_, err := x.q.Exec(ctx, `INSERT INTO deployment_event (deployment_id, message) VALUES ($1, $2)`, id, message)
+	_, err := x.q.Exec(ctx, `INSERT INTO deployment_event (id, deployment_id, message, at) VALUES ($3, $1, $2, clock_timestamp())`,
+		id, message, data.NewID())
 	return err
 }
 
 func (x queries) Events(ctx context.Context, id int64) ([]store.Event, error) {
-	rows, err := x.q.Query(ctx, `SELECT at, message FROM deployment_event WHERE deployment_id = $1 ORDER BY id`, id)
+	rows, err := x.q.Query(ctx, `SELECT at, message FROM deployment_event WHERE deployment_id = $1 ORDER BY at, id`, id)
 	if err != nil {
 		return nil, err
 	}
@@ -527,7 +568,7 @@ func (x queries) FinishDeployment(ctx context.Context, id int64, status store.St
 }
 
 func (x queries) SetHaltBy(ctx context.Context, id int64, by string) error {
-	_, err := x.q.Exec(ctx, `UPDATE deployment SET halt_by = $2 WHERE id = $1 AND halt_by IS NULL`, id, by)
+	_, err := x.q.Exec(ctx, `UPDATE deployment SET halt_by = $2 WHERE id = $1 AND halt_by IS NULL AND halt_reason IS NULL`, id, by)
 	return err
 }
 
@@ -551,8 +592,10 @@ func (x queries) AllowMigration(ctx context.Context, id int64, position int, all
 // ─── Services ───
 
 var serviceColumns = fmt.Sprintf(`s.id, s.repository_id, r.name, s.deploy, s.name, s.namespace, s.kind, s.workload, s.declared, s.declared_seq, s.group_name,
-	coalesce((SELECT d.id FROM deployment d WHERE d.repository_id = s.repository_id AND d.deploy = s.deploy ORDER BY d.id DESC LIMIT 1), 0),
-	coalesce((SELECT d.id FROM deployment d WHERE d.repository_id = s.repository_id AND d.deploy = s.deploy AND d.status = %d ORDER BY d.id DESC LIMIT 1), 0)`,
+	coalesce((SELECT d.id FROM deployment d WHERE d.repository_id = s.repository_id AND d.deploy = s.deploy
+		ORDER BY d.created_at DESC, d.id DESC LIMIT 1), 0),
+	coalesce((SELECT d.id FROM deployment d WHERE d.repository_id = s.repository_id AND d.deploy = s.deploy AND d.status = %d
+		ORDER BY d.created_at DESC, d.id DESC LIMIT 1), 0)`,
 	store.Succeeded)
 
 func (x queries) services(ctx context.Context, where string, arg int64) ([]store.ServiceRow, error) {
@@ -571,7 +614,8 @@ func (x queries) services(ctx context.Context, where string, arg int64) ([]store
 }
 
 func (x queries) Services(ctx context.Context, repo int64) ([]store.ServiceRow, error) {
-	return x.services(ctx, `WHERE ($1 = 0 OR s.repository_id = $1) ORDER BY r.name, s.name, s.id`, repo)
+	return x.services(ctx, `WHERE ($1::bigint = 0 AND NOT EXISTS (SELECT 1 FROM move_gate g WHERE g.repository_id = s.repository_id AND g.move_state <> '')
+		OR s.repository_id = $1) ORDER BY r.name, s.name, s.id`, repo)
 }
 
 func (x queries) Service(ctx context.Context, id int64) (store.ServiceRow, bool, error) {
@@ -631,4 +675,38 @@ func (x queries) Observations(ctx context.Context, ids []int64) (map[int64]*stor
 		out[id] = &o
 	}
 	return out, rows.Err()
+}
+
+func (x queries) LockStarts(ctx context.Context) error {
+	return lock.InTx(ctx, x.q, "deploy", "starts")
+}
+
+// ─── Keyed work ───
+
+func (x queries) MarkWork(ctx context.Context, kind string, key int64) error {
+	return pgdata.MarkWork(ctx, x.q, kind, key)
+}
+
+func (x queries) MarkWorkAt(ctx context.Context, kind string, key int64, at time.Time) error {
+	return pgdata.MarkWorkAt(ctx, x.q, kind, key, at)
+}
+
+func (x queries) MarkWorkIdle(ctx context.Context, kind string, key int64) error {
+	return pgdata.MarkWorkIdle(ctx, x.q, kind, key)
+}
+
+func (x queries) TakeWork(ctx context.Context, kind string, key int64, holder string, ttl time.Duration) (bool, error) {
+	return pgdata.TakeWork(ctx, x.q, kind, key, holder, ttl)
+}
+
+func (x queries) RenewWork(ctx context.Context, kind string, key int64, holder string, ttl time.Duration) (bool, error) {
+	return pgdata.RenewWork(ctx, x.q, kind, key, holder, ttl)
+}
+
+func (x queries) ReleaseWork(ctx context.Context, kind string, key int64, holder string) (bool, error) {
+	return pgdata.ReleaseWork(ctx, x.q, kind, key, holder)
+}
+
+func (x queries) DueWork(ctx context.Context, kind string, limit int) ([]int64, error) {
+	return pgdata.DueWork(ctx, x.q, kind, limit)
 }

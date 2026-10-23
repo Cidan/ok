@@ -16,31 +16,9 @@ use crate::model::resolved_terms;
 use crate::persist::MemLog;
 use crate::testfix::Entry;
 use crate::testfix::Fixture;
+use crate::testfix::base_tree;
 use crate::testfix::name;
 use crate::testfix::path;
-
-pub fn base_tree(fx: &mut Fixture) -> TreeId {
-    fx.tree(vec![
-        ("README", Entry::File(b"readme\n")),
-        ("run.sh", Entry::Exec(b"#!/bin/sh\n")),
-        ("link", Entry::Link("README")),
-        (
-            "src",
-            Entry::Dir(vec![
-                ("a.rs", Entry::File(b"fn a() {}\n")),
-                ("b.rs", Entry::File(b"fn b() {}\n")),
-                (
-                    "deep",
-                    Entry::Dir(vec![("c.rs", Entry::File(b"fn c() {}\n"))]),
-                ),
-            ]),
-        ),
-        (
-            "docs",
-            Entry::Dir(vec![("guide.md", Entry::File(b"# guide\n"))]),
-        ),
-    ])
-}
 
 // Reading the base: listings, attributes, contents, symlinks, and the .jj link.
 #[test]

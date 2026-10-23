@@ -24,6 +24,8 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/reflect/protoregistry"
+
+	"github.com/Cidan/ok/internal/cells"
 )
 
 // REST is every Service's JSON surface: POST /<package>.<Service>/<Method> with the
@@ -296,7 +298,14 @@ func writeMessage(w http.ResponseWriter, code int, m proto.Message) {
 	w.Write(b)
 }
 
+// writeStatus answers a failed call: a request about a repository another cell holds 421,
+// Misdirected Request, naming the cell, for the edge in front to send it there.
 func writeStatus(w http.ResponseWriter, s *status.Status) {
+	if m, ok := cells.MovedOf(s.Err()); ok {
+		w.Header().Set(cells.Header, m.GetCell())
+		writeStatusCode(w, http.StatusMisdirectedRequest, s)
+		return
+	}
 	writeStatusCode(w, httpStatus(s.Code()), s)
 }
 

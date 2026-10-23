@@ -84,6 +84,9 @@ type OIDCConfig struct {
 	// CAFile verifies the provider's certificate, when it is not one the system trusts: a
 	// provider inside the organization, behind its own CA.
 	CAFile string
+	// Client, when set, is how the provider is reached: an organization's, at public addresses
+	// alone (internal/netguard).
+	Client *http.Client
 }
 
 // OIDC signs people in with one OpenID Connect provider: the authorization code flow with PKCE.
@@ -129,7 +132,11 @@ func NewOIDC(ctx context.Context, cfg OIDCConfig, redirectURL string) (*OIDC, er
 		}
 		tr.TLSClientConfig = &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
 	}
-	return &OIDC{cfg: cfg, redirectURL: redirectURL, client: &http.Client{Transport: tr, Timeout: 30 * time.Second}}, nil
+	client := cfg.Client
+	if client == nil {
+		client = &http.Client{Transport: tr, Timeout: 30 * time.Second}
+	}
+	return &OIDC{cfg: cfg, redirectURL: redirectURL, client: client}, nil
 }
 
 // discover returns the provider's OAuth configuration and token verifier, discovering them the
@@ -167,6 +174,8 @@ type OIDCState struct {
 	Nonce    string
 	Verifier string // PKCE
 	Next     string
+	// LinkFor, when set, is the account, by ID, a signed-in person is linking the provider to.
+	LinkFor string
 }
 
 // Begin returns the provider's authorization URL for a sign-in whose state the caller keeps under
@@ -186,28 +195,79 @@ func (o *OIDC) Begin(ctx context.Context, stateID string, st OIDCState) (string,
 // Finish exchanges the code the provider returned for an ID token, verifies it — issuer,
 // audience, expiry, signature, the nonce — and returns the person it names.
 func (o *OIDC) Finish(ctx context.Context, people People, st OIDCState, code string) (store.Principal, error) {
-	oc, verifier, err := o.discover(ctx)
+	idt, err := o.exchange(ctx, st, code)
 	if err != nil {
 		return store.Principal{}, err
+	}
+	return o.person(ctx, people, idt)
+}
+
+// Identity is who a verified ID token says signed in: its subject, the email the provider verified
+// ("" when it did not), and a handle to suggest.
+type Identity struct {
+	Subject, Email, Handle string
+	// Claims are the ID token's, for a match by another claim (oid, for Entra).
+	Claims map[string]any
+}
+
+// Identify exchanges the code, verifies the ID token as Finish does, and returns who it names, for
+// an account linked to its subject: a hosted service's sign-up and sign-in with a social provider.
+func (o *OIDC) Identify(ctx context.Context, st OIDCState, code string) (Identity, error) {
+	idt, err := o.exchange(ctx, st, code)
+	if err != nil {
+		return Identity{}, err
+	}
+	var c struct {
+		Email             string `json:"email"`
+		EmailVerified     *bool  `json:"email_verified"`
+		PreferredUsername string `json:"preferred_username"`
+		Nickname          string `json:"nickname"`
+	}
+	if err := idt.Claims(&c); err != nil {
+		return Identity{}, err
+	}
+	id := Identity{Subject: idt.Subject, Claims: map[string]any{}}
+	if err := idt.Claims(&id.Claims); err != nil {
+		return Identity{}, err
+	}
+	if c.EmailVerified != nil && *c.EmailVerified {
+		id.Email = strings.ToLower(c.Email)
+	}
+	for _, h := range []string{c.PreferredUsername, c.Nickname, strings.Split(id.Email, "@")[0]} {
+		if h = strings.ToLower(h); h != "" {
+			id.Handle = h
+			break
+		}
+	}
+	if id.Subject == "" {
+		return Identity{}, fmt.Errorf("%s's ID token names no subject", o.cfg.Name)
+	}
+	return id, nil
+}
+
+func (o *OIDC) exchange(ctx context.Context, st OIDCState, code string) (*oidc.IDToken, error) {
+	oc, verifier, err := o.discover(ctx)
+	if err != nil {
+		return nil, err
 	}
 	ctx, cancel := context.WithTimeout(oidc.ClientContext(ctx, o.client), 20*time.Second)
 	defer cancel()
 	tok, err := oc.Exchange(ctx, code, oauth2.VerifierOption(st.Verifier))
 	if err != nil {
-		return store.Principal{}, fmt.Errorf("%s refused the sign-in: %w", o.cfg.Name, err)
+		return nil, fmt.Errorf("%s refused the sign-in: %w", o.cfg.Name, err)
 	}
 	raw, ok := tok.Extra("id_token").(string)
 	if !ok {
-		return store.Principal{}, fmt.Errorf("%s returned no ID token", o.cfg.Name)
+		return nil, fmt.Errorf("%s returned no ID token", o.cfg.Name)
 	}
 	idt, err := verifier.Verify(ctx, raw)
 	if err != nil {
-		return store.Principal{}, fmt.Errorf("%s's ID token: %w", o.cfg.Name, err)
+		return nil, fmt.Errorf("%s's ID token: %w", o.cfg.Name, err)
 	}
 	if idt.Nonce != st.Nonce {
-		return store.Principal{}, errors.New("the ID token is not this sign-in's")
+		return nil, errors.New("the ID token is not this sign-in's")
 	}
-	return o.person(ctx, people, idt)
+	return idt, nil
 }
 
 // person matches a verified ID token's claims to a person.

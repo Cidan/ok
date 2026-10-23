@@ -70,16 +70,137 @@ type RepoItem struct {
 	UpdatedTitle string
 }
 
-// ServeHome renders the home repo-finder: the bare content fragment on an htmx navigation, the
-// full document otherwise. user is the signed-in person's handle; keyword is the
-// active search filter; page1 is the first batch of rows; url is the ?page=N rows endpoint
-// (carrying the keyword); hasMore says whether page 2 exists.
-func ServeHome(w http.ResponseWriter, r *http.Request, user, keyword string, page1 []RepoItem, url string, pageSize int, hasMore bool) {
+// InboxItem is a CL in the signed-in person's inbox (docs/hosted.md, "ok control at scale, as
+// built"), whichever cell holds it.
+type InboxItem struct {
+	Repository string
+	Number     int64
+	Title      string
+	// Role is "author" or "reviewer"; Attention, that the CL waits on them.
+	Role         string
+	Attention    bool
+	Status       string
+	Link         string
+	UpdatedAgo   string
+	UpdatedTitle string
+}
+
+// NotificationItem is one of a person's notifications.
+type NotificationItem struct {
+	Who, Text         string
+	Repository, Title string
+	Number            int64
+	Link              string
+	Read              bool
+	Ago, AgoTitle     string
+}
+
+// MailKind is a kind of notification, and whether it is mailed.
+type MailKind struct {
+	Value, Label string
+	Mailed       bool
+}
+
+// NotificationsView is a person's notifications page.
+type NotificationsView struct {
+	Items  []NotificationItem
+	Unread int64
+	Kinds  []MailKind
+}
+
+// ServeNotifications renders a person's notifications.
+func ServeNotifications(w http.ResponseWriter, r *http.Request, v NotificationsView) {
 	if hxNav(r) {
-		render(w, r, HomeContent(user, keyword, page1, url, pageSize, hasMore))
+		render(w, r, NotificationsContent(v))
 		return
 	}
-	render(w, r, HomePage(NavModel(r.URL.Path), user, keyword, page1, url, pageSize, hasMore))
+	render(w, r, NotificationsPage(NavModel(r.URL.Path), v))
+}
+
+// SearchView is a repository's code search page.
+type SearchView struct {
+	Chrome                RepoChrome
+	Action                string
+	Query, Path           string
+	Regexp, CaseSensitive bool
+	// Notice says the index is being built, or older than main; Error, the query is not one.
+	Notice, Error string
+	Files         []SearchFile
+	Truncated     bool
+	Shown         int
+}
+
+// SearchFile is a file's lines found.
+type SearchFile struct {
+	Path, Href string
+	Lines      []SearchLine
+}
+
+// SearchLine is a line found: its number, its link, and its text around the match.
+type SearchLine struct {
+	Number               int
+	Href                 string
+	Before, Match, After string
+}
+
+// ServeSearch renders a repository's code search.
+func ServeSearch(w http.ResponseWriter, r *http.Request, v SearchView) {
+	if hxNav(r) {
+		render(w, r, SearchContent(v))
+		return
+	}
+	render(w, r, SearchPage(NavModel(r.URL.Path), v))
+}
+
+// WebhooksView is a repository's webhooks page.
+type WebhooksView struct {
+	Chrome  RepoChrome
+	Enabled bool
+	// Created is a webhook just made, whose secret is shown this once.
+	Created    *NewWebhook
+	Error      string
+	Hooks      []WebhookItem
+	CreateHref string
+}
+
+// NewWebhook is a webhook just made.
+type NewWebhook struct{ URL, Secret string }
+
+// WebhookItem is one of a repository's webhooks.
+type WebhookItem struct {
+	URL, Events, CreatedBy, Ago string
+	DeleteHref                  string
+	Deliveries                  []DeliveryItem
+}
+
+// DeliveryItem is one of a webhook's latest deliveries: its state (waiting, delivered, dead), event,
+// and what the endpoint last answered.
+type DeliveryItem struct {
+	State, Event, Detail, Ago string
+	RedeliverHref             string
+}
+
+// ServeWebhooks renders a repository's webhooks.
+func ServeWebhooks(w http.ResponseWriter, r *http.Request, v WebhooksView) {
+	if hxNav(r) {
+		render(w, r, WebhooksContent(v))
+		return
+	}
+	render(w, r, WebhooksPage(NavModel(r.URL.Path), v))
+}
+
+// ServeHome renders the home repo-finder: the bare content fragment on an htmx navigation, the
+// full document otherwise. user is the signed-in person's handle; unread their unread
+// notifications; inbox their CLs under way;
+// keyword is the active search filter; page1 is the first batch of rows; url is the ?page=N rows
+// endpoint (carrying the keyword); hasMore says whether page 2 exists.
+func ServeHome(w http.ResponseWriter, r *http.Request, user string, unread int64, inbox []InboxItem, keyword string, page1 []RepoItem, url string,
+	pageSize int, hasMore bool) {
+	if hxNav(r) {
+		render(w, r, HomeContent(user, unread, inbox, keyword, page1, url, pageSize, hasMore))
+		return
+	}
+	render(w, r, HomePage(NavModel(r.URL.Path), user, unread, inbox, keyword, page1, url, pageSize, hasMore))
 }
 
 // ServeHomeList renders just the repository list region — the fragment the search box (livefilter)
@@ -91,7 +212,23 @@ func ServeHomeList(w http.ResponseWriter, r *http.Request, keyword string, page1
 // NewRepoForm holds the create-repository form's field, echoed back on a validation error so
 // the input is preserved.
 type NewRepoForm struct {
-	Name string
+	// Owners are whom the person may make a repository of — the installation's organization,
+	// first, then themselves — and Owner the one chosen.
+	Owners []string
+	Owner  string
+	// Organization is the installation's organization's handle; "" for a hosted service.
+	Organization string
+	Name         string
+	// Upstream, for a fork, is the repository forked, and Action where the form posts.
+	Upstream, Action string
+}
+
+// formAction is where the form posts: a fork's own action, or a new repository's.
+func formAction(f NewRepoForm) string {
+	if f.Action != "" {
+		return f.Action
+	}
+	return "/repositories/new"
 }
 
 // ServeNewRepo renders the create-repository form: the bare fragment on an htmx navigation,
@@ -141,8 +278,15 @@ type CommitAt struct {
 // RepoChrome is the shared repo-view header/toolbar model: identity (the name, the subtitle),
 // the clone command, the commit being browsed, the path breadcrumb, and main's commit count.
 type RepoChrome struct {
-	Name         string
-	Subtitle     string // the header subtitle (who created it)
+	Name     string
+	Subtitle string // the header subtitle (who created it)
+	// Upstream is a fork's upstream, as the directory names it now, and UpstreamHref its page;
+	// ForkHref is where the person forks it, and SyncAction where they sync a fork they may write
+	// to: each "" when there is none, or they may not.
+	Upstream, UpstreamHref string
+	ForkHref, SyncAction   string
+	// WebhooksHref is its webhooks' page, for its administrators; "" for anyone else.
+	WebhooksHref string
 	Link         string // the repo's root URL path
 	CommitsCount int64
 	CommitsHref  string // main's history (/commits)
@@ -977,9 +1121,13 @@ type CLChecks struct {
 	Planned     bool   // its plan has run: the unaffected workflow jobs are known
 	Href        string // the tab's own fragment
 	Unavailable string // why automation could not be read ("" when it could)
-	Runs        []CLCheck
-	Skipped     []CLSkippedCheck
-	Post        CLPost
+	// NotRun says why the current patchset runs no pre of its own — a draft, or a CL under its
+	// stack's top — and RunPreHref runs it by hand ("" when the viewer may not).
+	NotRun     string
+	RunPreHref string
+	Runs       []CLCheck
+	Skipped    []CLSkippedCheck
+	Post       CLPost
 }
 
 // CLPost is the CL's post: its latest submission to the landing queue — where it stands, what

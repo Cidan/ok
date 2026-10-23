@@ -16,6 +16,11 @@ ok asks it who a caller is and what they are in.
   `eng.group.example.com`. More groups, and the ACLs that authorize, are declared in a repository as
   the **groups-and-ACLs tree**, a folder per set, where nesting is ownership: changes to a set are
   approved by the ACL that owns it.
+- **Organizations** own repositories (`hosted.md`, "Tenancy, as built"): `example.org.example.com`,
+  whose handle no person may have, nor any person's handle an organization. An installation has one,
+  made when ok identity first starts, of all its people; a hosted service has any number, each with
+  its owners, members, and teams (`eng.acme.team.example.com`, sets as groups are). An organization
+  acts as no one.
 - **Signing in**: people sign in in a browser with OpenID Connect (Google, Entra, Okta, Keycloak,
   any), their LDAP password, or a passkey. A command line signs in the way `gh auth login` does: it
   shows a code, the person approves it in a browser, and the machine gets a **credential** — a key it
@@ -139,6 +144,70 @@ opens `<public_url>/id/device`, where the person signs in and approves it, seein
 and address. Their account page lists every signed-in machine
 and signs any out.
 
+### Accounts, in a hosted service
+
+A hosted service (`tenancy.mode: hosted`) has no system of record for everyone: people make their
+own accounts, as `identity.sign_up` allows.
+
+- **Email and password** (`sign_up.email`, its links mailed through `smtp`, STARTTLS required but
+  to a server on loopback): `<public_url>/id/signup` takes an email, a handle, and a password — at
+  least 12 characters, holding neither the handle nor the email's name — hashed with argon2id at
+  once. A link mailed to the address makes the account within a day, after a button (so a mail
+  scanner that follows it makes nothing), and signs the person in. The page answers the same
+  whether the address has an account; one that has gets a note instead of a link. A person then
+  signs in with the email and password; a wrong password and an address with no account are
+  refused alike, in the same time, and ten failures in fifteen minutes stop an address's password
+  sign-ins until the window passes. `<public_url>/id/reset` mails a link, good for an hour, that
+  sets a new password and ends every other session (a role that resolved one lately lets it go
+  within 30 seconds, as it does a revoked credential).
+- **A social provider** (`sign_up.oidc`, among `sign_in.oidc`): its sign-in finds the account
+  linked to the provider's subject — never one matched by email, which would hand an account to
+  whoever controls that provider's claim — or, the first time, makes one under a handle the person
+  chooses, with the provider's verified email if no account has it. An account links and unlinks
+  providers on its page, and keeps a way in: its only link is not unlinked without a password.
+
+Passkeys are added after, as anywhere; jj and okfs sign in as always (`jj auth login`). A person
+deletes their account on its page, typing their handle: it is suspended and its repositories
+deleted, an administrator can restore it within 30 days (`Admin.RestoreAccount`), and after that it
+is gone for good, its handle never anyone's again.
+
+### Enterprise organizations
+
+An organization may bring its own identity provider (ok identity's `Tenancy.SetIdentityProvider`,
+by its owners): a system of record — Google Workspace, Entra ID, LDAP, or SCIM, configured as an
+installation's are, but per organization — and, optionally, its single sign-on, OpenID Connect. Its
+secrets (a service account's key, a client secret, a bind password) are sealed with the
+installation's key (`identity.sealing_key_file`: 32 random bytes, base64, `ok`'s `seal.NewKey`) and
+never answered; one left out when the provider is set again keeps what was set. Without the key, no
+organization keeps a provider.
+
+Its sync provisions the organization's people as an installation's sync does — made, renamed,
+suspended, and deleted as the provider says — named `<handle>-<org>` (`erin-acme`), so they take no
+handle anyone else holds, members of the organization, and linked to the provider by their ID there;
+its groups become the organization's teams, `<group>.<org>.team.<domain>`, whose members the sync
+alone changes, a renamed team's grants following it. It runs every `interval_secs` (five minutes at
+least), at once when an owner asks (`SyncIdentityProvider`), and soon after a SCIM provider pushes.
+A SCIM provider pushes to `<public_url>/id/scim/v2/orgs/<org>` with the token `ResetSCIMToken`
+makes (shown once); what it provisions is the organization's alone. ok reaches an organization's
+LDAP directory and OpenID Connect provider at public addresses alone, as federation's issuers.
+
+The organization's people sign in at `<public_url>/id/login/org/<org>`, matched among its people
+alone — by the provider's verified email, or by an external ID claim (`sub`; `oid` for Entra) — and
+a SCIM provider's by email, since its people are known by ok's own IDs. Removing the provider leaves
+its people as they are, signing in no more through it.
+
+### Personal tokens
+
+Where no device signs in — a CI job, a script — a person uses a **personal token**, made on their
+account page (`<public_url>/id/account`) or through the `Tokens` service: a label, the repositories
+it reaches (none: every one they may reach), the most it allows (read, triage, write, maintain, or
+admin), and how many days it lives (at most 366). Its secret, `okp_…`, is shown once, and ok keeps
+only its SHA-256. A request presents it as `Authorization: Bearer okp_…` (jj: `OK_TOKEN`), and is
+the person's, narrowed: what they may do, and no more than the token allows, on the repositories it
+names. A token reaches repositories and nothing else — it signs no one in to the account pages, and
+mints no token, credential, or organization. It stops working when revoked or expired, or when its
+person no longer stands; a role that cached it stops within 30 seconds.
+
 ## Robots
 
 ```bash
@@ -151,6 +220,55 @@ against the issuer listed under `identity.federation` and the audience you named
 value another service accepts too. For a robot that runs where no issuer vouches for it, an
 administrator certifies a key it holds (`Admin.CertifyRobot`), and it renews its certificate as a
 command line does.
+
+### An organization's robots
+
+In a hosted service an organization keeps robots of its own — a CI identity, a deploy agent — which
+its owners make, certify, and delete through ok identity's `Tenancy` service
+(`CreateOrganizationRobot`, `CertifyOrganizationRobot`, `DeleteOrganizationRobot`), and its
+members list. One is named under the organization, `ci.acme.robot.<domain>`; it is a member of
+nothing, so the organization's base role gives it nothing, and it reaches the organization's
+repositories through the grants they give it alone — never another organization's. It signs in with
+a key an owner certified, renewing its certificate as a command line does. (An installation's
+robots are its administrators', above, and are members of the installation.)
+
+One of them may be its **deploy agent** (`DeployAgents.SetDeployAgent`, by its owners;
+`GetDeployAgent`, by its members): the robot that runs in its cluster, through which ok's deployer
+rolls its workloads and runs its migrations (deploy.md, "Deploy agents"). The deployer asks which
+organization a connecting robot is the agent of, and the agent which cells hold its organization's
+repositories (`DeployCells`) and whether a repository is its organization's (`AgentRepository`). A
+deleted or suspended robot is no one's agent.
+
+An organization's robot may sign in with a CI system's token instead, as an installation's robot does — but from an
+issuer its organization trusts (`TrustIssuer`, by its owners; `ListIssuers`, by its members), and
+bound by its owners (`BindOrganizationRobot`) to that issuer's subject. A token for an organization
+carries the organization's ID as its audience (`ListIssuers` says it), so one minted for one
+organization signs in no other's robot, and two organizations may bind the same subject, each to its
+own robot. ok fetches an organization's issuer's discovery document and keys over HTTPS from
+public addresses only — refusing loopback, private, link-local, and shared addresses on each
+connection, after DNS — and keeps them a day (a development server, `-dev`, reaches one anywhere).
+Distrusting an issuer unbinds the organization's robots from it. In GitHub Actions:
+
+```yaml
+- run: |
+    token=$(curl -s -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+      "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=<the organization's audience>" | jq -r .value)
+```
+
+### Apps
+
+An **app** is one of an organization's robots with a public key — ECDSA P-256 or Ed25519 — which
+its owners make (ok identity's `Apps.CreateApp`), replace the key of, and delete. An organization's
+owners install one — their own, or another organization's made public — with a role on their
+repositories, the ones named or every one (`Apps.InstallApp`); installing it again changes what it
+was installed with, and its tokens go. The app signs in by signing a JWT with its key — ES256 or
+EdDSA; its `iss` the app's ID, its `aud` ok's public URL, issued now and expiring within ten
+minutes — and handing it to `AppTokens`: `ListAppInstallations` lists where it is installed, and
+`CreateInstallationToken` trades it for an installation's token, `oki_…`, good for an hour, which
+it presents as `Authorization: Bearer oki_…` (jj: `OK_TOKEN`). The token is the app's robot,
+narrowed to its installation: the installing organization's repositories alone, as far as the
+installation allows, wherever else the app is installed. Uninstalled, or the app deleted, its tokens
+are none.
 
 ### ok's own roles
 
@@ -210,5 +328,10 @@ tree, and shows each set's owner.
 ```
 ok admin sync | status | name | robots | robot create|delete|bind|unbind|certify | credentials | revoke
 ```
+
+`ok identity move-in [-config ok.yaml] [-organization HANDLE]` moves an installation in as an
+organization of a hosted service, from identity's database with ok's roles stopped
+([hosted.md](hosted.md), "Moving an installation in, as built"); it says what of the configuration
+to change before the roles start again.
 
 Every administrative act, sign-in, and sync is recorded in the audit table.

@@ -3,11 +3,10 @@ package migrate
 import (
 	"context"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"testing/fstest"
-
-	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Cidan/ok/internal/testdb"
 )
@@ -34,11 +33,7 @@ func TestLoad(t *testing.T) {
 
 func TestApply(t *testing.T) {
 	ctx := context.Background()
-	pool, err := pgxpool.New(ctx, testdb.Postgres(t))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(pool.Close)
+	pool := testdb.Pool(t)
 	ms := []Migration{
 		{1, "first", "CREATE TABLE a (x int)"},
 		{2, "second", "ALTER TABLE a ADD COLUMN y int"},
@@ -63,5 +58,44 @@ func TestApply(t *testing.T) {
 	var n int
 	if err := pool.QueryRow(ctx, "SELECT count(*) FROM test_migrations").Scan(&n); err != nil || n != 2 {
 		t.Errorf("recorded %d migrations, %v", n, err)
+	}
+}
+
+// Replicas starting together apply each migration once, under the schema's migrate lock: the
+// others wait for it, then find nothing left to do.
+func TestApplyAtOnce(t *testing.T) {
+	ctx := context.Background()
+	pool := testdb.Pool(t)
+	ms := []Migration{
+		{1, "table", "CREATE TABLE b (x int)"},
+		{2, "slow", "SELECT pg_sleep(0.5); INSERT INTO b VALUES (1)"},
+		{3, "again", "INSERT INTO b VALUES (2)"},
+	}
+	type result struct {
+		did []int
+		err error
+	}
+	results := make(chan result, 8)
+	for range 8 {
+		go func() {
+			did, err := Apply(ctx, pool, "atonce", ms)
+			results <- result{did, err}
+		}()
+	}
+	var all []int
+	for range 8 {
+		r := <-results
+		if r.err != nil {
+			t.Errorf("Apply at once: %v", r.err)
+		}
+		all = append(all, r.did...)
+	}
+	sort.Ints(all)
+	if !reflect.DeepEqual(all, []int{1, 2, 3}) {
+		t.Errorf("the migrations applied, among them all = %v, want each once", all)
+	}
+	var n int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM b").Scan(&n); err != nil || n != 2 {
+		t.Errorf("b holds %d rows, %v; want 2", n, err)
 	}
 }

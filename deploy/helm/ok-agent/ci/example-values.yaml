@@ -1,0 +1,6 @@
+address: ok.example.com:443
+organizationID: prn_exampleorganization
+namespaces: [shop, shop-jobs]
+migrations:
+  env:
+    APP_DATABASE_URL: {secret: shop-db, key: url}

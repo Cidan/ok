@@ -17,6 +17,8 @@ import (
 	"strings"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/Cidan/ok/internal/secrets"
 )
 
 // Phase is when a job runs.
@@ -41,7 +43,19 @@ type Job struct {
 	Target string // a Bazel label, canonical: //package:name
 	// Args are the job's arguments, placeholders unexpanded.
 	Args []string
-	Line int // the job's line in File
+	// Pool is the pool of workers it runs in (docs/hosted.md, "Hosted automation, as built"):
+	// "" for its repository's (Settings.Pool).
+	Pool string
+	// Secrets are the secrets a post job reads as it runs on main (docs/secrets.md, "Readers that
+	// are not people"); a pre job reads none.
+	Secrets []Secret
+	Line    int // the job's line in File
+}
+
+// Secret is a secret a stanza names, by its path, and its line.
+type Secret struct {
+	Path string // the repository path: secret/prod/db-password
+	Line int
 }
 
 // ID is the job's identity: its defining file, phase, and name. Two directories that include
@@ -84,6 +98,8 @@ type Deploy struct {
 	// other services need, such as a database's. It takes a wave of its own after the rest of its
 	// plan's, and no other deployment, of any plan, runs beside it.
 	Alone bool
+	// Secrets are the secrets its migrations read (docs/secrets.md, "Readers that are not people").
+	Secrets []Secret
 }
 
 // ID is the deploy's identity: its defining file and name.
@@ -310,8 +326,29 @@ func (p *parser) job(phase Phase, name string, kv pair) (Job, bool) {
 				}
 				j.Args = append(j.Args, a.Value)
 			}
+		case "pool":
+			if f.value.Kind != yaml.ScalarNode || f.value.Tag == "!!null" {
+				p.errorf(f.value.Line, "job %s: pool is the name of a pool of workers", name)
+				ok = false
+				continue
+			}
+			if err := ValidPool(f.value.Value); err != nil {
+				p.errorf(f.value.Line, "job %s: %v", name, err)
+				ok = false
+				continue
+			}
+			j.Pool = f.value.Value
+		case "secrets":
+			if phase != Post {
+				p.errorf(f.key.Line, "job %s: a %s job reads no secret: only post jobs, which run on main, do", name, phase)
+				ok = false
+				continue
+			}
+			s, good := p.secrets("job "+name, f.value)
+			ok = ok && good
+			j.Secrets = s
 		default:
-			p.errorf(f.key.Line, "job %s: unknown field %q (a job has target and args)", name, f.key.Value)
+			p.errorf(f.key.Line, "job %s: unknown field %q (a job has target, args, pool, and secrets)", name, f.key.Value)
 			ok = false
 		}
 	}
@@ -424,8 +461,12 @@ func (p *parser) deploy(name string, kv pair) (Deploy, bool) {
 				continue
 			}
 			d.Alone = f.value.Value == "true"
+		case "secrets":
+			s, good := p.secrets("deploy "+name, f.value)
+			ok = ok && good
+			d.Secrets = s
 		default:
-			fail(f.key.Line, "unknown field %q (a deploy has migrate, images, workload, group, and alone)", f.key.Value)
+			fail(f.key.Line, "unknown field %q (a deploy has migrate, images, workload, group, alone, and secrets)", f.key.Value)
 		}
 	}
 	if !ok {
@@ -444,8 +485,38 @@ func (p *parser) deploy(name string, kv pair) (Deploy, bool) {
 	case d.Group != "" && d.Workload == nil:
 		p.errorf(kv.key.Line, "deploy %s has a group but no workload: only a service — a deploy with a workload — is grouped", name)
 		return d, false
+	case len(d.Secrets) > 0 && len(d.Migrate) == 0:
+		p.errorf(kv.key.Line, "deploy %s names secrets but has no migrations to give them to: a deploy's secrets are its migrations'", name)
+		return d, false
 	}
 	return d, true
+}
+
+// secrets reads a stanza's secrets: a list of paths from the repository's root, //secret/…, each
+// once.
+func (p *parser) secrets(what string, n *yaml.Node) ([]Secret, bool) {
+	if n.Kind != yaml.SequenceNode || len(n.Content) == 0 {
+		p.errorf(n.Line, "%s: secrets is a list of secrets, //secret/<path>", what)
+		return nil, false
+	}
+	var out []Secret
+	ok := true
+	seen := map[string]bool{}
+	for _, e := range n.Content {
+		path, valid := secrets.ParseRef(e.Value)
+		switch {
+		case e.Kind != yaml.ScalarNode || !strings.HasPrefix(e.Value, "//") || !valid:
+			p.errorf(e.Line, "%s: %q is not a secret, //secret/<path>", what, e.Value)
+			ok = false
+		case seen[path]:
+			p.errorf(e.Line, "%s: %s is named twice", what, e.Value)
+			ok = false
+		default:
+			seen[path] = true
+			out = append(out, Secret{Path: path, Line: e.Line})
+		}
+	}
+	return out, ok
 }
 
 func (p *parser) workload(name string, n *yaml.Node) (*Workload, bool) {

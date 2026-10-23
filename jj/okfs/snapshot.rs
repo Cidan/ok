@@ -50,6 +50,10 @@ pub trait FsView: Send + Sync {
     fn list_dir(&self, path: &RepoPath) -> io::Result<pb::ListDirReply>;
     /// Remembers the content IDs computed for written files' versions.
     fn remember(&self, files: Vec<pb::Remembered>) -> io::Result<()>;
+    /// Stores a written secret's value in ok secrets and puts its pointer in the overlay
+    /// (docs/secrets.md, "In a virtual workspace"), returning the file's entry as it now is; None
+    /// when it is not to be recorded.
+    fn seal_secret(&self, path: &RepoPath) -> io::Result<Option<pb::DirEntry>>;
 }
 
 /// Which new files become tracked (jj's `SnapshotOptions`).
@@ -110,8 +114,13 @@ async fn trees_at(
     Ok(Merge::from_vec(out))
 }
 
+/// A name's value across a merge's terms, simplified: in a conflicted commit, whose tree has a term
+/// per side, a name no term holds is absent — not a merge of absences, which jj takes for present
+/// and for a tree — and one every side holds alike is that value, as the file system shows it.
 fn value_at(trees: &Merge<Option<Tree>>, name: &RepoPathComponent) -> MergedTreeValue {
-    trees.map(|t| t.as_ref().and_then(|t| t.value(name).cloned()))
+    trees
+        .map(|t| t.as_ref().and_then(|t| t.value(name).cloned()))
+        .simplify()
 }
 
 /// The terms of a tree-valued merge (None where a term is not a tree).
@@ -206,7 +215,9 @@ pub async fn snapshot(
             continue;
         }
 
-        // The directory's ignore files, .ignore first and .gitignore over it.
+        // The directory's ignore files, .ignore first and .gitignore over it. One the overlay does not
+        // hold is the source's, read as the file system shows it (model.rs): in a conflicted
+        // commit, whose tree has a term per side, a file each side holds alike is that file.
         let mut ignores = w.ignores.clone();
         for file in [".ignore", ".gitignore"] {
             let Ok(c) = RepoPathComponent::new(file) else {
@@ -214,9 +225,9 @@ pub async fn snapshot(
             };
             let contents = match overlay.get(file.as_bytes()) {
                 Some(e) => fs_contents(store, &w.path.join(c), e).await?,
-                None => match value_at(&source, c).into_resolved() {
-                    Ok(Some(TreeValue::File { id, .. })) => {
-                        Some(read_all(store, &w.path.join(c), &id).await?)
+                None => match value_at(&source, c).resolve_trivial(SameChange::Accept) {
+                    Some(Some(TreeValue::File { id, .. })) => {
+                        Some(read_all(store, &w.path.join(c), id).await?)
                     }
                     _ => None,
                 },
@@ -379,6 +390,11 @@ pub async fn snapshot(
                     }
                 }
                 Fs::Written(e) => {
+                    // A secret whose value was lost before it was sealed: the recorded tree keeps
+                    // what it had.
+                    if e.secret_lost {
+                        continue;
+                    }
                     if !tracked_file
                         && !new_file_tracked(&child, &ignores, t, Some(e.size), &mut untracked)
                     {
@@ -387,6 +403,21 @@ pub async fn snapshot(
                         }
                         continue;
                     }
+                    // A secret written and tracked: its value is stored now, and its pointer is
+                    // what the snapshot records.
+                    let e = if e.secret_pending {
+                        match view.seal_secret(&child).map_err(|err| {
+                            other(
+                                format!("storing the secret {}", child.as_internal_file_string()),
+                                err,
+                            )
+                        })? {
+                            Some(e) => e,
+                            None => continue,
+                        }
+                    } else {
+                        e
+                    };
                     let v = written_value(store, &child, &e, &rec, &mut remembered).await?;
                     if v != rec {
                         builder.set_or_remove(child, v);

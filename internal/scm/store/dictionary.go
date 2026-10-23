@@ -1,18 +1,21 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"errors"
 	"fmt"
-	"sort"
 	"sync"
 	"time"
 
 	builddict "github.com/klauspost/compress/dict"
 	"github.com/klauspost/compress/zstd"
 
+	"github.com/Cidan/ok/internal/scm/contentindex"
 	"github.com/Cidan/ok/internal/scm/encoding"
+	"github.com/Cidan/ok/internal/scm/pack"
+	"github.com/Cidan/ok/internal/scm/store/backend"
 	"github.com/Cidan/ok/internal/serve/metrics"
 )
 
@@ -54,17 +57,35 @@ var dictionaryChunks = metrics.NewCounter("ok_scm_dictionary_chunks_total",
 type dictionaries struct {
 	s        *Store
 	mu       sync.Mutex
-	decoders map[uint32]*zstd.Decoder
+	decoders map[netDictionary]*zstd.Decoder
+}
+
+// netDictionary is a dictionary as a frame names it within its network: an ID is its network's.
+type netDictionary struct {
+	net backend.Network
+	id  uint32
 }
 
 func newDictionaries(s *Store) *dictionaries {
-	return &dictionaries{s: s, decoders: map[uint32]*zstd.Decoder{}}
+	return &dictionaries{s: s, decoders: map[netDictionary]*zstd.Decoder{}}
 }
 
-// Decoder is a decoder holding the dictionary a frame names (pack.Dicts), read once.
-func (d *dictionaries) Decoder(id uint32) (*zstd.Decoder, error) {
+// of decodes the frames of a network's packs (pack.Dicts): each names one of its network's
+// dictionaries.
+func (d *dictionaries) of(net backend.Network) pack.Dicts { return networkDicts{d, net} }
+
+type networkDicts struct {
+	d   *dictionaries
+	net backend.Network
+}
+
+func (n networkDicts) Decoder(id uint32) (*zstd.Decoder, error) { return n.d.decoder(n.net, id) }
+
+// decoder is a decoder holding a network's dictionary a frame names, read once.
+func (d *dictionaries) decoder(net backend.Network, id uint32) (*zstd.Decoder, error) {
+	k := netDictionary{net, id}
 	d.mu.Lock()
-	dec, ok := d.decoders[id]
+	dec, ok := d.decoders[k]
 	d.mu.Unlock()
 	if ok {
 		return dec, nil
@@ -72,12 +93,12 @@ func (d *dictionaries) Decoder(id uint32) (*zstd.Decoder, error) {
 	if id < dictionaryIDBase {
 		return nil, fmt.Errorf("dictionary %d: no dictionary has that ID", id)
 	}
-	body, ok, err := d.s.b.DictionaryBody(context.Background(), int64(id-dictionaryIDBase))
+	body, _, ok, err := d.s.b.NetworkDictionary(context.Background(), net, int64(id-dictionaryIDBase))
 	if err != nil {
 		return nil, err
 	}
 	if !ok {
-		return nil, notFound("dictionary %d", id)
+		return nil, notFound("network %d's dictionary %d", net, id)
 	}
 	dec, err = zstd.NewReader(nil, zstd.WithDecoderDicts(body), zstd.WithDecoderConcurrency(0))
 	if err != nil {
@@ -85,47 +106,120 @@ func (d *dictionaries) Decoder(id uint32) (*zstd.Decoder, error) {
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if have, ok := d.decoders[id]; ok {
+	if have, ok := d.decoders[k]; ok {
 		dec.Close()
 		return have, nil
 	}
-	d.decoders[id] = dec
+	d.decoders[k] = dec
 	return dec, nil
 }
 
-// Dictionary is a repository's dictionary as a zstd frame names it: what a client decoding the
-// chunks compressed with it fetches. A dictionary holds pieces of the repository's files, so it is
-// read only through its repository.
+// Dictionary is a repository's network's dictionary as a zstd frame names it: what a client
+// decoding the chunks compressed with it fetches. A dictionary holds pieces of the files it was
+// trained on, so it is read only through a repository that may read those (dictionaryReadable).
 func (s *Store) Dictionary(ctx context.Context, repo int64, id uint32) ([]byte, error) {
 	if id < dictionaryIDBase {
 		return nil, notFound("dictionary %d", id)
 	}
-	body, ok, err := s.b.RepositoryDictionary(ctx, repo, int64(id-dictionaryIDBase))
-	if err == nil && !ok {
-		err = notFound("dictionary %d", id)
+	net, err := s.network(ctx, repo)
+	if err != nil {
+		return nil, err
 	}
-	return body, err
+	body, trainer, ok, err := s.ops(ctx).NetworkDictionary(ctx, net, int64(id-dictionaryIDBase))
+	if err != nil {
+		return nil, err
+	}
+	if ok {
+		s.dictTrainers.Store(id, trainer)
+		readable, err := s.dictionaryReadable(ctx, repo)
+		if err != nil {
+			return nil, err
+		}
+		if ok, err = readable(id); err != nil {
+			return nil, err
+		}
+	}
+	if !ok {
+		return nil, notFound("dictionary %d", id)
+	}
+	return body, nil
 }
 
-// newestDictionary is a repository's newest dictionary and when it was trained; a body of nil
-// when it has none.
+// dictionaryReadable says which dictionaries a repository may read (docs/hosted.md, "Fork
+// networks, as built", "Dictionaries"): those it trained, and of each other trainer those it was
+// granted — no newer than its source could read when it last forked or synced, and so trained
+// only on content it inherited.
+func (s *Store) dictionaryReadable(ctx context.Context, repo int64) (func(uint32) (bool, error), error) {
+	grants, err := s.ops(ctx).DictionaryGrants(ctx, repo)
+	if err != nil {
+		return nil, err
+	}
+	net, err := s.network(ctx, repo)
+	if err != nil {
+		return nil, err
+	}
+	return func(id uint32) (bool, error) {
+		if id < dictionaryIDBase {
+			return false, nil
+		}
+		row := int64(id - dictionaryIDBase)
+		trainer, ok := s.dictTrainers.Load(id)
+		if !ok {
+			_, t, found, err := s.ops(ctx).NetworkDictionary(ctx, net, row)
+			if err != nil || !found {
+				return false, err
+			}
+			s.dictTrainers.Store(id, t)
+			trainer = t
+		}
+		t := trainer.(int64)
+		upTo, granted := grants[t]
+		return t == repo || (granted && row <= upTo), nil
+	}, nil
+}
+
+// readableDictionaries are, for each trainer, the newest dictionary a repository may read: what
+// a fork of it, or a sync from it, grants.
+func (s *Store) readableDictionaries(ctx context.Context, repo int64) (map[int64]int64, error) {
+	grants, err := s.ops(ctx).DictionaryGrants(ctx, repo)
+	if err != nil {
+		return nil, err
+	}
+	own, ok, err := s.ops(ctx).NewestDictionaryOf(ctx, repo)
+	if err != nil {
+		return nil, err
+	}
+	if ok {
+		grants[repo] = own
+	}
+	return grants, nil
+}
+
+// newestDictionary is a repository's network's newest dictionary and when it was trained; a body
+// of nil when it has none.
 func (s *Store) newestDictionary(ctx context.Context, repo int64) (id uint32, body []byte, at time.Time, err error) {
-	row, body, at, ok, err := s.b.NewestDictionary(ctx, repo)
+	net, err := s.network(ctx, repo)
+	if err != nil {
+		return 0, nil, time.Time{}, err
+	}
+	row, body, at, ok, err := s.ops(ctx).NewestDictionary(ctx, net)
 	if err != nil || !ok {
 		return 0, nil, time.Time{}, err
 	}
 	return uint32(row + dictionaryIDBase), body, at, nil
 }
 
-// dictionaryEncoder is an encoder with a repository's newest dictionary, at zstd's highest level:
-// compaction's, which nothing waits on. Nil when the repository has none.
+// dictionaryEncoder is an encoder with a repository's newest dictionary: compaction's. It encodes
+// small chunks one EncodeAll at a time, and each call resets the encoder; at SpeedBestCompression a
+// reset with a dictionary copies the level's large tables, some 4.5 ms a chunk however small, for
+// 0.2% less output than SpeedBetterCompression's 37 µs. Nil when the repository has none.
 func (s *Store) dictionaryEncoder(ctx context.Context, repo int64) (*zstd.Encoder, uint32, error) {
 	id, body, _, err := s.newestDictionary(ctx, repo)
 	if err != nil || body == nil {
 		return nil, 0, err
 	}
 	enc, err := zstd.NewWriter(nil,
-		zstd.WithEncoderLevel(zstd.SpeedBestCompression),
+		zstd.WithEncoderLevel(zstd.SpeedBetterCompression),
 		zstd.WithEncoderDict(body),
 		zstd.WithEncoderCRC(true),
 		zstd.WithEncoderConcurrency(1))
@@ -135,12 +229,23 @@ func (s *Store) dictionaryEncoder(ctx context.Context, repo int64) (*zstd.Encode
 	return enc, id, nil
 }
 
-// trainDictionary trains a dictionary for the repository when it has none, or its newest is older
-// than DictionaryRetrain: from up to dictionarySamples of its small files, chosen as the files
+// trainDictionary trains a dictionary for the repository's network, if the repository is the one
+// that trains them, when it has none or its newest is older than DictionaryRetrain: from up to
+// dictionarySamples of its small pinned files, chosen as the files
 // whose IDs follow a random point — IDs are uniform, so they are a uniform sample, read through
 // the primary key whatever the repository's size. It returns the dictionary's frame ID, 0 when it
 // trained none.
 func (s *Store) trainDictionary(ctx context.Context, repo int64, now time.Time) (uint32, int, error) {
+	net, err := s.network(ctx, repo)
+	if err != nil {
+		return 0, 0, err
+	}
+	// One repository of a network trains, and only from what it has pinned: a dictionary holds
+	// pieces of what it was trained on, and every reader its trainer grants it to may read that.
+	trainer, err := s.ops(ctx).NetworkTrainer(ctx, net)
+	if err != nil || trainer != repo {
+		return 0, 0, err
+	}
 	_, body, at, err := s.newestDictionary(ctx, repo)
 	if err != nil {
 		return 0, 0, err
@@ -152,21 +257,27 @@ func (s *Store) trainDictionary(ctx context.Context, repo int64, now time.Time) 
 	if _, err := rand.Read(start[:]); err != nil {
 		return 0, 0, err
 	}
-	_, x, err := s.contentIndex(ctx, repo)
+	v, err := s.contentView(ctx, repoScope(repo))
 	if err != nil {
 		return 0, 0, err
 	}
 	// The small files whose IDs follow the random point, wrapping around.
-	all := x.Sorted()
-	first := sort.Search(len(all), func(i int) bool { return string(all[i].ID[:]) >= string(start[:]) })
 	var files []encoding.ID
-	for i := range all {
-		k := all[(first+i)%len(all)]
-		if k.Entry.Kind == encoding.KindFile && k.Entry.Body && k.Entry.Size >= dictionaryFileMin && k.Entry.Size <= dictionaryFileMax {
-			files = append(files, k.ID)
-			if len(files) == dictionarySamples {
-				break
-			}
+	sample := func(id encoding.ID, e contentindex.Entry) bool {
+		if e.Kind == encoding.KindFile && e.Pinned && e.Size >= dictionaryFileMin && e.Size <= dictionaryFileMax {
+			files = append(files, id)
+		}
+		return len(files) < dictionarySamples
+	}
+	if err := v.ascend(ctx, encoding.ID(start), sample); err != nil {
+		return 0, 0, err
+	}
+	if len(files) < dictionarySamples {
+		err := v.ascend(ctx, encoding.ID{}, func(id encoding.ID, e contentindex.Entry) bool {
+			return bytes.Compare(id[:], start[:]) < 0 && sample(id, e)
+		})
+		if err != nil {
+			return 0, 0, err
 		}
 	}
 	least := minDictionarySamples
@@ -183,8 +294,12 @@ func (s *Store) trainDictionary(ctx context.Context, repo int64, now time.Time) 
 	if len(samples) < least {
 		return 0, 0, nil
 	}
-	row, err := s.b.InsertDictionary(ctx, repo, len(samples))
-	if err != nil {
+	var row int64
+	if err := s.inTx(ctx, func(ctx context.Context, tx *txn) error {
+		var err error
+		row, err = tx.InsertDictionary(ctx, net, repo, len(samples))
+		return err
+	}); err != nil {
 		return 0, 0, err
 	}
 	id := uint32(row + dictionaryIDBase)
@@ -193,13 +308,13 @@ func (s *Store) trainDictionary(ctx context.Context, repo int64, now time.Time) 
 		HashBytes:      6,
 		ZstdDictID:     id,
 		ZstdDictCompat: true,
-		ZstdLevel:      zstd.SpeedBestCompression,
+		ZstdLevel:      zstd.SpeedBetterCompression, // dictionaryEncoder's, which the tables are fitted for
 	})
 	if err == nil {
-		err = s.b.SetDictionaryBody(ctx, row, dict)
+		err = s.inTx(ctx, func(ctx context.Context, tx *txn) error { return tx.SetDictionaryBody(ctx, net, row, dict) })
 	}
 	if err != nil {
-		if derr := s.b.DeleteDictionary(context.WithoutCancel(ctx), row); derr != nil {
+		if derr := s.b.DeleteDictionary(context.WithoutCancel(ctx), net, row); derr != nil {
 			return 0, 0, errors.Join(err, derr)
 		}
 		return 0, 0, fmt.Errorf("training dictionary %d: %w", id, err)

@@ -26,7 +26,7 @@ func (e *env) rollback(principal, path, reason string) string {
 // file is a file's contents on main, and whether it is there.
 func (e *env) file(repo, path string) (string, bool) {
 	e.t.Helper()
-	p := e.do(alice, http.MethodGet, "/"+repo+"/raw/main/"+path, nil, nil)
+	p := e.do(alice, http.MethodGet, "/example/"+repo+"/raw/main/"+path, nil, nil)
 	return p.body, p.status == http.StatusOK
 }
 
@@ -56,7 +56,7 @@ func TestRollbacks(t *testing.T) {
 	b.jj("svc", "describe", "-m", "lib: one is two")
 	n2 := uploaded(b.jj("svc", "cl"))[0]
 	p2 := clPath("svc", n2)
-	e.post(bob, p2+"/request-review", url.Values{"reviewer": {alice}})
+	e.post(bob, p2+"/request-review", url.Values{"reviewer": {e.id(alice)}})
 	e.post(alice, p2+"/reply", grant("LGTM"))
 	e.prePassed("svc", n2)
 	e.submitted(bob, p2, "submit")
@@ -82,7 +82,7 @@ func TestRollbacks(t *testing.T) {
 	if got := submitTitle(p, "Submit"); !strings.Contains(got, "LGTM") || strings.Contains(got, "Approval") {
 		t.Errorf("the rollback's submit: %q", got)
 	}
-	if !chip(e.get(carol, "/svc/cls"), "Rollback") {
+	if !chip(e.get(carol, "/example/svc/cls"), "Rollback") {
 		t.Errorf("the finder does not mark the rollback")
 	}
 
@@ -132,8 +132,8 @@ func TestRollbacks(t *testing.T) {
 	n5, n6 := stack[0], stack[1]
 	for _, n := range stack {
 		e.post(alice, clPath("svc", n)+"/reply", grant("LGTM"))
-		e.prePassed("svc", n)
 	}
+	e.prePassed("svc", n6) // at the stack's top, over both
 	e.submitted(bob, clPath("svc", n6), "submit-stack")
 	a.jj("svc", "sync")
 	a.jj("svc", "new", "main@ok", "-m", "lib: one is four")

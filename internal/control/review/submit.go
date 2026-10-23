@@ -8,8 +8,8 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/Cidan/ok/internal/authz"
 	"github.com/Cidan/ok/internal/control/db"
-	"github.com/Cidan/ok/internal/control/people"
 	automationpb "github.com/Cidan/ok/proto/ok/automation/v1"
 	scmpb "github.com/Cidan/ok/proto/ok/scm/v1"
 )
@@ -84,9 +84,11 @@ func (s *Service) plan(ctx context.Context, cl db.ChangeList, c *scmpb.ChangeLis
 }
 
 // check runs every gate but the landing itself against main's head: each CL open and not
-// already submitting, the principal allowed to submit it, its review requirements met, and its
-// current patchset's pre passed.
-func (s *Service) check(ctx context.Context, repo *scmpb.Repository, l *landing, principal string, head []byte) error {
+// already submitting, the principal allowed to submit it, and its review requirements met; and
+// the current patchset's pre of the top of what is submitted passed — pre runs at a stack's top,
+// over every CL of it (docs/automation.md, "pre"). With start, a top whose pre never ran has it
+// started.
+func (s *Service) check(ctx context.Context, repo *scmpb.Repository, l *landing, principal string, head []byte, start bool) error {
 	for i, cl := range l.items {
 		if cl.Status == db.StatusDraft {
 			if len(l.items) == 1 {
@@ -103,7 +105,10 @@ func (s *Service) check(ctx context.Context, repo *scmpb.Repository, l *landing,
 			}
 			return refuse("CL %d is already submitting", cl.Number)
 		}
-		if !s.CanManage(ctx, repo, cl, principal) {
+		if !s.CanSubmit(ctx, repo, cl, principal) {
+			if d := s.Decide(ctx, repo, principal, authz.Land); !d.Allowed {
+				return refuse("%s", upperFirst(d.Why))
+			}
 			if len(l.items) == 1 {
 				return refuse("Only the author or a repository admin can submit this changelist")
 			}
@@ -113,22 +118,27 @@ func (s *Service) check(ctx context.Context, repo *scmpb.Repository, l *landing,
 		if err != nil {
 			return err
 		}
-		reason := ev.Status.BlockedReason()
-		if reason == "" {
-			reason = s.PreBlocked(ctx, cl)
+		if reason := ev.Status.BlockedReason(); reason != "" {
+			return refuseFor(l, cl, reason)
 		}
-		if reason != "" {
-			if len(l.items) == 1 {
-				return refuse("%s", reason)
-			}
-			return refuse("CL %d: %s", cl.Number, strings.ToLower(reason[:1])+reason[1:])
-		}
+	}
+	top := l.items[len(l.items)-1]
+	if reason := s.PreBlocked(ctx, top, start, principal); reason != "" {
+		return refuseFor(l, top, reason)
 	}
 	return nil
 }
 
+// refuseFor refuses a submission for a reason of one of its CLs: named, when it is a stack's.
+func refuseFor(l *landing, cl db.ChangeList, reason string) error {
+	if len(l.items) == 1 {
+		return refuse("%s", reason)
+	}
+	return refuse("CL %d: %s", cl.Number, strings.ToLower(reason[:1])+reason[1:])
+}
+
 func (l *landing) request(repo int64, principal string, head []byte, dryRun bool) *scmpb.LandRequest {
-	req := &scmpb.LandRequest{RepositoryId: repo, Actor: principal, ExpectedHead: head, DryRun: dryRun}
+	req := &scmpb.LandRequest{RepositoryId: repo, ActorId: principal, ExpectedHead: head, DryRun: dryRun}
 	for _, cl := range l.items {
 		req.Items = append(req.Items, &scmpb.LandRequest_Item{Number: cl.Number, Patchset: cl.CurrentPatchset})
 	}
@@ -150,7 +160,7 @@ func (s *Service) Blocked(ctx context.Context, repo *scmpb.Repository, cl db.Cha
 		return blocked(err)
 	}
 	head := repo.GetHead()
-	if err := s.check(ctx, repo, l, principal, head); err != nil {
+	if err := s.check(ctx, repo, l, principal, head, false); err != nil {
 		return blocked(err)
 	}
 	_, err = s.scm.LandingChecks.DryRunLand(ctx, l.request(repo.GetId(), principal, head, true))
@@ -191,7 +201,7 @@ func (s *Service) Submit(ctx context.Context, repo *scmpb.Repository, cl db.Chan
 		if err != nil {
 			return err
 		}
-		if err := s.check(ctx, r, l, principal, r.GetHead()); err != nil {
+		if err := s.check(ctx, r, l, principal, r.GetHead(), true); err != nil {
 			return err
 		}
 		_, err = s.scm.LandingChecks.DryRunLand(ctx, l.request(repo.GetId(), principal, r.GetHead(), true))
@@ -204,7 +214,7 @@ func (s *Service) Submit(ctx context.Context, repo *scmpb.Repository, cl db.Chan
 		if err != nil {
 			return err
 		}
-		req := &automationpb.SubmitRequest{RepositoryId: repo.GetId(), ForPerson: principal}
+		req := &automationpb.SubmitRequest{RepositoryId: repo.GetId(), ForPersonId: principal}
 		for _, item := range l.items {
 			req.Cls = append(req.Cls, &automationpb.SubmitRequest_CL{Number: item.Number, Patchset: item.CurrentPatchset})
 		}
@@ -217,11 +227,11 @@ func (s *Service) Submit(ctx context.Context, repo *scmpb.Repository, cl db.Chan
 	return refuse("main kept moving while this changelist was being submitted: try again")
 }
 
-// CancelSubmit stops a CL's submission on principal's behalf: nothing of it lands. Its author or
-// a repository admin may.
+// CancelSubmit stops a CL's submission on principal's behalf: nothing of it lands. Whoever may
+// submit it may.
 func (s *Service) CancelSubmit(ctx context.Context, repo *scmpb.Repository, cl db.ChangeList, principal string) error {
-	if err := s.requireManage(ctx, repo, cl, principal, "cancel the submission of"); err != nil {
-		return err
+	if !s.CanSubmit(ctx, repo, cl, principal) {
+		return refuse("Only the author or a repository admin, who may land on it, can cancel the submission of this changelist")
 	}
 	sub, err := s.Submitting(ctx, cl.Repo, cl.Number)
 	if err != nil {
@@ -230,7 +240,6 @@ func (s *Service) CancelSubmit(ctx context.Context, repo *scmpb.Repository, cl d
 	if sub == nil {
 		return refuse("CL %d is not submitting", cl.Number)
 	}
-	_, err = s.auto.CancelSubmission(ctx, &automationpb.CancelSubmissionRequest{Id: sub.GetId(), ForPerson: principal,
-		Reason: "canceled by " + people.Handle(principal)})
+	_, err = s.auto.CancelSubmission(ctx, &automationpb.CancelSubmissionRequest{Id: sub.GetId(), ForPersonId: principal})
 	return err
 }

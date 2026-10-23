@@ -21,9 +21,13 @@ type store struct {
 
 type row struct {
 	dirty  bool
+	due    time.Time // zero: now
 	holder string
 	until  time.Time
 }
+
+// dueNow reports whether a row's mark is due.
+func (r *row) dueNow() bool { return r.dirty && !time.Now().Before(r.due) }
 
 func newStore() *store { return &store{rows: map[int64]*row{}} }
 
@@ -33,7 +37,22 @@ func (s *store) Mark(_ context.Context, _ string, key int64) error {
 	if s.rows[key] == nil {
 		s.rows[key] = &row{}
 	}
-	s.rows[key].dirty = true
+	s.rows[key].dirty, s.rows[key].due = true, time.Time{}
+	return nil
+}
+
+func (s *store) MarkAt(_ context.Context, _ string, key int64, at time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r := s.rows[key]
+	if r == nil {
+		r = &row{}
+		s.rows[key] = r
+	}
+	if !r.dirty || at.Before(r.due) {
+		r.due = at
+	}
+	r.dirty = true
 	return nil
 }
 
@@ -41,10 +60,14 @@ func (s *store) Take(_ context.Context, _ string, key int64, holder string, ttl 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	r := s.rows[key]
-	if r == nil || (r.holder != "" && time.Now().Before(r.until)) {
+	if r == nil {
+		r = &row{}
+		s.rows[key] = r
+	}
+	if r.holder != "" && time.Now().Before(r.until) {
 		return false, nil
 	}
-	r.holder, r.until, r.dirty = holder, time.Now().Add(ttl), false
+	r.holder, r.until, r.dirty, r.due = holder, time.Now().Add(ttl), false, time.Time{}
 	return true, nil
 }
 
@@ -66,8 +89,8 @@ func (s *store) Release(_ context.Context, _ string, key int64, holder string) (
 	if r == nil || r.holder != holder {
 		return false, nil
 	}
-	if r.dirty {
-		r.dirty = false
+	if r.dueNow() {
+		r.dirty, r.due = false, time.Time{}
 		return true, nil
 	}
 	r.holder = ""
@@ -79,7 +102,7 @@ func (s *store) Due(_ context.Context, _ string, limit int) ([]int64, error) {
 	defer s.mu.Unlock()
 	var out []int64
 	for k, r := range s.rows {
-		if (r.dirty && r.holder == "") || (r.holder != "" && time.Now().After(r.until)) {
+		if (r.dueNow() && r.holder == "") || (r.holder != "" && time.Now().After(r.until)) {
 			out = append(out, k)
 		}
 	}
@@ -264,4 +287,73 @@ func TestOneWorker(t *testing.T) {
 		}
 		return true
 	})
+}
+
+// A claim is one holder's at a time, its context ending if the lease is lost; released, another
+// takes it.
+func TestClaim(t *testing.T) {
+	ctx := context.Background()
+	s := newStore()
+	held, release, ok, err := work.Claim(ctx, s, "feed", 7, "a", time.Hour)
+	if err != nil || !ok {
+		t.Fatalf("claiming a key no one holds: %v, %v", ok, err)
+	}
+	if _, _, ok, _ := work.Claim(ctx, s, "feed", 7, "b", time.Hour); ok {
+		t.Fatal("a second holder claimed it")
+	}
+	release()
+	if held.Err() == nil {
+		t.Error("the released claim's context still runs")
+	}
+	_, release, ok, err = work.Claim(ctx, s, "feed", 7, "b", 30*time.Millisecond)
+	if err != nil || !ok {
+		t.Fatalf("claiming it once released: %v, %v", ok, err)
+	}
+	release()
+
+	s.renew = func(int64) bool { return false }
+	held, release, ok, _ = work.Claim(ctx, s, "feed", 8, "a", 30*time.Millisecond)
+	if !ok {
+		t.Fatal("claiming another key")
+	}
+	defer release()
+	select {
+	case <-held.Done():
+		if !errors.Is(context.Cause(held), work.ErrLost) {
+			t.Errorf("the lost claim's context ended with %v", context.Cause(held))
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("a lost lease never ended the claim")
+	}
+}
+
+// Work marked for a time is done then, not before; one marked for later while it is being done is
+// let go, and done again when due.
+func TestMarkAt(t *testing.T) {
+	ctx := context.Background()
+	s, d := newStore(), newDoer()
+	var calls atomic.Int32
+	run(t, &work.Runner{Kind: "q", Store: s, Idle: 5 * time.Millisecond, TTL: time.Second, Holder: "a", Do: d.do("a", func(ctx context.Context, key int64) error {
+		if calls.Add(1) == 1 {
+			s.MarkAt(ctx, "q", key, time.Now().Add(100*time.Millisecond))
+		}
+		return nil
+	})})
+	start := time.Now()
+	s.MarkAt(ctx, "q", 1, start.Add(100*time.Millisecond))
+	eventually(t, "the work done when due", func() bool { return d.count(1) == 1 })
+	if took := time.Since(start); took < 100*time.Millisecond {
+		t.Errorf("the work marked for 100ms on was done after %s", took)
+	}
+	// The lease is let go once the run ends — not kept until the work is due again.
+	eventually(t, "the lease let go, or the work done again", func() bool {
+		s.mu.Lock()
+		held := s.rows[1].holder
+		s.mu.Unlock()
+		return held == "" || d.count(1) > 1
+	})
+	if d.count(1) != 1 {
+		t.Error("work marked for later during it was held until it was done again")
+	}
+	eventually(t, "the work done again when due", func() bool { return d.count(1) == 2 })
 }

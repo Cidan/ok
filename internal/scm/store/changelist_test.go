@@ -19,15 +19,19 @@ const (
 	bob   = "bob.human.example.com"
 )
 
-// fakePeople knows every handle except those starting with "nobody".
+// fakePeople knows every handle except those starting with "nobody", each person's ID their
+// installation name.
 type fakePeople struct{}
 
-func (fakePeople) KnownHuman(_ context.Context, handle string) (bool, error) {
-	return !strings.HasPrefix(handle, "nobody"), nil
+func (fakePeople) Human(_ context.Context, handle string) (string, bool, error) {
+	if strings.HasPrefix(handle, "nobody") {
+		return "", false, nil
+	}
+	return handle + ".human.example.com", true, nil
 }
 
 func (fakePeople) KnownACL(_ context.Context, name string) (bool, error) {
-	return name == "admins", nil
+	return name == "admins" || name == "admins.acl.example.com" || name == "ops.acl.example.com", nil
 }
 
 // flat adds a tree holding the flat paths (each a file with the given contents) and
@@ -249,14 +253,12 @@ func TestUploadStackAndPatchsets(t *testing.T) {
 	// Patchset commits and what they reach are pinned.
 	for _, id := range []encoding.ID{c1, c2, c2b, c2c} {
 		var pinned bool
-		if err := poolOf(e.s).QueryRow(context.Background(), `SELECT pinned FROM commit WHERE repository_id = $1 AND id = $2`, e.repo, id[:]).Scan(&pinned); err != nil || !pinned {
-			t.Fatalf("commit %s pinned=%v err=%v", id, pinned, err)
+		dbOf(e.s).scan(t, `SELECT pinned FROM commit WHERE repository_id = @repo AND id = @id`, map[string]any{"repo": e.repo, "id": id[:]}, &pinned)
+		if !pinned {
+			t.Fatalf("commit %s not pinned", id)
 		}
 	}
-	var unpinned int
-	if err := poolOf(e.s).QueryRow(context.Background(), `SELECT count(*) FROM object WHERE repository_id = $1 AND NOT pinned`, e.repo).Scan(&unpinned); err != nil {
-		t.Fatal(err)
-	}
+	unpinned := dbOf(e.s).count(t, "object", `repository_id = @repo AND NOT pinned`, map[string]any{"repo": e.repo})
 	for _, k := range indexOf(t, e.s, e.repo).Sorted() {
 		if !k.Entry.Pinned {
 			unpinned++
@@ -364,7 +366,7 @@ func TestUploadRules(t *testing.T) {
 	if _, err := e.upload(alice, ReadinessUnchanged, nil, encoding.Hash([]byte("never published"))); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("an unpublished commit: %v", err)
 	}
-	if _, err := e.upload(alice, ReadinessUnchanged, []string{"carol", "dave@example.com"}, goodOwners); err != nil {
+	if _, err := e.upload(alice, ReadinessUnchanged, []string{"carol", "@dave", "dave@example.com"}, goodOwners); err != nil {
 		t.Fatalf("a valid OWNERS file: %v", err)
 	}
 	if _, err := e.upload(alice, ReadinessUnchanged, nil, goodWorkflow); err != nil {
@@ -428,7 +430,7 @@ func TestUploadRace(t *testing.T) {
 	if n != 1 {
 		t.Fatalf("%d uploads created the CL", n)
 	}
-	cls, _, err := e.s.ListChangeLists(context.Background(), e.repo, nil, "", 0, 0)
+	cls, _, err := e.s.ListChangeLists(context.Background(), e.repo, nil, "", 0, 0, 0)
 	if err != nil || len(cls) != 1 {
 		t.Fatalf("%d CLs (%v)", len(cls), err)
 	}
@@ -517,34 +519,24 @@ func TestLandFastForwardAndSplice(t *testing.T) {
 	}
 
 	// main's history, the paths index, and pins.
-	var logged int
-	if err := poolOf(e.s).QueryRow(ctx, `SELECT count(*) FROM head_log WHERE repository_id = $1`, e.repo).Scan(&logged); err != nil || logged != 2 {
-		t.Fatalf("head_log has %d rows (%v)", logged, err)
+	if logged := dbOf(e.s).count(t, "head_log", `repository_id = @repo`, map[string]any{"repo": e.repo}); logged != 2 {
+		t.Fatalf("head_log has %d rows", logged)
 	}
 	if r, _ := e.s.GetRepository(ctx, e.repo); r.HeadSeq != 2 {
 		t.Fatalf("head_seq %d", r.HeadSeq)
 	}
-	rows, err := poolOf(e.s).Query(ctx, `SELECT path FROM commit_path WHERE repository_id = $1 AND commit_id = $2 ORDER BY path`, e.repo, l2[:])
-	if err != nil {
-		t.Fatal(err)
-	}
-	var paths []string
-	for rows.Next() {
-		var p string
-		rows.Scan(&p)
-		paths = append(paths, p)
-	}
-	rows.Close()
+	paths := dbOf(e.s).strings(t, `SELECT path FROM commit_path WHERE repository_id = @repo AND commit_id = @commit ORDER BY path`,
+		map[string]any{"repo": e.repo, "commit": l2[:]})
 	if !reflect.DeepEqual(paths, []string{"b", "b/y"}) {
 		t.Fatalf("indexed paths %v, want the changed file and its directory", paths)
 	}
 	var pinned bool
-	if err := poolOf(e.s).QueryRow(ctx, `SELECT pinned FROM commit WHERE repository_id = $1 AND id = $2`, e.repo, l2[:]).Scan(&pinned); err != nil || !pinned {
-		t.Fatalf("landed commit pinned=%v (%v)", pinned, err)
+	dbOf(e.s).scan(t, `SELECT pinned FROM commit WHERE repository_id = @repo AND id = @id`, map[string]any{"repo": e.repo, "id": l2[:]}, &pinned)
+	if !pinned {
+		t.Fatal("the landed commit is not pinned")
 	}
-	var unpinned int
-	if err := poolOf(e.s).QueryRow(ctx, `SELECT count(*) FROM object WHERE repository_id = $1 AND NOT pinned`, e.repo).Scan(&unpinned); err != nil || unpinned != 0 {
-		t.Fatalf("%d trees unpinned after landing (%v)", unpinned, err)
+	if unpinned := dbOf(e.s).count(t, "object", `repository_id = @repo AND NOT pinned`, map[string]any{"repo": e.repo}); unpinned != 0 {
+		t.Fatalf("%d trees unpinned after landing", unpinned)
 	}
 	// Upload now knows both landed commits are on main.
 	c3 := e.commit(alice, newChange(), l2, "three", map[string]string{"a/x": "1", "k": "k", "b/y": "2", "c": "3"})
@@ -708,9 +700,8 @@ func TestCandidates(t *testing.T) {
 	if want := map[string]string{"k": "0", "a": "1", "b": "1", "x": "1"}; !reflect.DeepEqual(e.flatAt(landed[0].Commit), want) {
 		t.Fatalf("re-spliced tree %v", e.flatAt(landed[0].Commit))
 	}
-	var pending int
-	if err := poolOf(e.s).QueryRow(ctx, `SELECT count(*) FROM candidate WHERE repository_id = $1`, e.repo).Scan(&pending); err != nil || pending != 0 {
-		t.Fatalf("%d candidates pending after their CLs landed (%v)", pending, err)
+	if pending := dbOf(e.s).count(t, "candidate", `repository_id = @repo`, map[string]any{"repo": e.repo}); pending != 0 {
+		t.Fatalf("%d candidates pending after their CLs landed", pending)
 	}
 
 	// Discard is idempotent.
@@ -743,7 +734,7 @@ func TestChangeListQueries(t *testing.T) {
 	e.transition(2, RequestReview)
 	var got []int64
 	for before := int64(0); ; {
-		page, next, err := e.s.ListChangeLists(ctx, e.repo, nil, "", 2, before)
+		page, next, err := e.s.ListChangeLists(ctx, e.repo, nil, "", 0, 2, before)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -758,10 +749,22 @@ func TestChangeListQueries(t *testing.T) {
 	if !reflect.DeepEqual(got, []int64{5, 4, 3, 2, 1}) {
 		t.Fatalf("pages %v", got)
 	}
-	bobs, _, _ := e.s.ListChangeLists(ctx, e.repo, nil, bob, 0, 0)
-	open, _, _ := e.s.ListChangeLists(ctx, e.repo, []Status{StatusOpen}, "", 0, 0)
+	bobs, _, _ := e.s.ListChangeLists(ctx, e.repo, nil, bob, 0, 0, 0)
+	open, _, _ := e.s.ListChangeLists(ctx, e.repo, []Status{StatusOpen}, "", 0, 0, 0)
 	if len(bobs) != 2 || len(open) != 1 || open[0].Number != 2 {
 		t.Fatalf("bob's %d, open %d", len(bobs), len(open))
+	}
+	// Those stacked on a CL: the one directly above it, not the one above that.
+	low := e.commit(alice, newChange(), encoding.RootCommitID, "low", map[string]string{"low": "1"})
+	mid := e.commit(alice, newChange(), low, "mid", map[string]string{"low": "1", "mid": "1"})
+	high := e.commit(alice, newChange(), mid, "high", map[string]string{"low": "1", "mid": "1", "high": "1"})
+	stack := e.mustUpload(alice, ReadinessUnchanged, low, mid, high)
+	above, _, err := e.s.ListChangeLists(ctx, e.repo, nil, "", stack[0].Number, 0, 0)
+	if err != nil || len(above) != 1 || above[0].Number != stack[1].Number || above[0].ParentNumber != stack[0].Number {
+		t.Fatalf("stacked on CL %d: %v (%v)", stack[0].Number, above, err)
+	}
+	if none, _, _ := e.s.ListChangeLists(ctx, e.repo, nil, "", stack[2].Number, 0, 0); len(none) != 0 {
+		t.Fatalf("stacked on the top: %v", none)
 	}
 	found, err := e.s.LookupChanges(ctx, e.repo, []encoding.ChangeID{changes[3], newChange(), changes[0]})
 	if err != nil || len(found) != 2 || found[0].Number != 1 || found[1].Number != 4 {
@@ -769,5 +772,58 @@ func TestChangeListQueries(t *testing.T) {
 	}
 	if _, err := e.s.GetChangeList(ctx, e.repo, 99); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("missing CL: %v", err)
+	}
+}
+
+// A landing of several submissions — the landing queue's batch — names each CL's submitter: each
+// lands committed by its own, recorded as submitted by them, and announced as theirs; one main
+// move after another, in one transaction.
+func TestLandEachForItsSubmitter(t *testing.T) {
+	ctx := context.Background()
+	e := newCLEnv(t)
+	base := e.commit(alice, newChange(), encoding.RootCommitID, "base", map[string]string{"k": "k"})
+	nb := e.open(base)
+	e.mustLand(LandItem{Number: nb, Patchset: 1})
+	c1 := e.commit(alice, newChange(), encoding.RootCommitID, "alice's", map[string]string{"a": "1"})
+	c2 := e.commit(alice, newChange(), encoding.RootCommitID, "bob's", map[string]string{"b": "2"})
+	n1, n2 := e.open(c1), e.open(c2)
+	landed, head, last, err := e.s.Land(ctx, e.repo, []LandItem{{Number: n1, Patchset: 1}, {Number: n2, Patchset: 1, Actor: bob}},
+		e.head(), alice, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(landed) != 2 || head != landed[1].Commit || e.head() != head {
+		t.Fatalf("landed %v, head %s", landed, head)
+	}
+	for i, who := range []string{"alice", "bob"} {
+		c, err := e.s.readCommit(ctx, e.repo, landed[i].Commit)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if c.Committer.Name != who {
+			t.Errorf("CL %d's commit committed by %q, want %q", landed[i].Number, c.Committer.Name, who)
+		}
+	}
+	if got := e.cl(n1).SubmittedBy; got != alice {
+		t.Errorf("CL %d submitted by %s", n1, got)
+	}
+	if got := e.cl(n2).SubmittedBy; got != bob {
+		t.Errorf("CL %d submitted by %s", n2, got)
+	}
+	evs, err := e.s.ReadEvents(ctx, e.repo, last.GetRepositorySeq()-4, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	submitters := map[int64]string{}
+	for _, ev := range evs {
+		if l := ev.GetLanded(); l != nil {
+			submitters[l.GetNumber()] = l.GetSubmitterId()
+		}
+	}
+	if want := map[int64]string{n1: alice, n2: bob}; !reflect.DeepEqual(submitters, want) {
+		t.Errorf("the landing events' submitters %v, want %v", submitters, want)
+	}
+	if r, _ := e.s.GetRepository(ctx, e.repo); r.HeadSeq != 3 {
+		t.Errorf("head_seq %d, want 3: a main move a CL", r.HeadSeq)
 	}
 }

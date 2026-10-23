@@ -16,6 +16,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/pprof"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -70,6 +71,8 @@ type Config struct {
 	// nowhere unless MetricsListener is set, which is served instead.
 	MetricsAddr     string
 	MetricsListener net.Listener
+	// Profiling serves Go's profiles (/debug/pprof/) beside the metrics.
+	Profiling bool
 	// TLS, when set, serves the port over TLS (HTTP/1.1 and HTTP/2); without it the port is
 	// cleartext, for a network that secures it otherwise or for loopback.
 	TLS *tls.Config
@@ -133,7 +136,14 @@ func Serve(ctx context.Context, cfg Config) error {
 
 	var services, webservers int
 	var apps []node.Application
+	var front http.Handler
 	for _, n := range cfg.Nodes {
+		if f, ok := n.(node.Front); ok {
+			if front != nil {
+				return fmt.Errorf("serve: %s is a second front", n.Name())
+			}
+			front = f.Front()
+		}
 		if svc, ok := n.(node.Service); ok {
 			if err := svc.RegisterRPC(ctx, grpcSrv); err != nil {
 				return fmt.Errorf("serve: register service %s: %w", n.Name(), err)
@@ -157,6 +167,9 @@ func Serve(ctx context.Context, cfg Config) error {
 		}
 	}
 
+	if front != nil && (services > 0 || webservers > 0) {
+		return errors.New("serve: a front serves alone: no service or web server beside it")
+	}
 	rpcStats.Serve(grpcSrv.GetServiceInfo())
 
 	router.Get("/healthz", cfg.Health.Healthz)
@@ -230,7 +243,11 @@ func Serve(ctx context.Context, cfg Config) error {
 	// unencrypted HTTP/2).
 	var protocols http.Protocols
 	protocols.SetHTTP1(true)
-	httpSrv := &http.Server{Handler: grpcMux(grpcSrv, router), Protocols: &protocols, ReadHeaderTimeout: 30 * time.Second}
+	handler := grpcMux(grpcSrv, router)
+	if front != nil {
+		handler = frontMux(cfg.Health, front)
+	}
+	httpSrv := &http.Server{Handler: handler, Protocols: &protocols, ReadHeaderTimeout: 30 * time.Second}
 	if cfg.TLS != nil {
 		protocols.SetHTTP2(true)
 		httpSrv.TLSConfig = cfg.TLS.Clone()
@@ -253,7 +270,18 @@ func Serve(ctx context.Context, cfg Config) error {
 
 	var metricsSrv *http.Server
 	if metricsLis != nil {
-		metricsSrv = &http.Server{Handler: metrics.Handler(), ReadHeaderTimeout: 10 * time.Second}
+		var h http.Handler = metrics.Handler()
+		if cfg.Profiling {
+			mux := http.NewServeMux()
+			mux.Handle("/metrics", h)
+			mux.HandleFunc("/debug/pprof/", pprof.Index)
+			mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+			mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+			mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+			mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+			h = mux
+		}
+		metricsSrv = &http.Server{Handler: h, ReadHeaderTimeout: 10 * time.Second}
 		go func() {
 			if err := metricsSrv.Serve(metricsLis); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				serveErr <- err
@@ -296,6 +324,23 @@ func grpcMux(grpcSrv *grpc.Server, httpHandler http.Handler) http.Handler {
 			return
 		}
 		httpHandler.ServeHTTP(w, r)
+	})
+}
+
+// frontMux serves the probes, and sends every other request to front.
+func frontMux(h *health.Reporter, front http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			switch r.URL.Path {
+			case "/healthz":
+				h.Healthz(w, r)
+				return
+			case "/readyz":
+				h.Readyz(w, r)
+				return
+			}
+		}
+		front.ServeHTTP(w, r)
 	})
 }
 

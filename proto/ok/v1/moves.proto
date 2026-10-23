@@ -1,0 +1,174 @@
+syntax = "proto3";
+
+package ok.v1;
+
+import "google/protobuf/timestamp.proto";
+import "proto/ok/v1/annotations.proto";
+
+option go_package = "github.com/Cidan/ok/proto/ok/v1;okpb";
+
+// Moves is how a fork network moves between cells (docs/hosted.md, "Cells, as built"). Every role
+// but identity serves it: to the directory, which runs a move, and to the same role of another
+// cell, which copies from it. Each role admits only those two.
+service Moves {
+  option (ok.v1.callers) = CALLER_IDENTITY;
+  option (ok.v1.callers) = CALLER_SCM;
+  option (ok.v1.callers) = CALLER_CONTROL;
+  option (ok.v1.callers) = CALLER_AUTOMATION;
+  option (ok.v1.callers) = CALLER_DEPLOY;
+
+  // The source's, to the destination's role.
+
+  // Export is a page of a table's rows about the network, after a row by primary key (the last
+  // of the page before), in its order.
+  rpc Export(ExportRequest) returns (ExportResponse);
+  // ListObjects is a page of the network's objects, after a key, in its order.
+  rpc ListObjects(ListObjectsRequest) returns (ListObjectsResponse);
+  // ReadObject is one of the network's objects.
+  rpc ReadObject(ReadObjectRequest) returns (stream ReadObjectResponse);
+
+  // The source's, to the directory.
+
+  // Freeze refuses every write about the network's repositories from its commit, having waited
+  // for those under way (FAILED_PRECONDITION while the role holds work it cannot give up — a
+  // deployment under way). Thaw undoes it.
+  rpc Freeze(MoveScope) returns (FreezeResponse);
+  rpc Thaw(MoveScope) returns (ThawResponse);
+  // Finish records that the network moved: the role answers Moved, and deletes what it holds of
+  // the network a day later.
+  rpc Finish(FinishRequest) returns (FinishResponse);
+
+  // The destination's, to the directory.
+
+  // Import copies the network from its source cell's same role: its objects, or everything —
+  // what the role held of it before dropped first — leaving it frozen here.
+  rpc Import(ImportRequest) returns (ImportResponse);
+  // Open lets the network imported be written here, once the directory names this cell its cell,
+  // and brings up to date what the role keeps of it outside what moved.
+  rpc Open(MoveScope) returns (OpenResponse);
+  // Drop deletes what the role holds of a network a move abandoned.
+  rpc Drop(MoveScope) returns (DropResponse);
+}
+
+// MoveScope is a network moving, its repositories, and the role whose side of the move a request
+// is: scm, control, automation, or deploy — one address may serve several, one process's.
+message MoveScope {
+  int64 network_id = 1;
+  repeated int64 repositories = 2;
+  string role = 3;
+}
+
+message ExportRequest {
+  MoveScope scope = 1;
+  string table = 2;
+  Row after = 3;  // its primary key's columns; none for the start
+  int32 limit = 4;
+}
+
+message ExportResponse {
+  repeated Row rows = 1;
+  bool more = 2;  // more may follow the last
+}
+
+message ListObjectsRequest {
+  MoveScope scope = 1;
+  string after = 2;
+  int32 limit = 3;
+}
+
+message ListObjectsResponse {
+  repeated MovedObject objects = 1;
+  bool more = 2;
+}
+
+message MovedObject {
+  string key = 1;
+  int64 size = 2;
+}
+
+message ReadObjectRequest {
+  MoveScope scope = 1;
+  string key = 2;
+}
+
+message ReadObjectResponse {
+  bytes data = 1;
+}
+
+message FreezeResponse {}
+message ThawResponse {}
+
+message FinishRequest {
+  MoveScope scope = 1;
+  string destination = 2;  // the cell it moved to
+}
+
+message FinishResponse {}
+
+message ImportRequest {
+  enum Stage {
+    STAGE_UNSPECIFIED = 0;
+    STAGE_OBJECTS = 1;  // the objects it lacks, while the network is written
+    STAGE_ALL = 2;      // every row, and the objects it lacks, the network frozen
+  }
+  MoveScope scope = 1;
+  string source = 2;  // the cell it moves from
+  Stage stage = 3;
+}
+
+message ImportResponse {
+  int64 rows = 1;
+  int64 objects = 2;
+  int64 bytes = 3;
+}
+
+message OpenResponse {}
+
+message DropResponse {}
+
+// Frozen details a write refused because its repository's network is moving: UNAVAILABLE, a
+// refusal made before anything was done, which ok's clients retry.
+message Frozen {
+  int64 network_id = 1;
+}
+
+// Row is a table's row, as a move copies it between cells, whatever their databases: by column, as
+// PostgreSQL names them.
+message Row {
+  repeated Column columns = 1;
+}
+
+message Column {
+  string name = 1;
+  Value value = 2;
+}
+
+// Value is a column's value, of one of the types ok's tables hold.
+message Value {
+  oneof kind {
+    bool null = 1;
+    int64 int = 2;
+    double float = 3;
+    string text = 4;
+    bytes data = 5;
+    bool flag = 6;
+    google.protobuf.Timestamp time = 7;
+    string date = 8;  // YYYY-MM-DD
+    string json = 9;
+    Ints ints = 10;
+    Texts texts = 11;
+    Datas datas = 12;
+  }
+}
+
+message Ints {
+  repeated int64 values = 1;
+}
+
+message Texts {
+  repeated string values = 1;
+}
+
+message Datas {
+  repeated bytes values = 1;
+}

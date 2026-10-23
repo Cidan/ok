@@ -1,0 +1,19 @@
+# Dex, staging's sign-in provider (README.md): an OpenID Connect issuer in the cluster with one
+# static person, the load's, whom ok's device sign-in signs in. HASH is the person's password's
+# bcrypt hash, CLIENT_SECRET ok's client's secret; README.md's run fills them in.
+config:
+  issuer: http://dex.dex.svc:5556
+  storage: {type: memory}
+  enablePasswordDB: true
+  staticPasswords:
+    - email: load@example.com
+      hash: HASH
+      username: load
+      userID: "1"
+  staticClients:
+    - id: ok
+      name: ok
+      secret: CLIENT_SECRET
+      redirectURIs: [http://ok-server.ok.svc:8472/id/login/oidc/callback]
+  oauth2:
+    skipApprovalScreen: true

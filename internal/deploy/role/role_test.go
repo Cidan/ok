@@ -15,6 +15,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Cidan/ok/internal/bus/bustest"
+
 	"github.com/jackc/pgx/v5/pgxpool"
 	"google.golang.org/grpc"
 
@@ -33,7 +35,7 @@ import (
 	"github.com/Cidan/ok/internal/serve"
 	"github.com/Cidan/ok/internal/serve/node"
 	"github.com/Cidan/ok/internal/testbazel"
-	"github.com/Cidan/ok/internal/testdb"
+	"github.com/Cidan/ok/internal/testdb/roledb"
 	"github.com/Cidan/ok/internal/testdb/testobjects"
 	"github.com/Cidan/ok/internal/testjj"
 	deploypb "github.com/Cidan/ok/proto/ok/deploy/v1"
@@ -140,9 +142,16 @@ deploy:
 	if err != nil {
 		t.Fatal(err)
 	}
-	url := testdb.Postgres(t)
+	cfg.Bus = bustest.Config(t)
+	// The roles' databases (roledb, as OK_TEST_DATABASE names them): on Spanner each role opens its
+	// own as cfg says, and no pool.
+	dbs := roledb.New(t)
+	dbs.Configure(cfg)
 	open := func(schema string) *pgxpool.Pool {
-		p, err := pgdb.Open(ctx, url, schema, 0)
+		if dbs.OnSpanner() {
+			return nil
+		}
+		p, err := pgdb.Open(ctx, dbs.URL(), schema, 0)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -154,8 +163,10 @@ deploy:
 		t.Fatal(err)
 	}
 	idAddr := serveRole(t, ctx, id.Root, serve.WithAuthn(id.Resolver))
+	var adaID string // ada's stable ID, as ok identity minted it
 	for i := 0; ; i++ {
-		if _, err := id.Store.Principal(ctx, ada); err == nil {
+		if p, err := id.Store.Principal(ctx, ada); err == nil {
+			adaID = p.ID
 			break
 		}
 		if i == 200 {
@@ -217,7 +228,7 @@ deploy:
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := scmpb.NewLandingClient(as(t, scmAddr, autoBot)).Land(ctx, &scmpb.LandRequest{RepositoryId: r.GetId(), Actor: ada, ExpectedHead: r.GetHead(),
+		if _, err := scmpb.NewLandingClient(as(t, scmAddr, autoBot)).Land(ctx, &scmpb.LandRequest{RepositoryId: r.GetId(), ActorId: adaID, ExpectedHead: r.GetHead(),
 			Items: []*scmpb.LandRequest_Item{{Number: n, Patchset: c.GetCurrentPatchset()}}}); err != nil {
 			t.Fatalf("landing CL %d: %v", n, err)
 		}
@@ -267,7 +278,7 @@ deploy:
 			}
 			byName := map[string]*deploypb.Deployment{}
 			for _, dep := range resp.GetDeployments() {
-				if old := byName[dep.GetName()]; old == nil || dep.GetId() > old.GetId() {
+				if old := byName[dep.GetName()]; old == nil || dep.GetCreatedAt().AsTime().After(old.GetCreatedAt().AsTime()) {
 					byName[dep.GetName()] = dep
 				}
 			}
@@ -321,7 +332,7 @@ deploy:
 	write(map[string]string{"identity/ops/acl.yaml": "members: [ada.human.example.com]\n"})
 	second := land("an ops ACL")
 	got = settled("the tree's second deployment", func(m map[string]*deploypb.Deployment) bool {
-		return done("identity")(m) && m["identity"].GetId() > got["identity"].GetId()
+		return done("identity")(m) && m["identity"].GetId() != got["identity"].GetId()
 	})
 	if got["identity"].GetStatus() != deploypb.Deployment_STATUS_SUCCEEDED {
 		t.Fatalf("the second apply: %v", got["identity"])

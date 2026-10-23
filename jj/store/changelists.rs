@@ -12,6 +12,7 @@ use tonic::Code;
 use tonic::Status;
 
 use crate::Repository;
+use crate::client;
 use crate::ids::Id;
 use crate::ids::id_of;
 use crate::publish;
@@ -59,6 +60,27 @@ pub async fn repository(shared: &Arc<Shared>) -> Result<Repository, Status> {
     .await
 }
 
+/// Brings the repository, a fork, its upstream's newer work on the SCM; true when its main moved
+/// to the upstream's.
+pub async fn sync_fork(shared: &Arc<Shared>) -> Result<bool, Status> {
+    let shared = shared.clone();
+    shared::run(async move {
+        let req = pb::SyncForkRequest {
+            repository_id: shared.client.repository_id(),
+            actor_id: String::new(),
+        };
+        let r = shared
+            .client
+            .repositories()
+            .await?
+            .sync_fork(req)
+            .await?
+            .into_inner();
+        Ok(r.moved)
+    })
+    .await
+}
+
 /// Uploads commits, bottom of the stack first, as CLs.
 pub async fn upload(
     shared: &Arc<Shared>,
@@ -75,13 +97,19 @@ pub async fn upload(
             readiness: readiness as i32,
             reviewers,
         };
-        Ok(shared
-            .client
-            .change_lists()
-            .await?
-            .upload(req)
-            .await?
-            .into_inner())
+        client::while_frozen(|| {
+            let (shared, req) = (shared.clone(), req.clone());
+            async move {
+                Ok(shared
+                    .client
+                    .change_lists()
+                    .await?
+                    .upload(req)
+                    .await?
+                    .into_inner())
+            }
+        })
+        .await
     })
     .await
 }

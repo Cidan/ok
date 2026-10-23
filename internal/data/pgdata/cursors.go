@@ -33,6 +33,23 @@ func Cursor(ctx context.Context, q Querier, topic string, key int64) (int64, err
 	return seq, err
 }
 
+// Cursors are the last seqs of keys' logs on topic applied; a key with none is absent.
+func Cursors(ctx context.Context, q interface {
+	Query(context.Context, string, ...any) (pgx.Rows, error)
+}, topic string, keys []int64) (map[int64]int64, error) {
+	rows, err := q.Query(ctx, `SELECT key, seq FROM follow_cursor WHERE topic = $1 AND key = ANY($2)`, topic, keys)
+	if err != nil {
+		return nil, err
+	}
+	out := map[int64]int64{}
+	var key, seq int64
+	_, err = pgx.ForEachRow(rows, []any{&key, &seq}, func() error {
+		out[key] = seq
+		return nil
+	})
+	return out, err
+}
+
 // LockCursor is Cursor, held until the transaction q is ends: it makes key's row, at 0, if there is
 // none, so two transactions applying key's first event wait on one another.
 func LockCursor(ctx context.Context, q Querier, topic string, key int64) (int64, error) {
@@ -55,11 +72,5 @@ func SetCursor(ctx context.Context, q Querier, topic string, key, seq int64) err
 func AdvanceCursor(ctx context.Context, q Querier, topic string, key, seq int64) error {
 	_, err := q.Exec(ctx, `INSERT INTO follow_cursor (topic, key, seq) VALUES ($1, $2, $3)
 		ON CONFLICT (topic, key) DO UPDATE SET seq = greatest(follow_cursor.seq, EXCLUDED.seq)`, topic, key, seq)
-	return err
-}
-
-// SeedCursor sets key's cursor to seq, if it has none.
-func SeedCursor(ctx context.Context, q Querier, topic string, key, seq int64) error {
-	_, err := q.Exec(ctx, `INSERT INTO follow_cursor (topic, key, seq) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`, topic, key, seq)
 	return err
 }

@@ -7,11 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/Cidan/ok/internal/control/db"
+	"github.com/Cidan/ok/internal/move"
 )
 
 const (
@@ -46,16 +48,21 @@ func Run(t *testing.T, open func(t *testing.T) db.Store) {
 		{"ChangeListProjection", testChangeListProjection},
 		{"ReviewData", testReviewData},
 		{"RepositoriesAndFeed", testRepositoriesAndFeed},
+		{"Outbox", testOutbox},
+		{"Webhooks", testWebhooks},
 		{"CreateRepositoryConcurrently", testCreateRepositoryConcurrently},
+		{"DropRepository", testDropRepository},
 		{"Txn", testTxn},
 		{"LockChangeList", testLockChangeList},
 	} {
 		t.Run(tc.name, func(t *testing.T) { tc.fn(t, open(t)) })
 	}
+	t.Run("Moves", func(t *testing.T) { testMoves(t, open(t), open(t)) })
 }
 
 func testChangeListProjection(t *testing.T, s db.Store) {
-	ctx := context.Background()
+	// The store's own contract, not a write path: no move gate's tag (move.Untagged).
+	ctx := move.Untagged(context.Background())
 	for _, c := range []db.ChangeList{
 		cl(1, alice, db.StatusOpen, 0, 1),
 		cl(2, alice, db.StatusDraft, 1, 2),
@@ -155,7 +162,8 @@ func testChangeListProjection(t *testing.T, s db.Store) {
 }
 
 func testReviewData(t *testing.T, s db.Store) {
-	ctx := context.Background()
+	// The store's own contract, not a write path: no move gate's tag (move.Untagged).
+	ctx := move.Untagged(context.Background())
 	if _, err := s.UpsertChangeList(ctx, cl(1, alice, db.StatusOpen, 0, 1)); err != nil {
 		t.Fatal(err)
 	}
@@ -268,7 +276,8 @@ func testReviewData(t *testing.T, s db.Store) {
 }
 
 func testRepositoriesAndFeed(t *testing.T, s db.Store) {
-	ctx := context.Background()
+	// The store's own contract, not a write path: no move gate's tag (move.Untagged).
+	ctx := move.Untagged(context.Background())
 	for i, name := range []string{"alpha", "beta", "gamma_x", "gammax"} {
 		if err := s.CreateRepository(ctx, db.Repository{ID: int64(i + 1), Name: name, CreatedBy: alice, CreatedAt: epoch.Add(time.Duration(i) * time.Minute)}); err != nil {
 			t.Fatal(err)
@@ -303,11 +312,59 @@ func testRepositoriesAndFeed(t *testing.T, s db.Store) {
 	if rs, _ := s.ListRepositories(ctx, bob, "", 1, 2); !reflect.DeepEqual(names(rs), []string{"alpha", "gammax"}) {
 		t.Errorf("a page: %v", names(rs))
 	}
-	if err := s.RenameRepository(ctx, 3, "delta"); err != nil {
+	// The directory renames gamma_x, keeping who made it and when.
+	if err := s.NameRepository(ctx, db.Repository{ID: 3, Name: "delta", CreatedBy: bob, CreatedAt: epoch.Add(time.Hour)}); err != nil {
 		t.Fatal(err)
 	}
 	if rs, _ := s.ListRepositories(ctx, bob, "", 0, 10); !reflect.DeepEqual(names(rs), []string{"beta", "alpha", "gammax", "delta"}) {
 		t.Errorf("after a rename: %v", names(rs))
+	}
+	// A repository the SCM made, the directory's events not yet applied, has no name, and is not
+	// listed; named first by the directory, it is recorded from them; deleted, it is not listed.
+	if err := s.CreateRepository(ctx, db.Repository{ID: 5, CreatedBy: alice, CreatedAt: epoch}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.NameRepository(ctx, db.Repository{ID: 6, Name: "epsilon", Deleted: true, CreatedBy: alice, CreatedAt: epoch}); err != nil {
+		t.Fatal(err)
+	}
+	if rs, _ := s.ListRepositories(ctx, bob, "", 0, 10); len(rs) != 4 {
+		t.Errorf("an unnamed and a deleted repository listed: %v", names(rs))
+	}
+	// By ID: those held and not deleted, with bob's favorites; one of another cell's, absent.
+	byID, err := s.RepositoriesByID(ctx, bob, []int64{2, 3, 6, 99})
+	slices.SortFunc(byID, func(a, b db.Repository) int { return int(a.ID - b.ID) })
+	if err != nil || !reflect.DeepEqual(names(byID), []string{"beta", "delta"}) || !byID[0].Favorite || byID[1].Favorite {
+		t.Errorf("repositories by ID: %+v, %v", byID, err)
+	}
+	// The request that made it, after the change feed recorded it with no name, names it: it is
+	// listed at once, before the directory's events.
+	if err := s.CreateRepository(ctx, db.Repository{ID: 7, CreatedBy: alice, CreatedAt: epoch}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateRepository(ctx, db.Repository{ID: 7, Name: "zeta", CreatedBy: alice, CreatedAt: epoch}); err != nil {
+		t.Fatal(err)
+	}
+	if r, ok, _ := s.RepositoryByName(ctx, "zeta"); !ok || r.ID != 7 {
+		t.Errorf("a repository its request named after the feed recorded it: %+v, %v", r, ok)
+	}
+	if err := s.DropRepository(ctx, 7); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateRepository(ctx, db.Repository{ID: 6, Name: "x", CreatedBy: bob, CreatedAt: epoch}); err != nil {
+		t.Fatal(err)
+	}
+	if r, ok, _ := s.RepositoryByName(ctx, "epsilon"); !ok || r.ID != 6 || !r.Deleted || r.CreatedBy != alice {
+		t.Errorf("a repository the directory recorded first, then the SCM: %+v", r)
+	}
+	// Two repositories' names may cross, as each one's events are applied apart.
+	if err := s.NameRepository(ctx, db.Repository{ID: 5, Name: "delta", CreatedBy: alice, CreatedAt: epoch}); err != nil {
+		t.Errorf("a name another repository holds here: %v", err)
+	}
+	if err := s.DropRepository(ctx, 5); err != nil {
+		t.Fatal(err)
+	}
+	if r, ok, _ := s.RepositoryByName(ctx, "delta"); !ok || r.ID != 3 {
+		t.Errorf("delta after the other was purged: %+v", r)
 	}
 	if r, ok, err := s.RepositoryByName(ctx, "delta"); err != nil || !ok || r.ID != 3 || r.CreatedBy != alice {
 		t.Errorf("delta by name: %+v %v %v", r, ok, err)
@@ -364,29 +421,14 @@ func testRepositoriesAndFeed(t *testing.T, s db.Store) {
 	if c, _ := s.FollowCursor(ctx, topic, 2); c != 40 {
 		t.Errorf("after 40 locked advances from none repository 2's cursor is %d", c)
 	}
-	for _, seed := range [][2]int64{{3, 7}, {3, 9}, {1, 1}} {
-		if err := s.SeedFollowCursor(ctx, topic, seed[0], seed[1]); err != nil {
-			t.Fatal(err)
-		}
-	}
-	for repo, want := range map[int64]int64{1: 82, 3: 7} {
-		if c, _ := s.FollowCursor(ctx, topic, repo); c != want {
-			t.Errorf("repository %d's cursor after seeding: %d, want %d", repo, c, want)
-		}
-	}
-	if at, err := s.LegacyCursor(ctx); err != nil || at != 0 {
-		t.Errorf("a new store's place in the legacy feed: %d, %v", at, err)
-	}
-	if err := s.ForgetLegacyCursor(ctx); err != nil {
-		t.Errorf("forgetting a legacy cursor it never had: %v", err)
-	}
 }
 
 // A repository is recorded by both the request that created it and the change-feed follower,
 // often at the same instant: whichever is second does nothing, rather than failing on the
 // name's uniqueness while the first is still committing.
 func testCreateRepositoryConcurrently(t *testing.T, s db.Store) {
-	ctx := context.Background()
+	// The store's own contract, not a write path: no move gate's tag (move.Untagged).
+	ctx := move.Untagged(context.Background())
 	for i := range int64(100) {
 		r := db.Repository{ID: 1000 + i, Name: fmt.Sprintf("repo-%d", i), CreatedBy: alice, CreatedAt: epoch}
 		var wg sync.WaitGroup
@@ -409,7 +451,8 @@ func testCreateRepositoryConcurrently(t *testing.T, s db.Store) {
 
 // A transaction's writes are all or nothing.
 func testTxn(t *testing.T, s db.Store) {
-	ctx := context.Background()
+	// The store's own contract, not a write path: no move gate's tag (move.Untagged).
+	ctx := move.Untagged(context.Background())
 	boom := errors.New("boom")
 	err := s.Txn(ctx, func(tx db.Ops) error {
 		if _, err := tx.UpsertChangeList(ctx, cl(1, alice, db.StatusOpen, 0, 1)); err != nil {
@@ -446,7 +489,8 @@ func testTxn(t *testing.T, s db.Store) {
 // A CL locked in a transaction holds off other writers of it until the transaction ends: two
 // transactions that each read and increment its patchset never lose an increment.
 func testLockChangeList(t *testing.T, s db.Store) {
-	ctx := context.Background()
+	// The store's own contract, not a write path: no move gate's tag (move.Untagged).
+	ctx := move.Untagged(context.Background())
 	c := cl(1, alice, db.StatusOpen, 0, 1)
 	if _, err := s.UpsertChangeList(ctx, c); err != nil {
 		t.Fatal(err)
@@ -479,5 +523,49 @@ func testLockChangeList(t *testing.T, s db.Store) {
 	got, _, err := s.GetChangeList(ctx, 1, 1)
 	if err != nil || got.CurrentPatchset != 1+writers*each {
 		t.Fatalf("after %d locked increments the patchset is %d, %v", writers*each, got.CurrentPatchset, err)
+	}
+}
+
+// A repository the directory purged is forgotten whole — its CLs and what they hold, its favorites,
+// its row — and nothing of another repository's goes with it.
+func testDropRepository(t *testing.T, s db.Store) {
+	// The store's own contract, not a write path: no move gate's tag (move.Untagged).
+	ctx := move.Untagged(context.Background())
+	for _, id := range []int64{1, 2} {
+		if err := s.CreateRepository(ctx, db.Repository{ID: id, Name: fmt.Sprintf("r%d", id), CreatedBy: alice, CreatedAt: epoch}); err != nil {
+			t.Fatal(err)
+		}
+		c := cl(1, alice, db.StatusOpen, 0, 1)
+		c.Repo = id
+		if _, err := s.UpsertChangeList(ctx, c); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.AddReviewer(ctx, id, 1, bob, alice); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.SetFavorite(ctx, bob, id, true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.Txn(ctx, func(tx db.Ops) error { return tx.DropRepository(ctx, 1) }); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := s.GetChangeList(ctx, 1, 1); err != nil || ok {
+		t.Errorf("a purged repository's CL: %v, %v", ok, err)
+	}
+	if rs, err := s.Reviewers(ctx, 1, 1); err != nil || len(rs) != 0 {
+		t.Errorf("a purged repository's CL's reviewers: %v, %v", rs, err)
+	}
+	if fs, err := s.Favorites(ctx, bob); err != nil || !reflect.DeepEqual(fs, map[int64]bool{2: true}) {
+		t.Errorf("favorites after the purge: %v, %v", fs, err)
+	}
+	if _, ok, _ := s.RepositoryByName(ctx, "r1"); ok {
+		t.Error("a purged repository's row")
+	}
+	if _, ok, err := s.GetChangeList(ctx, 2, 1); err != nil || !ok {
+		t.Errorf("another repository's CL: %v, %v", ok, err)
+	}
+	if rs, _ := s.Reviewers(ctx, 2, 1); len(rs) != 1 {
+		t.Errorf("another repository's CL's reviewers: %v", rs)
 	}
 }

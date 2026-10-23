@@ -5,10 +5,13 @@ use std::path::PathBuf;
 
 const PROTOS: &[&str] = &[
     "proto/ok/v1/annotations.proto",
+    "proto/ok/v1/moved.proto",
+    "proto/ok/v1/moves.proto",
     "proto/ok/scm/v1/scm.proto",
     "proto/ok/identity/v1/identity.proto",
     "proto/ok/control/v1/control.proto",
     "proto/ok/okfs/v1/okfs.proto",
+    "proto/ok/secrets/v1/secrets.proto",
 ];
 
 fn main() {

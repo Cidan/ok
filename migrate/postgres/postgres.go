@@ -25,6 +25,7 @@ import (
 	"io/fs"
 	"net"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -32,21 +33,32 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	imigrate "github.com/Cidan/ok/internal/migrate"
+	"github.com/Cidan/ok/internal/secrets"
 	"github.com/Cidan/ok/migrate"
 )
 
 // Main is a migration program's main: it migrates the database whose URL the environment variable
-// -url-env names (DATABASE_URL unless set), or the file -url-file names, to the files in fsys,
-// recorded under -name (the table <name>_migrations; "app" unless set).
+// -url-env names (DATABASE_URL unless set), the file -url-file names, or the secret -url-secret
+// names — //secret/<path>, which the deployer gives the migration when its deploy's stanza names
+// it (docs/secrets.md) — to the files in fsys, recorded under -name (the table <name>_migrations;
+// "app" unless set).
 func Main(fsys fs.FS) {
 	flags := flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
 	urlEnv := flags.String("url-env", "DATABASE_URL", "the environment variable holding the database's URL")
 	urlFile := flags.String("url-file", "", "a file holding the database's URL, instead of the environment")
+	urlSecret := flags.String("url-secret", "", "a secret holding the database's URL, //secret/<path>, instead of the environment")
 	name := flags.String("name", "app", "what the migrations are recorded under: the table <name>_migrations")
 	migrate.Main(flags, func(ctx context.Context) (migrate.Migrator, error) {
 		url := os.Getenv(*urlEnv)
-		if *urlFile != "" {
-			data, err := os.ReadFile(*urlFile)
+		file := *urlFile
+		if *urlSecret != "" {
+			var err error
+			if file, err = secretFile(*urlSecret); err != nil {
+				return nil, err
+			}
+		}
+		if file != "" {
+			data, err := os.ReadFile(file)
 			if err != nil {
 				return nil, err
 			}
@@ -57,6 +69,20 @@ func Main(fsys fs.FS) {
 		}
 		return New(ctx, url, fsys, *name)
 	})
+}
+
+// secretFile is where a secret the deployer gave the migration is: $OK_SECRETS_DIR/<path below
+// //secret>.
+func secretFile(ref string) (string, error) {
+	p, ok := secrets.ParseRef(ref)
+	if !ok {
+		return "", fmt.Errorf("-url-secret %q is not a secret, //secret/<path>", ref)
+	}
+	dir := os.Getenv(secrets.DirEnv)
+	if dir == "" {
+		return "", fmt.Errorf("-url-secret %s: $%s is not set: the deploy's stanza names the secret (secrets:), and the deployer gives it to its migrations", ref, secrets.DirEnv)
+	}
+	return filepath.Join(dir, filepath.FromSlash(strings.TrimPrefix(p, secrets.Dir+"/"))), nil
 }
 
 // Migrator migrates one database to its files.

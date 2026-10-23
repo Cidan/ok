@@ -142,9 +142,6 @@ func NormalizeUserCode(typed string) string {
 // StartDeviceLogin begins a device login for a key: the device code, the command line's secret,
 // and the user code, the person's.
 func (s *Store) StartDeviceLogin(ctx context.Context, publicKey []byte, label, clientAddress string) (deviceCode, code string, expires time.Time, err error) {
-	if err := s.b.DeleteStaleDeviceLogins(ctx); err != nil {
-		return "", "", time.Time{}, err
-	}
 	expires = s.now().Add(DeviceLoginLifetime)
 	for range 5 {
 		deviceCode, code = token(), userCode()

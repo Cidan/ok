@@ -626,7 +626,10 @@ type CLStatus struct {
 	Failure *Failure `protobuf:"bytes,10,opt,name=failure,proto3" json:"failure,omitempty"`
 	// What ok could not read just now (ok automation, the deployer): the rest stands, and the
 	// stage is as much as could be told.
-	Unavailable   []string `protobuf:"bytes,11,rep,name=unavailable,proto3" json:"unavailable,omitempty"`
+	Unavailable []string `protobuf:"bytes,11,rep,name=unavailable,proto3" json:"unavailable,omitempty"`
+	// The CL whose pre covers this one — the top of its stack in review — when that is another CL;
+	// 0 otherwise. Pre runs at a stack's top, over every CL of it: this CL's own does not count.
+	PreAt         int64 `protobuf:"varint,12,opt,name=pre_at,json=preAt,proto3" json:"pre_at,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -736,6 +739,13 @@ func (x *CLStatus) GetUnavailable() []string {
 		return x.Unavailable
 	}
 	return nil
+}
+
+func (x *CLStatus) GetPreAt() int64 {
+	if x != nil {
+		return x.PreAt
+	}
+	return 0
 }
 
 type CL struct {
@@ -2521,7 +2531,7 @@ const file_proto_ok_control_v1_control_proto_rawDesc = "" +
 	"\n" +
 	"repository\x18\x01 \x01(\tR\n" +
 	"repository\x12\x16\n" +
-	"\x06number\x18\x02 \x01(\x03R\x06number\"\xe0\x03\n" +
+	"\x06number\x18\x02 \x01(\x03R\x06number\"\xf7\x03\n" +
 	"\bCLStatus\x12!\n" +
 	"\x02cl\x18\x01 \x01(\v2\x11.ok.control.v1.CLR\x02cl\x12*\n" +
 	"\x05stage\x18\x02 \x01(\x0e2\x14.ok.control.v1.StageR\x05stage\x127\n" +
@@ -2536,7 +2546,8 @@ const file_proto_ok_control_v1_control_proto_rawDesc = "" +
 	"\vdeployments\x18\t \x01(\v2\x1a.ok.control.v1.DeploymentsR\vdeployments\x120\n" +
 	"\afailure\x18\n" +
 	" \x01(\v2\x16.ok.control.v1.FailureR\afailure\x12 \n" +
-	"\vunavailable\x18\v \x03(\tR\vunavailable\"\xf1\x03\n" +
+	"\vunavailable\x18\v \x03(\tR\vunavailable\x12\x15\n" +
+	"\x06pre_at\x18\f \x01(\x03R\x05preAt\"\xf1\x03\n" +
 	"\x02CL\x12\x1e\n" +
 	"\n" +
 	"repository\x18\x01 \x01(\tR\n" +
@@ -2757,8 +2768,7 @@ const file_proto_ok_control_v1_control_proto_rawDesc = "" +
 	"\x11LABEL_UNSPECIFIED\x10\x00\x12\x0e\n" +
 	"\n" +
 	"LABEL_LGTM\x10\x01\x12\x12\n" +
-	"\x0eLABEL_APPROVAL\x10\x022\xe4\n" +
-	"\n" +
+	"\x0eLABEL_APPROVAL\x10\x022\x9d\v\n" +
 	"\vChangeLists\x127\n" +
 	"\x06Status\x12\x14.ok.control.v1.CLRef\x1a\x17.ok.control.v1.CLStatus\x128\n" +
 	"\x05Watch\x12\x14.ok.control.v1.CLRef\x1a\x17.ok.control.v1.CLStatus0\x01\x12I\n" +
@@ -2776,7 +2786,8 @@ const file_proto_ok_control_v1_control_proto_rawDesc = "" +
 	"\bRollback\x12\x1e.ok.control.v1.RollbackRequest\x1a\x1f.ok.control.v1.RollbackResponse\x12<\n" +
 	"\x05Rerun\x12\x1a.ok.control.v1.RunsRequest\x1a\x17.ok.control.v1.CLStatus\x12A\n" +
 	"\n" +
-	"CancelRuns\x12\x1a.ok.control.v1.RunsRequest\x1a\x17.ok.control.v1.CLStatus\x12C\n" +
+	"CancelRuns\x12\x1a.ok.control.v1.RunsRequest\x1a\x17.ok.control.v1.CLStatus\x127\n" +
+	"\x06RunPre\x12\x14.ok.control.v1.CLRef\x1a\x17.ok.control.v1.CLStatus\x12C\n" +
 	"\aReadLog\x12\x1d.ok.control.v1.ReadLogRequest\x1a\x17.ok.control.v1.LogChunk0\x01\x12L\n" +
 	"\x0fRetryDeployment\x12 .ok.control.v1.DeploymentRequest\x1a\x17.ok.control.v1.CLStatus\x12K\n" +
 	"\x0eHaltDeployment\x12 .ok.control.v1.DeploymentRequest\x1a\x17.ok.control.v1.CLStatus\x12I\n" +
@@ -2881,32 +2892,34 @@ var file_proto_ok_control_v1_control_proto_depIdxs = []int32{
 	27, // 45: ok.control.v1.ChangeLists.Rollback:input_type -> ok.control.v1.RollbackRequest
 	29, // 46: ok.control.v1.ChangeLists.Rerun:input_type -> ok.control.v1.RunsRequest
 	29, // 47: ok.control.v1.ChangeLists.CancelRuns:input_type -> ok.control.v1.RunsRequest
-	30, // 48: ok.control.v1.ChangeLists.ReadLog:input_type -> ok.control.v1.ReadLogRequest
-	32, // 49: ok.control.v1.ChangeLists.RetryDeployment:input_type -> ok.control.v1.DeploymentRequest
-	32, // 50: ok.control.v1.ChangeLists.HaltDeployment:input_type -> ok.control.v1.DeploymentRequest
-	32, // 51: ok.control.v1.ChangeLists.AllowHazards:input_type -> ok.control.v1.DeploymentRequest
-	10, // 52: ok.control.v1.ChangeLists.Status:output_type -> ok.control.v1.CLStatus
-	10, // 53: ok.control.v1.ChangeLists.Watch:output_type -> ok.control.v1.CLStatus
-	10, // 54: ok.control.v1.ChangeLists.RequestReview:output_type -> ok.control.v1.CLStatus
-	10, // 55: ok.control.v1.ChangeLists.ReturnToDraft:output_type -> ok.control.v1.CLStatus
-	10, // 56: ok.control.v1.ChangeLists.AddReviewers:output_type -> ok.control.v1.CLStatus
-	10, // 57: ok.control.v1.ChangeLists.RemoveReviewers:output_type -> ok.control.v1.CLStatus
-	10, // 58: ok.control.v1.ChangeLists.Reply:output_type -> ok.control.v1.CLStatus
-	10, // 59: ok.control.v1.ChangeLists.Comment:output_type -> ok.control.v1.CLStatus
-	10, // 60: ok.control.v1.ChangeLists.Resolve:output_type -> ok.control.v1.CLStatus
-	10, // 61: ok.control.v1.ChangeLists.Submit:output_type -> ok.control.v1.CLStatus
-	10, // 62: ok.control.v1.ChangeLists.CancelSubmit:output_type -> ok.control.v1.CLStatus
-	10, // 63: ok.control.v1.ChangeLists.Abandon:output_type -> ok.control.v1.CLStatus
-	10, // 64: ok.control.v1.ChangeLists.Restore:output_type -> ok.control.v1.CLStatus
-	28, // 65: ok.control.v1.ChangeLists.Rollback:output_type -> ok.control.v1.RollbackResponse
-	10, // 66: ok.control.v1.ChangeLists.Rerun:output_type -> ok.control.v1.CLStatus
-	10, // 67: ok.control.v1.ChangeLists.CancelRuns:output_type -> ok.control.v1.CLStatus
-	31, // 68: ok.control.v1.ChangeLists.ReadLog:output_type -> ok.control.v1.LogChunk
-	10, // 69: ok.control.v1.ChangeLists.RetryDeployment:output_type -> ok.control.v1.CLStatus
-	10, // 70: ok.control.v1.ChangeLists.HaltDeployment:output_type -> ok.control.v1.CLStatus
-	10, // 71: ok.control.v1.ChangeLists.AllowHazards:output_type -> ok.control.v1.CLStatus
-	52, // [52:72] is the sub-list for method output_type
-	32, // [32:52] is the sub-list for method input_type
+	9,  // 48: ok.control.v1.ChangeLists.RunPre:input_type -> ok.control.v1.CLRef
+	30, // 49: ok.control.v1.ChangeLists.ReadLog:input_type -> ok.control.v1.ReadLogRequest
+	32, // 50: ok.control.v1.ChangeLists.RetryDeployment:input_type -> ok.control.v1.DeploymentRequest
+	32, // 51: ok.control.v1.ChangeLists.HaltDeployment:input_type -> ok.control.v1.DeploymentRequest
+	32, // 52: ok.control.v1.ChangeLists.AllowHazards:input_type -> ok.control.v1.DeploymentRequest
+	10, // 53: ok.control.v1.ChangeLists.Status:output_type -> ok.control.v1.CLStatus
+	10, // 54: ok.control.v1.ChangeLists.Watch:output_type -> ok.control.v1.CLStatus
+	10, // 55: ok.control.v1.ChangeLists.RequestReview:output_type -> ok.control.v1.CLStatus
+	10, // 56: ok.control.v1.ChangeLists.ReturnToDraft:output_type -> ok.control.v1.CLStatus
+	10, // 57: ok.control.v1.ChangeLists.AddReviewers:output_type -> ok.control.v1.CLStatus
+	10, // 58: ok.control.v1.ChangeLists.RemoveReviewers:output_type -> ok.control.v1.CLStatus
+	10, // 59: ok.control.v1.ChangeLists.Reply:output_type -> ok.control.v1.CLStatus
+	10, // 60: ok.control.v1.ChangeLists.Comment:output_type -> ok.control.v1.CLStatus
+	10, // 61: ok.control.v1.ChangeLists.Resolve:output_type -> ok.control.v1.CLStatus
+	10, // 62: ok.control.v1.ChangeLists.Submit:output_type -> ok.control.v1.CLStatus
+	10, // 63: ok.control.v1.ChangeLists.CancelSubmit:output_type -> ok.control.v1.CLStatus
+	10, // 64: ok.control.v1.ChangeLists.Abandon:output_type -> ok.control.v1.CLStatus
+	10, // 65: ok.control.v1.ChangeLists.Restore:output_type -> ok.control.v1.CLStatus
+	28, // 66: ok.control.v1.ChangeLists.Rollback:output_type -> ok.control.v1.RollbackResponse
+	10, // 67: ok.control.v1.ChangeLists.Rerun:output_type -> ok.control.v1.CLStatus
+	10, // 68: ok.control.v1.ChangeLists.CancelRuns:output_type -> ok.control.v1.CLStatus
+	10, // 69: ok.control.v1.ChangeLists.RunPre:output_type -> ok.control.v1.CLStatus
+	31, // 70: ok.control.v1.ChangeLists.ReadLog:output_type -> ok.control.v1.LogChunk
+	10, // 71: ok.control.v1.ChangeLists.RetryDeployment:output_type -> ok.control.v1.CLStatus
+	10, // 72: ok.control.v1.ChangeLists.HaltDeployment:output_type -> ok.control.v1.CLStatus
+	10, // 73: ok.control.v1.ChangeLists.AllowHazards:output_type -> ok.control.v1.CLStatus
+	53, // [53:74] is the sub-list for method output_type
+	32, // [32:53] is the sub-list for method input_type
 	32, // [32:32] is the sub-list for extension type_name
 	32, // [32:32] is the sub-list for extension extendee
 	0,  // [0:32] is the sub-list for field type_name

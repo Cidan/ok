@@ -11,12 +11,18 @@ import (
 	"strconv"
 	"strings"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	"github.com/Cidan/ok/internal/authz"
 	"github.com/Cidan/ok/internal/control/checks"
 	"github.com/Cidan/ok/internal/control/db"
 	"github.com/Cidan/ok/internal/control/people"
 	"github.com/Cidan/ok/internal/control/review"
 	"github.com/Cidan/ok/internal/control/scm"
+	"github.com/Cidan/ok/internal/move"
 	"github.com/Cidan/ok/internal/owners"
+	"github.com/Cidan/ok/internal/tenancy"
 	automationpb "github.com/Cidan/ok/proto/ok/automation/v1"
 	controlpb "github.com/Cidan/ok/proto/ok/control/v1"
 	deploypb "github.com/Cidan/ok/proto/ok/deploy/v1"
@@ -53,7 +59,14 @@ func (a *API) load(ctx context.Context, ref *controlpb.CLRef) (*target, error) {
 	if err != nil {
 		return nil, err
 	}
-	cl, c, err := a.review.ChangeList(ctx, repo.GetId(), ref.GetNumber())
+	// ok control reads every repository; the person asking, what Authorize lets them: one they
+	// cannot see is none.
+	me, _ := a.caller(ctx)
+	if !a.review.May(ctx, repo, me, authz.ReadCode) {
+		return nil, status.Errorf(codes.NotFound, "no repository is called %s", ref.GetRepository())
+	}
+	// Reading it fresh records it: a write about the repository, through its move gate.
+	cl, c, err := a.review.ChangeList(move.WithRepository(ctx, repo.GetId()), repo.GetId(), ref.GetNumber())
 	if err != nil {
 		return nil, err
 	}
@@ -110,7 +123,7 @@ type blockedCache struct {
 // status reads where t stands. bc, when not nil, carries the submit gates' answer across a
 // watch's reads.
 func (a *API) status(ctx context.Context, t *target, bc *blockedCache) (*controlpb.CLStatus, error) {
-	st := &controlpb.CLStatus{Cl: a.clOut(t)}
+	st := &controlpb.CLStatus{Cl: a.clOut(ctx, t)}
 	active := t.cl.Status.Active()
 
 	rv, ev, err := a.reviewOut(ctx, t)
@@ -124,14 +137,19 @@ func (a *API) status(ctx context.Context, t *target, bc *blockedCache) (*control
 		a.unavailable(ctx, st, unavailableAutomation, "reading pre", t, err)
 		st.Pre = &controlpb.Checks{Patchset: t.cl.CurrentPatchset}
 	} else {
-		st.Pre = a.preOut(t, pre)
+		st.Pre = a.preOut(ctx, t, pre)
+	}
+	if active {
+		if st.PreAt, err = db.PreAt(ctx, a.db, t.repo.GetId(), t.cl.Number); err != nil {
+			return nil, err
+		}
 	}
 
 	subs, err := a.runs.ListSubmissions(ctx, &automationpb.ListSubmissionsRequest{RepositoryId: t.repo.GetId(), ClNumber: t.cl.Number, Limit: 1})
 	if err != nil {
 		a.unavailable(ctx, st, unavailableAutomation, "reading submissions", t, err)
 	} else if len(subs.GetSubmissions()) > 0 {
-		st.Post = a.postOut(t, subs.GetSubmissions()[0])
+		st.Post = a.postOut(ctx, t, subs.GetSubmissions()[0])
 	}
 
 	if t.cl.Status == db.StatusSubmitted && len(t.cl.LandedCommit) > 0 {
@@ -139,7 +157,7 @@ func (a *API) status(ctx context.Context, t *target, bc *blockedCache) (*control
 		if err != nil {
 			a.unavailable(ctx, st, unavailableDeployer, "listing deployments", t, err)
 		} else {
-			st.Deployments = a.deploymentsOut(t, resp)
+			st.Deployments = a.deploymentsOut(ctx, t, resp)
 		}
 	}
 
@@ -176,19 +194,19 @@ func (a *API) unavailable(ctx context.Context, st *controlpb.CLStatus, what, doi
 	}
 }
 
-func (a *API) clOut(t *target) *controlpb.CL {
+func (a *API) clOut(ctx context.Context, t *target) *controlpb.CL {
 	out := &controlpb.CL{
 		Repository:  t.repo.GetName(),
 		Number:      t.cl.Number,
 		Title:       t.cl.Title(),
-		Author:      people.Handle(t.cl.Author),
+		Author:      people.Handle(ctx, t.cl.Author),
 		Status:      controlpb.CL_Status(t.cl.Status),
 		Patchset:    t.cl.CurrentPatchset,
 		ChangeId:    scm.ChangeID(t.cl.ChangeID),
 		Parent:      t.cl.ParentNumber,
 		Rollback:    len(t.cl.RollsBack) > 0,
 		Url:         a.clURL(t.repo.GetName(), t.cl.Number),
-		SubmittedBy: people.Handle(t.cl.SubmittedBy),
+		SubmittedBy: people.Handle(ctx, t.cl.SubmittedBy),
 	}
 	if p := scm.Patchset(t.scm, t.cl.CurrentPatchset); p != nil {
 		out.CommitId = scm.Hex(p.GetCommitId())
@@ -208,7 +226,7 @@ func (a *API) reviewOut(ctx context.Context, t *target) (*controlpb.Review, *rev
 		return nil, nil, err
 	}
 	for _, r := range reviewers {
-		rv.Reviewers = append(rv.Reviewers, people.Handle(r.Principal))
+		rv.Reviewers = append(rv.Reviewers, people.Handle(ctx, r.Principal))
 	}
 	comments, err := a.db.Comments(ctx, t.repo.GetId(), t.cl.Number)
 	if err != nil {
@@ -224,7 +242,7 @@ func (a *API) reviewOut(ctx context.Context, t *target) (*controlpb.Review, *rev
 	// (db.UnresolvedThreads, which review counts).
 	for _, c := range comments {
 		if c.ParentID == 0 && c.FilePath != "" && !c.Resolved {
-			rv.Unresolved = append(rv.Unresolved, &controlpb.Thread{Id: c.ID, Author: people.Handle(c.Author), File: c.FilePath,
+			rv.Unresolved = append(rv.Unresolved, &controlpb.Thread{Id: c.ID, Author: people.Handle(ctx, c.Author), File: c.FilePath,
 				Line: c.Line, Body: c.Body, Patchset: c.Patchset, Replies: replies[c.ID]})
 		}
 	}
@@ -240,7 +258,7 @@ func (a *API) reviewOut(ctx context.Context, t *target) (*controlpb.Review, *rev
 	rv.Lgtm = s.LGTMSatisfied
 	rv.SelfLgtmAllowed = s.SelfLGTMAllowed
 	for _, p := range s.LGTMBy {
-		rv.LgtmBy = append(rv.LgtmBy, people.Handle(p))
+		rv.LgtmBy = append(rv.LgtmBy, people.Handle(ctx, p))
 	}
 	for _, o := range s.Owners {
 		set := &controlpb.OwnerSet{Satisfied: o.Satisfied, Implicit: o.Implicit}
@@ -251,7 +269,7 @@ func (a *API) reviewOut(ctx context.Context, t *target) (*controlpb.Review, *rev
 			}
 		}
 		for _, p := range o.ApprovedBy {
-			set.ApprovedBy = append(set.ApprovedBy, people.Handle(p))
+			set.ApprovedBy = append(set.ApprovedBy, people.Handle(ctx, p))
 		}
 		rv.OwnerSets = append(rv.OwnerSets, set)
 	}
@@ -272,7 +290,7 @@ func (a *API) reviewOut(ctx context.Context, t *target) (*controlpb.Review, *rev
 // ownerOut writes an owner as OWNERS does.
 func ownerOut(o owners.Owner) string { return o.String() }
 
-func (a *API) preOut(t *target, pre *automationpb.Pre) *controlpb.Checks {
+func (a *API) preOut(ctx context.Context, t *target, pre *automationpb.Pre) *controlpb.Checks {
 	out := &controlpb.Checks{Patchset: t.cl.CurrentPatchset, CommitId: scm.Hex(pre.GetCommitId())}
 	switch pre.GetVerdict() {
 	case automationpb.Pre_VERDICT_PASSED:
@@ -285,18 +303,19 @@ func (a *API) preOut(t *target, pre *automationpb.Pre) *controlpb.Checks {
 		out.Verdict = controlpb.Checks_VERDICT_NONE
 	}
 	if pre.GetPlan() != nil {
-		out.Runs = append(out.Runs, a.checkOut(t, pre.GetPlan()))
+		out.Runs = append(out.Runs, a.checkOut(ctx, t, pre.GetPlan()))
 	}
 	for _, r := range pre.GetJobs() {
-		out.Runs = append(out.Runs, a.checkOut(t, r))
+		out.Runs = append(out.Runs, a.checkOut(ctx, t, r))
 	}
 	out.Passed, out.Total = tally(out.Runs)
 	return out
 }
 
-func (a *API) postOut(t *target, sub *automationpb.Submission) *controlpb.Post {
+func (a *API) postOut(ctx context.Context, t *target, sub *automationpb.Submission) *controlpb.Post {
 	p := &controlpb.Post{Submission: sub.GetId(), Status: controlpb.Post_Status(sub.GetStatus()),
-		SubmittedBy: people.Handle(sub.GetSubmittedBy()), Note: sub.GetNote(), Reason: sub.GetReason()}
+		SubmittedBy: people.Handle(ctx, sub.GetSubmittedById()), Note: sub.GetNote(),
+		Reason: people.Reason(ctx, sub.GetReason(), sub.GetCanceledById())}
 	for _, c := range sub.GetCls() {
 		if c.GetNumber() == t.cl.Number {
 			p.Patchset = c.GetPatchset()
@@ -306,10 +325,10 @@ func (a *API) postOut(t *target, sub *automationpb.Submission) *controlpb.Post {
 	p.Attempt = attemptWord(att)
 	if c := checks.Candidate(att, t.cl.Number); c != nil {
 		if c.GetPlan() != nil {
-			p.Runs = append(p.Runs, a.checkOut(t, c.GetPlan()))
+			p.Runs = append(p.Runs, a.checkOut(ctx, t, c.GetPlan()))
 		}
 		for _, r := range c.GetJobs() {
-			p.Runs = append(p.Runs, a.checkOut(t, r))
+			p.Runs = append(p.Runs, a.checkOut(ctx, t, r))
 		}
 	}
 	p.Passed, p.Total = tally(p.Runs)
@@ -342,10 +361,10 @@ func attemptWord(at *automationpb.Attempt) string {
 	return "failed"
 }
 
-func (a *API) checkOut(t *target, r *automationpb.Run) *controlpb.Check {
+func (a *API) checkOut(ctx context.Context, t *target, r *automationpb.Run) *controlpb.Check {
 	name, source := checks.JobName(r.GetOrigin().GetJob())
 	c := &controlpb.Check{Run: r.GetId(), Name: name, Source: source, Kind: kindWord(r.GetJob().GetKind()),
-		Targets: r.GetJob().GetTargets(), Status: controlpb.Check_Status(r.GetStatus()), Reason: r.GetReason(),
+		Targets: r.GetJob().GetTargets(), Status: controlpb.Check_Status(r.GetStatus()), Reason: people.Reason(ctx, r.GetReason(), r.GetCanceledById()),
 		Url: a.runURL(t.repo.GetName(), t.cl.Number, r.GetId()), CarriedFrom: r.GetCarriedFrom(), Why: r.GetWhy()}
 	if from := r.GetCarriedFrom(); from > 0 {
 		c.Url = a.runURL(t.repo.GetName(), t.cl.Number, from)
@@ -367,13 +386,19 @@ func tally(runs []*controlpb.Check) (passed, total int32) {
 	return passed, total
 }
 
+// newer reports whether a was made after b: by when, its ID deciding between two made at once.
+func newer(a, b *deploypb.Deployment) bool {
+	at, bt := a.GetCreatedAt().AsTime(), b.GetCreatedAt().AsTime()
+	return at.After(bt) || at.Equal(bt) && a.GetId() > b.GetId()
+}
+
 // deploymentsOut are each deploy's latest deployment covering the commit, newest first: a
 // deployment a newer commit replaced is covered by its replacement, which decides the deploy.
-func (a *API) deploymentsOut(t *target, resp *deploypb.ListDeploymentsResponse) *controlpb.Deployments {
+func (a *API) deploymentsOut(ctx context.Context, t *target, resp *deploypb.ListDeploymentsResponse) *controlpb.Deployments {
 	out := &controlpb.Deployments{Planned: resp.GetPlanned()}
 	latest := map[string]*deploypb.Deployment{}
 	for _, d := range resp.GetDeployments() {
-		if cur, ok := latest[d.GetDeploy()]; !ok || d.GetId() > cur.GetId() {
+		if cur, ok := latest[d.GetDeploy()]; !ok || newer(d, cur) {
 			latest[d.GetDeploy()] = d
 		}
 	}
@@ -381,10 +406,10 @@ func (a *API) deploymentsOut(t *target, resp *deploypb.ListDeploymentsResponse) 
 	for _, d := range latest {
 		ds = append(ds, d)
 	}
-	sort.Slice(ds, func(i, j int) bool { return ds[i].GetId() > ds[j].GetId() })
+	sort.Slice(ds, func(i, j int) bool { return newer(ds[i], ds[j]) })
 	for _, d := range ds {
 		item := &controlpb.Deployment{Id: d.GetId(), Name: d.GetName(), Status: controlpb.Deployment_Status(d.GetStatus()),
-			Stage: strings.ToLower(strings.TrimPrefix(d.GetStage().String(), "STAGE_")), Reason: d.GetReason(),
+			Stage: strings.ToLower(strings.TrimPrefix(d.GetStage().String(), "STAGE_")), Reason: people.HaltReason(ctx, d.GetReason(), d.GetHaltById()),
 			Url: a.deploymentURL(t.repo.GetName(), d.GetId(), t.cl.Number)}
 		if w := d.GetWorkload(); w != nil {
 			item.Workload = w.GetNamespace() + "/" + w.GetName()
@@ -484,13 +509,13 @@ func (a *API) logTail(ctx context.Context, id int64) (string, error) {
 func (a *API) admins(ctx context.Context, repo *scmpb.Repository) []string {
 	var out []string
 	for _, p := range a.review.Admins(ctx, repo) {
-		out = append(out, people.Handle(p))
+		out = append(out, people.Handle(ctx, p))
 	}
 	return out
 }
 
 func (a *API) clURL(repo string, number int64) string {
-	return a.base + "/" + repo + "/cl/" + strconv.FormatInt(number, 10)
+	return a.base + tenancy.URLPath(repo, a.installation) + "/cl/" + strconv.FormatInt(number, 10)
 }
 
 func (a *API) runURL(repo string, number, run int64) string {
@@ -498,5 +523,5 @@ func (a *API) runURL(repo string, number, run int64) string {
 }
 
 func (a *API) deploymentURL(repo string, id, number int64) string {
-	return a.base + "/" + repo + "/deploy/" + strconv.FormatInt(id, 10) + "?cl=" + strconv.FormatInt(number, 10)
+	return a.base + tenancy.URLPath(repo, a.installation) + "/deploy/" + strconv.FormatInt(id, 10) + "?cl=" + strconv.FormatInt(number, 10)
 }

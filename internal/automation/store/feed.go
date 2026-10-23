@@ -3,7 +3,7 @@ package store
 import (
 	"context"
 
-	"github.com/Cidan/ok/internal/lock"
+	"github.com/Cidan/ok/internal/move"
 	"github.com/Cidan/ok/internal/scm/scmfeed"
 )
 
@@ -13,25 +13,13 @@ func (s *Store) Cursor(ctx context.Context, repo int64) (int64, error) {
 	return s.b.FollowCursor(ctx, scmfeed.Topic, repo)
 }
 
+// Cursors are Cursor's of repos, at once; a repository with none is absent.
+func (s *Store) Cursors(ctx context.Context, repos []int64) (map[int64]int64, error) {
+	return s.b.FollowCursors(ctx, scmfeed.Topic, repos)
+}
+
 // SetCursor records the last of a repository's events applied. It never moves the cursor back,
 // so an event is never applied twice however many followers there are.
 func (s *Store) SetCursor(ctx context.Context, repo, seq int64) error {
-	return s.b.AdvanceFollowCursor(ctx, scmfeed.Topic, repo, seq)
-}
-
-// LegacyCursor, Seed, and LeaveLegacy are a follow.Legacy's: automation's place in the SCM's feed
-// before it followed each repository's log, which it leaves once.
-func (s *Store) LegacyCursor(ctx context.Context) (int64, error) { return s.b.LegacyCursor(ctx) }
-
-func (s *Store) Seed(ctx context.Context, repo, seq int64) error {
-	return s.b.SeedFollowCursor(ctx, scmfeed.Topic, repo, seq)
-}
-
-func (s *Store) LeaveLegacy(ctx context.Context) error { return s.b.ForgetLegacyCursor(ctx) }
-
-// LeadBuildCache runs fn holding the build cache sweep's lock, with a context that ends if the
-// lock is lost, and gives the lock up when fn returns. It returns lock.ErrNotAcquired when
-// another replica holds the lock, and otherwise fn's error.
-func (s *Store) LeadBuildCache(ctx context.Context, fn lock.LockFn) error {
-	return s.b.Lead(ctx, "buildcache", fn)
+	return s.b.AdvanceFollowCursor(move.WithRepository(ctx, repo), scmfeed.Topic, repo, seq)
 }

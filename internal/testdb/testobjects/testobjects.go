@@ -88,6 +88,9 @@ func (l Location) Open(t testing.TB) blob.Store {
 	if err != nil {
 		t.Fatalf("testobjects: opening the %s store: %v", l.Type, err)
 	}
+	if d := Latency(t); d > 0 {
+		return NewSlow(s, d)
+	}
 	return s
 }
 

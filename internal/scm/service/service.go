@@ -25,11 +25,15 @@ import (
 	"google.golang.org/protobuf/protoadapt"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	"github.com/Cidan/ok/internal/authz"
+	"github.com/Cidan/ok/internal/move"
+	"github.com/Cidan/ok/internal/names"
 	"github.com/Cidan/ok/internal/scm/encoding"
 	"github.com/Cidan/ok/internal/scm/pack"
 	"github.com/Cidan/ok/internal/scm/store"
 	"github.com/Cidan/ok/internal/serve/authn"
 	scmpb "github.com/Cidan/ok/proto/ok/scm/v1"
+	okpb "github.com/Cidan/ok/proto/ok/v1"
 )
 
 // maxRefs bounds the refs, IDs, and paths one request may name.
@@ -39,22 +43,41 @@ const maxRefs = 100_000
 // which the serving runtime enforces before a request reaches it: nothing here checks a caller
 // against a list.
 type core struct {
-	store  *store.Store
-	people store.People
-	now    func() time.Time // the clock leases are measured by
+	store     *store.Store
+	people    store.People
+	names     *names.Resolver // principals' IDs to names, and back
+	dir       Tenancy         // the directory, which names repositories
+	repoNames *repoNames
+	access    *access          // decides people's requests (Authorize)
+	now       func() time.Time // the clock leases are measured by
+	// cell is the cell the SCM serves, and peers reach the others' (InCell).
+	cell  string
+	peers PeerSCMs
 }
 
-func newCore(s *store.Store, dir Directory) *core {
-	return &core{store: s, people: people{dir: dir, names: s.Names()}, now: time.Now}
+// PeerSCMs reaches other cells' SCMs (docs/hosted.md, "Cells, as built").
+type PeerSCMs interface {
+	// SCM is the Cells service of the named cell's SCM; Moves its Moves service.
+	SCM(ctx context.Context, cell string) (scmpb.CellsClient, error)
+	Moves(ctx context.Context, cell string) (okpb.MovesClient, error)
 }
 
-// caller returns the principal a request is for.
+// elsewhere reports whether cell is another cell's; never, for an SCM that serves no one cell.
+func (k *core) elsewhere(cell string) bool { return k.cell != "" && cell != "" && cell != k.cell }
+
+func newCore(s *store.Store, dir Directory, ten Tenancy) *core {
+	return &core{store: s, people: people{dir: dir, names: s.Names()}, names: names.New(names.Client{Dir: dir}), dir: ten,
+		repoNames: newRepoNames(ten), now: time.Now}
+}
+
+// caller returns the stable ID of the principal a request is for, as the SCM records principals
+// (docs/hosted.md, "Tenancy, as built").
 func caller(ctx context.Context) (string, error) {
 	c, ok := authn.FromContext(ctx)
 	if !ok {
 		return "", status.Error(codes.Unauthenticated, "the SCM serves identified principals only")
 	}
-	return c.Principal, nil
+	return c.ID, nil
 }
 
 // toStatus maps a store error onto its gRPC status.
@@ -197,8 +220,23 @@ type Repositories struct {
 	c *core
 }
 
-func repositoryOut(r store.Repository) *scmpb.Repository {
-	return &scmpb.Repository{Id: r.ID, Name: r.Name, Head: r.Head[:], HeadSeq: r.HeadSeq, CreatedAt: timestamppb.New(r.CreatedAt), CreatedBy: r.CreatedBy}
+func (k *core) repositoryOut(ctx context.Context, r store.Repository) (*scmpb.Repository, error) {
+	by, err := k.names.Name(ctx, r.CreatedBy)
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable, "naming repository %d's creator: %v", r.ID, err)
+	}
+	e, err := k.repoNames.entry(ctx, r.ID)
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable, "naming repository %d: %v", r.ID, err)
+	}
+	out := &scmpb.Repository{Id: r.ID, Name: e.full, Head: r.Head[:], HeadSeq: r.HeadSeq, CreatedAt: timestamppb.New(r.CreatedAt),
+		CreatedBy: by, CreatedById: r.CreatedBy, ParentId: e.parent}
+	if e.parent != 0 {
+		if out.Parent, err = k.repoNames.name(ctx, e.parent); err != nil {
+			return nil, status.Errorf(codes.Unavailable, "naming repository %d's upstream: %v", r.ID, err)
+		}
+	}
+	return out, nil
 }
 
 func (s *Repositories) CreateRepository(ctx context.Context, req *scmpb.CreateRepositoryRequest) (*scmpb.Repository, error) {
@@ -206,25 +244,32 @@ func (s *Repositories) CreateRepository(ctx context.Context, req *scmpb.CreateRe
 	if err != nil {
 		return nil, err
 	}
-	if req.GetActor() != "" {
+	if req.GetActorId() != "" {
 		return nil, status.Error(codes.InvalidArgument, "a repository is created for another person through Review.CreateRepository")
 	}
-	r, err := s.c.store.CreateRepository(ctx, req.GetName(), principal)
-	if err != nil {
-		return nil, toStatus(err)
-	}
-	return repositoryOut(r), nil
+	return s.c.create(ctx, principal, req.GetName())
 }
 
-func (s *Repositories) RenameRepository(ctx context.Context, req *scmpb.RenameRepositoryRequest) (*scmpb.Repository, error) {
-	if _, err := caller(ctx); err != nil {
-		return nil, err
+func (s *Repositories) ForkRepository(ctx context.Context, req *scmpb.ForkRepositoryRequest) (*scmpb.Repository, error) {
+	c, ok := authn.FromContext(ctx)
+	if !ok {
+		return nil, status.Error(codes.Unauthenticated, "the SCM serves identified principals only")
 	}
-	r, err := s.c.store.RenameRepository(ctx, req.GetRepositoryId(), req.GetName())
-	if err != nil {
-		return nil, toStatus(err)
+	if req.GetActorId() != "" {
+		return nil, status.Error(codes.InvalidArgument, "a fork is made for another person through Review.ForkRepository")
 	}
-	return repositoryOut(r), nil
+	return s.c.fork(ctx, c.ID, c.Token, req.GetParent(), req.GetName())
+}
+
+func (s *Repositories) SyncFork(ctx context.Context, req *scmpb.SyncForkRequest) (*scmpb.SyncForkResponse, error) {
+	c, ok := authn.FromContext(ctx)
+	if !ok {
+		return nil, status.Error(codes.Unauthenticated, "the SCM serves identified principals only")
+	}
+	if req.GetActorId() != "" {
+		return nil, status.Error(codes.InvalidArgument, "a fork is synced for another person through Review.SyncFork")
+	}
+	return s.c.syncFork(ctx, c.ID, c.Token, req.GetRepositoryId())
 }
 
 func (s *Repositories) GetRepository(ctx context.Context, req *scmpb.GetRepositoryRequest) (*scmpb.Repository, error) {
@@ -237,32 +282,17 @@ func (s *Repositories) GetRepository(ctx context.Context, req *scmpb.GetReposito
 	case *scmpb.GetRepositoryRequest_Id:
 		r, err = s.c.store.GetRepository(ctx, k.Id)
 	case *scmpb.GetRepositoryRequest_Name:
-		r, err = s.c.store.GetRepositoryByName(ctx, k.Name)
+		r, err = s.c.resolve(ctx, k.Name)
+		if err != nil {
+			return nil, err
+		}
 	default:
 		return nil, status.Error(codes.InvalidArgument, "name a repository by id or name")
 	}
 	if err != nil {
 		return nil, toStatus(err)
 	}
-	return repositoryOut(r), nil
-}
-
-func (s *Repositories) ListRepositories(ctx context.Context, req *scmpb.ListRepositoriesRequest) (*scmpb.ListRepositoriesResponse, error) {
-	if _, err := caller(ctx); err != nil {
-		return nil, err
-	}
-	if req.GetPageSize() < 0 {
-		return nil, status.Error(codes.InvalidArgument, "page_size is negative")
-	}
-	rs, next, err := s.c.store.ListRepositories(ctx, int(req.GetPageSize()), req.GetPageToken())
-	if err != nil {
-		return nil, toStatus(err)
-	}
-	out := &scmpb.ListRepositoriesResponse{NextPageToken: next}
-	for _, r := range rs {
-		out.Repositories = append(out.Repositories, repositoryOut(r))
-	}
-	return out, nil
+	return s.c.repositoryOut(ctx, r)
 }
 
 // Store serves jj's storage surface: Backend reads, the caller's operation log, and
@@ -634,6 +664,14 @@ func (s *Store) Publish(stream grpc.BidiStreamingServer[scmpb.PublishRequest, sc
 		}
 		files[i] = m
 	}
+	// The stream's context was taken before its first message named the repository.
+	ctx = move.WithRepository(ctx, begin.GetRepositoryId())
+	// A client that would store a secret's value is refused before anything is sent.
+	if !begin.GetGuardsSecrets() {
+		if err := s.c.store.RequireGuard(ctx, begin.GetRepositoryId()); err != nil {
+			return toStatus(err)
+		}
+	}
 	p, err := s.c.store.BeginPublish(ctx, begin.GetRepositoryId(), principal, begin.GetWorkspace(), objects, files)
 	if err != nil {
 		return toStatus(err)
@@ -709,14 +747,50 @@ type Services struct {
 	Browse        *Browse
 	Events        *Events
 	Workspaces    *Workspaces
+	Cells         *Cells
+	Search        *Search
+	// SecretReferences is ok secrets': the pointers repositories hold.
+	SecretReferences *SecretReferences
+
+	access *access
 }
 
 // New returns the services over s. dir is ok identity's directory, which upload asks about OWNERS
-// users and ACLs, and reviewers.
-func New(s *store.Store, dir Directory) Services {
-	c := newCore(s, dir)
+// users and ACLs, and reviewers; ten its tenancy, which names repositories; facts its
+// Authorization, the facts Authorize decides people's requests from.
+func New(s *store.Store, dir Directory, ten Tenancy, facts authz.Source) Services {
+	c := newCore(s, dir, ten)
+	c.access = &access{checker: authz.NewChecker(facts)}
 	return Services{Repositories: &Repositories{c: c}, Store: &Store{c: c}, ChangeLists: &ChangeLists{c: c}, Review: &Review{c: c},
-		Landing: &Landing{c: c}, LandingChecks: &LandingChecks{c: c}, Browse: &Browse{c: c}, Events: &Events{c: c}, Workspaces: &Workspaces{c: c}}
+		Landing: &Landing{c: c}, LandingChecks: &LandingChecks{c: c}, Browse: &Browse{c: c}, Events: &Events{c: c}, Workspaces: &Workspaces{c: c},
+		Cells: &Cells{c: c}, Search: &Search{c: c}, SecretReferences: &SecretReferences{c: c}, access: c.access}
+}
+
+// InCell says which cell the services serve, and how they reach other cells' SCMs, before they
+// serve: they refuse the repositories other cells hold, and a creation the directory places in
+// another cell is that cell's SCM's to make. Without it they serve every repository, as a single
+// installation's do.
+func (s Services) InCell(name string, peers PeerSCMs) {
+	s.access.cell = name
+	s.Cells.c.cell, s.Cells.c.peers = name, peers
+}
+
+// Register registers every service on reg, each method deciding a person's request with Authorize
+// before it serves it.
+func (s Services) Register(reg grpc.ServiceRegistrar) {
+	r := registrar{reg: reg, a: s.access}
+	scmpb.RegisterRepositoriesServer(r, s.Repositories)
+	scmpb.RegisterStoreServer(r, s.Store)
+	scmpb.RegisterChangeListsServer(r, s.ChangeLists)
+	scmpb.RegisterReviewServer(r, s.Review)
+	scmpb.RegisterLandingServer(r, s.Landing)
+	scmpb.RegisterLandingChecksServer(r, s.LandingChecks)
+	scmpb.RegisterBrowseServer(r, s.Browse)
+	scmpb.RegisterEventsServer(r, s.Events)
+	scmpb.RegisterWorkspacesServer(r, s.Workspaces)
+	scmpb.RegisterCellsServer(r, s.Cells)
+	scmpb.RegisterSearchServer(r, s.Search)
+	scmpb.RegisterSecretReferencesServer(r, s.SecretReferences)
 }
 
 // unreachable reports an error that is a backend not answering — the database, or object storage

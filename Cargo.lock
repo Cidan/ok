@@ -2213,6 +2213,7 @@ dependencies = [
  "ok-credential",
  "ok-proto",
  "ok-review",
+ "ok-secret",
  "ok-store",
  "ok-testscm",
  "ok-working-copy",
@@ -2254,6 +2255,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ok-secret"
+version = "1.1.0"
+dependencies = [
+ "blake3",
+ "serde",
+ "serde_json",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
 name = "ok-store"
 version = "1.1.0"
 dependencies = [
@@ -2271,6 +2283,7 @@ dependencies = [
  "ok-credential",
  "ok-encoding",
  "ok-proto",
+ "ok-secret",
  "ok-testscm",
  "prost",
  "prost-types",
@@ -2293,6 +2306,7 @@ dependencies = [
  "libc",
  "ok-proto",
  "ok-store",
+ "tokio",
  "tonic",
 ]
 
@@ -2319,7 +2333,9 @@ dependencies = [
  "jj-lib",
  "libc",
  "ok-proto",
+ "ok-secret",
  "ok-store",
+ "okfs",
  "okfs-fuse",
  "okfs-nfs",
  "prost",

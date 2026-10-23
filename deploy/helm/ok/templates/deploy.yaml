@@ -6,6 +6,9 @@ kind: ServiceAccount
 metadata:
   name: {{ include "ok.name" . }}-deploy
   labels: {{- include "ok.labels" . | nindent 4 }}
+  {{- with .Values.deploy.serviceAccountAnnotations }}
+  annotations: {{- toYaml . | nindent 4 }}
+  {{- end }}
 ---
 apiVersion: v1
 kind: Service
@@ -45,16 +48,31 @@ spec:
       imagePullSecrets: {{- toYaml . | nindent 8 }}
       {{- end }}
       terminationGracePeriodSeconds: 60
+      {{- if eq .Values.deploy.checkout "virtual" }}
+      # The pod's pause process is its init, reaping what Bazel leaves behind: ok is not PID 1.
+      shareProcessNamespace: true
+      {{- end }}
       containers:
         - name: deploy
           image: {{ include "ok.runnerImage" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- if eq .Values.deploy.checkout "virtual" }}
+          # A virtual checkout's okfs daemon mounts in a user and mount namespace of the deployer's own,
+          # which unshare makes before ok starts (docs/okfs.md, "ok's roles").
+          command: [/usr/bin/unshare, --map-root-user, --mount, --propagation, private, --, /usr/local/bin/ok]
+          {{- end }}
           args: [deploy, serve, -config, /etc/ok/config/ok.yaml]
           env:
             - name: OK_DEPLOY_COLOR
               valueFrom: {fieldRef: {fieldPath: "metadata.labels['{{ include "ok.colorLabel" . }}']"}}
             - name: HOSTNAME
               valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            # Where its cell's other replicas reach it, to relay to the deploy agents connected here
+            # (docs/hosted.md, "Deploy agents, as built").
+            - name: POD_IP
+              valueFrom: {fieldRef: {fieldPath: status.podIP}}
+            - name: OK_DEPLOY_ADDRESS
+              value: "$(POD_IP):8472"
           ports:
             - {name: http, containerPort: 8472}
             - {name: metrics, containerPort: 8473}

@@ -13,6 +13,7 @@ import (
 	"github.com/Cidan/ok/internal/scm/contentindex"
 	"github.com/Cidan/ok/internal/scm/encoding"
 	"github.com/Cidan/ok/internal/scm/pack"
+	"github.com/Cidan/ok/internal/scm/store/backend"
 )
 
 // Compaction's parameters (docs/scm.md, "Garbage collection and compaction").
@@ -67,6 +68,10 @@ type compactChunk struct {
 // with no chunk are retired once every new pack is written. Readers that located a chunk in a retired pack still read it: a
 // retired pack stays in S3 for RetiredPackGrace.
 func (s *Store) compact(ctx context.Context, repo int64, opts GCOptions, r *GCReport) error {
+	net, netScope, err := s.networkOf(ctx, repo)
+	if err != nil {
+		return err
+	}
 	enc, dict, err := s.dictionaryEncoder(ctx, repo)
 	if err != nil {
 		return err
@@ -80,17 +85,16 @@ func (s *Store) compact(ctx context.Context, repo int64, opts GCOptions, r *GCRe
 	if enc != nil {
 		dictRow = int64(dict - dictionaryIDBase)
 	}
-	li := s.live(repo)
-	if err := s.refreshIndex(ctx, repo, li); err != nil {
+	v, err := s.contentView(ctx, netScope)
+	if err != nil {
 		return err
 	}
-	x := li.x.Load()
 	type packStats struct {
 		chunks, small int
 		live          int64
 	}
 	stats := map[uint64]*packStats{}
-	x.Range(func(_ encoding.ID, e contentindex.Entry) bool {
+	err = v.each(ctx, func(_ encoding.ID, e contentindex.Entry) bool {
 		if e.Kind != encoding.KindChunk {
 			return true
 		}
@@ -106,7 +110,10 @@ func (s *Store) compact(ctx context.Context, repo int64, opts GCOptions, r *GCRe
 		}
 		return true
 	})
-	live, err := s.b.LivePacks(ctx, repo)
+	if err != nil {
+		return err
+	}
+	live, err := s.ops(ctx).LivePacks(ctx, net)
 	if err != nil {
 		return err
 	}
@@ -145,7 +152,9 @@ func (s *Store) compact(ctx context.Context, repo int64, opts GCOptions, r *GCRe
 		for i, p := range considered {
 			marked[i] = p.id
 		}
-		if err := s.b.SetPacksDictionary(ctx, repo, marked, dictRow); err != nil {
+		if err := s.inTx(ctx, func(ctx context.Context, tx *txn) error {
+			return tx.SetPacksDictionary(ctx, net, marked, dictRow)
+		}); err != nil {
 			return err
 		}
 	}
@@ -154,7 +163,7 @@ func (s *Store) compact(ctx context.Context, repo int64, opts GCOptions, r *GCRe
 		for i, p := range empty {
 			ids[i] = p.id
 		}
-		n, bytes, err := s.retireDrained(ctx, repo, ids, opts.DryRun)
+		n, bytes, err := s.retireDrained(ctx, net, ids, opts.DryRun)
 		if err != nil {
 			return err
 		}
@@ -182,7 +191,7 @@ func (s *Store) compact(ctx context.Context, repo int64, opts GCOptions, r *GCRe
 		return nil
 	}
 
-	chunks, err := s.compactChunks(ctx, repo, x, chosen)
+	chunks, err := s.compactChunks(ctx, repo, v, chosen)
 	if err != nil {
 		return err
 	}
@@ -241,7 +250,7 @@ func (s *Store) compact(ctx context.Context, repo int64, opts GCOptions, r *GCRe
 			return err
 		}
 		sourceFiles[p.id] = f
-		size, err := s.blobs.Download(ctx, packKey(repo, p.id), f)
+		size, err := s.blobs.Download(ctx, packKey(net, p.id), f)
 		if err != nil {
 			return fmt.Errorf("pack %s: %w", p.id, err)
 		}
@@ -251,14 +260,14 @@ func (s *Store) compact(ctx context.Context, repo int64, opts GCOptions, r *GCRe
 	}
 	var written int64
 	for i, out := range outputs {
-		size, err := s.writeCompacted(ctx, repo, dir, i, out, sourceFiles, enc, dictRow, r)
+		size, err := s.writeCompacted(ctx, net, dir, i, out, sourceFiles, enc, dictRow, r)
 		if err != nil {
 			return err
 		}
 		r.PacksWritten++
 		written += size
 	}
-	retired, freed, err := s.retireDrained(ctx, repo, sourceIDs, false)
+	retired, freed, err := s.retireDrained(ctx, net, sourceIDs, false)
 	if err != nil {
 		return err
 	}
@@ -273,45 +282,61 @@ func (s *Store) compact(ctx context.Context, repo int64, opts GCOptions, r *GCRe
 // compactChunks lists the live chunks of the source packs, from the content index, in the order
 // compaction writes them: by the path on main of a file that holds each (the first in path
 // order), then its offset in that file; chunks no file on main holds go last, by ID.
-func (s *Store) compactChunks(ctx context.Context, repo int64, x *contentindex.Index, sources []compactPack) ([]compactChunk, error) {
+func (s *Store) compactChunks(ctx context.Context, repo int64, v *contentView, sources []compactPack) ([]compactChunk, error) {
 	byNum := make(map[uint64]encoding.ID, len(sources))
 	for _, p := range sources {
 		byNum[p.num] = p.id
 	}
+	paths, err := s.mainPaths(ctx, repo)
+	if err != nil {
+		return nil, err
+	}
+	files, err := s.contentView(ctx, repoScope(repo))
+	if err != nil {
+		return nil, err
+	}
+	// One scan of the network's chunk index for the chunks in the source packs, and one of the
+	// repository's content index for the files on main, whose chunks are matched to them after.
+	type onMain struct {
+		id     encoding.ID
+		path   string
+		chunks []contentindex.FileChunk
+	}
 	var out []compactChunk
+	var onMainFiles []onMain
 	at := map[encoding.ID]int{}
-	x.Range(func(id encoding.ID, e contentindex.Entry) bool {
-		if e.Kind != encoding.KindChunk {
-			return true
-		}
-		if pid, ok := byNum[e.Loc.Pack]; ok {
+	err = v.each(ctx, func(id encoding.ID, e contentindex.Entry) bool {
+		if pid, ok := byNum[e.Loc.Pack]; ok && e.Kind == encoding.KindChunk {
 			at[id] = len(out)
 			out = append(out, compactChunk{id: id, pack: pid, loc: pack.Location{
 				Offset: e.Loc.Offset, Codec: pack.Codec(e.Loc.Codec), RawLength: e.Loc.Raw, StoredLength: e.Loc.Stored}})
 		}
 		return true
 	})
-	paths, err := s.mainPaths(ctx, repo)
 	if err != nil {
 		return nil, err
 	}
-	x.Range(func(fid encoding.ID, e contentindex.Entry) bool {
-		path, onMain := paths[fid]
-		if e.Kind != encoding.KindFile || !onMain {
-			return true
+	err = files.each(ctx, func(id encoding.ID, e contentindex.Entry) bool {
+		if path, ok := paths[id]; ok && e.Kind == encoding.KindFile {
+			onMainFiles = append(onMainFiles, onMain{id: id, path: path, chunks: e.Chunks})
 		}
+		return true
+	})
+	if err != nil {
+		return nil, err
+	}
+	for _, f := range onMainFiles {
 		var off int64
-		for _, fc := range e.Chunks {
+		for _, fc := range f.chunks {
 			if i, ok := at[fc.ID]; ok {
 				c := &out[i]
-				if !c.hinted || path < c.hint || (path == c.hint && string(fid[:]) < string(c.fileID[:])) {
-					c.hinted, c.hint, c.fileID, c.offset = true, path, fid, off
+				if !c.hinted || f.path < c.hint || (f.path == c.hint && string(f.id[:]) < string(c.fileID[:])) {
+					c.hinted, c.hint, c.fileID, c.offset = true, f.path, f.id, off
 				}
 			}
 			off += int64(fc.Length)
 		}
-		return true
-	})
+	}
 	sort.Slice(out, func(i, j int) bool {
 		a, b := out[i], out[j]
 		if a.hinted != b.hinted {
@@ -358,7 +383,7 @@ func (s *Store) mainPaths(ctx context.Context, repo int64) (map[encoding.ID]stri
 // compressed with the repository's dictionary is, with enc, if that shrinks it. A pack written
 // with enc records dictRow, the dictionary that considered its chunks. It returns the pack's
 // size.
-func (s *Store) writeCompacted(ctx context.Context, repo int64, dir string, n int, chunks []compactChunk, sources map[encoding.ID]*os.File, enc *zstd.Encoder, dictRow int64, r *GCReport) (int64, error) {
+func (s *Store) writeCompacted(ctx context.Context, net backend.Network, dir string, n int, chunks []compactChunk, sources map[encoding.ID]*os.File, enc *zstd.Encoder, dictRow int64, r *GCReport) (int64, error) {
 	f, err := os.Create(filepath.Join(dir, fmt.Sprintf("out-%d", n)))
 	if err != nil {
 		return 0, err
@@ -373,7 +398,7 @@ func (s *Store) writeCompacted(ctx context.Context, repo int64, dir string, n in
 		}
 		codec := c.loc.Codec
 		if enc != nil && codec != pack.ZstdDict && c.loc.RawLength <= DictionaryChunkMax {
-			raw, err := pack.Decode(s.dicts, c.id, codec, c.loc.RawLength, stored)
+			raw, err := pack.Decode(s.dicts.of(net), c.id, codec, c.loc.RawLength, stored)
 			if err != nil {
 				return 0, fmt.Errorf("pack %s: %w", c.pack, err)
 			}
@@ -386,7 +411,7 @@ func (s *Store) writeCompacted(ctx context.Context, repo int64, dir string, n in
 				dictionaryChunks.With("not_smaller").Inc()
 			}
 		}
-		loc, err := pw.AddStored(s.dicts, c.id, codec, c.loc.RawLength, stored)
+		loc, err := pw.AddStored(s.dicts.of(net), c.id, codec, c.loc.RawLength, stored)
 		if err != nil {
 			return 0, fmt.Errorf("pack %s: chunk %s: %w", c.pack, c.id, err)
 		}
@@ -399,43 +424,46 @@ func (s *Store) writeCompacted(ctx context.Context, repo int64, dir string, n in
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		return 0, err
 	}
-	if err := s.blobs.Put(ctx, packKey(repo, packID), f, size); err != nil {
+	if err := s.blobs.Put(ctx, packKey(net, packID), f, size); err != nil {
 		return 0, err
 	}
 
-	li := s.live(repo)
-	err = s.inTx(ctx, func(tx *txn) error {
+	li := s.live(backend.NetworkScope(net))
+	err = s.inTx(ctx, func(ctx context.Context, tx *txn) error {
 		// No transaction changes the index while this one moves chunks in it, and the index
 		// read after the lock holds every change before.
-		if _, err := tx.LockContentIndex(ctx, repo); err != nil {
+		if _, err := tx.LockContentIndex(ctx, backend.NetworkScope(net)); err != nil {
 			return err
 		}
-		if err := s.refreshIndex(ctx, repo, li); err != nil {
+		lg, err := s.txIndex(ctx, tx, backend.NetworkScope(net))
+		if err != nil {
 			return err
 		}
-		x := li.x.Load()
 		var considered *int64
 		if enc != nil {
 			considered = &dictRow
 		}
-		num, err := tx.InsertPack(ctx, repo, packID, size, considered)
+		num, err := tx.InsertPack(ctx, net, packID, size, considered)
 		if err != nil {
 			return err
 		}
 		var live int64
 		for i, c := range chunks {
-			e, ok := x.Get(c.id)
-			if !ok || e.Kind != encoding.KindChunk || e.Loc.Offset != c.loc.Offset {
+			e, ok, err := lg.has(ctx, encoding.KindChunk, c.id)
+			if err != nil {
+				return err
+			}
+			if !ok || e.Loc.Offset != c.loc.Offset {
 				continue
 			}
-			if pid, err := s.packID(ctx, repo, li, e.Loc.Pack); err != nil || pid != c.pack {
+			if pid, err := s.packID(ctx, net, li, e.Loc.Pack); err != nil || pid != c.pack {
 				if err != nil {
 					return err
 				}
 				continue
 			}
 			loc := locs[i]
-			s.logIndex(tx, repo, contentindex.Update{Op: contentindex.Move, ID: c.id, Entry: contentindex.Entry{
+			s.logIndex(tx, backend.NetworkScope(net), contentindex.Update{Op: contentindex.Move, ID: c.id, Entry: contentindex.Entry{
 				Kind: encoding.KindChunk,
 				Loc:  contentindex.Location{Pack: num, Offset: loc.Offset, Stored: loc.StoredLength, Raw: loc.RawLength, Codec: uint8(loc.Codec)},
 			}})
@@ -443,7 +471,7 @@ func (s *Store) writeCompacted(ctx context.Context, repo int64, dir string, n in
 		}
 		if live == 0 {
 			// Every chunk it copied moved or went meanwhile: it holds nothing live.
-			return tx.RetirePack(ctx, repo, packID)
+			return tx.RetirePack(ctx, net, packID)
 		}
 		return nil
 	})
@@ -455,19 +483,22 @@ func (s *Store) writeCompacted(ctx context.Context, repo int64, dir string, n in
 
 // retireDrained retires the packs among ids that no chunk in the content index is in, and
 // returns how many and their total size.
-func (s *Store) retireDrained(ctx context.Context, repo int64, packIDs []encoding.ID, dryRun bool) (int, int64, error) {
-	li := s.live(repo)
-	if err := s.refreshIndex(ctx, repo, li); err != nil {
+func (s *Store) retireDrained(ctx context.Context, net backend.Network, packIDs []encoding.ID, dryRun bool) (int, int64, error) {
+	v, err := s.contentView(ctx, backend.NetworkScope(net))
+	if err != nil {
 		return 0, 0, err
 	}
 	used := map[uint64]bool{}
-	li.x.Load().Range(func(_ encoding.ID, e contentindex.Entry) bool {
+	err = v.each(ctx, func(_ encoding.ID, e contentindex.Entry) bool {
 		if e.Kind == encoding.KindChunk {
 			used[e.Loc.Pack] = true
 		}
 		return true
 	})
-	nums, err := s.b.LivePackNumbers(ctx, repo, packIDs)
+	if err != nil {
+		return 0, 0, err
+	}
+	nums, err := s.ops(ctx).LivePackNumbers(ctx, net, packIDs)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -480,5 +511,12 @@ func (s *Store) retireDrained(ctx context.Context, repo int64, packIDs []encodin
 	if len(drained) == 0 {
 		return 0, 0, nil
 	}
-	return s.b.RetirePacks(ctx, repo, drained, dryRun)
+	var n int
+	var bytes int64
+	err = s.inTx(ctx, func(ctx context.Context, tx *txn) error {
+		var err error
+		n, bytes, err = tx.RetirePacks(ctx, net, drained, dryRun)
+		return err
+	})
+	return n, bytes, err
 }

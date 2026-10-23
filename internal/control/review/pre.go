@@ -16,6 +16,7 @@ import (
 // pre, which gates submit, and the landing queue, which a submit hands its CLs to.
 type Automation interface {
 	GetPre(ctx context.Context, in *automationpb.GetPreRequest, opts ...grpc.CallOption) (*automationpb.Pre, error)
+	StartPre(ctx context.Context, in *automationpb.StartPreRequest, opts ...grpc.CallOption) (*automationpb.Pre, error)
 	Submit(ctx context.Context, in *automationpb.SubmitRequest, opts ...grpc.CallOption) (*automationpb.Submission, error)
 	CancelSubmission(ctx context.Context, in *automationpb.CancelSubmissionRequest, opts ...grpc.CallOption) (*automationpb.Submission, error)
 	ListSubmissions(ctx context.Context, in *automationpb.ListSubmissionsRequest, opts ...grpc.CallOption) (*automationpb.ListSubmissionsResponse, error)
@@ -60,8 +61,10 @@ func (s *Service) SubmittingBlocked(ctx context.Context, cl db.ChangeList) strin
 
 // PreBlocked says why a CL's current patchset's pre does not let it land — it has not run, is
 // still running, or did not pass — or "" when it passed. pre always blocks submit: ok
-// automation being unreachable blocks it too, as a reason, never as a failure.
-func (s *Service) PreBlocked(ctx context.Context, cl db.ChangeList) string {
+// automation being unreachable blocks it too, as a reason, never as a failure. With start, a pre
+// that never ran is started, for principal: the top of a submission that was under its stack's
+// top (docs/automation.md, "pre").
+func (s *Service) PreBlocked(ctx context.Context, cl db.ChangeList, start bool, principal string) string {
 	pre, err := s.auto.GetPre(ctx, &automationpb.GetPreRequest{RepositoryId: cl.Repo, ClNumber: cl.Number, Patchset: cl.CurrentPatchset})
 	if err != nil {
 		if ctx.Err() == nil {
@@ -69,7 +72,19 @@ func (s *Service) PreBlocked(ctx context.Context, cl db.ChangeList) string {
 		}
 		return unavailable
 	}
-	return PreReason(pre, cl.CurrentPatchset)
+	if pre.GetVerdict() != automationpb.Pre_VERDICT_NONE {
+		return PreReason(pre, cl.CurrentPatchset)
+	}
+	if !start {
+		return fmt.Sprintf("Checks haven't run on patchset %d yet: submitting starts them", cl.CurrentPatchset)
+	}
+	if _, err := s.auto.StartPre(ctx, &automationpb.StartPreRequest{RepositoryId: cl.Repo, ClNumber: cl.Number, ForPersonId: principal}); err != nil {
+		if ctx.Err() == nil {
+			slog.Warn("ok control: starting pre for submit", "repository", cl.Repo, "cl", cl.Number, "err", err)
+		}
+		return unavailable
+	}
+	return fmt.Sprintf("Checks hadn't run on patchset %d: they are running now — submit again once they pass", cl.CurrentPatchset)
 }
 
 // PreReason words a patchset's pre for the Submit button: "" when it passed, else what stands in

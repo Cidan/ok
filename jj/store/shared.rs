@@ -99,6 +99,8 @@ pub struct Shared {
     tree_sizes: Arc<Batcher<Id, TreeSizes>>,
     /// Reads of files' contents and manifests that waited on ok.
     waits: Mutex<crate::calls::WaitStats>,
+    /// What ok secrets last said of whether the repository keeps secrets.
+    pub(crate) keeps_secrets: Mutex<Option<crate::secrets::Keeps>>,
 }
 
 /// A chunk a ranged read is missing, with where it lies in the file it is read from: what the
@@ -180,6 +182,7 @@ impl Shared {
             chunks: chunk_batcher(client.clone(), cache.clone()),
             tree_sizes: tree_sizes_batcher(client.clone(), cache.clone()),
             waits: Mutex::default(),
+            keeps_secrets: Mutex::default(),
             outbox: {
                 let outbox = Outbox::open(store_dir.join("outbox"), store_dir.join("quarantine"))?;
                 cache.register_outbox(&dunce::canonicalize(store_dir.join("outbox"))?)?;

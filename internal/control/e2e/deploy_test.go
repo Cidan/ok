@@ -29,7 +29,7 @@ type deployer struct {
 	mu          sync.Mutex
 	deployments map[int64]*deploypb.Deployment
 	covers      map[int64][][]byte // deployment → the commits it covers
-	asked       []string           // "retry 3 for alice.human.example.com"
+	asked       []string           // "retry 3 for " and alice's stable ID
 	down        bool               // it cannot be reached
 	unplanned   bool               // its plans have not reached the commits it is asked about
 	next        int64
@@ -124,7 +124,7 @@ func (d *deployer) GetDeployment(_ context.Context, req *deploypb.GetDeploymentR
 func (d *deployer) RetryDeployment(_ context.Context, req *deploypb.RetryDeploymentRequest) (*deploypb.Deployment, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.asked = append(d.asked, "retry "+itoa(req.GetId())+" for "+req.GetForPerson())
+	d.asked = append(d.asked, "retry "+itoa(req.GetId())+" for "+req.GetForPersonId())
 	old := d.deployments[req.GetId()]
 	d.next++
 	dep := proto.Clone(old).(*deploypb.Deployment)
@@ -137,22 +137,22 @@ func (d *deployer) RetryDeployment(_ context.Context, req *deploypb.RetryDeploym
 func (d *deployer) HaltDeployment(_ context.Context, req *deploypb.HaltDeploymentRequest) (*deploypb.Deployment, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.asked = append(d.asked, "halt "+itoa(req.GetId())+" for "+req.GetForPerson())
+	d.asked = append(d.asked, "halt "+itoa(req.GetId())+" for "+req.GetForPersonId())
 	dep := d.deployments[req.GetId()]
-	if dep.GetHaltBy() != "" {
+	if dep.GetHaltById() != "" {
 		return nil, status.Error(codes.FailedPrecondition, "deployment is halting already")
 	}
-	dep.HaltBy = req.GetForPerson()
+	dep.HaltById = req.GetForPersonId()
 	return proto.Clone(dep).(*deploypb.Deployment), nil
 }
 
 func (d *deployer) AllowHazards(_ context.Context, req *deploypb.AllowHazardsRequest) (*deploypb.Deployment, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.asked = append(d.asked, "allow "+itoa(req.GetId())+" for "+req.GetForPerson())
+	d.asked = append(d.asked, "allow "+itoa(req.GetId())+" for "+req.GetForPersonId())
 	dep := d.deployments[req.GetId()]
 	dep.Stage = deploypb.Deployment_STAGE_MIGRATE
-	dep.Migrations[0].Status, dep.Migrations[0].AllowedBy, dep.Migrations[0].Allowed = deploypb.Migration_STATUS_PENDING, req.GetForPerson(), dep.Migrations[0].GetRefused()
+	dep.Migrations[0].Status, dep.Migrations[0].AllowedById, dep.Migrations[0].Allowed = deploypb.Migration_STATUS_PENDING, req.GetForPersonId(), dep.Migrations[0].GetRefused()
 	return proto.Clone(dep).(*deploypb.Deployment), nil
 }
 
@@ -217,7 +217,7 @@ func TestDeployments(t *testing.T) {
 	}
 	now := timestamppb.New(time.Now())
 	e.deployer.add(&deploypb.Deployment{Id: 7, RepositoryId: repo, PlanId: 3, Deploy: "//.ok/workflow/d.yaml:deploy:web", Name: "web",
-		CommitId: cl.LandedCommit, Why: "container web's image //web:push is affected", Wave: 1, RequestedBy: "deploy.ok.robot.example.com",
+		CommitId: cl.LandedCommit, Why: "container web's image //web:push is affected", Wave: 1, RequestedById: e.id(deployBot),
 		Workload: &deploypb.Workload{Namespace: "web", Kind: "deployment", Name: "web"},
 		Status:   deploypb.Deployment_STATUS_FAILED, Stage: deploypb.Deployment_STAGE_DONE, Reason: "rolled back: canary: pod web-green-3: container web: CrashLoopBackOff",
 		CreatedAt: now, StartedAt: now, FinishedAt: now,
@@ -226,7 +226,7 @@ func TestDeployments(t *testing.T) {
 		Events: []*deploypb.Event{{At: now, Message: "planned at abc: container web's image //web:push is affected"}, {At: now, Message: "canary: one green pod beside 3 blue"}},
 	}, cl.LandedCommit)
 	e.deployer.add(&deploypb.Deployment{Id: 8, RepositoryId: repo, PlanId: 3, Deploy: "//.ok/workflow/d.yaml:deploy:data", Name: "data",
-		CommitId: cl.LandedCommit, Why: "its migration is affected", Wave: 2, RequestedBy: "deploy.ok.robot.example.com",
+		CommitId: cl.LandedCommit, Why: "its migration is affected", Wave: 2, RequestedById: e.id(deployBot),
 		Status: deploypb.Deployment_STATUS_RUNNING, Stage: deploypb.Deployment_STAGE_HAZARD, CreatedAt: now, StartedAt: now,
 		Migrations: []*deploypb.Migration{{Target: "//data/schema:apply", Status: deploypb.Migration_STATUS_WAITING, Refused: []string{"DELETES_DATA"},
 			Plan: &deploypb.MigrationPlan{Database: "data", Steps: []*deploypb.MigrationPlan_Step{{Description: "drop column public.t.old",
@@ -235,17 +235,17 @@ func TestDeployments(t *testing.T) {
 
 	p := e.get(carol, path)
 	for _, want := range []string{"web", "deployment web/web", "Failed", "rolled back: canary", "data", "Needs Allowance", "Waiting for an Allowance",
-		`href="/svc/deploy/7?cl=` + itoa(n) + `"`} {
+		`href="/example/svc/deploy/7?cl=` + itoa(n) + `"`} {
 		if !p.has(want) {
 			t.Errorf("the CL's deployments lack %q: %s", want, excerpt(p.body))
 		}
 	}
 
 	// The failed deployment's page: its author may retry it; someone else may not.
-	dpath := "/svc/deploy/7?cl=" + itoa(n)
+	dpath := "/example/svc/deploy/7?cl=" + itoa(n)
 	p = e.get(bob, dpath)
 	for _, want := range []string{"Deployment 7", "CL #" + itoa(n), "registry.example.com/apps/web@sha256:ab", "Push Run 41", "Rolled back · green replacing blue · 3 replicas",
-		"canary: one green pod beside 3 blue", "/svc/deploy/7/retry?cl="} {
+		"canary: one green pod beside 3 blue", "/example/svc/deploy/7/retry?cl="} {
 		if !p.has(want) {
 			t.Errorf("the deployment page lacks %q: %s", want, excerpt(p.body))
 		}
@@ -253,49 +253,49 @@ func TestDeployments(t *testing.T) {
 	if p := e.get(carol, dpath); p.has("/retry") || p.has("/halt") {
 		t.Errorf("someone else is offered actions: %s", excerpt(p.body))
 	}
-	if got := notice(e.post(carol, "/svc/deploy/7/retry?cl="+itoa(n), nil)); got != "Only a repository admin or the author of a CL it deploys can retry this deployment" {
+	if got := notice(e.post(carol, "/example/svc/deploy/7/retry?cl="+itoa(n), nil)); got != "Only a repository admin or maintainer, or the author of a CL it deploys, can retry this deployment" {
 		t.Errorf("someone else retrying: %q", got)
 	}
 	// Without the CL it came from, the author is no one special.
-	if p := e.get(bob, "/svc/deploy/7"); p.has("/retry") {
+	if p := e.get(bob, "/example/svc/deploy/7"); p.has("/retry") {
 		t.Errorf("the author is offered Retry away from their CL")
 	}
-	p = e.do(bob, http.MethodPost, "/svc/deploy/7/retry?cl="+itoa(n), url.Values{}, map[string]string{"HX-Request": "true", "HX-Target": "div#repo-main"})
-	if !strings.Contains(p.header.Get("HX-Location"), "/svc/deploy/101?cl="+itoa(n)) {
+	p = e.do(bob, http.MethodPost, "/example/svc/deploy/7/retry?cl="+itoa(n), url.Values{}, map[string]string{"HX-Request": "true", "HX-Target": "div#repo-main"})
+	if !strings.Contains(p.header.Get("HX-Location"), "/example/svc/deploy/101?cl="+itoa(n)) {
 		t.Fatalf("retrying: %d %q", p.status, p.header.Get("HX-Location"))
 	}
-	if got := e.deployer.actions(); len(got) != 1 || got[0] != "retry 7 for "+bob {
+	if got := e.deployer.actions(); len(got) != 1 || got[0] != "retry 7 for "+e.id(bob) {
 		t.Errorf("the deployer was asked %v", got)
 	}
 
 	// The migration's hazards: shown, and allowed by a repository admin only.
-	p = e.get(dana, "/svc/deploy/8")
-	for _, want := range []string{"//data/schema:apply", "DELETES_DATA", "ALTER TABLE public.t DROP COLUMN old", "Its plan carries gated hazards", "/svc/deploy/8/allow", "/svc/deploy/8/halt"} {
+	p = e.get(dana, "/example/svc/deploy/8")
+	for _, want := range []string{"//data/schema:apply", "DELETES_DATA", "ALTER TABLE public.t DROP COLUMN old", "Its plan carries gated hazards", "/example/svc/deploy/8/allow", "/example/svc/deploy/8/halt"} {
 		if !p.has(want) {
 			t.Errorf("the waiting deployment lacks %q: %s", want, excerpt(p.body))
 		}
 	}
-	if e.get(bob, "/svc/deploy/8?cl="+itoa(n)).has("/allow") {
+	if e.get(bob, "/example/svc/deploy/8?cl="+itoa(n)).has("/allow") {
 		t.Errorf("the author is offered Allow")
 	}
-	if got := notice(e.post(bob, "/svc/deploy/8/allow?cl="+itoa(n), nil)); got != "Only a repository admin can allow this deployment" {
+	if got := notice(e.post(bob, "/example/svc/deploy/8/allow?cl="+itoa(n), nil)); got != "Only a repository admin can allow this deployment" {
 		t.Errorf("the author allowing: %q", got)
 	}
-	if p := e.post(dana, "/svc/deploy/8/allow", nil); !p.has("dana allowed DELETES_DATA") {
+	if p := e.post(dana, "/example/svc/deploy/8/allow", nil); !p.has("dana allowed DELETES_DATA") {
 		t.Errorf("an admin allowing: %s", excerpt(p.body))
 	}
-	if p := e.post(bob, "/svc/deploy/8/halt?cl="+itoa(n), nil); !p.has("Halting") {
+	if p := e.post(bob, "/example/svc/deploy/8/halt?cl="+itoa(n), nil); !p.has("Halting") {
 		t.Errorf("the author halting: %s", excerpt(p.body))
 	}
-	if got := notice(e.post(dana, "/svc/deploy/8/halt", nil)); got != "Deployment is halting already" {
+	if got := notice(e.post(dana, "/example/svc/deploy/8/halt", nil)); got != "Deployment is halting already" {
 		t.Errorf("halting twice: %q", got)
 	}
-	if got := e.deployer.actions(); strings.Join(got, "; ") != "retry 7 for "+bob+"; allow 8 for "+dana+"; halt 8 for "+bob+"; halt 8 for "+dana {
+	if got := e.deployer.actions(); strings.Join(got, "; ") != "retry 7 for "+e.id(bob)+"; allow 8 for "+e.id(dana)+"; halt 8 for "+e.id(bob)+"; halt 8 for "+e.id(dana) {
 		t.Errorf("the deployer was asked %v", got)
 	}
 
 	// A deployment of another repository is not this one's; the deployer down still shows the CL.
-	if p := e.do(bob, http.MethodGet, "/svc/deploy/999", nil, nil); p.status != http.StatusNotFound {
+	if p := e.do(bob, http.MethodGet, "/example/svc/deploy/999", nil, nil); p.status != http.StatusNotFound {
 		t.Errorf("a deployment that does not exist: %d", p.status)
 	}
 	e.deployer.mu.Lock()

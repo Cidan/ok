@@ -11,6 +11,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/Cidan/ok/internal/scm/encoding"
+	"github.com/Cidan/ok/internal/scm/scmtest"
 	scmpb "github.com/Cidan/ok/proto/ok/scm/v1"
 )
 
@@ -45,10 +46,10 @@ func TestChangeListsService(t *testing.T) {
 	r := newRepo(t, c)
 	repo := r.GetId()
 
-	b := newObjects(t)
-	tree := b.add(&encoding.Tree{Entries: []encoding.TreeEntry{{Name: "f", Value: encoding.TreeValue{Kind: encoding.TreeValueFile, ID: b.file([]byte("one"))}}}})
-	commit := b.commit(tree, "one", encoding.RootCommitID)
-	if _, _, err := b.publish(alice, c, repo, nil); err != nil {
+	b := scmtest.NewObjects(t)
+	tree := b.Add(&encoding.Tree{Entries: []encoding.TreeEntry{{Name: "f", Value: encoding.TreeValue{Kind: encoding.TreeValueFile, ID: b.File([]byte("one"))}}}})
+	commit := b.Commit(tree, "one", encoding.RootCommitID)
+	if _, _, err := b.Publish(alice, c.store, repo, nil); err != nil {
 		t.Fatal(err)
 	}
 	upload := &scmpb.UploadRequest{RepositoryId: repo, CommitIds: [][]byte{commit[:]}, Readiness: scmpb.UploadRequest_READINESS_READY}
@@ -76,7 +77,7 @@ func TestChangeListsService(t *testing.T) {
 	// Everyone reads CLs.
 	cl, err := c.cls.GetChangeList(bob, &scmpb.GetChangeListRequest{RepositoryId: repo, Number: 1})
 	if err != nil || cl.GetStatus() != scmpb.ChangeListStatus_CHANGE_LIST_STATUS_OPEN || cl.GetAuthor() != "alice.human.example.com" ||
-		len(cl.GetPatchsets()) != 1 || !bytes.Equal(cl.GetPatchsets()[0].GetBaseCommitId(), encoding.RootCommitID[:]) {
+		cl.GetAuthorId() != "id-alice.human.example.com" || len(cl.GetPatchsets()) != 1 || cl.GetPatchsets()[0].GetUploadedById() != "id-alice.human.example.com" || !bytes.Equal(cl.GetPatchsets()[0].GetBaseCommitId(), encoding.RootCommitID[:]) {
 		t.Fatalf("get: %v (%v)", cl, err)
 	}
 	var change encoding.ChangeID
@@ -94,7 +95,7 @@ func TestChangeListsService(t *testing.T) {
 
 	// ok control transitions, naming the human it acts for (the mesh admits no one else to
 	// Review: TestCallers).
-	transition := &scmpb.TransitionRequest{RepositoryId: repo, Number: 1, Kind: scmpb.TransitionRequest_KIND_RETURN_TO_DRAFT, Actor: "alice.human.example.com"}
+	transition := &scmpb.TransitionRequest{RepositoryId: repo, Number: 1, Kind: scmpb.TransitionRequest_KIND_RETURN_TO_DRAFT, ActorId: "id-alice.human.example.com"}
 	_, err = c.review.Transition(control(), &scmpb.TransitionRequest{RepositoryId: repo, Number: 1, Kind: scmpb.TransitionRequest_KIND_RETURN_TO_DRAFT})
 	wantCode(t, err, codes.InvalidArgument)
 	if resp, err := c.review.Transition(control(), transition); err != nil || resp.GetChangeList().GetStatus() != scmpb.ChangeListStatus_CHANGE_LIST_STATUS_DRAFT || resp.GetRepositorySeq() == 0 {
@@ -103,7 +104,7 @@ func TestChangeListsService(t *testing.T) {
 	_, err = c.review.Transition(control(), transition)
 	wantCode(t, err, codes.FailedPrecondition)
 
-	land := &scmpb.LandRequest{RepositoryId: repo, Items: []*scmpb.LandRequest_Item{{Number: 1, Patchset: 1}}, Actor: "alice.human.example.com", ExpectedHead: encoding.RootCommitID[:]}
+	land := &scmpb.LandRequest{RepositoryId: repo, Items: []*scmpb.LandRequest_Item{{Number: 1, Patchset: 1}}, ActorId: "id-alice.human.example.com", ExpectedHead: encoding.RootCommitID[:]}
 	_, err = c.landing.Land(automation(), land)
 	if rej := landRejection(t, err); rej.GetReason() != scmpb.LandRejection_REASON_NOT_OPEN || rej.GetNumber() != 1 {
 		t.Fatalf("landing a draft: %v", rej)
@@ -112,13 +113,13 @@ func TestChangeListsService(t *testing.T) {
 	if _, err := c.review.Transition(control(), transition); err != nil {
 		t.Fatal(err)
 	}
-	cand, err := c.landing.PrepareCandidate(automation(), &scmpb.PrepareCandidateRequest{RepositoryId: repo, Number: 1, Patchset: 1, Base: encoding.RootCommitID[:], Actor: "alice.human.example.com"})
-	if err != nil || !bytes.Equal(cand.GetCommitId(), commit[:]) || cand.GetPreparedBy() != "alice.human.example.com" || cand.GetPreparedAt() == nil {
+	cand, err := c.landing.PrepareCandidate(automation(), &scmpb.PrepareCandidateRequest{RepositoryId: repo, Number: 1, Patchset: 1, Base: encoding.RootCommitID[:], ActorId: "id-alice.human.example.com"})
+	if err != nil || !bytes.Equal(cand.GetCommitId(), commit[:]) || cand.GetPreparedBy() != "alice.human.example.com" || cand.GetPreparedById() != "id-alice.human.example.com" || cand.GetPreparedAt() == nil {
 		t.Fatalf("candidate: %v (%v)", cand, err)
 	}
 	// ok automation, which runs post and the landing queue, prepares, lists, and discards
 	// candidates.
-	again, err := c.landing.PrepareCandidate(automation(), &scmpb.PrepareCandidateRequest{RepositoryId: repo, Number: 1, Patchset: 1, Base: encoding.RootCommitID[:], Actor: "bob.human.example.com"})
+	again, err := c.landing.PrepareCandidate(automation(), &scmpb.PrepareCandidateRequest{RepositoryId: repo, Number: 1, Patchset: 1, Base: encoding.RootCommitID[:], ActorId: "id-bob.human.example.com"})
 	if err != nil || !bytes.Equal(again.GetCommitId(), commit[:]) || again.GetPreparedBy() != "alice.human.example.com" {
 		t.Fatalf("preparing the same candidate again: %v (%v)", again, err)
 	}
@@ -156,8 +157,8 @@ func TestChangeListsService(t *testing.T) {
 	}
 
 	// ok control rolls back a landed CL for a person, as a new CL of theirs.
-	rollback := &scmpb.RollbackRequest{RepositoryId: repo, Number: 1, Actor: "bob.human.example.com", Reason: "it broke the build",
-		Reviewers: []string{"alice.human.example.com"}}
+	rollback := &scmpb.RollbackRequest{RepositoryId: repo, Number: 1, ActorId: "id-bob.human.example.com", Reason: "it broke the build",
+		ReviewerIds: []string{"id-alice.human.example.com"}}
 	_, err = c.review.Rollback(control(), &scmpb.RollbackRequest{RepositoryId: repo, Number: 1, Reason: "no actor"})
 	wantCode(t, err, codes.InvalidArgument)
 	rolled, err := c.review.Rollback(control(), rollback)
@@ -165,7 +166,7 @@ func TestChangeListsService(t *testing.T) {
 		t.Fatal(err)
 	}
 	rb := rolled.GetChangeList()
-	if rb.GetNumber() != 2 || rb.GetAuthor() != "bob.human.example.com" || rb.GetStatus() != scmpb.ChangeListStatus_CHANGE_LIST_STATUS_OPEN ||
+	if rb.GetNumber() != 2 || rb.GetAuthor() != "bob.human.example.com" || rb.GetAuthorId() != "id-bob.human.example.com" || rb.GetStatus() != scmpb.ChangeListStatus_CHANGE_LIST_STATUS_OPEN ||
 		rolled.GetRepositorySeq() == 0 || !strings.HasPrefix(rb.GetDescription(), "Roll back CL 1: one\n\nit broke the build\n") {
 		t.Fatalf("rollback: %v", rolled)
 	}

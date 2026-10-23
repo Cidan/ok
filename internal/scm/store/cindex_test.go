@@ -4,22 +4,22 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/Cidan/ok/internal/scm/contentindex"
 	"github.com/Cidan/ok/internal/scm/encoding"
 	"github.com/Cidan/ok/internal/scm/pack"
+	"github.com/Cidan/ok/internal/scm/store/backend"
+	"github.com/Cidan/ok/internal/work"
 )
 
 func logRows(t *testing.T, s *Store, repo int64) int {
 	t.Helper()
-	var n int
-	if err := poolOf(s).QueryRow(context.Background(), `SELECT count(*) FROM content_log WHERE repository_id = $1`, repo).Scan(&n); err != nil {
-		t.Fatal(err)
-	}
-	return n
+	return dbOf(s).count(t, "content_log", `scope = 0 AND owner_id = @repo`, map[string]any{"repo": repo})
 }
 
 // A rebuild folds the log into the next generation's blocks, and what is logged after it applies
@@ -35,8 +35,8 @@ func TestContentIndexRebuild(t *testing.T) {
 		t.Fatal("a publish logged nothing")
 	}
 	before := indexOf(t, e.s, e.repo).Sorted()
-	gen, entries, err := e.s.RebuildContentIndex(ctx, e.repo)
-	if err != nil || gen != 2 || entries != len(before) {
+	gen, entries, folded, err := e.s.RebuildContentIndex(ctx, e.repo)
+	if err != nil || gen != 2 || entries != len(before) || folded != 0 {
 		t.Fatalf("rebuild: generation %d of %d entries (%d before), %v", gen, entries, len(before), err)
 	}
 	if n := logRows(t, e.s, e.repo); n != 0 {
@@ -50,19 +50,86 @@ func TestContentIndexRebuild(t *testing.T) {
 	}
 	pinned := b.commit(b.tree(fileEntry("again", b.file([]byte("again\n")))), "more", commit)
 	mustPublish(t, e.s, e.repo, alice, b, nil)
-	if err := e.s.inTx(ctx, func(tx *txn) error { return e.s.pin(ctx, tx, e.repo, []ref{{table: tCommit, id: pinned}}) }); err != nil {
+	if err := e.s.inTx(ctx, func(ctx context.Context, tx *txn) error {
+		return e.s.pin(ctx, tx, e.repo, []ref{{table: tCommit, id: pinned}})
+	}); err != nil {
 		t.Fatal(err)
 	}
 	if logRows(t, e.s, e.repo) == 0 {
 		t.Fatal("nothing logged after the rebuild")
 	}
-	var blocks int
-	if err := poolOf(e.s).QueryRow(ctx, `SELECT count(*) FROM index_block WHERE repository_id = $1 AND generation <> 2`, e.repo).Scan(&blocks); err != nil || blocks != 0 {
-		t.Fatalf("%d blocks of the old generation remain (%v)", blocks, err)
+	if blocks := dbOf(e.s).count(t, "index_block", `scope = 0 AND owner_id = @repo AND generation <> 2`, map[string]any{"repo": e.repo}); blocks != 0 {
+		t.Fatalf("%d blocks of the old generation remain", blocks)
 	}
 	clean(t, e.s, e.repo)
-	if _, _, err := reopen(t, e.s).RebuildContentIndex(ctx, e.repo); err != nil {
+	if _, _, _, err := reopen(t, e.s).RebuildContentIndex(ctx, e.repo); err != nil {
 		t.Fatal(err)
+	}
+	clean(t, e.s, e.repo)
+}
+
+// A fold writes its next generation a few blocks a transaction (Config.FoldBatch) before the one
+// that makes it the generation, after deleting what a fold that stopped short left, then deletes
+// the generation it replaced a few rows a transaction; a fold that finds another running changes
+// nothing.
+func TestFoldInBatches(t *testing.T) {
+	ctx := context.Background()
+	e := newCLEnv(t)
+	b := newBuilder(t)
+	for i := range 3000 {
+		b.file([]byte(fmt.Sprintf("file %d\n", i)))
+	}
+	mustPublish(t, e.s, e.repo, alice, b, nil)
+	before := indexOf(t, e.s, e.repo).Sorted()
+	gen, _, ok, err := e.s.ops(ctx).ContentIndexGeneration(ctx, repoScope(e.repo))
+	if err != nil || !ok {
+		t.Fatal(ok, err)
+	}
+	blocksOf := func(where string) int {
+		return dbOf(e.s).count(t, "index_block", `scope = 0 AND owner_id = @repo AND `+where, map[string]any{"repo": e.repo, "gen": gen})
+	}
+
+	// Another fold holds the index: this one changes nothing.
+	_, release, ok, err := work.Claim(ctx, e.s.Work(), FoldWork, e.repo, "another replica", time.Minute)
+	if err != nil || !ok {
+		t.Fatalf("claiming the fold: %v, %v", ok, err)
+	}
+	if g, _, _, err := e.s.RebuildContentIndex(ctx, e.repo); err != nil || g != 0 {
+		t.Fatalf("a fold beside another's: generation %d, %v; want nothing done", g, err)
+	}
+	release()
+
+	// What a fold that stopped short left: a block of the next generation.
+	stray := contentindex.Keyed{ID: encoding.ID{0xee}, Entry: before[0].Entry}
+	if err := e.s.inTx(ctx, func(ctx context.Context, tx *txn) error {
+		return writeBlocks(ctx, tx, repoScope(e.repo), gen+1, []contentindex.Keyed{stray})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	small := mustOpen(t, dbOf(e.s), e.s.blobs, Config{FoldBatch: 2, DeleteBatch: 3, Signals: e.s.signals})
+	txns := 0
+	small.txAttempts = func() { txns++ }
+	folded, entries, _, err := small.RebuildContentIndex(ctx, e.repo)
+	if err != nil || folded != gen+1 || entries != len(before) {
+		t.Fatalf("the fold: generation %d of %d entries (%d before), %v", folded, entries, len(before), err)
+	}
+	if want := (len(before)+2*contentindex.BlockEntries-1)/(2*contentindex.BlockEntries) + 2; txns < want {
+		t.Errorf("the fold took %d transactions, want at least %d: two blocks to one", txns, want)
+	}
+	if n := blocksOf(`generation <> @gen + 1`); n != 0 {
+		t.Errorf("%d blocks of other generations remain", n)
+	}
+	if n, want := blocksOf(`generation = @gen + 1`), (len(before)+contentindex.BlockEntries-1)/contentindex.BlockEntries; n != want {
+		t.Errorf("%d blocks of the new generation, want %d", n, want)
+	}
+	after := indexOf(t, reopen(t, e.s), e.repo).Sorted()
+	if len(after) != len(before) {
+		t.Fatalf("%d entries after the fold, %d before", len(after), len(before))
+	}
+	for i := range before {
+		if before[i].ID != after[i].ID || !before[i].Entry.Equal(after[i].Entry) {
+			t.Fatalf("entry %s changed in the fold: %+v, then %+v", before[i].ID, before[i].Entry, after[i].Entry)
+		}
 	}
 	clean(t, e.s, e.repo)
 }
@@ -77,11 +144,11 @@ func TestFsckFindsAWrongContentIndex(t *testing.T) {
 	mustPublish(t, e.s, e.repo, alice, b, nil)
 	clean(t, e.s, e.repo)
 	chunk := pack.ChunkID(contents)
-	ce, _ := indexOf(t, e.s, e.repo).Get(chunk)
+	ce, _ := locationsOf(t, e.s, e.repo).Get(chunk)
 	wrong := ce.Loc
 	wrong.Offset += 5
-	if err := e.s.inTx(ctx, func(tx *txn) error {
-		e.s.logIndex(tx, e.repo, contentindex.Update{Op: contentindex.Move, ID: chunk, Entry: contentindex.Entry{Kind: encoding.KindChunk, Loc: wrong}})
+	if err := e.s.inTx(ctx, func(ctx context.Context, tx *txn) error {
+		e.s.logIndex(tx, backend.NetworkScope(netOf(t, e.s, e.repo)), contentindex.Update{Op: contentindex.Move, ID: chunk, Entry: contentindex.Entry{Kind: encoding.KindChunk, Loc: wrong}})
 		return nil
 	}); err != nil {
 		t.Fatal(err)
@@ -118,7 +185,7 @@ func TestAnotherReplicaReadsThroughItsIndex(t *testing.T) {
 		t.Fatal("the other replica read the second file wrong")
 	}
 	// A rebuild moves the index to a new generation, folding the log in.
-	if gen, _, err := e.s.RebuildContentIndex(ctx, e.repo); err != nil || gen < 2 {
+	if gen, _, _, err := e.s.RebuildContentIndex(ctx, e.repo); err != nil || gen < 2 {
 		t.Fatalf("rebuild: %d, %v", gen, err)
 	}
 	third := bytesOf(3_000, 3)
@@ -150,8 +217,8 @@ func TestSweepKeepsWhatTheIndexSaysIsFresh(t *testing.T) {
 	age(t, e.s, e.repo, 20)
 	chunk := pack.ChunkID(contents)
 	today := contentindex.DayOf(time.Now())
-	if err := e.s.inTx(ctx, func(tx *txn) error {
-		e.s.logIndex(tx, e.repo,
+	if err := e.s.inTx(ctx, func(ctx context.Context, tx *txn) error {
+		e.s.logIndex(tx, repoScope(e.repo),
 			contentindex.Update{Op: contentindex.Touch, ID: f, Entry: contentindex.Entry{Kind: encoding.KindFile, Day: today}},
 			contentindex.Update{Op: contentindex.Touch, ID: chunk, Entry: contentindex.Entry{Kind: encoding.KindChunk, Day: today}})
 		return nil
@@ -168,4 +235,31 @@ func TestSweepKeepsWhatTheIndexSaysIsFresh(t *testing.T) {
 	if !bytes.Equal(readAll(t, e.s, e.repo, f), contents) {
 		t.Fatal("the file reads back wrong")
 	}
+}
+
+// Writers beyond the pool's connections, each reading a repository's content index for the first
+// time, all finish: a writer refreshes the index through its own transaction, and never waits for
+// a second connection while it holds one — which, with every connection held so, would wait
+// forever.
+func TestWritersBeyondThePool(t *testing.T) {
+	s := testStoreOf(t, 2)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	repos := make([]int64, 12)
+	for i := range repos {
+		repos[i] = newRepo(t, s).ID
+	}
+	// Cold indexes, as on a replica that has never read these repositories.
+	fresh := reopen(t, s)
+	var wg sync.WaitGroup
+	for i, repo := range repos {
+		wg.Go(func() {
+			b := newBuilder(t)
+			b.change(newChange(), encoding.RootCommitID, "c", map[string]string{"f": fmt.Sprint(i)})
+			if _, err := publish(ctx, fresh, repo, alice, b, nil); err != nil {
+				t.Errorf("publishing to repository %d: %v", repo, err)
+			}
+		})
+	}
+	wg.Wait()
 }

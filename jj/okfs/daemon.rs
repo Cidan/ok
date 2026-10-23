@@ -59,6 +59,7 @@ use crate::control::Paths;
 use crate::control::private_dir;
 use crate::fs::Fetch;
 use crate::fs::Mount;
+use crate::fs::SecretStore;
 use crate::model::Conflict;
 use crate::model::Model;
 use crate::model::Stale;
@@ -421,14 +422,81 @@ impl Fetch for OkFetch {
     }
 }
 
+/// A workspace's secrets, from ok secrets (docs/secrets.md, "In a virtual workspace"): what its mount
+/// reads and writes as the files under `secret/`.
+struct OkSecrets {
+    shared: Arc<Shared>,
+}
+
+/// A refusal of ok secrets' as the errno a file operation fails with — `EACCES` for what the
+/// caller may not do, or has not unsealed — with why, and what to run, in the daemon's log.
+fn secret_errno(path: &str, s: tonic::Status) -> io::Error {
+    eprintln!("okfs: {path}: {}", s.message());
+    io::Error::from_raw_os_error(match s.code() {
+        tonic::Code::PermissionDenied
+        | tonic::Code::Unauthenticated
+        | tonic::Code::FailedPrecondition => libc::EACCES,
+        tonic::Code::InvalidArgument => libc::EINVAL,
+        _ => libc::EIO,
+    })
+}
+
+impl SecretStore for OkSecrets {
+    fn keeps_secrets(&self) -> bool {
+        let shared = self.shared.clone();
+        bounded(async move { Ok(shared.keeps_secrets().await) }).unwrap_or(true)
+    }
+
+    fn read(&self, path: &str, digest: &ok_secret::Digest) -> io::Result<ok_secret::SecretBuf> {
+        let (shared, p, d) = (self.shared.clone(), path.to_owned(), *digest);
+        bounded(async move {
+            shared
+                .read_secret(&p, &d)
+                .await
+                .map_err(|s| secret_errno(&p, s))
+        })
+    }
+
+    fn write(&self, path: &str, value: &[u8]) -> io::Result<ok_secret::Digest> {
+        let (shared, p, v) = (
+            self.shared.clone(),
+            path.to_owned(),
+            ok_secret::SecretBuf::new(value.to_vec()),
+        );
+        // Only a snapshot seals: its error says why, as ok secrets did.
+        bounded(async move {
+            shared
+                .write_secret(&p, v.as_slice())
+                .await
+                .map_err(|s| io::Error::other(s.message().to_owned()))
+        })
+    }
+
+    fn may_write(&self, path: &str) -> io::Result<bool> {
+        let (shared, p) = (self.shared.clone(), path.to_owned());
+        bounded(async move {
+            let a = shared
+                .secret_access(&p)
+                .await
+                .map_err(|s| secret_errno(&p, s))?;
+            if !a.write {
+                eprintln!("okfs: {p}: {}", a.why_not_write);
+            }
+            Ok(a.write)
+        })
+    }
+}
+
 /// The file system, read in process by the checkpointer.
 struct LocalView(Arc<Mount>);
 
 impl FsView for LocalView {
     fn list_dir(&self, path: &RepoPath) -> io::Result<pb::ListDirReply> {
-        self.0
-            .with(|m| m.list_dir(path))
-            .map_err(io::Error::from_raw_os_error)
+        self.0.list_dir(path).map_err(io::Error::from_raw_os_error)
+    }
+
+    fn seal_secret(&self, path: &RepoPath) -> io::Result<Option<pb::DirEntry>> {
+        self.0.seal_secret(path)
     }
 
     fn remember(&self, files: Vec<pb::Remembered>) -> io::Result<()> {
@@ -743,15 +811,21 @@ impl Daemon {
                 last.store(now, Ordering::SeqCst);
             })
         };
-        let mount = Arc::new(
-            Mount::new(
-                model,
-                Arc::new(OkFetch::new(store.clone(), shared.clone())),
-                state.join("staging"),
-                on_change,
-            )
-            .map_err(|e| e.to_string())?,
-        );
+        #[allow(unused_mut)]
+        let mut mount = Mount::new(
+            model,
+            Arc::new(OkFetch::new(store.clone(), shared.clone())),
+            state.join("staging"),
+            on_change,
+        )
+        .map_err(|e| e.to_string())?;
+        // Over FUSE a secret reads as its value; over NFS, whose client caches file data so no read
+        // can be made the only one, as its pointer (docs/secrets.md, "Clients").
+        #[cfg(not(target_os = "macos"))]
+        mount.use_secrets(Arc::new(OkSecrets {
+            shared: shared.clone(),
+        }));
+        let mount = Arc::new(mount);
         let loaded = started.elapsed();
         #[cfg(target_os = "macos")]
         let (thread, nfs) = {
@@ -1268,11 +1342,21 @@ impl Daemon {
                 let path = RepoPathBuf::from_internal_string(l.path).map_err(|e| e.to_string())?;
                 let mount = active.mount.clone();
                 A::ListDir(
-                    tokio::task::spawn_blocking(move || mount.with(|m| m.list_dir(&path)))
+                    tokio::task::spawn_blocking(move || mount.list_dir(&path))
                         .await
                         .map_err(|e| e.to_string())?
                         .map_err(|e| format!("listing: {}", io::Error::from_raw_os_error(e)))?,
                 )
+            }
+            Q::SealSecret(s) => {
+                let active = self.active(&s.workspace_id).await?;
+                let path = RepoPathBuf::from_internal_string(s.path).map_err(|e| e.to_string())?;
+                let mount = active.mount.clone();
+                let entry = tokio::task::spawn_blocking(move || mount.seal_secret(&path))
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .map_err(|e| format!("storing the secret: {e}"))?;
+                A::SealSecret(pb::SealSecretReply { entry })
             }
             Q::RememberFiles(r) => {
                 let active = self.active(&r.workspace_id).await?;
@@ -1400,6 +1484,10 @@ impl Daemon {
                 A::Status(out)
             }
             Q::Present(p) => A::Present(self.present(p).await?),
+            Q::Unpresent(u) => {
+                self.unpresent_at(Path::new(&u.mount_point)).await;
+                A::Empty(pb::Empty {})
+            }
             Q::Prefetch(p) => {
                 let active = self.active(&p.workspace_id).await?;
                 prefetch(&active, &p.paths).await?;
@@ -1469,6 +1557,24 @@ fn write_negotiated(p: &Path, n: fuse::Negotiated) {
 /// (a connection that ended leaves ENOTCONN behind).
 /// Ends a presentation: refuses everything from now on, and detaches its mount (the connection
 /// ends once nothing uses it; its thread exits on its own).
+impl Daemon {
+    /// Stops presenting at a mount point, and deletes its state.
+    async fn unpresent_at(&self, mount_point: &Path) {
+        let slot = self.presented.lock().await.remove(mount_point);
+        if let Some(slot) = slot
+            && let Some(pr) = slot.lock().await.take()
+        {
+            unpresent(pr);
+        }
+        let state = self
+            .paths
+            .presented()
+            .join("mounts")
+            .join(mount_dir_name(mount_point));
+        let _ = std::fs::remove_dir_all(&state);
+    }
+}
+
 fn unpresent(pr: Presentation) {
     pr.mount.close();
     if let Err(e) = fuse::unmount(&pr.mount_point) {
@@ -1848,6 +1954,7 @@ async fn check_out(active: &Arc<Active>, c: pb::CheckOut) -> Result<pb::CheckOut
     .await
     .map_err(|e| e.to_string())?
     .map_err(|e| format!("checking out: {}", io::Error::from_raw_os_error(e)))?;
+    active.mount.forget_secrets();
     let refresh = refresh_out(active.mount.invalidate(&stale));
     for id in new.iter().flatten() {
         let (shared, id) = (active.shared.clone(), id.clone());

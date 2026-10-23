@@ -1,0 +1,86 @@
+package pages
+
+import (
+	"strconv"
+
+	"github.com/Cidan/ok/internal/web/layout"
+	"github.com/Cidan/ok/internal/web/nav"
+)
+
+// NotificationsPage is the full document of a person's notifications (docs/hosted.md, "ok control at
+// scale, as built"): what asks something of them, from every cell, and which kinds they are mailed.
+templ NotificationsPage(n nav.Model, v NotificationsView) {
+	@layout.Shell(shell("Notifications · "+Brand, layout.LeftNav, n)) {
+		@NotificationsContent(v)
+	}
+}
+
+templ NotificationsContent(v NotificationsView) {
+	<div class="flex h-full flex-1 flex-col overflow-hidden">
+		<div class="shrink-0">
+			@PageHead("Notifications", notificationsSubtitle(v.Unread), "") {
+				if v.Unread > 0 {
+					<form method="post" action="/notifications/read">
+						<button type="submit" class={ btnClass(btnInverse) }>Mark all read</button>
+					</form>
+				}
+			}
+		</div>
+		<div class="flex-1 overflow-y-auto">
+			<div class="mx-auto w-full max-w-5xl space-y-8 px-6 pb-12 sm:px-10">
+				if len(v.Items) == 0 {
+					<div class="py-16 text-center text-sm">
+						<div class="font-medium text-zinc-200">Nothing Yet</div>
+						<div class="mt-1.5 text-zinc-500">Reviews asked of you, replies to your changes, and comments in your threads show here.</div>
+					</div>
+				} else {
+					<div id="notifications" class="rounded-lg border border-zinc-800 bg-zinc-900/40">
+						for _, it := range v.Items {
+							<a
+								href={ templ.SafeURL(it.Link) }
+								data-notification
+								data-read={ boolAttr(it.Read) }
+								class="flex items-start gap-3 border-b border-zinc-800/70 px-4 py-3 text-sm last:border-b-0 hover:bg-zinc-800/40"
+							>
+								if it.Read {
+									<span class="mt-1.5 h-2 w-2 shrink-0 rounded-full bg-zinc-700"></span>
+								} else {
+									<span class="mt-1.5 h-2 w-2 shrink-0 rounded-full bg-sky-400" title="Unread"></span>
+								}
+								<span class="min-w-0 flex-1">
+									<span class={ "block truncate", templ.KV("text-zinc-200", !it.Read), templ.KV("text-zinc-400", it.Read) }>
+										<span class="font-medium">{ it.Who }</span> { it.Text }
+									</span>
+									<span class="mt-0.5 block truncate text-xs text-zinc-500">
+										<span class="font-mono">{ it.Repository } #{ strconv.FormatInt(it.Number, 10) }</span> · { it.Title }
+									</span>
+								</span>
+								<span class="shrink-0 text-xs text-zinc-600" title={ it.AgoTitle }>{ it.Ago }</span>
+							</a>
+						}
+					</div>
+				}
+				<form method="post" action="/notifications/preferences" class="max-w-xl space-y-3">
+					<h2 class="text-xs font-medium uppercase tracking-wide text-zinc-500">Mailed to you</h2>
+					for _, k := range v.Kinds {
+						<label class="flex items-center gap-2.5 text-sm text-zinc-300">
+							<input type="checkbox" name="mail" value={ k.Value } checked?={ k.Mailed } class="accent-zinc-300"/>
+							{ k.Label }
+						</label>
+					}
+					<button type="submit" class={ btnClass(btnInverse) }>Save</button>
+				</form>
+			</div>
+		</div>
+	</div>
+}
+
+func notificationsSubtitle(unread int64) string {
+	switch unread {
+	case 0:
+		return "Nothing unread."
+	case 1:
+		return "1 unread."
+	}
+	return strconv.FormatInt(unread, 10) + " unread."
+}

@@ -1254,6 +1254,73 @@ impl Model {
         Ok(data.len() as u32)
     }
 
+    /// What an inode is, if it exists.
+    pub fn kind_of(&self, ino: Ino) -> Option<Kind> {
+        self.inodes.get(&ino).map(|i| i.kind)
+    }
+
+    /// A materialized file's content version: bumped by every change of its bytes.
+    pub fn version_of(&self, ino: Ino) -> Option<u64> {
+        self.inodes.get(&ino).map(|i| i.version)
+    }
+
+    /// Whether an inode is a secret's file (docs/secrets.md): a regular file beneath the root's
+    /// `secret` folder, named neither `acl.yaml` nor as an OWNERS file. It walks the inode's links
+    /// without building a path.
+    pub fn is_secret(&self, ino: Ino) -> bool {
+        let Some(i) = self.inodes.get(&ino) else {
+            return false;
+        };
+        if i.kind != Kind::File || !i.name.to_str().is_some_and(ok_secret::secret_name) {
+            return false;
+        }
+        let mut cur = ino;
+        let mut depth = 0;
+        loop {
+            let Some(n) = self.inodes.get(&cur) else {
+                return false;
+            };
+            match n.parent {
+                0 => return false,
+                ROOT => return depth > 0 && n.name == ok_secret::DIR,
+                p => {
+                    cur = p;
+                    depth += 1;
+                }
+            }
+        }
+    }
+
+    /// Records a change to a file whose bytes are not the overlay's: a secret's value, which the
+    /// mount keeps in memory and never writes here (docs/secrets.md, "In a virtual workspace").
+    /// The file is materialized — its overlay keeps whatever pointer it had — and its version moves,
+    /// so a snapshot or checkpoint looks at it.
+    pub fn secret_written(&mut self, ino: Ino) -> R<()> {
+        if !matches!(self.inode(ino)?.content, Content::Materialized) {
+            self.materialize_file(ino)?;
+        }
+        let t = (self.clock)();
+        let i = self.inode_mut(ino)?;
+        i.version += 1;
+        i.checkout_conflict = false;
+        i.meta.mtime = t;
+        i.meta.ctime = t;
+        self.touch(ino);
+        self.note(ino);
+        self.flush()?;
+        Ok(())
+    }
+
+    /// Replaces a file's contents in the overlay: a secret's pointer, once its value is sealed.
+    pub fn put_contents(&mut self, ino: Ino, contents: &[u8]) -> R<()> {
+        if !matches!(self.inode(ino)?.content, Content::Materialized) {
+            self.materialize_file(ino)?;
+        }
+        self.truncate(ino, 0)?;
+        self.write(ino, 0, contents)?;
+        Ok(())
+    }
+
     pub fn fsync(&mut self, ino: Ino) -> R<()> {
         if let Some(f) = self.files.get(&ino) {
             f.sync_data()?;
@@ -2801,7 +2868,8 @@ impl Model {
                 Some(pb::record::Record::Unwhiteout(w)) => {
                     whiteouts.remove(&(w.dir, w.name));
                 }
-                None => {}
+                // A snapshot's mark, which the log's reader takes off before the model sees it.
+                Some(pb::record::Record::Compaction(_)) | None => {}
             }
         }
         let t = clock();

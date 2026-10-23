@@ -74,6 +74,10 @@ type Options struct {
 	GroupNames map[string]string
 	// Declared are the names the groups-and-ACLs tree declares: a synced group may not take one.
 	Declared map[string]bool
+	// HumanName and GroupName make a person's and a group's names of their handle and label: the
+	// installation's, ada.human.<domain> and eng.group.<domain>, when nil; an enterprise
+	// organization's people and teams otherwise.
+	HumanName, GroupName func(string) string
 }
 
 // HumanChange is a human the plan makes or changes: Before is nil for a new one.
@@ -186,7 +190,7 @@ func (p *Plan) Empty() bool { return len(p.Humans) == 0 && len(p.Groups) == 0 }
 //   - groups follow likewise, their members those people and groups the directory holds, and no
 //     group takes a name the tree declares.
 //
-// It is pure: the store applies the plan (Apply) in one transaction.
+// It is pure: the store applies the plan (Apply), a chunk at a time.
 func Reconcile(names identity.Names, st *State, snap *Snapshot, opts Options) (*Plan, error) {
 	if err := snap.check(); err != nil {
 		return nil, err
@@ -221,6 +225,9 @@ func Reconcile(names identity.Names, st *State, snap *Snapshot, opts Options) (*
 			continue
 		}
 		name := names.Human(handle)
+		if opts.HumanName != nil {
+			name = opts.HumanName(handle)
+		}
 		want[p.ExternalID] = name
 		if cur, ok := byID[p.ExternalID]; !ok || cur.Name != name {
 			wanted[name] = append(wanted[name], p.ExternalID)
@@ -302,6 +309,9 @@ func Reconcile(names identity.Names, st *State, snap *Snapshot, opts Options) (*
 			continue
 		}
 		name := names.Of(identity.Group, label)
+		if opts.GroupName != nil {
+			name = opts.GroupName(label)
+		}
 		gWant[g.ExternalID] = name
 		if cur, ok := gByID[g.ExternalID]; !ok || cur.Name != name {
 			gWanted[name] = append(gWanted[name], g.ExternalID)

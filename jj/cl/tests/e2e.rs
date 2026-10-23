@@ -362,9 +362,10 @@ impl Control {
                     number,
                     patchset,
                     candidate: Vec::new(),
+                    actor_id: String::new(),
                 })
                 .collect(),
-            actor: ALICE.to_owned(),
+            actor_id: ok_testscm::id(ALICE).await,
             expected_head: expected,
             dry_run,
         };

@@ -17,6 +17,7 @@ futures.workspace = true
 hex.workspace = true
 jj-cli.workspace = true
 jj-lib.workspace = true
+ok-secret.workspace = true
 mimalloc.workspace = true
 ok-cl.workspace = true
 ok-credential.workspace = true
@@ -37,3 +38,9 @@ okfs-fuse.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
 
+# The virtual scenarios enter a user and mount namespace of their own first thing in main, which
+# only a single-threaded process may: they have a harness of their own (okfs_fuse::testns::run).
+[[test]]
+name = "cli_virtual"
+path = "tests/cli_virtual.rs"
+harness = false

@@ -7,6 +7,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/Cidan/ok/internal/data"
 	"github.com/Cidan/ok/internal/scm/encoding"
 	"github.com/Cidan/ok/internal/scm/store/backend"
 )
@@ -26,8 +27,8 @@ func (x queries) OpLogID(ctx context.Context, repo int64, principal, workspace s
 func (x queries) InsertOpLog(ctx context.Context, repo int64, principal, workspace string) (int64, bool, error) {
 	var id int64
 	err := x.q.QueryRow(ctx,
-		`INSERT INTO op_log (repository_id, principal, workspace) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING RETURNING id`,
-		repo, principal, workspace).Scan(&id)
+		`INSERT INTO op_log (id, repository_id, principal, workspace) VALUES ($4, $1, $2, $3) ON CONFLICT DO NOTHING RETURNING id`,
+		repo, principal, workspace, data.NewID()).Scan(&id)
 	switch {
 	case err == nil:
 		return id, true, nil
@@ -123,10 +124,11 @@ func (x queries) PutOperations(ctx context.Context, log int64, ops []backend.Ope
 	for i, o := range ops {
 		idCol[i], viewCol[i], bs[i] = o.ID, o.View, o.Body
 	}
-	_, err := x.q.Exec(ctx, `INSERT INTO operation (op_log_id, id, view_id, body)
+	_, err := x.q.Exec(ctx, `WITH revived AS (DELETE FROM op_tombstone WHERE op_log_id = $1 AND kind = $5 AND id = ANY($2))
+		INSERT INTO operation (op_log_id, id, view_id, body)
 		SELECT $1, u.id, u.view, u.body FROM unnest($2::bytea[], $3::bytea[], $4::bytea[]) AS u(id, view, body)
 		ORDER BY u.id ON CONFLICT (op_log_id, id) DO UPDATE SET touched_at = now()`,
-		log, ids(idCol), ids(viewCol), bs)
+		log, ids(idCol), ids(viewCol), bs, int16(encoding.KindOperation))
 	return err
 }
 
@@ -136,28 +138,29 @@ func (x queries) PutViews(ctx context.Context, log int64, views []backend.Object
 	for i, v := range views {
 		idCol[i], bs[i] = v.ID, v.Body
 	}
-	_, err := x.q.Exec(ctx, `INSERT INTO view (op_log_id, id, body)
+	_, err := x.q.Exec(ctx, `WITH revived AS (DELETE FROM op_tombstone WHERE op_log_id = $1 AND kind = $4 AND id = ANY($2))
+		INSERT INTO view (op_log_id, id, body)
 		SELECT $1, u.id, u.body FROM unnest($2::bytea[], $3::bytea[]) AS u(id, body)
 		ORDER BY u.id ON CONFLICT (op_log_id, id) DO UPDATE SET touched_at = now()`,
-		log, ids(idCol), bs)
+		log, ids(idCol), bs, int16(encoding.KindView))
 	return err
 }
 
-func (x queries) TouchOps(ctx context.Context, log int64, kind encoding.Kind, members []encoding.ID) error {
-	_, err := x.q.Exec(ctx, `UPDATE `+opTable(kind)+` SET touched_at = now() WHERE op_log_id = $1 AND id = ANY($2)`, log, ids(members))
-	return err
+func (x queries) TouchOps(ctx context.Context, log int64, kind encoding.Kind, members []encoding.ID) ([]encoding.ID, error) {
+	return idList(x.q.Query(ctx, `UPDATE `+opTable(kind)+` SET touched_at = now() WHERE op_log_id = $1 AND id = ANY($2) RETURNING id`,
+		log, ids(members)))
 }
 
-func (x queries) CollectOps(ctx context.Context, log int64, doomed []encoding.ID, before time.Time, dry bool) (int64, int64, error) {
+func (x queries) CollectOps(ctx context.Context, log int64, doomed, keep []encoding.ID, before time.Time, dry bool) (int64, int64, error) {
 	var ops, views int64
 	if dry {
 		if err := x.q.QueryRow(ctx, `SELECT count(*) FROM operation WHERE op_log_id = $1 AND id = ANY($2) AND touched_at < $3`,
 			log, ids(doomed), before).Scan(&ops); err != nil {
 			return 0, 0, err
 		}
-		err := x.q.QueryRow(ctx, `SELECT count(*) FROM view v WHERE v.op_log_id = $1 AND v.touched_at < $2
+		err := x.q.QueryRow(ctx, `SELECT count(*) FROM view v WHERE v.op_log_id = $1 AND v.touched_at < $2 AND NOT v.id = ANY($4)
 			AND NOT EXISTS (SELECT 1 FROM operation o WHERE o.op_log_id = v.op_log_id AND o.view_id = v.id
-			AND NOT (o.id = ANY($3) AND o.touched_at < $2))`, log, before, ids(doomed)).Scan(&views)
+			AND NOT (o.id = ANY($3) AND o.touched_at < $2))`, log, before, ids(doomed), ids(keep)).Scan(&views)
 		return ops, views, err
 	}
 	tag, err := x.q.Exec(ctx, `DELETE FROM operation WHERE op_log_id = $1 AND id = ANY($2) AND touched_at < $3`,
@@ -167,13 +170,111 @@ func (x queries) CollectOps(ctx context.Context, log int64, doomed []encoding.ID
 	}
 	ops = tag.RowsAffected()
 	tag, err = x.q.Exec(ctx,
-		`DELETE FROM view v WHERE v.op_log_id = $1 AND v.touched_at < $2
+		`DELETE FROM view v WHERE v.op_log_id = $1 AND v.touched_at < $2 AND NOT v.id = ANY($3)
 		   AND NOT EXISTS (SELECT 1 FROM operation o WHERE o.op_log_id = v.op_log_id AND o.view_id = v.id)`,
-		log, before)
+		log, before, ids(keep))
 	if err != nil {
 		return 0, 0, err
 	}
 	return ops, tag.RowsAffected(), nil
+}
+
+func (x queries) TombstoneOps(ctx context.Context, log int64, kind encoding.Kind, members []encoding.ID, dry bool) (int64, error) {
+	if len(members) == 0 {
+		return 0, nil
+	}
+	without := `FROM unnest($3::bytea[]) AS u(id)
+		WHERE NOT EXISTS (SELECT 1 FROM ` + opTable(kind) + ` t WHERE t.op_log_id = $1 AND t.id = u.id)
+		  AND NOT EXISTS (SELECT 1 FROM op_tombstone d WHERE d.op_log_id = $1 AND d.kind = $2 AND d.id = u.id)`
+	if dry {
+		var n int64
+		err := x.q.QueryRow(ctx, `SELECT count(*) `+without, log, int16(kind), ids(members)).Scan(&n)
+		return n, err
+	}
+	tag, err := x.q.Exec(ctx, `INSERT INTO op_tombstone (op_log_id, kind, id) SELECT $1, $2, u.id `+without, log, int16(kind), ids(members))
+	return tag.RowsAffected(), err
+}
+
+func (x queries) TailOpTombstones(ctx context.Context, log int64, kind encoding.Kind, members []encoding.ID) (map[encoding.ID]bool, error) {
+	return idSet(x.q.Query(ctx, `SELECT id FROM op_tombstone WHERE op_log_id = $1 AND kind = $2 AND id = ANY($3)`, log, int16(kind), ids(members)))
+}
+
+// opKeys reads rows of an operation log, a kind, and an ID.
+func opKeys(rows pgx.Rows, err error) ([]backend.OpKey, error) {
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, func(r pgx.CollectableRow) (backend.OpKey, error) {
+		var k backend.OpKey
+		var kind int16
+		var idb []byte
+		if err := r.Scan(&k.Log, &kind, &idb); err != nil {
+			return k, err
+		}
+		k.Kind = encoding.Kind(kind)
+		var err error
+		k.ID, err = toID(idb)
+		return k, err
+	})
+}
+
+func (x queries) RepositoryOpTombstones(ctx context.Context, repo int64) ([]backend.OpKey, error) {
+	return opKeys(x.q.Query(ctx, `SELECT d.op_log_id, d.kind, d.id FROM op_tombstone d JOIN op_log l ON l.id = d.op_log_id
+		WHERE l.repository_id = $1`, repo))
+}
+
+func (x queries) TailOpViewRefs(ctx context.Context, log int64, doomed []encoding.ID, before time.Time) (map[encoding.ID]bool, error) {
+	return idSet(x.q.Query(ctx, `SELECT DISTINCT view_id FROM operation WHERE op_log_id = $1 AND NOT (id = ANY($2) AND touched_at < $3)`,
+		log, ids(doomed), before))
+}
+
+func (x queries) AllOpLogs(ctx context.Context, repo int64) ([]int64, error) {
+	return int64s(x.q.Query(ctx, `SELECT id FROM op_log WHERE repository_id = $1 ORDER BY id`, repo))
+}
+
+// opRecords reads rows of an operation log, a kind, an ID, a view (null for a view), a body, and
+// a time.
+func opRecords(rows pgx.Rows, err error) ([]backend.OpRecord, error) {
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, func(r pgx.CollectableRow) (backend.OpRecord, error) {
+		var o backend.OpRecord
+		var kind int16
+		var idb, viewb []byte
+		if err := r.Scan(&o.Log, &kind, &idb, &viewb, &o.Body, &o.TouchedAt); err != nil {
+			return o, err
+		}
+		o.Kind = encoding.Kind(kind)
+		var err error
+		if o.ID, err = toID(idb); err != nil {
+			return o, err
+		}
+		if viewb != nil {
+			o.View, err = toID(viewb)
+		}
+		return o, err
+	})
+}
+
+func (x queries) SettledOps(ctx context.Context, repo int64, before time.Time, limit int) ([]backend.OpRecord, error) {
+	ops, err := opRecords(x.q.Query(ctx, `SELECT o.op_log_id, $4::smallint, o.id, o.view_id, o.body, o.touched_at
+		FROM operation o JOIN op_log l ON l.id = o.op_log_id
+		WHERE l.repository_id = $1 AND o.touched_at < $2 ORDER BY o.op_log_id, o.id LIMIT $3`,
+		repo, before, limit, int16(encoding.KindOperation)))
+	if err != nil {
+		return nil, err
+	}
+	views, err := opRecords(x.q.Query(ctx, `SELECT v.op_log_id, $4::smallint, v.id, NULL::bytea, v.body, v.touched_at
+		FROM view v JOIN op_log l ON l.id = v.op_log_id
+		WHERE l.repository_id = $1 AND v.touched_at < $2 ORDER BY v.op_log_id, v.id LIMIT $3`,
+		repo, before, limit, int16(encoding.KindView)))
+	return append(ops, views...), err
+}
+
+func (x queries) OpTombstones(ctx context.Context, repo int64, limit int) ([]backend.OpKey, error) {
+	return opKeys(x.q.Query(ctx, `SELECT d.op_log_id, d.kind, d.id FROM op_tombstone d JOIN op_log l ON l.id = d.op_log_id
+		WHERE l.repository_id = $1 ORDER BY d.op_log_id, d.kind, d.id LIMIT $2`, repo, limit))
 }
 
 func (x queries) WorkspaceOpLogs(ctx context.Context, repo int64) ([]int64, error) {
@@ -199,12 +300,12 @@ func (x queries) DeleteOrphanWorkspaces(ctx context.Context, repo int64, dry boo
 		WHERE l.repository_id = w.repository_id AND l.principal = w.principal AND l.workspace = w.name)`, repo, dry)
 }
 
-func (x queries) RepositoryOperations(ctx context.Context, repo int64) ([]backend.Object, error) {
-	rows, err := x.q.Query(ctx, `SELECT o.id, o.body FROM operation o JOIN op_log l ON l.id = o.op_log_id WHERE l.repository_id = $1`, repo)
-	return objects(rows, err, encoding.KindOperation)
+func (x queries) RepositoryOperations(ctx context.Context, repo int64) ([]backend.OpRecord, error) {
+	return opRecords(x.q.Query(ctx, `SELECT o.op_log_id, $2::smallint, o.id, o.view_id, o.body, o.touched_at
+		FROM operation o JOIN op_log l ON l.id = o.op_log_id WHERE l.repository_id = $1`, repo, int16(encoding.KindOperation)))
 }
 
-func (x queries) RepositoryViews(ctx context.Context, repo int64) ([]backend.Object, error) {
-	rows, err := x.q.Query(ctx, `SELECT v.id, v.body FROM view v JOIN op_log l ON l.id = v.op_log_id WHERE l.repository_id = $1`, repo)
-	return objects(rows, err, encoding.KindView)
+func (x queries) RepositoryViews(ctx context.Context, repo int64) ([]backend.OpRecord, error) {
+	return opRecords(x.q.Query(ctx, `SELECT v.op_log_id, $2::smallint, v.id, NULL::bytea, v.body, v.touched_at
+		FROM view v JOIN op_log l ON l.id = v.op_log_id WHERE l.repository_id = $1`, repo, int16(encoding.KindView)))
 }

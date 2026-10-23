@@ -98,7 +98,10 @@ thing to keep running. It is the `jj` binary itself, started as a hidden subcomm
 - lingering (`loginctl enable-linger`), offered on the first virtual clone, so mounts outlive the
   login session.
 
-On macOS it is the **launchd agent** `ok.okfs` instead ([macOS](#macos)).
+On macOS it is the **launchd agent** `ok.okfs` instead ([macOS](#macos)). A service manager always
+starts it; jj never runs a copy of itself. On a machine with neither, run `jj fs daemon` under
+whatever supervises its processes: a jj command that finds no daemon says so, as does one that
+finds a daemon of another build, which only what started it can replace.
 
 It talks to ok as the user, with the machine's credential (`jj/credential`),
 renewing the certificate as the CLI does, and reconnecting when a renewal replaces it.
@@ -130,6 +133,15 @@ repository is its own, in its state directory, and goes when the workspace is fo
 workspace is isolated from every other (scm.md, "Decisions", 3). Only the cache is
 shared, and only because it holds content-addressed data, never state: a second clone of the
 large repository fetches nothing the first already read.
+
+The inode table is a snapshot (`inodes.snap`) and the records logged since (`inodes.log`).
+Compacting it writes the new snapshot to a temporary file, syncs it, renames it into place, and
+syncs the directory — the snapshot durable, name and all — before it empties the log; the
+snapshot's first record marks the log it was compacted from, by its length and BLAKE3 hash. So a
+power loss mid-compaction leaves the old snapshot and its whole log, or the new snapshot and a
+log that was emptied or still starts with exactly the marked bytes, which loading skips: no
+record is lost, and none is replayed over a snapshot that holds it. Loading rewrites the log only
+to drop such bytes or a torn last record, and then as compaction writes the snapshot.
 
 ### `.jj` inside the mount
 
@@ -223,6 +235,32 @@ Everything a file system is asked to hold works in the overlay, tracked or not: 
 between written files, FIFOs and sockets (language servers create them), extended attributes,
 `flock` and POSIX locks (kept by the kernel). A snapshot records what jj records — files,
 executables, and symlinks — and skips the rest, as jj's local working copy does.
+
+### Secrets
+
+In a repository that keeps secrets ([secrets.md](secrets.md)), a file under `secret/` that is
+neither an `acl.yaml` nor an OWNERS file is a secret: the tree and the overlay hold its pointer, and
+over FUSE the mount serves its value instead.
+
+- **Reading.** A read-only open fetches the value from ok secrets (`ReadSecret`), using one of the
+  person's unseals, checks it against the pointer, and holds it for that open alone: its release
+  drops it. With no unseal the open fails with `EACCES`, and the daemon's log says what to run. A
+  file holding no pointer — a conflict's markers — reads as it is.
+- **Writing.** An open to write asks ok secrets whether the person writes the folder (`EACCES` if
+  not); the value is then held in the daemon's memory, never the overlay, until the next snapshot
+  or checkpoint seals it: `WriteSecret` keeps it as a new version, and its pointer is written to
+  the overlay (`SealSecret` on the control socket, for jj's snapshot). A value equal to the one its
+  pointer names stores nothing; a value that is itself a pointer sets the pointer.
+- **The kernel.** A secret is `0600`, its size what an open holds (else 0), its attributes never
+  cached, and its reads and writes bypass the page cache (`FOPEN_DIRECT_IO`). A value is bound to
+  its path: renames and links into, out of, or within `secret/` are `EXDEV`, which `mv` meets by
+  copying; symlinks, FIFOs, and sockets there `EPERM`; names that are not UTF-8 `EINVAL`.
+- **Whether the repository keeps secrets** is ok secrets' answer for `main`, or the workspace's own
+  `.ok/repository.yaml` when it has a `secrets:` stanza, so values stay off disk from the moment a
+  workspace starts keeping them.
+
+Over NFS (macOS), whose client caches file data so no read can be made the only one, and in a
+presentation, a secret's file is its pointer: `jj secret cat` reads it.
 
 ### The journal
 
@@ -500,6 +538,9 @@ checkout; reading every file again 0.5 s against 0.3 s; `jj st` 30 ms against 10
 - No privilege anywhere: mounting is `fusermount3` (on macOS, `mount_nfs`), and nothing needs
   `CAP_SYS_ADMIN`.
 - On macOS, NFS handles are unforgeable and calls from other users refused ([macOS](#macos)).
+- A secret's value is never written to disk: the overlay holds its pointer, and the value is in
+  the daemon's memory only while an open reads it or until a snapshot seals what was written
+  ([Secrets](#secrets)).
 
 ## ok's roles
 
@@ -518,12 +559,15 @@ nothing else.
   "How the roles reach each other"). On a network the installation trusts to carry plaintext — a
   service mesh — `OK_PLAINTEXT=1` admits a plaintext endpoint on a cluster address; the credential
   is presented all the same.
-- **Mounting.** A container usually cannot mount. The role therefore runs itself again in a user
-  and mount namespace of its own, mapping every id the container has to itself: it is root there,
-  with full capabilities over the new mount namespace, and the daemon mounts there directly (FUSE
-  is mountable in a user namespace). The first process stays as the container's init: it forwards
-  signals, reaps orphans, and exits with the role's status. Only processes in the namespace see
-  the mount.
+- **Mounting.** A container usually cannot mount, so the role is started in a user and mount
+  namespace of its own, where it is root with full capabilities over the mount namespace and the
+  daemon mounts directly (FUSE is mountable in a user namespace): `unshare --map-root-user --mount
+  --propagation private -- ok …`, as the chart starts it (`checkout.Launch`). ok never makes the
+  namespaces itself — only a single-threaded process can enter a new user namespace — and never
+  runs itself again to become one. At start it checks it is in them (`checkout.RequireIsolated`:
+  not the host's user namespace, and able to make every mount private), refusing with how to start
+  it otherwise. Only processes in the namespace see the mount. The pod's init is its pause process
+  (`shareProcessNamespace`), which reaps what Bazel leaves behind; ok is not PID 1.
 - **Presenting.** A `Present` on the control socket mounts the commit's tree read-only
   (`MS_RDONLY`, and `EROFS` from the daemon); each later one moves the presentation to the new
   commit's tree the way a workspace's checkout does, reading only the trees of directories the

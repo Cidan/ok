@@ -15,6 +15,7 @@ import (
 
 	"github.com/Cidan/ok/internal/automation/changes"
 	"github.com/Cidan/ok/internal/automation/store"
+	"github.com/Cidan/ok/internal/serve/metrics"
 	"github.com/Cidan/ok/internal/work"
 	"github.com/Cidan/ok/internal/workflow"
 	scmpb "github.com/Cidan/ok/proto/ok/scm/v1"
@@ -37,10 +38,15 @@ type Config struct {
 	// Grace is how old a candidate no attempt holds must be before it is discarded: one
 	// prepared just now is recorded a moment later.
 	Grace time.Duration
+	// Batch bounds how many submissions one landing lands (Batch).
+	Batch int
 }
 
+// DefaultBatch is how many submissions one landing lands at most.
+const DefaultBatch = 32
+
 // DefaultConfig is the service's.
-var DefaultConfig = Config{Depth: DefaultDepth, Idle: 10 * time.Second, Grace: 5 * time.Minute}
+var DefaultConfig = Config{Depth: DefaultDepth, Idle: 10 * time.Second, Grace: 5 * time.Minute, Batch: DefaultBatch}
 
 // Runner runs the landing queue: each repository's queue is keyed work (internal/work), done by
 // one replica at a time and by every replica between them, which reads the queue, asks Decide
@@ -57,37 +63,20 @@ func New(s *store.Store, scm SCM, cfg Config, log *slog.Logger) *Runner {
 	return &Runner{store: s, scm: scm, cfg: cfg, log: log}
 }
 
-// Run runs the queue until ctx ends: each repository's whenever something it acts on changes,
-// and every repository with work in the queue at least every Idle.
+// Run runs the queue until ctx ends: each repository's whenever something it acts on changes —
+// every such change marks it, in its transaction — and when a candidate it left comes of age.
 func (r *Runner) Run(ctx context.Context) error {
 	return (&work.Runner{
 		Kind:  store.QueueWork,
 		Store: r.store.Work(),
 		Do:    r.repository,
 		Watch: r.store.WatchQueue,
-		Sweep: r.sweep,
 		Idle:  r.cfg.Idle,
 		Log:   r.log,
 	}).Run(ctx)
 }
 
-// sweep marks the queue of every repository it has work in, to act on what no change announces:
-// what time decides.
-func (r *Runner) sweep(ctx context.Context) error {
-	repos, err := r.store.QueueRepositories(ctx, time.Hour)
-	if err != nil {
-		return err
-	}
-	w := r.store.Work()
-	for _, repo := range repos {
-		if err := w.Mark(ctx, store.QueueWork, repo); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// maxSteps bounds one pass over a repository: each step lands at most one submission.
+// maxSteps bounds one pass over a repository: each step lands at most one batch.
 const maxSteps = 1000
 
 // repository acts on a repository's queue until nothing lands, then discards the candidates no
@@ -102,9 +91,16 @@ func (r *Runner) repository(ctx context.Context, repo int64) error {
 		if err != nil {
 			return err
 		}
-		acts := Decide(r.snapshot(st, rep))
-		if len(acts) > 0 && (acts[0].Kind == Land || acts[0].Kind == Adopt) {
+		snap := r.snapshot(st, rep)
+		acts := Decide(snap)
+		if len(acts) > 0 && acts[0].Kind == Land {
 			// Landing moves main: everything else is decided again from the new head.
+			if err := r.land(ctx, rep, st, Batch(snap, max(r.cfg.Batch, 1))); err != nil {
+				return err
+			}
+			continue
+		}
+		if len(acts) > 0 && acts[0].Kind == Adopt {
 			if err := r.act(ctx, rep, st, acts[0]); err != nil {
 				return err
 			}
@@ -175,7 +171,7 @@ func attemptState(a *store.Attempt) (State, string, *Footprint) {
 	if a.PrepareError != "" {
 		return Failed, a.PrepareError, nil
 	}
-	own := a.Own()
+	own := a.Planned()
 	planning := len(own) == 0
 	for _, c := range own {
 		switch {
@@ -258,20 +254,20 @@ func (r *Runner) act(ctx context.Context, rep *scmpb.Repository, st *store.Queue
 		r.log.Info("queue: discarded an attempt", "repository", rep.GetName(), "submission", a.Submission, "attempt", a.Attempt, "reason", a.Reason)
 		err = r.store.DiscardAttempt(ctx, a.Attempt, a.Reason)
 	case Land:
-		err = r.land(ctx, rep, st, a.Submission, a.Attempt)
+		err = r.land(ctx, rep, st, []Action{a})
 	case Adopt:
 		var landed []store.LandedCL
 		for _, c := range submission(st, a.Submission).CLs {
 			landed = append(landed, store.LandedCL{CLNumber: c.Number, Commit: st.LandedCLs[c.Number]})
 		}
 		r.log.Info("queue: adopted a landing", "repository", rep.GetName(), "submission", a.Submission)
-		err = r.store.RecordLanding(ctx, a.Submission, a.Attempt, landed, 0)
+		err = r.store.RecordLanding(ctx, a.Submission, a.Attempt, landed, store.MainUnknown)
 	case Fail:
 		r.log.Info("queue: failed a submission", "repository", rep.GetName(), "submission", a.Submission, "reason", a.Reason)
 		err = r.store.FailSubmission(ctx, a.Submission, a.Reason)
 	case Cancel:
 		r.log.Info("queue: canceled a submission", "repository", rep.GetName(), "submission", a.Submission, "reason", a.Reason)
-		_, err = r.store.CancelSubmission(ctx, a.Submission, a.Reason)
+		_, err = r.store.CancelSubmission(ctx, a.Submission, a.Reason, "")
 	case Note:
 		err = r.store.SetNote(ctx, a.Submission, a.Reason)
 	}
@@ -319,7 +315,7 @@ func (r *Runner) create(ctx context.Context, rep *scmpb.Repository, st *store.Qu
 			return c, err
 		}
 		c, err := r.scm.Landing.PrepareCandidate(ctx, &scmpb.PrepareCandidateRequest{RepositoryId: repo,
-			Number: cl.Number, Patchset: cl.Patchset, Base: prev, Actor: sub.SubmittedBy})
+			Number: cl.Number, Patchset: cl.Patchset, Base: prev, ActorId: sub.SubmittedBy})
 		return c.GetCommitId(), err
 	}
 	var on []string
@@ -353,7 +349,10 @@ func (r *Runner) create(ctx context.Context, rep *scmpb.Repository, st *store.Qu
 		}
 		na.Why += fmt.Sprintf(", speculating that %s %s first", strings.Join(on, " and "), verb)
 	}
-	for _, cl := range e.CLs {
+	// Post is planned once, on the top's candidate, over the whole submission: from the commit
+	// its lowest candidate is prepared on (docs/automation.md, "post").
+	bottom := prev
+	for i, cl := range e.CLs {
 		commit, err := prepare(e.Submission, cl)
 		if rej := landRejection(err); rej != nil {
 			na.PrepareError = rejectionMessage(rej)
@@ -362,32 +361,35 @@ func (r *Runner) create(ctx context.Context, rep *scmpb.Repository, st *store.Qu
 		if err != nil {
 			return err
 		}
-		files, err := changes.Files(ctx, r.scm.Browse, repo, prev, commit)
-		if err != nil {
-			return err
+		nc := store.NewCandidate{SubmissionID: id, CLNumber: cl.Number, Patchset: cl.Patchset, Commit: commit, Base: prev, Own: true}
+		if i == len(e.CLs)-1 {
+			files, err := changes.Files(ctx, r.scm.Browse, repo, bottom, commit)
+			if err != nil {
+				return err
+			}
+			c, err := r.scm.ChangeLists.GetChangeList(ctx, &scmpb.GetChangeListRequest{RepositoryId: repo, Number: cl.Number})
+			if err != nil {
+				return err
+			}
+			jc := workflow.Context{
+				Change: workflow.Change{
+					Phase:      workflow.Post,
+					Repository: workflow.Repository{ID: repo, Name: rep.GetName()},
+					CL:         cl.Number,
+					Patchset:   cl.Patchset,
+					Author:     c.GetAuthor(),
+					Commit:     hex.EncodeToString(commit),
+					Base:       hex.EncodeToString(bottom),
+				},
+				Files: files,
+			}
+			change, err := json.Marshal(jc.Change)
+			if err != nil {
+				return err
+			}
+			nc.WorkflowsCommit, nc.Context, nc.Touched = rep.GetHead(), change, jc.Touched()
 		}
-		c, err := r.scm.ChangeLists.GetChangeList(ctx, &scmpb.GetChangeListRequest{RepositoryId: repo, Number: cl.Number})
-		if err != nil {
-			return err
-		}
-		jc := workflow.Context{
-			Change: workflow.Change{
-				Phase:      workflow.Post,
-				Repository: workflow.Repository{ID: repo, Name: rep.GetName()},
-				CL:         cl.Number,
-				Patchset:   cl.Patchset,
-				Author:     c.GetAuthor(),
-				Commit:     hex.EncodeToString(commit),
-				Base:       hex.EncodeToString(prev),
-			},
-			Files: files,
-		}
-		change, err := json.Marshal(jc.Change)
-		if err != nil {
-			return err
-		}
-		na.Candidates = append(na.Candidates, store.NewCandidate{SubmissionID: id, CLNumber: cl.Number, Patchset: cl.Patchset,
-			Commit: commit, Base: prev, Own: true, WorkflowsCommit: rep.GetHead(), Context: change, Touched: jc.Touched()})
+		na.Candidates = append(na.Candidates, nc)
 		prev = commit
 	}
 	return r.record(ctx, na)
@@ -406,33 +408,76 @@ func (r *Runner) record(ctx context.Context, na store.NewAttempt) error {
 // land lands a submission on its passed attempt's candidates, against main's head: the SCM
 // lands each candidate as it is when main is still its base, and splices it onto main
 // otherwise. A refusal fails the submission; a moved head is decided again.
-func (r *Runner) land(ctx context.Context, rep *scmpb.Repository, st *store.QueueState, id, attemptID int64) error {
-	e := submission(st, id)
-	a := attemptOf(e, attemptID)
-	req := &scmpb.LandRequest{RepositoryId: rep.GetId(), ExpectedHead: rep.GetHead(), Actor: e.SubmittedBy}
-	for _, c := range a.Own() {
-		req.Items = append(req.Items, &scmpb.LandRequest_Item{Number: c.CLNumber, Patchset: c.Patchset, Candidate: c.Commit})
+// land lands a batch of submissions in one landing — one transaction in the SCM, main moved once
+// — each CL committed for its own submitter, then records each one's landing. A crash or a deploy
+// between the two leaves every CL landed or none, and a landing not recorded is adopted on the
+// next pass (Adopt), as the SCM's record says what landed. A batch the SCM refuses lands its
+// first submission alone, which says whose the refusal is.
+func (r *Runner) land(ctx context.Context, rep *scmpb.Repository, st *store.QueueState, batch []Action) error {
+	req := &scmpb.LandRequest{RepositoryId: rep.GetId(), ExpectedHead: rep.GetHead(), ActorId: submission(st, batch[0].Submission).SubmittedBy}
+	counts := make([]int, 0, len(batch))
+	for i, a := range batch {
+		e := submission(st, a.Submission)
+		own := attemptOf(e, a.Attempt).Own()
+		if i > 0 && len(req.Items)+len(own) > maxLandItems {
+			batch = batch[:i]
+			break
+		}
+		for _, c := range own {
+			req.Items = append(req.Items, &scmpb.LandRequest_Item{Number: c.CLNumber, Patchset: c.Patchset, Candidate: c.Commit,
+				ActorId: e.SubmittedBy})
+		}
+		counts = append(counts, len(own))
 	}
 	resp, err := r.scm.Landing.Land(ctx, req)
 	if rej := landRejection(err); rej != nil {
-		if rej.GetReason() == scmpb.LandRejection_REASON_HEAD_MOVED {
+		switch {
+		case rej.GetReason() == scmpb.LandRejection_REASON_HEAD_MOVED:
 			return nil
+		case len(batch) > 1:
+			return r.land(ctx, rep, st, batch[:1])
 		}
-		return r.store.FailSubmission(ctx, id, rejectionMessage(rej))
+		return r.store.FailSubmission(ctx, batch[0].Submission, rejectionMessage(rej))
 	}
 	if err != nil {
 		return err
 	}
-	var landed []store.LandedCL
-	for _, l := range resp.GetLanded() {
-		landed = append(landed, store.LandedCL{CLNumber: l.GetNumber(), Commit: l.GetCommitId()})
+	if len(resp.GetLanded()) != len(req.Items) {
+		return fmt.Errorf("the SCM landed %d CLs of %d", len(resp.GetLanded()), len(req.Items))
 	}
-	r.log.Info("queue: landed", "repository", rep.GetName(), "submission", id, "attempt", attemptID, "head", short(resp.GetHead()))
-	return r.store.RecordLanding(ctx, id, attemptID, landed, rep.GetHeadSeq())
+	landings.Inc()
+	landedSubmissions.Add(uint64(len(batch)))
+	var errs []error
+	from, at := rep.GetHeadSeq(), 0
+	for i, a := range batch {
+		var landed []store.LandedCL
+		for _, l := range resp.GetLanded()[at : at+counts[i]] {
+			landed = append(landed, store.LandedCL{CLNumber: l.GetNumber(), Commit: l.GetCommitId()})
+		}
+		r.log.Info("queue: landed", "repository", rep.GetName(), "submission", a.Submission, "attempt", a.Attempt,
+			"batch", len(batch), "head", short(resp.GetHead()))
+		err := r.store.RecordLanding(ctx, a.Submission, a.Attempt, landed, from)
+		var conflict *store.ConflictError
+		if err != nil && !errors.As(err, &conflict) {
+			errs = append(errs, fmt.Errorf("submission %d: %w", a.Submission, err))
+		}
+		from, at = from+int64(counts[i]), at+counts[i]
+	}
+	return errors.Join(errs...)
 }
 
+// maxLandItems bounds the CLs one landing names, as the SCM does.
+const maxLandItems = 1000
+
+var (
+	landings = metrics.NewCounter("ok_automation_landings_total",
+		"Landings the landing queue made: one transaction in the SCM each, main moved once.")
+	landedSubmissions = metrics.NewCounter("ok_automation_landed_submissions_total",
+		"Submissions the landing queue landed, in all its landings.")
+)
+
 // collect discards the repository's candidates no active attempt holds, once they are older
-// than the grace period.
+// than the grace period, and marks the queue due when the youngest of the rest comes of age.
 func (r *Runner) collect(ctx context.Context, repo int64) error {
 	resp, err := r.scm.Landing.ListCandidates(ctx, &scmpb.ListCandidatesRequest{RepositoryId: repo})
 	if err != nil {
@@ -442,14 +487,24 @@ func (r *Runner) collect(ctx context.Context, repo int64) error {
 	if err != nil {
 		return err
 	}
+	var comesOfAge time.Time
 	for _, c := range resp.GetCandidates() {
-		if inUse[string(c.GetCommitId())] || time.Since(c.GetPreparedAt().AsTime()) < r.cfg.Grace {
+		if inUse[string(c.GetCommitId())] {
+			continue // collected after its attempt ends, which marks the queue
+		}
+		if old := c.GetPreparedAt().AsTime().Add(r.cfg.Grace); time.Now().Before(old) {
+			if comesOfAge.IsZero() || old.Before(comesOfAge) {
+				comesOfAge = old
+			}
 			continue
 		}
 		if _, err := r.scm.Landing.DiscardCandidate(ctx, &scmpb.DiscardCandidateRequest{RepositoryId: repo,
 			CommitId: c.GetCommitId()}); err != nil {
 			return err
 		}
+	}
+	if !comesOfAge.IsZero() {
+		return r.store.Work().MarkAt(ctx, store.QueueWork, repo, comesOfAge)
 	}
 	return nil
 }

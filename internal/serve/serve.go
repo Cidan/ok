@@ -46,6 +46,7 @@ func Run(ctx context.Context, root node.Node, opts ...Option) error {
 		MaxRecvMsgSize: o.maxRecv,
 		MaxSendMsgSize: o.maxSend,
 		MetricsAddr:    metricsAddr,
+		Profiling:      o.profiling,
 		TLS:            o.tls,
 		Middleware:     o.middleware,
 	})

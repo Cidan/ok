@@ -8,6 +8,8 @@ import (
 	"github.com/Cidan/ok/internal/directory"
 	"github.com/Cidan/ok/internal/directory/scim"
 	"github.com/Cidan/ok/internal/lock"
+	"github.com/Cidan/ok/internal/tenancy"
+	"github.com/Cidan/ok/internal/work"
 )
 
 // Backend is identity's database: what each database it runs on implements (postgres), and the
@@ -19,6 +21,8 @@ type Backend interface {
 	// Txn runs fn in one read-write transaction, again if the database aborts it to break a
 	// deadlock or a conflict; fn has no effects outside the transaction.
 	Txn(ctx context.Context, fn func(tx Ops) error) error
+	// Work is its keyed work's store: mail's sending.
+	Work() work.Store
 	// Lock runs fn holding the lock id in bucket, which one holder has at a time, waiting up to
 	// wait for it (0: not at all), with a context that ends if the lock is lost. It returns
 	// lock.ErrNotAcquired when it could not take it, and otherwise fn's error.
@@ -27,6 +31,11 @@ type Backend interface {
 	Ping(ctx context.Context) error
 	// SCIM is what an identity provider provisioned (scim.Store), kept beside the directory.
 	SCIM() scim.Store
+	// SCIMOf is an organization's SCIM, by its ID.
+	SCIMOf(org string) scim.Store
+	// RelayDirectoryEvents takes up to limit pending events no other relay holds, calls publish
+	// with them in order, and marks them published if it succeeds; it returns how many it took.
+	RelayDirectoryEvents(ctx context.Context, limit int, publish func([]DirectoryEventRow) error) (int, error)
 }
 
 // Ops are the database's operations. Outside a transaction each is its own; inside Txn they are
@@ -55,8 +64,8 @@ type Ops interface {
 	// LockNames, in a transaction, serializes it with every other that gives out names until it
 	// ends: names live in several tables, and two must never give one name at once.
 	LockNames(ctx context.Context) error
-	// NameHeld reports whether a principal, a synced group, or a tree set holds name, or it is
-	// retired.
+	// NameHeld reports whether a principal, a synced group, a tree set, or a team holds name, or
+	// it is retired.
 	NameHeld(ctx context.Context, name string) (bool, error)
 	// RetireName retires a name, once: no one will hold it again.
 	RetireName(ctx context.Context, name, reason string) error
@@ -132,13 +141,33 @@ type Ops interface {
 	DeleteSession(ctx context.Context, tokenHash []byte) error
 	// DeleteSessionsOf ends every session of a principal.
 	DeleteSessionsOf(ctx context.Context, principalID string) error
-	// DeleteExpired deletes the sessions expired or idled out and the ceremonies expired.
+	// DeleteExpired deletes the sessions expired or idled out, the ceremonies expired, and the
+	// approvals expired a day ago.
 	DeleteExpired(ctx context.Context) error
 	// InsertCeremony keeps a ceremony's state until expires.
 	InsertCeremony(ctx context.Context, id, kind string, data []byte, expires time.Time) error
 	// TakeCeremony deletes an unexpired ceremony of kind and returns its state; ErrNotFound when
 	// none.
 	TakeCeremony(ctx context.Context, id, kind string) ([]byte, error)
+	// PeekCeremony returns an unexpired ceremony's state, leaving it; ErrNotFound when there is none.
+	PeekCeremony(ctx context.Context, id, kind string) ([]byte, error)
+
+	// ─── Secrets' roots ───
+
+	// SecretsRoot is an organization's own root, by its ID; "" for none.
+	SecretsRoot(ctx context.Context, org string) (string, error)
+	// SetSecretsRoot names it, as a principal (by ID); "" forgets it.
+	SetSecretsRoot(ctx context.Context, org, root, by string) error
+
+	// ─── Approvals ───
+
+	// InsertApproval records an approval a person is asked for.
+	InsertApproval(ctx context.Context, a Approval) error
+	// Approval reads an approval; ErrNotFound when there is none.
+	Approval(ctx context.Context, id string) (Approval, error)
+	// DecideApproval records a principal's answer to their approval, while it waits and has not
+	// expired; false when it does not.
+	DecideApproval(ctx context.Context, id, principalID string, approved bool) (bool, error)
 
 	// ─── Passkeys ───
 
@@ -185,6 +214,314 @@ type Ops interface {
 	ReplaceTreeSets(ctx context.Context, sets []StoredSet) error
 	// PutTreeState records the applied tree's commit and sequence, now.
 	PutTreeState(ctx context.Context, commit string, sequence int64) error
+
+	// ─── Tenancy ───
+
+	// InsertOrganization records an organization's settings; its principal is already recorded.
+	InsertOrganization(ctx context.Context, o Organization) error
+	// Organization reads an organization with its principal; ErrNotFound for none.
+	Organization(ctx context.Context, id string) (Organization, error)
+	// LockOrganization is Organization, held.
+	LockOrganization(ctx context.Context, id string) (Organization, error)
+	// UpdateOrganization writes an organization's settings.
+	UpdateOrganization(ctx context.Context, o Organization) error
+	// PutMember makes a principal a member or owner of an organization, or changes which.
+	PutMember(ctx context.Context, org, principal string, role tenancy.Membership) error
+	// DeleteMember takes a principal out of an organization, reporting whether it was in it.
+	DeleteMember(ctx context.Context, org, principal string) (bool, error)
+	// Members are an organization's members, by principal ID.
+	Members(ctx context.Context, org string) ([]Member, error)
+	// MembershipsOf are a principal's memberships, by organization ID.
+	MembershipsOf(ctx context.Context, principal string) (map[string]tenancy.Membership, error)
+	// InsertTeam records a team.
+	InsertTeam(ctx context.Context, t Team) error
+	// Team reads a team by name; ErrNotFound for none. LockTeam holds it.
+	Team(ctx context.Context, name string) (Team, error)
+	LockTeam(ctx context.Context, name string) (Team, error)
+	// Teams are an organization's teams, by name; AllTeams every organization's.
+	Teams(ctx context.Context, org string) ([]Team, error)
+	AllTeams(ctx context.Context) ([]Team, error)
+	// SetTeamMembers replaces a team's members (IDs, sorted).
+	SetTeamMembers(ctx context.Context, name string, members []string) error
+	// DeleteTeam removes a team.
+	DeleteTeam(ctx context.Context, name string) error
+	// InsertRepository records a repository's entry and returns it as stored; ErrTaken when its
+	// owner has a repository of its name.
+	InsertRepository(ctx context.Context, r Repository) (Repository, error)
+	// Repository reads an entry by ID; ErrNotFound for none. LockRepository holds it.
+	Repository(ctx context.Context, id int64) (Repository, error)
+	LockRepository(ctx context.Context, id int64) (Repository, error)
+	// RepositoryByName reads the entry an owner's name names; ErrNotFound for none.
+	RepositoryByName(ctx context.Context, owner, name string) (Repository, error)
+	// RepositoryCellCounts are how many repositories each cell holds, deleted ones but not purged
+	// among them, by cell ("" for those made before there were cells).
+	RepositoryCellCounts(ctx context.Context) (map[string]int64, error)
+	// NetworkRepositories are a fork network's repositories, every state, by ID.
+	NetworkRepositories(ctx context.Context, network int64) ([]Repository, error)
+	// OwnerRegion is the region an owner (by ID) named for its new repositories; "" for none.
+	// SetOwnerRegion names it; "" forgets it.
+	OwnerRegion(ctx context.Context, owner string) (string, error)
+	SetOwnerRegion(ctx context.Context, owner, region string) error
+	// AccountQuotas are the quotas administrators set accounts, by account ID; an account with none
+	// is absent. SetAccountQuota sets one; ClearAccountQuota forgets it.
+	AccountQuotas(ctx context.Context, accounts []string) (map[string]Quota, error)
+	SetAccountQuota(ctx context.Context, account string, q Quota) error
+	ClearAccountQuota(ctx context.Context, account string) error
+	// AddNotification records a notification unless its recipient has it from its source already,
+	// and reports whether it did. NotificationsOf are up to limit of a person's latest (unread ones
+	// alone, if asked); UnreadNotifications counts their unread ones. MarkNotificationsRead marks
+	// some read, or all.
+	AddNotification(ctx context.Context, n Notification) (bool, error)
+	NotificationsOf(ctx context.Context, principal string, unread bool, limit int) ([]Notification, error)
+	UnreadNotifications(ctx context.Context, principal string) (int64, error)
+	MarkNotificationsRead(ctx context.Context, principal string, sources []string, all bool) error
+	// NotificationPrefs are the kinds a person has mailed (a bit each), and whether they set them;
+	// SetNotificationPrefs sets them.
+	NotificationPrefs(ctx context.Context, principal string) (uint64, bool, error)
+	SetNotificationPrefs(ctx context.Context, principal string, mailed uint64) error
+	// QueueMail queues a message; MailByID reads one; UpdateMail writes its state, attempts, next
+	// try, and last error. DueMails are up to limit waiting messages due by a time.
+	QueueMail(ctx context.Context, m Mail) error
+	MailByID(ctx context.Context, id int64) (Mail, bool, error)
+	UpdateMail(ctx context.Context, m Mail) error
+	DueMails(ctx context.Context, before time.Time, limit int) ([]int64, error)
+	// InboxVersion is the version a CL's inbox entries were set at (0: never); ReplaceInbox replaces
+	// them, at a version. InboxOf are up to limit of a person's entries — of a relation (0: both), of
+	// active CLs unless closed — those with attention first, then the latest changed.
+	InboxVersion(ctx context.Context, repo, number int64) (int64, error)
+	ReplaceInbox(ctx context.Context, repo, number, version int64, entries []InboxEntry) error
+	InboxOf(ctx context.Context, principal string, relation InboxRelation, closed bool, limit int) ([]InboxEntry, error)
+	// SearchRepositories are up to limit repositories, in every state, whose names hold name,
+	// lowercase, of owners whose handles start with owner ("" for any); SearchPrincipals up to
+	// limit active people and organizations whose handles or display names hold q, lowercase.
+	SearchRepositories(ctx context.Context, owner, name string, limit int) ([]Repository, error)
+	SearchPrincipals(ctx context.Context, q string, limit int) ([]Principal, error)
+	// ReportUsage records a cell's use this month by accounts, now. UsageElsewhere sums accounts'
+	// use in a month in the cells but one: their seconds, and their running runs as reported since
+	// a time.
+	ReportUsage(ctx context.Context, cell, month string, usage []Usage, at time.Time) error
+	UsageElsewhere(ctx context.Context, accounts []string, cell, month string, since time.Time) (map[string]Usage, error)
+
+	// PutMove records a network's move over the one it had; LockMove reads it, held in a
+	// transaction (ErrNotFound for none); Move reads it; Moves are the latest, newest first;
+	// DueMoves the unfinished whose next_at has come, by network.
+	PutMove(ctx context.Context, m Move) error
+	LockMove(ctx context.Context, network int64) (Move, error)
+	Move(ctx context.Context, network int64) (Move, error)
+	Moves(ctx context.Context, limit int) ([]Move, error)
+	DueMoves(ctx context.Context, now time.Time, limit int) ([]int64, error)
+	// UpdateRepository writes an entry's owner, name, visibility, proposing role, and state.
+	UpdateRepository(ctx context.Context, r Repository) error
+	// DeleteRepository removes an entry, its grants, redirects, inbox entries, and notifications with it.
+	DeleteRepository(ctx context.Context, id int64) error
+	// RepositoriesOf are an owner's entries, by name.
+	RepositoriesOf(ctx context.Context, owner string) ([]Repository, error)
+	// ForksOf locks and reads a repository's direct forks, in any state, oldest first.
+	ForksOf(ctx context.Context, parent int64) ([]Repository, error)
+	// PersonalForksIn are the active forks people own in networks.
+	PersonalForksIn(ctx context.Context, networks []int64) ([]Repository, error)
+	// RepositoriesIn are up to limit entries in a state since before then, oldest first.
+	RepositoriesIn(ctx context.Context, state RepositoryState, before time.Time, limit int) ([]Repository, error)
+	// Redirect is the repository a name an owner's repository had names; ErrNotFound for none.
+	Redirect(ctx context.Context, owner, name string) (int64, error)
+	// PutRedirect points a name an owner's repository had at it.
+	PutRedirect(ctx context.Context, owner, name string, repo int64) error
+	// DeleteRedirect removes a redirect, if there is one.
+	DeleteRedirect(ctx context.Context, owner, name string) error
+	// PutGrant grants, or changes, a subject's role on a repository.
+	PutGrant(ctx context.Context, g Grant) error
+	// DeleteGrant revokes a subject's grant on a repository, reporting whether it had one.
+	DeleteGrant(ctx context.Context, repo int64, subject string) (bool, error)
+	// DeleteGrantsTo revokes every grant to a subject, returning the repositories it had grants on.
+	DeleteGrantsTo(ctx context.Context, subject string) ([]int64, error)
+	// Grants are a repository's grants, by subject.
+	Grants(ctx context.Context, repo int64) ([]Grant, error)
+
+	// ─── Organizations' robots ───
+
+	// PutDeployAgent designates an organization's deploy agent, replacing any; DeleteDeployAgent
+	// designates none. DeployAgentOf and DeployAgentByRobot read a designation; ErrNotFound when
+	// there is none.
+	PutDeployAgent(ctx context.Context, a DeployAgent) error
+	DeleteDeployAgent(ctx context.Context, org string) error
+	DeployAgentOf(ctx context.Context, org string) (DeployAgent, error)
+	DeployAgentByRobot(ctx context.Context, robot string) (DeployAgent, error)
+	// OwnerCells are the cells holding an owner's repositories, made ones.
+	OwnerCells(ctx context.Context, owner string) ([]string, error)
+	// InsertOrganizationRobot records a robot as an organization's.
+	InsertOrganizationRobot(ctx context.Context, robot, org string) error
+	// RobotOrganization is the organization a robot is of; ErrNotFound for none.
+	RobotOrganization(ctx context.Context, robot string) (string, error)
+	// OrganizationRobots are an organization's robots, by name, deleted ones too.
+	OrganizationRobots(ctx context.Context, org string) ([]Principal, error)
+	// InsertIssuer has an organization trust an issuer; again is no change.
+	InsertIssuer(ctx context.Context, org, issuer string, at time.Time) error
+	// DeleteIssuer stops an organization trusting an issuer, and removes its robots' bindings to
+	// it, reporting whether it trusted it.
+	DeleteIssuer(ctx context.Context, org, issuer string) (bool, error)
+	// Issuers are the issuers an organization trusts, sorted.
+	Issuers(ctx context.Context, org string) ([]string, error)
+	// TrustsIssuer reports whether an organization trusts an issuer.
+	TrustsIssuer(ctx context.Context, org, issuer string) (bool, error)
+	// OrganizationBindings are an organization's robots' bindings, by robot ID.
+	OrganizationBindings(ctx context.Context, org string) (map[string][]Binding, error)
+	// DeleteOrganizationBinding removes a binding of an organization's robot, by its ID, reporting
+	// whether it had it.
+	DeleteOrganizationBinding(ctx context.Context, robot string, b Binding) (bool, error)
+
+	// ─── Enterprise organizations ───
+
+	// PutIdentityProvider sets an organization's identity provider; DeleteIdentityProvider removes
+	// it, reporting whether there was one.
+	PutIdentityProvider(ctx context.Context, p IdentityProvider) error
+	IdentityProviderOf(ctx context.Context, org string) (IdentityProvider, error)
+	DeleteIdentityProvider(ctx context.Context, org string) (bool, error)
+	// DueIdentityProviders are the organizations whose provider's sync is due at now.
+	DueIdentityProviders(ctx context.Context, now time.Time) ([]string, error)
+	// PutOrganizationSync records a sync that went: the mirror it followed, what waits, its notes.
+	// PutOrganizationSyncFailure one that failed.
+	PutOrganizationSync(ctx context.Context, org string, mirror, waiting, notes []byte, at time.Time) error
+	PutOrganizationSyncFailure(ctx context.Context, org, cause string, at time.Time) error
+	// OrganizationPeople are the people an organization's provider provisioned, by their external
+	// ID; InsertOrganizationPerson links one; PersonOrganization reads a principal's organization and
+	// external ID, ErrNotFound for one no organization provisioned.
+	OrganizationPeople(ctx context.Context, org string) (map[string]Principal, error)
+	InsertOrganizationPerson(ctx context.Context, org, externalID, principal string) error
+	PersonOrganization(ctx context.Context, principal string) (org, externalID string, err error)
+	// UpdatePrincipal changes a principal's name, status, email, and display name.
+	UpdatePrincipal(ctx context.Context, id, name string, status directory.Status, email, displayName string) error
+	// UpdateSyncedTeam renames a synced team and sets its members, its grants following the name;
+	// DeleteSyncedTeam removes one and its grants. Each answers the team's name before.
+	UpdateSyncedTeam(ctx context.Context, org, externalID, name string, members []string) (string, error)
+	DeleteSyncedTeam(ctx context.Context, org, externalID string) (string, error)
+	// PutSCIMToken sets an organization's SCIM bearer token's hash; SCIMTokenOrganization reads the
+	// organization a hash is of.
+	PutSCIMToken(ctx context.Context, org string, hash []byte, at time.Time) error
+	SCIMTokenOrganization(ctx context.Context, hash []byte) (string, error)
+
+	// ─── Moving in ───
+
+	// TenancyState reads the mode the directory serves, and the organization moved in; mode is ""
+	// for a directory that has served none yet.
+	TenancyState(ctx context.Context) (mode, movedIn string, err error)
+	// PutTenancyState records them.
+	PutTenancyState(ctx context.Context, mode, movedIn string, at time.Time) error
+	// InsertAlias makes an old name an alias of a new one; Alias reads one, ErrNotFound for none;
+	// Aliases reads them all, by old name.
+	InsertAlias(ctx context.Context, old, new string) error
+	Alias(ctx context.Context, old string) (string, error)
+	Aliases(ctx context.Context) (map[string]string, error)
+	// RenameGrantSubject moves every grant to a subject onto another, answering the repositories
+	// whose grants changed.
+	RenameGrantSubject(ctx context.Context, old, new string) ([]int64, error)
+	// DeleteSyncedGroup forgets a synced group by name.
+	DeleteSyncedGroup(ctx context.Context, name string) error
+	// ClearSyncState forgets the installation's sync's mirror. The names administrators set over the
+	// system of record's stay: an organization moved in syncs by them.
+	ClearSyncState(ctx context.Context) error
+	// MoveSCIM makes what the installation's SCIM provisioned an organization's.
+	MoveSCIM(ctx context.Context, org string) error
+
+	// ─── Deletions ───
+
+	// InsertDeletion records a principal's deletion; ErrTaken when one is recorded already.
+	InsertDeletion(ctx context.Context, d Deletion) error
+	// DeletionOf reads a principal's deletion; ErrNotFound for none.
+	DeletionOf(ctx context.Context, principal string) (Deletion, error)
+	// RemoveDeletion forgets a principal's deletion, reporting whether there was one.
+	RemoveDeletion(ctx context.Context, principal string) (bool, error)
+	// DueDeletions locks and reads up to limit deletions requested before a time, skipping those
+	// another transaction holds.
+	DueDeletions(ctx context.Context, before time.Time, limit int) ([]Deletion, error)
+	// RemoveFromTeams takes a principal out of every team.
+	RemoveFromTeams(ctx context.Context, principal string) error
+	// DeleteMembersOf drops every membership of an organization; DeleteMembershipsOf every one of
+	// a principal.
+	DeleteMembersOf(ctx context.Context, org string) error
+	DeleteMembershipsOf(ctx context.Context, principal string) error
+	// RevokeTokensOf revokes every live token of a principal.
+	RevokeTokensOf(ctx context.Context, principal string, at time.Time) error
+	// DeleteSignInsOf drops a person's password, provider links, and passkeys.
+	DeleteSignInsOf(ctx context.Context, principal string) error
+
+	// ─── Accounts ───
+
+	// PutPassword sets a principal's password hash.
+	PutPassword(ctx context.Context, principal, hash string, at time.Time) error
+	// Password reads a principal's password hash; ErrNotFound for none.
+	Password(ctx context.Context, principal string) (string, error)
+	// InsertEmailToken records an emailed link's token by its hash.
+	InsertEmailToken(ctx context.Context, hash []byte, t EmailToken) error
+	// TakeEmailToken reads and removes a live token of a purpose; ErrNotFound for none.
+	TakeEmailToken(ctx context.Context, hash []byte, purpose string, now time.Time) (EmailToken, error)
+	// InsertLoginLink links a principal to a provider's subject; ErrTaken when it names another.
+	InsertLoginLink(ctx context.Context, provider, subject, principal string, at time.Time) error
+	// LinkedPrincipal reads the principal a provider's subject is linked to; ErrNotFound for none.
+	LinkedPrincipal(ctx context.Context, provider, subject string) (Principal, error)
+	// LoginLinks are a principal's links, by provider.
+	LoginLinks(ctx context.Context, principal string) ([]LoginLink, error)
+	// DeleteLoginLink removes a principal's link to a provider, reporting whether it had one.
+	DeleteLoginLink(ctx context.Context, principal, provider string) (bool, error)
+	// SignInFailures reads a key's failures since a time; NoteSignInFailure counts one more, in a
+	// window starting at now if the last is older than since; ClearSignInFailures forgets them.
+	SignInFailures(ctx context.Context, key string, since time.Time) (int, error)
+	NoteSignInFailure(ctx context.Context, key string, now, since time.Time) error
+	ClearSignInFailures(ctx context.Context, key string) error
+	// DeleteExpiredEmailTokens removes links whose time is up.
+	DeleteExpiredEmailTokens(ctx context.Context, now time.Time) error
+
+	// ─── Apps ───
+
+	// InsertApp records an app.
+	InsertApp(ctx context.Context, a App) error
+	// App reads an app by ID; ErrNotFound for none.
+	App(ctx context.Context, id string) (App, error)
+	// AppOfRobot reads the app a robot is; ErrNotFound for none.
+	AppOfRobot(ctx context.Context, robot string) (App, error)
+	// Apps are an organization's apps.
+	Apps(ctx context.Context, org string) ([]App, error)
+	// SetAppKey replaces an app's public key.
+	SetAppKey(ctx context.Context, id string, key []byte) error
+	// DeleteApp removes an app, its installations, and their tokens.
+	DeleteApp(ctx context.Context, id string) error
+	// InsertInstallation records an installation; ErrTaken when the app is installed there already.
+	InsertInstallation(ctx context.Context, i Installation) error
+	// UpdateInstallation changes an installation's role and repositories.
+	UpdateInstallation(ctx context.Context, i Installation) error
+	// Installation reads an installation by ID; ErrNotFound for none.
+	Installation(ctx context.Context, id string) (Installation, error)
+	// InstallationOf reads an app's installation in an organization; ErrNotFound for none.
+	InstallationOf(ctx context.Context, app, org string) (Installation, error)
+	// Installations are an organization's installations; InstallationsOfApp an app's.
+	Installations(ctx context.Context, org string) ([]Installation, error)
+	InstallationsOfApp(ctx context.Context, app string) ([]Installation, error)
+	// DeleteInstallation removes an installation and its tokens, reporting whether there was one.
+	DeleteInstallation(ctx context.Context, id string) (bool, error)
+
+	// ─── Tokens ───
+
+	// InsertToken records a token by its secret's hash.
+	InsertToken(ctx context.Context, t Token, hash []byte) error
+	// TokenByHash reads the token a secret's hash names, standing or not; ErrNotFound for none.
+	TokenByHash(ctx context.Context, hash []byte) (Token, error)
+	// TouchToken notes a token's use.
+	TouchToken(ctx context.Context, id string, at time.Time) error
+	// Tokens are a principal's tokens, newest first.
+	Tokens(ctx context.Context, principal string) ([]Token, error)
+	// RevokeToken revokes a principal's standing token, reporting whether there was one.
+	RevokeToken(ctx context.Context, principal, id string, at time.Time) (bool, error)
+
+	// ─── The directory's log ───
+
+	// NextDirectorySeq takes the next place in a repository's log.
+	NextDirectorySeq(ctx context.Context, repo int64) (int64, error)
+	// InsertDirectoryEvent records an event at its place, pending its publishing.
+	InsertDirectoryEvent(ctx context.Context, e DirectoryEventRow, at time.Time) error
+	// DirectoryEvents are up to limit of a repository's events after a place, in order.
+	DirectoryEvents(ctx context.Context, repo, after int64, limit int) ([]DirectoryEventRow, error)
+	// DirectoryHeads are how far up to limit repositories' logs reach, those after one, by
+	// repository.
+	DirectoryHeads(ctx context.Context, after int64, limit int) ([]DirectoryHead, error)
 }
 
 // StoredSet is a set of the applied tree as the database keeps it: its full name, kind ("group"

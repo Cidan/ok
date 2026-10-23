@@ -3,18 +3,18 @@ package review
 import (
 	"context"
 	"log/slog"
-	"slices"
 
 	scmpb "github.com/Cidan/ok/proto/ok/scm/v1"
 
+	"github.com/Cidan/ok/internal/authz"
 	"github.com/Cidan/ok/internal/control/db"
 )
 
-// MayRerun refuses a person who may not rerun a check of patchset of cl: its author and the
-// repository's admins rerun its checks, and only the current patchset's of a CL under review —
-// a post run is its submission's, rerun by submitting again.
+// MayRerun refuses a person who may not rerun a check of patchset of cl: whoever may land on the
+// repository (write) reruns its checks, and only the current patchset's of a CL under review — a
+// post run is its submission's, rerun by submitting again.
 func (s *Service) MayRerun(ctx context.Context, repo *scmpb.Repository, cl db.ChangeList, principal string, patchset int32) error {
-	if err := s.requireManage(ctx, repo, cl, principal, "rerun the checks of"); err != nil {
+	if err := s.requireAction(ctx, repo, principal, authz.Land); err != nil {
 		return err
 	}
 	if !cl.Status.Active() {
@@ -26,10 +26,22 @@ func (s *Service) MayRerun(ctx context.Context, repo *scmpb.Repository, cl db.Ch
 	return nil
 }
 
-// MayCancelRuns refuses a person who may not cancel cl's checks: its author and the repository's
-// admins.
+// MayRunPre refuses a person who may not run cl's pre by hand: whoever may land on the repository
+// (write), on a draft or a CL in review.
+func (s *Service) MayRunPre(ctx context.Context, repo *scmpb.Repository, cl db.ChangeList, principal string) error {
+	if err := s.requireAction(ctx, repo, principal, authz.Land); err != nil {
+		return err
+	}
+	if !cl.Status.Active() {
+		return refuse("CL %d is %s: pre runs on a draft or a changelist in review", cl.Number, statusWord(cl.Status))
+	}
+	return nil
+}
+
+// MayCancelRuns refuses a person who may not cancel cl's checks: whoever may land on the
+// repository (write).
 func (s *Service) MayCancelRuns(ctx context.Context, repo *scmpb.Repository, cl db.ChangeList, principal string) error {
-	return s.requireManage(ctx, repo, cl, principal, "cancel the checks of")
+	return s.requireAction(ctx, repo, principal, authz.Land)
 }
 
 // Deployment actions.
@@ -39,9 +51,10 @@ const (
 	DeploymentAllow = "allow"
 )
 
-// MayActOnDeployment refuses a person who may not take action on a deployment: a repository
-// admin retries and halts any, and the author of a CL it deploys (author, covered by it) those;
-// allowing a migration's hazards is an admin's alone.
+// MayActOnDeployment refuses a person who may not take action on a deployment: a repository's
+// admins and maintainers retry and halt any, and the author of a CL it deploys (author, covered
+// by it) who may land on the repository (write) those; allowing a migration's hazards is an
+// admin's alone.
 func (s *Service) MayActOnDeployment(ctx context.Context, repo *scmpb.Repository, principal, action string, author bool) error {
 	if s.IsAdmin(ctx, repo, principal) {
 		return nil
@@ -49,30 +62,19 @@ func (s *Service) MayActOnDeployment(ctx context.Context, repo *scmpb.Repository
 	if action == DeploymentAllow {
 		return refuse("Only a repository admin can allow this deployment")
 	}
-	if !author {
-		return refuse("Only a repository admin or the author of a CL it deploys can %s this deployment", action)
+	if s.May(ctx, repo, principal, authz.Maintain) || author && s.May(ctx, repo, principal, authz.Land) {
+		return nil
 	}
-	return nil
+	return refuse("Only a repository admin or maintainer, or the author of a CL it deploys, can %s this deployment", action)
 }
 
-// Admins are the repository's admins: its creator, and ok's administrators, sorted. When ok
-// identity cannot say who administers ok, the creator alone.
+// Admins are the repository's admins, by stable ID, sorted by name; none when ok identity cannot
+// say.
 func (s *Service) Admins(ctx context.Context, repo *scmpb.Repository) []string {
-	out := []string{}
-	if c := repo.GetCreatedBy(); c != "" {
-		out = append(out, c)
+	admins, err := s.access.Admins(ctx, repo.GetId())
+	if err != nil {
+		slog.Warn("review: asking ok identity who administers a repository", "repository", repo.GetId(), "err", err)
+		return nil
 	}
-	if s.people != nil {
-		admins, err := s.people.Admins(ctx)
-		if err != nil {
-			slog.Warn("review: listing ok's administrators", "err", err)
-		}
-		for _, p := range admins {
-			if !slices.Contains(out, p) {
-				out = append(out, p)
-			}
-		}
-	}
-	slices.Sort(out)
-	return out
+	return admins
 }

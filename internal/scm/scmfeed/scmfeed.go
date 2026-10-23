@@ -10,6 +10,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"github.com/Cidan/ok/internal/bus"
+	"github.com/Cidan/ok/internal/bus/follow"
 	scmpb "github.com/Cidan/ok/proto/ok/scm/v1"
 )
 
@@ -35,24 +36,26 @@ func (l Log) Read(ctx context.Context, repo, after int64) ([]bus.Event, error) {
 	return out, nil
 }
 
-// Heads calls fn with how far each repository's log reaches — now, or as of a place in the SCM's
-// feed — by repository.
-func (l Log) Heads(ctx context.Context, asOf int64, fn func(repo, seq int64) error) error {
+// Heads calls fn with how far each repository's log reaches, a page of repositories at a time, by
+// repository.
+func (l Log) Heads(ctx context.Context, fn func([]follow.Head) error) error {
 	var after int64
 	for {
-		resp, err := l.Events.Heads(ctx, &scmpb.HeadsRequest{AfterRepositoryId: after, AsOfSeq: asOf})
+		resp, err := l.Events.Heads(ctx, &scmpb.HeadsRequest{AfterRepositoryId: after})
 		if err != nil {
 			return err
-		}
-		for _, h := range resp.GetHeads() {
-			if err := fn(h.GetRepositoryId(), h.GetRepositorySeq()); err != nil {
-				return err
-			}
-			after = h.GetRepositoryId()
 		}
 		if len(resp.GetHeads()) == 0 {
 			return nil
 		}
+		page := make([]follow.Head, len(resp.GetHeads()))
+		for i, h := range resp.GetHeads() {
+			page[i] = follow.Head{Key: h.GetRepositoryId(), Seq: h.GetRepositorySeq()}
+		}
+		if err := fn(page); err != nil {
+			return err
+		}
+		after = page[len(page)-1].Key
 	}
 }
 

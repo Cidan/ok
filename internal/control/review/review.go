@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
 	"path"
 	"slices"
 	"strings"
@@ -13,6 +12,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/Cidan/ok/internal/authz"
 	"github.com/Cidan/ok/internal/control/db"
 	"github.com/Cidan/ok/internal/control/people"
 	"github.com/Cidan/ok/internal/control/scm"
@@ -27,6 +27,8 @@ type Service struct {
 	scm    *scm.Client
 	auto   Automation
 	people *people.Directory
+	// access decides what each person may do to a repository.
+	access Access
 	// identityDir is ok identity, which a change to the groups-and-ACLs tree must be one it applies.
 	identityDir IdentityDirectory
 	// treeRepository names the repository whose groups-and-ACLs tree is ok's.
@@ -40,8 +42,8 @@ type Service struct {
 // gates submit, and its landing queue lands what is submitted. dir is ok identity's directory:
 // its people, its sets, and who administers ok — every repository, besides each one's creator.
 // treeRepository names the repository whose groups-and-ACLs tree is ok's, if any.
-func New(d db.Store, c *scm.Client, auto Automation, dir *people.Directory, treeRepository string) *Service {
-	s := &Service{db: d, scm: c, auto: auto, people: dir, treeRepository: treeRepository, feedWait: 10 * time.Second}
+func New(d db.Store, c *scm.Client, auto Automation, dir *people.Directory, access Access, treeRepository string) *Service {
+	s := &Service{db: d, scm: c, auto: auto, people: dir, access: access, treeRepository: treeRepository, feedWait: 10 * time.Second}
 	if dir != nil {
 		s.identityDir = dir
 	}
@@ -66,32 +68,6 @@ func IsUserError(err error) bool {
 
 // ErrNotFound is a CL or comment that does not exist.
 var ErrNotFound = errors.New("not found")
-
-// IsAdmin reports whether principal administers the repository: its creator, or one of ok's
-// administrators. When ok identity cannot say, they are not one: the answer gates actions.
-func (s *Service) IsAdmin(ctx context.Context, repo *scmpb.Repository, principal string) bool {
-	if principal == "" {
-		return false
-	}
-	if principal == repo.GetCreatedBy() {
-		return true
-	}
-	if s.people == nil {
-		return false
-	}
-	ok, err := s.people.IsAdmin(ctx, principal)
-	if err != nil {
-		slog.Warn("review: asking ok identity whether someone administers ok", "principal", principal, "err", err)
-		return false
-	}
-	return ok
-}
-
-// CanManage reports whether principal may drive a CL's lifecycle — Request Review,
-// Return to Draft, Submit, Abandon, Restore: its author, or a repository admin.
-func (s *Service) CanManage(ctx context.Context, repo *scmpb.Repository, cl db.ChangeList, principal string) bool {
-	return principal != "" && (principal == cl.Author || s.IsAdmin(ctx, repo, principal))
-}
 
 // ChangeList reads a CL's projection, and the SCM's CL with its patchsets.
 func (s *Service) ChangeList(ctx context.Context, repo, number int64) (db.ChangeList, *scmpb.ChangeList, error) {
@@ -131,6 +107,22 @@ type Evaluation struct {
 
 // maxOwnersFileSize caps how much of an OWNERS-config file is read.
 const maxOwnersFileSize = 256 << 10
+
+// unreachable reports an error of reaching a service, not of what it answered: a call broken off,
+// out of time, or refused for now.
+func unreachable(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	switch status.Code(err) {
+	case codes.Unavailable, codes.DeadlineExceeded, codes.Aborted, codes.ResourceExhausted, codes.Canceled:
+		return true
+	}
+	return false
+}
 
 // ownersSource reads OWNERS-config files at a commit through Browse: the OWNERS along the
 // governed files' directories in one call (ReadFilesAt, prefetch), and anything else the
@@ -299,11 +291,16 @@ func (s *Service) Evaluate(ctx context.Context, cl db.ChangeList, c *scmpb.Chang
 	} else {
 		sets, ownersErr = owners.NewResolver(src).Resolve(governed)
 	}
-	var acls aclMembers
+	var ow owned
 	if ownersErr == nil {
-		acls, ownersErr = s.aclMembers(ctx, sets)
+		ow, ownersErr = s.owned(ctx, sets)
 	}
-	st := evaluate(sets, ownersErr, grants, cl.Author, unresolved, rollback, acls)
+	if unreachable(ownersErr) {
+		// The SCM did not answer: the CL is not judged on OWNERS it could not read — invalid ones
+		// fail Approval closed — and its caller tries again.
+		return nil, ownersErr
+	}
+	st := evaluate(sets, ownersErr, grants, cl.Author, unresolved, rollback, ow)
 	st.Identity, st.IdentityErr = idReqs, idErr
 	return &Evaluation{Status: st, Head: head, Files: files, Governed: governed}, nil
 }
@@ -400,7 +397,7 @@ func (s *Service) WaitForFeed(ctx context.Context, repo, seq int64) error {
 // transition applies a lifecycle transition through the SCM on principal's behalf.
 func (s *Service) transition(ctx context.Context, cl db.ChangeList, kind scmpb.TransitionRequest_Kind, principal, reason string) error {
 	resp, err := s.scm.Review.Transition(ctx, &scmpb.TransitionRequest{
-		RepositoryId: cl.Repo, Number: cl.Number, Kind: kind, Actor: principal, Reason: reason,
+		RepositoryId: cl.Repo, Number: cl.Number, Kind: kind, ActorId: principal, Reason: reason,
 	})
 	if status.Code(err) == codes.FailedPrecondition {
 		return refuse("%s", upperFirst(status.Convert(err).Message()))
@@ -416,7 +413,7 @@ func (s *Service) transition(ctx context.Context, cl db.ChangeList, kind scmpb.T
 
 func (s *Service) requireManage(ctx context.Context, repo *scmpb.Repository, cl db.ChangeList, principal, action string) error {
 	if !s.CanManage(ctx, repo, cl, principal) {
-		return refuse("Only the author or a repository admin can %s this changelist", action)
+		return refuse("Only the author, or someone who may triage this repository, can %s this changelist", action)
 	}
 	return nil
 }
@@ -430,14 +427,14 @@ func (s *Service) checkReviewers(ctx context.Context, cl db.ChangeList, principa
 			continue
 		}
 		if p == cl.Author {
-			return nil, refuse("The author of CL %d, %s, can't review it", cl.Number, people.Handle(p))
+			return nil, refuse("The author of CL %d, %s, can't review it", cl.Number, people.Handle(ctx, p))
 		}
 		ok, err := s.people.IsActiveHuman(ctx, p)
 		if err != nil {
 			return nil, err
 		}
 		if !ok {
-			return nil, refuse("%s is not someone who can review changes", people.Handle(p))
+			return nil, refuse("%s is not someone who can review changes", people.Handle(ctx, p))
 		}
 		out = append(out, p)
 	}
@@ -530,8 +527,11 @@ func (s *Service) Restore(ctx context.Context, repo *scmpb.Repository, cl db.Cha
 // authors of the CLs it rolls back. It returns the rollback CL's number once the feed has
 // applied its creation.
 func (s *Service) Rollback(ctx context.Context, cl db.ChangeList, principal, reason string) (int64, error) {
-	if !people.IsHuman(principal) {
+	if !people.IsHumanID(ctx, principal) {
 		return 0, refuse("Only a person can roll back a change")
+	}
+	if err := s.requireAction(ctx, repoOf(cl), principal, authz.Propose); err != nil {
+		return 0, err
 	}
 	if cl.Status != db.StatusSubmitted {
 		return 0, refuse("CL %d is %s: only a submitted change is rolled back", cl.Number, statusWord(cl.Status))
@@ -551,7 +551,7 @@ func (s *Service) Rollback(ctx context.Context, cl db.ChangeList, principal, rea
 		}
 	}
 	resp, err := s.scm.Review.Rollback(ctx, &scmpb.RollbackRequest{
-		RepositoryId: cl.Repo, Number: cl.Number, Actor: principal, Reason: reason, Reviewers: reviewers,
+		RepositoryId: cl.Repo, Number: cl.Number, ActorId: principal, Reason: reason, ReviewerIds: reviewers,
 	})
 	if status.Code(err) == codes.FailedPrecondition {
 		return 0, refuse("%s", upperFirst(strings.TrimPrefix(status.Convert(err).Message(), "rollback refused: ")))
@@ -607,7 +607,7 @@ func statusWord(s db.Status) string {
 }
 
 // AddReviewers assigns more reviewers to an active CL, posting the optional message. The
-// author, a repository admin, and the CL's reviewers (who may hand a review on) can add
+// author, a triager, and the CL's reviewers who may propose (who may hand a review on) can add
 // reviewers.
 func (s *Service) AddReviewers(ctx context.Context, repo *scmpb.Repository, cl db.ChangeList, principal string, reviewers []string, message string) error {
 	if !s.CanManage(ctx, repo, cl, principal) {
@@ -615,8 +615,8 @@ func (s *Service) AddReviewers(ctx context.Context, repo *scmpb.Repository, cl d
 		if err != nil {
 			return err
 		}
-		if !ok {
-			return refuse("Only the author, a repository admin, or a reviewer can add reviewers to this changelist")
+		if !ok || !s.May(ctx, repo, principal, authz.Propose) {
+			return refuse("Only the author, a reviewer, or someone who may triage this repository can add reviewers to this changelist")
 		}
 	}
 	reviewers, err := s.checkReviewers(ctx, cl, reviewers)
@@ -674,6 +674,9 @@ func (s *Service) RemoveReviewer(ctx context.Context, repo *scmpb.Repository, cl
 // on an active CL; a comment may be left on any. Granting makes the granter a reviewer
 // (never the author).
 func (s *Service) Reply(ctx context.Context, cl db.ChangeList, principal string, grants map[db.Label]bool, comment string) error {
+	if err := s.requireAction(ctx, repoOf(cl), principal, authz.Propose); err != nil {
+		return err
+	}
 	if err := s.db.Txn(ctx, func(tx db.Ops) error {
 		cur := cl
 		if len(grants) > 0 {
@@ -718,6 +721,9 @@ func (s *Service) Reply(ctx context.Context, cl db.ChangeList, principal string,
 // thread opens unresolved, withdrawing the CL's approval until it is resolved; a reply
 // inherits its thread's anchor.
 func (s *Service) Comment(ctx context.Context, cl db.ChangeList, principal string, patchset int32, file string, line int32, side db.Side, parent int64, body string) error {
+	if err := s.requireAction(ctx, repoOf(cl), principal, authz.Propose); err != nil {
+		return err
+	}
 	body = strings.TrimSpace(body)
 	if body == "" {
 		return refuse("A comment needs some text")
@@ -820,18 +826,53 @@ func (s *Service) PortThreads(ctx context.Context, c *scmpb.ChangeList, viewed i
 // CreateRepository creates a repository on the SCM for principal, who becomes its
 // creator.
 func (s *Service) CreateRepository(ctx context.Context, name, principal string) (*scmpb.Repository, error) {
-	r, err := s.scm.Review.CreateRepository(ctx, &scmpb.CreateRepositoryRequest{Name: name, Actor: principal})
+	r, err := s.scm.Review.CreateRepository(ctx, &scmpb.CreateRepositoryRequest{Name: name, ActorId: principal})
 	switch status.Code(err) {
 	case codes.OK:
 		// The feed records it too; recording it now lists it before the feed catches up.
-		return r, s.db.CreateRepository(ctx, db.Repository{ID: r.GetId(), Name: r.GetName(), CreatedBy: r.GetCreatedBy(), CreatedAt: r.GetCreatedAt().AsTime()})
+		return r, s.db.CreateRepository(ctx, db.Repository{ID: r.GetId(), Name: r.GetName(), CreatedBy: r.GetCreatedById(), CreatedAt: r.GetCreatedAt().AsTime()})
 	case codes.AlreadyExists:
 		return nil, refuse("A repository named %s already exists", name)
-	case codes.InvalidArgument:
+	case codes.InvalidArgument, codes.PermissionDenied:
 		return nil, refuse("%s", upperFirst(status.Convert(err).Message()))
 	}
 	return nil, err
 }
+
+// ForkRepository forks the repository upstream names, as name, for the person principal names:
+// the SCM, and the directory, decide whether they may fork it and make repositories of the fork's
+// owner.
+func (s *Service) ForkRepository(ctx context.Context, upstream, name, principal string) (*scmpb.Repository, error) {
+	r, err := s.scm.Review.ForkRepository(ctx, &scmpb.ForkRepositoryRequest{Parent: upstream, Name: name, ActorId: principal})
+	switch status.Code(err) {
+	case codes.OK:
+		return r, s.db.CreateRepository(ctx, db.Repository{ID: r.GetId(), Name: r.GetName(), CreatedBy: r.GetCreatedById(), CreatedAt: r.GetCreatedAt().AsTime()})
+	case codes.AlreadyExists:
+		return nil, refuse("A repository named %s already exists", name)
+	case codes.InvalidArgument, codes.PermissionDenied, codes.FailedPrecondition, codes.NotFound:
+		return nil, refuse("%s", upperFirst(status.Convert(err).Message()))
+	}
+	return nil, err
+}
+
+// SyncFork brings a fork its upstream's newer work, for a person who may write to it; true when
+// its main moved to the upstream's.
+func (s *Service) SyncFork(ctx context.Context, repo *scmpb.Repository, principal string) (bool, error) {
+	if d := s.Decide(ctx, repo, principal, authz.Land); !d.Allowed {
+		return false, refuse("%s", upperFirst(d.Why))
+	}
+	r, err := s.scm.Review.SyncFork(ctx, &scmpb.SyncForkRequest{RepositoryId: repo.GetId(), ActorId: principal})
+	switch status.Code(err) {
+	case codes.OK:
+		return r.GetMoved(), nil
+	case codes.FailedPrecondition, codes.NotFound, codes.PermissionDenied:
+		return false, refuse("%s", upperFirst(status.Convert(err).Message()))
+	}
+	return false, err
+}
+
+// repoOf is the repository a CL is of, as Authorize names it.
+func repoOf(cl db.ChangeList) *scmpb.Repository { return &scmpb.Repository{Id: cl.Repo} }
 
 func upperFirst(s string) string {
 	if s == "" {
@@ -840,28 +881,43 @@ func upperFirst(s string) string {
 	return strings.ToUpper(s[:1]) + s[1:]
 }
 
-// aclMembers resolves the members of every ACL the owner sets name, with ok identity. An ACL ok identity
-// cannot answer for fails approval closed.
-func (s *Service) aclMembers(ctx context.Context, sets []*owners.Set) (aclMembers, error) {
-	out := aclMembers{}
+// owned resolves who the owner sets name, with ok identity: the members of every ACL they name,
+// and the person each user: line's handle names now. An ACL, or a handle, ok identity cannot
+// answer for fails approval closed; a handle no person has names no one.
+func (s *Service) owned(ctx context.Context, sets []*owners.Set) (owned, error) {
+	out := owned{acls: map[string]map[string]bool{}, users: map[string]string{}}
+	looked := map[string]bool{}
 	for _, set := range sets {
 		for _, o := range set.Owners {
-			if o.Kind != owners.ACL {
-				continue
+			switch o.Kind {
+			case owners.User:
+				if looked[o.Name] {
+					continue
+				}
+				looked[o.Name] = true
+				id, err := people.ID(ctx, o.Name)
+				switch {
+				case errors.Is(err, people.ErrUnknown):
+				case err != nil:
+					return owned{}, fmt.Errorf("the person %s: %w", o.Name, err)
+				default:
+					out.users[o.Name] = id
+				}
+			case owners.ACL:
+				name := ACLName(o)
+				if _, done := out.acls[name]; done {
+					continue
+				}
+				members, err := s.people.ACLMembers(ctx, name)
+				if err != nil {
+					return owned{}, fmt.Errorf("the members of %s: %w", name, err)
+				}
+				in := map[string]bool{}
+				for _, m := range members {
+					in[m] = true
+				}
+				out.acls[name] = in
 			}
-			name := ACLName(o)
-			if _, done := out[name]; done {
-				continue
-			}
-			members, err := s.people.ACLMembers(ctx, name)
-			if err != nil {
-				return nil, fmt.Errorf("the members of %s: %w", name, err)
-			}
-			in := map[string]bool{}
-			for _, m := range members {
-				in[m] = true
-			}
-			out[name] = in
 		}
 	}
 	return out, nil

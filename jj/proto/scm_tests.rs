@@ -37,6 +37,7 @@ fn publish_request_round_trips() {
             }],
             files: vec![],
             workspace: "laptop-ada".to_owned(),
+            guards_secrets: true,
         })),
     };
     let bytes = req.encode_to_vec();

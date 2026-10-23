@@ -2,6 +2,8 @@ package pgdb_test
 
 import (
 	"context"
+	"fmt"
+	"sync"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
@@ -99,5 +101,27 @@ func TestBeside(t *testing.T) {
 	}
 	if _, err := pgdb.Beside(ctx, pool, "Bad; DROP"); err == nil {
 		t.Error("a schema name that is no identifier was accepted")
+	}
+}
+
+// Roles starting at once on a new database each make the schema they share, or find it made:
+// none fails because another made it first.
+func TestOpenAtOnce(t *testing.T) {
+	ctx := context.Background()
+	url := testdb.Postgres(t)
+	for round := range 5 {
+		schema := fmt.Sprintf("together_%d", round)
+		var wg sync.WaitGroup
+		for range 8 {
+			wg.Go(func() {
+				p, err := pgdb.Open(ctx, url, schema, 1)
+				if err != nil {
+					t.Errorf("opening %s beside others: %v", schema, err)
+					return
+				}
+				p.Close()
+			})
+		}
+		wg.Wait()
 	}
 }

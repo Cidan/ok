@@ -8,6 +8,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/Cidan/ok/internal/control/db"
+	"github.com/Cidan/ok/internal/data"
 )
 
 func (x queries) Reviewers(ctx context.Context, repo, number int64) ([]db.Reviewer, error) {
@@ -128,9 +129,16 @@ func (x queries) CreateComment(ctx context.Context, repo int64, c db.Comment) (i
 		side = &s
 	}
 	var id int64
-	err := x.q.QueryRow(ctx, `INSERT INTO comment (repository_id, number, patchset, author, parent_id, file_path, line, side, body)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
-		repo, c.Number, c.Patchset, c.Author, parent, file, line, side, c.Body).Scan(&id)
+	err := x.q.QueryRow(ctx, `WITH c AS (
+			INSERT INTO comment (id, repository_id, number, patchset, author, parent_id, file_path, line, side, body, created_at, updated_at)
+			VALUES ($10, $1, $2, $3, $4, $5, $6, $7, $8, $9, clock_timestamp(), clock_timestamp()) RETURNING id
+		), ob AS (
+			INSERT INTO outbox (repository_id, entry_id, number, queued_at, comment_id) SELECT $1, $11, $2, clock_timestamp(), id FROM c
+		), w AS (
+			INSERT INTO work (kind, key, dirty) VALUES ($12, $1, true) ON CONFLICT (kind, key) DO UPDATE SET dirty = true, due_at = NULL
+		)
+		SELECT id FROM c`,
+		repo, c.Number, c.Patchset, c.Author, parent, file, line, side, c.Body, data.NewID(), data.NewID(), db.OutboxWork).Scan(&id)
 	return id, err
 }
 
@@ -157,15 +165,24 @@ func (x queries) RecordEvent(ctx context.Context, repo, number int64, e db.Event
 	if at.IsZero() {
 		at = time.Now()
 	}
-	_, err := x.q.Exec(ctx, `INSERT INTO event (repository_id, number, at, actor, kind, from_status, to_status, subject, label, patchset, commit_id, message, related)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
-		repo, number, at, e.Actor, e.Kind, e.From, e.To, e.Subject, e.Label, e.Patchset, e.Commit, e.Message, e.Related)
+	// The event, its outbox entry, and the outbox's mark, in one statement: none without the others.
+	_, err := x.q.Exec(ctx, `WITH ev AS (
+			INSERT INTO event (id, repository_id, number, at, actor, kind, from_status, to_status, subject, label, patchset,
+				commit_id, message, related, recorded_at)
+			VALUES ($14, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, clock_timestamp())
+			RETURNING id
+		), ob AS (
+			INSERT INTO outbox (repository_id, entry_id, number, queued_at, event_id) SELECT $1, $15, $2, clock_timestamp(), id FROM ev
+		)
+		INSERT INTO work (kind, key, dirty) VALUES ($16, $1, true) ON CONFLICT (kind, key) DO UPDATE SET dirty = true, due_at = NULL`,
+		repo, number, at, e.Actor, e.Kind, e.From, e.To, e.Subject, e.Label, e.Patchset, e.Commit, e.Message, e.Related, data.NewID(), data.NewID(),
+		db.OutboxWork)
 	return err
 }
 
 func (x queries) Events(ctx context.Context, repo, number int64) ([]db.Event, error) {
 	rows, err := x.q.Query(ctx, `SELECT id, at, actor, kind, from_status, to_status, subject, label, patchset, commit_id, message, related
-		FROM event WHERE repository_id = $1 AND number = $2 ORDER BY at, id`, repo, number)
+		FROM event WHERE repository_id = $1 AND number = $2 ORDER BY at, recorded_at, id`, repo, number)
 	if err != nil {
 		return nil, err
 	}
@@ -183,7 +200,8 @@ func (x queries) Events(ctx context.Context, repo, number int64) ([]db.Event, er
 
 func (x queries) LastAbandon(ctx context.Context, repo, number int64) (db.Event, bool, error) {
 	var e db.Event
-	err := x.q.QueryRow(ctx, `SELECT id, from_status FROM event WHERE repository_id = $1 AND number = $2 AND kind = $3 ORDER BY id DESC LIMIT 1`,
+	err := x.q.QueryRow(ctx, `SELECT id, from_status FROM event WHERE repository_id = $1 AND number = $2 AND kind = $3
+		ORDER BY at DESC, recorded_at DESC, id DESC LIMIT 1`,
 		repo, number, db.EventAbandoned).Scan(&e.ID, &e.From)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return db.Event{}, false, nil

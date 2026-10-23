@@ -30,28 +30,39 @@ type Services struct {
 	Runs   automationpb.RunsServer
 	Pushes automationpb.PushesServer
 	Work   automationpb.WorkServer
+	// SecretRuns is ok secrets'.
+	SecretRuns automationpb.SecretRunsServer
 }
 
 // New builds the services. Who may call each is ok's runtime's to decide, from its protocol's
-// ok.v1.callers: Runs ok control, Pushes ok's deployer, Work ok's workers. Nothing here checks a
-// caller against a list.
-func New(s *store.Store, heartbeat time.Duration) Services {
-	c := &core{store: s, heartbeat: heartbeat}
-	return Services{Runs: &runs{c: c}, Pushes: &pushes{c: c}, Work: &work{c: c}}
+// ok.v1.callers: Runs ok control, Pushes ok's deployer, Work ok's workers, SecretRuns ok secrets.
+// Nothing here checks a caller against a list.
+func New(s *store.Store, heartbeat time.Duration, cache bool, pre PreStarter) Services {
+	c := &core{store: s, heartbeat: heartbeat, cache: cache, pre: pre}
+	return Services{Runs: &runs{c: c}, Pushes: &pushes{c: c}, Work: &work{c: c}, SecretRuns: &secretRuns{c: c}}
+}
+
+// PreStarter plans pre by hand (the feed's follower, over the SCM): Runs.StartPre.
+type PreStarter interface {
+	StartPre(ctx context.Context, repo, number int64, requestedBy string) (int32, error)
 }
 
 type core struct {
 	store     *store.Store
 	heartbeat time.Duration
+	// cache: ok automation serves a remote cache, which leases say.
+	cache bool
+	pre   PreStarter
 }
 
-// caller returns the principal a request is for.
+// caller returns the stable ID of the principal a request is for: ok automation records principals
+// by ID (docs/hosted.md, "Tenancy, as built").
 func caller(ctx context.Context) (string, error) {
 	c, ok := authn.FromContext(ctx)
 	if !ok {
 		return "", status.Error(codes.Unauthenticated, "ok automation serves identified principals only")
 	}
-	return c.Principal, nil
+	return c.ID, nil
 }
 
 // requester returns who a Runs request is for: the person ok control names.
@@ -111,7 +122,7 @@ func (s *pushes) StartRun(ctx context.Context, req *automationpb.StartRunRequest
 	if req.GetJob().GetKind() != automationpb.Job_KIND_PUSH || req.GetOrigin().GetPhase() != automationpb.Origin_PHASE_DEPLOY {
 		return nil, status.Error(codes.InvalidArgument, "Pushes starts a deployment's push: a push job of the deploy phase")
 	}
-	if req.GetForPerson() != "" {
+	if req.GetForPersonId() != "" {
 		return nil, status.Error(codes.InvalidArgument, "a deployment's push is the deployer's own: it names no person")
 	}
 	r, err := s.c.store.Start(ctx, store.StartRequest{
@@ -151,11 +162,7 @@ func (s *pushes) CancelRun(ctx context.Context, req *automationpb.CancelRunReque
 	if run.Origin.Phase != store.PhaseDeploy {
 		return nil, status.Error(codes.FailedPrecondition, "Pushes cancels deployments' pushes only")
 	}
-	reason := req.GetReason()
-	if reason == "" {
-		reason = "canceled by " + p
-	}
-	r, err := s.c.store.Cancel(ctx, req.GetId(), reason)
+	r, err := s.c.store.Cancel(ctx, req.GetId(), req.GetReason(), p)
 	if err != nil {
 		return nil, toStatus(err)
 	}
@@ -173,7 +180,7 @@ func (s *runs) StartRun(ctx context.Context, req *automationpb.StartRunRequest) 
 	if req.GetJob().GetKind() == automationpb.Job_KIND_PUSH || req.GetOrigin().GetPhase() == automationpb.Origin_PHASE_DEPLOY {
 		return nil, status.Error(codes.InvalidArgument, "a push is a deployment's: the deployer starts it through Pushes")
 	}
-	who, err := s.c.requester(ctx, req.GetForPerson())
+	who, err := s.c.requester(ctx, req.GetForPersonId())
 	if err != nil {
 		return nil, err
 	}
@@ -225,7 +232,7 @@ func (s *runs) ListRuns(ctx context.Context, req *automationpb.ListRunsRequest) 
 }
 
 func (s *runs) CancelRun(ctx context.Context, req *automationpb.CancelRunRequest) (*automationpb.Run, error) {
-	who, err := s.c.requester(ctx, req.GetForPerson())
+	who, err := s.c.requester(ctx, req.GetForPersonId())
 	if err != nil {
 		return nil, err
 	}
@@ -236,11 +243,7 @@ func (s *runs) CancelRun(ctx context.Context, req *automationpb.CancelRunRequest
 	if run.Origin.Phase == store.PhaseDeploy {
 		return nil, status.Error(codes.FailedPrecondition, "a push is its deployment's: halt the deployment")
 	}
-	reason := req.GetReason()
-	if reason == "" {
-		reason = "canceled by " + who
-	}
-	r, err := s.c.store.Cancel(ctx, req.GetId(), reason)
+	r, err := s.c.store.Cancel(ctx, req.GetId(), req.GetReason(), who)
 	if err != nil {
 		return nil, toStatus(err)
 	}
@@ -248,7 +251,7 @@ func (s *runs) CancelRun(ctx context.Context, req *automationpb.CancelRunRequest
 }
 
 func (s *runs) RerunRun(ctx context.Context, req *automationpb.RerunRunRequest) (*automationpb.Run, error) {
-	who, err := s.c.requester(ctx, req.GetForPerson())
+	who, err := s.c.requester(ctx, req.GetForPersonId())
 	if err != nil {
 		return nil, err
 	}
@@ -270,14 +273,14 @@ func (s *runs) ReadLog(req *automationpb.ReadLogRequest, stream grpc.ServerStrea
 }
 
 func (s *runs) Submit(ctx context.Context, req *automationpb.SubmitRequest) (*automationpb.Submission, error) {
-	if _, err := s.c.requester(ctx, req.GetForPerson()); err != nil {
+	if _, err := s.c.requester(ctx, req.GetForPersonId()); err != nil {
 		return nil, err
 	}
 	var cls []store.SubmittedCL
 	for _, c := range req.GetCls() {
 		cls = append(cls, store.SubmittedCL{Number: c.GetNumber(), Patchset: c.GetPatchset()})
 	}
-	sub, err := s.c.store.Submit(ctx, store.SubmitRequest{RepositoryID: req.GetRepositoryId(), CLs: cls, SubmittedBy: req.GetForPerson()})
+	sub, err := s.c.store.Submit(ctx, store.SubmitRequest{RepositoryID: req.GetRepositoryId(), CLs: cls, SubmittedBy: req.GetForPersonId()})
 	if err != nil {
 		return nil, toStatus(err)
 	}
@@ -285,15 +288,11 @@ func (s *runs) Submit(ctx context.Context, req *automationpb.SubmitRequest) (*au
 }
 
 func (s *runs) CancelSubmission(ctx context.Context, req *automationpb.CancelSubmissionRequest) (*automationpb.Submission, error) {
-	who, err := s.c.requester(ctx, req.GetForPerson())
+	who, err := s.c.requester(ctx, req.GetForPersonId())
 	if err != nil {
 		return nil, err
 	}
-	reason := req.GetReason()
-	if reason == "" {
-		reason = "canceled by " + who
-	}
-	sub, err := s.c.store.CancelSubmission(ctx, req.GetId(), reason)
+	sub, err := s.c.store.CancelSubmission(ctx, req.GetId(), req.GetReason(), who)
 	if err != nil {
 		return nil, toStatus(err)
 	}
@@ -333,14 +332,15 @@ func (s *runs) ListSubmissions(ctx context.Context, req *automationpb.ListSubmis
 // submissionOut is a submission with its attempts, newest first.
 func (s *runs) submissionOut(ctx context.Context, sub *store.Submission) (*automationpb.Submission, error) {
 	out := &automationpb.Submission{
-		Id:           sub.ID,
-		RepositoryId: sub.RepositoryID,
-		SubmittedBy:  sub.SubmittedBy,
-		Status:       automationpb.Submission_Status(sub.Status),
-		Reason:       sub.Reason,
-		Note:         sub.Note,
-		CreatedAt:    timeOut(sub.CreatedAt),
-		FinishedAt:   timeOut(sub.FinishedAt),
+		Id:            sub.ID,
+		RepositoryId:  sub.RepositoryID,
+		SubmittedById: sub.SubmittedBy,
+		CanceledById:  sub.CanceledBy,
+		Status:        automationpb.Submission_Status(sub.Status),
+		Reason:        sub.Reason,
+		Note:          sub.Note,
+		CreatedAt:     timeOut(sub.CreatedAt),
+		FinishedAt:    timeOut(sub.FinishedAt),
 	}
 	for _, c := range sub.CLs {
 		out.Cls = append(out.Cls, &automationpb.Submission_CL{Number: c.Number, Patchset: c.Patchset, LandedCommit: c.LandedCommit})
@@ -420,6 +420,27 @@ func verdictOut(s queue.State) automationpb.Attempt_Verdict {
 	return automationpb.Attempt_VERDICT_FAILED
 }
 
+func (s *runs) StartPre(ctx context.Context, req *automationpb.StartPreRequest) (*automationpb.Pre, error) {
+	who, err := s.c.requester(ctx, req.GetForPersonId())
+	if err != nil {
+		return nil, err
+	}
+	if req.GetRepositoryId() <= 0 || req.GetClNumber() <= 0 {
+		return nil, status.Error(codes.InvalidArgument, "a CL is named by its repository and number")
+	}
+	if s.c.pre == nil {
+		return nil, status.Error(codes.Unavailable, "this replica cannot plan pre: it reaches no SCM")
+	}
+	patchset, err := s.c.pre.StartPre(ctx, req.GetRepositoryId(), req.GetClNumber(), who)
+	if err != nil {
+		if _, ok := status.FromError(err); ok {
+			return nil, err
+		}
+		return nil, toStatus(err)
+	}
+	return s.GetPre(ctx, &automationpb.GetPreRequest{RepositoryId: req.GetRepositoryId(), ClNumber: req.GetClNumber(), Patchset: patchset})
+}
+
 func (s *runs) GetPre(ctx context.Context, req *automationpb.GetPreRequest) (*automationpb.Pre, error) {
 	if err := s.c.identified(ctx); err != nil {
 		return nil, err
@@ -457,15 +478,15 @@ func (s *work) Lease(ctx context.Context, req *automationpb.LeaseRequest) (*auto
 		return nil, err
 	}
 	wait := min(time.Duration(req.GetWaitSeconds())*time.Second, maxLeaseWait)
-	r, err := s.c.store.Lease(ctx, req.GetWorker(), max(wait, 0))
+	r, err := s.c.store.Lease(ctx, req.GetWorker(), req.GetPool(), max(wait, 0))
 	if err != nil {
 		return nil, toStatus(err)
 	}
-	out := &automationpb.LeaseResponse{HeartbeatSeconds: int32(s.c.heartbeat / time.Second)}
+	out := &automationpb.LeaseResponse{HeartbeatSeconds: int32(s.c.heartbeat / time.Second), Cache: s.c.cache}
 	if r == nil {
 		return out, nil
 	}
-	out.Run = runOut(r)
+	out.Run, out.RunKey = runOut(r), r.LeaseKey
 	if r.PlanID > 0 {
 		plan, err := s.c.store.GetPlan(ctx, r.PlanID)
 		if err != nil {
@@ -536,7 +557,7 @@ func (s *work) Finish(ctx context.Context, req *automationpb.FinishRequest) (*au
 // ─── Conversions ───
 
 func jobIn(j *automationpb.Job) store.Job {
-	return store.Job{Kind: store.Kind(j.GetKind()), Targets: j.GetTargets(), Args: j.GetArgs()}
+	return store.Job{Kind: store.Kind(j.GetKind()), Targets: j.GetTargets(), Args: j.GetArgs(), Pool: j.GetPool()}
 }
 
 // planIn is a planning run's plan, or nil when the request carries none.
@@ -583,6 +604,7 @@ func runOut(r *store.Run) *automationpb.Run {
 			Kind:    automationpb.Job_Kind(r.Job.Kind),
 			Targets: r.Job.Targets,
 			Args:    r.Job.Args,
+			Pool:    r.Job.Pool,
 		},
 		Origin: &automationpb.Origin{
 			Phase:    automationpb.Origin_Phase(r.Origin.Phase),
@@ -591,7 +613,8 @@ func runOut(r *store.Run) *automationpb.Run {
 			Job:      r.Origin.Job,
 		},
 		Status:         automationpb.Run_Status(r.Status),
-		RequestedBy:    r.RequestedBy,
+		RequestedById:  r.RequestedBy,
+		CanceledById:   r.CanceledBy,
 		RerunOf:        r.RerunOf,
 		Attempt:        r.Attempt,
 		Worker:         r.Worker,
@@ -614,4 +637,23 @@ func pushedOut(ps []store.Pushed) []*automationpb.PushedImage {
 		out = append(out, &automationpb.PushedImage{Target: p.Target, Registry: p.Registry, Repository: p.Repository, Digest: p.Digest, Tags: p.Tags})
 	}
 	return out
+}
+
+// ─── SecretRuns ───
+
+type secretRuns struct {
+	automationpb.UnimplementedSecretRunsServer
+	c *core
+}
+
+// CheckRun is a run, while it runs under the lease the key was minted for.
+func (s *secretRuns) CheckRun(ctx context.Context, req *automationpb.CheckRunRequest) (*automationpb.Run, error) {
+	if len(req.GetRunKey()) != 32 {
+		return nil, status.Error(codes.InvalidArgument, "a run's key is 32 bytes")
+	}
+	r, err := s.c.store.RunOfLease(ctx, req.GetRunId(), req.GetRunKey())
+	if err != nil {
+		return nil, toStatus(err)
+	}
+	return runOut(r), nil
 }

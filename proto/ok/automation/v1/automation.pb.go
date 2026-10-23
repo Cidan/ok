@@ -319,7 +319,7 @@ func (x Pre_Verdict) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use Pre_Verdict.Descriptor instead.
 func (Pre_Verdict) EnumDescriptor() ([]byte, []int) {
-	return file_proto_ok_automation_v1_automation_proto_rawDescGZIP(), []int{23, 0}
+	return file_proto_ok_automation_v1_automation_proto_rawDescGZIP(), []int{24, 0}
 }
 
 type Submission_Status int32
@@ -374,7 +374,7 @@ func (x Submission_Status) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use Submission_Status.Descriptor instead.
 func (Submission_Status) EnumDescriptor() ([]byte, []int) {
-	return file_proto_ok_automation_v1_automation_proto_rawDescGZIP(), []int{30, 0}
+	return file_proto_ok_automation_v1_automation_proto_rawDescGZIP(), []int{31, 0}
 }
 
 type Attempt_Status int32
@@ -429,7 +429,7 @@ func (x Attempt_Status) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use Attempt_Status.Descriptor instead.
 func (Attempt_Status) EnumDescriptor() ([]byte, []int) {
-	return file_proto_ok_automation_v1_automation_proto_rawDescGZIP(), []int{31, 0}
+	return file_proto_ok_automation_v1_automation_proto_rawDescGZIP(), []int{32, 0}
 }
 
 type Attempt_Verdict int32
@@ -487,7 +487,7 @@ func (x Attempt_Verdict) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use Attempt_Verdict.Descriptor instead.
 func (Attempt_Verdict) EnumDescriptor() ([]byte, []int) {
-	return file_proto_ok_automation_v1_automation_proto_rawDescGZIP(), []int{31, 1}
+	return file_proto_ok_automation_v1_automation_proto_rawDescGZIP(), []int{32, 1}
 }
 
 // A job is Bazel, run on a commit's checkout, that must succeed (docs/automation.md, "The jobs, as
@@ -505,7 +505,11 @@ type Job struct {
 	// PLAN, of post: the commit the CL's pre ran on, its patchset's. The plan marks each job that
 	// nothing changed for between it and the candidate (PlannedJob.unchanged_since_pre). Empty
 	// when the patchset has no pre.
-	PreCommit     []byte `protobuf:"bytes,7,opt,name=pre_commit,json=preCommit,proto3" json:"pre_commit,omitempty"`
+	PreCommit []byte `protobuf:"bytes,7,opt,name=pre_commit,json=preCommit,proto3" json:"pre_commit,omitempty"`
+	// The pool of workers it runs in (docs/hosted.md, "Hosted automation, as built"): a workflow
+	// job's own, else its repository's, else default — as the plan read them; a planning run's is
+	// automation.plan_pool. Empty is default.
+	Pool          string `protobuf:"bytes,8,opt,name=pool,proto3" json:"pool,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -573,6 +577,13 @@ func (x *Job) GetPreCommit() []byte {
 		return x.PreCommit
 	}
 	return nil
+}
+
+func (x *Job) GetPool() string {
+	if x != nil {
+		return x.Pool
+	}
+	return ""
 }
 
 // Why a run exists: its phase, and the CL, patchset, and job it runs for.
@@ -654,8 +665,7 @@ type Run struct {
 	Job          *Job                   `protobuf:"bytes,4,opt,name=job,proto3" json:"job,omitempty"`
 	Origin       *Origin                `protobuf:"bytes,5,opt,name=origin,proto3" json:"origin,omitempty"`
 	Status       Run_Status             `protobuf:"varint,6,opt,name=status,proto3,enum=ok.automation.v1.Run_Status" json:"status,omitempty"`
-	RequestedBy  string                 `protobuf:"bytes,7,opt,name=requested_by,json=requestedBy,proto3" json:"requested_by,omitempty"` // the principal the run was started or rerun for
-	RerunOf      int64                  `protobuf:"varint,8,opt,name=rerun_of,json=rerunOf,proto3" json:"rerun_of,omitempty"`            // 0: none
+	RerunOf      int64                  `protobuf:"varint,8,opt,name=rerun_of,json=rerunOf,proto3" json:"rerun_of,omitempty"` // 0: none
 	// 1, or 2 once a lost worker's run is queued again.
 	Attempt        int32                  `protobuf:"varint,9,opt,name=attempt,proto3" json:"attempt,omitempty"`
 	Worker         string                 `protobuf:"bytes,10,opt,name=worker,proto3" json:"worker,omitempty"`
@@ -673,7 +683,13 @@ type Run struct {
 	Pushed []*PushedImage `protobuf:"bytes,19,rep,name=pushed,proto3" json:"pushed,omitempty"`
 	// A post run that never ran: the pre run whose pass it carries, on the CL's patchset, where
 	// the job had the same inputs (docs/automation.md, "post"). 0: it ran.
-	CarriedFrom   int64 `protobuf:"varint,20,opt,name=carried_from,json=carriedFrom,proto3" json:"carried_from,omitempty"`
+	CarriedFrom int64 `protobuf:"varint,20,opt,name=carried_from,json=carriedFrom,proto3" json:"carried_from,omitempty"`
+	// The stable ID of the principal the run was started or rerun for (docs/hosted.md, "Tenancy,
+	// as built"): ok automation serves ok's roles, which name principals by ID.
+	RequestedById string `protobuf:"bytes,21,opt,name=requested_by_id,json=requestedById,proto3" json:"requested_by_id,omitempty"`
+	// Who canceled it, or asked its worker to stop it, by stable ID; empty for no one (ok itself),
+	// or a run not canceled. Its reason never names a person.
+	CanceledById  string `protobuf:"bytes,22,opt,name=canceled_by_id,json=canceledById,proto3" json:"canceled_by_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -748,13 +764,6 @@ func (x *Run) GetStatus() Run_Status {
 		return x.Status
 	}
 	return Run_STATUS_UNSPECIFIED
-}
-
-func (x *Run) GetRequestedBy() string {
-	if x != nil {
-		return x.RequestedBy
-	}
-	return ""
 }
 
 func (x *Run) GetRerunOf() int64 {
@@ -848,6 +857,20 @@ func (x *Run) GetCarriedFrom() int64 {
 	return 0
 }
 
+func (x *Run) GetRequestedById() string {
+	if x != nil {
+		return x.RequestedById
+	}
+	return ""
+}
+
+func (x *Run) GetCanceledById() string {
+	if x != nil {
+		return x.CanceledById
+	}
+	return ""
+}
+
 // An image a push run pushed: where it went, and the digest of its manifest.
 type PushedImage struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
@@ -932,7 +955,7 @@ type StartRunRequest struct {
 	Job            *Job                   `protobuf:"bytes,3,opt,name=job,proto3" json:"job,omitempty"`
 	Origin         *Origin                `protobuf:"bytes,4,opt,name=origin,proto3" json:"origin,omitempty"`
 	TimeoutSeconds int32                  `protobuf:"varint,5,opt,name=timeout_seconds,json=timeoutSeconds,proto3" json:"timeout_seconds,omitempty"` // 0: the service's default
-	ForPerson      string                 `protobuf:"bytes,6,opt,name=for_person,json=forPerson,proto3" json:"for_person,omitempty"`                 // ok control only
+	ForPersonId    string                 `protobuf:"bytes,7,opt,name=for_person_id,json=forPersonId,proto3" json:"for_person_id,omitempty"`         // ok control only: the stable ID of the person it acts for
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }
@@ -1002,9 +1025,9 @@ func (x *StartRunRequest) GetTimeoutSeconds() int32 {
 	return 0
 }
 
-func (x *StartRunRequest) GetForPerson() string {
+func (x *StartRunRequest) GetForPersonId() string {
 	if x != nil {
-		return x.ForPerson
+		return x.ForPersonId
 	}
 	return ""
 }
@@ -1186,7 +1209,7 @@ type CancelRunRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Id            int64                  `protobuf:"varint,1,opt,name=id,proto3" json:"id,omitempty"`
 	Reason        string                 `protobuf:"bytes,2,opt,name=reason,proto3" json:"reason,omitempty"`
-	ForPerson     string                 `protobuf:"bytes,3,opt,name=for_person,json=forPerson,proto3" json:"for_person,omitempty"` // ok control only
+	ForPersonId   string                 `protobuf:"bytes,4,opt,name=for_person_id,json=forPersonId,proto3" json:"for_person_id,omitempty"` // ok control only
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1235,9 +1258,9 @@ func (x *CancelRunRequest) GetReason() string {
 	return ""
 }
 
-func (x *CancelRunRequest) GetForPerson() string {
+func (x *CancelRunRequest) GetForPersonId() string {
 	if x != nil {
-		return x.ForPerson
+		return x.ForPersonId
 	}
 	return ""
 }
@@ -1245,7 +1268,7 @@ func (x *CancelRunRequest) GetForPerson() string {
 type RerunRunRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Id            int64                  `protobuf:"varint,1,opt,name=id,proto3" json:"id,omitempty"`
-	ForPerson     string                 `protobuf:"bytes,2,opt,name=for_person,json=forPerson,proto3" json:"for_person,omitempty"` // ok control only
+	ForPersonId   string                 `protobuf:"bytes,3,opt,name=for_person_id,json=forPersonId,proto3" json:"for_person_id,omitempty"` // ok control only
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1287,9 +1310,9 @@ func (x *RerunRunRequest) GetId() int64 {
 	return 0
 }
 
-func (x *RerunRunRequest) GetForPerson() string {
+func (x *RerunRunRequest) GetForPersonId() string {
 	if x != nil {
-		return x.ForPerson
+		return x.ForPersonId
 	}
 	return ""
 }
@@ -1419,6 +1442,7 @@ type LeaseRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Worker        string                 `protobuf:"bytes,1,opt,name=worker,proto3" json:"worker,omitempty"` // the worker's name, unique among the workers (its pod's)
 	WaitSeconds   int32                  `protobuf:"varint,2,opt,name=wait_seconds,json=waitSeconds,proto3" json:"wait_seconds,omitempty"`
+	Pool          string                 `protobuf:"bytes,3,opt,name=pool,proto3" json:"pool,omitempty"` // the pool it serves (worker.pool); empty is default
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1467,16 +1491,30 @@ func (x *LeaseRequest) GetWaitSeconds() int32 {
 	return 0
 }
 
+func (x *LeaseRequest) GetPool() string {
+	if x != nil {
+		return x.Pool
+	}
+	return ""
+}
+
 type LeaseResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	Run   *Run                   `protobuf:"bytes,1,opt,name=run,proto3" json:"run,omitempty"`
 	// How often to renew the lease: it lapses after three missed renewals.
 	HeartbeatSeconds int32 `protobuf:"varint,2,opt,name=heartbeat_seconds,json=heartbeatSeconds,proto3" json:"heartbeat_seconds,omitempty"`
+	// ok automation serves a remote cache, which the run's Bazel reaches through its worker, naming
+	// the run (docs/hosted.md, "Hosted automation, as built").
+	Cache bool `protobuf:"varint,4,opt,name=cache,proto3" json:"cache,omitempty"`
 	// The run's change (docs/automation.md, "The job context"), as JSON: the job context
 	// but its changed files, which the worker reads from the SCM and adds before writing the
 	// context into the checkout as ok-context.json. Empty for a run that has none (a manual
 	// run's).
-	Context       []byte `protobuf:"bytes,3,opt,name=context,proto3" json:"context,omitempty"`
+	Context []byte `protobuf:"bytes,3,opt,name=context,proto3" json:"context,omitempty"`
+	// The lease's key, minted for this lease and given to this worker alone: what proves to ok
+	// secrets that a request for a post run's secrets is this lease's (docs/secrets.md, "Readers
+	// that are not people").
+	RunKey        []byte `protobuf:"bytes,5,opt,name=run_key,json=runKey,proto3" json:"run_key,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1525,9 +1563,23 @@ func (x *LeaseResponse) GetHeartbeatSeconds() int32 {
 	return 0
 }
 
+func (x *LeaseResponse) GetCache() bool {
+	if x != nil {
+		return x.Cache
+	}
+	return false
+}
+
 func (x *LeaseResponse) GetContext() []byte {
 	if x != nil {
 		return x.Context
+	}
+	return nil
+}
+
+func (x *LeaseResponse) GetRunKey() []byte {
+	if x != nil {
+		return x.RunKey
 	}
 	return nil
 }
@@ -2109,6 +2161,66 @@ func (x *GetPreRequest) GetPatchset() int32 {
 	return 0
 }
 
+type StartPreRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	RepositoryId  int64                  `protobuf:"varint,1,opt,name=repository_id,json=repositoryId,proto3" json:"repository_id,omitempty"`
+	ClNumber      int64                  `protobuf:"varint,2,opt,name=cl_number,json=clNumber,proto3" json:"cl_number,omitempty"`
+	ForPersonId   string                 `protobuf:"bytes,3,opt,name=for_person_id,json=forPersonId,proto3" json:"for_person_id,omitempty"` // ok control only: the stable ID of the person it acts for
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *StartPreRequest) Reset() {
+	*x = StartPreRequest{}
+	mi := &file_proto_ok_automation_v1_automation_proto_msgTypes[23]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *StartPreRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StartPreRequest) ProtoMessage() {}
+
+func (x *StartPreRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_ok_automation_v1_automation_proto_msgTypes[23]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StartPreRequest.ProtoReflect.Descriptor instead.
+func (*StartPreRequest) Descriptor() ([]byte, []int) {
+	return file_proto_ok_automation_v1_automation_proto_rawDescGZIP(), []int{23}
+}
+
+func (x *StartPreRequest) GetRepositoryId() int64 {
+	if x != nil {
+		return x.RepositoryId
+	}
+	return 0
+}
+
+func (x *StartPreRequest) GetClNumber() int64 {
+	if x != nil {
+		return x.ClNumber
+	}
+	return 0
+}
+
+func (x *StartPreRequest) GetForPersonId() string {
+	if x != nil {
+		return x.ForPersonId
+	}
+	return ""
+}
+
 // A patchset's pre.
 type Pre struct {
 	state           protoimpl.MessageState `protogen:"open.v1"`
@@ -2124,7 +2236,7 @@ type Pre struct {
 
 func (x *Pre) Reset() {
 	*x = Pre{}
-	mi := &file_proto_ok_automation_v1_automation_proto_msgTypes[23]
+	mi := &file_proto_ok_automation_v1_automation_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2136,7 +2248,7 @@ func (x *Pre) String() string {
 func (*Pre) ProtoMessage() {}
 
 func (x *Pre) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_automation_v1_automation_proto_msgTypes[23]
+	mi := &file_proto_ok_automation_v1_automation_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2149,7 +2261,7 @@ func (x *Pre) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Pre.ProtoReflect.Descriptor instead.
 func (*Pre) Descriptor() ([]byte, []int) {
-	return file_proto_ok_automation_v1_automation_proto_rawDescGZIP(), []int{23}
+	return file_proto_ok_automation_v1_automation_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *Pre) GetVerdict() Pre_Verdict {
@@ -2202,7 +2314,7 @@ type FinishResponse struct {
 
 func (x *FinishResponse) Reset() {
 	*x = FinishResponse{}
-	mi := &file_proto_ok_automation_v1_automation_proto_msgTypes[24]
+	mi := &file_proto_ok_automation_v1_automation_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2214,7 +2326,7 @@ func (x *FinishResponse) String() string {
 func (*FinishResponse) ProtoMessage() {}
 
 func (x *FinishResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_automation_v1_automation_proto_msgTypes[24]
+	mi := &file_proto_ok_automation_v1_automation_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2227,21 +2339,21 @@ func (x *FinishResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FinishResponse.ProtoReflect.Descriptor instead.
 func (*FinishResponse) Descriptor() ([]byte, []int) {
-	return file_proto_ok_automation_v1_automation_proto_rawDescGZIP(), []int{24}
+	return file_proto_ok_automation_v1_automation_proto_rawDescGZIP(), []int{25}
 }
 
 type SubmitRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	RepositoryId  int64                  `protobuf:"varint,1,opt,name=repository_id,json=repositoryId,proto3" json:"repository_id,omitempty"`
 	Cls           []*SubmitRequest_CL    `protobuf:"bytes,2,rep,name=cls,proto3" json:"cls,omitempty"` // bottom first: a stack lands whole, in this order
-	ForPerson     string                 `protobuf:"bytes,3,opt,name=for_person,json=forPerson,proto3" json:"for_person,omitempty"`
+	ForPersonId   string                 `protobuf:"bytes,4,opt,name=for_person_id,json=forPersonId,proto3" json:"for_person_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *SubmitRequest) Reset() {
 	*x = SubmitRequest{}
-	mi := &file_proto_ok_automation_v1_automation_proto_msgTypes[25]
+	mi := &file_proto_ok_automation_v1_automation_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2253,7 +2365,7 @@ func (x *SubmitRequest) String() string {
 func (*SubmitRequest) ProtoMessage() {}
 
 func (x *SubmitRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_automation_v1_automation_proto_msgTypes[25]
+	mi := &file_proto_ok_automation_v1_automation_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2266,7 +2378,7 @@ func (x *SubmitRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SubmitRequest.ProtoReflect.Descriptor instead.
 func (*SubmitRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_automation_v1_automation_proto_rawDescGZIP(), []int{25}
+	return file_proto_ok_automation_v1_automation_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *SubmitRequest) GetRepositoryId() int64 {
@@ -2283,9 +2395,9 @@ func (x *SubmitRequest) GetCls() []*SubmitRequest_CL {
 	return nil
 }
 
-func (x *SubmitRequest) GetForPerson() string {
+func (x *SubmitRequest) GetForPersonId() string {
 	if x != nil {
-		return x.ForPerson
+		return x.ForPersonId
 	}
 	return ""
 }
@@ -2294,14 +2406,14 @@ type CancelSubmissionRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Id            int64                  `protobuf:"varint,1,opt,name=id,proto3" json:"id,omitempty"`
 	Reason        string                 `protobuf:"bytes,2,opt,name=reason,proto3" json:"reason,omitempty"`
-	ForPerson     string                 `protobuf:"bytes,3,opt,name=for_person,json=forPerson,proto3" json:"for_person,omitempty"` // ok control only
+	ForPersonId   string                 `protobuf:"bytes,4,opt,name=for_person_id,json=forPersonId,proto3" json:"for_person_id,omitempty"` // ok control only
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *CancelSubmissionRequest) Reset() {
 	*x = CancelSubmissionRequest{}
-	mi := &file_proto_ok_automation_v1_automation_proto_msgTypes[26]
+	mi := &file_proto_ok_automation_v1_automation_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2313,7 +2425,7 @@ func (x *CancelSubmissionRequest) String() string {
 func (*CancelSubmissionRequest) ProtoMessage() {}
 
 func (x *CancelSubmissionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_automation_v1_automation_proto_msgTypes[26]
+	mi := &file_proto_ok_automation_v1_automation_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2326,7 +2438,7 @@ func (x *CancelSubmissionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CancelSubmissionRequest.ProtoReflect.Descriptor instead.
 func (*CancelSubmissionRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_automation_v1_automation_proto_rawDescGZIP(), []int{26}
+	return file_proto_ok_automation_v1_automation_proto_rawDescGZIP(), []int{27}
 }
 
 func (x *CancelSubmissionRequest) GetId() int64 {
@@ -2343,9 +2455,9 @@ func (x *CancelSubmissionRequest) GetReason() string {
 	return ""
 }
 
-func (x *CancelSubmissionRequest) GetForPerson() string {
+func (x *CancelSubmissionRequest) GetForPersonId() string {
 	if x != nil {
-		return x.ForPerson
+		return x.ForPersonId
 	}
 	return ""
 }
@@ -2359,7 +2471,7 @@ type GetSubmissionRequest struct {
 
 func (x *GetSubmissionRequest) Reset() {
 	*x = GetSubmissionRequest{}
-	mi := &file_proto_ok_automation_v1_automation_proto_msgTypes[27]
+	mi := &file_proto_ok_automation_v1_automation_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2371,7 +2483,7 @@ func (x *GetSubmissionRequest) String() string {
 func (*GetSubmissionRequest) ProtoMessage() {}
 
 func (x *GetSubmissionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_automation_v1_automation_proto_msgTypes[27]
+	mi := &file_proto_ok_automation_v1_automation_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2384,7 +2496,7 @@ func (x *GetSubmissionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetSubmissionRequest.ProtoReflect.Descriptor instead.
 func (*GetSubmissionRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_automation_v1_automation_proto_rawDescGZIP(), []int{27}
+	return file_proto_ok_automation_v1_automation_proto_rawDescGZIP(), []int{28}
 }
 
 func (x *GetSubmissionRequest) GetId() int64 {
@@ -2405,7 +2517,7 @@ type ListSubmissionsRequest struct {
 
 func (x *ListSubmissionsRequest) Reset() {
 	*x = ListSubmissionsRequest{}
-	mi := &file_proto_ok_automation_v1_automation_proto_msgTypes[28]
+	mi := &file_proto_ok_automation_v1_automation_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2417,7 +2529,7 @@ func (x *ListSubmissionsRequest) String() string {
 func (*ListSubmissionsRequest) ProtoMessage() {}
 
 func (x *ListSubmissionsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_automation_v1_automation_proto_msgTypes[28]
+	mi := &file_proto_ok_automation_v1_automation_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2430,7 +2542,7 @@ func (x *ListSubmissionsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListSubmissionsRequest.ProtoReflect.Descriptor instead.
 func (*ListSubmissionsRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_automation_v1_automation_proto_rawDescGZIP(), []int{28}
+	return file_proto_ok_automation_v1_automation_proto_rawDescGZIP(), []int{29}
 }
 
 func (x *ListSubmissionsRequest) GetRepositoryId() int64 {
@@ -2463,7 +2575,7 @@ type ListSubmissionsResponse struct {
 
 func (x *ListSubmissionsResponse) Reset() {
 	*x = ListSubmissionsResponse{}
-	mi := &file_proto_ok_automation_v1_automation_proto_msgTypes[29]
+	mi := &file_proto_ok_automation_v1_automation_proto_msgTypes[30]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2475,7 +2587,7 @@ func (x *ListSubmissionsResponse) String() string {
 func (*ListSubmissionsResponse) ProtoMessage() {}
 
 func (x *ListSubmissionsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_automation_v1_automation_proto_msgTypes[29]
+	mi := &file_proto_ok_automation_v1_automation_proto_msgTypes[30]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2488,7 +2600,7 @@ func (x *ListSubmissionsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListSubmissionsResponse.ProtoReflect.Descriptor instead.
 func (*ListSubmissionsResponse) Descriptor() ([]byte, []int) {
-	return file_proto_ok_automation_v1_automation_proto_rawDescGZIP(), []int{29}
+	return file_proto_ok_automation_v1_automation_proto_rawDescGZIP(), []int{30}
 }
 
 func (x *ListSubmissionsResponse) GetSubmissions() []*Submission {
@@ -2504,7 +2616,8 @@ type Submission struct {
 	Id            int64                  `protobuf:"varint,1,opt,name=id,proto3" json:"id,omitempty"`
 	RepositoryId  int64                  `protobuf:"varint,2,opt,name=repository_id,json=repositoryId,proto3" json:"repository_id,omitempty"`
 	Cls           []*Submission_CL       `protobuf:"bytes,3,rep,name=cls,proto3" json:"cls,omitempty"`
-	SubmittedBy   string                 `protobuf:"bytes,4,opt,name=submitted_by,json=submittedBy,proto3" json:"submitted_by,omitempty"`
+	SubmittedById string                 `protobuf:"bytes,11,opt,name=submitted_by_id,json=submittedById,proto3" json:"submitted_by_id,omitempty"` // the submitter's stable ID
+	CanceledById  string                 `protobuf:"bytes,12,opt,name=canceled_by_id,json=canceledById,proto3" json:"canceled_by_id,omitempty"`    // who canceled it, by stable ID; empty for no one
 	Status        Submission_Status      `protobuf:"varint,5,opt,name=status,proto3,enum=ok.automation.v1.Submission_Status" json:"status,omitempty"`
 	Reason        string                 `protobuf:"bytes,6,opt,name=reason,proto3" json:"reason,omitempty"` // why it failed or was canceled
 	Note          string                 `protobuf:"bytes,7,opt,name=note,proto3" json:"note,omitempty"`     // what the queue is waiting for, while it is active
@@ -2517,7 +2630,7 @@ type Submission struct {
 
 func (x *Submission) Reset() {
 	*x = Submission{}
-	mi := &file_proto_ok_automation_v1_automation_proto_msgTypes[30]
+	mi := &file_proto_ok_automation_v1_automation_proto_msgTypes[31]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2529,7 +2642,7 @@ func (x *Submission) String() string {
 func (*Submission) ProtoMessage() {}
 
 func (x *Submission) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_automation_v1_automation_proto_msgTypes[30]
+	mi := &file_proto_ok_automation_v1_automation_proto_msgTypes[31]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2542,7 +2655,7 @@ func (x *Submission) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Submission.ProtoReflect.Descriptor instead.
 func (*Submission) Descriptor() ([]byte, []int) {
-	return file_proto_ok_automation_v1_automation_proto_rawDescGZIP(), []int{30}
+	return file_proto_ok_automation_v1_automation_proto_rawDescGZIP(), []int{31}
 }
 
 func (x *Submission) GetId() int64 {
@@ -2566,9 +2679,16 @@ func (x *Submission) GetCls() []*Submission_CL {
 	return nil
 }
 
-func (x *Submission) GetSubmittedBy() string {
+func (x *Submission) GetSubmittedById() string {
 	if x != nil {
-		return x.SubmittedBy
+		return x.SubmittedById
+	}
+	return ""
+}
+
+func (x *Submission) GetCanceledById() string {
+	if x != nil {
+		return x.CanceledById
 	}
 	return ""
 }
@@ -2634,7 +2754,7 @@ type Attempt struct {
 
 func (x *Attempt) Reset() {
 	*x = Attempt{}
-	mi := &file_proto_ok_automation_v1_automation_proto_msgTypes[31]
+	mi := &file_proto_ok_automation_v1_automation_proto_msgTypes[32]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2646,7 +2766,7 @@ func (x *Attempt) String() string {
 func (*Attempt) ProtoMessage() {}
 
 func (x *Attempt) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_automation_v1_automation_proto_msgTypes[31]
+	mi := &file_proto_ok_automation_v1_automation_proto_msgTypes[32]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2659,7 +2779,7 @@ func (x *Attempt) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Attempt.ProtoReflect.Descriptor instead.
 func (*Attempt) Descriptor() ([]byte, []int) {
-	return file_proto_ok_automation_v1_automation_proto_rawDescGZIP(), []int{31}
+	return file_proto_ok_automation_v1_automation_proto_rawDescGZIP(), []int{32}
 }
 
 func (x *Attempt) GetId() int64 {
@@ -2743,7 +2863,7 @@ type ReleaseRequest struct {
 
 func (x *ReleaseRequest) Reset() {
 	*x = ReleaseRequest{}
-	mi := &file_proto_ok_automation_v1_automation_proto_msgTypes[32]
+	mi := &file_proto_ok_automation_v1_automation_proto_msgTypes[33]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2755,7 +2875,7 @@ func (x *ReleaseRequest) String() string {
 func (*ReleaseRequest) ProtoMessage() {}
 
 func (x *ReleaseRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_automation_v1_automation_proto_msgTypes[32]
+	mi := &file_proto_ok_automation_v1_automation_proto_msgTypes[33]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2768,7 +2888,7 @@ func (x *ReleaseRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReleaseRequest.ProtoReflect.Descriptor instead.
 func (*ReleaseRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_automation_v1_automation_proto_rawDescGZIP(), []int{32}
+	return file_proto_ok_automation_v1_automation_proto_rawDescGZIP(), []int{33}
 }
 
 func (x *ReleaseRequest) GetRunId() int64 {
@@ -2800,7 +2920,7 @@ type ReleaseResponse struct {
 
 func (x *ReleaseResponse) Reset() {
 	*x = ReleaseResponse{}
-	mi := &file_proto_ok_automation_v1_automation_proto_msgTypes[33]
+	mi := &file_proto_ok_automation_v1_automation_proto_msgTypes[34]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2812,7 +2932,7 @@ func (x *ReleaseResponse) String() string {
 func (*ReleaseResponse) ProtoMessage() {}
 
 func (x *ReleaseResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_automation_v1_automation_proto_msgTypes[33]
+	mi := &file_proto_ok_automation_v1_automation_proto_msgTypes[34]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2825,7 +2945,59 @@ func (x *ReleaseResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReleaseResponse.ProtoReflect.Descriptor instead.
 func (*ReleaseResponse) Descriptor() ([]byte, []int) {
-	return file_proto_ok_automation_v1_automation_proto_rawDescGZIP(), []int{33}
+	return file_proto_ok_automation_v1_automation_proto_rawDescGZIP(), []int{34}
+}
+
+type CheckRunRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	RunId         int64                  `protobuf:"varint,1,opt,name=run_id,json=runId,proto3" json:"run_id,omitempty"`
+	RunKey        []byte                 `protobuf:"bytes,2,opt,name=run_key,json=runKey,proto3" json:"run_key,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CheckRunRequest) Reset() {
+	*x = CheckRunRequest{}
+	mi := &file_proto_ok_automation_v1_automation_proto_msgTypes[35]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CheckRunRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CheckRunRequest) ProtoMessage() {}
+
+func (x *CheckRunRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_ok_automation_v1_automation_proto_msgTypes[35]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CheckRunRequest.ProtoReflect.Descriptor instead.
+func (*CheckRunRequest) Descriptor() ([]byte, []int) {
+	return file_proto_ok_automation_v1_automation_proto_rawDescGZIP(), []int{35}
+}
+
+func (x *CheckRunRequest) GetRunId() int64 {
+	if x != nil {
+		return x.RunId
+	}
+	return 0
+}
+
+func (x *CheckRunRequest) GetRunKey() []byte {
+	if x != nil {
+		return x.RunKey
+	}
+	return nil
 }
 
 type SubmitRequest_CL struct {
@@ -2838,7 +3010,7 @@ type SubmitRequest_CL struct {
 
 func (x *SubmitRequest_CL) Reset() {
 	*x = SubmitRequest_CL{}
-	mi := &file_proto_ok_automation_v1_automation_proto_msgTypes[34]
+	mi := &file_proto_ok_automation_v1_automation_proto_msgTypes[36]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2850,7 +3022,7 @@ func (x *SubmitRequest_CL) String() string {
 func (*SubmitRequest_CL) ProtoMessage() {}
 
 func (x *SubmitRequest_CL) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_automation_v1_automation_proto_msgTypes[34]
+	mi := &file_proto_ok_automation_v1_automation_proto_msgTypes[36]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2863,7 +3035,7 @@ func (x *SubmitRequest_CL) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SubmitRequest_CL.ProtoReflect.Descriptor instead.
 func (*SubmitRequest_CL) Descriptor() ([]byte, []int) {
-	return file_proto_ok_automation_v1_automation_proto_rawDescGZIP(), []int{25, 0}
+	return file_proto_ok_automation_v1_automation_proto_rawDescGZIP(), []int{26, 0}
 }
 
 func (x *SubmitRequest_CL) GetNumber() int64 {
@@ -2891,7 +3063,7 @@ type Submission_CL struct {
 
 func (x *Submission_CL) Reset() {
 	*x = Submission_CL{}
-	mi := &file_proto_ok_automation_v1_automation_proto_msgTypes[35]
+	mi := &file_proto_ok_automation_v1_automation_proto_msgTypes[37]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2903,7 +3075,7 @@ func (x *Submission_CL) String() string {
 func (*Submission_CL) ProtoMessage() {}
 
 func (x *Submission_CL) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_automation_v1_automation_proto_msgTypes[35]
+	mi := &file_proto_ok_automation_v1_automation_proto_msgTypes[37]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2916,7 +3088,7 @@ func (x *Submission_CL) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Submission_CL.ProtoReflect.Descriptor instead.
 func (*Submission_CL) Descriptor() ([]byte, []int) {
-	return file_proto_ok_automation_v1_automation_proto_rawDescGZIP(), []int{30, 0}
+	return file_proto_ok_automation_v1_automation_proto_rawDescGZIP(), []int{31, 0}
 }
 
 func (x *Submission_CL) GetNumber() int64 {
@@ -2951,7 +3123,7 @@ type Attempt_Speculation struct {
 
 func (x *Attempt_Speculation) Reset() {
 	*x = Attempt_Speculation{}
-	mi := &file_proto_ok_automation_v1_automation_proto_msgTypes[36]
+	mi := &file_proto_ok_automation_v1_automation_proto_msgTypes[38]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2963,7 +3135,7 @@ func (x *Attempt_Speculation) String() string {
 func (*Attempt_Speculation) ProtoMessage() {}
 
 func (x *Attempt_Speculation) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_automation_v1_automation_proto_msgTypes[36]
+	mi := &file_proto_ok_automation_v1_automation_proto_msgTypes[38]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2976,7 +3148,7 @@ func (x *Attempt_Speculation) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Attempt_Speculation.ProtoReflect.Descriptor instead.
 func (*Attempt_Speculation) Descriptor() ([]byte, []int) {
-	return file_proto_ok_automation_v1_automation_proto_rawDescGZIP(), []int{31, 0}
+	return file_proto_ok_automation_v1_automation_proto_rawDescGZIP(), []int{32, 0}
 }
 
 func (x *Attempt_Speculation) GetSubmissionId() int64 {
@@ -3009,7 +3181,7 @@ type Attempt_Candidate struct {
 
 func (x *Attempt_Candidate) Reset() {
 	*x = Attempt_Candidate{}
-	mi := &file_proto_ok_automation_v1_automation_proto_msgTypes[37]
+	mi := &file_proto_ok_automation_v1_automation_proto_msgTypes[39]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3021,7 +3193,7 @@ func (x *Attempt_Candidate) String() string {
 func (*Attempt_Candidate) ProtoMessage() {}
 
 func (x *Attempt_Candidate) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_automation_v1_automation_proto_msgTypes[37]
+	mi := &file_proto_ok_automation_v1_automation_proto_msgTypes[39]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3034,7 +3206,7 @@ func (x *Attempt_Candidate) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Attempt_Candidate.ProtoReflect.Descriptor instead.
 func (*Attempt_Candidate) Descriptor() ([]byte, []int) {
-	return file_proto_ok_automation_v1_automation_proto_rawDescGZIP(), []int{31, 1}
+	return file_proto_ok_automation_v1_automation_proto_rawDescGZIP(), []int{32, 1}
 }
 
 func (x *Attempt_Candidate) GetClNumber() int64 {
@@ -3090,14 +3262,15 @@ var File_proto_ok_automation_v1_automation_proto protoreflect.FileDescriptor
 
 const file_proto_ok_automation_v1_automation_proto_rawDesc = "" +
 	"\n" +
-	"'proto/ok/automation/v1/automation.proto\x12\x10ok.automation.v1\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x1dproto/ok/v1/annotations.proto\"\xb7\x02\n" +
+	"'proto/ok/automation/v1/automation.proto\x12\x10ok.automation.v1\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x1dproto/ok/v1/annotations.proto\"\xcb\x02\n" +
 	"\x03Job\x12.\n" +
 	"\x04kind\x18\x01 \x01(\x0e2\x1a.ok.automation.v1.Job.KindR\x04kind\x12\x18\n" +
 	"\atargets\x18\x02 \x03(\tR\atargets\x12\x12\n" +
 	"\x04args\x18\x03 \x03(\tR\x04args\x12)\n" +
 	"\x10workflows_commit\x18\x06 \x01(\fR\x0fworkflowsCommit\x12\x1d\n" +
 	"\n" +
-	"pre_commit\x18\a \x01(\fR\tpreCommit\"|\n" +
+	"pre_commit\x18\a \x01(\fR\tpreCommit\x12\x12\n" +
+	"\x04pool\x18\b \x01(\tR\x04pool\"|\n" +
 	"\x04Kind\x12\x14\n" +
 	"\x10KIND_UNSPECIFIED\x10\x00\x12\x0e\n" +
 	"\n" +
@@ -3118,15 +3291,14 @@ const file_proto_ok_automation_v1_automation_proto_rawDesc = "" +
 	"\n" +
 	"PHASE_POST\x10\x02\x12\x10\n" +
 	"\fPHASE_MANUAL\x10\x03\x12\x10\n" +
-	"\fPHASE_DEPLOY\x10\x04\"\x85\a\n" +
+	"\fPHASE_DEPLOY\x10\x04\"\xc4\a\n" +
 	"\x03Run\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\x03R\x02id\x12#\n" +
 	"\rrepository_id\x18\x02 \x01(\x03R\frepositoryId\x12\x1b\n" +
 	"\tcommit_id\x18\x03 \x01(\fR\bcommitId\x12'\n" +
 	"\x03job\x18\x04 \x01(\v2\x15.ok.automation.v1.JobR\x03job\x120\n" +
 	"\x06origin\x18\x05 \x01(\v2\x18.ok.automation.v1.OriginR\x06origin\x124\n" +
-	"\x06status\x18\x06 \x01(\x0e2\x1c.ok.automation.v1.Run.StatusR\x06status\x12!\n" +
-	"\frequested_by\x18\a \x01(\tR\vrequestedBy\x12\x19\n" +
+	"\x06status\x18\x06 \x01(\x0e2\x1c.ok.automation.v1.Run.StatusR\x06status\x12\x19\n" +
 	"\brerun_of\x18\b \x01(\x03R\arerunOf\x12\x18\n" +
 	"\aattempt\x18\t \x01(\x05R\aattempt\x12\x16\n" +
 	"\x06worker\x18\n" +
@@ -3142,7 +3314,9 @@ const file_proto_ok_automation_v1_automation_proto_rawDesc = "" +
 	"finishedAt\x12\x10\n" +
 	"\x03why\x18\x12 \x01(\tR\x03why\x125\n" +
 	"\x06pushed\x18\x13 \x03(\v2\x1d.ok.automation.v1.PushedImageR\x06pushed\x12!\n" +
-	"\fcarried_from\x18\x14 \x01(\x03R\vcarriedFrom\"\x94\x01\n" +
+	"\fcarried_from\x18\x14 \x01(\x03R\vcarriedFrom\x12&\n" +
+	"\x0frequested_by_id\x18\x15 \x01(\tR\rrequestedById\x12$\n" +
+	"\x0ecanceled_by_id\x18\x16 \x01(\tR\fcanceledById\"\x94\x01\n" +
 	"\x06Status\x12\x16\n" +
 	"\x12STATUS_UNSPECIFIED\x10\x00\x12\x11\n" +
 	"\rSTATUS_QUEUED\x10\x01\x12\x12\n" +
@@ -3150,7 +3324,7 @@ const file_proto_ok_automation_v1_automation_proto_rawDesc = "" +
 	"\rSTATUS_PASSED\x10\x03\x12\x11\n" +
 	"\rSTATUS_FAILED\x10\x04\x12\x13\n" +
 	"\x0fSTATUS_CANCELED\x10\x05\x12\x10\n" +
-	"\fSTATUS_ERROR\x10\x06\"\x8d\x01\n" +
+	"\fSTATUS_ERROR\x10\x06J\x04\b\a\x10\bR\frequested_by\"\x8d\x01\n" +
 	"\vPushedImage\x12\x16\n" +
 	"\x06target\x18\x01 \x01(\tR\x06target\x12\x1a\n" +
 	"\bregistry\x18\x02 \x01(\tR\bregistry\x12\x1e\n" +
@@ -3158,15 +3332,15 @@ const file_proto_ok_automation_v1_automation_proto_rawDesc = "" +
 	"repository\x18\x03 \x01(\tR\n" +
 	"repository\x12\x16\n" +
 	"\x06digest\x18\x04 \x01(\tR\x06digest\x12\x12\n" +
-	"\x04tags\x18\x05 \x03(\tR\x04tags\"\xf6\x01\n" +
+	"\x04tags\x18\x05 \x03(\tR\x04tags\"\x8d\x02\n" +
 	"\x0fStartRunRequest\x12#\n" +
 	"\rrepository_id\x18\x01 \x01(\x03R\frepositoryId\x12\x1b\n" +
 	"\tcommit_id\x18\x02 \x01(\fR\bcommitId\x12'\n" +
 	"\x03job\x18\x03 \x01(\v2\x15.ok.automation.v1.JobR\x03job\x120\n" +
 	"\x06origin\x18\x04 \x01(\v2\x18.ok.automation.v1.OriginR\x06origin\x12'\n" +
-	"\x0ftimeout_seconds\x18\x05 \x01(\x05R\x0etimeoutSeconds\x12\x1d\n" +
-	"\n" +
-	"for_person\x18\x06 \x01(\tR\tforPerson\"\x1f\n" +
+	"\x0ftimeout_seconds\x18\x05 \x01(\x05R\x0etimeoutSeconds\x12\"\n" +
+	"\rfor_person_id\x18\a \x01(\tR\vforPersonIdJ\x04\b\x06\x10\aR\n" +
+	"for_person\"\x1f\n" +
 	"\rGetRunRequest\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\x03R\x02id\"\xbf\x01\n" +
 	"\x0fListRunsRequest\x12#\n" +
@@ -3177,16 +3351,16 @@ const file_proto_ok_automation_v1_automation_proto_rawDesc = "" +
 	"\x05limit\x18\x05 \x01(\x05R\x05limit\x12\x1b\n" +
 	"\tbefore_id\x18\x06 \x01(\x03R\bbeforeId\"=\n" +
 	"\x10ListRunsResponse\x12)\n" +
-	"\x04runs\x18\x01 \x03(\v2\x15.ok.automation.v1.RunR\x04runs\"Y\n" +
+	"\x04runs\x18\x01 \x03(\v2\x15.ok.automation.v1.RunR\x04runs\"p\n" +
 	"\x10CancelRunRequest\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\x03R\x02id\x12\x16\n" +
-	"\x06reason\x18\x02 \x01(\tR\x06reason\x12\x1d\n" +
-	"\n" +
-	"for_person\x18\x03 \x01(\tR\tforPerson\"@\n" +
+	"\x06reason\x18\x02 \x01(\tR\x06reason\x12\"\n" +
+	"\rfor_person_id\x18\x04 \x01(\tR\vforPersonIdJ\x04\b\x03\x10\x04R\n" +
+	"for_person\"W\n" +
 	"\x0fRerunRunRequest\x12\x0e\n" +
-	"\x02id\x18\x01 \x01(\x03R\x02id\x12\x1d\n" +
-	"\n" +
-	"for_person\x18\x02 \x01(\tR\tforPerson\"P\n" +
+	"\x02id\x18\x01 \x01(\x03R\x02id\x12\"\n" +
+	"\rfor_person_id\x18\x03 \x01(\tR\vforPersonIdJ\x04\b\x02\x10\x03R\n" +
+	"for_person\"P\n" +
 	"\x0eReadLogRequest\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\x03R\x02id\x12\x16\n" +
 	"\x06offset\x18\x02 \x01(\x03R\x06offset\x12\x16\n" +
@@ -3194,14 +3368,17 @@ const file_proto_ok_automation_v1_automation_proto_rawDesc = "" +
 	"\bLogChunk\x12\x16\n" +
 	"\x06offset\x18\x01 \x01(\x03R\x06offset\x12\x12\n" +
 	"\x04data\x18\x02 \x01(\fR\x04data\x12\x10\n" +
-	"\x03end\x18\x03 \x01(\bR\x03end\"I\n" +
+	"\x03end\x18\x03 \x01(\bR\x03end\"]\n" +
 	"\fLeaseRequest\x12\x16\n" +
 	"\x06worker\x18\x01 \x01(\tR\x06worker\x12!\n" +
-	"\fwait_seconds\x18\x02 \x01(\x05R\vwaitSeconds\"\x7f\n" +
+	"\fwait_seconds\x18\x02 \x01(\x05R\vwaitSeconds\x12\x12\n" +
+	"\x04pool\x18\x03 \x01(\tR\x04pool\"\xae\x01\n" +
 	"\rLeaseResponse\x12'\n" +
 	"\x03run\x18\x01 \x01(\v2\x15.ok.automation.v1.RunR\x03run\x12+\n" +
-	"\x11heartbeat_seconds\x18\x02 \x01(\x05R\x10heartbeatSeconds\x12\x18\n" +
-	"\acontext\x18\x03 \x01(\fR\acontext\"A\n" +
+	"\x11heartbeat_seconds\x18\x02 \x01(\x05R\x10heartbeatSeconds\x12\x14\n" +
+	"\x05cache\x18\x04 \x01(\bR\x05cache\x12\x18\n" +
+	"\acontext\x18\x03 \x01(\fR\acontext\x12\x17\n" +
+	"\arun_key\x18\x05 \x01(\fR\x06runKey\"A\n" +
 	"\x10HeartbeatRequest\x12\x15\n" +
 	"\x06run_id\x18\x01 \x01(\x03R\x05runId\x12\x16\n" +
 	"\x06worker\x18\x02 \x01(\tR\x06worker\"\xc3\x01\n" +
@@ -3247,7 +3424,11 @@ const file_proto_ok_automation_v1_automation_proto_rawDesc = "" +
 	"\rGetPreRequest\x12#\n" +
 	"\rrepository_id\x18\x01 \x01(\x03R\frepositoryId\x12\x1b\n" +
 	"\tcl_number\x18\x02 \x01(\x03R\bclNumber\x12\x1a\n" +
-	"\bpatchset\x18\x03 \x01(\x05R\bpatchset\"\x87\x03\n" +
+	"\bpatchset\x18\x03 \x01(\x05R\bpatchset\"w\n" +
+	"\x0fStartPreRequest\x12#\n" +
+	"\rrepository_id\x18\x01 \x01(\x03R\frepositoryId\x12\x1b\n" +
+	"\tcl_number\x18\x02 \x01(\x03R\bclNumber\x12\"\n" +
+	"\rfor_person_id\x18\x03 \x01(\tR\vforPersonId\"\x87\x03\n" +
 	"\x03Pre\x127\n" +
 	"\averdict\x18\x01 \x01(\x0e2\x1d.ok.automation.v1.Pre.VerdictR\averdict\x12)\n" +
 	"\x04plan\x18\x02 \x01(\v2\x15.ok.automation.v1.RunR\x04plan\x12)\n" +
@@ -3261,20 +3442,20 @@ const file_proto_ok_automation_v1_automation_proto_rawDesc = "" +
 	"\x0fVERDICT_PENDING\x10\x02\x12\x12\n" +
 	"\x0eVERDICT_PASSED\x10\x03\x12\x12\n" +
 	"\x0eVERDICT_FAILED\x10\x04\"\x10\n" +
-	"\x0eFinishResponse\"\xc3\x01\n" +
+	"\x0eFinishResponse\"\xda\x01\n" +
 	"\rSubmitRequest\x12#\n" +
 	"\rrepository_id\x18\x01 \x01(\x03R\frepositoryId\x124\n" +
-	"\x03cls\x18\x02 \x03(\v2\".ok.automation.v1.SubmitRequest.CLR\x03cls\x12\x1d\n" +
-	"\n" +
-	"for_person\x18\x03 \x01(\tR\tforPerson\x1a8\n" +
+	"\x03cls\x18\x02 \x03(\v2\".ok.automation.v1.SubmitRequest.CLR\x03cls\x12\"\n" +
+	"\rfor_person_id\x18\x04 \x01(\tR\vforPersonId\x1a8\n" +
 	"\x02CL\x12\x16\n" +
 	"\x06number\x18\x01 \x01(\x03R\x06number\x12\x1a\n" +
-	"\bpatchset\x18\x02 \x01(\x05R\bpatchset\"`\n" +
+	"\bpatchset\x18\x02 \x01(\x05R\bpatchsetJ\x04\b\x03\x10\x04R\n" +
+	"for_person\"w\n" +
 	"\x17CancelSubmissionRequest\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\x03R\x02id\x12\x16\n" +
-	"\x06reason\x18\x02 \x01(\tR\x06reason\x12\x1d\n" +
-	"\n" +
-	"for_person\x18\x03 \x01(\tR\tforPerson\"&\n" +
+	"\x06reason\x18\x02 \x01(\tR\x06reason\x12\"\n" +
+	"\rfor_person_id\x18\x04 \x01(\tR\vforPersonIdJ\x04\b\x03\x10\x04R\n" +
+	"for_person\"&\n" +
 	"\x14GetSubmissionRequest\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\x03R\x02id\"p\n" +
 	"\x16ListSubmissionsRequest\x12#\n" +
@@ -3282,13 +3463,14 @@ const file_proto_ok_automation_v1_automation_proto_rawDesc = "" +
 	"\tcl_number\x18\x02 \x01(\x03R\bclNumber\x12\x14\n" +
 	"\x05limit\x18\x03 \x01(\x05R\x05limit\"Y\n" +
 	"\x17ListSubmissionsResponse\x12>\n" +
-	"\vsubmissions\x18\x01 \x03(\v2\x1c.ok.automation.v1.SubmissionR\vsubmissions\"\xfe\x04\n" +
+	"\vsubmissions\x18\x01 \x03(\v2\x1c.ok.automation.v1.SubmissionR\vsubmissions\"\xbd\x05\n" +
 	"\n" +
 	"Submission\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\x03R\x02id\x12#\n" +
 	"\rrepository_id\x18\x02 \x01(\x03R\frepositoryId\x121\n" +
-	"\x03cls\x18\x03 \x03(\v2\x1f.ok.automation.v1.Submission.CLR\x03cls\x12!\n" +
-	"\fsubmitted_by\x18\x04 \x01(\tR\vsubmittedBy\x12;\n" +
+	"\x03cls\x18\x03 \x03(\v2\x1f.ok.automation.v1.Submission.CLR\x03cls\x12&\n" +
+	"\x0fsubmitted_by_id\x18\v \x01(\tR\rsubmittedById\x12$\n" +
+	"\x0ecanceled_by_id\x18\f \x01(\tR\fcanceledById\x12;\n" +
 	"\x06status\x18\x05 \x01(\x0e2#.ok.automation.v1.Submission.StatusR\x06status\x12\x16\n" +
 	"\x06reason\x18\x06 \x01(\tR\x06reason\x12\x12\n" +
 	"\x04note\x18\a \x01(\tR\x04note\x129\n" +
@@ -3307,7 +3489,7 @@ const file_proto_ok_automation_v1_automation_proto_rawDesc = "" +
 	"\rSTATUS_ACTIVE\x10\x01\x12\x11\n" +
 	"\rSTATUS_LANDED\x10\x02\x12\x11\n" +
 	"\rSTATUS_FAILED\x10\x03\x12\x13\n" +
-	"\x0fSTATUS_CANCELED\x10\x04\"\xa8\b\n" +
+	"\x0fSTATUS_CANCELED\x10\x04J\x04\b\x04\x10\x05R\fsubmitted_by\"\xa8\b\n" +
 	"\aAttempt\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\x03R\x02id\x12\x12\n" +
 	"\x04base\x18\x02 \x01(\fR\x04base\x12\x19\n" +
@@ -3353,7 +3535,10 @@ const file_proto_ok_automation_v1_automation_proto_rawDesc = "" +
 	"\x06run_id\x18\x01 \x01(\x03R\x05runId\x12\x16\n" +
 	"\x06worker\x18\x02 \x01(\tR\x06worker\x12\x16\n" +
 	"\x06reason\x18\x03 \x01(\tR\x06reason\"\x11\n" +
-	"\x0fReleaseResponse2\xe8\x06\n" +
+	"\x0fReleaseResponse\"A\n" +
+	"\x0fCheckRunRequest\x12\x15\n" +
+	"\x06run_id\x18\x01 \x01(\x03R\x05runId\x12\x17\n" +
+	"\arun_key\x18\x02 \x01(\fR\x06runKey2\xae\a\n" +
 	"\x04Runs\x12G\n" +
 	"\x06Submit\x12\x1f.ok.automation.v1.SubmitRequest\x1a\x1c.ok.automation.v1.Submission\x12[\n" +
 	"\x10CancelSubmission\x12).ok.automation.v1.CancelSubmissionRequest\x1a\x1c.ok.automation.v1.Submission\x12U\n" +
@@ -3365,7 +3550,8 @@ const file_proto_ok_automation_v1_automation_proto_rawDesc = "" +
 	"\tCancelRun\x12\".ok.automation.v1.CancelRunRequest\x1a\x15.ok.automation.v1.Run\x12D\n" +
 	"\bRerunRun\x12!.ok.automation.v1.RerunRunRequest\x1a\x15.ok.automation.v1.Run\x12I\n" +
 	"\aReadLog\x12 .ok.automation.v1.ReadLogRequest\x1a\x1a.ok.automation.v1.LogChunk0\x01\x12@\n" +
-	"\x06GetPre\x12\x1f.ok.automation.v1.GetPreRequest\x1a\x15.ok.automation.v1.Pre\x1a\x05\xc2\xf3\x18\x01\f2\xdf\x01\n" +
+	"\x06GetPre\x12\x1f.ok.automation.v1.GetPreRequest\x1a\x15.ok.automation.v1.Pre\x12D\n" +
+	"\bStartPre\x12!.ok.automation.v1.StartPreRequest\x1a\x15.ok.automation.v1.Pre\x1a\x05\xc2\xf3\x18\x01\f2\xdf\x01\n" +
 	"\x06Pushes\x12D\n" +
 	"\bStartRun\x12!.ok.automation.v1.StartRunRequest\x1a\x15.ok.automation.v1.Run\x12@\n" +
 	"\x06GetRun\x12\x1f.ok.automation.v1.GetRunRequest\x1a\x15.ok.automation.v1.Run\x12F\n" +
@@ -3375,7 +3561,10 @@ const file_proto_ok_automation_v1_automation_proto_rawDesc = "" +
 	"\tHeartbeat\x12\".ok.automation.v1.HeartbeatRequest\x1a#.ok.automation.v1.HeartbeatResponse\x12V\n" +
 	"\tAppendLog\x12\".ok.automation.v1.AppendLogRequest\x1a#.ok.automation.v1.AppendLogResponse(\x01\x12K\n" +
 	"\x06Finish\x12\x1f.ok.automation.v1.FinishRequest\x1a .ok.automation.v1.FinishResponse\x12N\n" +
-	"\aRelease\x12 .ok.automation.v1.ReleaseRequest\x1a!.ok.automation.v1.ReleaseResponse\x1a\x05\xc2\xf3\x18\x01\x0eB9Z7github.com/Cidan/ok/proto/ok/automation/v1;automationpbb\x06proto3"
+	"\aRelease\x12 .ok.automation.v1.ReleaseRequest\x1a!.ok.automation.v1.ReleaseResponse\x1a\x05\xc2\xf3\x18\x01\x0e2Y\n" +
+	"\n" +
+	"SecretRuns\x12D\n" +
+	"\bCheckRun\x12!.ok.automation.v1.CheckRunRequest\x1a\x15.ok.automation.v1.Run\x1a\x05\xc2\xf3\x18\x01\x11B9Z7github.com/Cidan/ok/proto/ok/automation/v1;automationpbb\x06proto3"
 
 var (
 	file_proto_ok_automation_v1_automation_proto_rawDescOnce sync.Once
@@ -3390,7 +3579,7 @@ func file_proto_ok_automation_v1_automation_proto_rawDescGZIP() []byte {
 }
 
 var file_proto_ok_automation_v1_automation_proto_enumTypes = make([]protoimpl.EnumInfo, 8)
-var file_proto_ok_automation_v1_automation_proto_msgTypes = make([]protoimpl.MessageInfo, 38)
+var file_proto_ok_automation_v1_automation_proto_msgTypes = make([]protoimpl.MessageInfo, 40)
 var file_proto_ok_automation_v1_automation_proto_goTypes = []any{
 	(Job_Kind)(0),                   // 0: ok.automation.v1.Job.Kind
 	(Origin_Phase)(0),               // 1: ok.automation.v1.Origin.Phase
@@ -3423,22 +3612,24 @@ var file_proto_ok_automation_v1_automation_proto_goTypes = []any{
 	(*PlannedJob)(nil),              // 28: ok.automation.v1.PlannedJob
 	(*SkippedJob)(nil),              // 29: ok.automation.v1.SkippedJob
 	(*GetPreRequest)(nil),           // 30: ok.automation.v1.GetPreRequest
-	(*Pre)(nil),                     // 31: ok.automation.v1.Pre
-	(*FinishResponse)(nil),          // 32: ok.automation.v1.FinishResponse
-	(*SubmitRequest)(nil),           // 33: ok.automation.v1.SubmitRequest
-	(*CancelSubmissionRequest)(nil), // 34: ok.automation.v1.CancelSubmissionRequest
-	(*GetSubmissionRequest)(nil),    // 35: ok.automation.v1.GetSubmissionRequest
-	(*ListSubmissionsRequest)(nil),  // 36: ok.automation.v1.ListSubmissionsRequest
-	(*ListSubmissionsResponse)(nil), // 37: ok.automation.v1.ListSubmissionsResponse
-	(*Submission)(nil),              // 38: ok.automation.v1.Submission
-	(*Attempt)(nil),                 // 39: ok.automation.v1.Attempt
-	(*ReleaseRequest)(nil),          // 40: ok.automation.v1.ReleaseRequest
-	(*ReleaseResponse)(nil),         // 41: ok.automation.v1.ReleaseResponse
-	(*SubmitRequest_CL)(nil),        // 42: ok.automation.v1.SubmitRequest.CL
-	(*Submission_CL)(nil),           // 43: ok.automation.v1.Submission.CL
-	(*Attempt_Speculation)(nil),     // 44: ok.automation.v1.Attempt.Speculation
-	(*Attempt_Candidate)(nil),       // 45: ok.automation.v1.Attempt.Candidate
-	(*timestamppb.Timestamp)(nil),   // 46: google.protobuf.Timestamp
+	(*StartPreRequest)(nil),         // 31: ok.automation.v1.StartPreRequest
+	(*Pre)(nil),                     // 32: ok.automation.v1.Pre
+	(*FinishResponse)(nil),          // 33: ok.automation.v1.FinishResponse
+	(*SubmitRequest)(nil),           // 34: ok.automation.v1.SubmitRequest
+	(*CancelSubmissionRequest)(nil), // 35: ok.automation.v1.CancelSubmissionRequest
+	(*GetSubmissionRequest)(nil),    // 36: ok.automation.v1.GetSubmissionRequest
+	(*ListSubmissionsRequest)(nil),  // 37: ok.automation.v1.ListSubmissionsRequest
+	(*ListSubmissionsResponse)(nil), // 38: ok.automation.v1.ListSubmissionsResponse
+	(*Submission)(nil),              // 39: ok.automation.v1.Submission
+	(*Attempt)(nil),                 // 40: ok.automation.v1.Attempt
+	(*ReleaseRequest)(nil),          // 41: ok.automation.v1.ReleaseRequest
+	(*ReleaseResponse)(nil),         // 42: ok.automation.v1.ReleaseResponse
+	(*CheckRunRequest)(nil),         // 43: ok.automation.v1.CheckRunRequest
+	(*SubmitRequest_CL)(nil),        // 44: ok.automation.v1.SubmitRequest.CL
+	(*Submission_CL)(nil),           // 45: ok.automation.v1.Submission.CL
+	(*Attempt_Speculation)(nil),     // 46: ok.automation.v1.Attempt.Speculation
+	(*Attempt_Candidate)(nil),       // 47: ok.automation.v1.Attempt.Candidate
+	(*timestamppb.Timestamp)(nil),   // 48: google.protobuf.Timestamp
 }
 var file_proto_ok_automation_v1_automation_proto_depIdxs = []int32{
 	0,  // 0: ok.automation.v1.Job.kind:type_name -> ok.automation.v1.Job.Kind
@@ -3446,9 +3637,9 @@ var file_proto_ok_automation_v1_automation_proto_depIdxs = []int32{
 	8,  // 2: ok.automation.v1.Run.job:type_name -> ok.automation.v1.Job
 	9,  // 3: ok.automation.v1.Run.origin:type_name -> ok.automation.v1.Origin
 	2,  // 4: ok.automation.v1.Run.status:type_name -> ok.automation.v1.Run.Status
-	46, // 5: ok.automation.v1.Run.queued_at:type_name -> google.protobuf.Timestamp
-	46, // 6: ok.automation.v1.Run.started_at:type_name -> google.protobuf.Timestamp
-	46, // 7: ok.automation.v1.Run.finished_at:type_name -> google.protobuf.Timestamp
+	48, // 5: ok.automation.v1.Run.queued_at:type_name -> google.protobuf.Timestamp
+	48, // 6: ok.automation.v1.Run.started_at:type_name -> google.protobuf.Timestamp
+	48, // 7: ok.automation.v1.Run.finished_at:type_name -> google.protobuf.Timestamp
 	11, // 8: ok.automation.v1.Run.pushed:type_name -> ok.automation.v1.PushedImage
 	8,  // 9: ok.automation.v1.StartRunRequest.job:type_name -> ok.automation.v1.Job
 	9,  // 10: ok.automation.v1.StartRunRequest.origin:type_name -> ok.automation.v1.Origin
@@ -3465,26 +3656,26 @@ var file_proto_ok_automation_v1_automation_proto_depIdxs = []int32{
 	10, // 21: ok.automation.v1.Pre.plan:type_name -> ok.automation.v1.Run
 	10, // 22: ok.automation.v1.Pre.jobs:type_name -> ok.automation.v1.Run
 	29, // 23: ok.automation.v1.Pre.skipped:type_name -> ok.automation.v1.SkippedJob
-	42, // 24: ok.automation.v1.SubmitRequest.cls:type_name -> ok.automation.v1.SubmitRequest.CL
-	38, // 25: ok.automation.v1.ListSubmissionsResponse.submissions:type_name -> ok.automation.v1.Submission
-	43, // 26: ok.automation.v1.Submission.cls:type_name -> ok.automation.v1.Submission.CL
+	44, // 24: ok.automation.v1.SubmitRequest.cls:type_name -> ok.automation.v1.SubmitRequest.CL
+	39, // 25: ok.automation.v1.ListSubmissionsResponse.submissions:type_name -> ok.automation.v1.Submission
+	45, // 26: ok.automation.v1.Submission.cls:type_name -> ok.automation.v1.Submission.CL
 	5,  // 27: ok.automation.v1.Submission.status:type_name -> ok.automation.v1.Submission.Status
-	46, // 28: ok.automation.v1.Submission.created_at:type_name -> google.protobuf.Timestamp
-	46, // 29: ok.automation.v1.Submission.finished_at:type_name -> google.protobuf.Timestamp
-	39, // 30: ok.automation.v1.Submission.attempts:type_name -> ok.automation.v1.Attempt
-	44, // 31: ok.automation.v1.Attempt.chain:type_name -> ok.automation.v1.Attempt.Speculation
+	48, // 28: ok.automation.v1.Submission.created_at:type_name -> google.protobuf.Timestamp
+	48, // 29: ok.automation.v1.Submission.finished_at:type_name -> google.protobuf.Timestamp
+	40, // 30: ok.automation.v1.Submission.attempts:type_name -> ok.automation.v1.Attempt
+	46, // 31: ok.automation.v1.Attempt.chain:type_name -> ok.automation.v1.Attempt.Speculation
 	6,  // 32: ok.automation.v1.Attempt.status:type_name -> ok.automation.v1.Attempt.Status
 	7,  // 33: ok.automation.v1.Attempt.verdict:type_name -> ok.automation.v1.Attempt.Verdict
-	46, // 34: ok.automation.v1.Attempt.created_at:type_name -> google.protobuf.Timestamp
-	46, // 35: ok.automation.v1.Attempt.finished_at:type_name -> google.protobuf.Timestamp
-	45, // 36: ok.automation.v1.Attempt.candidates:type_name -> ok.automation.v1.Attempt.Candidate
+	48, // 34: ok.automation.v1.Attempt.created_at:type_name -> google.protobuf.Timestamp
+	48, // 35: ok.automation.v1.Attempt.finished_at:type_name -> google.protobuf.Timestamp
+	47, // 36: ok.automation.v1.Attempt.candidates:type_name -> ok.automation.v1.Attempt.Candidate
 	10, // 37: ok.automation.v1.Attempt.Candidate.plan:type_name -> ok.automation.v1.Run
 	10, // 38: ok.automation.v1.Attempt.Candidate.jobs:type_name -> ok.automation.v1.Run
 	29, // 39: ok.automation.v1.Attempt.Candidate.skipped:type_name -> ok.automation.v1.SkippedJob
-	33, // 40: ok.automation.v1.Runs.Submit:input_type -> ok.automation.v1.SubmitRequest
-	34, // 41: ok.automation.v1.Runs.CancelSubmission:input_type -> ok.automation.v1.CancelSubmissionRequest
-	35, // 42: ok.automation.v1.Runs.GetSubmission:input_type -> ok.automation.v1.GetSubmissionRequest
-	36, // 43: ok.automation.v1.Runs.ListSubmissions:input_type -> ok.automation.v1.ListSubmissionsRequest
+	34, // 40: ok.automation.v1.Runs.Submit:input_type -> ok.automation.v1.SubmitRequest
+	35, // 41: ok.automation.v1.Runs.CancelSubmission:input_type -> ok.automation.v1.CancelSubmissionRequest
+	36, // 42: ok.automation.v1.Runs.GetSubmission:input_type -> ok.automation.v1.GetSubmissionRequest
+	37, // 43: ok.automation.v1.Runs.ListSubmissions:input_type -> ok.automation.v1.ListSubmissionsRequest
 	12, // 44: ok.automation.v1.Runs.StartRun:input_type -> ok.automation.v1.StartRunRequest
 	13, // 45: ok.automation.v1.Runs.GetRun:input_type -> ok.automation.v1.GetRunRequest
 	14, // 46: ok.automation.v1.Runs.ListRuns:input_type -> ok.automation.v1.ListRunsRequest
@@ -3492,35 +3683,39 @@ var file_proto_ok_automation_v1_automation_proto_depIdxs = []int32{
 	17, // 48: ok.automation.v1.Runs.RerunRun:input_type -> ok.automation.v1.RerunRunRequest
 	18, // 49: ok.automation.v1.Runs.ReadLog:input_type -> ok.automation.v1.ReadLogRequest
 	30, // 50: ok.automation.v1.Runs.GetPre:input_type -> ok.automation.v1.GetPreRequest
-	12, // 51: ok.automation.v1.Pushes.StartRun:input_type -> ok.automation.v1.StartRunRequest
-	13, // 52: ok.automation.v1.Pushes.GetRun:input_type -> ok.automation.v1.GetRunRequest
-	16, // 53: ok.automation.v1.Pushes.CancelRun:input_type -> ok.automation.v1.CancelRunRequest
-	20, // 54: ok.automation.v1.Work.Lease:input_type -> ok.automation.v1.LeaseRequest
-	22, // 55: ok.automation.v1.Work.Heartbeat:input_type -> ok.automation.v1.HeartbeatRequest
-	24, // 56: ok.automation.v1.Work.AppendLog:input_type -> ok.automation.v1.AppendLogRequest
-	26, // 57: ok.automation.v1.Work.Finish:input_type -> ok.automation.v1.FinishRequest
-	40, // 58: ok.automation.v1.Work.Release:input_type -> ok.automation.v1.ReleaseRequest
-	38, // 59: ok.automation.v1.Runs.Submit:output_type -> ok.automation.v1.Submission
-	38, // 60: ok.automation.v1.Runs.CancelSubmission:output_type -> ok.automation.v1.Submission
-	38, // 61: ok.automation.v1.Runs.GetSubmission:output_type -> ok.automation.v1.Submission
-	37, // 62: ok.automation.v1.Runs.ListSubmissions:output_type -> ok.automation.v1.ListSubmissionsResponse
-	10, // 63: ok.automation.v1.Runs.StartRun:output_type -> ok.automation.v1.Run
-	10, // 64: ok.automation.v1.Runs.GetRun:output_type -> ok.automation.v1.Run
-	15, // 65: ok.automation.v1.Runs.ListRuns:output_type -> ok.automation.v1.ListRunsResponse
-	10, // 66: ok.automation.v1.Runs.CancelRun:output_type -> ok.automation.v1.Run
-	10, // 67: ok.automation.v1.Runs.RerunRun:output_type -> ok.automation.v1.Run
-	19, // 68: ok.automation.v1.Runs.ReadLog:output_type -> ok.automation.v1.LogChunk
-	31, // 69: ok.automation.v1.Runs.GetPre:output_type -> ok.automation.v1.Pre
-	10, // 70: ok.automation.v1.Pushes.StartRun:output_type -> ok.automation.v1.Run
-	10, // 71: ok.automation.v1.Pushes.GetRun:output_type -> ok.automation.v1.Run
-	10, // 72: ok.automation.v1.Pushes.CancelRun:output_type -> ok.automation.v1.Run
-	21, // 73: ok.automation.v1.Work.Lease:output_type -> ok.automation.v1.LeaseResponse
-	23, // 74: ok.automation.v1.Work.Heartbeat:output_type -> ok.automation.v1.HeartbeatResponse
-	25, // 75: ok.automation.v1.Work.AppendLog:output_type -> ok.automation.v1.AppendLogResponse
-	32, // 76: ok.automation.v1.Work.Finish:output_type -> ok.automation.v1.FinishResponse
-	41, // 77: ok.automation.v1.Work.Release:output_type -> ok.automation.v1.ReleaseResponse
-	59, // [59:78] is the sub-list for method output_type
-	40, // [40:59] is the sub-list for method input_type
+	31, // 51: ok.automation.v1.Runs.StartPre:input_type -> ok.automation.v1.StartPreRequest
+	12, // 52: ok.automation.v1.Pushes.StartRun:input_type -> ok.automation.v1.StartRunRequest
+	13, // 53: ok.automation.v1.Pushes.GetRun:input_type -> ok.automation.v1.GetRunRequest
+	16, // 54: ok.automation.v1.Pushes.CancelRun:input_type -> ok.automation.v1.CancelRunRequest
+	20, // 55: ok.automation.v1.Work.Lease:input_type -> ok.automation.v1.LeaseRequest
+	22, // 56: ok.automation.v1.Work.Heartbeat:input_type -> ok.automation.v1.HeartbeatRequest
+	24, // 57: ok.automation.v1.Work.AppendLog:input_type -> ok.automation.v1.AppendLogRequest
+	26, // 58: ok.automation.v1.Work.Finish:input_type -> ok.automation.v1.FinishRequest
+	41, // 59: ok.automation.v1.Work.Release:input_type -> ok.automation.v1.ReleaseRequest
+	43, // 60: ok.automation.v1.SecretRuns.CheckRun:input_type -> ok.automation.v1.CheckRunRequest
+	39, // 61: ok.automation.v1.Runs.Submit:output_type -> ok.automation.v1.Submission
+	39, // 62: ok.automation.v1.Runs.CancelSubmission:output_type -> ok.automation.v1.Submission
+	39, // 63: ok.automation.v1.Runs.GetSubmission:output_type -> ok.automation.v1.Submission
+	38, // 64: ok.automation.v1.Runs.ListSubmissions:output_type -> ok.automation.v1.ListSubmissionsResponse
+	10, // 65: ok.automation.v1.Runs.StartRun:output_type -> ok.automation.v1.Run
+	10, // 66: ok.automation.v1.Runs.GetRun:output_type -> ok.automation.v1.Run
+	15, // 67: ok.automation.v1.Runs.ListRuns:output_type -> ok.automation.v1.ListRunsResponse
+	10, // 68: ok.automation.v1.Runs.CancelRun:output_type -> ok.automation.v1.Run
+	10, // 69: ok.automation.v1.Runs.RerunRun:output_type -> ok.automation.v1.Run
+	19, // 70: ok.automation.v1.Runs.ReadLog:output_type -> ok.automation.v1.LogChunk
+	32, // 71: ok.automation.v1.Runs.GetPre:output_type -> ok.automation.v1.Pre
+	32, // 72: ok.automation.v1.Runs.StartPre:output_type -> ok.automation.v1.Pre
+	10, // 73: ok.automation.v1.Pushes.StartRun:output_type -> ok.automation.v1.Run
+	10, // 74: ok.automation.v1.Pushes.GetRun:output_type -> ok.automation.v1.Run
+	10, // 75: ok.automation.v1.Pushes.CancelRun:output_type -> ok.automation.v1.Run
+	21, // 76: ok.automation.v1.Work.Lease:output_type -> ok.automation.v1.LeaseResponse
+	23, // 77: ok.automation.v1.Work.Heartbeat:output_type -> ok.automation.v1.HeartbeatResponse
+	25, // 78: ok.automation.v1.Work.AppendLog:output_type -> ok.automation.v1.AppendLogResponse
+	33, // 79: ok.automation.v1.Work.Finish:output_type -> ok.automation.v1.FinishResponse
+	42, // 80: ok.automation.v1.Work.Release:output_type -> ok.automation.v1.ReleaseResponse
+	10, // 81: ok.automation.v1.SecretRuns.CheckRun:output_type -> ok.automation.v1.Run
+	61, // [61:82] is the sub-list for method output_type
+	40, // [40:61] is the sub-list for method input_type
 	40, // [40:40] is the sub-list for extension type_name
 	40, // [40:40] is the sub-list for extension extendee
 	0,  // [0:40] is the sub-list for field type_name
@@ -3537,9 +3732,9 @@ func file_proto_ok_automation_v1_automation_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_ok_automation_v1_automation_proto_rawDesc), len(file_proto_ok_automation_v1_automation_proto_rawDesc)),
 			NumEnums:      8,
-			NumMessages:   38,
+			NumMessages:   40,
 			NumExtensions: 0,
-			NumServices:   3,
+			NumServices:   4,
 		},
 		GoTypes:           file_proto_ok_automation_v1_automation_proto_goTypes,
 		DependencyIndexes: file_proto_ok_automation_v1_automation_proto_depIdxs,

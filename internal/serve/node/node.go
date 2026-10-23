@@ -2,6 +2,7 @@ package node
 
 import (
 	"context"
+	"net/http"
 
 	"github.com/go-chi/chi/v5"
 	"google.golang.org/grpc"
@@ -52,6 +53,14 @@ type Application interface {
 type WebServer interface {
 	Node
 	Mount(r *chi.Mux) (route string, err error)
+}
+
+// Front is a node that takes every request but the probes, gRPC's among them: ok's edge, which
+// forwards each to the role that serves it (docs/hosted.md, "Cells, as built"). A process with a
+// Front serves no service or web server of its own.
+type Front interface {
+	Node
+	Front() http.Handler
 }
 
 // SelfAuthenticated is a WebServer that authenticates its own requests — a protocol with its own

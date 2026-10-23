@@ -16,6 +16,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/Cidan/ok/internal/authz"
 	pages "github.com/Cidan/ok/internal/control/pages"
 	"github.com/Cidan/ok/internal/control/render"
 	"github.com/Cidan/ok/internal/control/review"
@@ -57,7 +58,7 @@ func (s *Server) tree(w http.ResponseWriter, r *http.Request) {
 			pages.ServeError(w, r, http.StatusNotFound, "Not Found", "Nothing has landed on main yet.")
 			return
 		}
-		pages.ServeRepoView(w, r, pages.RepoView{Chrome: chrome(repo, rev, at, p), IsEmpty: true})
+		pages.ServeRepoView(w, r, pages.RepoView{Chrome: s.landingChrome(r, repo, rev, at), IsEmpty: true})
 		return
 	}
 	resp, err := s.scm.Browse.ReadTree(r.Context(), &scmpb.ReadTreeRequest{RepositoryId: repo.GetId(), CommitId: at, Path: p, LastCommits: true})
@@ -84,7 +85,27 @@ func (s *Server) landing(w http.ResponseWriter, r *http.Request, repo *scmpb.Rep
 		fail(w, r, err)
 		return
 	}
-	pages.ServeRepoView(w, r, pages.RepoView{Chrome: chrome(repo, rev, at, ""), Entries: entries, Readme: readme, Latest: latest})
+	pages.ServeRepoView(w, r, pages.RepoView{Chrome: s.landingChrome(r, repo, rev, at), Entries: entries, Readme: readme, Latest: latest})
+}
+
+// landingChrome is the landing's header: with forking it, and syncing a fork, where the person
+// may.
+func (s *Server) landingChrome(r *http.Request, repo *scmpb.Repository, rev string, at []byte) pages.RepoChrome {
+	c := chrome(repo, rev, at, "")
+	who := principal(r)
+	if who == "" {
+		return c
+	}
+	if s.review.Decide(r.Context(), repo, who, authz.Fork).Allowed {
+		c.ForkHref = repoLink(repo.GetName()) + "/fork"
+	}
+	if c.Upstream != "" && s.review.Decide(r.Context(), repo, who, authz.Land).Allowed {
+		c.SyncAction = repoLink(repo.GetName()) + "/action/sync-fork"
+	}
+	if s.hooks != nil && s.hooks.Sealer != nil && s.review.Decide(r.Context(), repo, who, authz.Administer).Allowed {
+		c.WebhooksHref = repoLink(repo.GetName()) + "/webhooks"
+	}
+	return c
 }
 
 // directory shows a directory below the root in the browser: the tree, open down to it, and in

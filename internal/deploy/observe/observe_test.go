@@ -42,10 +42,13 @@ func replica(t *testing.T, url string) *store.Store {
 func withService(t *testing.T, st *store.Store) {
 	t.Helper()
 	ctx := context.Background()
-	for _, ev := range []store.FeedEvent{{Seq: 1, Repository: 1, Name: "smoke", Created: true}, {Seq: 2, Repository: 1, Head: make([]byte, 32), HeadSeq: 1}} {
+	for _, ev := range []store.FeedEvent{{Seq: 1, Repository: 1, Created: true}, {Seq: 2, Repository: 1, Head: make([]byte, 32), HeadSeq: 1}} {
 		if err := st.Apply(ctx, ev); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if err := st.ApplyDirectory(ctx, store.DirectoryEvent{Seq: 1, Repository: 1, FullName: "smoke"}); err != nil {
+		t.Fatal(err)
 	}
 	serve := workflow.Deploy{File: ".ok/workflow/deploy.yaml", Name: "serve", Images: []workflow.Image{{Container: "serve", Target: "//serve:push"}},
 		Workload: &workflow.Workload{Namespace: "smoke", Kind: workflow.Deployment, Name: "serve"}}

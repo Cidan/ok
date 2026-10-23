@@ -8,7 +8,7 @@
 use bytes::Bytes;
 use http_body_util::BodyExt as _;
 use ok_proto::ok::control::v1 as pb;
-use ok_store::client::DevPrincipal;
+use ok_store::client::Headers;
 use ok_store::shared;
 use tonic::Status;
 use tonic::codegen::http;
@@ -37,41 +37,51 @@ pub enum Event<T> {
 pub struct Control {
     client: Client,
     channel: ok_store::client::Conn,
-    dev: DevPrincipal,
+    headers: Headers,
     endpoint: String,
 }
 
 impl Control {
-    /// Connects to ok control at `endpoint` (`ok.web-url`, e.g. `https://ok.example.com`).
-    pub async fn connect(endpoint: &str) -> Result<Control, Status> {
+    /// Connects to ok control at `endpoint` (`ok.web-url`, e.g. `https://ok.example.com`) about
+    /// `repository`'s CLs (its full name), which every request names for the edge in front to
+    /// route by.
+    pub async fn connect(endpoint: &str, repository: &str) -> Result<Control, Status> {
         let endpoint = endpoint.trim_end_matches('/').to_owned();
+        let repository = repository.to_owned();
         shared::run(async move {
-            let (channel, dev) = ok_store::client::connect(&endpoint, None).await?;
+            let (channel, headers) = ok_store::client::connect(&endpoint, None).await?;
+            let headers = headers.for_repository(&repository);
             let client = pb::change_lists_client::ChangeListsClient::with_interceptor(
                 channel.clone(),
-                dev.clone(),
+                headers.clone(),
             )
             .max_decoding_message_size(MAX_MESSAGE);
             Ok(Control {
                 client,
                 channel,
-                dev,
+                headers,
                 endpoint,
             })
         })
         .await
     }
 
-    /// Runs one unary call on the store runtime.
+    /// Runs one unary call on the store runtime, again while its repository's network is frozen
+    /// between cells (ok_store::client::while_frozen).
     async fn call<Req, Resp, F, Fut>(&self, req: Req, f: F) -> Result<Resp, Status>
     where
-        Req: Send + 'static,
+        Req: Clone + Send + Sync + 'static,
         Resp: Send + 'static,
-        F: FnOnce(Client, Req) -> Fut + Send + 'static,
+        F: Fn(Client, Req) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<tonic::Response<Resp>, Status>> + Send,
     {
         let client = self.client.clone();
-        shared::run(async move { f(client, req).await.map(tonic::Response::into_inner) }).await
+        shared::run(async move {
+            ok_store::client::while_frozen(|| f(client.clone(), req.clone()))
+                .await
+                .map(tonic::Response::into_inner)
+        })
+        .await
     }
 
     pub async fn status(&self, cl: ClRef) -> Result<ClStatus, Status> {
@@ -146,6 +156,11 @@ impl Control {
 
     pub async fn rerun(&self, req: pb::RunsRequest) -> Result<ClStatus, Status> {
         self.call(req, |mut c, r| async move { c.rerun(r).await })
+            .await
+    }
+
+    pub async fn run_pre(&self, cl: ClRef) -> Result<ClStatus, Status> {
+        self.call(cl, |mut c, r| async move { c.run_pre(r).await })
             .await
     }
 
@@ -252,14 +267,17 @@ impl Control {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let uri = format!("{}/ok.control.v1.ChangeLists/{method}", self.endpoint);
         let channel = self.channel.clone();
-        let dev = self.dev.clone();
+        let headers = self.headers.clone();
         shared::spawn(async move {
             let mut req = http::Request::builder()
                 .method(http::Method::POST)
                 .uri(&uri)
                 .header(http::header::CONTENT_TYPE, "application/json");
-            if let Some(p) = dev.value() {
-                req = req.header("ok-dev-principal", p.as_bytes());
+            if let Some(p) = headers.dev_principal() {
+                req = req.header(ok_store::client::DEV_PRINCIPAL_KEY, p.as_bytes());
+            }
+            if let Some(r) = headers.repository() {
+                req = req.header(ok_store::client::REPOSITORY_KEY, r.as_bytes());
             }
             let body =
                 tonic::body::Body::new(http_body_util::Full::new(Bytes::from(body.to_string())));

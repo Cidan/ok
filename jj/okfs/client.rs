@@ -1,12 +1,12 @@
 //! jj's side of the daemon: finding it, starting it, and replacing one of another build
-//! (docs/okfs.md, "The daemon"). Where the user has a systemd user manager it runs as the
-//! `okfs.service` unit, which keeps its mounts' connections across restarts; on macOS as the
-//! launchd agent `ok.okfs`, which restarts it at once, its NFS mounts waiting for it; elsewhere it
-//! is a detached process of its own. `OKFS_DAEMON=spawn` forces the latter, and
-//! `OKFS_DAEMON=external` (tests) only connects to a daemon something else started.
+//! (docs/okfs.md, "The daemon"). The daemon runs under a service manager, never as a copy of jj
+//! that jj starts itself: where the user has a systemd user manager, as the `okfs.service` unit,
+//! which keeps its mounts' connections across restarts; on macOS, as the launchd agent `ok.okfs`,
+//! which restarts it at once, its NFS mounts waiting for it. Elsewhere jj only connects, and says
+//! how to start one (`jj fs daemon`, under whatever supervises the machine's processes) when none
+//! runs. `OKFS_DAEMON=external` (tests) only connects, to a daemon of any build.
 
 use std::io;
-use std::os::unix::process::CommandExt as _;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -32,9 +32,9 @@ pub fn under_launchd() -> bool {
     std::env::var("XPC_SERVICE_NAME").is_ok_and(|n| n == LAUNCHD_LABEL)
 }
 
-/// Whether the daemon runs as a launchd agent here: on macOS, unless forced to spawn.
+/// Whether the daemon runs as a launchd agent here: on macOS.
 fn launchd() -> bool {
-    cfg!(target_os = "macos") && mode() != "spawn"
+    cfg!(target_os = "macos")
 }
 
 fn mode() -> String {
@@ -43,9 +43,6 @@ fn mode() -> String {
 
 /// Whether the user has a systemd user manager to run the daemon under.
 fn systemd_user() -> bool {
-    if mode() == "spawn" {
-        return false;
-    }
     std::env::var_os("XDG_RUNTIME_DIR")
         .is_some_and(|d| Path::new(&d).join("systemd/private").exists())
 }
@@ -186,7 +183,12 @@ fn start(paths: &Paths) -> io::Result<()> {
     if launchd() {
         return launch(paths, false);
     }
-    spawn(paths)
+    Err(io::Error::other(format!(
+        "no okfs daemon runs at {}, and this machine has no service manager for jj to run one under \
+         (no systemd user manager, and this is not macOS): start it yourself — `jj fs daemon`, under \
+         whatever supervises this machine's processes (docs/okfs.md, \"The daemon\")",
+        paths.socket().display()
+    )))
 }
 
 /// The launchd domain the agent runs in: the user's, which is there whether or not anyone is
@@ -333,31 +335,6 @@ fn launch(paths: &Paths, replace: bool) -> io::Result<()> {
     run(Command::new("launchctl").args(args))
 }
 
-/// Starts the daemon as a detached process of its own, logging to the state directory.
-fn spawn(paths: &Paths) -> io::Result<()> {
-    private_dir(&paths.state)?;
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(paths.state.join("daemon.log"))?;
-    let mut cmd = Command::new(std::env::current_exe()?);
-    cmd.args(["fs", "daemon"])
-        .stdin(Stdio::null())
-        .stdout(log.try_clone()?)
-        .stderr(log)
-        .env_remove("NOTIFY_SOCKET");
-    unsafe {
-        cmd.pre_exec(|| {
-            if libc::setsid() < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    cmd.spawn()?;
-    Ok(())
-}
-
 /// Replaces a daemon of another build with this one.
 fn restart(paths: &Paths, pid: u32) -> io::Result<()> {
     if mode() == "external" {
@@ -372,20 +349,11 @@ fn restart(paths: &Paths, pid: u32) -> io::Result<()> {
     if launchd() {
         return launch(paths, true);
     }
-    unsafe {
-        libc::kill(pid as i32, libc::SIGTERM);
-    }
-    let deadline = Instant::now() + Duration::from_secs(30);
-    // Signal 0 checks the process is there, sending nothing.
-    while unsafe { libc::kill(pid as i32, 0) } == 0 {
-        if Instant::now() > deadline {
-            return Err(io::Error::other(format!(
-                "the old okfs daemon (pid {pid}) did not exit"
-            )));
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    spawn(paths)
+    Err(io::Error::other(format!(
+        "the okfs daemon at {} (pid {pid}) is another build of jj, and only what started it can \
+         replace it: stop it, and start `jj fs daemon` again (docs/okfs.md, \"The daemon\")",
+        paths.socket().display()
+    )))
 }
 
 /// Whether lingering is on for this user (mounts outlive the login session).

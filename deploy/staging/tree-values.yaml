@@ -1,0 +1,15 @@
+# The groups-and-ACLs tree on staging (README.md), over values.yaml: the deployer, which applies the
+# tree a repository called tree holds to ok identity (docs/identity.md) — what an acl.yaml under
+# //secret names (secrets-values.yaml). Its image is the runner's: PROJECT and TAG as values.yaml's.
+runnerImage: {repository: us-central1-docker.pkg.dev/PROJECT/ok/ok-runner, tag: TAG}
+config:
+  identity:
+    tree_repository: tree
+deploy:
+  enabled: true
+  checkout: real
+  serviceAccountAnnotations: {iam.gke.io/gcp-service-account: ok-staging-ok@PROJECT.iam.gserviceaccount.com}
+  securityContext:
+    seccompProfile: {type: Unconfined}
+    appArmorProfile: {type: Unconfined}
+    allowPrivilegeEscalation: false

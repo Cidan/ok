@@ -6,7 +6,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"google.golang.org/grpc"
@@ -14,18 +13,24 @@ import (
 	"github.com/Cidan/ok/internal/blob"
 	"github.com/Cidan/ok/internal/bus"
 	"github.com/Cidan/ok/internal/bus/busconfig"
+	"github.com/Cidan/ok/internal/cells"
 	"github.com/Cidan/ok/internal/config"
 	"github.com/Cidan/ok/internal/credential"
-	"github.com/Cidan/ok/internal/devdir"
 	"github.com/Cidan/ok/internal/dial"
 	"github.com/Cidan/ok/internal/idclient"
+	"github.com/Cidan/ok/internal/names"
 	"github.com/Cidan/ok/internal/pgdb"
 	"github.com/Cidan/ok/internal/scm/server"
+	"github.com/Cidan/ok/internal/scm/service"
 	"github.com/Cidan/ok/internal/scm/store"
+	"github.com/Cidan/ok/internal/scm/store/backend"
 	scmpostgres "github.com/Cidan/ok/internal/scm/store/postgres"
+	scmspanner "github.com/Cidan/ok/internal/scm/store/spannerstore"
 	"github.com/Cidan/ok/internal/serve/authn"
 	"github.com/Cidan/ok/internal/serve/node"
+	"github.com/Cidan/ok/internal/spannerdb"
 	identitypb "github.com/Cidan/ok/proto/ok/identity/v1"
+	secretspb "github.com/Cidan/ok/proto/ok/secrets/v1"
 )
 
 // Schema is the PostgreSQL schema the SCM keeps its tables in.
@@ -64,6 +69,10 @@ type Options struct {
 	Stream bus.Stream
 	// Identity, when set, is ok identity, dialed as the role: tests.
 	Identity grpc.ClientConnInterface
+	// Secrets, when set, is ok secrets, dialed as the role: tests, and ok serve.
+	Secrets grpc.ClientConnInterface
+	// Peers, when set, connects to another cell's SCM at an address, as the role: tests.
+	Peers func(addr string) grpc.ClientConnInterface
 	// Roots, when set, are the identity CA's certificates as identity in the same process holds
 	// them (ok serve); unset, they are read from identity.
 	Roots *idclient.Roots
@@ -76,11 +85,23 @@ func OpenStore(ctx context.Context, cfg *config.Config, opts Options) (*store.St
 	return st, done, err
 }
 
-// open is OpenStore, with the pool the store is over.
+// open is OpenStore, with the pool the store is over: none on Spanner, where the SCM's database is
+// its own and the bus another backend's (config).
 func open(ctx context.Context, cfg *config.Config, opts Options) (*store.Store, *pgxpool.Pool, func(), error) {
 	done := func() {}
+	var b backend.Backend
 	pool := opts.Pool
-	if pool == nil {
+	if pool == nil && cfg.Database.Type == "spanner" {
+		db, err := spannerdb.Open(ctx, cfg.Database.Spanner, "scm")
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		done = db.Close
+		if b, err = scmspanner.Open(ctx, db.Admin, db.Client); err != nil {
+			done()
+			return nil, nil, nil, fmt.Errorf("the SCM's store: %w", err)
+		}
+	} else if pool == nil {
 		dsn, err := config.Secret(cfg.Database.URLFile)
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("database.url_file: %w", err)
@@ -102,14 +123,18 @@ func open(ctx context.Context, cfg *config.Config, opts Options) (*store.Store, 
 		}
 		blobs = s3
 	}
-	b, err := scmpostgres.Open(ctx, pool)
-	if err != nil {
-		done()
-		return nil, nil, nil, fmt.Errorf("the SCM's store: %w", err)
+	if b == nil {
+		pb, err := scmpostgres.Open(ctx, pool)
+		if err != nil {
+			done()
+			return nil, nil, nil, fmt.Errorf("the SCM's store: %w", err)
+		}
+		b = pb
 	}
 	st, err := store.New(b, blobs, store.Config{
 		Names: cfg.Names(), EmailDomain: cfg.SCM.EmailDomain,
 		ObjectCacheBytes: cfg.SCM.Cache.Objects, ChunkCacheBytes: cfg.SCM.Cache.Chunks, DiffCacheBytes: cfg.SCM.Cache.Diffs,
+		CodeIndexCacheBytes: cfg.SCM.Cache.CodeIndexes,
 	})
 	if err != nil {
 		done()
@@ -142,36 +167,40 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (*Role, error)
 		r.closers = append(r.closers, b.Close)
 		stream = b.Stream
 	}
+	// The stream's backend carries the signals (docs/hosted.md, "Signals").
+	if sig, ok := stream.(bus.Signals); ok {
+		st.SetSignals(sig)
+	}
 
 	hour := DefaultGCHour
 	if cfg.SCM.GCHour != nil {
 		hour = *cfg.SCM.GCHour
 	}
-	conn := opts.Identity
-	if conn == nil && opts.Dev && cfg.Services.Identity == "" {
-		// Development with no identity: callers are the principals they name, on loopback.
-		slog.Warn("scm: no services.identity, so every principal a caller names is trusted (-dev only)")
-		dir := devdir.Directory{Names: cfg.Names()}
-		r.Resolver = authn.NewResolver(authn.Config{Directory: dir, Dev: true, Roles: idclient.Roles(cfg)})
-		svc := server.New(st, dir)
-		r.Root = &assembly{deps: []node.Node{svc, server.NewGC(svc, hour), server.NewRelay(svc, stream)}}
-		ok = true
-		return r, nil
-	}
-	if conn == nil {
-		if cfg.Services.Identity == "" {
-			return nil, errors.New("services.identity is where the SCM reaches ok identity")
-		}
+	// dialOptions are how the SCM dials ok's other roles, as itself.
+	dialOptions := func() (dial.Options, error) {
 		base, err := idclient.Options(cfg.Services)
 		if err != nil {
-			return nil, err
+			return dial.Options{}, err
 		}
-		cred, err := idclient.Credential(cfg, base)
+		o := base
+		if opts.Dev && cfg.Workload.TokenFile == "" && cfg.Workload.CredentialDir == "" {
+			// Development, with no workload credential: the SCM names itself to a development
+			// identity, as ok serve's roles do.
+			o.DevPrincipal = cfg.RobotName(cfg.Roles.SCM)
+		} else if o.Credential, err = idclient.Credential(cfg, base); err != nil {
+			return dial.Options{}, err
+		}
+		return o, nil
+	}
+	conn := opts.Identity
+	if conn == nil {
+		if cfg.Services.Identity == "" {
+			return nil, errors.New("services.identity is where the SCM reaches ok identity, which knows its callers and names its repositories")
+		}
+		o, err := dialOptions()
 		if err != nil {
 			return nil, err
 		}
-		o := base
-		o.Credential = cred
 		c, err := dial.Dial(cfg.Services.Identity, o)
 		if err != nil {
 			return nil, err
@@ -192,8 +221,47 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (*Role, error)
 		Dev:           opts.Dev,
 		Roles:         idclient.Roles(cfg),
 	})
-	svc := server.New(st, identitypb.NewDirectoryClient(conn))
-	r.Root = &assembly{deps: []node.Node{svc, server.NewGC(svc, hour), server.NewRelay(svc, stream), roots}}
+	st.SetPrincipals(names.New(idclient.NewDirectory(conn)))
+	// ok secrets, which upload asks about secrets' versions and writers (docs/secrets.md, "The
+	// SCM"), where the installation runs it.
+	secConn := opts.Secrets
+	if secConn == nil && cfg.Services.Secrets != "" {
+		o, err := dialOptions()
+		if err != nil {
+			return nil, err
+		}
+		c, err := dial.Dial(cfg.Services.Secrets, o)
+		if err != nil {
+			return nil, err
+		}
+		r.closers = append(r.closers, func() { c.Close() })
+		secConn = c
+	}
+	if secConn != nil {
+		st.SetSecrets(service.SecretVersions{Client: secretspb.NewVersionsClient(secConn)})
+	}
+	ten := identitypb.NewTenancyClient(conn)
+	svc := server.New(st, identitypb.NewDirectoryClient(conn), ten, identitypb.NewAuthorizationClient(conn))
+	// Its cell's repositories, and other cells' SCMs where the directory says (docs/hosted.md,
+	// "Cells, as built").
+	peers := cells.NewPeers(identitypb.NewCellsClient(conn), func(addr string) (grpc.ClientConnInterface, func(), error) {
+		if opts.Peers != nil {
+			return opts.Peers(addr), nil, nil
+		}
+		o, err := dialOptions()
+		if err != nil {
+			return nil, nil, err
+		}
+		c, err := dial.Dial(addr, o)
+		if err != nil {
+			return nil, nil, err
+		}
+		return c, func() { c.Close() }, nil
+	})
+	r.closers = append(r.closers, peers.Close)
+	svc.InCell(cfg.Cell.Name, peerSCMs{peers})
+	r.Root = &assembly{deps: []node.Node{svc, server.NewGC(svc, hour), server.NewPurge(svc), server.NewSegments(svc, 0), server.NewFolds(svc), server.NewRelay(svc, stream),
+		server.NewMovePurge(svc), server.NewCodeSearch(svc), roots}}
 	ok = true
 	return r, nil
 }

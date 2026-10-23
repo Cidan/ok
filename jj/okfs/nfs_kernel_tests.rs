@@ -13,12 +13,12 @@ use okfs_nfs as nfs;
 use crate::fs::Mount;
 use crate::model::ROOT;
 use crate::model::resolved_terms;
-use crate::model_tests::base_tree;
 use crate::nfs::NfsMount;
 use crate::nfs::Refresh;
 use crate::testfix::Entry;
 use crate::testfix::Fixture;
 use crate::testfix::FixtureFetch;
+use crate::testfix::base_tree;
 
 /// Unmounts when dropped, forcing it, so a failed test leaves no mount behind.
 struct Mounted(std::path::PathBuf);

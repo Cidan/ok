@@ -1,0 +1,12 @@
+syntax = "proto3";
+
+package ok.v1;
+
+option go_package = "github.com/Cidan/ok/proto/ok/v1;okpb";
+
+// Moved details a request a cell refused because another cell holds the repository it names
+// (docs/hosted.md, "Cells, as built"): FAILED_PRECONDITION, naming the cell that does.
+message Moved {
+  int64 repository_id = 1;
+  string cell = 2;
+}

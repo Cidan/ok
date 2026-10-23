@@ -565,6 +565,22 @@ impl FsView for RemoteView {
             }))?;
         Ok(())
     }
+
+    fn seal_secret(&self, path: &RepoPath) -> std::io::Result<Option<pb::DirEntry>> {
+        match self
+            .client
+            .lock()
+            .unwrap()
+            .call(pb::request::Request::SealSecret(pb::SealSecret {
+                workspace_id: self.workspace_id.clone(),
+                path: path.as_internal_file_string().to_owned(),
+            }))? {
+            pb::response::Response::SealSecret(r) => Ok(r.entry),
+            _ => Err(std::io::Error::other(
+                "the okfs daemon answered SealSecret with something else",
+            )),
+        }
+    }
 }
 
 fn checkout_err(

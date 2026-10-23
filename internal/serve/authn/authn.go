@@ -17,7 +17,9 @@ package authn
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
@@ -35,6 +37,7 @@ import (
 	"google.golang.org/protobuf/reflect/protoregistry"
 	"google.golang.org/protobuf/types/descriptorpb"
 
+	"github.com/Cidan/ok/internal/authz"
 	"github.com/Cidan/ok/internal/credential"
 	okpb "github.com/Cidan/ok/proto/ok/v1"
 )
@@ -55,7 +58,12 @@ const (
 	ViaHeader     = "header"
 	ViaCredential = "credential"
 	ViaToken      = "token"
-	ViaSession    = "session"
+	// ViaPersonalToken is a person's personal token (okp_…), which narrows them (Caller.Token).
+	ViaPersonalToken = "personal-token"
+	// ViaInstallationToken is an app's installation token (oki_…): the app's robot, narrowed to
+	// its installation (Caller.Token).
+	ViaInstallationToken = "installation-token"
+	ViaSession           = "session"
 )
 
 // Caller is the principal a request is for.
@@ -70,7 +78,16 @@ type Caller struct {
 	Via string
 	// Credential is the device credential's ID, for a caller resolved from one.
 	Credential string
+	// Token is what the personal token a caller presented allows, which narrows them (Authorize);
+	// nil for none.
+	Token *authz.Token
+	// Role is which of ok's roles the caller is (Config.Roles); CALLER_UNSPECIFIED for anyone else —
+	// a person, or a robot of the installation's or an organization's, whom Authorize decides.
+	Role okpb.Caller
 }
+
+// IsRole reports whether the caller is one of ok's roles, which act for a person they checked.
+func (c Caller) IsRole() bool { return c.Role != okpb.Caller_CALLER_UNSPECIFIED }
 
 type callerKey struct{}
 
@@ -87,11 +104,22 @@ func FromContext(ctx context.Context) (Caller, bool) {
 
 // Principal is what the directory says of a principal.
 type Principal struct {
-	Name   string
-	ID     string
-	Human  bool
+	Name  string
+	ID    string
+	Human bool
+	// Org: an organization, which owns repositories and acts as no one — never a caller.
+	Org    bool
 	Active bool
+	// Scope is what a personal token allows, for a principal resolved from one.
+	Scope *authz.Token
 }
+
+// PersonalTokenPrefix starts every personal token, and InstallationTokenPrefix every app's
+// installation token.
+const (
+	PersonalTokenPrefix     = "okp_"
+	InstallationTokenPrefix = "oki_"
+)
 
 // ErrNotFound is the directory's answer for what it does not hold.
 var ErrNotFound = errors.New("not found")
@@ -100,11 +128,16 @@ var ErrNotFound = errors.New("not found")
 type Directory interface {
 	// Principal returns the principal with a name.
 	Principal(ctx context.Context, name string) (Principal, error)
+	// PrincipalByID returns the principal with a stable ID, under its current name; Active is
+	// false for one suspended or deleted.
+	PrincipalByID(ctx context.Context, id string) (Principal, error)
 	// Credential returns the principal a device credential (by ID) belongs to; Active is false
 	// when either the principal or the credential no longer stands.
 	Credential(ctx context.Context, id string) (Principal, error)
 	// Session returns the principal a browser session belongs to, while it is alive.
 	Session(ctx context.Context, id string) (Principal, error)
+	// Token returns the person a live personal token is theirs, its Scope what it allows.
+	Token(ctx context.Context, secret string) (Principal, error)
 }
 
 // TokenVerifier verifies a federated bearer token and names the principal it is for.
@@ -178,7 +211,7 @@ func (r *Resolver) lookup(ctx context.Context, key string, ask func(context.Cont
 			e = entry{expires: r.now().Add(NegativeTTL)}
 		case err != nil:
 			return nil, err
-		case p.Active:
+		case p.Active && !p.Org:
 			e = entry{p: p, ok: true, expires: r.now().Add(PositiveTTL)}
 		default:
 			e = entry{expires: r.now().Add(NegativeTTL)}
@@ -230,6 +263,13 @@ func (r *Resolver) Resolve(ctx context.Context, md metadata.MD, method string) (
 	case err != nil:
 		return Caller{}, false, status.Error(codes.Unavailable, "resolving the caller: "+err.Error())
 	}
+	if ok && !c.Human && c.Token == nil {
+		for k, name := range r.cfg.Roles {
+			if name != "" && name == c.Principal {
+				c.Role = k
+			}
+		}
+	}
 	return c, ok, nil
 }
 
@@ -259,13 +299,43 @@ func (r *Resolver) resolve(ctx context.Context, md metadata.MD, method string) (
 		if err != nil {
 			return Caller{}, false, err
 		}
-		if !ok || p.Name != v.Principal {
+		if ok && p.Name != v.Principal {
+			// A certificate issued under a name an installation's move gave up names the principal
+			// still: the old name is an alias of theirs, and a retired name is never anyone else's.
+			q, found, err := r.lookup(ctx, "alias:"+v.Principal, func(ctx context.Context) (Principal, error) {
+				return r.cfg.Directory.Principal(ctx, v.Principal)
+			})
+			if err != nil {
+				return Caller{}, false, err
+			}
+			ok = found && q.ID == p.ID
+		}
+		if !ok {
 			return Caller{}, false, errUnauthenticated{"the device credential is revoked, or its principal is not active"}
 		}
 		return Caller{Principal: p.Name, ID: p.ID, Human: p.Human, Via: ViaCredential, Credential: v.Credential}, true, nil
 	}
 	if auth := single(md, authorizationKey); auth != "" {
 		token, ok := strings.CutPrefix(auth, "Bearer ")
+		token = strings.TrimSpace(token)
+		personal, installation := strings.HasPrefix(token, PersonalTokenPrefix), strings.HasPrefix(token, InstallationTokenPrefix)
+		if ok && (personal || installation) {
+			// Cached by the secret's hash: no secret is kept as a key.
+			h := sha256.Sum256([]byte(token))
+			p, found, err := r.lookup(ctx, "token:"+hex.EncodeToString(h[:]), func(ctx context.Context) (Principal, error) {
+				return r.cfg.Directory.Token(ctx, token)
+			})
+			if err != nil {
+				return Caller{}, false, err
+			}
+			switch {
+			case personal && found && p.Human && p.Scope != nil:
+				return Caller{Principal: p.Name, ID: p.ID, Human: true, Via: ViaPersonalToken, Token: p.Scope}, true, nil
+			case installation && found && !p.Human && !p.Org && p.Scope != nil && p.Scope.Owner != "":
+				return Caller{Principal: p.Name, ID: p.ID, Via: ViaInstallationToken, Token: p.Scope}, true, nil
+			}
+			return Caller{}, false, errUnauthenticated{"the token is revoked, expired, or its holder no longer stands"}
+		}
 		if !ok || r.cfg.Tokens == nil {
 			return Caller{}, false, errUnauthenticated{"this server takes no such authorization"}
 		}
@@ -341,6 +411,15 @@ var open = map[string]bool{
 	"grpc.reflection.v1alpha.ServerReflection": true,
 }
 
+// foreign are services outside ok's protocols that ok serves to some callers: Bazel's remote cache,
+// which ok automation serves to workers (docs/hosted.md, "Hosted automation, as built").
+var foreign = map[string][]okpb.Caller{
+	"build.bazel.remote.execution.v2.ContentAddressableStorage": {okpb.Caller_CALLER_WORKER},
+	"build.bazel.remote.execution.v2.ActionCache":               {okpb.Caller_CALLER_WORKER},
+	"build.bazel.remote.execution.v2.Capabilities":              {okpb.Caller_CALLER_WORKER},
+	"google.bytestream.ByteStream":                              {okpb.Caller_CALLER_WORKER},
+}
+
 var callersCache sync.Map // service full name -> []okpb.Caller
 
 // Callers are the callers a service (by its full name) declares; a service declaring none admits
@@ -352,6 +431,8 @@ func Callers(service string) []okpb.Caller {
 	var out []okpb.Caller
 	if open[service] {
 		out = []okpb.Caller{okpb.Caller_CALLER_ANYONE}
+	} else if c, ok := foreign[service]; ok {
+		out = c
 	} else if d, err := protoregistry.GlobalFiles.FindDescriptorByName(protoreflect.FullName(service)); err == nil {
 		if sd, ok := d.(protoreflect.ServiceDescriptor); ok {
 			if opts, ok := sd.Options().(*descriptorpb.ServiceOptions); ok && opts != nil {

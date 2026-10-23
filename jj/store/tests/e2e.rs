@@ -1165,6 +1165,16 @@ async fn chunks_compressed_with_a_dictionary_reach_a_cold_machine() {
     let root = repo.store().root_commit();
     let commit = child(&mut tx, &root, &changes, "small files").await;
     tx.commit("small files").await.unwrap();
+    // Uploaded, so pinned: a dictionary is trained only on what its trainer has pinned.
+    let shared_a = ok_store::Shared::for_store_path(&a.repo_dir.join("store")).unwrap();
+    ok_store::changelists::upload(
+        &shared_a,
+        &[commit.id().clone()],
+        ok_store::pb::upload_request::Readiness::Ready,
+        Vec::new(),
+    )
+    .await
+    .unwrap();
 
     let report = ok_testscm::gc(&remote.name);
     assert!(

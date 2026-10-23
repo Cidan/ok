@@ -1,0 +1,82 @@
+package pages
+
+import (
+	"github.com/Cidan/ok/internal/web/layout"
+	"github.com/Cidan/ok/internal/web/nav"
+)
+
+// WebhooksPage is a repository's webhooks (docs/hosted.md, "ok control at scale, as built"): its
+// administrators' to add and remove, each with its latest deliveries.
+templ WebhooksPage(n nav.Model, v WebhooksView) {
+	@layout.Shell(shell("Webhooks · "+v.Chrome.Name+" · "+Brand, layout.LeftNav, n)) {
+		@WebhooksContent(v)
+	}
+}
+
+templ WebhooksContent(v WebhooksView) {
+	<div class="flex h-full flex-1 flex-col overflow-hidden">
+		<div class="shrink-0">
+			@PageHead(v.Chrome.Name, v.Chrome.Subtitle, "") {
+				@changesLink(v.Chrome.ChangesHref, "#repo-main")
+				@codeButton(v.Chrome.Clone)
+			}
+		</div>
+		<div id="repo-main" class="flex-1 overflow-y-auto">
+			<div class="mx-auto w-full max-w-5xl space-y-8 px-6 pb-16 sm:px-10">
+				<div>
+					<h2 class="text-xl font-semibold tracking-tight text-zinc-50">Webhooks</h2>
+					<p class="mt-1.5 text-sm text-zinc-400">ok POSTs each event a webhook wants to it, signed with its secret: <span class="font-mono text-zinc-300">X-Ok-Signature-256</span>, HMAC-SHA256 of the body.</p>
+				</div>
+				if !v.Enabled {
+					<div class="rounded-lg border border-zinc-800 bg-zinc-900/30 px-4 py-3 text-sm text-zinc-400">This installation keeps no webhooks: its administrators name a sealing key (<span class="font-mono">control.sealing_key_file</span>).</div>
+				} else {
+					if v.Error != "" {
+						<div class="rounded-lg border border-red-900/50 bg-red-950/20 px-4 py-3 text-sm text-red-400">{ v.Error }</div>
+					}
+					if v.Created != nil {
+						<div id="webhook-secret" class="rounded-lg border border-amber-700/50 bg-amber-950/20 px-4 py-3 text-sm text-amber-200">
+							<div>Its secret, shown this once — keep it where the endpoint checks signatures:</div>
+							<div class="mt-2 select-all break-all font-mono text-amber-100">{ v.Created.Secret }</div>
+						</div>
+					}
+					for _, w := range v.Hooks {
+						<section data-webhook class="rounded-lg border border-zinc-800 bg-zinc-900/40">
+							<div class="flex items-start gap-3 border-b border-zinc-800/70 px-4 py-3">
+								<div class="min-w-0 flex-1">
+									<div class="truncate font-mono text-sm text-zinc-100">{ w.URL }</div>
+									<div class="mt-0.5 text-xs text-zinc-500">{ w.Events } · added by { w.CreatedBy } { w.Ago }</div>
+								</div>
+								<form method="post" action={ templ.SafeURL(w.DeleteHref) }>
+									<button type="submit" class={ btnClass(btnSecondary) }>Remove</button>
+								</form>
+							</div>
+							if len(w.Deliveries) == 0 {
+								<div class="px-4 py-3 text-xs text-zinc-500">No deliveries yet.</div>
+							}
+							for _, d := range w.Deliveries {
+								<div data-delivery data-state={ d.State } class="flex items-center gap-3 border-b border-zinc-800/50 px-4 py-2 text-xs last:border-b-0">
+									<span class={ "w-20 shrink-0 font-medium", templ.KV("text-emerald-400", d.State == "delivered"), templ.KV("text-amber-400", d.State == "waiting"), templ.KV("text-red-400", d.State == "dead") }>{ d.State }</span>
+									<span class="w-12 shrink-0 font-mono text-zinc-400">{ d.Event }</span>
+									<span class="min-w-0 flex-1 truncate text-zinc-500">{ d.Detail }</span>
+									<span class="shrink-0 text-zinc-600">{ d.Ago }</span>
+									<form method="post" action={ templ.SafeURL(d.RedeliverHref) }>
+										<button type="submit" class="text-zinc-400 hover:text-zinc-200">Redeliver</button>
+									</form>
+								</div>
+							}
+						</section>
+					}
+					<form method="post" action={ templ.SafeURL(v.CreateHref) } class="max-w-xl space-y-4">
+						<h3 class="text-xs font-medium uppercase tracking-wide text-zinc-500">Add a webhook</h3>
+						<input name="url" type="url" required placeholder="https://example.com/ok" autocomplete="off" spellcheck="false" class="w-full rounded-lg border border-zinc-800 bg-zinc-900/50 px-3.5 py-2.5 font-mono text-sm text-zinc-100 placeholder:text-zinc-600 transition-colors focus:border-zinc-600 focus:outline-none"/>
+						<div class="flex gap-5 text-sm text-zinc-300">
+							<label class="flex items-center gap-2"><input type="checkbox" name="event" value="cl" checked class="accent-zinc-300"/> CL events and comments</label>
+							<label class="flex items-center gap-2"><input type="checkbox" name="event" value="push" class="accent-zinc-300"/> Main moved</label>
+						</div>
+						<button type="submit" class={ btnClass(btnInverse) }>Add webhook</button>
+					</form>
+				}
+			</div>
+		</div>
+	</div>
+}

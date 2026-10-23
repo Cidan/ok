@@ -11,8 +11,9 @@ import "google/protobuf/timestamp.proto";
 import "proto/ok/v1/annotations.proto";
 
 // Deployments serves ok control and the deployer's administrators. ok control acts on
-// behalf of a person it has authorized, and names them (for_person); an administrator acts as
-// itself.
+// behalf of a person it has authorized, and names them by stable ID (for_person_id); an
+// administrator acts as itself. Principals are named by stable ID throughout (docs/hosted.md,
+// "Tenancy, as built").
 service Deployments {
   // Only ok control, acting for the people it authorized.
   option (ok.v1.callers) = CALLER_CONTROL;
@@ -118,17 +119,23 @@ message GetDeploymentRequest {
 
 message RetryDeploymentRequest {
   int64 id = 1;
-  string for_person = 2;  // ok control only
+  string for_person_id = 3;  // ok control only
+  reserved 2;
+  reserved "for_person";
 }
 
 message HaltDeploymentRequest {
   int64 id = 1;
-  string for_person = 2;
+  string for_person_id = 3;
+  reserved 2;
+  reserved "for_person";
 }
 
 message AllowHazardsRequest {
   int64 id = 1;
-  string for_person = 2;
+  string for_person_id = 3;
+  reserved 2;
+  reserved "for_person";
 }
 
 // A deployment: one deploy, at one commit of main.
@@ -163,13 +170,11 @@ message Deployment {
   int64 to_seq = 9;
   string why = 10;
   int32 wave = 11;
-  string requested_by = 12;
   Workload workload = 13;  // unset for a deploy that only migrates
   Status status = 14;
   Stage stage = 15;
   string reason = 16;
-  bool self = 17;       // it deploys the deployer
-  string halt_by = 18;  // who asked it to halt
+  bool self = 17;  // it deploys the deployer
   google.protobuf.Timestamp created_at = 19;
   google.protobuf.Timestamp started_at = 20;
   google.protobuf.Timestamp finished_at = 21;
@@ -177,6 +182,12 @@ message Deployment {
   repeated Migration migrations = 23;
   Roll roll = 24;              // unset until it rolls
   repeated Event events = 25;  // GetDeployment only
+  string requested_by_id = 26;
+  string halt_by_id = 27;  // who asked it to halt
+  string halt_reason =
+      28;  // why ok asked it to halt, itself: another deployment of its plan failed
+  reserved 12, 18;
+  reserved "requested_by", "halt_by";
 }
 
 message Workload {
@@ -208,7 +219,9 @@ message Migration {
   MigrationPlan plan = 4;  // its plan, as the migrate protocol reports it
   repeated string refused = 5;
   repeated string allowed = 6;
-  string allowed_by = 7;
+  string allowed_by_id = 8;
+  reserved 7;
+  reserved "allowed_by";
 }
 
 // A migration's plan: what a target speaking the migrate protocol prints when run with `plan`
@@ -245,4 +258,115 @@ message Roll {
 message Event {
   google.protobuf.Timestamp at = 1;
   string message = 2;
+}
+
+// ─── Agents (docs/hosted.md, "Deploy agents, as built") ───
+
+// Agents is where an organization's deploy agent, running in its cluster, connects to a cell's
+// deployer, out from the cluster: the agent says who it is (AgentHello), the deployer welcomes it
+// (AgentWelcome), then sends it requests — its cluster's API, and migrations — which it answers,
+// many at once, each by its ID. Only the robot its organization designated connects.
+service Agents {
+  option (ok.v1.callers) = CALLER_ROBOTS;
+  rpc Connect(stream AgentUp) returns (stream AgentDown);
+}
+
+// AgentRelay carries a replica's requests to the agent whose connection another replica holds:
+// the first message names the account, and each after it carries a request's frame.
+service AgentRelay {
+  option (ok.v1.callers) = CALLER_DEPLOY;
+  rpc Exchange(stream RelayDown) returns (stream AgentUp);
+}
+
+// AgentUp is what an agent sends.
+message AgentUp {
+  oneof kind {
+    AgentHello hello = 1;
+    KubeResponseFrame kube = 2;
+    MigrationResult migration = 3;
+  }
+}
+
+// AgentDown is what a deployer sends an agent.
+message AgentDown {
+  oneof kind {
+    AgentWelcome welcome = 1;
+    KubeRequestFrame kube = 2;
+    MigrationRequest migration = 3;
+    // cancel ends a request the deployer no longer waits on.
+    int64 cancel = 4;
+  }
+}
+
+message AgentHello {
+  string version = 1;  // the agent's ok version
+}
+
+message AgentWelcome {
+  string account_id = 1;  // the organization it is the agent of
+  string cell = 2;        // the deployer's cell
+}
+
+message RelayDown {
+  string account_id = 1;  // the first message's alone
+  AgentDown down = 2;
+}
+
+message Header {
+  string name = 1;
+  repeated string values = 2;
+}
+
+// KubeRequestFrame is a piece of a request to the cluster's API server: its first frame carries
+// its method, path and query, and headers; every frame a piece of its body; its last sets end.
+message KubeRequestFrame {
+  int64 id = 1;
+  string method = 2;
+  string url = 3;  // the path and query: /apis/apps/v1/namespaces/web/deployments/api?timeout=30s
+  repeated Header headers = 4;
+  bytes body = 5;
+  bool end = 6;
+}
+
+// KubeResponseFrame is a piece of the answer: its first frame carries its status and headers,
+// every frame a piece of its body, its last sets end — or error, when the agent could not ask or
+// refused to (status 0).
+message KubeResponseFrame {
+  int64 id = 1;
+  int32 status = 2;
+  repeated Header headers = 3;
+  bytes body = 4;
+  bool end = 5;
+  string error = 6;
+}
+
+// MigrationRequest asks an agent to run a deployment's migration in its cluster: the target at a
+// commit of a repository of its organization's, allowing the gated hazard classes allow.
+message MigrationRequest {
+  int64 id = 1;
+  int64 repository_id = 2;
+  bytes commit_id = 3;
+  string target = 4;
+  repeated string allow = 5;
+  // The secrets the deploy's stanza names, which ok secrets gave the deployer for this commit of
+  // main (docs/secrets.md, "Readers that are not people"): the agent writes them on a memory file
+  // system for the migration alone, and redacts them from what it reports.
+  repeated SecretValue secrets = 6;
+}
+
+message SecretValue {
+  string path = 1;  // secret/prod/db-password
+  bytes value = 2;
+}
+
+// MigrationResult is what the migration did: its report (ok's migrate protocol, JSON), the
+// classes it refused, everything it printed, and why it failed; or error, when the agent could not
+// run it — worth asking again.
+message MigrationResult {
+  int64 id = 1;
+  bytes report = 2;
+  repeated string refused = 3;
+  string output = 4;
+  string failed = 5;
+  string error = 6;
 }

@@ -32,11 +32,12 @@ type IdentityReq struct {
 	ACL     string
 	ACLPath string
 	// Eligible are the principals whose Approval accepts it, given what the change's accepted
-	// parts grant.
+	// parts grant — by name, as the tree names them.
 	Eligible []string
 	Accepted bool
-	// ApprovedBy are the eligible principals who granted Approval; Implicit, that the author is
-	// eligible, which accepts it by itself — as an author who is an owner satisfies OWNERS.
+	// ApprovedBy are the eligible principals who granted Approval, by name; Implicit, that the
+	// author is eligible, which accepts it by itself — as an author who is an owner satisfies
+	// OWNERS.
 	ApprovedBy []string
 	Implicit   bool
 }
@@ -330,5 +331,10 @@ func (s *Service) evaluateIdentity(ctx context.Context, cl db.ChangeList, dir st
 			other = append(other, f)
 		}
 	}
-	return evaluateTree(dir, before, after, other, grants, cl.Author), true, nil, nil
+	// The tree names principals by name: approvers are matched by theirs now.
+	byName := make([]grant, len(grants))
+	for i, g := range grants {
+		byName[i] = grant{label: g.label, principal: people.Name(ctx, g.principal)}
+	}
+	return evaluateTree(dir, before, after, other, byName, people.Name(ctx, cl.Author)), true, nil, nil
 }

@@ -9,6 +9,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/Cidan/ok/internal/move"
 	"github.com/Cidan/ok/internal/work"
 )
 
@@ -35,9 +36,10 @@ type SubmittedCL struct {
 type Submission struct {
 	ID           int64
 	RepositoryID int64
-	SubmittedBy  string
+	SubmittedBy  string // a person's stable ID
 	Status       SubmissionStatus
 	Reason       string // why it failed or was canceled
+	CanceledBy   string // who canceled it, by stable ID; "" for no one
 	Note         string // what the queue is waiting for, while it is active
 	CLs          []SubmittedCL
 	CreatedAt    time.Time
@@ -56,7 +58,7 @@ const (
 
 // Attempt is a submission's candidates on one arrangement of main — main's head when it was
 // prepared, and the earlier submissions it speculates land first (its chain) — with the post
-// plan of each of its own.
+// plan of its top.
 type Attempt struct {
 	ID           int64
 	SubmissionID int64
@@ -72,10 +74,22 @@ type Attempt struct {
 	Candidates   []*AttemptCandidate // in landing order: its chain's, then its own
 }
 
-// Own returns the attempt's own candidates, those with post plans.
+// Own returns the attempt's own candidates: its submission's CLs, bottom first, which it lands.
 func (a *Attempt) Own() []*AttemptCandidate {
 	var out []*AttemptCandidate
 	for _, c := range a.Candidates {
+		if c.SubmissionID == a.SubmissionID {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// Planned returns the own candidates with post plans: a stack's top alone, whose plan is over the
+// whole submission (docs/automation.md, "post").
+func (a *Attempt) Planned() []*AttemptCandidate {
+	var out []*AttemptCandidate
+	for _, c := range a.Own() {
 		if c.PlanID > 0 {
 			out = append(out, c)
 		}
@@ -96,11 +110,9 @@ type AttemptCandidate struct {
 	Jobs         []*Run // the latest run of each of the plan's jobs
 }
 
-// postPriority is post's runs' priority: main waits on them.
-const postPriority = 1
-
-// maxSubmissionCLs bounds a submission's stack.
-const maxSubmissionCLs = 100
+// maxSubmissionCLs bounds a submission's stack: the SCM's bound on one landing. A stack's post is
+// one plan, at its top, so a CL under it costs a candidate and its part of the landing.
+const maxSubmissionCLs = 1000
 
 // SubmitRequest is what ok control asks automation to land.
 type SubmitRequest struct {
@@ -132,7 +144,7 @@ func (s *Store) Submit(ctx context.Context, req SubmitRequest) (*Submission, err
 		numbers[i] = c.Number
 	}
 	var id int64
-	err := s.b.Txn(ctx, func(tx Ops) error {
+	err := s.txn(ctx, func(tx Ops) error {
 		locked := append([]int64(nil), numbers...)
 		sort.Slice(locked, func(i, j int) bool { return locked[i] < locked[j] })
 		for _, n := range locked {
@@ -177,6 +189,9 @@ type workStore struct{ b Backend }
 
 func (w workStore) Mark(ctx context.Context, kind string, key int64) error {
 	return w.b.MarkWork(ctx, kind, key)
+}
+func (w workStore) MarkAt(ctx context.Context, kind string, key int64, at time.Time) error {
+	return w.b.MarkWorkAt(ctx, kind, key, at)
 }
 func (w workStore) Take(ctx context.Context, kind string, key int64, holder string, ttl time.Duration) (bool, error) {
 	return w.b.TakeWork(ctx, kind, key, holder, ttl)
@@ -291,7 +306,7 @@ func cancelAttemptRuns(ctx context.Context, tx Ops, attempts []int64, reason str
 		return err
 	}
 	for _, id := range ids {
-		if err := cancelRun(ctx, tx, id, reason); err != nil {
+		if err := cancelRun(ctx, tx, id, reason, ""); err != nil {
 			return err
 		}
 	}
@@ -309,8 +324,8 @@ func endAttempts(ctx context.Context, tx Ops, submission int64, status AttemptSt
 
 // finishSubmission ends an active submission with status and reason, and its attempts; it
 // reports whether the submission was active.
-func finishSubmission(ctx context.Context, tx Ops, id int64, status SubmissionStatus, reason string) (bool, error) {
-	repo, ok, err := tx.FinishSubmission(ctx, id, status, reason)
+func finishSubmission(ctx context.Context, tx Ops, id int64, status SubmissionStatus, reason, by string) (bool, error) {
+	repo, ok, err := tx.FinishSubmission(ctx, id, status, reason, by)
 	if err != nil || !ok {
 		return false, err
 	}
@@ -326,12 +341,12 @@ func finishSubmission(ctx context.Context, tx Ops, id int64, status SubmissionSt
 
 // CancelSubmission cancels an active submission: its runs stop, and nothing of it lands. A
 // finished submission is returned as it is.
-func (s *Store) CancelSubmission(ctx context.Context, id int64, reason string) (*Submission, error) {
+func (s *Store) CancelSubmission(ctx context.Context, id int64, reason, by string) (*Submission, error) {
 	if reason == "" {
 		reason = "canceled"
 	}
-	if err := s.b.Txn(ctx, func(tx Ops) error {
-		_, err := finishSubmission(ctx, tx, id, SubmissionCanceled, reason)
+	if err := s.txn(ctx, func(tx Ops) error {
+		_, err := finishSubmission(ctx, tx, id, SubmissionCanceled, reason, by)
 		return err
 	}); err != nil {
 		return nil, err
@@ -343,14 +358,14 @@ func (s *Store) CancelSubmission(ctx context.Context, id int64, reason string) (
 // patchset, or every one when patchset is 0 — and returns how many.
 func (s *Store) CancelSubmissionsOf(ctx context.Context, repo, cl int64, patchset int32, reason string) (int, error) {
 	n := 0
-	err := s.b.Txn(ctx, func(tx Ops) error {
+	err := s.txn(ctx, func(tx Ops) error {
 		n = 0
 		ids, err := tx.ActiveSubmissionsOfCL(ctx, repo, cl, patchset)
 		if err != nil {
 			return err
 		}
 		for _, id := range ids {
-			ok, err := finishSubmission(ctx, tx, id, SubmissionCanceled, reason)
+			ok, err := finishSubmission(ctx, tx, id, SubmissionCanceled, reason, "")
 			if err != nil {
 				return err
 			}
@@ -365,26 +380,33 @@ func (s *Store) CancelSubmissionsOf(ctx context.Context, repo, cl int64, patchse
 
 // FailSubmission fails an active submission: nothing of it lands.
 func (s *Store) FailSubmission(ctx context.Context, id int64, reason string) error {
-	return s.b.Txn(ctx, func(tx Ops) error {
-		_, err := finishSubmission(ctx, tx, id, SubmissionFailed, reason)
+	return s.txn(ctx, func(tx Ops) error {
+		_, err := finishSubmission(ctx, tx, id, SubmissionFailed, reason, "")
 		return err
 	})
 }
 
 // SetNote records what the queue is waiting for on an active submission.
 func (s *Store) SetNote(ctx context.Context, id int64, note string) error {
-	return s.b.SetNote(ctx, id, note)
+	return s.txn(ctx, func(tx Ops) error {
+		if _, err := tx.LockSubmission(ctx, id); err != nil {
+			return err
+		}
+		return tx.SetNote(ctx, id, note)
+	})
 }
 
-// NewCandidate is a candidate of an attempt the queue prepared. An own candidate carries its
-// post plan's inputs: the workflow files' commit and the job context.
+// NewCandidate is a candidate of an attempt the queue prepared: the chain's, or its own
+// submission's (Own), of which the top alone is planned.
 type NewCandidate struct {
-	SubmissionID    int64
-	CLNumber        int64
-	Patchset        int32
-	Commit          []byte
-	Base            []byte
-	Own             bool
+	SubmissionID int64
+	CLNumber     int64
+	Patchset     int32
+	Commit       []byte
+	Base         []byte
+	Own          bool
+	// A planned own candidate — a submission's top — carries its workflows commit, its job
+	// context, and its footprint's paths, over the whole submission; the rest carry none.
 	WorkflowsCommit []byte
 	Context         []byte   // the change, as the job context holds it (workflow.Change), JSON
 	Touched         []string // every path the change touches: its footprint
@@ -414,12 +436,20 @@ func (s *Store) CreateAttempt(ctx context.Context, na NewAttempt) (int64, error)
 		if len(c.Commit) != 32 || len(c.Base) != 32 {
 			return 0, invalid("a candidate and its base are 32-byte commit IDs")
 		}
-		if c.Own && (len(c.WorkflowsCommit) != 32 || !json.Valid(c.Context)) {
-			return 0, invalid("an own candidate carries its workflows commit and its job context")
+		if c.Own && c.Context != nil && (len(c.WorkflowsCommit) != 32 || !json.Valid(c.Context)) {
+			return 0, invalid("a planned own candidate carries its workflows commit and its job context")
+		}
+		if !c.Own && c.Context != nil {
+			return 0, invalid("only an own candidate is planned")
+		}
+	}
+	if n := len(na.Candidates); n > 0 && na.PrepareError == "" {
+		if top := na.Candidates[n-1]; top.Own && top.Context == nil {
+			return 0, invalid("a submission's top candidate is planned")
 		}
 	}
 	var id int64
-	err := s.b.Txn(ctx, func(tx Ops) error {
+	err := s.txn(ctx, func(tx Ops) error {
 		sub, err := tx.LockSubmission(ctx, na.SubmissionID)
 		if err != nil {
 			return err
@@ -446,7 +476,7 @@ func (s *Store) CreateAttempt(ctx context.Context, na NewAttempt) (int64, error)
 		anyQueued := false
 		for i, c := range na.Candidates {
 			var planID int64
-			if c.Own {
+			if c.Own && c.Context != nil {
 				// The planning run compares the candidate with the commit the patchset's pre ran on.
 				var preCommit []byte
 				pre, err := tx.PrePlan(ctx, repo, c.CLNumber, c.Patchset)
@@ -462,10 +492,10 @@ func (s *Store) CreateAttempt(ctx context.Context, na NewAttempt) (int64, error)
 					return err
 				}
 				if _, err := tx.InsertRun(ctx, NewRun{
-					RepositoryID: repo, CommitID: c.Commit, Job: Job{Kind: KindPlan},
+					RepositoryID: repo, CommitID: c.Commit, Job: Job{Kind: KindPlan, Pool: s.cfg.PlanPool},
 					Origin: Origin{Phase: PhasePost, CLNumber: c.CLNumber, Patchset: c.Patchset, Job: planJob}, PlanID: p.ID,
 					Why: na.Why, RequestedBy: sub.SubmittedBy, Status: StatusQueued,
-					TimeoutSeconds: int32(s.cfg.DefaultTimeout / time.Second), Priority: postPriority,
+					TimeoutSeconds: int32(s.cfg.DefaultTimeout / time.Second),
 				}); err != nil {
 					return err
 				}
@@ -491,7 +521,7 @@ func (s *Store) CreateAttempt(ctx context.Context, na NewAttempt) (int64, error)
 // which passed there, is recorded passed at once instead, carrying that pass.
 func (s *Store) ReleaseAttempt(ctx context.Context, id int64) error {
 	var carried []int64
-	err := s.b.Txn(ctx, func(tx Ops) error {
+	err := s.txn(ctx, func(tx Ops) error {
 		carried = nil
 		a, err := tx.LockAttempt(ctx, id)
 		if err != nil {
@@ -564,19 +594,16 @@ func (s *Store) releasePlan(ctx context.Context, tx Ops, repo int64, p *Plan, re
 			toQueue = append(toQueue, j)
 			continue
 		}
-		note := fmt.Sprintf("ok: not run: it passed in pre as run %d, on patchset %d's commit %.10x, and nothing it reads differs on this candidate\n",
-			from.ID, p.Patchset, from.CommitID)
+		// Its log is a note naming the pass, which the store makes from the two runs.
+		note := carriedNote(from.ID, p.Patchset, from.CommitID)
 		o := origin
 		o.Job = j.Job
 		run, err := tx.InsertRun(ctx, NewRun{
 			RepositoryID: repo, CommitID: p.CommitID, Job: j.Spec, Origin: o, PlanID: p.ID, Why: j.Why, RequestedBy: requestedBy,
-			Status: StatusPassed, TimeoutSeconds: int32(s.cfg.DefaultTimeout / time.Second), Priority: postPriority,
-			Started: true, Finished: true, CarriedFrom: from.ID,
+			Status: StatusPassed, TimeoutSeconds: int32(s.cfg.DefaultTimeout / time.Second),
+			Started: true, Finished: true, CarriedFrom: from.ID, LogSize: int64(len(note)),
 		})
 		if err != nil {
-			return nil, err
-		}
-		if err := tx.AppendLogChunk(ctx, run.ID, 0, []byte(note)); err != nil {
 			return nil, err
 		}
 		if err := notify(ctx, tx, chanDone, run.ID); err != nil {
@@ -584,7 +611,7 @@ func (s *Store) releasePlan(ctx context.Context, tx Ops, repo int64, p *Plan, re
 		}
 		carried = append(carried, run.ID)
 	}
-	return carried, s.insertJobs(ctx, tx, repo, p.CommitID, origin, p.ID, requestedBy, toQueue, postPriority, StatusQueued, "")
+	return carried, s.insertJobs(ctx, tx, repo, p.CommitID, origin, p.ID, requestedBy, toQueue, StatusQueued, "")
 }
 
 // passes are the jobs of a patchset's pre whose latest run passed.
@@ -614,7 +641,10 @@ func prePasses(ctx context.Context, tx Ops, repo, cl int64, patchset int32) (*pa
 			out.all = append(out.all, r)
 		}
 	}
-	sort.Slice(out.all, func(i, j int) bool { return out.all[i].ID < out.all[j].ID })
+	sort.Slice(out.all, func(i, j int) bool {
+		a, b := out.all[i], out.all[j]
+		return a.QueuedAt.Before(b.QueuedAt) || a.QueuedAt.Equal(b.QueuedAt) && a.ID < b.ID
+	})
 	return out, nil
 }
 
@@ -642,12 +672,26 @@ func sameJob(a, b Job) bool {
 
 // DiscardAttempt ends an active attempt that no longer holds for main, canceling its runs.
 func (s *Store) DiscardAttempt(ctx context.Context, id int64, reason string) error {
-	return s.b.Txn(ctx, func(tx Ops) error {
+	return s.txn(ctx, func(tx Ops) error {
+		a, err := tx.LockAttempt(ctx, id)
+		if err != nil {
+			return err
+		}
 		moved, err := tx.SetAttemptStatus(ctx, id, AttemptActive, AttemptDiscarded, reason)
 		if err != nil || !moved {
 			return err
 		}
-		return cancelAttemptRuns(ctx, tx, []int64{id}, reason)
+		if err := cancelAttemptRuns(ctx, tx, []int64{id}, reason); err != nil {
+			return err
+		}
+		subs, err := tx.Submissions(ctx, []int64{a.SubmissionID})
+		if err != nil {
+			return err
+		}
+		if len(subs) == 0 {
+			return ErrNotFound
+		}
+		return notifyQueue(ctx, tx, subs[0].RepositoryID)
 	})
 }
 
@@ -657,16 +701,28 @@ type LandedCL struct {
 	Commit   []byte
 }
 
+// MainUnknown is a landing's place on main before it when the queue does not know it (an adopted
+// landing): main's history comes from the SCM's events alone, which find the submission by its
+// CLs' commits as they record each one.
+const MainUnknown = -1
+
 // RecordLanding records that a submission landed on an attempt: the commit each CL landed as,
-// and — at fromSeq, main's place before the landing, when it is known — main's history.
+// and — at fromSeq, main's place before the landing, 0 for a main with nothing on it, unless it is
+// MainUnknown — main's history.
 func (s *Store) RecordLanding(ctx context.Context, submission, attempt int64, landed []LandedCL, fromSeq int64) error {
-	return s.b.Txn(ctx, func(tx Ops) error {
-		repo, ok, err := tx.FinishSubmission(ctx, submission, SubmissionLanded, "")
+	return s.txn(ctx, func(tx Ops) error {
+		repo, ok, err := tx.FinishSubmission(ctx, submission, SubmissionLanded, "", "")
 		if err != nil {
 			return err
 		}
 		if !ok {
 			return &ConflictError{Message: fmt.Sprintf("submission %d is no longer active", submission)}
+		}
+		// The SCM's event of the move may be recorded at once (RecordMainCommit): the two take
+		// turns, or each — an adopted landing's record of its submission, the event's of the row —
+		// would miss the other.
+		if err := tx.LockMain(ctx, repo); err != nil {
+			return err
 		}
 		a, err := tx.LockAttempt(ctx, attempt)
 		switch {
@@ -687,7 +743,7 @@ func (s *Store) RecordLanding(ctx context.Context, submission, attempt int64, la
 			if err := tx.InsertLandedChange(ctx, repo, l.Commit, l.CLNumber); err != nil {
 				return err
 			}
-			if fromSeq > 0 {
+			if fromSeq != MainUnknown {
 				if err := tx.PutMainCommit(ctx, repo, fromSeq+int64(i)+1, l.Commit, submission); err != nil {
 					return err
 				}
@@ -703,7 +759,10 @@ func (s *Store) RecordLanding(ctx context.Context, submission, attempt int64, la
 
 // RecordMainCommit records a commit main moved to, at its place in main's history.
 func (s *Store) RecordMainCommit(ctx context.Context, repo, seq int64, commit []byte) error {
-	return s.b.Txn(ctx, func(tx Ops) error {
+	return s.txn(ctx, func(tx Ops) error {
+		if err := tx.LockMain(ctx, repo); err != nil {
+			return err
+		}
 		if err := tx.InsertMainCommit(ctx, repo, seq, commit); err != nil {
 			return err
 		}
@@ -713,7 +772,7 @@ func (s *Store) RecordMainCommit(ctx context.Context, repo, seq int64, commit []
 
 // RecordLandedChange records the CL a landed commit is.
 func (s *Store) RecordLandedChange(ctx context.Context, repo int64, commit []byte, cl int64) error {
-	return s.b.InsertLandedChange(ctx, repo, commit, cl)
+	return s.b.InsertLandedChange(move.WithRepository(ctx, repo), repo, commit, cl)
 }
 
 // ReusableCandidate returns a candidate an active attempt already prepared from a CL's
@@ -725,13 +784,6 @@ func (s *Store) ReusableCandidate(ctx context.Context, repo int64, base []byte, 
 // CandidatesInUse returns the candidates a repository's active attempts hold, by commit ID.
 func (s *Store) CandidatesInUse(ctx context.Context, repo int64) (map[string]bool, error) {
 	return s.b.CandidatesInUse(ctx, repo)
-}
-
-// QueueRepositories returns the repositories the landing queue has work in: those with active
-// submissions, and those where a submission finished within recent, whose candidates it
-// cleans up.
-func (s *Store) QueueRepositories(ctx context.Context, recent time.Duration) ([]int64, error) {
-	return s.b.QueueRepositories(ctx, recent)
 }
 
 // MainCommit is one commit main moved to: its place in main's history, the CL it is (0 when

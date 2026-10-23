@@ -16,8 +16,9 @@ import (
 
 	"github.com/Cidan/ok/internal/control/db"
 	"github.com/Cidan/ok/internal/data/pgdata"
-	"github.com/Cidan/ok/internal/lock"
 	"github.com/Cidan/ok/internal/migrate"
+	"github.com/Cidan/ok/internal/move"
+	"github.com/Cidan/ok/internal/scm/scmfeed"
 )
 
 //go:embed migrations/*.sql
@@ -30,7 +31,7 @@ var Migrations = migrate.MustLoad(migrations, "migrations")
 type Store struct {
 	queries
 	pool  *pgxpool.Pool
-	locks *lock.Lock
+	moves *move.PostgresRows
 }
 
 var _ db.Store = (*Store)(nil)
@@ -40,8 +41,35 @@ func Open(ctx context.Context, pool *pgxpool.Pool) (*Store, error) {
 	if _, err := migrate.Apply(ctx, pool, "control", Migrations); err != nil {
 		return nil, err
 	}
-	return &Store{queries: queries{pool}, pool: pool, locks: lock.New(pool)}, nil
+	return &Store{queries: queries{move.GatedPool{Pool: pool, Tables: moveTableSet}}, pool: pool,
+		moves: &move.PostgresRows{Pool: pool, Tables: moveTables, Where: moveWhere}}, nil
 }
+
+// moveTables are the tables of rows about repositories this cell holds, which a move copies
+// (docs/hosted.md, "Cells, as built"): their CLs, their outboxes, their webhooks and deliveries, and
+// where the SCM's feed of each was applied to.
+// Not the repository table, nor favorites: every cell's ok control lists every repository, by the
+// directory's events, for anyone's favorites.
+var moveTables = []string{"changelist", "reviewer", "label_grant", "comment", "event", "outbox", "webhook", "webhook_delivery", "follow_cursor"}
+
+var moveTableSet = func() map[string]bool {
+	m := map[string]bool{}
+	for _, t := range moveTables {
+		m[t] = true
+	}
+	return m
+}()
+
+// moveWhere is the condition a table's rows about repositories (@repos) meet.
+func moveWhere(table string) string {
+	if table == "follow_cursor" {
+		return "topic = '" + scmfeed.Topic + "' AND key = ANY(@repos)"
+	}
+	return "repository_id = ANY(@repos)"
+}
+
+// Moves are the store's rows about repositories, for a move.
+func (s *Store) Moves() move.Rows { return s.moves }
 
 // Pool is the underlying pool.
 func (s *Store) Pool() *pgxpool.Pool { return s.pool }
@@ -49,7 +77,16 @@ func (s *Store) Pool() *pgxpool.Pool { return s.pool }
 // Txn runs fn in a transaction, again if PostgreSQL aborts it to break a deadlock or a
 // serialization conflict.
 func (s *Store) Txn(ctx context.Context, fn func(db.Ops) error) error {
-	return pgdata.Txn(ctx, s.pool, func(tx pgx.Tx) error { return fn(queries{tx}) })
+	return pgdata.Txn(ctx, s.pool, func(tx pgx.Tx) error {
+		// What ctx's lease guards is written only while its holder holds it (data.Fence).
+		if err := pgdata.CheckFence(ctx, tx); err != nil {
+			return err
+		}
+		if err := move.PostgresGate(ctx, tx); err != nil {
+			return err
+		}
+		return fn(queries{&move.CheckedTx{Tx: tx, Tables: moveTableSet}})
+	})
 }
 
 // querier runs queries, inside a transaction or not.
@@ -211,15 +248,8 @@ func (x queries) SetApproved(ctx context.Context, repo, number int64, approved b
 	return tag.RowsAffected() > 0, err
 }
 
-func (x queries) LegacyCursor(ctx context.Context) (int64, error) {
-	var seq int64
-	err := x.q.QueryRow(ctx, `SELECT coalesce((SELECT seq FROM feed_cursor), 0)`).Scan(&seq)
-	return seq, err
-}
-
-func (x queries) ForgetLegacyCursor(ctx context.Context) error {
-	_, err := x.q.Exec(ctx, `DELETE FROM feed_cursor`)
-	return err
+func (x queries) FollowCursors(ctx context.Context, topic string, keys []int64) (map[int64]int64, error) {
+	return pgdata.Cursors(ctx, x.q, topic, keys)
 }
 
 func (x queries) FollowCursor(ctx context.Context, topic string, key int64) (int64, error) {
@@ -234,21 +264,28 @@ func (x queries) SetFollowCursor(ctx context.Context, topic string, key, seq int
 	return pgdata.SetCursor(ctx, x.q, topic, key, seq)
 }
 
-func (x queries) SeedFollowCursor(ctx context.Context, topic string, key, seq int64) error {
-	return pgdata.SeedCursor(ctx, x.q, topic, key, seq)
-}
-
-// CreateRepository leaves a repository already recorded as it is: a conflict clause naming only
-// the ID would let the second of two concurrent inserts fail on the name instead.
 func (x queries) CreateRepository(ctx context.Context, r db.Repository) error {
 	_, err := x.q.Exec(ctx, `INSERT INTO repository (id, name, created_by, created_at, head_seq, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $4) ON CONFLICT DO NOTHING`, r.ID, r.Name, r.CreatedBy, r.CreatedAt, r.HeadSeq)
+		VALUES ($1, NULLIF($2, ''), $3, $4, $5, $4)
+		ON CONFLICT (id) DO UPDATE SET name = COALESCE(repository.name, EXCLUDED.name)`, r.ID, r.Name, r.CreatedBy, r.CreatedAt, r.HeadSeq)
 	return err
 }
 
-func (x queries) RenameRepository(ctx context.Context, id int64, name string) error {
-	_, err := x.q.Exec(ctx, `UPDATE repository SET name = $2 WHERE id = $1`, id, name)
+func (x queries) NameRepository(ctx context.Context, r db.Repository) error {
+	_, err := x.q.Exec(ctx, `INSERT INTO repository (id, name, deleted, created_by, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $5) ON CONFLICT (id) DO UPDATE SET name = $2, deleted = $3`, r.ID, r.Name, r.Deleted, r.CreatedBy, r.CreatedAt)
 	return err
+}
+
+func (x queries) DropRepository(ctx context.Context, id int64) error {
+	// A CL's reviewers, labels, comments, and events go with it (ON DELETE CASCADE).
+	for _, q := range []string{`DELETE FROM changelist WHERE repository_id = $1`, `DELETE FROM favorite WHERE repository_id = $1`,
+		`DELETE FROM repository WHERE id = $1`} {
+		if _, err := x.q.Exec(ctx, q, id); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (x queries) MoveHead(ctx context.Context, id, headSeq int64, at time.Time) error {
@@ -258,19 +295,39 @@ func (x queries) MoveHead(ctx context.Context, id, headSeq int64, at time.Time) 
 
 func (x queries) RepositoryByName(ctx context.Context, name string) (db.Repository, bool, error) {
 	var r db.Repository
-	err := x.q.QueryRow(ctx, `SELECT id, name, created_by, created_at, head_seq, updated_at FROM repository WHERE name = $1`, name).
-		Scan(&r.ID, &r.Name, &r.CreatedBy, &r.CreatedAt, &r.HeadSeq, &r.UpdatedAt)
+	err := x.q.QueryRow(ctx, `SELECT id, name, deleted, created_by, created_at, head_seq, updated_at FROM repository
+		WHERE name = $1 ORDER BY deleted, id LIMIT 1`, name).
+		Scan(&r.ID, &r.Name, &r.Deleted, &r.CreatedBy, &r.CreatedAt, &r.HeadSeq, &r.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return db.Repository{}, false, nil
 	}
 	return r, err == nil, err
 }
 
+func (x queries) RepositoriesByID(ctx context.Context, principal string, ids []int64) ([]db.Repository, error) {
+	rows, err := x.q.Query(ctx, `SELECT r.id, coalesce(r.name, ''), r.created_by, r.created_at, r.head_seq, r.updated_at, f.principal IS NOT NULL
+		FROM repository r LEFT JOIN favorite f ON f.repository_id = r.id AND f.principal = $1
+		WHERE r.id = ANY($2) AND NOT r.deleted`, principal, ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []db.Repository
+	for rows.Next() {
+		var r db.Repository
+		if err := rows.Scan(&r.ID, &r.Name, &r.CreatedBy, &r.CreatedAt, &r.HeadSeq, &r.UpdatedAt, &r.Favorite); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 func (x queries) ListRepositories(ctx context.Context, principal, keyword string, offset, limit int) ([]db.Repository, error) {
 	pattern := "%" + strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(strings.ToLower(keyword)) + "%"
 	rows, err := x.q.Query(ctx, `SELECT r.id, r.name, r.created_by, r.created_at, r.head_seq, r.updated_at, f.principal IS NOT NULL
 		FROM repository r LEFT JOIN favorite f ON f.repository_id = r.id AND f.principal = $1
-		WHERE r.name LIKE $2
+		WHERE r.name LIKE $2 AND NOT r.deleted
 		ORDER BY f.principal IS NOT NULL DESC, r.updated_at DESC, r.id
 		OFFSET $3 LIMIT $4`, principal, pattern, offset, limit)
 	if err != nil {

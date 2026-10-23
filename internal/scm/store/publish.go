@@ -43,6 +43,7 @@ type OpHeadsUpdate struct {
 type Publication struct {
 	s         *Store
 	repo      int64
+	net       backend.Network
 	principal string
 	workspace string
 	opLog     int64
@@ -84,11 +85,18 @@ func isVirtual(r ObjectRef) bool {
 // views for the operation log of the caller's workspace. It touches every staged object and file
 // the server already holds, and reports the rest as missing (see Missing).
 func (s *Store) BeginPublish(ctx context.Context, repo int64, principal, workspace string, objects []ObjectRef, files []FileManifest) (*Publication, error) {
-	if err := s.repositoryExists(ctx, s.b, repo); err != nil {
+	if err := s.repositoryExists(ctx, s.ops(ctx), repo); err != nil {
+		return nil, err
+	}
+	if err := s.gate(ctx, s.ops(ctx)); err != nil {
+		return nil, err
+	}
+	net, err := s.network(ctx, repo)
+	if err != nil {
 		return nil, err
 	}
 	p := &Publication{
-		s: s, repo: repo, principal: principal, workspace: workspace,
+		s: s, repo: repo, net: net, principal: principal, workspace: workspace,
 		staged: map[ObjectRef]bool{}, held: map[ObjectRef]bool{}, want: map[ObjectRef]bool{},
 		received: map[ObjectRef]encoding.Object{}, bodies: map[ObjectRef][]byte{},
 		files: map[encoding.ID]FileManifest{}, heldFiles: map[encoding.ID]bool{},
@@ -140,7 +148,6 @@ func (s *Store) BeginPublish(ctx context.Context, repo int64, principal, workspa
 
 	// Objects are the repository's; operations and views are a workspace's. Only a publish
 	// carrying them, or naming its workspace, reaches an operation log.
-	var err error
 	carriesOps := false
 	for r := range p.staged {
 		carriesOps = carriesOps || r.Kind == encoding.KindOperation || r.Kind == encoding.KindView
@@ -157,7 +164,7 @@ func (s *Store) BeginPublish(ctx context.Context, repo int64, principal, workspa
 	for id := range manifests {
 		fileIDs = append(fileIDs, id)
 	}
-	if p.heldFiles, err = s.existing(ctx, s.b, repo, tFile, 0, fileIDs); err != nil {
+	if p.heldFiles, err = s.existing(ctx, s.ops(ctx), repo, tFile, 0, fileIDs); err != nil {
 		return nil, err
 	}
 
@@ -200,16 +207,20 @@ func (s *Store) BeginPublish(ctx context.Context, repo int64, principal, workspa
 			chunkIDs = append(chunkIDs, c.ID)
 		}
 	}
-	// Chunks the server holds are touched too, for the same reason; the rest are wanted.
-	chunkRoots := make([]ref, len(chunkIDs))
-	for i, id := range chunkIDs {
-		chunkRoots[i] = ref{table: tChunk, id: id}
-	}
-	absent, err := s.touchHeld(ctx, repo, chunkRoots)
+	// Chunks the server holds are touched too, for the same reason; the rest are wanted. Those its
+	// index has are touched — what a sweep took meanwhile is wanted too — and no more: a touch that
+	// reaches a missing chunk is rolled back and run again without it.
+	present, err := s.existing(ctx, s.ops(ctx), repo, tChunk, 0, chunkIDs)
 	if err != nil {
 		return nil, err
 	}
-	present, err := s.existing(ctx, s.b, repo, tChunk, 0, chunkIDs)
+	var chunkRoots []ref
+	for _, id := range chunkIDs {
+		if present[id] {
+			chunkRoots = append(chunkRoots, ref{table: tChunk, id: id})
+		}
+	}
+	absent, err := s.touchHeld(ctx, repo, chunkRoots)
 	if err != nil {
 		return nil, err
 	}
@@ -243,7 +254,7 @@ func (s *Store) touchHeld(ctx context.Context, repo int64, roots []ref) ([]ref, 
 	var vanished []ref
 	for len(roots) > 0 {
 		var missing []ref
-		err := s.inTx(ctx, func(tx *txn) error {
+		err := s.inTx(ctx, func(ctx context.Context, tx *txn) error {
 			var err error
 			if missing, err = s.touch(ctx, tx, repo, roots); err != nil {
 				return err
@@ -294,10 +305,10 @@ func (s *Store) heldObjects(ctx context.Context, repo, opLog int64, staged map[O
 		var err error
 		switch kind {
 		case encoding.KindOperation, encoding.KindView:
-			present, err = existingInOpLog(ctx, s.b, opLog, kind, members)
+			present, err = s.existingInOpLog(ctx, s.ops(ctx), repo, opLog, kind, members)
 		default:
 			rf := refOf(kind, encoding.ID{})
-			present, err = s.existing(ctx, s.b, repo, rf.table, rf.kind, members)
+			present, err = s.existing(ctx, s.ops(ctx), repo, rf.table, rf.kind, members)
 		}
 		if err != nil {
 			return nil, err
@@ -309,12 +320,12 @@ func (s *Store) heldObjects(ctx context.Context, repo, opLog int64, staged map[O
 	return held, nil
 }
 
-func existingInOpLog(ctx context.Context, q backend.Ops, opLog int64, kind encoding.Kind, members []encoding.ID) (map[encoding.ID]bool, error) {
+func (s *Store) existingInOpLog(ctx context.Context, q backend.Ops, repo, opLog int64, kind encoding.Kind, members []encoding.ID) (map[encoding.ID]bool, error) {
 	out := map[encoding.ID]bool{}
 	if len(members) == 0 {
 		return out, nil
 	}
-	bodies, err := q.OpBodies(ctx, opLog, kind, members)
+	bodies, err := s.opBodies(ctx, q, repo, opLog, kind, members)
 	if err != nil {
 		return nil, err
 	}
@@ -424,7 +435,7 @@ func (p *Publication) chunk(ctx context.Context, c ChunkRef) ([]byte, error) {
 		if _, err := p.spool.ReadAt(stored, loc.DataOffset()); err != nil {
 			return nil, err
 		}
-		return pack.Decode(p.s.dicts, c.ID, loc.Codec, loc.RawLength, stored)
+		return pack.Decode(p.s.dicts.of(p.net), c.ID, loc.Codec, loc.RawLength, stored)
 	}
 	data, err := p.s.chunkBytes(ctx, p.repo, []encoding.ID{c.ID})
 	if err != nil {
@@ -438,6 +449,58 @@ func (p *Publication) chunk(ctx context.Context, c ChunkRef) ([]byte, error) {
 		return nil, invalid("chunk %s is %d bytes, declared %d", c.ID, len(raw), c.Length)
 	}
 	return raw, nil
+}
+
+// checkSecrets refuses a publish whose new commits hold a secret's value under //secret
+// (checkSecretValues), reading their trees and files from the publish where it carries them.
+func (p *Publication) checkSecrets(ctx context.Context) error {
+	var roots []encoding.ID
+	for r, o := range p.received {
+		if c, ok := o.(*encoding.Commit); ok && r.Kind == encoding.KindCommit {
+			roots = append(roots, c.RootTree...)
+		}
+	}
+	if len(roots) == 0 {
+		return nil
+	}
+	stored := p.s.storedFiles(ctx, p.repo)
+	read := func(id encoding.ID) (uint64, func() ([]byte, error), error) {
+		f, ok := p.files[id]
+		if !ok {
+			return stored(id)
+		}
+		return f.Size, func() ([]byte, error) {
+			var out []byte
+			for _, c := range f.Chunks {
+				raw, err := p.chunk(ctx, c)
+				if err != nil {
+					return nil, err
+				}
+				out = append(out, raw...)
+			}
+			return out, nil
+		}, nil
+	}
+	return p.s.checkSecretValues(ctx, p.repo, publishedTrees{p: p, stored: p.s.pendingTrees(ctx, p.repo)}, read, roots)
+}
+
+// publishedTrees reads the trees a publish carries, and the repository's others.
+type publishedTrees struct {
+	p      *Publication
+	stored *pendingTrees
+}
+
+func (t publishedTrees) readTree(id encoding.ID) (*encoding.Tree, error) {
+	if o, ok := t.p.received[ObjectRef{Kind: encoding.KindTree, ID: id}]; ok {
+		if tree, ok := o.(*encoding.Tree); ok {
+			return tree, nil
+		}
+	}
+	return t.stored.readTree(id)
+}
+
+func (t publishedTrees) writeTree(*encoding.Tree) (encoding.ID, error) {
+	return encoding.ID{}, errors.New("a publish's trees are read, never written")
 }
 
 // verifyFile checks that a new file's chunks, concatenated in manifest order, hash to
@@ -479,6 +542,9 @@ func (p *Publication) Commit(ctx context.Context, heads *OpHeadsUpdate) ([]encod
 		if err := p.verifyFile(ctx, p.files[id]); err != nil {
 			return nil, err
 		}
+	}
+	if err := p.checkSecrets(ctx); err != nil {
+		return nil, err
 	}
 
 	// Everything the new objects (and the heads update) reference must resolve: to an
@@ -540,7 +606,7 @@ func (p *Publication) Commit(ctx context.Context, heads *OpHeadsUpdate) ([]encod
 		if _, err := p.spool.Seek(0, io.SeekStart); err != nil {
 			return nil, err
 		}
-		if err := p.s.blobs.Put(ctx, packKey(p.repo, packID), p.spool, packSize); err != nil {
+		if err := p.s.blobs.Put(ctx, packKey(p.net, packID), p.spool, packSize); err != nil {
 			return nil, err
 		}
 	}
@@ -556,7 +622,7 @@ func (p *Publication) Commit(ctx context.Context, heads *OpHeadsUpdate) ([]encod
 		p.s.beforeCommit()
 	}
 	var result []encoding.ID
-	err := p.s.inTx(ctx, func(tx *txn) error {
+	err := p.s.inTx(ctx, func(ctx context.Context, tx *txn) error {
 		// The log's row lock orders this publish against collection and against the
 		// caller's other publishes that move its operations.
 		if carriesOps {
@@ -575,7 +641,7 @@ func (p *Publication) Commit(ctx context.Context, heads *OpHeadsUpdate) ([]encod
 					members = append(members, r.id)
 				}
 			}
-			present, err := existingInOpLog(ctx, tx, p.opLog, kind, members)
+			present, err := p.s.existingInOpLog(ctx, tx, p.repo, p.opLog, kind, members)
 			if err != nil {
 				return err
 			}
@@ -647,12 +713,20 @@ func (p *Publication) Commit(ctx context.Context, heads *OpHeadsUpdate) ([]encod
 	return result, nil
 }
 
-func packKey(repo int64, id encoding.ID) string {
-	return fmt.Sprintf("repos/%d/packs/%s", repo, id)
-}
+// packKey is a pack's object in the bucket, under its network's keys.
+func packKey(net backend.Network, id encoding.ID) string { return packPrefix(net) + id.String() }
 
+// packPrefix begins the key of every pack of a network.
+func packPrefix(net backend.Network) string { return fmt.Sprintf("nets/%d/packs/", net) }
+
+// insertPack records the pack and its chunks: each the repository lacks in the repository's
+// content index, and each the network lacks a location of in the network's.
 func (p *Publication) insertPack(ctx context.Context, tx *txn, packID encoding.ID, size int64) error {
-	lg, err := p.s.txIndex(ctx, tx, p.repo)
+	lg, err := p.s.txIndex(ctx, tx, repoScope(p.repo))
+	if err != nil {
+		return err
+	}
+	net, err := p.s.txIndex(ctx, tx, backend.NetworkScope(p.net))
 	if err != nil {
 		return err
 	}
@@ -661,22 +735,39 @@ func (p *Publication) insertPack(ctx context.Context, tx *txn, packID encoding.I
 		chunkIDs = append(chunkIDs, id)
 	}
 	sortIDs(chunkIDs)
-	// A chunk another publish stored first keeps its entry; this pack's copy of it is dead
-	// bytes that compaction reclaims.
-	var fresh []encoding.ID
+	// A chunk another publish stored first keeps its entry, and a chunk the network stores
+	// already keeps its location; this pack's copy of either is dead bytes that compaction
+	// reclaims.
+	var fresh, unlocated []encoding.ID
 	for _, id := range chunkIDs {
-		if _, ok := lg.has(encoding.KindChunk, id); !ok {
+		_, held, err := lg.has(ctx, encoding.KindChunk, id)
+		if err != nil {
+			return err
+		}
+		if !held {
 			fresh = append(fresh, id)
 		}
+		_, located, err := net.has(ctx, encoding.KindChunk, id)
+		if err != nil {
+			return err
+		}
+		if !located {
+			unlocated = append(unlocated, id)
+		}
 	}
-	num, err := tx.PutPack(ctx, p.repo, packID, size)
+	num, err := tx.PutPack(ctx, p.net, packID, size)
 	if err != nil {
 		return err
 	}
 	for _, id := range fresh {
-		loc := p.spooled[id]
-		p.s.logIndex(tx, p.repo, contentindex.Update{Op: contentindex.Put, ID: id, Entry: contentindex.Entry{
+		p.s.logIndex(tx, repoScope(p.repo), contentindex.Update{Op: contentindex.Put, ID: id, Entry: contentindex.Entry{
 			Kind: encoding.KindChunk, Day: lg.today,
+		}})
+	}
+	for _, id := range unlocated {
+		loc := p.spooled[id]
+		p.s.logIndex(tx, backend.NetworkScope(p.net), contentindex.Update{Op: contentindex.Put, ID: id, Entry: contentindex.Entry{
+			Kind: encoding.KindChunk, Day: net.today,
 			Loc: contentindex.Location{Pack: num, Offset: loc.Offset, Stored: loc.StoredLength, Raw: loc.RawLength, Codec: uint8(loc.Codec)},
 		}})
 	}
@@ -705,13 +796,17 @@ func (p *Publication) insertFiles(ctx context.Context, tx *txn, fileIDs []encodi
 	if len(fileIDs) == 0 {
 		return nil, nil
 	}
-	lg, err := p.s.txIndex(ctx, tx, p.repo)
+	lg, err := p.s.txIndex(ctx, tx, repoScope(p.repo))
 	if err != nil {
 		return nil, err
 	}
 	var found []ref
 	for _, id := range fileIDs {
-		if _, ok := lg.has(encoding.KindFile, id); ok {
+		_, ok, err := lg.has(ctx, encoding.KindFile, id)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
 			found = append(found, ref{table: tFile, id: id})
 			continue
 		}
@@ -720,7 +815,7 @@ func (p *Publication) insertFiles(ctx context.Context, tx *txn, fileIDs []encodi
 		for i, c := range f.Chunks {
 			chunks[i] = contentindex.FileChunk{ID: c.ID, Length: c.Length}
 		}
-		p.s.logIndex(tx, p.repo, contentindex.Update{Op: contentindex.Put, ID: id, Entry: contentindex.Entry{
+		p.s.logIndex(tx, repoScope(p.repo), contentindex.Update{Op: contentindex.Put, ID: id, Entry: contentindex.Entry{
 			Kind: encoding.KindFile, Day: lg.today, Size: f.Size, Chunks: chunks,
 		}})
 	}
@@ -796,7 +891,7 @@ func (p *Publication) insertCommits(ctx context.Context, tx *txn) ([]ref, error)
 	}
 	gen := map[encoding.ID]int64{encoding.RootCommitID: 0}
 	if len(outside) > 0 {
-		got, err := tx.CommitGenerations(ctx, p.repo, outside)
+		got, err := p.s.commitGenerations(ctx, p.repo, outside)
 		if err != nil {
 			return nil, err
 		}
@@ -873,7 +968,7 @@ func (p *Publication) insertOperations(ctx context.Context, tx *txn) error {
 			}
 		}
 		if len(heldIDs) > 0 {
-			if err := tx.TouchOps(ctx, p.opLog, kind, heldIDs); err != nil {
+			if err := p.s.touchOps(ctx, tx, p.repo, p.opLog, kind, heldIDs); err != nil {
 				return err
 			}
 		}

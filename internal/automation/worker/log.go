@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/Cidan/ok/internal/secrets"
 	automationpb "github.com/Cidan/ok/proto/ok/automation/v1"
 )
 
@@ -22,8 +24,9 @@ const (
 	// perCall is the most one AppendLog call sends, in requests of perRequest.
 	perCall    = 8 << 20
 	perRequest = 1 << 20
-	// sendEvery is how often what was written is sent.
-	sendEvery = 250 * time.Millisecond
+	// sendEvery is how often what was written is sent, or sooner once a request's worth is
+	// pending. Each request the service takes is an object in its logs bucket.
+	sendEvery = time.Second
 )
 
 // logStream is a run's log as the worker writes it: an io.Writer whose bytes are sent to
@@ -41,6 +44,12 @@ type logStream struct {
 	full    bool   // the log reached the most a run keeps: nothing more is sent
 	lost    bool   // the lease was lost
 	wake    chan struct{}
+
+	// hidden are values the log never holds — a post run's secrets, by path (docs/secrets.md,
+	// "Readers that are not people") — each written as what names it; held is the raw tail of
+	// what was written, kept back until the next write, as it may begin one.
+	hidden map[string][]byte
+	held   []byte
 }
 
 func newLogStream(work automationpb.WorkClient, run int64, worker string) *logStream {
@@ -53,17 +62,93 @@ func (l *logStream) Write(p []byte) (int, error) {
 	if l.full || l.lost {
 		return len(p), nil
 	}
+	if l.hidden != nil {
+		n := len(p)
+		l.add(l.redact(p))
+		return n, nil
+	}
+	return l.add(p), nil
+}
+
+// add appends what is written to what is pending, as much as there is room for.
+func (l *logStream) add(p []byte) int {
 	room := maxPending - len(l.pending)
 	if room < len(p) {
 		l.dropped += int64(len(p) - max(room, 0))
 		p = p[:max(room, 0)]
 	}
 	l.pending = append(l.pending, p...)
-	select {
-	case l.wake <- struct{}{}:
-	default:
+	if len(l.pending) >= perRequest {
+		select {
+		case l.wake <- struct{}{}:
+		default:
+		}
 	}
-	return len(p), nil
+	return len(p)
+}
+
+// hide has the log never hold values, from now until reveal, which clears them: they are the log's
+// until then.
+func (l *logStream) hide(values map[string][]byte) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.hidden = values
+}
+
+// reveal writes what was held back, redacted, and clears and forgets the values.
+func (l *logStream) reveal() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.hidden == nil {
+		return
+	}
+	if !l.full && !l.lost && len(l.held) > 0 {
+		l.add(secrets.Redacted(l.held, l.hidden))
+	}
+	clear(l.held)
+	for _, v := range l.hidden {
+		clear(v)
+	}
+	l.hidden, l.held = nil, nil
+}
+
+// redact is what may be logged of what was held back and p, redacted: everything but the
+// longest tail that may begin a value, which is held back, raw, for the next write to complete —
+// and, where a whole value spans that point, from the value's start.
+func (l *logStream) redact(p []byte) []byte {
+	buf := append(l.held, p...)
+	cut := len(buf)
+	for _, v := range l.hidden {
+		if len(v) < secrets.MinRedacted {
+			continue
+		}
+		for k := min(len(v)-1, len(buf)); k > 0 && len(buf)-k < cut; k-- {
+			if bytes.HasSuffix(buf, v[:k]) {
+				cut = len(buf) - k
+				break
+			}
+		}
+	}
+	for moved := true; moved; {
+		moved = false
+		for _, v := range l.hidden {
+			if len(v) < secrets.MinRedacted {
+				continue
+			}
+			// A whole occurrence starting before cut and ending after it.
+			from, to := max(cut-len(v)+1, 0), min(cut+len(v)-1, len(buf))
+			if from < to {
+				if i := bytes.Index(buf[from:to], v); i >= 0 {
+					cut, moved = from+i, true
+				}
+			}
+		}
+	}
+	out := bytes.Clone(secrets.Redacted(buf[:cut], l.hidden))
+	held := bytes.Clone(buf[cut:])
+	clear(buf)
+	l.held = held
+	return out
 }
 
 // Printf writes one of the worker's own lines.
@@ -152,15 +237,21 @@ func (l *logStream) flush(ctx context.Context) error {
 		l.mu.Unlock()
 	}
 	for {
+		l.mu.Lock()
+		before := l.acked
+		l.mu.Unlock()
 		err := l.send(ctx)
 		if errors.Is(err, errLeaseLost) {
 			return err
 		}
 		l.mu.Lock()
-		done := l.full || len(l.pending) == 0
+		done, moved := l.full || len(l.pending) == 0, l.acked > before
 		l.mu.Unlock()
 		if done && err == nil {
 			return nil
+		}
+		if err == nil && moved {
+			continue // more to send: at once
 		}
 		select {
 		case <-ctx.Done():

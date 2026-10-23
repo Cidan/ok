@@ -1,9 +1,11 @@
 package store
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/Cidan/ok/internal/scm/encoding"
@@ -97,55 +99,77 @@ func (c *ChangeList) Current() Patchset { return c.Patchsets[c.CurrentPatchset-1
 // active reports whether the CL takes patchsets and transitions other than restore.
 func (c *ChangeList) active() bool { return c.Status == StatusDraft || c.Status == StatusOpen }
 
-// loadChangeLists makes CLs of rows, all of one repository's, with their patchsets, in the rows'
-// order.
+// changeListOf makes a CL of its row and its patchsets, in number order.
+func changeListOf(repo int64, r backend.ChangeList, pss []backend.Patchset) (*ChangeList, error) {
+	if len(r.ChangeID) != encoding.ChangeIDLen {
+		return nil, fmt.Errorf("CL %d: stored change ID of %d bytes", r.Number, len(r.ChangeID))
+	}
+	c := &ChangeList{
+		Repository: repo, Number: r.Number, ChangeID: encoding.ChangeID(r.ChangeID), Author: r.Author,
+		Status: Status(r.Status), AbandonedFrom: Status(r.AbandonedFrom), ParentNumber: r.Parent,
+		CurrentPatchset: r.CurrentPatchset, LandedCommit: r.Landed, SubmittedBy: r.SubmittedBy,
+		Description: r.Description, CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,
+	}
+	if len(r.RollsBack) > 0 {
+		c.Rollback = &Rollback{CLs: r.RollsBack, Paths: r.RollbackPaths, Left: r.RollbackLeft}
+	}
+	for _, p := range pss {
+		if int(p.Number) != len(c.Patchsets)+1 {
+			return nil, fmt.Errorf("CL %d: patchset %d follows %d", r.Number, p.Number, len(c.Patchsets))
+		}
+		c.Patchsets = append(c.Patchsets, Patchset{Number: p.Number, Commit: p.Commit, Base: p.Base, UploadedBy: p.UploadedBy, UploadedAt: p.UploadedAt})
+	}
+	if c.CurrentPatchset < 1 || int(c.CurrentPatchset) > len(c.Patchsets) {
+		return nil, fmt.Errorf("CL %d: current patchset %d of %d", c.Number, c.CurrentPatchset, len(c.Patchsets))
+	}
+	return c, nil
+}
+
+// loadChangeLists makes CLs of the tail's rows, all of one repository's, with their patchsets, in
+// the rows' order.
 func loadChangeLists(ctx context.Context, q backend.Ops, repo int64, rows []backend.ChangeList) ([]*ChangeList, error) {
 	if len(rows) == 0 {
 		return nil, nil
 	}
-	out := make([]*ChangeList, 0, len(rows))
-	byNumber := map[int64]*ChangeList{}
-	for _, r := range rows {
-		if len(r.ChangeID) != encoding.ChangeIDLen {
-			return nil, fmt.Errorf("CL %d: stored change ID of %d bytes", r.Number, len(r.ChangeID))
-		}
-		c := &ChangeList{
-			Repository: repo, Number: r.Number, ChangeID: encoding.ChangeID(r.ChangeID), Author: r.Author,
-			Status: Status(r.Status), AbandonedFrom: Status(r.AbandonedFrom), ParentNumber: r.Parent,
-			CurrentPatchset: r.CurrentPatchset, LandedCommit: r.Landed, SubmittedBy: r.SubmittedBy,
-			Description: r.Description, CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,
-		}
-		if len(r.RollsBack) > 0 {
-			c.Rollback = &Rollback{CLs: r.RollsBack, Paths: r.RollbackPaths, Left: r.RollbackLeft}
-		}
-		out = append(out, c)
-		byNumber[c.Number] = c
-	}
-	numbers := make([]int64, 0, len(out))
-	for _, c := range out {
-		numbers = append(numbers, c.Number)
+	numbers := make([]int64, len(rows))
+	for i, r := range rows {
+		numbers[i] = r.Number
 	}
 	pss, err := q.Patchsets(ctx, repo, numbers)
 	if err != nil {
 		return nil, err
 	}
+	byCL := map[int64][]backend.Patchset{}
 	for _, p := range pss {
-		c := byNumber[p.CL]
-		if int(p.Number) != len(c.Patchsets)+1 {
-			return nil, fmt.Errorf("CL %d: patchset %d follows %d", p.CL, p.Number, len(c.Patchsets))
-		}
-		c.Patchsets = append(c.Patchsets, Patchset{Number: p.Number, Commit: p.Commit, Base: p.Base, UploadedBy: p.UploadedBy, UploadedAt: p.UploadedAt})
+		byCL[p.CL] = append(byCL[p.CL], p)
 	}
-	for _, c := range out {
-		if c.CurrentPatchset < 1 || int(c.CurrentPatchset) > len(c.Patchsets) {
-			return nil, fmt.Errorf("CL %d: current patchset %d of %d", c.Number, c.CurrentPatchset, len(c.Patchsets))
+	out := make([]*ChangeList, 0, len(rows))
+	for _, r := range rows {
+		c, err := changeListOf(repo, r, byCL[r.Number])
+		if err != nil {
+			return nil, err
 		}
+		out = append(out, c)
 	}
 	return out, nil
 }
 
-// readChangeLists reads the named CLs — held, with lock — by number.
-func readChangeLists(ctx context.Context, q backend.Ops, repo int64, numbers []int64, lock bool) (map[int64]*ChangeList, error) {
+// settledOf makes CLs of landed CLs' records in the segments.
+func settledOf(repo int64, settled map[int64]backend.SettledChangeList) ([]*ChangeList, error) {
+	out := make([]*ChangeList, 0, len(settled))
+	for _, sc := range settled {
+		c, err := changeListOf(repo, sc.ChangeList, sc.Patchsets)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, nil
+}
+
+// readChangeLists reads the named CLs by number: the tail's — held, with lock — and the
+// segments' for the rest, which are landed and so never change, and need no lock.
+func (s *Store) readChangeLists(ctx context.Context, q backend.Ops, repo int64, numbers []int64, lock bool) (map[int64]*ChangeList, error) {
 	out := map[int64]*ChangeList{}
 	if len(numbers) == 0 {
 		return out, nil
@@ -161,23 +185,56 @@ func readChangeLists(ctx context.Context, q backend.Ops, repo int64, numbers []i
 	for _, c := range cls {
 		out[c.Number] = c
 	}
+	var rest []int64
+	for _, n := range numbers {
+		if out[n] == nil {
+			rest = append(rest, n)
+		}
+	}
+	settled, err := s.settledChangeLists(ctx, repo, rest)
+	if err != nil {
+		return nil, err
+	}
+	more, err := settledOf(repo, settled)
+	if err != nil {
+		return nil, err
+	}
+	for _, c := range more {
+		out[c.Number] = c
+	}
 	return out, nil
 }
 
-// lockChangeLists locks the named CLs, in number order, and reads them.
-func lockChangeLists(ctx context.Context, tx *txn, repo int64, numbers []int64) (map[int64]*ChangeList, error) {
-	return readChangeLists(ctx, tx, repo, numbers, true)
+// lockChangeLists locks the named CLs in the tail, in number order, and reads them.
+func (s *Store) lockChangeLists(ctx context.Context, tx *txn, repo int64, numbers []int64) (map[int64]*ChangeList, error) {
+	return s.readChangeLists(ctx, tx, repo, numbers, true)
+}
+
+// clStatus is a CL's status, in the tail or the segments.
+func (s *Store) clStatus(ctx context.Context, q backend.Ops, repo, number int64) (Status, error) {
+	st, ok, err := q.ChangeListStatus(ctx, repo, number)
+	if err != nil || ok {
+		return Status(st), err
+	}
+	settled, err := s.settledChangeLists(ctx, repo, []int64{number})
+	if err != nil {
+		return 0, err
+	}
+	if sc, ok := settled[number]; ok {
+		return Status(sc.Status), nil
+	}
+	return 0, notFound("CL %d", number)
 }
 
 // GetChangeList returns one CL.
 func (s *Store) GetChangeList(ctx context.Context, repo, number int64) (ChangeList, error) {
-	cls, err := readChangeLists(ctx, s.b, repo, []int64{number}, false)
+	cls, err := s.readChangeLists(ctx, s.ops(ctx), repo, []int64{number}, false)
 	if err != nil {
 		return ChangeList{}, err
 	}
 	c, ok := cls[number]
 	if !ok {
-		if err := s.repositoryExists(ctx, s.b, repo); err != nil {
+		if err := s.repositoryExists(ctx, s.ops(ctx), repo); err != nil {
 			return ChangeList{}, err
 		}
 		return ChangeList{}, notFound("CL %d", number)
@@ -186,10 +243,10 @@ func (s *Store) GetChangeList(ctx context.Context, repo, number int64) (ChangeLi
 }
 
 // ListChangeLists returns up to pageSize of a repository's CLs numbered below `before`
-// (0: from the newest), newest first, optionally only those in statuses or by author, and
-// the number to continue below (0 at the end).
-func (s *Store) ListChangeLists(ctx context.Context, repo int64, statuses []Status, author string, pageSize int, before int64) ([]ChangeList, int64, error) {
-	if err := s.repositoryExists(ctx, s.b, repo); err != nil {
+// (0: from the newest), newest first, optionally only those in statuses, by author, or stacked on
+// parent, and the number to continue below (0 at the end).
+func (s *Store) ListChangeLists(ctx context.Context, repo int64, statuses []Status, author string, parent int64, pageSize int, before int64) ([]ChangeList, int64, error) {
+	if err := s.repositoryExists(ctx, s.ops(ctx), repo); err != nil {
 		return nil, 0, err
 	}
 	if pageSize <= 0 || pageSize > 1000 {
@@ -199,13 +256,39 @@ func (s *Store) ListChangeLists(ctx context.Context, repo int64, statuses []Stat
 	for i, st := range statuses {
 		sts[i] = int16(st)
 	}
-	rows, err := s.b.ListChangeLists(ctx, repo, before, sts, author, pageSize+1)
+	rows, err := s.ops(ctx).ListChangeLists(ctx, repo, before, sts, author, parent, pageSize+1)
 	if err != nil {
 		return nil, 0, err
 	}
-	cls, err := loadChangeLists(ctx, s.b, repo, rows)
+	cls, err := loadChangeLists(ctx, s.ops(ctx), repo, rows)
 	if err != nil {
 		return nil, 0, err
+	}
+	// Landed CLs in segments, each source's first page merged: those are all a page can use.
+	if len(statuses) == 0 || slices.Contains(statuses, StatusSubmitted) {
+		numbers, err := s.settledNumbers(ctx, repo, before, author, pageSize+1)
+		if err != nil {
+			return nil, 0, err
+		}
+		have := map[int64]bool{}
+		for _, c := range cls {
+			have[c.Number] = true
+		}
+		numbers = slices.DeleteFunc(numbers, func(n int64) bool { return have[n] })
+		settled, err := s.settledChangeLists(ctx, repo, numbers)
+		if err != nil {
+			return nil, 0, err
+		}
+		more, err := settledOf(repo, settled)
+		if err != nil {
+			return nil, 0, err
+		}
+		if parent != 0 {
+			more = slices.DeleteFunc(more, func(c *ChangeList) bool { return c.ParentNumber != parent })
+		}
+		cls = append(cls, more...)
+		slices.SortFunc(cls, func(a, b *ChangeList) int { return cmp.Compare(b.Number, a.Number) })
+		cls = cls[:min(len(cls), pageSize+1)]
 	}
 	var next int64
 	if len(cls) > pageSize {
@@ -221,21 +304,45 @@ func (s *Store) ListChangeLists(ctx context.Context, repo int64, statuses []Stat
 
 // LookupChanges returns the CLs of the given change IDs that have one, in number order.
 func (s *Store) LookupChanges(ctx context.Context, repo int64, changeIDs []encoding.ChangeID) ([]ChangeList, error) {
-	if err := s.repositoryExists(ctx, s.b, repo); err != nil {
+	if err := s.repositoryExists(ctx, s.ops(ctx), repo); err != nil {
 		return nil, err
 	}
 	keys := make([][]byte, len(changeIDs))
 	for i := range changeIDs {
 		keys[i] = changeIDs[i][:]
 	}
-	rows, err := s.b.ChangeListsOfChanges(ctx, repo, keys)
+	rows, err := s.ops(ctx).ChangeListsOfChanges(ctx, repo, keys)
 	if err != nil {
 		return nil, err
 	}
-	cls, err := loadChangeLists(ctx, s.b, repo, rows)
+	cls, err := loadChangeLists(ctx, s.ops(ctx), repo, rows)
 	if err != nil {
 		return nil, err
 	}
+	found := map[encoding.ChangeID]bool{}
+	for _, c := range cls {
+		found[c.ChangeID] = true
+	}
+	var rest [][]byte
+	for i, id := range changeIDs {
+		if !found[id] {
+			rest = append(rest, keys[i])
+		}
+	}
+	numbers, err := s.settledByChange(ctx, repo, rest)
+	if err != nil {
+		return nil, err
+	}
+	settled, err := s.settledChangeLists(ctx, repo, numbers)
+	if err != nil {
+		return nil, err
+	}
+	more, err := settledOf(repo, settled)
+	if err != nil {
+		return nil, err
+	}
+	cls = append(cls, more...)
+	slices.SortFunc(cls, func(a, b *ChangeList) int { return cmp.Compare(a.Number, b.Number) })
 	out := make([]ChangeList, len(cls))
 	for i, c := range cls {
 		out[i] = *c
@@ -263,8 +370,8 @@ func (s *Store) Transition(ctx context.Context, repo, number int64, kind Transit
 	}
 	var out ChangeList
 	var ev *scmpb.Event
-	err := s.inTx(ctx, func(tx *txn) error {
-		cls, err := lockChangeLists(ctx, tx, repo, []int64{number})
+	err := s.inTx(ctx, func(ctx context.Context, tx *txn) error {
+		cls, err := s.lockChangeLists(ctx, tx, repo, []int64{number})
 		if err != nil {
 			return err
 		}
@@ -309,13 +416,13 @@ func (s *Store) Transition(ctx context.Context, repo, number int64, kind Transit
 		if err := tx.SetChangeListStatus(ctx, repo, number, int16(to), abandonedFrom); err != nil {
 			return err
 		}
-		cls, err = lockChangeLists(ctx, tx, repo, []int64{number})
+		cls, err = s.lockChangeLists(ctx, tx, repo, []int64{number})
 		if err != nil {
 			return err
 		}
 		out = *cls[number]
 		ev = &scmpb.Event{Kind: &scmpb.Event_Transitioned{Transitioned: &scmpb.ChangeListTransitioned{
-			Number: number, From: from.proto(), To: to.proto(), Actor: actor, Reason: reason,
+			Number: number, From: from.proto(), To: to.proto(), ActorId: actor, Reason: reason,
 		}}}
 		return appendEvent(ctx, tx, repo, ev)
 	})

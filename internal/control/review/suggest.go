@@ -2,6 +2,7 @@ package review
 
 import (
 	"context"
+	"errors"
 	"path"
 	"slices"
 
@@ -61,7 +62,7 @@ func (s *Service) suggest(ctx context.Context, cl db.ChangeList, st *Status, fil
 		rank[p] = i
 	}
 	eligible := func(p string) (bool, error) {
-		if p == cl.Author || !people.IsHuman(p) {
+		if p == cl.Author {
 			return false, nil
 		}
 		return s.people.IsActiveHuman(ctx, p)
@@ -79,15 +80,17 @@ func (s *Service) suggest(ctx context.Context, cl db.ChangeList, st *Status, fil
 				var named []string
 				switch owner.Kind {
 				case owners.User:
-					named = []string{people.Principal(owner.Name)}
+					if id, ok := st.owned.users[owner.Name]; ok {
+						named = []string{id}
+					}
 				case owners.ACL:
-					for m := range st.acls[ACLName(owner)] {
+					for m := range st.owned.acls[ACLName(owner)] {
 						named = append(named, m)
 					}
 					slices.Sort(named)
 				}
 				for _, p := range named {
-					if !grantCounts(o.Set, p, cl.Author, st.acls) || slices.Contains(ids, p) {
+					if !grantCounts(o.Set, p, cl.Author, st.owned) || slices.Contains(ids, p) {
 						continue
 					}
 					ok, err := eligible(p)
@@ -110,7 +113,14 @@ func (s *Service) suggest(ctx context.Context, cl db.ChangeList, st *Status, fil
 			continue
 		}
 		var ids []string
-		for _, p := range r.Eligible {
+		for _, name := range r.Eligible {
+			p, err := people.IDOfName(ctx, name)
+			if errors.Is(err, people.ErrUnknown) {
+				continue
+			}
+			if err != nil {
+				return nil, err
+			}
 			ok, err := eligible(p)
 			if err != nil {
 				return nil, err
@@ -129,7 +139,7 @@ func (s *Service) suggest(ctx context.Context, cl db.ChangeList, st *Status, fil
 		if !ok {
 			r = len(rank)
 		}
-		return r, people.Handle(p)
+		return r, people.Handle(ctx, p)
 	})
 	inSets := map[string]bool{}
 	for i, ids := range sets {
@@ -267,7 +277,7 @@ func (s *Service) recentPeople(ctx context.Context, repo int64, files []string) 
 				add(p)
 			}
 		}
-		add(people.FromEmail(c.GetAuthor().GetEmail()))
+		add(people.FromEmail(ctx, c.GetAuthor().GetEmail()))
 	}
 	return out, nil
 }

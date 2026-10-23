@@ -4,6 +4,7 @@ package storetest
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"reflect"
 	"testing"
@@ -26,10 +27,31 @@ func Run(t *testing.T, open func(t *testing.T) store.Backend) {
 	}{
 		{"Robots", testRobots},
 		{"Sync", testSync},
+		{"SyncAtScale", testSyncAtScale},
 		{"Tree", testTree},
 		{"DeviceLogin", testDeviceLogin},
 		{"Credentials", testCredentials},
 		{"SessionsAndCeremonies", testSessionsAndCeremonies},
+		{"Approvals", testApprovals},
+		{"SecretsRoots", testSecretsRoots},
+		{"Tenancy", testTenancy},
+		{"DirectoryLog", testDirectoryLog},
+		{"Names", testNames},
+		{"Tokens", testTokens},
+		{"OrganizationRobots", testOrganizationRobots},
+		{"Apps", testApps},
+		{"Accounts", testAccounts},
+		{"Enterprise", testEnterprise},
+		{"ForkRules", testForkRules},
+		{"Deletions", testDeletions},
+		{"MoveIn", testMoveIn},
+		{"NetworkMoves", testNetworkMoves},
+		{"OwnerRegions", testOwnerRegions},
+		{"Quotas", testQuotas},
+		{"Search", testSearch},
+		{"Inbox", testInbox},
+		{"Notifications", testNotifications},
+		{"DeployAgents", testDeployAgents},
 	} {
 		t.Run(tc.name, func(t *testing.T) { tc.fn(t, store.New(open(t), names)) })
 	}
@@ -393,7 +415,7 @@ func testSessionsAndCeremonies(t *testing.T, s *store.Store) {
 		t.Fatal(err)
 	}
 	pk, err := s.PasskeyByID(ctx, []byte("pk1"))
-	if err != nil || string(pk.Data) != `{"n": 2}` || pk.LastUsed.IsZero() {
+	if err != nil || !sameJSON(pk.Data, `{"n":2}`) || pk.LastUsed.IsZero() {
 		t.Errorf("PasskeyByID = %+v (%s), %v", pk, pk.Data, err)
 	}
 	if err := s.RemovePasskey(ctx, ada.ID, []byte("pk1")); err != nil {
@@ -402,4 +424,11 @@ func testSessionsAndCeremonies(t *testing.T, s *store.Store) {
 	if list, _ := s.Passkeys(ctx, ada.ID); len(list) != 0 {
 		t.Errorf("Passkeys after removing = %+v", list)
 	}
+}
+
+// sameJSON reports whether stored JSON is want's value: a database keeps JSON's value, not its
+// spacing or the order of its keys.
+func sameJSON(got []byte, want string) bool {
+	var g, w any
+	return json.Unmarshal(got, &g) == nil && json.Unmarshal([]byte(want), &w) == nil && reflect.DeepEqual(g, w)
 }

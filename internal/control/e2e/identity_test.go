@@ -55,7 +55,7 @@ func TestIdentityApprovals(t *testing.T) {
 	if got := submitTitle(p, "Submit"); !strings.Contains(got, "Approval from a member of eng.acl.example.com (change the members of eng.group.example.com)") {
 		t.Errorf("carol's change: submit %q", got)
 	}
-	if !p.has("eng.acl.example.com") || !p.has("/org/tree/main/identity/eng/acl.yaml") || !p.has("0 of 1 parts of the groups-and-ACLs tree's change") {
+	if !p.has("eng.acl.example.com") || !p.has("/example/org/tree/main/identity/eng/acl.yaml") || !p.has("0 of 1 parts of the groups-and-ACLs tree's change") {
 		t.Errorf("who can approve carol's change: %s", excerpt(p.body))
 	}
 	e.post(bob, path+"/reply", grant("Approval"))

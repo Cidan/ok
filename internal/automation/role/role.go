@@ -14,24 +14,37 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"google.golang.org/grpc"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
 
+	"github.com/Cidan/ok/internal/authz"
+	"github.com/Cidan/ok/internal/automation/cache"
 	"github.com/Cidan/ok/internal/automation/feed"
 	"github.com/Cidan/ok/internal/automation/queue"
+	"github.com/Cidan/ok/internal/automation/quota"
+	"github.com/Cidan/ok/internal/automation/scale"
 	"github.com/Cidan/ok/internal/automation/service"
 	"github.com/Cidan/ok/internal/automation/store"
 	autopostgres "github.com/Cidan/ok/internal/automation/store/postgres"
+	"github.com/Cidan/ok/internal/automation/store/spannerstore"
 	"github.com/Cidan/ok/internal/blob"
 	"github.com/Cidan/ok/internal/bus"
 	"github.com/Cidan/ok/internal/bus/busconfig"
+	"github.com/Cidan/ok/internal/cells"
 	"github.com/Cidan/ok/internal/config"
 	"github.com/Cidan/ok/internal/credential"
 	"github.com/Cidan/ok/internal/dial"
 	"github.com/Cidan/ok/internal/idclient"
+	"github.com/Cidan/ok/internal/move"
 	"github.com/Cidan/ok/internal/pgdb"
 	"github.com/Cidan/ok/internal/serve/authn"
 	"github.com/Cidan/ok/internal/serve/node"
+	"github.com/Cidan/ok/internal/spannerdb"
 	automationpb "github.com/Cidan/ok/proto/ok/automation/v1"
+	identitypb "github.com/Cidan/ok/proto/ok/identity/v1"
 	scmpb "github.com/Cidan/ok/proto/ok/scm/v1"
+	okpb "github.com/Cidan/ok/proto/ok/v1"
 )
 
 // Schema is the PostgreSQL schema ok automation keeps its tables in.
@@ -66,9 +79,13 @@ type Options struct {
 	Stream bus.Stream
 	// Identity and SCM, when set, are dialed as ok automation already: tests.
 	Identity, SCM grpc.ClientConnInterface
+	// Deployments, when set, sizes the pools' worker Deployments instead of the cluster's: tests.
+	Deployments scale.Deployments
 	// Roots, when set, are the identity CA's certificates as identity in the same process holds
 	// them (ok serve); unset, they are read from identity.
 	Roots *idclient.Roots
+	// Peers, when set, connects to another cell's ok automation at an address, as the role: tests.
+	Peers func(addr string) grpc.ClientConnInterface
 }
 
 // Build assembles ok automation from its configuration.
@@ -80,19 +97,38 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (*Role, error)
 			r.Close()
 		}
 	}()
+	var b store.Backend
+	var err error
 	pool := opts.Pool
-	if pool == nil {
-		dsn, err := config.Secret(cfg.Database.URLFile)
+	if pool == nil && cfg.Database.Type == "spanner" {
+		// Its own database in the instance; the bus is another backend's (config).
+		db, err := spannerdb.Open(ctx, cfg.Database.Spanner, "automation")
 		if err != nil {
-			return nil, fmt.Errorf("database.url_file: %w", err)
-		}
-		if dsn == "" {
-			return nil, errors.New("database.url_file names no database")
-		}
-		if pool, err = pgdb.Open(ctx, dsn, Schema, cfg.Database.MaxConnections); err != nil {
 			return nil, err
 		}
-		r.closers = append(r.closers, pool.Close)
+		r.closers = append(r.closers, db.Close)
+		if b, err = spannerstore.Open(ctx, db.Admin, db.Client); err != nil {
+			return nil, fmt.Errorf("ok automation's store: %w", err)
+		}
+	} else {
+		if pool == nil {
+			dsn, err := config.Secret(cfg.Database.URLFile)
+			if err != nil {
+				return nil, fmt.Errorf("database.url_file: %w", err)
+			}
+			if dsn == "" {
+				return nil, errors.New("database.url_file names no database")
+			}
+			if pool, err = pgdb.Open(ctx, dsn, Schema, cfg.Database.MaxConnections); err != nil {
+				return nil, err
+			}
+			r.closers = append(r.closers, pool.Close)
+		}
+		pb, err := autopostgres.Open(ctx, pool)
+		if err != nil {
+			return nil, fmt.Errorf("ok automation's store: %w", err)
+		}
+		b = pb
 	}
 	logs := opts.Logs
 	if logs == nil {
@@ -102,11 +138,6 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (*Role, error)
 		}
 		logs = s3
 	}
-	b, err := autopostgres.Open(ctx, pool)
-	if err != nil {
-		return nil, fmt.Errorf("ok automation's store: %w", err)
-	}
-	st := store.New(b, logs, store.DefaultConfig)
 	stream := opts.Stream
 	if stream == nil {
 		bb, err := busconfig.Open(ctx, cfg.Bus, pool)
@@ -116,7 +147,6 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (*Role, error)
 		r.closers = append(r.closers, bb.Close)
 		stream = bb.Stream
 	}
-	r.Store = st
 
 	idConn, scmConn := opts.Identity, opts.SCM
 	if idConn == nil || scmConn == nil {
@@ -161,31 +191,123 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (*Role, error)
 		Dev:           opts.Dev,
 		Roles:         idclient.Roles(cfg),
 	})
+	scfg := store.DefaultConfig
+	// The stream's backend carries the signals (docs/hosted.md, "Signals").
+	scfg.Signals, _ = stream.(bus.Signals)
+	// Admission by the directory's quotas, with the other cells' use (docs/hosted.md, "Hosted
+	// automation, as built").
+	quotas := identitypb.NewQuotasClient(idConn)
+	scfg.PlanPool, scfg.Quotas = cfg.Automation.PlanPool, quota.NewCache(quotas, cfg.Cell.Name).Get
+	st := store.New(b, logs, scfg)
+	r.Store = st
+	report := &app{name: "ok/automation/usage", run: (&quota.Reporter{Store: st, Quotas: quotas, Cell: cfg.Cell.Name, Log: slog.Default()}).Run}
 	qcfg := queue.DefaultConfig
 	if d := cfg.Automation.SpeculationDepth; d != nil {
 		qcfg.Depth = *d
 	}
-	svc := &services{svc: service.New(st, store.DefaultConfig.Heartbeat)}
-	sweep := &sweeper{store: st}
+	if b := cfg.Automation.LandingBatch; b != nil {
+		qcfg.Batch = *b
+	}
+	// Runs.StartPre plans pre as the feed does, reading the SCM.
 	follow := &follower{f: feed.New(st, stream, feed.SCM{
 		Events:       scmpb.NewEventsClient(scmConn),
 		ChangeLists:  scmpb.NewChangeListsClient(scmConn),
 		Repositories: scmpb.NewRepositoriesClient(scmConn),
 		Browse:       scmpb.NewBrowseClient(scmConn),
 	}, slog.Default())}
+	svc := &services{svc: service.New(st, store.DefaultConfig.Heartbeat, cfg.Automation.Cache != nil, follow.f)}
+	// The remote cache its workers' Bazel reaches, in the logs' bucket (docs/hosted.md, "Hosted
+	// automation, as built").
+	if ac := cfg.Automation.Cache; ac != nil {
+		ns := &service.Namespaces{Store: st, Checker: authz.NewChecker(identitypb.NewAuthorizationClient(idConn))}
+		svc.cache = cache.New(logs, ns.Resolve, int64(ac.MemoryMiB)<<20)
+		svc.sweep = &app{name: "ok/automation/cache", run: func(ctx context.Context) error {
+			return cache.Expire(ctx, svc.cache, st.Work(), ac.TTL, slog.Default())
+		}}
+	}
+	sweep := &sweeper{store: st}
 	lander := &lander{q: queue.New(st, queue.SCM{
 		ChangeLists:  scmpb.NewChangeListsClient(scmConn),
 		Landing:      scmpb.NewLandingClient(scmConn),
 		Repositories: scmpb.NewRepositoriesClient(scmConn),
 		Browse:       scmpb.NewBrowseClient(scmConn),
 	}, qcfg, slog.Default())}
-	r.Root = &assembly{deps: []node.Node{svc, sweep, follow, lander, roots}}
+	directory := &dirFollower{d: feed.NewDirectory(st, stream, identitypb.NewDirectoryEventsClient(idConn), slog.Default())}
+	// Moves of its repositories' rows and logs between cells, from the same role of the source
+	// cell (docs/hosted.md, "Cells, as built").
+	peers := cells.NewPeers(identitypb.NewCellsClient(idConn), func(addr string) (grpc.ClientConnInterface, func(), error) {
+		if opts.Peers != nil {
+			return opts.Peers(addr), nil, nil
+		}
+		base, err := idclient.Options(cfg.Services)
+		if err != nil {
+			return nil, nil, err
+		}
+		if opts.Dev && cfg.Workload.TokenFile == "" && cfg.Workload.CredentialDir == "" {
+			// Development, with no workload credential: the role names itself to the other cell's.
+			base.DevPrincipal = cfg.RobotName(cfg.Roles.Automation)
+		} else if base.Credential, err = idclient.Credential(cfg, base); err != nil {
+			return nil, nil, err
+		}
+		c, err := dial.Dial(addr, base)
+		if err != nil {
+			return nil, nil, err
+		}
+		return c, func() { c.Close() }, nil
+	})
+	r.closers = append(r.closers, peers.Close)
+	mover := st.Mover()
+	moves := move.NewNode("ok/automation/moves", move.NewServer(mover, okpb.Caller_CALLER_AUTOMATION,
+		func(ctx context.Context, cell string) (okpb.MovesClient, error) {
+			c, err := peers.Conn(ctx, cell, cells.Automation)
+			if err != nil {
+				return nil, err
+			}
+			return okpb.NewMovesClient(c), nil
+		}), mover.Purge)
+	deps := []node.Node{svc, sweep, follow, directory, lander, moves, report, roots}
+	// The pools of workers, sized to what they are asked for (docs/hosted.md, "Hosted automation,
+	// as built").
+	if len(cfg.Automation.Pools) > 0 {
+		ds := opts.Deployments
+		if ds == nil {
+			var rc *rest.Config
+			if cfg.Automation.Kubeconfig != "" {
+				rc, err = clientcmd.BuildConfigFromFlags("", cfg.Automation.Kubeconfig)
+			} else {
+				rc, err = rest.InClusterConfig()
+			}
+			if err != nil {
+				return nil, fmt.Errorf("the pools' cluster: %w", err)
+			}
+			kube, err := kubernetes.NewForConfig(rc)
+			if err != nil {
+				return nil, err
+			}
+			ds = scale.Kube{Client: kube}
+		}
+		var pools []scale.Pool
+		for _, p := range cfg.Automation.Pools {
+			pools = append(pools, scale.Pool{Name: p.Name, Namespace: p.Namespace, Deployment: p.Deployment, Slots: int32(p.Slots),
+				Min: int32(p.Min), Max: int32(p.Max)})
+		}
+		sc := &scale.Scaler{Store: st, Pools: pools, Deployments: ds, Log: slog.Default()}
+		deps = append(deps, &app{name: "ok/automation/pools", run: func(ctx context.Context) error { return sc.Run(ctx, st.Work()) }})
+	}
+	if svc.sweep != nil {
+		deps = append(deps, svc.sweep)
+	}
+	r.Root = &assembly{deps: deps}
 	ok = true
 	return r, nil
 }
 
 // services are ok automation's gRPC services.
-type services struct{ svc service.Services }
+type services struct {
+	svc   service.Services
+	cache *cache.Server
+	sweep node.Node
+}
 
 var _ node.Service = (*services)(nil)
 
@@ -198,6 +320,10 @@ func (s *services) RegisterRPC(_ context.Context, reg grpc.ServiceRegistrar) err
 	automationpb.RegisterRunsServer(reg, s.svc.Runs)
 	automationpb.RegisterPushesServer(reg, s.svc.Pushes)
 	automationpb.RegisterWorkServer(reg, s.svc.Work)
+	automationpb.RegisterSecretRunsServer(reg, s.svc.SecretRuns)
+	if s.cache != nil {
+		s.cache.Register(reg)
+	}
 	return nil
 }
 
@@ -237,6 +363,17 @@ func (*follower) Setup(context.Context) error       { return nil }
 func (*follower) Healthy(context.Context) bool      { return true }
 func (f *follower) Start(ctx context.Context) error { return f.f.Run(ctx) }
 
+// dirFollower forgets the repositories the directory purges.
+type dirFollower struct{ d *feed.Directory }
+
+var _ node.Application = (*dirFollower)(nil)
+
+func (*dirFollower) Name() string                      { return "ok/automation/directory" }
+func (*dirFollower) Dependencies() []node.Node         { return nil }
+func (*dirFollower) Setup(context.Context) error       { return nil }
+func (*dirFollower) Healthy(context.Context) bool      { return true }
+func (f *dirFollower) Start(ctx context.Context) error { return f.d.Run(ctx) }
+
 // lander is the landing queue.
 type lander struct{ q *queue.Runner }
 
@@ -255,3 +392,17 @@ func (*assembly) Name() string                 { return "ok/automation" }
 func (a *assembly) Dependencies() []node.Node  { return a.deps }
 func (*assembly) Healthy(context.Context) bool { return true }
 func (*assembly) Setup(context.Context) error  { return nil }
+
+// app runs a function while the role runs: a node.Application.
+type app struct {
+	name string
+	run  func(ctx context.Context) error
+}
+
+var _ node.Application = (*app)(nil)
+
+func (a *app) Name() string                    { return a.name }
+func (*app) Dependencies() []node.Node         { return nil }
+func (*app) Setup(context.Context) error       { return nil }
+func (*app) Healthy(context.Context) bool      { return true }
+func (a *app) Start(ctx context.Context) error { return a.run(ctx) }

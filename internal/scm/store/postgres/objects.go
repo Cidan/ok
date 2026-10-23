@@ -191,79 +191,78 @@ func (x queries) sweep(ctx context.Context, table string, repo int64, members []
 }
 
 func (x queries) SweepObjects(ctx context.Context, repo int64, members []encoding.ID, cutoff time.Time, dry bool) (int64, error) {
-	return x.sweep(ctx, "object", repo, members, cutoff, dry)
+	if dry {
+		return x.sweep(ctx, "object", repo, members, cutoff, dry)
+	}
+	// What a swept tree's or copy's row carried with it once: its sizes record, its edges.
+	var n int64
+	err := x.q.QueryRow(ctx, `WITH gone AS (
+			DELETE FROM object WHERE repository_id = $1 AND id = ANY($2) AND NOT pinned AND touched_at < $3 RETURNING id),
+		sizes AS (DELETE FROM tree_sizes WHERE repository_id = $1 AND tree_id IN (SELECT id FROM gone)),
+		edges AS (DELETE FROM copy_parent WHERE repository_id = $1 AND copy_id IN (SELECT id FROM gone))
+		SELECT count(*) FROM gone`, repo, ids(members), cutoff).Scan(&n)
+	return n, err
 }
 
 func (x queries) SweepCommits(ctx context.Context, repo int64, members []encoding.ID, cutoff time.Time, dry bool) (int64, error) {
 	return x.sweep(ctx, "commit", repo, members, cutoff, dry)
 }
 
-// CopyRelatives walks copy_parent with fenced per-row index probes, as Ancestry does.
-func (x queries) CopyRelatives(ctx context.Context, repo int64, id encoding.ID) (map[encoding.ID][]byte, error) {
-	return bodies(x.q.Query(ctx, `WITH RECURSIVE
-		anc(id) AS (
-			SELECT $2::bytea
-			UNION
-			SELECT p.parent_id FROM anc, LATERAL (
-				SELECT cp.parent_id FROM copy_parent cp WHERE cp.repository_id = $1 AND cp.copy_id = anc.id OFFSET 0) p
-		),
-		rel(id) AS (
-			SELECT id FROM anc
-			UNION
-			SELECT c.copy_id FROM rel, LATERAL (
-				SELECT cp.copy_id FROM copy_parent cp WHERE cp.repository_id = $1 AND cp.parent_id = rel.id OFFSET 0) c
-		)
-		SELECT o.id, o.body FROM rel JOIN object o ON o.repository_id = $1 AND o.id = rel.id AND o.kind = $3`,
-		repo, id[:], int16(encoding.KindCopyHistory)))
+func (x queries) CopyChildren(ctx context.Context, repo int64, parents []encoding.ID) ([][2]encoding.ID, error) {
+	return pairs(x.q.Query(ctx, `SELECT copy_id, parent_id FROM copy_parent WHERE repository_id = $1 AND parent_id = ANY($2)`,
+		repo, ids(parents)))
 }
 
-// parentsOf is the parent edges of one commit, with each parent's generation. The
-// OFFSET 0 fence keeps it a subquery run per row — two primary-key probes — so a walk
-// that visits a window of a repository's history never becomes a join over every edge
-// in the repository.
-const parentsOf = `SELECT cp.parent_id, cp.ord, pc.generation
-	FROM commit_parent cp JOIN commit pc ON pc.repository_id = cp.repository_id AND pc.id = cp.parent_id
-	WHERE cp.repository_id = $1 AND cp.commit_id = walk.id OFFSET 0`
-
-func (x queries) Ancestry(ctx context.Context, repo int64, from []encoding.ID, minGen int64) ([]backend.Ancestor, error) {
-	rows, err := x.q.Query(ctx, `WITH RECURSIVE walk(id) AS (
-			SELECT unnest($2::bytea[])
-			UNION
-			SELECT e.parent_id FROM walk, LATERAL (`+parentsOf+`) e WHERE e.generation >= $3
-		)
-		SELECT walk.id, e.parent_id, e.generation
-		FROM walk LEFT JOIN LATERAL (`+parentsOf+`) e ON true
-		ORDER BY walk.id, e.ord`, repo, ids(from), minGen)
+// graphCommits reads rows of a commit's ID, generation, and parents.
+func graphCommits(rows pgx.Rows, err error) ([]backend.GraphCommit, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var out []backend.Ancestor
-	for rows.Next() {
-		var idb, parentb []byte
-		var pgen *int64
-		if err := rows.Scan(&idb, &parentb, &pgen); err != nil {
-			return nil, err
+	return pgx.CollectRows(rows, func(r pgx.CollectableRow) (backend.GraphCommit, error) {
+		var g backend.GraphCommit
+		var idb []byte
+		var parents [][]byte
+		if err := r.Scan(&idb, &g.Generation, &parents); err != nil {
+			return g, err
 		}
-		id, err := toID(idb)
-		if err != nil {
-			return nil, err
+		var err error
+		if g.ID, err = toID(idb); err != nil {
+			return g, err
 		}
-		if len(out) == 0 || out[len(out)-1].ID != id {
-			out = append(out, backend.Ancestor{ID: id})
+		for _, p := range parents {
+			id, err := toID(p)
+			if err != nil {
+				return g, err
+			}
+			g.Parents = append(g.Parents, id)
 		}
-		if pgen == nil {
-			continue
-		}
-		parent, err := toID(parentb)
-		if err != nil {
-			return nil, err
-		}
-		a := &out[len(out)-1]
-		a.Parents = append(a.Parents, parent)
-		a.Generations = append(a.Generations, *pgen)
-	}
-	return out, rows.Err()
+		return g, nil
+	})
+}
+
+// commitParents is a commit's parents in order, as an array.
+const commitParents = `coalesce((SELECT array_agg(p.parent_id ORDER BY p.ord) FROM commit_parent p
+	WHERE p.repository_id = c.repository_id AND p.commit_id = c.id), '{}')`
+
+// TailAncestry walks commit_parent with per-row index probes, the OFFSET 0 fence keeping each
+// step a subquery run per row — so a walk over a window of a repository's history never becomes a
+// join over every edge in it — and stops at parents the tail lacks, which the store looks for in
+// segments.
+func (x queries) TailAncestry(ctx context.Context, repo int64, from []encoding.ID, minGen int64) ([]backend.GraphCommit, error) {
+	return graphCommits(x.q.Query(ctx, `WITH RECURSIVE walk(id) AS (
+			SELECT c.id FROM commit c WHERE c.repository_id = $1 AND c.id = ANY($2)
+			UNION
+			SELECT e.parent_id FROM walk, LATERAL (
+				SELECT cp.parent_id FROM commit_parent cp JOIN commit pc ON pc.repository_id = cp.repository_id AND pc.id = cp.parent_id
+				WHERE cp.repository_id = $1 AND cp.commit_id = walk.id AND pc.generation >= $3 OFFSET 0) e
+		)
+		SELECT c.id, c.generation, `+commitParents+` FROM walk JOIN commit c ON c.repository_id = $1 AND c.id = walk.id`,
+		repo, ids(from), minGen))
+}
+
+func (x queries) TailGraph(ctx context.Context, repo int64, members []encoding.ID) ([]backend.GraphCommit, error) {
+	return graphCommits(x.q.Query(ctx, `SELECT c.id, c.generation, `+commitParents+` FROM commit c
+		WHERE c.repository_id = $1 AND c.id = ANY($2)`, repo, ids(members)))
 }
 
 func (x queries) AllObjects(ctx context.Context, repo int64) ([]backend.Object, error) {
@@ -385,6 +384,41 @@ func (x queries) HeadSeqOf(ctx context.Context, repo int64, commit encoding.ID) 
 	return seq, err == nil, err
 }
 
+func (x queries) InsertPathIndex(ctx context.Context, repo int64, p backend.PathIndex) error {
+	_, err := x.q.Exec(ctx, `INSERT INTO path_index (repository_id, generation, commit_id, parent_id) VALUES ($1, $2, $3, $4)`,
+		repo, p.Generation, p.Commit[:], p.Parent[:])
+	return err
+}
+
+func (x queries) PathIndexes(ctx context.Context, repo int64) ([]backend.PathIndex, error) {
+	rows, err := x.q.Query(ctx, `SELECT generation, commit_id, parent_id FROM path_index WHERE repository_id = $1 ORDER BY generation`, repo)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []backend.PathIndex
+	for rows.Next() {
+		var p backend.PathIndex
+		var commit, parent []byte
+		if err := rows.Scan(&p.Generation, &commit, &parent); err != nil {
+			return nil, err
+		}
+		if p.Commit, err = toID(commit); err != nil {
+			return nil, err
+		}
+		if p.Parent, err = toID(parent); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+func (x queries) DeletePathIndex(ctx context.Context, repo, gen int64) error {
+	_, err := x.q.Exec(ctx, `DELETE FROM path_index WHERE repository_id = $1 AND generation = $2`, repo, gen)
+	return err
+}
+
 func (x queries) InsertCommitPaths(ctx context.Context, repo, gen int64, commit encoding.ID, paths []string) error {
 	_, err := x.q.Exec(ctx, `INSERT INTO commit_path (repository_id, path, generation, commit_id)
 		SELECT $1, u.path, $2, $3 FROM unnest($4::text[]) AS u(path) ON CONFLICT DO NOTHING`,
@@ -398,34 +432,33 @@ func (x queries) PathCommits(ctx context.Context, repo int64, paths []string, fr
 		GROUP BY commit_id, generation ORDER BY generation `+order(ascending)+` LIMIT $5`, repo, paths, from, to, limit))
 }
 
-func (x queries) LastPathCommits(ctx context.Context, repo, gen int64, paths []string) (map[int]encoding.ID, error) {
-	rows, err := x.q.Query(ctx, `SELECT u.i, (SELECT cp.commit_id FROM commit_path cp
+func (x queries) LastPathCommits(ctx context.Context, repo, gen int64, paths []string) (map[int]backend.GenCommit, error) {
+	rows, err := x.q.Query(ctx, `SELECT u.i, l.commit_id, l.generation FROM unnest($3::text[]) WITH ORDINALITY AS u(path, i)
+		CROSS JOIN LATERAL (SELECT cp.commit_id, cp.generation FROM commit_path cp
 			WHERE cp.repository_id = $1 AND cp.path = u.path AND cp.generation <= $2
-			ORDER BY cp.generation DESC LIMIT 1)
-		FROM unnest($3::text[]) WITH ORDINALITY AS u(path, i)`, repo, gen, paths)
+			ORDER BY cp.generation DESC LIMIT 1) l`, repo, gen, paths)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	out := map[int]encoding.ID{}
+	out := map[int]backend.GenCommit{}
 	for rows.Next() {
 		var i int64
 		var b []byte
-		if err := rows.Scan(&i, &b); err != nil {
+		var g int64
+		if err := rows.Scan(&i, &b, &g); err != nil {
 			return nil, err
-		}
-		if b == nil {
-			continue
 		}
 		id, err := toID(b)
 		if err != nil {
 			return nil, err
 		}
-		out[int(i-1)] = id
+		out[int(i-1)] = backend.GenCommit{Commit: id, Generation: g}
 	}
 	return out, rows.Err()
 }
 
-func (x queries) PathHistory(ctx context.Context, repo int64, path string, gen int64) ([]encoding.ID, error) {
-	return idList(x.q.Query(ctx, `SELECT commit_id FROM commit_path WHERE repository_id = $1 AND path = $2 AND generation <= $3 ORDER BY generation DESC`, repo, path, gen))
+func (x queries) PathHistory(ctx context.Context, repo int64, path string, gen int64) ([]backend.GenCommit, error) {
+	return genCommits(x.q.Query(ctx, `SELECT commit_id, generation FROM commit_path
+		WHERE repository_id = $1 AND path = $2 AND generation <= $3 ORDER BY generation DESC`, repo, path, gen))
 }

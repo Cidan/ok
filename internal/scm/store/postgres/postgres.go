@@ -7,6 +7,7 @@ import (
 	"embed"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -14,7 +15,6 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Cidan/ok/internal/data/pgdata"
-	"github.com/Cidan/ok/internal/lock"
 	"github.com/Cidan/ok/internal/migrate"
 	"github.com/Cidan/ok/internal/scm/encoding"
 	"github.com/Cidan/ok/internal/scm/store/backend"
@@ -29,8 +29,7 @@ var Migrations = migrate.MustLoad(migrations, "migrations")
 // Backend is the SCM's database on PostgreSQL.
 type Backend struct {
 	queries
-	pool  *pgxpool.Pool
-	locks *lock.Lock
+	pool *pgxpool.Pool
 }
 
 var _ backend.Backend = (*Backend)(nil)
@@ -40,14 +39,22 @@ func Open(ctx context.Context, pool *pgxpool.Pool) (*Backend, error) {
 	if _, err := migrate.Apply(ctx, pool, "scm", Migrations); err != nil {
 		return nil, err
 	}
-	return &Backend{queries: queries{pool}, pool: pool, locks: lock.New(pool)}, nil
+	return &Backend{queries: queries{pool}, pool: pool}, nil
 }
 
 // Pool is the backend's pool: for tests, which inspect and age rows.
 func (b *Backend) Pool() *pgxpool.Pool { return b.pool }
 
+// Txn runs fn in a transaction. Its operations may be called from several goroutines at once:
+// they take turns on its connection.
 func (b *Backend) Txn(ctx context.Context, fn func(backend.Ops) error) error {
-	return pgx.BeginFunc(ctx, b.pool, func(tx pgx.Tx) error { return fn(queries{tx}) })
+	return pgx.BeginFunc(ctx, b.pool, func(tx pgx.Tx) error {
+		// What ctx's lease guards is written only while its holder holds it (data.Fence).
+		if err := pgdata.CheckFence(ctx, tx); err != nil {
+			return err
+		}
+		return fn(queries{&serial{q: tx}})
+	})
 }
 
 // Retryable reports a deadlock victim or a serialization failure.
@@ -57,16 +64,7 @@ func (b *Backend) Retryable(err error) bool {
 
 // Snapshot runs fn in a read-only, repeatable-read transaction.
 func (b *Backend) Snapshot(ctx context.Context, fn func(backend.Ops) error) error {
-	return pgdata.Snapshot(ctx, b.pool, func(tx pgx.Tx) error { return fn(queries{tx}) })
-}
-
-func (b *Backend) Lead(ctx context.Context, role string, fn lock.LockFn) error {
-	return b.locks.LockFn(ctx, "leaders", role, 0, fn)
-}
-
-// Listen holds a connection of its own, apart from the pool, listening on channels.
-func (b *Backend) Listen(ctx context.Context, channels []string, ready func(), deliver func(channel, payload string)) error {
-	return pgdata.Listen(ctx, b.pool, channels, ready, deliver)
+	return pgdata.Snapshot(ctx, b.pool, func(tx pgx.Tx) error { return fn(queries{&serial{q: tx}}) })
 }
 
 func (b *Backend) Ping(ctx context.Context) error { return b.pool.Ping(ctx) }
@@ -112,9 +110,91 @@ type querier interface {
 // queries are the backend's operations over a pool or a transaction.
 type queries struct{ q querier }
 
-func (x queries) Notify(ctx context.Context, channel, payload string) error {
-	_, err := x.q.Exec(ctx, `SELECT pg_notify($1, $2)`, channel, payload)
-	return err
+// serial runs a transaction's statements one at a time, each until its rows are read: a
+// connection runs one statement at a time, and a transaction's operations may be called from
+// several goroutines.
+type serial struct {
+	mu sync.Mutex
+	q  querier
+	// stamps are the stamps of the transaction's content log rows, by index (ShareContentIndex,
+	// LockContentIndex).
+	stampMu sync.Mutex
+	stamps  map[backend.Scope]int64
+}
+
+// stamp records the stamp a transaction's log rows of an index carry; a pool's operations, each a
+// transaction of its own, keep none.
+func (x queries) stamp(sc backend.Scope, seq int64) {
+	if s, ok := x.q.(*serial); ok {
+		s.stampMu.Lock()
+		defer s.stampMu.Unlock()
+		if s.stamps == nil {
+			s.stamps = map[backend.Scope]int64{}
+		}
+		s.stamps[sc] = seq
+	}
+}
+
+// stamped is the stamp a transaction's log rows of an index carry, if it holds the index.
+func (x queries) stamped(sc backend.Scope) (int64, bool) {
+	if s, ok := x.q.(*serial); ok {
+		s.stampMu.Lock()
+		defer s.stampMu.Unlock()
+		seq, held := s.stamps[sc]
+		return seq, held
+	}
+	return 0, false
+}
+
+func (s *serial) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.q.Exec(ctx, sql, args...)
+}
+
+func (s *serial) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	s.mu.Lock()
+	rows, err := s.q.Query(ctx, sql, args...)
+	if err != nil {
+		s.mu.Unlock()
+		return nil, err
+	}
+	return &serialRows{Rows: rows, unlock: sync.OnceFunc(s.mu.Unlock)}, nil
+}
+
+func (s *serial) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	s.mu.Lock()
+	return serialRow{row: s.q.QueryRow(ctx, sql, args...), unlock: s.mu.Unlock}
+}
+
+// serialRows hands the connection on once its rows are read or closed.
+type serialRows struct {
+	pgx.Rows
+	unlock func()
+}
+
+func (r *serialRows) Next() bool {
+	if r.Rows.Next() {
+		return true
+	}
+	r.unlock()
+	return false
+}
+
+func (r *serialRows) Close() {
+	r.Rows.Close()
+	r.unlock()
+}
+
+// serialRow hands the connection on once its row is scanned.
+type serialRow struct {
+	row    pgx.Row
+	unlock func()
+}
+
+func (r serialRow) Scan(dest ...any) error {
+	defer r.unlock()
+	return r.row.Scan(dest...)
 }
 
 // ids converts IDs to the [][]byte pgx sends as bytea[].

@@ -85,6 +85,12 @@ const (
 	GroupMember
 	// ACLMember is an ACL.
 	ACLMember
+	// Org is an organization: <handle>.org.<domain>, its handle in the namespace people's are in
+	// (docs/hosted.md, "Tenancy, as built"). An organization is in no set.
+	Org
+	// TeamMember is an organization's team: <team>.<org>.team.<domain>. A set may hold one, as it
+	// holds a group.
+	TeamMember
 )
 
 func (k MemberKind) String() string {
@@ -97,6 +103,10 @@ func (k MemberKind) String() string {
 		return "group"
 	case ACLMember:
 		return "acl"
+	case Org:
+		return "org"
+	case TeamMember:
+		return "team"
 	}
 	return fmt.Sprintf("MemberKind(%d)", int(k))
 }
@@ -107,9 +117,9 @@ var labelRE = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`)
 // ValidLabel reports whether s is a lowercase DNS label: what a set's (and its folder's) name is.
 func ValidLabel(s string) bool { return len(s) <= 63 && labelRE.MatchString(s) }
 
-// KindOf returns the kind of thing a name names: one label before .human, .group, or .acl, and
+// KindOf returns the kind of thing a name names: one label before .human, .org, .group, or .acl,
 // one or two before .robot (a robot is named by itself, or by its Kubernetes ServiceAccount and
-// namespace).
+// namespace, or an organization), and two before .team (the team, then its organization).
 func (n Names) KindOf(name string) (MemberKind, bool) {
 	rest, ok := strings.CutSuffix(name, "."+n.domain)
 	if !ok {
@@ -134,8 +144,27 @@ func (n Names) KindOf(name string) (MemberKind, bool) {
 		return GroupMember, len(labels) == 1
 	case "acl":
 		return ACLMember, len(labels) == 1
+	case "org":
+		return Org, len(labels) == 1
+	case "team":
+		return TeamMember, len(labels) == 2
 	}
 	return 0, false
+}
+
+// Org is the name of the organization with handle: acme.org.example.com.
+func (n Names) Org(handle string) string { return handle + ".org." + n.domain }
+
+// Team is the name of an organization's team: eng.acme.team.example.com.
+func (n Names) Team(team, org string) string { return team + "." + org + ".team." + n.domain }
+
+// HandleOf is the handle in a person's or an organization's name, which share one namespace.
+func (n Names) HandleOf(name string) (string, bool) {
+	k, ok := n.KindOf(name)
+	if !ok || (k != Human && k != Org) {
+		return "", false
+	}
+	return name[:strings.IndexByte(name, '.')], true
 }
 
 // Of is the name of the set of kind k named name: eng.acl.example.com.
@@ -291,7 +320,10 @@ func New(names Names, sets []Set, opts ...Option) (*Tree, error) {
 			k, ok := names.KindOf(m)
 			switch {
 			case !ok:
-				add("%s: %q is no name under %s (<handle>.human.%[3]s, <name>.robot.%[3]s, <serviceaccount>.<namespace>.robot.%[3]s, <name>.group.%[3]s, or <name>.acl.%[3]s)", describe(s), m, names.domain)
+				add("%s: %q is no name under %s (<handle>.human.%[3]s, <name>.robot.%[3]s, <serviceaccount>.<namespace>.robot.%[3]s, <name>.group.%[3]s, <team>.<org>.team.%[3]s, or <name>.acl.%[3]s)", describe(s), m, names.domain)
+				continue
+			case k == Org:
+				add("%s: %s is an organization, which is in no set: name its people, or a team of it", describe(s), m)
 				continue
 			case seen[m]:
 				add("%s: %s is a member twice", describe(s), m)
@@ -302,7 +334,8 @@ func New(names Names, sets []Set, opts ...Option) (*Tree, error) {
 			case s.Kind == Group && k == ACLMember:
 				add("%s: a group cannot contain an ACL (%s): group identity carries no authorization", describe(s), m)
 				continue
-			case k == ACLMember && t.sets[m] == nil, k == GroupMember && t.sets[m] == nil && t.synced[m] == nil:
+			case k == ACLMember && t.sets[m] == nil, k == GroupMember && t.sets[m] == nil && t.synced[m] == nil,
+				k == TeamMember && t.synced[m] == nil:
 				add("%s: %s is not declared in the tree, nor synced from the system of record", describe(s), m)
 				continue
 			}

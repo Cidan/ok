@@ -9,10 +9,12 @@ import (
 	"embed"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io/fs"
 	"log/slog"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,6 +24,7 @@ import (
 	"golang.org/x/oauth2"
 	"google.golang.org/grpc/status"
 
+	"github.com/Cidan/ok/internal/id/enterprise"
 	"github.com/Cidan/ok/internal/id/service"
 	"github.com/Cidan/ok/internal/id/signin"
 	"github.com/Cidan/ok/internal/id/store"
@@ -51,12 +54,20 @@ type Config struct {
 	Passkeys *signin.Passkeys
 	// SessionLifetime and SessionIdle bound a browser session.
 	SessionLifetime, SessionIdle time.Duration
+	// SignUp, set in a hosted service, is how its people make accounts.
+	SignUp *SignUp
+	// Hosted: a hosted service, whose people delete their own accounts.
+	Hosted bool
+	// Enterprise, set where identity keeps organizations' identity providers, signs their people in
+	// through their own.
+	Enterprise *enterprise.Syncer
 }
 
 // Web is the pages' node.
 type Web struct {
 	cfg    Config
 	secure bool // cookies only over HTTPS: the public URL is https
+	orgs   orgProviders
 }
 
 var _ node.WebServer = (*Web)(nil)
@@ -69,7 +80,7 @@ func New(cfg Config) *Web {
 	if cfg.SessionIdle == 0 {
 		cfg.SessionIdle = store.DefaultSessionIdle
 	}
-	return &Web{cfg: cfg, secure: strings.HasPrefix(cfg.PublicURL, "https://")}
+	return &Web{cfg: cfg, secure: strings.HasPrefix(cfg.PublicURL, "https://"), orgs: orgProviders{byID: map[string]orgProvider{}}}
 }
 
 func (w *Web) Name() string                     { return "ok/identity/web" }
@@ -99,8 +110,14 @@ func (w *Web) Mount(r *chi.Mux) (string, error) {
 	r.Post("/logout", w.logout)
 	r.Get("/device", w.device)
 	r.Post("/device", w.deviceDecide)
+	w.mountApprovals(r)
 	r.Get("/account", w.account)
 	r.Post("/account/credentials/revoke", w.revokeCredential)
+	r.Get("/login/org/{handle}", w.orgLogin)
+	w.mountSignUp(r)
+	r.Post("/account/tokens", w.createToken)
+	r.Post("/account/delete", w.deleteAccount)
+	r.Post("/account/tokens/revoke", w.revokeToken)
 	r.Post("/account/passkeys/remove", w.passkeyRemove)
 	r.Get("/admin", w.admin)
 	r.Post("/admin/sync", w.adminSync)
@@ -154,9 +171,11 @@ func next(raw string) string {
 }
 
 // caller is the signed-in person of a request, if any.
+// caller is the person a page's request is from. A personal token reaches repositories alone, so
+// it signs no one in here: these pages manage an account.
 func caller(r *http.Request) (authn.Caller, bool) {
 	c, ok := authn.FromContext(r.Context())
-	if !ok || !c.Human {
+	if !ok || !c.Human || c.Via == authn.ViaPersonalToken {
 		return authn.Caller{}, false
 	}
 	return c, true
@@ -173,7 +192,8 @@ func (w *Web) requireSignIn(rw http.ResponseWriter, r *http.Request) (authn.Call
 
 func (w *Web) loginView(r *http.Request, errMsg string) LoginView {
 	n := next(r.URL.Query().Get("next"))
-	v := LoginView{Installation: w.cfg.Installation, Next: n, NextQuery: url.QueryEscape(n), Error: errMsg, LDAP: w.cfg.LDAP != nil, LDAPName: w.cfg.LDAPName, Passkeys: w.cfg.Passkeys != nil}
+	v := LoginView{Installation: w.cfg.Installation, Next: n, NextQuery: url.QueryEscape(n), Error: errMsg, LDAP: w.cfg.LDAP != nil, LDAPName: w.cfg.LDAPName, Passkeys: w.cfg.Passkeys != nil,
+		Password: w.emailOn(), SignUp: w.cfg.SignUp != nil}
 	for _, p := range w.cfg.OIDC {
 		v.Providers = append(v.Providers, Provider{ID: p.ID(), Name: p.Name()})
 	}
@@ -238,6 +258,10 @@ func (w *Web) oidcBegin(rw http.ResponseWriter, r *http.Request) {
 		http.NotFound(rw, r)
 		return
 	}
+	if r.URL.Query().Get("link") != "" && w.social(p.ID()) {
+		w.beginLink(rw, r, p)
+		return
+	}
 	st := signin.OIDCState{Provider: p.ID(), Nonce: randomString(), Verifier: oauth2.GenerateVerifier(), Next: next(r.URL.Query().Get("next"))}
 	id, err := w.cfg.Store.BeginCeremony(r.Context(), "oidc", st, ceremonyLifetime)
 	if err != nil {
@@ -263,9 +287,17 @@ func (w *Web) oidcCallback(rw http.ResponseWriter, r *http.Request) {
 		w.render(rw, r, http.StatusUnauthorized, LoginPage(w.loginView(r, "The provider did not sign you in: "+e)))
 		return
 	}
+	if org, ok := strings.CutPrefix(st.Provider, "org:"); ok {
+		w.orgCallback(rw, r, org, st, q.Get("code"))
+		return
+	}
 	p := w.provider(st.Provider)
 	if p == nil {
 		http.NotFound(rw, r)
+		return
+	}
+	if w.social(p.ID()) {
+		w.socialSignIn(rw, r, p, st, q.Get("code"))
 		return
 	}
 	who, err := p.Finish(r.Context(), w.cfg.Store, st, q.Get("code"))
@@ -415,12 +447,42 @@ func (w *Web) account(rw http.ResponseWriter, r *http.Request) {
 }
 
 func (w *Web) renderAccount(rw http.ResponseWriter, r *http.Request, c authn.Caller, errMsg string) {
+	w.renderAccountWith(rw, r, c, errMsg, "")
+}
+
+// renderAccountWith renders the account page, showing a token's secret just made, once.
+func (w *Web) renderAccountWith(rw http.ResponseWriter, r *http.Request, c authn.Caller, errMsg, secret string) {
 	p, err := w.cfg.Store.PrincipalByID(r.Context(), c.ID)
 	if err != nil {
 		w.message(rw, r, http.StatusInternalServerError, "Your account", err.Error())
 		return
 	}
-	v := AccountView{Installation: w.cfg.Installation, Principal: p.Name, Email: p.Email, Error: errMsg, PasskeysOn: w.cfg.Passkeys != nil}
+	v := AccountView{Installation: w.cfg.Installation, Principal: p.Name, Email: p.Email, Error: errMsg, PasskeysOn: w.cfg.Passkeys != nil,
+		NewToken: secret}
+	tokens, err := w.cfg.Services.ListTokens(asCaller(r, c), &identitypb.ListTokensRequest{})
+	if err != nil {
+		w.message(rw, r, http.StatusInternalServerError, "Your account", status.Convert(err).Message())
+		return
+	}
+	for _, t := range tokens.GetTokens() {
+		reach := "every repository you may reach"
+		if len(t.GetRepositories()) > 0 {
+			reach = strings.Join(t.GetRepositories(), ", ")
+		}
+		row := TokenRow{ID: t.GetId(), Label: t.GetLabel(), Revocable: t.GetRevoked() == nil && t.GetExpires().AsTime().After(time.Now())}
+		switch {
+		case t.GetRevoked() != nil:
+			row.Detail = "revoked " + t.GetRevoked().AsTime().Format("Jan 2, 2006")
+		case !row.Revocable:
+			row.Detail = "expired " + t.GetExpires().AsTime().Format("Jan 2, 2006")
+		default:
+			row.Detail = fmt.Sprintf("%s on %s, until %s", t.GetRole(), reach, t.GetExpires().AsTime().Format("Jan 2, 2006"))
+			if t.GetLastUsed() != nil {
+				row.Detail += ", last used " + t.GetLastUsed().AsTime().Format("Jan 2 15:04")
+			}
+		}
+		v.Tokens = append(v.Tokens, row)
+	}
 	creds, err := w.cfg.Store.CredentialsOf(r.Context(), p.ID)
 	if err != nil {
 		w.message(rw, r, http.StatusInternalServerError, "Your account", err.Error())
@@ -453,6 +515,28 @@ func (w *Web) renderAccount(rw http.ResponseWriter, r *http.Request, c authn.Cal
 	if _, err := w.cfg.Services.GetSyncStatus(asCaller(r, c), &identitypb.GetSyncStatusRequest{}); err == nil {
 		v.Admin = true
 	}
+	v.Deletable = w.cfg.Hosted && p.ExternalID == ""
+	if w.cfg.SignUp != nil {
+		v.PasswordOn = w.emailOn()
+		if v.HasPassword, err = w.cfg.Store.HasPassword(r.Context(), p.ID); err != nil {
+			w.message(rw, r, http.StatusInternalServerError, "Your account", err.Error())
+			return
+		}
+		links, err := w.cfg.Store.LoginLinks(r.Context(), p.ID)
+		if err != nil {
+			w.message(rw, r, http.StatusInternalServerError, "Your account", err.Error())
+			return
+		}
+		linked := map[string]bool{}
+		for _, l := range links {
+			linked[l.Provider] = true
+		}
+		for _, o := range w.cfg.OIDC {
+			if w.social(o.ID()) {
+				v.Links = append(v.Links, LinkRow{Provider: o.ID(), Name: o.Name(), Linked: linked[o.ID()]})
+			}
+		}
+	}
 	w.render(rw, r, http.StatusOK, AccountPage(v))
 }
 
@@ -466,6 +550,70 @@ func (w *Web) revokeCredential(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if _, err := w.cfg.Services.Revoke(asCaller(r, c), &identitypb.RevokeRequest{Id: r.PostForm.Get("id")}); err != nil {
+		w.renderAccount(rw, r, c, status.Convert(err).Message())
+		return
+	}
+	http.Redirect(rw, r, "/id/account", http.StatusSeeOther)
+}
+
+// createToken makes a personal token, showing its secret on the page this once.
+func (w *Web) createToken(rw http.ResponseWriter, r *http.Request) {
+	c, ok := w.requireSignIn(rw, r)
+	if !ok {
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(rw, err.Error(), http.StatusBadRequest)
+		return
+	}
+	var repos []string
+	for _, f := range strings.FieldsFunc(r.PostForm.Get("repositories"), func(c rune) bool { return c == ',' || c == '\n' || c == ' ' }) {
+		if f = strings.TrimSpace(f); f != "" {
+			repos = append(repos, f)
+		}
+	}
+	days, _ := strconv.ParseInt(r.PostForm.Get("days"), 10, 64)
+	resp, err := w.cfg.Services.CreateToken(asCaller(r, c), &identitypb.CreateTokenRequest{Label: r.PostForm.Get("label"),
+		Role: r.PostForm.Get("role"), Repositories: repos, LifetimeDays: days})
+	if err != nil {
+		w.renderAccount(rw, r, c, status.Convert(err).Message())
+		return
+	}
+	rw.Header().Set("Cache-Control", "no-store")
+	w.renderAccountWith(rw, r, c, "", resp.GetSecret())
+}
+
+// deleteAccount deletes the signed-in person's account, their handle typed to confirm, and signs
+// them out.
+func (w *Web) deleteAccount(rw http.ResponseWriter, r *http.Request) {
+	c, ok := w.requireSignIn(rw, r)
+	if !ok {
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(rw, err.Error(), http.StatusBadRequest)
+		return
+	}
+	d, err := w.cfg.Services.DeleteAccount(asCaller(r, c), &identitypb.DeleteAccountRequest{Confirm: strings.TrimSpace(r.PostForm.Get("confirm"))})
+	if err != nil {
+		w.renderAccount(rw, r, c, status.Convert(err).Message())
+		return
+	}
+	http.SetCookie(rw, &http.Cookie{Name: authn.SessionCookie, Value: "", Path: "/", HttpOnly: true, Secure: w.secure, SameSite: http.SameSiteLaxMode, MaxAge: -1})
+	w.message(rw, r, http.StatusOK, "Your account is deleted",
+		"Its repositories are deleted with it. An administrator can restore it until "+d.GetFinal().AsTime().Format("January 2, 2006")+"; after, it is gone for good, and its handle is never anyone's again.")
+}
+
+func (w *Web) revokeToken(rw http.ResponseWriter, r *http.Request) {
+	c, ok := w.requireSignIn(rw, r)
+	if !ok {
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(rw, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if _, err := w.cfg.Services.RevokeToken(asCaller(r, c), &identitypb.RevokeTokenRequest{Id: r.PostForm.Get("id")}); err != nil {
 		w.renderAccount(rw, r, c, status.Convert(err).Message())
 		return
 	}

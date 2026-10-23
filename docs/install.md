@@ -13,7 +13,13 @@ To try ok first, on one machine, use Docker Compose or Podman instead:
 - **Kubernetes 1.30 or later.** The deployer's admission policy uses ValidatingAdmissionPolicy,
   which is GA in 1.30.
 - **PostgreSQL**, one database, which every role keeps its tables in under a schema of its own:
-  a Secret holding its URL, with its password (`database.urlSecret`).
+  a Secret holding its URL, with its password (`database.urlSecret`). Or **Spanner**: an
+  instance (`database.spanner.instance`, `projects/P/instances/I`), each role's database made
+  there when it first starts, reached as the server's workload identity — a cloud's annotation
+  on its ServiceAccount (`server.serviceAccountAnnotations`, such as GKE's
+  `iam.gke.io/gcp-service-account`). Google's Spanner must be its **Enterprise** edition where ok
+  identity keeps its database: the directory's search uses Spanner's full-text search, which the
+  Standard edition lacks, and identity refuses to start without it.
 - **Two S3 buckets**, any S3-compatible store: one for the SCM's file contents, one for automation's
   logs. Credentials are key files mounted from Secrets, or, without them, AWS's credential chain:
   the pod's role.
@@ -93,6 +99,9 @@ both make **user namespaces**. The chart runs workers and the deployer with the 
 `Unconfined`, which allows them, and a worker checks as it starts that it can make its sandbox,
 failing with what to change on the node if it cannot.
 
+- **GKE** (Container-Optimized OS) confines containers with an AppArmor profile that refuses the
+  mount the sandbox makes in its user namespace. Run workers and the deployer unconfined by it —
+  `securityContext.appArmorProfile: {type: Unconfined}`, beside the chart's seccomp `Unconfined`.
 - **Ubuntu 23.10 and later** restrict unprivileged user namespaces through AppArmor
   (`kernel.apparmor_restrict_unprivileged_userns = 1`). Either load the `ok-sandbox` profile
   ([deploy/apparmor/ok-sandbox](../deploy/apparmor/ok-sandbox)) on each node and give workers and
@@ -116,7 +125,20 @@ failing with what to change on the node if it cannot.
   runtime allows a pod only as a device plugin offers it. Run one that offers `/dev/fuse` —
   [generic-device-plugin](https://github.com/squat/generic-device-plugin), with a `fuse` device —
   and name the resource it offers: `worker.fuseResource: devic.es/fuse`. Without a device plugin,
-  check out real (the default), which needs no FUSE.
+  check out real (the default), which needs no FUSE. The chart starts a virtual checkout's worker
+  and deployer under `unshare --map-root-user --mount --propagation private`, from the runner
+  image's util-linux, which makes the user and mount namespace okfs mounts in (ok checks it is in
+  one as it starts, and refuses otherwise); outside the chart, start them the same way.
+- **Runs in microVMs** (`worker.microvm.enabled`; [hosted.md](hosted.md), "Hosted automation, as
+  built") need KVM: nodes with hardware virtualization — bare metal, or VMs with nested
+  virtualization (on GKE, an N2 or C2 node pool with `--enable-nested-virtualization`) — and
+  `/dev/kvm` in the worker's pod, which a device plugin offers as a resource
+  (`worker.microvm.kvmResource: devic.es/kvm`, generic-device-plugin's with a `kvm` device), else
+  the chart binds it in from the node where the runtime allows it. The runner image carries Cloud
+  Hypervisor, virtiofsd, and the guests' kernel. Each run's guest sees its trust domain's checkouts
+  and output bases and the image's `/usr`, never the worker's credentials, and reaches out only
+  through the worker's proxy, to the hosts `worker.microvm.egress` allows; give the pods room for
+  each run's guest (`worker.runMemoryGiB` a slot) on top of the worker's own.
 - **The runner image** (`ok-runner`) carries bazelisk, which runs the Bazel your repository's
   `.bazelversion` names; bubblewrap; FUSE's mount helper; Python; and a C and C++ compiler, which
   Bazel's default C++ toolchain looks for. A repository whose builds need more brings it as a

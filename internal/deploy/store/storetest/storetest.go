@@ -4,6 +4,7 @@ package storetest
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"reflect"
 	"strconv"
@@ -11,8 +12,8 @@ import (
 	"testing"
 	"time"
 
+	okdata "github.com/Cidan/ok/internal/data"
 	"github.com/Cidan/ok/internal/deploy/store"
-	"github.com/Cidan/ok/internal/lock"
 	"github.com/Cidan/ok/internal/workflow"
 )
 
@@ -25,16 +26,26 @@ func Run(t *testing.T, open func(t *testing.T) store.Backend) {
 		fn   func(t *testing.T, s *store.Store)
 	}{
 		{"Feed", testFeed},
+		{"Agents", testAgents},
 		{"Cursors", testCursors},
-		{"Plans", testPlans},
+		{"Unnamed", testUnnamed},
+		{"Plans", testPlans}, {"Purge", testPurge},
 		{"Lifecycle", testLifecycle},
 		{"Actions", testActions},
 		{"Retiring", testRetiring},
-		{"Lock", testLock},
+		{"Leases", testLeases},
 		{"Gates", testGates},
 	} {
 		t.Run(tc.name, func(t *testing.T) { tc.fn(t, store.New(open(t))) })
 	}
+	t.Run("Moves", func(t *testing.T) { testMoves(t, store.New(open(t)), store.New(open(t))) })
+}
+
+// sameJSON reports whether a stored JSON value is want's: a database keeps JSON's value, not its
+// spacing or the order of its keys.
+func sameJSON(got []byte, want string) bool {
+	var g, w any
+	return json.Unmarshal(got, &g) == nil && json.Unmarshal([]byte(want), &w) == nil && reflect.DeepEqual(g, w)
 }
 
 func commit(b byte) []byte {
@@ -64,7 +75,10 @@ func moveMain(t *testing.T, s *store.Store, n int) {
 	}
 	if seq == 0 {
 		seq++
-		if err := s.Apply(ctx, store.FeedEvent{Seq: seq, Repository: 1, Name: "svc", Created: true}); err != nil {
+		if err := s.Apply(ctx, store.FeedEvent{Seq: seq, Repository: 1, Created: true}); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.ApplyDirectory(ctx, store.DirectoryEvent{Seq: 1, Repository: 1, FullName: "svc"}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -76,34 +90,37 @@ func moveMain(t *testing.T, s *store.Store, n int) {
 	}
 }
 
-// Each repository's log has a cursor of its own; seeding sets one only where there is none, and a
-// store that never followed the SCM's feed has no place in it to leave.
+// A repository whose main moved waits to be planned until the directory names it: what a plan
+// holds depends on the name.
+func testUnnamed(t *testing.T, s *store.Store) {
+	ctx := context.Background()
+	for _, ev := range []store.FeedEvent{{Seq: 1, Repository: 2, Created: true}, {Seq: 2, Repository: 2, Head: commit(9), HeadSeq: 1}} {
+		if err := s.Apply(ctx, ev); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if rs, err := s.Unplanned(ctx); err != nil || len(rs) != 0 {
+		t.Errorf("a repository the directory has not named, unplanned: %+v, %v", rs, err)
+	}
+	if err := s.ApplyDirectory(ctx, store.DirectoryEvent{Seq: 1, Repository: 2, FullName: "named"}); err != nil {
+		t.Fatal(err)
+	}
+	if rs, err := s.Unplanned(ctx); err != nil || len(rs) != 1 || rs[0].ID != 2 || rs[0].Name != "named" {
+		t.Errorf("named, it is unplanned: %+v, %v", rs, err)
+	}
+}
+
+// Each repository's log has a cursor of its own.
 func testCursors(t *testing.T, s *store.Store) {
 	ctx := context.Background()
 	moveMain(t, s, 3)
-	if err := s.Apply(ctx, store.FeedEvent{Seq: 1, Repository: 2, Name: "two", Created: true}); err != nil {
+	if err := s.Apply(ctx, store.FeedEvent{Seq: 1, Repository: 2, Created: true}); err != nil {
 		t.Fatal(err)
 	}
 	for repo, want := range map[int64]int64{1: 4, 2: 1, 3: 0} {
 		if c, err := s.Cursor(ctx, repo); err != nil || c != want {
 			t.Errorf("repository %d's cursor: %d, %v; want %d", repo, c, err, want)
 		}
-	}
-	for _, seed := range [][2]int64{{3, 7}, {3, 9}, {1, 1}} {
-		if err := s.Seed(ctx, seed[0], seed[1]); err != nil {
-			t.Fatal(err)
-		}
-	}
-	for repo, want := range map[int64]int64{1: 4, 3: 7} {
-		if c, err := s.Cursor(ctx, repo); err != nil || c != want {
-			t.Errorf("repository %d's cursor after seeding: %d, %v; want %d", repo, c, err, want)
-		}
-	}
-	if at, err := s.LegacyCursor(ctx); err != nil || at != 0 {
-		t.Errorf("a new store's place in the legacy feed: %d, %v", at, err)
-	}
-	if err := s.LeaveLegacy(ctx); err != nil {
-		t.Errorf("leaving a legacy feed it never followed: %v", err)
 	}
 }
 
@@ -116,8 +133,15 @@ func testFeed(t *testing.T, s *store.Store) {
 	if err := s.Apply(ctx, store.FeedEvent{Seq: 2, Repository: 1, Head: commit(9), HeadSeq: 9}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Apply(ctx, store.FeedEvent{Seq: 5, Repository: 1, Name: "svc2"}); err != nil {
-		t.Fatal(err)
+	// The directory renames it, once however often its event comes; its cursors are its own.
+	for _, ev := range []store.DirectoryEvent{{Seq: 2, Repository: 1, FullName: "svc2"}, {Seq: 2, Repository: 1, FullName: "other"},
+		{Seq: 1, Repository: 1, FullName: "svc"}} {
+		if err := s.ApplyDirectory(ctx, ev); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if c, err := s.DirectoryCursors(ctx, []int64{1, 2}); err != nil || c[1] != 2 || c[2] != 0 {
+		t.Errorf("the directory's cursors = %v, %v", c, err)
 	}
 	rs, err := s.Unplanned(ctx)
 	if err != nil {
@@ -236,7 +260,7 @@ func testLifecycle(t *testing.T, s *store.Store) {
 	}
 	got, _ := s.Get(ctx, w.ID)
 	if got.Status != store.Running || got.Stage != store.Migrate || got.Images[0].RunID != 41 || got.Images[0].Reference != "reg/web@sha256:ab" ||
-		got.Migrations[0].Status != store.MigrationApplied || string(got.Roll) != `{"stage": "canary"}` || got.StartedAt.IsZero() {
+		got.Migrations[0].Status != store.MigrationApplied || !sameJSON(got.Roll, `{"stage":"canary"}`) || got.StartedAt.IsZero() {
 		t.Errorf("running %+v", got)
 	}
 
@@ -253,7 +277,7 @@ func testLifecycle(t *testing.T, s *store.Store) {
 	if got, _ := s.Get(ctx, d.ID); got.Status != store.Canceled || got.Reason != "deployment "+itoa(w.ID)+" of its plan failed" {
 		t.Errorf("the waiting deployment of the failed plan %+v", got)
 	}
-	if got, _ := s.Get(ctx, z.ID); got.Status != store.Running || got.HaltBy != "deployment "+itoa(w.ID)+" of its plan failed" {
+	if got, _ := s.Get(ctx, z.ID); got.Status != store.Running || got.HaltBy != "" || got.HaltReason != "deployment "+itoa(w.ID)+" of its plan failed" {
 		t.Errorf("the running deployment of the failed plan %+v", got)
 	}
 	evs, err := s.Events(ctx, w.ID)
@@ -307,7 +331,7 @@ func testActions(t *testing.T, s *store.Store) {
 	if got, err := s.Halt(ctx, w.ID, "bob.human.example.com"); err != nil || got.HaltBy != "bob.human.example.com" || got.Status != store.Running {
 		t.Errorf("halting a running deployment %+v (%v)", got, err)
 	}
-	if err := s.Finish(ctx, w.ID, store.Halted, "halted by bob.human.example.com"); err != nil {
+	if err := s.Finish(ctx, w.ID, store.Halted, "halted"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.Halt(ctx, w.ID, "bob.human.example.com"); !errors.As(err, &conflictErr) {
@@ -326,7 +350,8 @@ func testActions(t *testing.T, s *store.Store) {
 		t.Errorf("retrying what a newer deployment superseded: %v", err)
 	}
 	// Halting a waiting deployment cancels it at once.
-	if got, err := s.Halt(ctx, r.ID, "bob.human.example.com"); err != nil || got.Status != store.Canceled {
+	if got, err := s.Halt(ctx, r.ID, "bob.human.example.com"); err != nil || got.Status != store.Canceled || got.HaltBy != "bob.human.example.com" ||
+		got.Reason != "halted before it started" {
 		t.Errorf("halting a waiting deployment %+v (%v)", got, err)
 	}
 	if _, err := s.Get(ctx, 9999); !errors.Is(err, store.ErrNotFound) {
@@ -368,49 +393,93 @@ func testRetiring(t *testing.T, s *store.Store) {
 	}
 }
 
-// A lock is one holder's at a time, and free again once released: the leader's while it leads,
-// and each deployment's, apart from every other, past the context it was taken in until it is
-// released.
-func testLock(t *testing.T, s *store.Store) {
+// Each deployment's lock is one holder's at a time, apart from every other, held past the context
+// it was taken in until released, and free again once released; what is written with it is
+// written only while it is held. Which deployments start is decided one transaction at a time:
+// two deployments of one workload, started at once from many replicas, start one at a time.
+func testLeases(t *testing.T, s *store.Store) {
 	ctx := context.Background()
-	err := s.Lead(ctx, func(ctx context.Context) error {
-		if err := s.Lead(ctx, func(context.Context) error { t.Error("two leaders"); return nil }); !errors.Is(err, lock.ErrNotAcquired) {
-			t.Errorf("a second leader: %v, want lock.ErrNotAcquired", err)
-		}
-		if err := s.LeadObserver(ctx, func(context.Context) error { return nil }); err != nil {
-			t.Errorf("the observer's lock while leading: %v", err)
-		}
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("leading: %v", err)
-	}
-	led := false
-	if err := s.Lead(ctx, func(context.Context) error { led = true; return nil }); err != nil || !led {
-		t.Errorf("leading once the first gave up: %v", err)
-	}
-
 	pass, endPass := context.WithCancel(ctx)
-	release, ok, err := s.LockDeployment(pass, 7)
+	_, release, ok, err := s.LockDeployment(pass, 7)
 	if err != nil || !ok {
 		t.Fatalf("the first take: %v %v", ok, err)
 	}
 	endPass()
 	time.Sleep(2 * time.Second)
-	if _, ok, err := s.LockDeployment(ctx, 7); err != nil || ok {
+	if _, _, ok, err := s.LockDeployment(ctx, 7); err != nil || ok {
 		t.Errorf("a second take while held, after the pass that took it ended: %v %v", ok, err)
 	}
-	if r, ok, err := s.LockDeployment(ctx, 8); err != nil || !ok {
+	if _, r, ok, err := s.LockDeployment(ctx, 8); err != nil || !ok {
 		t.Errorf("another deployment's lock: %v %v", ok, err)
 	} else {
 		r()
 	}
 	release()
-	r, ok, err := s.LockDeployment(ctx, 7)
+	_, r, ok, err := s.LockDeployment(ctx, 7)
 	if err != nil || !ok {
 		t.Errorf("taking it once released: %v %v", ok, err)
 	}
 	r()
+
+	moveMain(t, s, 1)
+	again := web()
+	again.Name = "web-again" // another deploy, rolling web's workload
+	if _, err := s.RecordPlan(ctx, store.PlanResult{Repository: 1, Head: commit(1), HeadSeq: 1, By: self,
+		Deployments: []store.NewDeployment{{Deploy: web(), Why: "w", Wave: 1}, {Deploy: again, Why: "a", Wave: 1}}}); err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan []*store.Deployment, 8)
+	for range 8 {
+		go func() {
+			ds, err := s.StartTurns(ctx, "")
+			if err != nil {
+				t.Errorf("StartTurns at once: %v", err)
+			}
+			started <- ds
+		}()
+	}
+	var first []*store.Deployment
+	for range 8 {
+		first = append(first, <-started...)
+	}
+	if len(first) != 1 {
+		t.Fatalf("two deployments of one workload, started at once: %d started", len(first))
+	}
+	w := first[0]
+
+	// Its lock's holder writes it; once another holds the lock, the first holder's writes are
+	// refused, and nothing it wrote after is kept.
+	held, release, ok, err := s.LockDeployment(ctx, w.ID)
+	if err != nil || !ok {
+		t.Fatalf("the deployment's lock: %v %v", ok, err)
+	}
+	if err := s.SetStage(held, w.ID, store.Migrate); err != nil {
+		t.Errorf("a write while holding the lock: %v", err)
+	}
+	release()
+	_, other, ok, err := s.LockDeployment(ctx, w.ID)
+	if err != nil || !ok {
+		t.Fatalf("the lock, taken by another: %v %v", ok, err)
+	}
+	defer other()
+	if err := s.SetStage(held, w.ID, store.Roll); !errors.Is(err, okdata.ErrFenced) {
+		t.Errorf("a write after the lock passed to another: %v, want okdata.ErrFenced", err)
+	}
+	if err := s.Log(held, w.ID, "a late line"); !errors.Is(err, okdata.ErrFenced) {
+		t.Errorf("a log line after the lock passed to another: %v, want okdata.ErrFenced", err)
+	}
+	if got, _ := s.Get(ctx, w.ID); got.Stage != store.Migrate {
+		t.Errorf("the deployment's stage = %v: a fenced write was kept", got.Stage)
+	}
+
+	// The other starts once the first is over.
+	if err := s.Finish(ctx, w.ID, store.Succeeded, ""); err != nil {
+		t.Fatal(err)
+	}
+	next, err := s.StartTurns(ctx, "")
+	if err != nil || len(next) != 1 || next[0].ID == w.ID {
+		t.Errorf("starting once the first finished = %v, %v", next, err)
+	}
 }
 
 // A deployment that replaces a waiting one takes its place — its gates and its wave in its
@@ -460,5 +529,36 @@ func testGates(t *testing.T, s *store.Store) {
 	}
 	if got, _ := s.Get(ctx, w3.ID); got.Status != store.Canceled {
 		t.Errorf("web at 3 after plan 1 failed: %s", got.Status)
+	}
+}
+
+// A repository the directory purged is forgotten whole — its plans, deployments, services, and
+// main's commits — once however often its purge comes, and nothing of another's goes with it.
+func testPurge(t *testing.T, s *store.Store) {
+	ctx := context.Background()
+	moveMain(t, s, 2)
+	if _, err := s.RecordPlan(ctx, store.PlanResult{Repository: 1, Head: commit(2), HeadSeq: 2, By: self,
+		Deployments: []store.NewDeployment{{Deploy: web(), Why: "first", Wave: 1}}}); err != nil {
+		t.Fatal(err)
+	}
+	if open, err := s.Unfinished(ctx); err != nil || len(open) != 1 {
+		t.Fatalf("unfinished before the purge: %v, %v", open, err)
+	}
+	for i := 0; i < 2; i++ {
+		if err := s.ApplyDirectory(ctx, store.DirectoryEvent{Seq: 5, Repository: 1, Purged: true}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if open, err := s.Unfinished(ctx); err != nil || len(open) != 0 {
+		t.Errorf("unfinished after the purge: %v, %v", open, err)
+	}
+	if cov, planned, err := s.Covering(ctx, 1, commit(2)); err != nil || planned || len(cov) != 0 {
+		t.Errorf("a purged repository's commit covered: %d, %v, %v", len(cov), planned, err)
+	}
+	if svcs, err := s.Services(ctx, 1); err != nil || len(svcs) != 0 {
+		t.Errorf("a purged repository's services: %v, %v", svcs, err)
+	}
+	if c, err := s.DirectoryCursors(ctx, []int64{1}); err != nil || c[1] != 5 {
+		t.Errorf("the cursor after the purge = %v, %v", c, err)
 	}
 }

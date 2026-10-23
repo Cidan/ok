@@ -23,6 +23,7 @@ mod outbox;
 pub mod prefetch;
 mod publish;
 mod refs;
+pub mod secrets;
 mod segments;
 pub mod shared;
 
@@ -84,11 +85,11 @@ pub async fn get_repository(endpoint: &str, name: &str) -> Result<Repository, to
     use ok_proto::ok::scm::v1 as pb;
     let (endpoint, name) = (endpoint.to_owned(), name.to_owned());
     shared::run(async move {
+        let mut repositories = client::repositories(&endpoint, &name).await?;
         let req = pb::GetRepositoryRequest {
             key: Some(pb::get_repository_request::Key::Name(name)),
         };
-        client::repositories(&endpoint)
-            .await?
+        repositories
             .get_repository(req)
             .await?
             .into_inner()
@@ -103,13 +104,39 @@ pub async fn create_repository(endpoint: &str, name: &str) -> Result<Repository,
     use ok_proto::ok::scm::v1 as pb;
     let (endpoint, name) = (endpoint.to_owned(), name.to_owned());
     shared::run(async move {
+        let mut repositories = client::repositories(&endpoint, &name).await?;
         let req = pb::CreateRepositoryRequest {
             name,
-            actor: String::new(),
+            actor_id: String::new(),
         };
-        client::repositories(&endpoint)
-            .await?
+        repositories
             .create_repository(req)
+            .await?
+            .into_inner()
+            .try_into()
+    })
+    .await
+}
+
+/// Forks the repository named `parent` on the SCM at `endpoint` as `name` (`ada/app`), the caller
+/// becoming the fork's creator.
+pub async fn fork_repository(
+    endpoint: &str,
+    parent: &str,
+    name: &str,
+) -> Result<Repository, tonic::Status> {
+    use ok_proto::ok::scm::v1 as pb;
+    let (endpoint, parent, name) = (endpoint.to_owned(), parent.to_owned(), name.to_owned());
+    shared::run(async move {
+        // A fork is made in its upstream's cell.
+        let mut repositories = client::repositories(&endpoint, &parent).await?;
+        let req = pb::ForkRepositoryRequest {
+            parent,
+            name,
+            actor_id: String::new(),
+        };
+        repositories
+            .fork_repository(req)
             .await?
             .into_inner()
             .try_into()

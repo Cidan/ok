@@ -7,6 +7,9 @@ kind: ServiceAccount
 metadata:
   name: {{ include "ok.name" . }}-server
   labels: {{- include "ok.labels" . | nindent 4 }}
+  {{- with .Values.server.serviceAccountAnnotations }}
+  annotations: {{- toYaml . | nindent 4 }}
+  {{- end }}
 ---
 apiVersion: v1
 kind: Service

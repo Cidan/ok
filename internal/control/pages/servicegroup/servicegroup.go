@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Service is a service as the Services pages list it: what a group is made of.
@@ -28,13 +29,14 @@ type Service struct {
 	Replicas       int32
 	// What ok deployed: the image(s), short ("smoke/serve@674607bcb740"), the commit they
 	// were built at, the CL that landed it, and when. DeployedID is that deployment (0: never
-	// deployed), which orders a group's deployments.
+	// deployed), and DeployedAt when it was made, which orders a group's deployments.
 	Version    string
 	Commit     string
 	CommitHref string
 	CL         int64
 	CLHref     string
 	DeployedID int64
+	DeployedAt time.Time
 	Age        string
 	AgeTitle   string
 }
@@ -206,7 +208,8 @@ func (g Group) Declared() bool {
 func (g Group) Newest() (Service, bool) {
 	var out Service
 	for _, sv := range g.Members {
-		if sv.DeployedID > out.DeployedID {
+		if sv.DeployedID != 0 && (out.DeployedID == 0 || sv.DeployedAt.After(out.DeployedAt) ||
+			sv.DeployedAt.Equal(out.DeployedAt) && sv.DeployedID > out.DeployedID) {
 			out = sv
 		}
 	}

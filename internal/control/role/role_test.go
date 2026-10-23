@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Cidan/ok/internal/bus/bustest"
+
 	"github.com/jackc/pgx/v5/pgxpool"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -87,6 +89,7 @@ identity:
 	if err != nil {
 		t.Fatal(err)
 	}
+	cfg.Bus = bustest.Config(t)
 	dbURL := testdb.Postgres(t)
 	open := func(schema string) *pgxpool.Pool {
 		p, err := pgdb.Open(ctx, dbURL, schema, 0)
@@ -184,18 +187,27 @@ identity:
 		t.Fatal(err)
 	}
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusSeeOther || resp.Header.Get("Location") != "/app" {
+	if resp.StatusCode != http.StatusSeeOther || resp.Header.Get("Location") != "/example/app" {
 		t.Fatalf("creating a repository: %d, %s", resp.StatusCode, resp.Header.Get("Location"))
 	}
-	repo, err := scm.Store.GetRepositoryByName(ctx, "app")
-	if err != nil || repo.CreatedBy != ada {
+	adaP, err := id.Store.Principal(ctx, ada)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The directory names it, the installation's organization's; the SCM records her by her ID.
+	entry, _, err := id.Store.ResolveFullName(ctx, "app")
+	if err != nil || entry.CreatedBy != adaP.ID {
+		t.Fatalf("the directory's entry: %+v, %v", entry, err)
+	}
+	repo, err := scm.Store.GetRepository(ctx, entry.ID)
+	if err != nil || repo.CreatedBy != adaP.ID {
 		t.Fatalf("the SCM's repository: %+v, %v", repo, err)
 	}
 
 	// The change feed brings it to the finder.
 	for i := 0; ; i++ {
 		_, body, _ := get("/repositories/list", ada)
-		if strings.Contains(body, `href="/app"`) {
+		if strings.Contains(body, `href="/example/app"`) {
 			break
 		}
 		if i == 100 {
@@ -203,8 +215,25 @@ identity:
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	if code, body, _ := get("/app", ada); code != http.StatusOK || !strings.Contains(body, "app · Example ok") {
+	if code, body, _ := get("/example/app", ada); code != http.StatusOK || !strings.Contains(body, "app · Example ok") {
 		t.Errorf("the repository's page: %d\n%.400s", code, body)
+	}
+	// Renamed in the directory, the finder shows its new name: the directory's events bring it.
+	if _, err := id.Store.RenameRepository(ctx, entry.ID, "service"); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; ; i++ {
+		_, body, _ := get("/repositories/list", ada)
+		if strings.Contains(body, `href="/example/service"`) && !strings.Contains(body, `href="/example/app"`) {
+			break
+		}
+		if i == 200 {
+			t.Fatalf("the finder never showed the rename:\n%.600s", body)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if _, err := id.Store.RenameRepository(ctx, entry.ID, "app"); err != nil {
+		t.Fatal(err)
 	}
 
 	// The ChangeLists service serves people, and no one else.
@@ -229,8 +258,12 @@ identity:
 
 	// Who administers comes from identity: bea, a bootstrap administrator, administers app; ada
 	// created it.
-	repoPB := &scmpb.Repository{Name: repo.Name, CreatedBy: repo.CreatedBy}
-	if !ctl.Review.IsAdmin(ctx, repoPB, bea) || !ctl.Review.IsAdmin(ctx, repoPB, ada) || ctl.Review.IsAdmin(ctx, repoPB, "cal.human.example.com") {
-		t.Errorf("IsAdmin: bea %v, ada %v", ctl.Review.IsAdmin(ctx, repoPB, bea), ctl.Review.IsAdmin(ctx, repoPB, ada))
+	repoPB := &scmpb.Repository{Id: entry.ID, Name: entry.Name, CreatedById: repo.CreatedBy}
+	beaP, err := id.Store.Principal(ctx, bea)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ctl.Review.IsAdmin(ctx, repoPB, beaP.ID) || !ctl.Review.IsAdmin(ctx, repoPB, adaP.ID) || ctl.Review.IsAdmin(ctx, repoPB, "prn_cal") {
+		t.Errorf("IsAdmin: bea %v, ada %v", ctl.Review.IsAdmin(ctx, repoPB, beaP.ID), ctl.Review.IsAdmin(ctx, repoPB, adaP.ID))
 	}
 }

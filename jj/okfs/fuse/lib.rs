@@ -16,9 +16,6 @@ mod session;
 #[cfg(target_os = "linux")]
 pub mod testns;
 
-#[cfg(all(test, target_os = "linux"))]
-mod tests;
-
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::io;

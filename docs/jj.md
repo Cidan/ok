@@ -4,7 +4,7 @@ ok's jj is upstream [jj](https://github.com/jj-vcs/jj) — `jj-cli` and `jj-lib`
 (backend, op store, op heads store) registered and ok's commands built in: `jj auth`, `jj clone`,
 `jj create`, and the ChangeList commands — `jj cl` (upload), `jj cl get`, `jj sync`, and a CL's
 whole lifecycle: `jj cl status [-f]`, `ready`, `draft`, `reviewers`, `review`, `comment`, `resolve`,
-`submit`, `abandon`, `restore`, `rollback`, `rerun`, `cancel`, `log`, and `deployment`. It is the
+`submit`, `abandon`, `restore`, `rollback`, `rerun`, `pre`, `cancel`, `log`, and `deployment`. It is the
 only way code enters ok. Its design — stores, cache, outbox, commands — is [scm.md](scm.md), "The
 client".
 
@@ -21,14 +21,24 @@ refused.
 cargo install --locked --path jj/cli               # the jj binary
 jj auth login https://ok.example.com               # once per machine: approve the code in a browser
 jj create hello                                    # a new repository on ok, cloned into ./hello
+jj fork acme/app ada/app                           # a fork of one, on ok, cloned into ./app
 jj clone app ~/src/app                             # an existing one (virtual)
 jj clone app ~/src/app-real --real                 # a real checkout
 ```
 
+`jj fork <upstream> <owner>/<name>` forks a repository on ok — in the upstream's network, its main
+the upstream's, holding all the upstream holds without copying it — then clones the fork as `jj
+create` clones what it makes. In a fork's clone, `jj sync --upstream` first has ok bring the fork
+its upstream's newer work (its main moving to the upstream's if it has landed nothing of its own
+since), then syncs as always.
+
 `jj auth login` signs the machine in with ok identity's device login, as `ok auth login` does —
 the same credential, in the same place, so either one signs the machine in for both
 ([identity.md](identity.md), "Signing in"). `jj auth status` says who it is signed in as; `jj auth
-logout` revokes the credential and removes it.
+logout` revokes the credential and removes it. Where no device signs in — a CI job, a script — a
+personal token does instead: with `OK_TOKEN` set, every request carries it, and the person is
+narrowed to the repositories it names and the role it allows ([identity.md](identity.md),
+"Personal tokens").
 
 Both `clone` and `create` make the repository on ok first (`create`) or look it up (`clone`),
 make the workspace on ok, lay out its own jj repository with the `ok` stores (a real checkout's in
@@ -65,7 +75,8 @@ CL's page:
 
 ```bash
 jj cl status -f                           # a line each time it moves; exits once it is settled
-jj cl ready --reviewer bob                # send a draft for review
+jj cl ready --reviewer bob                # send a draft for review (a stack: its top first)
+jj cl pre                                 # run a draft's pre by hand (else it runs once in review)
 jj cl review 87 --lgtm --approve          # as a reviewer
 jj cl submit -f                           # submit, and follow it until deployed
 jj cl status -f --until deployed --json   # ok control's JSON, one object per line
@@ -120,15 +131,17 @@ read-only, moved to another commit at once (`Present`; `the roles' checkout`'s `
 
 The daemon is this binary (`jj fs daemon`), one per user, run as the systemd user service
 `okfs.service` that the first virtual clone installs and enables (on macOS, the launchd agent
-`ok.okfs`; where there is neither, a detached process logging to `~/.local/share/ok/daemon.log`). A
-jj command that finds a daemon of another build restarts it; systemd (or launchd) keeps every
-mount's connection across the restart, so open files read on. Its state: `~/.local/share/ok/` —
+`ok.okfs`). jj never starts a copy of itself: where there is neither service manager, run `jj fs
+daemon` under whatever supervises the machine's processes, and a jj command that finds no daemon
+says so. A jj command that finds a daemon of another build has its service manager restart it
+(elsewhere, it says to); systemd (or launchd) keeps every mount's connection across the restart, so
+open files read on. Its state: `~/.local/share/ok/` —
 `workspaces/<id>/` (`repo/` is the workspace's own jj repository — stores, outbox, operation heads,
 index; `jj/` is the workspace's `.jj`, which the mount shows as a symlink; `overlay/` written files;
 `inodes.snap`/`inodes.log`), `workspaces.toml` (what to mount), `machine` (this machine's ID, for
 leases and checkpoints) — and the control socket in `$XDG_RUNTIME_DIR/okfs/`. `OKFS_STATE_DIR`,
-`OKFS_RUNTIME_DIR`, and `OKFS_DAEMON` (`spawn`: no systemd; `external`: only connect) override them,
-which the tests use.
+`OKFS_RUNTIME_DIR`, and `OKFS_DAEMON=external` (only connect, to a daemon of any build) override
+them, which the tests use.
 
 A repository lists in `.ok/redirections` the paths (one a line) a virtual workspace presents as
 symlinks to directories on local disk — heavy ignored outputs like `node_modules/` — which are
@@ -145,7 +158,7 @@ The Cargo workspace at the repository's root; every crate is under `jj/`.
 
 | Crate | What it is |
 |---|---|
-| `jj/cli` (`ok-jj`, the `jj` binary) | `main.rs` (`CliRunner` with ok's stores, working copy, commands, and configuration), `auth.rs` (`jj auth`), `commands.rs` (`jj clone`, `jj create`), `changelists.rs` (`jj cl`, `jj cl get`, `jj sync`), `lifecycle.rs` (`jj cl status` and the rest of a CL's lifecycle), and `fs.rs` (`jj fs`) |
+| `jj/cli` (`ok-jj`, the `jj` binary) | `main.rs` (`CliRunner` with ok's stores, working copy, commands, and configuration), `auth.rs` (`jj auth`), `commands.rs` (`jj clone`, `jj create`, `jj fork`), `changelists.rs` (`jj cl`, `jj cl get`, `jj sync`), `lifecycle.rs` (`jj cl status` and the rest of a CL's lifecycle), and `fs.rs` (`jj fs`) |
 | `jj/workingcopy` (`ok-working-copy`) | jj's local working copy honoring `.ignore` files, and the workspace loader that gives every ok workspace it |
 | `jj/cl` (`ok-cl`) | The ChangeList workflow over jj-lib — what `jj cl` refuses before asking the SCM, the upload (publishing first), `jj cl get`, and `jj sync` — so tests drive it without the command line |
 | `jj/store` (`ok-store`) | jj's `Backend`, `OpStore`, and `OpHeadsStore` over the SCM, with the cache, the outbox, publishing, prefetch, and laying out `.jj/repo` for a clone; `changelists` holds the SCM calls behind the CL commands |
@@ -172,6 +185,21 @@ Everything lives under `.jj/repo/store`, shared by the repository's workspaces o
 A command that dies before its publish leaves its transaction in the outbox and nothing on the
 SCM; the next command publishes it along with its own.
 
+Secrets ([secrets.md](secrets.md)): in a repository that keeps them, every file under `secret/`
+but an `acl.yaml` or an OWNERS file holds a pointer, never a value — jj refuses to snapshot one
+that does not, saying what to run — and reading one uses an unseal:
+
+```bash
+jj secret unseal //secret/prod/db-password   # one read, for ten minutes; a passkey where the folder asks
+jj secret status                             # your unused unseals
+jj secret cat //secret/prod/db-password      # unseal and print it (a real checkout, or macOS)
+printf %s "$value" | jj secret write //secret/prod/db-password   # a new version; its pointer in @
+```
+
+In a virtual workspace on Linux a secret's file is its value: read it after `jj secret unseal`,
+and write it as any file; the next snapshot keeps it in ok secrets and records its pointer
+([okfs.md](okfs.md), "Secrets").
+
 ## What it asks ok
 
 Every connection to ok's services records each RPC by method — calls, failures (a status not
@@ -196,12 +224,13 @@ cargo test --workspace
 ```
 
 The unit tests need nothing. The end-to-end suites — `jj/store/tests/e2e.rs`, `jj/cl/tests/e2e.rs`,
-and `jj/cli/tests/cli.rs` — run a real `ok scm` (`jj/testscm`: `ok scm serve -dev`, started once
-per test process on a loopback port, the `ok` binary from `$OK_BINARY` or the `PATH`) over
-PostgreSQL and S3, which the environment names; without them they are skipped, and with
+and `jj/cli/tests/cli.rs` — run a real `ok scm` beside the ok identity that knows its callers and
+names its repositories (`jj/testscm`: `ok serve -dev -roles identity,scm`, started once per test
+process on a loopback port, the `ok` binary from `$OK_BINARY` or the `PATH`) over PostgreSQL and
+S3, which the environment names; without them they are skipped, and with
 `OK_TEST_INTEGRATION=require` they fail instead. A caller there names its principal (a development
-SCM trusts it on loopback): a clone's recorded principal, and the harness's clients act as anyone
-— alice, bob, or ok control. Each test makes its own repository. The tests that mount need
+server trusts it on loopback): a clone's recorded principal, and the harness's clients act as
+anyone its identity knows — ada, alice, bob, e2e, or ok control. Each test makes its own repository. The tests that mount need
 `/dev/fuse` and user namespaces. [building.md](building.md) has the environment.
 
 - **The stores** (`store/tests/e2e.rs`): one workspace on two machines sharing its operation log,
@@ -214,11 +243,12 @@ SCM trusts it on loopback): a clone's recorded principal, and the harness's clie
   agrees, and `jj sync` retiring landed changes without divergence while keeping later edits.
 - **The binary** (`cli/tests/cli.rs`): as two people — `jj create`, `jj clone`, `jj cl`, `jj cl
   get`, stacking, and `jj sync` after landings; files up to 50 MiB; and ignore files. Each runs
-  twice: real (`--real`), and virtual — in a namespace of its own, each person running a daemon
-  (`OKFS_DAEMON=external`). And what only virtual workspaces do: checkpoints with no jj command, a
-  takeover by a second machine, a crash and a restart, `jj fs checkpoints` and `restore`, `jj fs
-  forget` and attaching again, working offline behind a proxy the test cuts, `jj fs watch`, and
-  redirections. `cli/tests/nofuse.rs` checks a virtual clone is refused where `/dev/fuse` does not
+  twice: real (`--real`), and virtual (`cli/tests/cli_virtual.rs`, a binary that enters a user and
+  mount namespace of its own first thing in `main`, each person running a daemon,
+  `OKFS_DAEMON=external`). And, there, what only virtual workspaces do: checkpoints with no jj
+  command, a takeover by a second machine, a crash and a restart, `jj fs checkpoints` and
+  `restore`, `jj fs forget` and attaching again, working offline behind a proxy the test cuts, `jj
+  fs watch`, and redirections. `cli/tests/nofuse.rs` checks a virtual clone is refused where `/dev/fuse` does not
   exist. Both run on Linux; elsewhere the workspace builds, and its unit tests run.
 
 A plaintext `http://` endpoint is accepted only on a loopback address — where the client names its

@@ -53,8 +53,8 @@ type VirtualConfig struct {
 
 // Virtual presents each commit at its directory through okfs (docs/okfs.md, "ok's roles"): it
 // runs the okfs daemon as its child, starting it again if it exits, and asks
-// it to present each commit it is synced to. It must run where it can mount: in the namespace
-// Isolate makes.
+// it to present each commit it is synced to. It must run where it can mount: in the namespaces
+// RequireIsolated checks it was started in.
 type Virtual struct {
 	cfg VirtualConfig
 	// syncing serializes Syncs at cfg.Dir; each presentation At makes has its own.
@@ -131,6 +131,26 @@ type presentation struct {
 	v   *Virtual
 	dir string
 	mu  sync.Mutex // serializes its Syncs
+}
+
+// Close stops presenting at its directory: unmounted, and its state deleted.
+func (p *presentation) Close() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.v.mu.Lock()
+	err := p.v.start()
+	p.v.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	resp, err := p.v.call(context.Background(), &okfspb.Request{Request: &okfspb.Request_Unpresent{Unpresent: &okfspb.Unpresent{MountPoint: p.dir}}})
+	if err != nil {
+		return fmt.Errorf("the okfs daemon: %w", err)
+	}
+	if resp.GetError() != "" {
+		return fmt.Errorf("the okfs daemon: %s", resp.GetError())
+	}
+	return nil
 }
 
 func (p *presentation) Dir() string { return p.dir }

@@ -17,6 +17,7 @@ import (
 	"github.com/Cidan/ok/internal/scm/copies"
 	"github.com/Cidan/ok/internal/scm/encoding"
 	"github.com/Cidan/ok/internal/scm/pack"
+	"github.com/Cidan/ok/internal/scm/store/backend"
 	"github.com/Cidan/ok/internal/serve/metrics"
 )
 
@@ -36,8 +37,9 @@ func objectKey(repo int64, r ObjectRef) string {
 	return string(append(b, r.ID[:]...))
 }
 
-func chunkKey(repo int64, id encoding.ID) string {
-	b := binary.LittleEndian.AppendUint64(nil, uint64(repo))
+// chunkKey is a chunk's key in the chunk cache: its network's, as its bytes are.
+func chunkKey(net backend.Network, id encoding.ID) string {
+	b := binary.LittleEndian.AppendUint64(nil, uint64(net))
 	b = append(b, byte(encoding.KindChunk))
 	return string(append(b, id[:]...))
 }
@@ -66,21 +68,42 @@ func (s *Store) ReadObjects(ctx context.Context, repo int64, refs []ObjectRef) (
 		misses[r.Kind] = append(misses[r.Kind], r.ID)
 	}
 	found := map[ObjectRef][]byte{}
+	// A transaction reads its own objects too, which are no one else's until it commits: what
+	// it reads stays out of the cache.
+	cache := !inTxContext(ctx)
 	for kind, members := range misses {
 		var bodies map[encoding.ID][]byte
 		var err error
 		if kind == encoding.KindCommit {
-			bodies, err = s.b.CommitBodies(ctx, repo, members)
+			bodies, err = s.ops(ctx).CommitBodies(ctx, repo, members)
 		} else {
-			bodies, err = s.b.ObjectBodies(ctx, repo, kind, members)
+			bodies, err = s.ops(ctx).ObjectBodies(ctx, repo, kind, members)
 		}
 		if err != nil {
 			return nil, err
 		}
+		if len(bodies) < len(members) {
+			// The rest are pinned, in segments, unless the repository lacks them.
+			var rest []encoding.ID
+			for _, id := range members {
+				if _, ok := bodies[id]; !ok {
+					rest = append(rest, id)
+				}
+			}
+			moved, err := s.segmentBodies(ctx, repo, kind, rest)
+			if err != nil {
+				return nil, err
+			}
+			for id, body := range moved {
+				bodies[id] = body
+			}
+		}
 		for id, body := range bodies {
 			r := ObjectRef{Kind: kind, ID: id}
 			found[r] = body
-			s.objects.put(objectKey(repo, r), body, len(body))
+			if cache {
+				s.objects.put(objectKey(repo, r), body, len(body))
+			}
 		}
 	}
 	for i := range out {
@@ -158,18 +181,23 @@ type chunkLoc struct {
 	loc  pack.Location
 }
 
-// chunkLocations locates chunks through the content index; one it lacks is absent.
+// chunkLocations locates a repository's chunks through its network's chunk index; one it lacks is
+// absent. Every caller names chunks of files the repository holds, so none is another's.
 func (s *Store) chunkLocations(ctx context.Context, repo int64, members []encoding.ID) (map[encoding.ID]chunkLoc, error) {
 	out := map[encoding.ID]chunkLoc{}
 	if len(members) == 0 {
 		return out, nil
 	}
-	li, entries, err := s.contentEntries(ctx, repo, encoding.KindChunk, members)
+	net, sc, err := s.networkOf(ctx, repo)
+	if err != nil {
+		return nil, err
+	}
+	li, entries, err := s.contentEntries(ctx, sc, encoding.KindChunk, members)
 	if err != nil {
 		return nil, err
 	}
 	for id, e := range entries {
-		pid, err := s.packID(ctx, repo, li, e.Loc.Pack)
+		pid, err := s.packID(ctx, net, li, e.Loc.Pack)
 		if err != nil {
 			return nil, err
 		}
@@ -192,9 +220,13 @@ func (s *Store) chunkBytes(ctx context.Context, repo int64, members []encoding.I
 	if err != nil {
 		return nil, err
 	}
+	net, err := s.network(ctx, repo)
+	if err != nil {
+		return nil, err
+	}
 	out := make(map[encoding.ID][]byte, len(stored))
 	for id, c := range stored {
-		raw, err := pack.Decompress(s.dicts, id, c.codec, c.raw, c.data)
+		raw, err := pack.Decompress(s.dicts.of(net), id, c.codec, c.raw, c.data)
 		if err != nil {
 			return nil, err
 		}
@@ -207,13 +239,17 @@ func (s *Store) chunkBytes(ctx context.Context, repo int64, members []encoding.I
 // cache holds chunks compressed, as stored, each verified against its ID when it was fetched.
 // A read whose pack was retired by repacking re-reads the chunk locations once.
 func (s *Store) storedChunks(ctx context.Context, repo int64, members []encoding.ID) (map[encoding.ID]storedChunk, error) {
+	net, sc, err := s.networkOf(ctx, repo)
+	if err != nil {
+		return nil, err
+	}
 	out := map[encoding.ID]storedChunk{}
 	var misses []encoding.ID
 	for _, id := range members {
 		if _, done := out[id]; done {
 			continue
 		}
-		if c, ok := s.chunks.get(chunkKey(repo, id)); ok {
+		if c, ok := s.chunks.get(chunkKey(net, id)); ok {
 			out[id] = c
 			continue
 		}
@@ -223,7 +259,7 @@ func (s *Store) storedChunks(ctx context.Context, repo int64, members []encoding
 	for attempt := 0; len(misses) > 0; attempt++ {
 		if attempt > 0 {
 			// The packs it read from were retired: the index has moved on since.
-			if err := s.refreshIndex(ctx, repo, s.live(repo)); err != nil {
+			if err := s.refreshIndex(ctx, sc, s.live(sc)); err != nil {
 				return nil, err
 			}
 		}
@@ -239,7 +275,7 @@ func (s *Store) storedChunks(ctx context.Context, repo int64, members []encoding
 		if s.afterLocate != nil {
 			s.afterLocate()
 		}
-		retry, err := s.fetchChunks(ctx, repo, locs, out)
+		retry, err := s.fetchChunks(ctx, net, locs, out)
 		if err != nil {
 			return nil, err
 		}
@@ -262,7 +298,7 @@ type span struct {
 // read with one range GET, the bytes between them discarded, and up to fetchesAtOnce GETs run
 // at once: a pack's chunks lie in the order compaction wrote them (by path), so a directory's
 // files are usually one read.
-func (s *Store) fetchChunks(ctx context.Context, repo int64, locs map[encoding.ID]chunkLoc, out map[encoding.ID]storedChunk) ([]encoding.ID, error) {
+func (s *Store) fetchChunks(ctx context.Context, net backend.Network, locs map[encoding.ID]chunkLoc, out map[encoding.ID]storedChunk) ([]encoding.ID, error) {
 	byPack := map[encoding.ID][]chunkLoc{}
 	for _, l := range locs {
 		byPack[l.pack] = append(byPack[l.pack], l)
@@ -306,7 +342,7 @@ func (s *Store) fetchChunks(ctx context.Context, repo int64, locs map[encoding.I
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
-			got, lost, err := s.fetchSpan(ctx, repo, sp)
+			got, lost, err := s.fetchSpan(ctx, net, sp)
 			mu.Lock()
 			defer mu.Unlock()
 			if err != nil {
@@ -345,10 +381,10 @@ var (
 
 // fetchSpan reads one span's chunks, verifying each against its ID and caching it as stored; a
 // span whose pack is gone returns its chunks as lost.
-func (s *Store) fetchSpan(ctx context.Context, repo int64, sp span) (map[encoding.ID]storedChunk, []encoding.ID, error) {
+func (s *Store) fetchSpan(ctx context.Context, net backend.Network, sp span) (map[encoding.ID]storedChunk, []encoding.ID, error) {
 	first, last := sp.locs[0].loc, sp.locs[len(sp.locs)-1].loc
 	length := last.DataOffset() + int64(last.StoredLength) - first.DataOffset()
-	b, err := s.blobs.GetRange(ctx, packKey(repo, sp.pack), first.DataOffset(), length)
+	b, err := s.blobs.GetRange(ctx, packKey(net, sp.pack), first.DataOffset(), length)
 	if errors.Is(err, blob.ErrNotFound) {
 		lost := make([]encoding.ID, len(sp.locs))
 		for i, l := range sp.locs {
@@ -372,13 +408,13 @@ func (s *Store) fetchSpan(ctx context.Context, repo int64, sp span) (map[encodin
 	for _, l := range sp.locs {
 		at := l.loc.DataOffset() - first.DataOffset()
 		data := b[at : at+int64(l.loc.StoredLength)]
-		if _, err := pack.Decode(s.dicts, l.id, l.loc.Codec, l.loc.RawLength, data); err != nil {
+		if _, err := pack.Decode(s.dicts.of(net), l.id, l.loc.Codec, l.loc.RawLength, data); err != nil {
 			return nil, nil, err
 		}
 		// A copy: the span's other bytes, and the gaps between its chunks, are not kept.
 		c := storedChunk{codec: l.loc.Codec, raw: l.loc.RawLength, data: bytes.Clone(data)}
 		got[l.id] = c
-		s.chunks.put(chunkKey(repo, l.id), c, len(c.data))
+		s.chunks.put(chunkKey(net, l.id), c, len(c.data))
 	}
 	return got, nil, nil
 }
@@ -401,7 +437,7 @@ const manifestBatch = 1000
 
 // manifests reads files' manifests from the content index; an absent file has no entry.
 func (s *Store) manifests(ctx context.Context, repo int64, files []encoding.ID) (map[encoding.ID]*manifest, error) {
-	_, entries, err := s.contentEntries(ctx, repo, encoding.KindFile, files)
+	_, entries, err := s.contentEntries(ctx, repoScope(repo), encoding.KindFile, files)
 	if err != nil {
 		return nil, err
 	}
@@ -518,6 +554,19 @@ const (
 // its frames are sent.
 func (s *Store) ReadFiles(ctx context.Context, repo int64, ranges []FileRange, form ChunkForm, emit func(FileFrame) error) error {
 	stored := form != RawChunks
+	net, err := s.network(ctx, repo)
+	if err != nil {
+		return err
+	}
+	// A dictionary sent is one the repository may read (dictionaryReadable): a chunk compressed
+	// with another is sent raw.
+	var readable func(uint32) (bool, error)
+	if form == StoredChunksWithDictionaries {
+		var err error
+		if readable, err = s.dictionaryReadable(ctx, repo); err != nil {
+			return err
+		}
+	}
 	label := "raw"
 	switch form {
 	case StoredChunks:
@@ -614,8 +663,18 @@ func (s *Store) ReadFiles(ctx context.Context, repo int64, ranges []FileRange, f
 			case p.chunk && stored:
 				c := as[f.ChunkID]
 				f.Data, f.Codec, f.RawLength = c.data, c.codec, c.raw
-				if c.codec == pack.ZstdDict && form != StoredChunksWithDictionaries {
-					raw, err := pack.Decompress(s.dicts, f.ChunkID, c.codec, c.raw, c.data)
+				send := form == StoredChunksWithDictionaries
+				if c.codec == pack.ZstdDict && send {
+					dict, err := pack.DictionaryID(c.data)
+					if err != nil {
+						return err
+					}
+					if send, err = readable(dict); err != nil {
+						return err
+					}
+				}
+				if c.codec == pack.ZstdDict && !send {
+					raw, err := pack.Decompress(s.dicts.of(net), f.ChunkID, c.codec, c.raw, c.data)
 					if err != nil {
 						return err
 					}
@@ -674,11 +733,103 @@ func (s *Store) ReadManifests(ctx context.Context, repo int64, files []encoding.
 	return nil
 }
 
+// copyRelatives are the copy histories related to id that the repository holds — its ancestors,
+// and everything descended from any of those — with their bodies: ancestors through each one's
+// parents, descendants through the parent edges reversed, the tail's and the segments'.
+func (s *Store) copyRelatives(ctx context.Context, repo int64, id encoding.ID) (map[encoding.ID][]byte, error) {
+	bodies := map[encoding.ID][]byte{}
+	// read reads the bodies of ids not read yet, returning those the repository holds.
+	read := func(ids []encoding.ID) ([]encoding.ID, error) {
+		var refs []ObjectRef
+		for _, id := range ids {
+			if _, ok := bodies[id]; !ok {
+				refs = append(refs, ObjectRef{Kind: encoding.KindCopyHistory, ID: id})
+			}
+		}
+		if len(refs) == 0 {
+			return nil, nil
+		}
+		res, err := s.ReadObjects(ctx, repo, refs)
+		if err != nil {
+			return nil, err
+		}
+		var found []encoding.ID
+		for _, r := range res {
+			if r.Found {
+				bodies[r.Ref.ID] = r.Body
+				found = append(found, r.Ref.ID)
+			}
+		}
+		return found, nil
+	}
+	for frontier := []encoding.ID{id}; len(frontier) > 0; {
+		found, err := read(frontier)
+		if err != nil {
+			return nil, err
+		}
+		frontier = nil
+		for _, f := range found {
+			o, err := decodeStored(encoding.KindCopyHistory, f, bodies[f])
+			if err != nil {
+				return nil, err
+			}
+			frontier = append(frontier, o.(*encoding.CopyHistory).Parents...)
+		}
+	}
+	seen := map[encoding.ID]bool{}
+	var frontier []encoding.ID
+	for a := range bodies {
+		seen[a] = true
+		frontier = append(frontier, a)
+	}
+	for len(frontier) > 0 {
+		children, err := s.copyChildren(ctx, repo, frontier)
+		if err != nil {
+			return nil, err
+		}
+		var next []encoding.ID
+		for _, c := range children {
+			if !seen[c] {
+				seen[c] = true
+				next = append(next, c)
+			}
+		}
+		if frontier, err = read(next); err != nil {
+			return nil, err
+		}
+	}
+	return bodies, nil
+}
+
+// copyChildren are the copy histories with any of parents as a parent, from the tail's edges and
+// the segments' reversed ones.
+func (s *Store) copyChildren(ctx context.Context, repo int64, parents []encoding.ID) ([]encoding.ID, error) {
+	edges, err := s.ops(ctx).CopyChildren(ctx, repo, parents)
+	if err != nil {
+		return nil, err
+	}
+	var out []encoding.ID
+	for _, e := range edges {
+		out = append(out, e[0])
+	}
+	prefixes := make([][]byte, len(parents))
+	for i := range parents {
+		prefixes[i] = parents[i][:]
+	}
+	err = s.segmentPrefixes(ctx, repoScope(repo), segCopyEdges, prefixes, func(key, _ []byte) error {
+		var c encoding.ID
+		copy(c[:], key[encoding.IDLen:])
+		out = append(out, c)
+		return nil
+	})
+	return out, err
+}
+
 // GetRelatedCopies returns the copy histories related to copyID — its ancestors, and
 // every descendant of those — children before parents, ties broken by ID (jj's
 // get_related_copies contract).
 func (s *Store) GetRelatedCopies(ctx context.Context, repo int64, copyID encoding.ID) ([]EncodedObject, error) {
-	bodies, err := s.b.CopyRelatives(ctx, repo, copyID)
+	bodies, err := s.copyRelatives(ctx, repo, copyID)
 	if err != nil {
 		return nil, err
 	}
@@ -872,7 +1023,7 @@ func (s *Store) loadGenerations(ctx context.Context, repo int64, members []encod
 	if len(members) == 0 {
 		return nil
 	}
-	got, err := s.b.CommitGenerations(ctx, repo, members)
+	got, err := s.commitGenerations(ctx, repo, members)
 	if err != nil {
 		return err
 	}
@@ -885,7 +1036,7 @@ func (s *Store) loadGenerations(ctx context.Context, repo int64, members []encod
 // loadEdges loads the parent edges of from and of every ancestor down to generation
 // minGen in one read. The virtual root has no commit row, so it is never a parent here.
 func (s *Store) loadEdges(ctx context.Context, repo int64, from []encoding.ID, minGen int64, gen map[encoding.ID]int64, edges map[encoding.ID][]encoding.ID, loaded map[encoding.ID]bool) error {
-	ancestors, err := s.b.Ancestry(ctx, repo, from, minGen)
+	ancestors, err := s.ancestry(ctx, repo, from, minGen)
 	if err != nil {
 		return err
 	}
@@ -902,7 +1053,7 @@ func (s *Store) loadEdges(ctx context.Context, repo int64, from []encoding.ID, m
 // opLogCommits lists every commit the caller's operation log references: each view's
 // commits and each operation's commit_predecessors.
 func (s *Store) opLogCommits(ctx context.Context, repo int64, principal, workspace string) ([]encoding.ID, error) {
-	opLog, err := logOf(ctx, s.b, repo, principal, workspace)
+	opLog, err := logOf(ctx, s.ops(ctx), repo, principal, workspace)
 	if err != nil {
 		return nil, err
 	}
@@ -914,7 +1065,7 @@ func (s *Store) opLogCommits(ctx context.Context, repo int64, principal, workspa
 			out = append(out, id)
 		}
 	}
-	views, err := s.b.Views(ctx, opLog)
+	views, err := s.logViews(ctx, repo, opLog)
 	if err != nil {
 		return nil, err
 	}
@@ -927,7 +1078,7 @@ func (s *Store) opLogCommits(ctx context.Context, repo int64, principal, workspa
 			add(c)
 		}
 	}
-	ops, err := s.b.Operations(ctx, opLog, time.Time{})
+	ops, err := s.logOperations(ctx, repo, opLog, time.Time{})
 	if err != nil {
 		return nil, err
 	}

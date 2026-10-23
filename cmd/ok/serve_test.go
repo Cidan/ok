@@ -13,16 +13,23 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	"github.com/Cidan/ok/internal/dial"
 	"github.com/Cidan/ok/internal/id/ca"
 	"github.com/Cidan/ok/internal/id/signin/oidctest"
+	"github.com/Cidan/ok/internal/secrets/keys/keystest"
 	"github.com/Cidan/ok/internal/testdb"
 	"github.com/Cidan/ok/internal/testdb/testobjects"
+	secretspb "github.com/Cidan/ok/proto/ok/secrets/v1"
 )
 
-// ok serve runs identity, the SCM, automation, and control in one process on one port, each role
-// calling the others as its own robot with a key identity certified in process: a person signed in
-// in a browser sees control's pages, creates a repository through control — which asks the SCM as
-// control's robot — and finds it once control's feed, following the SCM as that robot, brings it.
+// ok serve runs identity, the SCM, automation, control, and ok secrets in one process on one port,
+// each role calling the others as its own robot with a key identity certified in process: a person
+// signed in in a browser sees control's pages, creates a repository through control — which asks
+// the SCM as control's robot — and finds it once control's feed, following the SCM as that robot,
+// brings it; and ok secrets serves its services on the same port.
 func TestServe(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	dir := t.TempDir()
@@ -52,7 +59,7 @@ public_url: `+base+`
 listen: `+addr+`
 metrics_listen: 127.0.0.1:0
 database: {url_file: `+secret("database-url", testdb.Postgres(t))+`}
-roles: {identity: identity.ok, scm: scm.ok, control: control.ok, automation: automation.ok, worker: worker.ok, deploy: deploy.ok}
+roles: {identity: identity.ok, scm: scm.ok, control: control.ok, automation: automation.ok, worker: worker.ok, deploy: deploy.ok, secrets: secrets.ok}
 identity:
   ca_dir: `+filepath.Join(dir, "ca")+`
   sign_in:
@@ -63,10 +70,11 @@ scm:
   `+bucket("objects")+`
 automation:
   `+bucket("logs")+`
+secrets: {root: `+keystest.Keyring(t, 1)+`}
 `), 0o644)
 	done := make(chan error, 1)
 	go func() {
-		done <- serveRolesUntil(ctx, []string{"-config", config, "-roles", "identity,scm,automation,control"})
+		done <- serveRolesUntil(ctx, []string{"-config", config, "-roles", "identity,scm,automation,control,secrets"})
 	}()
 	t.Cleanup(func() {
 		cancel()
@@ -128,17 +136,27 @@ automation:
 	}
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusOK || resp.Request.URL.Path != "/app" {
+	if resp.StatusCode != http.StatusOK || resp.Request.URL.Path != "/example/app" {
 		t.Fatalf("creating a repository: %d at %s\n%.600s", resp.StatusCode, resp.Request.URL, body)
 	}
 	// Control's feed, following the SCM as its robot, brings it to the finder.
 	for i := 0; ; i++ {
-		if _, page = get("/repositories/list"); strings.Contains(page, `href="/app"`) {
+		if _, page = get("/repositories/list"); strings.Contains(page, `href="/example/app"`) {
 			break
 		}
 		if i == 100 {
 			t.Fatalf("the finder never listed app:\n%.600s", page)
 		}
 		time.Sleep(100 * time.Millisecond)
+	}
+
+	// ok secrets is on the port: its services refuse a caller with no credential, as theirs.
+	conn, err := dial.Dial(addr, dial.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := secretspb.NewSecretsClient(conn).CheckAccess(ctx, &secretspb.CheckAccessRequest{RepositoryId: 1, Path: "secret/x"}); status.Code(err) != codes.Unauthenticated {
+		t.Errorf("ok secrets' service with no caller: %v", err)
 	}
 }

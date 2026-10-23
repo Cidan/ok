@@ -1084,6 +1084,15 @@ templ clChecksRegion(c CLChecks) {
 				@panelEmpty() {
 					{ c.Unavailable }
 				}
+			} else if len(c.Runs) == 0 && c.NotRun != "" {
+				@panelEmpty() {
+					<div class="flex items-center gap-3">
+						<span class="flex-1">{ c.NotRun }</span>
+						if c.RunPreHref != "" {
+							<button type="button" hx-post={ c.RunPreHref } hx-target="#cl-checks" hx-swap="outerHTML" class={ btnClass(btnSecondary) }>Run pre</button>
+						}
+					</div>
+				}
 			} else if len(c.Runs) == 0 {
 				@panelEmpty() {
 					ok has not planned this patchset's checks yet.

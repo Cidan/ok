@@ -89,11 +89,11 @@ func (n *notifier) waitAny(ctx context.Context, max time.Duration, chs ...<-chan
 	return nil
 }
 
-// Listen delivers the database's notifications to the store's waiters until ctx ends,
-// reconnecting after a failure.
+// Listen delivers the store's signals to its waiters until ctx ends, listening again after a
+// failure.
 func (s *Store) Listen(ctx context.Context) error {
 	for ctx.Err() == nil {
-		err := s.b.Listen(ctx, []string{chanQueue, chanLog, chanDone, chanSubmission}, s.notify.fireAll, s.notify.fire)
+		err := s.cfg.Signals.Listen(ctx, []string{chanQueue, chanLog, chanDone, chanSubmission}, s.notify.fireAll, s.notify.fire)
 		if ctx.Err() != nil {
 			return nil
 		}

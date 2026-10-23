@@ -1,0 +1,117 @@
+{{- if not .Values.address }}{{ fail "address is where ok is reached, host:port" }}{{ end -}}
+{{- if and (not .Values.credentialSecret) (not .Values.organizationID) }}{{ fail "organizationID (for a token) or credentialSecret is how the agent's robot proves itself" }}{{ end -}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "agent.name" . }}
+  labels: {{- include "agent.labels" . | nindent 4 }}
+automountServiceAccountToken: false
+---
+{{- if .Values.migrations.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "agent.name" . }}-state
+  labels: {{- include "agent.labels" . | nindent 4 }}
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: {requests: {storage: {{ .Values.migrations.storage }}}}
+---
+{{- end }}
+# One agent: a newer connection of the organization's agent replaces the older, so two would replace
+# each other. Recreate never runs two.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "agent.name" . }}
+  labels: {{- include "agent.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/name: ok-agent
+  template:
+    metadata:
+      labels: {{- include "agent.labels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "agent.name" . }}
+      automountServiceAccountToken: false
+      containers:
+        - name: agent
+          image: {{ include "agent.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - deploy
+            - agent
+            - -address
+            - {{ .Values.address | quote }}
+            {{- if .Values.credentialSecret }}
+            - -credential-dir
+            - /var/run/secrets/ok/credential
+            {{- else }}
+            - -token-file
+            - /var/run/secrets/ok/token/token
+            {{- end }}
+            {{- if .Values.caConfigMap.name }}
+            - -ca-file
+            - /etc/ok/ca/{{ .Values.caConfigMap.key }}
+            {{- end }}
+            {{- if .Values.migrations.enabled }}
+            - -state
+            - /var/lib/ok-agent
+            {{- end }}
+          env:
+            - name: HOSTNAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - name: HOME
+              value: /var/lib/ok-agent/home
+            {{- range $name, $ref := .Values.migrations.env }}
+            - name: {{ $name }}
+              valueFrom: {secretKeyRef: {name: {{ $ref.secret }}, key: {{ $ref.key }}}}
+            {{- end }}
+          securityContext: {{- toYaml .Values.securityContext | nindent 12 }}
+          resources: {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            # The cluster's API, as the agent's ServiceAccount: in-cluster configuration's paths.
+            - {name: kube-api, mountPath: /var/run/secrets/kubernetes.io/serviceaccount, readOnly: true}
+            {{- if .Values.credentialSecret }}
+            - {name: credential, mountPath: /var/run/secrets/ok/credential}
+            {{- else }}
+            - {name: ok-token, mountPath: /var/run/secrets/ok/token, readOnly: true}
+            {{- end }}
+            {{- if .Values.caConfigMap.name }}
+            - {name: ca, mountPath: /etc/ok/ca, readOnly: true}
+            {{- end }}
+            - {name: tmp, mountPath: /tmp}
+            {{- if .Values.migrations.enabled }}
+            - {name: state, mountPath: /var/lib/ok-agent}
+            {{- end }}
+      volumes:
+        - name: kube-api
+          projected:
+            sources:
+              - serviceAccountToken: {expirationSeconds: 3600, path: token}
+              - configMap: {name: kube-root-ca.crt, items: [{key: ca.crt, path: ca.crt}]}
+              - downwardAPI: {items: [{path: namespace, fieldRef: {fieldPath: metadata.namespace}}]}
+        {{- if .Values.credentialSecret }}
+        - name: credential
+          secret: {secretName: {{ .Values.credentialSecret }}, defaultMode: 0600}
+        {{- else }}
+        # ok's: its audience the organization's ID, so it signs in no other organization's robot.
+        - name: ok-token
+          projected:
+            sources:
+              - serviceAccountToken: {audience: {{ .Values.organizationID | quote }}, expirationSeconds: 3600, path: token}
+        {{- end }}
+        {{- if .Values.caConfigMap.name }}
+        - name: ca
+          configMap: {name: {{ .Values.caConfigMap.name }}}
+        {{- end }}
+        - name: tmp
+          emptyDir: {}
+        {{- if .Values.migrations.enabled }}
+        - name: state
+          persistentVolumeClaim: {claimName: {{ include "agent.name" . }}-state}
+        {{- end }}

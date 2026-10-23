@@ -70,7 +70,7 @@ func (s *Server) clList(w http.ResponseWriter, r *http.Request) {
 	v := pages.CLListView{Chrome: chrome(repo, "main", repo.GetHead(), ""), Empty: filterEmpty[f]}
 	for _, c := range cls {
 		label, kind := statusLabel(c.Status, c.Approved)
-		item := pages.CLItem{Number: c.Number, Title: c.Title(), Author: people.Handle(c.Author), StatusLabel: label, StatusKind: kind,
+		item := pages.CLItem{Number: c.Number, Title: c.Title(), Author: people.Handle(r.Context(), c.Author), StatusLabel: label, StatusKind: kind,
 			Rollback: len(c.RollsBack) > 0, Href: clHref(repo.GetName(), c.Number)}
 		item.Age, item.AgeTitle = age(c.UpdatedAt)
 		v.Items = append(v.Items, item)
@@ -204,7 +204,7 @@ func (s *Server) buildCL(r *http.Request, t *clTarget) (*pages.CLView, error) {
 		Title:       cl.Title(),
 		StatusLabel: label,
 		StatusKind:  kind,
-		Author:      people.Handle(cl.Author),
+		Author:      people.Handle(ctx, cl.Author),
 		ChangeID:    scm.ShortChangeID(cl.ChangeID),
 		CanReply:    true,
 		ReplyHref:   link + "/reply",
@@ -244,7 +244,7 @@ func (s *Server) buildCL(r *http.Request, t *clTarget) (*pages.CLView, error) {
 		grantedBy[g.Principal][g.Label] = g.Granted
 	}
 	for _, rv := range reviewers {
-		chip := pages.CLReviewer{Name: people.Handle(rv.Principal)}
+		chip := pages.CLReviewer{Name: people.Handle(ctx, rv.Principal)}
 		for _, l := range db.Labels {
 			if grantedBy[rv.Principal][l] {
 				chip.Labels = append(chip.Labels, l.String())
@@ -256,11 +256,12 @@ func (s *Server) buildCL(r *http.Request, t *clTarget) (*pages.CLView, error) {
 		v.Reviewers = append(v.Reviewers, chip)
 	}
 
-	// The review requirements.
-	handles := func(ps []string) []string {
+	// The review requirements: OWNERS' by stable ID, the groups-and-ACLs tree's by name.
+	handles := func(ps []string) []string { return people.Handles(ctx, ps) }
+	treeHandles := func(ps []string) []string {
 		out := make([]string, len(ps))
 		for i, p := range ps {
-			out[i] = people.Handle(p)
+			out[i] = people.HandleOf(p)
 		}
 		return out
 	}
@@ -326,10 +327,10 @@ func (s *Server) buildCL(r *http.Request, t *clTarget) (*pages.CLView, error) {
 	}
 	for _, r := range st.Identity {
 		set := pages.CLOwnerSet{
-			Label: r.ACL, What: r.What, Satisfied: r.Accepted, Implicit: r.Implicit, ApprovedBy: handles(r.ApprovedBy),
+			Label: r.ACL, What: r.What, Satisfied: r.Accepted, Implicit: r.Implicit, ApprovedBy: treeHandles(r.ApprovedBy),
 			Href: treeHref(repo.GetName(), "main", path.Join(r.Dir, r.ACLPath, identity.ACL.File())),
 		}
-		set.Owners = handles(r.Eligible)
+		set.Owners = treeHandles(r.Eligible)
 		v.OwnerSets = append(v.OwnerSets, set)
 	}
 
@@ -338,15 +339,15 @@ func (s *Server) buildCL(r *http.Request, t *clTarget) (*pages.CLView, error) {
 	var entries []timed
 	subs := s.submissions(ctx, repo, cl.Number)
 	for _, sub := range subs.list {
-		entries = append(entries, submissionMessages(sub, cl.Number)...)
+		entries = append(entries, submissionMessages(ctx, sub, cl.Number)...)
 	}
 	for _, e := range events {
-		m := eventMessage(e, repo.GetName())
+		m := eventMessage(ctx, e, repo.GetName())
 		m.Age, m.AgeTitle = age(e.At)
 		entries = append(entries, timed{e.At, m})
 	}
 	for _, cm := range comments {
-		m := pages.CLMessage{Author: people.Handle(cm.Author), Action: "commented", Body: cm.Body, PatchSet: int64(cm.Patchset)}
+		m := pages.CLMessage{Author: people.Handle(ctx, cm.Author), Action: "commented", Body: cm.Body, PatchSet: int64(cm.Patchset)}
 		m.Age, m.AgeTitle = age(cm.CreatedAt)
 		entries = append(entries, timed{cm.CreatedAt, m})
 	}
@@ -364,7 +365,7 @@ func (s *Server) buildCL(r *http.Request, t *clTarget) (*pages.CLView, error) {
 	}
 	if sub := subs.latest(); sub.GetStatus() == automationpb.Submission_STATUS_ACTIVE {
 		v.Submitting = true
-		if canManage {
+		if s.review.CanSubmit(ctx, repo, cl, me) {
 			v.CancelSubmitHref = link + "/cancel-submit"
 		}
 	}
@@ -376,7 +377,7 @@ func (s *Server) buildCL(r *http.Request, t *clTarget) (*pages.CLView, error) {
 	if active {
 		counts := map[db.Label]bool{
 			db.LabelLGTM:     me != cl.Author || st.SelfLGTMAllowed,
-			db.LabelApproval: st.CanApprove(me, cl.Author),
+			db.LabelApproval: st.CanApprove(ctx, me, cl.Author),
 		}
 		for _, l := range db.Labels {
 			if counts[l] || grantedBy[me][l] {
@@ -486,7 +487,7 @@ func (s *Server) clThreads(ctx context.Context, c *scmpb.ChangeList, viewed int3
 	views := make([]*pages.CommentThread, 0, len(threads))
 	var placed []placedThread
 	for _, th := range threads {
-		tv := threadView(th, link, viewed, me)
+		tv := threadView(ctx, th, link, viewed, me)
 		views = append(views, &tv)
 		anchor, isPorted := ported[th.RootID]
 		switch {
@@ -687,10 +688,10 @@ func sideName(s db.Side) string {
 
 // threadView is a thread as the page shows it, with its reply and resolve targets, which
 // re-render the viewed patchset.
-func threadView(t review.Thread, link string, viewed int32, me string) pages.CommentThread {
+func threadView(ctx context.Context, t review.Thread, link string, viewed int32, me string) pages.CommentThread {
 	var comments []pages.CommentView
 	for _, c := range t.Comments {
-		cv := pages.CommentView{ID: c.ID, Author: people.Handle(c.Author), Body: c.Body, CanEdit: c.Author == me}
+		cv := pages.CommentView{ID: c.ID, Author: people.Handle(ctx, c.Author), Body: c.Body, CanEdit: c.Author == me}
 		cv.Age, cv.AgeTitle = age(c.CreatedAt)
 		comments = append(comments, cv)
 	}
@@ -751,17 +752,17 @@ func (s *Server) rollbacks(ctx context.Context, v *pages.CLView, repo *scmpb.Rep
 		v.RolledBackBy = append(v.RolledBackBy, clLink(repo.GetName(), b))
 		underway = underway || b.Status.Active()
 	}
-	if !underway && people.IsHuman(me) {
+	if !underway && people.IsHumanID(ctx, me) {
 		v.RollbackHref = clHref(repo.GetName(), cl.Number) + "/rollback"
 	}
 	return nil
 }
 
 // eventMessage renders one entry of a CL's history for the change log.
-func eventMessage(e db.Event, repo string) pages.CLMessage {
+func eventMessage(ctx context.Context, e db.Event, repo string) pages.CLMessage {
 	actor := "ok"
 	if e.Actor != "" {
-		actor = people.Handle(e.Actor)
+		actor = people.Handle(ctx, e.Actor)
 	}
 	m := pages.CLMessage{Author: actor, PatchSet: int64(e.Patchset)}
 	switch e.Kind {
@@ -783,12 +784,12 @@ func eventMessage(e db.Event, repo string) pages.CLMessage {
 		m.Commit = scm.Short(e.Commit)
 		m.CommitHref = commitHref(repo, e.Commit)
 	case db.EventReviewerAdded:
-		m.Action = "added reviewer " + people.Handle(e.Subject)
+		m.Action = "added reviewer " + people.Handle(ctx, e.Subject)
 	case db.EventReviewerRemoved:
 		if e.Subject == e.Actor {
 			m.Action = "stopped reviewing"
 		} else {
-			m.Action = "removed reviewer " + people.Handle(e.Subject)
+			m.Action = "removed reviewer " + people.Handle(ctx, e.Subject)
 		}
 	case db.EventLabelGranted:
 		m.Action, m.Label = "granted", e.Label.String()
@@ -813,7 +814,7 @@ func (s *Server) reviewDialog(ctx context.Context, cl db.ChangeList, ev *review.
 		return nil, err
 	}
 	cand := func(c review.Candidate) pages.CLCandidate {
-		return pages.CLCandidate{Principal: c.Principal, Name: people.Handle(c.Principal), Selected: c.Selected, Assigned: c.Assigned}
+		return pages.CLCandidate{Principal: c.Principal, Name: people.Handle(ctx, c.Principal), Selected: c.Selected, Assigned: c.Assigned}
 	}
 	d := &pages.CLReviewDialog{Title: "Add Reviewers", Action: "Add", Href: link + "/reviewers", SearchHref: link + "/reviewers/search", NeedsLGTM: sug.NeedsLGTM}
 	if request {
@@ -912,7 +913,7 @@ type timed struct {
 
 // submissionMessages are a submission's entries in a CL's change log: its submitting, and — when
 // it did not land (the landing is the CL's own entry) — how it ended.
-func submissionMessages(sub *automationpb.Submission, number int64) []timed {
+func submissionMessages(ctx context.Context, sub *automationpb.Submission, number int64) []timed {
 	var ps int64
 	for _, c := range sub.GetCls() {
 		if c.GetNumber() == number {
@@ -923,7 +924,7 @@ func submissionMessages(sub *automationpb.Submission, number int64) []timed {
 	if len(sub.GetCls()) > 1 {
 		action = "sent its stack to the landing queue"
 	}
-	m := pages.CLMessage{Author: people.Handle(sub.GetSubmittedBy()), Action: action, PatchSet: ps}
+	m := pages.CLMessage{Author: people.Handle(ctx, sub.GetSubmittedById()), Action: action, PatchSet: ps}
 	m.Age, m.AgeTitle = age(sub.GetCreatedAt().AsTime())
 	out := []timed{{sub.GetCreatedAt().AsTime(), m}}
 	var end pages.CLMessage
@@ -931,7 +932,7 @@ func submissionMessages(sub *automationpb.Submission, number int64) []timed {
 	case automationpb.Submission_STATUS_FAILED:
 		end = pages.CLMessage{Author: "ok", Action: "could not land it", Body: upperFirst(sub.GetReason()), PatchSet: ps}
 	case automationpb.Submission_STATUS_CANCELED:
-		end = pages.CLMessage{Author: "ok", Action: "stopped submitting it", Body: upperFirst(sub.GetReason()), PatchSet: ps}
+		end = pages.CLMessage{Author: "ok", Action: "stopped submitting it", Body: upperFirst(people.Reason(ctx, sub.GetReason(), sub.GetCanceledById())), PatchSet: ps}
 	default:
 		return out
 	}
@@ -1035,7 +1036,7 @@ func (s *Server) clReviewerSearch(w http.ResponseWriter, r *http.Request) {
 	}
 	var out []pages.CLCandidate
 	for _, p := range found {
-		out = append(out, pages.CLCandidate{Principal: p, Name: people.Handle(p)})
+		out = append(out, pages.CLCandidate{Principal: p, Name: people.Handle(r.Context(), p)})
 	}
 	pages.ServeCLReviewerResults(w, r, keyword != "", out)
 }

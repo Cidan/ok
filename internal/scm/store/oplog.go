@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"context"
+	"slices"
 	"time"
 
 	"github.com/Cidan/ok/internal/scm/encoding"
@@ -47,10 +48,10 @@ func ensureOpLog(ctx context.Context, tx *txn, repo int64, principal, workspace 
 
 // OpLog returns the operation log of the caller's workspace in repo (see logOf).
 func (s *Store) OpLog(ctx context.Context, repo int64, principal, workspace string) (int64, error) {
-	if err := s.repositoryExists(ctx, s.b, repo); err != nil {
+	if err := s.repositoryExists(ctx, s.ops(ctx), repo); err != nil {
 		return 0, err
 	}
-	return logOf(ctx, s.b, repo, principal, workspace)
+	return logOf(ctx, s.ops(ctx), repo, principal, workspace)
 }
 
 // GetOpHeads returns the operation heads of the caller's workspace: never empty, the root
@@ -60,7 +61,7 @@ func (s *Store) GetOpHeads(ctx context.Context, repo int64, principal, workspace
 	if err != nil {
 		return nil, err
 	}
-	return s.b.OpHeads(ctx, opLog)
+	return s.ops(ctx).OpHeads(ctx, opLog)
 }
 
 // updateOpHeads applies jj's update_op_heads: add newID, then remove each old ID other
@@ -109,7 +110,7 @@ func (s *Store) ResolveOperationPrefix(ctx context.Context, repo int64, principa
 		}
 		return bytes.Equal(id[:n], lo)
 	}
-	opLog, err := logOf(ctx, s.b, repo, principal, workspace)
+	opLog, err := logOf(ctx, s.ops(ctx), repo, principal, workspace)
 	if err != nil {
 		return NoMatch, encoding.ID{}, err
 	}
@@ -132,7 +133,7 @@ func (s *Store) ResolveOperationPrefix(ctx context.Context, repo int64, principa
 	if !carry && len(hi) > 0 {
 		upper = hi
 	}
-	more, err := s.b.OperationIDsFrom(ctx, opLog, lo, upper, 2)
+	more, err := s.operationIDsFrom(ctx, repo, opLog, lo, upper, 2)
 	if err != nil {
 		return NoMatch, encoding.ID{}, err
 	}
@@ -154,7 +155,7 @@ func (s *Store) ReadOperations(ctx context.Context, repo int64, principal, works
 			return nil, invalid("ReadOperations reads operations and views, not a %s", r.Kind)
 		}
 	}
-	opLog, err := logOf(ctx, s.b, repo, principal, workspace)
+	opLog, err := logOf(ctx, s.ops(ctx), repo, principal, workspace)
 	if err != nil {
 		return nil, err
 	}
@@ -169,7 +170,7 @@ func (s *Store) ReadOperations(ctx context.Context, repo int64, principal, works
 		if len(want) == 0 {
 			continue
 		}
-		got, err := s.b.OpBodies(ctx, opLog, kind, want)
+		got, err := s.opBodies(ctx, s.ops(ctx), repo, opLog, kind, want)
 		if err != nil {
 			return nil, err
 		}
@@ -194,7 +195,7 @@ const prefetchOpsBatch = 500
 // is ignored. The log's operations are read with one query, as collection reads them: a log is
 // one person's, and collection keeps it to what its heads reach.
 func (s *Store) PrefetchOperations(ctx context.Context, repo int64, principal, workspace string, want, have []encoding.ID, limit int, emit func(EncodedObject) error) error {
-	opLog, err := logOf(ctx, s.b, repo, principal, workspace)
+	opLog, err := logOf(ctx, s.ops(ctx), repo, principal, workspace)
 	if err != nil {
 		return err
 	}
@@ -204,7 +205,7 @@ func (s *Store) PrefetchOperations(ctx context.Context, repo int64, principal, w
 		parents []encoding.ID
 	}
 	ops := map[encoding.ID]*op{}
-	all, err := s.b.Operations(ctx, opLog, time.Time{})
+	all, err := s.logOperations(ctx, repo, opLog, time.Time{})
 	if err != nil {
 		return err
 	}
@@ -216,7 +217,7 @@ func (s *Store) PrefetchOperations(ctx context.Context, repo int64, principal, w
 		ops[row.ID] = &op{body: row.Body, view: row.View, parents: o.(*encoding.Operation).Parents}
 	}
 	if len(want) == 0 {
-		if want, err = s.b.OpHeads(ctx, opLog); err != nil {
+		if want, err = s.ops(ctx).OpHeads(ctx, opLog); err != nil {
 			return err
 		}
 	}
@@ -248,7 +249,7 @@ func (s *Store) PrefetchOperations(ctx context.Context, repo int64, principal, w
 		bodies := map[encoding.ID][]byte{}
 		if len(views) > 0 {
 			var err error
-			if bodies, err = s.b.OpBodies(ctx, opLog, encoding.KindView, views); err != nil {
+			if bodies, err = s.opBodies(ctx, s.ops(ctx), repo, opLog, encoding.KindView, views); err != nil {
 				return err
 			}
 		}
@@ -294,11 +295,11 @@ func (s *Store) PrefetchOperations(ctx context.Context, repo int64, principal, w
 // before keepNewer (server time). A head published concurrently is therefore never
 // collected, whatever the caller passes.
 func (s *Store) CollectOperations(ctx context.Context, repo int64, principal, workspace string, heads []encoding.ID, keepNewer time.Time) error {
-	opLog, err := logOf(ctx, s.b, repo, principal, workspace)
+	opLog, err := logOf(ctx, s.ops(ctx), repo, principal, workspace)
 	if err != nil {
 		return err
 	}
-	_, err = s.collectLog(ctx, opLog, heads, keepNewer, false)
+	_, err = s.collectLog(ctx, repo, opLog, heads, keepNewer, false)
 	return err
 }
 
@@ -311,32 +312,58 @@ type Collected struct {
 // whole log is computed from a snapshot without the log's row lock; then, under the lock
 // every Publish carrying operations also takes, only what was published since is walked
 // — from the current heads through operations the snapshot did not reach — so collection
-// holds the lock for the new operations, not the log's history.
-func (s *Store) collectLog(ctx context.Context, opLog int64, heads []encoding.ID, keepNewer time.Time, dryRun bool) (Collected, error) {
+// holds the lock for the new operations, not the log's history. What it collects that only a
+// segment holds it records a tombstone of; the tail's it deletes.
+func (s *Store) collectLog(ctx context.Context, repo, opLog int64, heads []encoding.ID, keepNewer time.Time, dryRun bool) (Collected, error) {
 	var out Collected
-	old, err := s.b.OlderThan(ctx, opLog, keepNewer)
+	old, err := s.olderThan(ctx, repo, opLog, keepNewer)
 	if err != nil || !old {
 		return out, err
 	}
 
-	// The snapshot: every operation's parents, and which are old enough to collect.
+	// The snapshot: every operation's parents, which are old enough to collect, and what only a
+	// segment holds: operations, with their views, and views.
 	parents := map[encoding.ID][]encoding.ID{}
 	stale := map[encoding.ID]bool{}
-	all, err := s.b.Operations(ctx, opLog, keepNewer)
+	movedOps := map[encoding.ID]encoding.ID{}
+	allOps, err := s.logOps(ctx, repo, opLog, encoding.KindOperation)
 	if err != nil {
 		return out, err
 	}
-	for _, row := range all {
+	tailOld, err := s.ops(ctx).Operations(ctx, opLog, keepNewer)
+	if err != nil {
+		return out, err
+	}
+	oldInTail := map[encoding.ID]bool{}
+	for _, row := range tailOld {
+		oldInTail[row.ID] = row.Old
+	}
+	for _, row := range allOps {
 		o, err := decodeStored(encoding.KindOperation, row.ID, row.Body)
 		if err != nil {
 			return out, err
 		}
 		parents[row.ID] = o.(*encoding.Operation).Parents
-		if row.Old {
+		if row.inSegment {
+			movedOps[row.ID] = row.View
+			if row.TouchedAt.Before(keepNewer) {
+				stale[row.ID] = true
+			}
+		} else if oldInTail[row.ID] {
 			stale[row.ID] = true
 		}
 	}
-	current, err := s.b.OpHeads(ctx, opLog)
+	allViews, err := s.logOps(ctx, repo, opLog, encoding.KindView)
+	if err != nil {
+		return out, err
+	}
+	var movedViews []encoding.ID
+	for _, v := range allViews {
+		if v.inSegment && v.TouchedAt.Before(keepNewer) {
+			movedViews = append(movedViews, v.ID)
+		}
+	}
+	current, err := s.ops(ctx).OpHeads(ctx, opLog)
 	if err != nil {
 		return out, err
 	}
@@ -363,7 +390,7 @@ func (s *Store) collectLog(ctx context.Context, opLog int64, heads []encoding.ID
 	}
 	reach(append(append([]encoding.ID(nil), heads...), current...))
 
-	err = s.inTx(ctx, func(tx *txn) error {
+	err = s.inTx(ctx, func(ctx context.Context, tx *txn) error {
 		out = Collected{}
 		if err := tx.LockOpLog(ctx, opLog); err != nil {
 			return err
@@ -387,7 +414,7 @@ func (s *Store) collectLog(ctx context.Context, opLog int64, heads []encoding.ID
 			if len(batch) == 0 {
 				break
 			}
-			got, err := tx.OpBodies(ctx, opLog, encoding.KindOperation, batch)
+			got, err := s.opBodies(ctx, tx, repo, opLog, encoding.KindOperation, batch)
 			if err != nil {
 				return err
 			}
@@ -410,9 +437,50 @@ func (s *Store) collectLog(ctx context.Context, opLog int64, heads []encoding.ID
 			}
 		}
 		sortIDs(doomed)
-		// The last touch is checked again: re-publishing an operation keeps it.
-		out.Operations, out.Views, err = tx.CollectOps(ctx, opLog, doomed, keepNewer, dryRun)
-		return err
+		// The views of the operations only segments hold that stay.
+		var keep []encoding.ID
+		var movedDoomed []encoding.ID
+		for _, id := range doomed {
+			if _, ok := movedOps[id]; ok {
+				movedDoomed = append(movedDoomed, id)
+			}
+		}
+		for id, view := range movedOps {
+			if !slices.Contains(movedDoomed, id) {
+				keep = append(keep, view)
+			}
+		}
+		sortIDs(keep)
+		// The last touch is checked again: re-publishing an operation keeps it — its row in the
+		// tail again, if only a segment held it, so it gets no tombstone.
+		if out.Operations, out.Views, err = tx.CollectOps(ctx, opLog, doomed, keep, keepNewer, dryRun); err != nil {
+			return err
+		}
+		ops, err := tx.TombstoneOps(ctx, opLog, encoding.KindOperation, movedDoomed, dryRun)
+		if err != nil {
+			return err
+		}
+		// A view only segments hold goes when no operation that stays names it.
+		named, err := tx.TailOpViewRefs(ctx, opLog, doomed, keepNewer)
+		if err != nil {
+			return err
+		}
+		for _, v := range keep {
+			named[v] = true
+		}
+		var deadViews []encoding.ID
+		for _, v := range movedViews {
+			if !named[v] {
+				deadViews = append(deadViews, v)
+			}
+		}
+		views, err := tx.TombstoneOps(ctx, opLog, encoding.KindView, deadViews, dryRun)
+		if err != nil {
+			return err
+		}
+		out.Operations += ops
+		out.Views += views
+		return nil
 	})
 	return out, err
 }

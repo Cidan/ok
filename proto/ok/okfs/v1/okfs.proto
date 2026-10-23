@@ -28,6 +28,8 @@ message Request {
     Subscribe subscribe = 12;
     Flush flush = 13;
     Present present = 14;
+    Unpresent unpresent = 15;
+    SealSecret seal_secret = 16;
   }
 }
 
@@ -46,6 +48,7 @@ message Response {
     Event event = 8;
     FlushReply flush = 9;
     PresentReply present = 10;
+    SealSecretReply seal_secret = 12;
   }
 }
 
@@ -133,6 +136,13 @@ message DirEntry {
   uint32 conflict_marker_len = 12;
   // A redirection (.ok/redirections): a symlink to local disk, never snapshotted.
   bool redirect = 13;
+  // A secret written and not yet stored (docs/secrets.md): its value is in the daemon's memory,
+  // and its overlay holds the pointer it had, or nothing. A snapshot that tracks it asks the
+  // daemon to seal it (SealSecret) and records what that returns.
+  bool secret_pending = 14;
+  // A secret whose overlay holds no pointer and whose value is gone (a daemon that stopped before
+  // sealing it): there is nothing to record; the recorded tree keeps what it had.
+  bool secret_lost = 15;
 }
 
 // A file, symlink, or tree, as a tree holds it.
@@ -278,6 +288,12 @@ message Present {
   // before the reply, with the trees they are found through.
   repeated string read_ahead = 6;
 }
+// Stops presenting at a mount point: unmounted, and its state deleted — a worker's trust domain it
+// evicted (docs/hosted.md, "Hosted automation, as built"). One not presented is no error.
+message Unpresent {
+  string mount_point = 1;
+}
+
 message PresentedFile {
   string name = 1;  // a name at the root
   bytes contents = 2;
@@ -326,7 +342,17 @@ message Record {
     Base base = 3;
     Whiteout whiteout = 4;
     Unwhiteout unwhiteout = 5;
+    CompactionMark compaction = 6;  // a snapshot's first record: the log it was compacted from
   }
+}
+
+// What a snapshot was compacted from: the log's length and BLAKE3 hash then. A log that still
+// starts with exactly those bytes — its truncation lost to a crash, the snapshot's rename not —
+// is that log, which the snapshot holds; loading skips them. A reader that knows no marks
+// ignores the record.
+message CompactionMark {
+  uint64 log_bytes = 1;
+  bytes log_blake3 = 2;
 }
 
 // The workspace's base tree (what unwritten paths show) and recorded tree.
@@ -394,4 +420,16 @@ message Link {
 message Xattr {
   bytes name = 1;
   bytes value = 2;
+}
+
+// Stores a written secret's value in ok secrets and puts its pointer in the overlay
+// (docs/secrets.md, "In a virtual workspace"), for a snapshot that tracks it.
+message SealSecret {
+  string workspace_id = 1;
+  string path = 2;
+}
+message SealSecretReply {
+  // The file as it is now: a written file holding the secret's pointer. Unset: the secret is not
+  // to be recorded — its name is no secret's, or it was removed meanwhile.
+  DirEntry entry = 1;
 }

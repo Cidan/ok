@@ -26,7 +26,11 @@ func name(kind string) string {
 const patience = 60 * time.Second
 
 // StreamOptions says how a stream behaves beyond what every stream must.
-type StreamOptions struct{}
+type StreamOptions struct {
+	// Concurrent is how many deliveries, of different keys, the stream hands one member at once:
+	// at least this many are in flight before any is answered. Zero checks nothing.
+	Concurrent int
+}
 
 type delivered struct {
 	topic    string
@@ -125,7 +129,7 @@ func createGroup(t *testing.T, s bus.Stream, topic, group string) {
 }
 
 // RunStream runs the stream suite on the stream open makes.
-func RunStream(t *testing.T, open func(t *testing.T) bus.Stream, _ StreamOptions) {
+func RunStream(t *testing.T, open func(t *testing.T) bus.Stream, o StreamOptions) {
 	t.Run("Delivery", func(t *testing.T) {
 		s := open(t)
 		topic, group := name("topic"), name("group")
@@ -251,6 +255,49 @@ func RunStream(t *testing.T, open func(t *testing.T) bus.Stream, _ StreamOptions
 		eventually(t, "the large event", func() bool { return c.has(es) })
 		if got := c.body[delivered{topic, 1, 1}]; !bytes.Equal(got, body) {
 			t.Fatalf("the large body came back as %d bytes", len(got))
+		}
+	})
+	t.Run("Concurrent", func(t *testing.T) {
+		if o.Concurrent < 2 {
+			t.Skip("the stream hands a member one delivery at a time")
+		}
+		s := open(t)
+		topic, group := name("topic"), name("group")
+		createGroup(t, s, topic, group)
+		var inFlight, peak atomic.Int64
+		release := make(chan struct{})
+		c := newCollector()
+		subscribe(t, s, topic, group, func(ctx context.Context, e bus.Event) error {
+			n := inFlight.Add(1)
+			for p := peak.Load(); n > p && !peak.CompareAndSwap(p, n); p = peak.Load() {
+			}
+			select {
+			case <-release:
+			case <-time.After(patience):
+			}
+			inFlight.Add(-1)
+			return c.handle(ctx, e)
+		})
+		es := events(topic, 64, 1)
+		publish(t, s, es)
+		eventually(t, fmt.Sprintf("%d deliveries in flight at once", o.Concurrent), func() bool { return peak.Load() >= int64(o.Concurrent) })
+		close(release)
+		eventually(t, "every event", func() bool { return c.has(es) })
+	})
+	t.Run("Prompt", func(t *testing.T) {
+		s := open(t)
+		topic, group := name("topic"), name("group")
+		createGroup(t, s, topic, group)
+		c := newCollector()
+		subscribe(t, s, topic, group, c.handle)
+		// The member waits a while for events, as one does between bursts.
+		time.Sleep(1500 * time.Millisecond)
+		es := []bus.Event{{Topic: topic, Key: 5, Seq: 1, Body: []byte("now")}}
+		start := time.Now()
+		publish(t, s, es)
+		eventually(t, "the event", func() bool { return c.has(es) })
+		if took := time.Since(start); took > 5*time.Second {
+			t.Fatalf("a waiting member handled an event %v after it was published", took)
 		}
 	})
 	t.Run("ConcurrentPublishers", func(t *testing.T) {

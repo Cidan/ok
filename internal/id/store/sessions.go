@@ -49,7 +49,14 @@ func (s *Store) Expire(ctx context.Context) error {
 	if err := s.b.DeleteExpired(ctx); err != nil {
 		return err
 	}
-	return s.b.DeleteStaleDeviceLogins(ctx)
+	if err := s.b.DeleteExpiredEmailTokens(ctx, s.now()); err != nil {
+		return err
+	}
+	if err := s.b.DeleteStaleDeviceLogins(ctx); err != nil {
+		return err
+	}
+	_, err := s.FinishDeletions(ctx, 100)
+	return err
 }
 
 // BeginCeremony keeps a sign-in ceremony's state — an OIDC redirect's, a passkey challenge's —
@@ -66,6 +73,16 @@ func (s *Store) BeginCeremony(ctx context.Context, kind string, data any, lifeti
 // EndCeremony takes a ceremony's state, once: a second return of the same ceremony finds nothing.
 func (s *Store) EndCeremony(ctx context.Context, id, kind string, into any) error {
 	raw, err := s.b.TakeCeremony(ctx, id, kind)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(raw, into)
+}
+
+// PeekCeremony reads a ceremony's state, leaving it for EndCeremony: a page that shows it before
+// the form that ends it.
+func (s *Store) PeekCeremony(ctx context.Context, id, kind string, into any) error {
+	raw, err := s.b.PeekCeremony(ctx, id, kind)
 	if err != nil {
 		return err
 	}

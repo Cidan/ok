@@ -3,6 +3,9 @@ package store
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -189,9 +192,7 @@ func TestCheckpointRetentionAndGC(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := poolOf(s).Exec(ctx, `UPDATE checkpoint SET created_at = $2 WHERE id = $1`, c.ID, at); err != nil {
-			t.Fatal(err)
-		}
+		dbOf(s).setCheckpointCreated(t, c.ID, at)
 		return c
 	}
 	hour := now.Add(-10 * 24 * time.Hour).Truncate(time.Hour)
@@ -273,5 +274,60 @@ func TestReadManifests(t *testing.T) {
 	}
 	if frames[5].FileID != fEmpty || !frames[5].Last || frames[5].Size != 0 || frames[5].ChunkID != (encoding.ID{}) {
 		t.Errorf("the empty file: %+v", frames[5])
+	}
+}
+
+// Checkpoints of different workspaces in one repository, recorded at once, do not abort one
+// another: each takes one transaction.
+func TestConcurrentCheckpoints(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	repo := newRepo(t, s).ID
+	const people, each = 16, 10
+	b := newBuilder(t)
+	var trees []encoding.ID
+	for i := range people * each {
+		trees = append(trees, b.tree(fileEntry("a", b.file([]byte(fmt.Sprint(i))))))
+	}
+	base := b.commit(trees[0], "base", encoding.RootCommitID)
+	mustPublish(t, s, repo, "alice.human.example.com", b, nil)
+	leases := make([]Lease, people)
+	for i := range people {
+		who := fmt.Sprintf("p%d.human.example.com", i)
+		if _, err := s.CreateWorkspace(ctx, who, repo, "w"); err != nil {
+			t.Fatal(err)
+		}
+		a, err := s.Attach(ctx, who, repo, "w", "m", false, time.Now())
+		if err != nil || !a.Granted {
+			t.Fatal(a, err)
+		}
+		leases[i] = a.Lease
+	}
+	var attempts atomic.Int32
+	s.txAttempts = func() { attempts.Add(1) }
+	defer func() { s.txAttempts = nil }()
+	var wg sync.WaitGroup
+	errs := make(chan error, people)
+	for i := range people {
+		wg.Go(func() {
+			who := fmt.Sprintf("p%d.human.example.com", i)
+			var parent int64
+			for j := range each {
+				c, err := s.RecordCheckpoint(ctx, who, leases[i], parent, []encoding.ID{trees[i*each+j]}, base)
+				if err != nil {
+					errs <- fmt.Errorf("%s: %w", who, err)
+					return
+				}
+				parent = c.ID
+			}
+		})
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+	if n := attempts.Load(); n > people*each*11/10 {
+		t.Errorf("%d checkpoints took %d transaction attempts", people*each, n)
 	}
 }

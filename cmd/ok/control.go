@@ -35,7 +35,7 @@ func controlServe(args []string) error {
 		return err
 	}
 	defer r.Close()
-	opts := []serve.Option{serve.WithAuthn(r.Resolver), serve.WithListenAddr(cfg.Listen), serve.WithMetricsAddr(cfg.MetricsListen)}
+	opts := []serve.Option{serve.WithAuthn(r.Resolver), serve.WithListenAddr(cfg.Listen), serve.WithMetricsAddr(cfg.MetricsListen), serve.WithProfiling(cfg.Profiling)}
 	if cfg.TLS != nil {
 		tc, err := serve.LoadTLS(cfg.TLS.Cert, cfg.TLS.Key)
 		if err != nil {

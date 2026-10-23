@@ -85,9 +85,29 @@ func (s *Store) TreeSizes(ctx context.Context, repo int64, trees []encoding.ID) 
 	return out, nil
 }
 
-// keptTreeSizes reads the records already kept for trees.
+// keptTreeSizes reads the records already kept for trees: the tail's, then the segments'.
 func (s *Store) keptTreeSizes(ctx context.Context, repo int64, trees []encoding.ID) (map[encoding.ID][]byte, error) {
-	return s.b.TreeSizes(ctx, repo, trees)
+	kept, err := s.ops(ctx).TreeSizes(ctx, repo, trees)
+	if err != nil || len(kept) == len(trees) {
+		return kept, err
+	}
+	var rest [][]byte
+	for i := range trees {
+		if _, ok := kept[trees[i]]; !ok {
+			rest = append(rest, trees[i][:])
+		}
+	}
+	moved, err := s.segmentGet(ctx, repoScope(repo), segTreeSizes, rest)
+	if err != nil {
+		return nil, err
+	}
+	if kept == nil {
+		kept = map[encoding.ID][]byte{}
+	}
+	for k, v := range moved {
+		kept[encoding.ID([]byte(k))] = v
+	}
+	return kept, nil
 }
 
 // deriveTreeSizes derives the records of trees never read before, from each tree's entries alone,
@@ -166,7 +186,7 @@ func (s *Store) deriveTreeSizes(ctx context.Context, repo int64, trees []encodin
 	if len(keepIDs) > 0 {
 		// Keeping is what spares the next reader the derivation; a record not kept — its tree
 		// collected meanwhile, or the database busy — is still correct to serve.
-		if err := s.b.InsertTreeSizes(ctx, repo, keepIDs, keepBodies); err != nil {
+		if err := s.ops(ctx).InsertTreeSizes(ctx, repo, keepIDs, keepBodies); err != nil {
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
@@ -178,7 +198,7 @@ func (s *Store) deriveTreeSizes(ctx context.Context, repo int64, trees []encodin
 
 // fileSizes reads files' sizes from the content index; an absent file has none.
 func (s *Store) fileSizes(ctx context.Context, repo int64, files []encoding.ID) (map[encoding.ID]uint64, error) {
-	_, entries, err := s.contentEntries(ctx, repo, encoding.KindFile, files)
+	_, entries, err := s.contentEntries(ctx, repoScope(repo), encoding.KindFile, files)
 	if err != nil {
 		return nil, err
 	}

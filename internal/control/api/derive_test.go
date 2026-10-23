@@ -47,8 +47,16 @@ func TestDerive(t *testing.T) {
 	}{
 		"abandoned": {&controlpb.CLStatus{Cl: cl(controlpb.CL_STATUS_ABANDONED)},
 			controlpb.Stage_STAGE_ABANDONED, controlpb.WaitingOn_WAITING_ON_NOBODY, nil, "Abandoned"},
-		"pre not planned yet": {&controlpb.CLStatus{Cl: cl(controlpb.CL_STATUS_DRAFT), Pre: pre(controlpb.Checks_VERDICT_NONE, 0, 0)},
+		"pre not planned yet": {&controlpb.CLStatus{Cl: cl(controlpb.CL_STATUS_OPEN), Pre: pre(controlpb.Checks_VERDICT_NONE, 0, 0)},
 			controlpb.Stage_STAGE_PRE_RUNNING, controlpb.WaitingOn_WAITING_ON_AUTOMATION, nil, "Pre is being planned"},
+		"a draft, which runs no pre": {&controlpb.CLStatus{Cl: cl(controlpb.CL_STATUS_DRAFT), Pre: pre(controlpb.Checks_VERDICT_NONE, 0, 0)},
+			controlpb.Stage_STAGE_DRAFT, controlpb.WaitingOn_WAITING_ON_AUTHOR, []string{"ann"}, "pre runs once it is sent for review (jj cl ready), or now (jj cl pre)"},
+		"under its stack's top, in review": {&controlpb.CLStatus{Cl: cl(controlpb.CL_STATUS_OPEN), Pre: pre(controlpb.Checks_VERDICT_NONE, 0, 0), PreAt: 9,
+			Review: &controlpb.Review{Reviewers: []string{"bea"}}},
+			controlpb.Stage_STAGE_IN_REVIEW, controlpb.WaitingOn_WAITING_ON_REVIEWERS, []string{"bea"}, "In review; pre runs at CL 9, the top of its stack"},
+		"under its stack's top, approved, its own old pre failed": {&controlpb.CLStatus{Cl: cl(controlpb.CL_STATUS_OPEN), Pre: pre(controlpb.Checks_VERDICT_FAILED, 1, 7), PreAt: 9,
+			Review: approved},
+			controlpb.Stage_STAGE_SUBMITTABLE, controlpb.WaitingOn_WAITING_ON_AUTHOR, []string{"ann"}, "submit the stack from there (jj cl submit --stack 9)"},
 		"pre running": {&controlpb.CLStatus{Cl: cl(controlpb.CL_STATUS_OPEN), Pre: pre(controlpb.Checks_VERDICT_PENDING, 3, 7)},
 			controlpb.Stage_STAGE_PRE_RUNNING, controlpb.WaitingOn_WAITING_ON_AUTOMATION, nil, "Pre is running: 3/7 passed"},
 		"pre unreadable": {&controlpb.CLStatus{Cl: cl(controlpb.CL_STATUS_OPEN), Pre: pre(controlpb.Checks_VERDICT_UNSPECIFIED, 0, 0), Unavailable: []string{unavailableAutomation}},
@@ -112,7 +120,7 @@ func TestDerive(t *testing.T) {
 // Only a person acts here, and never by a request from another site.
 func TestCaller(t *testing.T) {
 	a := &API{base: "https://ok.example.com"}
-	person := authn.Caller{Principal: "ann.human.example.com", Human: true}
+	person := authn.Caller{Principal: "ann.human.example.com", ID: "prn_ann", Human: true}
 	for name, tc := range map[string]struct {
 		caller *authn.Caller
 		md     []string
@@ -133,7 +141,7 @@ func TestCaller(t *testing.T) {
 				ctx = authn.NewContext(ctx, *tc.caller)
 			}
 			me, err := a.caller(ctx)
-			if tc.ok != (err == nil) || (!tc.ok && status.Code(err) != codes.PermissionDenied) || (tc.ok && me != "ann.human.example.com") {
+			if tc.ok != (err == nil) || (!tc.ok && status.Code(err) != codes.PermissionDenied) || (tc.ok && me != "prn_ann") {
 				t.Errorf("caller = %q, %v", me, err)
 			}
 		})

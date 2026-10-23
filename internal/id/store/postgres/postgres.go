@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"strings"
 	"time"
 
@@ -16,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/Cidan/ok/internal/data"
 	"github.com/Cidan/ok/internal/data/pgdata"
 	"github.com/Cidan/ok/internal/directory"
 	"github.com/Cidan/ok/internal/directory/scim"
@@ -50,7 +50,13 @@ func Open(ctx context.Context, pool *pgxpool.Pool) (*Backend, error) {
 // Txn runs fn in a transaction, again if PostgreSQL aborts it to break a deadlock or a
 // serialization conflict.
 func (b *Backend) Txn(ctx context.Context, fn func(store.Ops) error) error {
-	return pgdata.Txn(ctx, b.pool, func(tx pgx.Tx) error { return fn(queries{tx}) })
+	return pgdata.Txn(ctx, b.pool, func(tx pgx.Tx) error {
+		// What ctx's lease guards is written only while its holder holds it (data.Fence).
+		if err := pgdata.CheckFence(ctx, tx); err != nil {
+			return err
+		}
+		return fn(queries{tx})
+	})
 }
 
 func (b *Backend) Lock(ctx context.Context, bucket, id string, wait time.Duration, fn lock.LockFn) error {
@@ -59,7 +65,10 @@ func (b *Backend) Lock(ctx context.Context, bucket, id string, wait time.Duratio
 
 func (b *Backend) Ping(ctx context.Context) error { return b.pool.Ping(ctx) }
 
-func (b *Backend) SCIM() scim.Store { return scimStore{b.pool} }
+func (b *Backend) SCIM() scim.Store { return scimStore{pool: b.pool} }
+
+// SCIMOf is an organization's SCIM, by its ID.
+func (b *Backend) SCIMOf(org string) scim.Store { return scimStore{pool: b.pool, scope: org} }
 
 type querier interface {
 	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
@@ -209,24 +218,15 @@ func (x queries) SetStatus(ctx context.Context, id string, status directory.Stat
 	return err
 }
 
-// namesLock is the advisory lock LockNames takes.
-var namesLock = func() int64 {
-	h := fnv.New64a()
-	h.Write([]byte("ok-identity-names"))
-	return int64(h.Sum64())
-}()
-
-func (x queries) LockNames(ctx context.Context) error {
-	_, err := x.q.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, namesLock)
-	return err
-}
+func (x queries) LockNames(ctx context.Context) error { return lock.InTx(ctx, x.q, "names", "all") }
 
 func (x queries) NameHeld(ctx context.Context, name string) (bool, error) {
 	var held bool
 	err := x.q.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM principals WHERE name = $1)
 		OR EXISTS (SELECT 1 FROM retired_names WHERE name = $1)
 		OR EXISTS (SELECT 1 FROM synced_groups WHERE name = $1)
-		OR EXISTS (SELECT 1 FROM tree_sets WHERE name = $1)`, name).Scan(&held)
+		OR EXISTS (SELECT 1 FROM tree_sets WHERE name = $1)
+		OR EXISTS (SELECT 1 FROM teams WHERE name = $1)`, name).Scan(&held)
 	return held, err
 }
 
@@ -248,14 +248,15 @@ func (x queries) RetiredNames(ctx context.Context) ([]store.RetiredName, error) 
 }
 
 func (x queries) AppendAudit(ctx context.Context, actor, action string, detail map[string]any) error {
-	_, err := x.q.Exec(ctx, `INSERT INTO audit (actor, action, detail) VALUES ($1, $2, $3)`, actor, action, detail)
+	_, err := x.q.Exec(ctx, `INSERT INTO audit (id, actor, action, detail) VALUES ($4, $1, $2, $3)`, actor, action, detail, data.NewID())
 	return err
 }
 
 // ─── Robots' bindings ───
 
 func (x queries) InsertBinding(ctx context.Context, principalID string, b store.Binding) error {
-	_, err := x.q.Exec(ctx, `INSERT INTO robot_bindings (issuer, subject, principal_id) VALUES ($1, $2, $3)`, b.Issuer, b.Subject, principalID)
+	_, err := x.q.Exec(ctx, `INSERT INTO robot_bindings (organization_id, issuer, subject, principal_id) VALUES ($1, $2, $3, $4)`,
+		b.Organization, b.Issuer, b.Subject, principalID)
 	if unique(err) {
 		return store.ErrBindingTaken
 	}
@@ -264,7 +265,8 @@ func (x queries) InsertBinding(ctx context.Context, principalID string, b store.
 
 func (x queries) DeleteBinding(ctx context.Context, robot string, b store.Binding) (bool, error) {
 	tag, err := x.q.Exec(ctx, `DELETE FROM robot_bindings rb USING principals p
-		WHERE rb.principal_id = p.id AND p.name = $1 AND rb.issuer = $2 AND rb.subject = $3`, robot, b.Issuer, b.Subject)
+		WHERE rb.principal_id = p.id AND p.name = $1 AND rb.organization_id = $2 AND rb.issuer = $3 AND rb.subject = $4`,
+		robot, b.Organization, b.Issuer, b.Subject)
 	return tag.RowsAffected() > 0, err
 }
 
@@ -275,11 +277,11 @@ func (x queries) DeleteBindingsOf(ctx context.Context, principalID string) error
 
 func (x queries) BoundPrincipal(ctx context.Context, b store.Binding) (store.Principal, error) {
 	return scanPrincipal(x.q.QueryRow(ctx, `SELECT `+prefixed("p")+` FROM robot_bindings rb JOIN principals p ON p.id = rb.principal_id
-		WHERE rb.issuer = $1 AND rb.subject = $2`, b.Issuer, b.Subject))
+		WHERE rb.organization_id = $1 AND rb.issuer = $2 AND rb.subject = $3`, b.Organization, b.Issuer, b.Subject))
 }
 
 func (x queries) Bindings(ctx context.Context) (map[string][]store.Binding, error) {
-	rows, err := x.q.Query(ctx, `SELECT principal_id, issuer, subject FROM robot_bindings ORDER BY issuer, subject`)
+	rows, err := x.q.Query(ctx, `SELECT principal_id, organization_id, issuer, subject FROM robot_bindings ORDER BY organization_id, issuer, subject`)
 	if err != nil {
 		return nil, err
 	}
@@ -288,7 +290,7 @@ func (x queries) Bindings(ctx context.Context) (map[string][]store.Binding, erro
 	for rows.Next() {
 		var id string
 		var b store.Binding
-		if err := rows.Scan(&id, &b.Issuer, &b.Subject); err != nil {
+		if err := rows.Scan(&id, &b.Organization, &b.Issuer, &b.Subject); err != nil {
 			return nil, err
 		}
 		out[id] = append(out[id], b)
@@ -483,12 +485,58 @@ func (x queries) DeleteExpired(ctx context.Context) error {
 	for _, q := range []string{
 		`DELETE FROM sessions WHERE expires_at < now() OR idle_until < now()`,
 		`DELETE FROM ceremonies WHERE expires_at < now()`,
+		`DELETE FROM approvals WHERE expires_at < now() - interval '1 day'`,
 	} {
 		if _, err := x.q.Exec(ctx, q); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func (x queries) SecretsRoot(ctx context.Context, org string) (string, error) {
+	var root string
+	err := x.q.QueryRow(ctx, `SELECT root FROM organization_secrets_roots WHERE organization_id = $1`, org).Scan(&root)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	return root, err
+}
+
+func (x queries) SetSecretsRoot(ctx context.Context, org, root, by string) error {
+	if root == "" {
+		_, err := x.q.Exec(ctx, `DELETE FROM organization_secrets_roots WHERE organization_id = $1`, org)
+		return err
+	}
+	_, err := x.q.Exec(ctx, `INSERT INTO organization_secrets_roots (organization_id, root, set_by) VALUES ($1, $2, $3)
+		ON CONFLICT (organization_id) DO UPDATE SET root = $2, set_by = $3, set_at = now()`, org, root, by)
+	return err
+}
+
+func (x queries) InsertApproval(ctx context.Context, a store.Approval) error {
+	_, err := x.q.Exec(ctx, `INSERT INTO approvals (id, principal_id, scope, description, created_at, expires_at) VALUES ($1, $2, $3, $4, $5, $6)`,
+		a.ID, a.PrincipalID, a.Scope, a.Description, a.Created, a.Expires)
+	return err
+}
+
+func (x queries) Approval(ctx context.Context, id string) (store.Approval, error) {
+	var a store.Approval
+	err := x.q.QueryRow(ctx, `SELECT id, principal_id, scope, description, created_at, expires_at, decision, decided_at FROM approvals WHERE id = $1`,
+		id).Scan(&a.ID, &a.PrincipalID, &a.Scope, &a.Description, &a.Created, &a.Expires, &a.Decision, &a.Decided)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return a, store.ErrNotFound
+	}
+	return a, err
+}
+
+func (x queries) DecideApproval(ctx context.Context, id, principalID string, approved bool) (bool, error) {
+	decision := store.ApprovalDeclined
+	if approved {
+		decision = store.ApprovalApproved
+	}
+	tag, err := x.q.Exec(ctx, `UPDATE approvals SET decision = $3, decided_at = now()
+		WHERE id = $1 AND principal_id = $2 AND decision = '' AND expires_at > now()`, id, principalID, decision)
+	return tag.RowsAffected() == 1, err
 }
 
 func (x queries) InsertCeremony(ctx context.Context, id, kind string, data []byte, expires time.Time) error {
@@ -499,6 +547,15 @@ func (x queries) InsertCeremony(ctx context.Context, id, kind string, data []byt
 func (x queries) TakeCeremony(ctx context.Context, id, kind string) ([]byte, error) {
 	var raw []byte
 	err := x.q.QueryRow(ctx, `DELETE FROM ceremonies WHERE id = $1 AND kind = $2 AND expires_at > now() RETURNING data`, id, kind).Scan(&raw)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, store.ErrNotFound
+	}
+	return raw, err
+}
+
+func (x queries) PeekCeremony(ctx context.Context, id, kind string) ([]byte, error) {
+	var raw []byte
+	err := x.q.QueryRow(ctx, `SELECT data FROM ceremonies WHERE id = $1 AND kind = $2 AND expires_at > now()`, id, kind).Scan(&raw)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, store.ErrNotFound
 	}

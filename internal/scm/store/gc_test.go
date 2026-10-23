@@ -10,39 +10,24 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Cidan/ok/internal/lock"
 	"github.com/Cidan/ok/internal/scm/contentindex"
 	"github.com/Cidan/ok/internal/scm/encoding"
 	"github.com/Cidan/ok/internal/scm/pack"
+	"github.com/Cidan/ok/internal/scm/store/backend"
 )
 
 // age makes a repository's unpinned objects, and its operations and views, days old, as
 // if nothing had touched them since.
 func age(t *testing.T, s *Store, repo int64, days int) {
 	t.Helper()
-	ctx := context.Background()
-	for _, tbl := range []string{"commit", "object"} {
-		if _, err := poolOf(s).Exec(ctx, `UPDATE `+tbl+` SET touched_at = current_date - $2::int WHERE repository_id = $1 AND NOT pinned`, repo, days); err != nil {
-			t.Fatal(err)
-		}
-	}
-	for _, tbl := range []string{"operation", "view"} {
-		if _, err := poolOf(s).Exec(ctx, `UPDATE `+tbl+` x SET touched_at = now() - make_interval(days => $2::int)
-			FROM op_log l WHERE l.id = x.op_log_id AND l.repository_id = $1`, repo, days); err != nil {
-			t.Fatal(err)
-		}
-	}
+	dbOf(s).ageTail(t, repo, days)
 	ageIndex(t, s, repo, days)
 }
 
 // ageIndex makes a repository's unpinned files and chunks days old in its content index.
 func ageIndex(t *testing.T, s *Store, repo int64, days int) {
 	t.Helper()
-	var today time.Time
-	if err := poolOf(s).QueryRow(context.Background(), `SELECT current_date`).Scan(&today); err != nil {
-		t.Fatal(err)
-	}
-	old := contentindex.DayOf(today) - contentindex.Day(days)
+	old := contentindex.DayOf(dbOf(s).today(t)) - contentindex.Day(days)
 	rewriteIndex(t, s, repo, func(_ encoding.ID, e *contentindex.Entry) {
 		if !e.Pinned {
 			e.Day = old
@@ -55,7 +40,15 @@ func ageIndex(t *testing.T, s *Store, repo int64, days int) {
 func rewriteIndex(t *testing.T, s *Store, repo int64, f func(encoding.ID, *contentindex.Entry)) {
 	t.Helper()
 	ctx := context.Background()
-	x := indexOf(t, s, repo)
+	var x *contentindex.Index
+	var place backend.LogPlace
+	if err := s.snapshot(ctx, func(tx backend.Ops) error {
+		var err error
+		x, place, _, _, err = s.loadContentIndex(ctx, tx, repoScope(repo))
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
 	var entries []contentindex.Keyed
 	for _, k := range x.Sorted() {
 		if !k.Entry.Body {
@@ -64,29 +57,63 @@ func rewriteIndex(t *testing.T, s *Store, repo int64, f func(encoding.ID, *conte
 		f(k.ID, &k.Entry)
 		entries = append(entries, k)
 	}
-	if err := s.inTx(ctx, func(tx *txn) error {
-		gen, err := tx.LockContentIndex(ctx, repo)
-		if err != nil {
+	gen, _, ok, err := s.ops(ctx).ContentIndexGeneration(ctx, repoScope(repo))
+	if err != nil || !ok {
+		t.Fatalf("the content index's generation: %v, %v", ok, err)
+	}
+	// The next generation's blocks a bounded transaction at a time, as a fold writes them — a
+	// repository's whole index is more than one Spanner transaction holds — none read until the
+	// last makes it the generation.
+	if err := s.writeBlocksBatched(ctx, repoScope(repo), gen+1, entries); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.inTx(ctx, func(ctx context.Context, tx *txn) error {
+		if current, err := tx.LockContentIndex(ctx, repoScope(repo)); err != nil || current != gen {
+			return fmt.Errorf("the content index's generation is %d (%v), not %d", current, err, gen)
+		}
+		if err := tx.DeleteIndexBlocks(ctx, repoScope(repo), gen); err != nil {
 			return err
 		}
-		if err := tx.DeleteIndexBlocks(ctx, repo, gen); err != nil {
-			return err
-		}
-		logs, err := tx.ContentLogIDs(ctx, repo)
-		if err != nil {
-			return err
-		}
-		if err := tx.DeleteContentLogs(ctx, repo, logs); err != nil {
-			return err
-		}
-		if err := tx.SetContentIndexGeneration(ctx, repo, gen+1); err != nil {
-			return err
-		}
-		return writeBlocks(ctx, tx, repo, gen+1, entries)
+
+		return tx.SetContentIndexGeneration(ctx, repoScope(repo), gen+1, place)
 	}); err != nil {
 		t.Fatal(err)
 	}
-	s.indexChanged(repo)
+	if err := s.deleteTail(ctx, func(ctx context.Context, tx *txn, limit int) (int64, error) {
+		return tx.DeleteFoldedContentLogs(ctx, repoScope(repo), place, limit)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	s.indexChanged(repoScope(repo))
+}
+
+// netOf is a repository's network.
+func netOf(t *testing.T, s *Store, repo int64) backend.Network {
+	t.Helper()
+	net, err := s.network(context.Background(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return net
+}
+
+// locationsOf reads a repository's network's chunk index afresh.
+func locationsOf(t *testing.T, s *Store, repo int64) *contentindex.Index {
+	t.Helper()
+	sc := backend.NetworkScope(netOf(t, s, repo))
+	var x *contentindex.Index
+	if err := s.snapshot(context.Background(), func(tx backend.Ops) error {
+		var found bool
+		var err error
+		x, _, _, found, err = s.loadContentIndex(context.Background(), tx, sc)
+		if err == nil && !found {
+			err = fmt.Errorf("%s has no chunk index", sc.Name())
+		}
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return x
 }
 
 // indexOf reads a repository's content index afresh.
@@ -99,11 +126,16 @@ func indexOf(t *testing.T, s *Store, repo int64) *contentindex.Index {
 	return x
 }
 
-// dropFromIndex drops a file or chunk from a repository's content index, as a sweep does.
+// dropFromIndex drops a file or chunk from a repository's content index, as a sweep does — a
+// chunk's location from its network's chunk index too.
 func dropFromIndex(t *testing.T, s *Store, repo int64, kind encoding.Kind, id encoding.ID) {
 	t.Helper()
-	if err := s.inTx(context.Background(), func(tx *txn) error {
-		s.logIndex(tx, repo, contentindex.Update{Op: contentindex.Drop, ID: id, Entry: contentindex.Entry{Kind: kind}})
+	net := backend.NetworkScope(netOf(t, s, repo))
+	if err := s.inTx(context.Background(), func(ctx context.Context, tx *txn) error {
+		s.logIndex(tx, repoScope(repo), contentindex.Update{Op: contentindex.Drop, ID: id, Entry: contentindex.Entry{Kind: kind}})
+		if kind == encoding.KindChunk {
+			s.logIndex(tx, net, contentindex.Update{Op: contentindex.Drop, ID: id, Entry: contentindex.Entry{Kind: kind}})
+		}
 		return nil
 	}); err != nil {
 		t.Fatal(err)
@@ -119,25 +151,33 @@ func has(t *testing.T, s *Store, repo int64, tbl string, id encoding.ID) bool {
 		if tbl == "file" {
 			kind = encoding.KindFile
 		}
-		_, entries, err := s.contentEntries(context.Background(), repo, kind, []encoding.ID{id})
+		_, entries, err := s.contentEntries(context.Background(), repoScope(repo), kind, []encoding.ID{id})
 		if err != nil {
 			t.Fatal(err)
 		}
 		_, ok := entries[id]
 		return ok
 	}
-	var ok bool
-	if err := poolOf(s).QueryRow(context.Background(), `SELECT EXISTS (SELECT 1 FROM `+tbl+` WHERE repository_id = $1 AND id = $2)`, repo, id[:]).Scan(&ok); err != nil {
+	if dbOf(s).count(t, tbl, `repository_id = @repo AND id = @id`, map[string]any{"repo": repo, "id": id[:]}) > 0 {
+		return true
+	}
+	// Pinned, it may have moved into a segment.
+	kind := segObjects
+	if tbl == "commit" {
+		kind = segCommitGraph
+	}
+	got, err := s.segmentGet(context.Background(), repoScope(repo), kind, [][]byte{id[:]})
+	if err != nil {
 		t.Fatal(err)
 	}
-	return ok
+	return len(got) > 0
 }
 
 // dropChunk deletes a chunk as a sweep does — its pack's live bytes too — whatever its
 // freshness, to put a publish where a sweep that raced it would.
 func dropChunk(t *testing.T, s *Store, repo int64, id encoding.ID) {
 	t.Helper()
-	if n, _, err := s.sweepBatch(context.Background(), repo, tChunk, []encoding.ID{id}, time.Now().AddDate(1, 0, 0), false); err != nil || n != 1 {
+	if n, _, _, err := s.sweepBatch(context.Background(), repo, tChunk, []encoding.ID{id}, time.Now().AddDate(1, 0, 0), false); err != nil || n != 1 {
 		t.Fatalf("dropping chunk %s: %d, %v", id, n, err)
 	}
 }
@@ -179,7 +219,7 @@ func readAll(t *testing.T, s *Store, repo int64, f encoding.ID) []byte {
 func liveBytes(t *testing.T, s *Store, repo int64) int64 {
 	t.Helper()
 	var n int64
-	for _, k := range indexOf(t, s, repo).Sorted() {
+	for _, k := range locationsOf(t, s, repo).Sorted() {
 		if k.Entry.Kind == encoding.KindChunk {
 			n += int64(k.Entry.Loc.Stored)
 		}
@@ -228,11 +268,7 @@ func TestGCSweepsWhatNothingReaches(t *testing.T) {
 	}
 	keptSizes := func(tree encoding.ID) bool {
 		t.Helper()
-		var n int
-		if err := poolOf(e.s).QueryRow(ctx, `SELECT count(*) FROM tree_sizes WHERE repository_id = $1 AND tree_id = $2`, e.repo, tree[:]).Scan(&n); err != nil {
-			t.Fatal(err)
-		}
-		return n == 1
+		return dbOf(e.s).count(t, "tree_sizes", `repository_id = @repo AND tree_id = @tree`, map[string]any{"repo": e.repo, "tree": tree[:]}) == 1
 	}
 
 	before := liveBytes(t, e.s, e.repo)
@@ -449,9 +485,8 @@ func TestExchangeNeverFreshensOverAMissingObject(t *testing.T) {
 	if len(objs) != 1 || objs[0] != (ObjectRef{Kind: encoding.KindTree, ID: tree}) || len(chunks) != 1 || chunks[0] != lost {
 		t.Fatalf("missing %v, chunks %v", objs, chunks)
 	}
-	var fresh bool
-	if err := poolOf(e.s).QueryRow(ctx, `SELECT touched_at >= current_date FROM object WHERE repository_id = $1 AND id = $2`, e.repo, tree[:]).Scan(&fresh); err != nil || fresh {
-		t.Fatalf("the tree over the missing chunk was freshened (%v)", err)
+	if !dbOf(e.s).touched(t, "object", e.repo, tree).Before(dbOf(e.s).today(t)) {
+		t.Fatal("the tree over the missing chunk was freshened")
 	}
 	mustPublish(t, e.s, e.repo, alice, g, nil)
 	if !bytes.Equal(readAll(t, e.s, e.repo, file), contents) {
@@ -594,16 +629,16 @@ func TestSpliceReusingGarbageKeepsIt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var fresh, pinned bool
-	if err := poolOf(e.s).QueryRow(ctx, `SELECT touched_at >= current_date, pinned FROM object WHERE repository_id = $1 AND id = $2`, e.repo, spliced[:]).Scan(&fresh, &pinned); err != nil || !fresh {
-		t.Fatalf("the candidate's reused tree was not refreshed (%v)", err)
+	if dbOf(e.s).touched(t, "object", e.repo, spliced).Before(dbOf(e.s).today(t)) {
+		t.Fatal("the candidate's reused tree was not refreshed")
 	}
+	var pinned bool
 	if r, err := e.s.GC(ctx, e.repo, time.Now(), GCOptions{}); err != nil || r.ObjectsSwept != 0 {
 		t.Fatalf("GC beside a candidate: %s, %v", r, err)
 	}
 	landedAs := e.mustLand(LandItem{Number: ny, Patchset: 1, Candidate: &cand.Commit})
-	if err := poolOf(e.s).QueryRow(ctx, `SELECT pinned FROM object WHERE repository_id = $1 AND id = $2`, e.repo, spliced[:]).Scan(&pinned); err != nil || !pinned {
-		t.Fatalf("the landing did not pin its reused tree (%v)", err)
+	if dbOf(e.s).scan(t, `SELECT pinned FROM object WHERE repository_id = @repo AND id = @id`, map[string]any{"repo": e.repo, "id": spliced[:]}, &pinned); !pinned {
+		t.Fatal("the landing did not pin its reused tree")
 	}
 	if landedAs[0].Commit != cand.Commit {
 		t.Fatalf("landed as %s, the candidate was %s", landedAs[0].Commit, cand.Commit)
@@ -613,16 +648,12 @@ func TestSpliceReusingGarbageKeepsIt(t *testing.T) {
 
 func packsOf(t *testing.T, s *Store, repo int64) (live, retired int) {
 	t.Helper()
-	if err := poolOf(s).QueryRow(context.Background(), `SELECT count(*) FILTER (WHERE retired_at IS NULL), count(*) FILTER (WHERE retired_at IS NOT NULL)
-		FROM pack WHERE repository_id = $1`, repo).Scan(&live, &retired); err != nil {
-		t.Fatal(err)
-	}
-	return live, retired
+	return dbOf(s).packs(t, int64(netOf(t, s, repo)))
 }
 
 func s3Bytes(t *testing.T, s *Store, repo int64) (int64, int) {
 	t.Helper()
-	objs, err := s.blobs.List(context.Background(), fmt.Sprintf("repos/%d/packs/", repo))
+	objs, err := s.blobs.List(context.Background(), packPrefix(netOf(t, s, repo)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -672,9 +703,7 @@ func TestCompactionReclaimsBytes(t *testing.T) {
 		v.files[f] = c
 	}
 	mustPublish(t, e.s, e.repo, alice, v, &OpHeadsUpdate{Old: []encoding.ID{encoding.RootOperationID}, New: op})
-	if _, err := poolOf(e.s).Exec(ctx, `UPDATE repository SET head = $2 WHERE id = $1`, e.repo, onMain[:]); err != nil {
-		t.Fatal(err)
-	}
+	dbOf(e.s).setHead(t, e.repo, onMain)
 	// And one large unreachable file, whose pack the sweep leaves nearly empty.
 	g := newBuilder(t)
 	big := bytesOf(3_000_000, 99)
@@ -700,7 +729,7 @@ func TestCompactionReclaimsBytes(t *testing.T) {
 		}
 	}
 	// The new pack holds the files' chunks in the order of their paths on main.
-	x := indexOf(t, e.s, e.repo)
+	x, locs := indexOf(t, e.s, e.repo), locationsOf(t, e.s, e.repo)
 	type placed struct {
 		path string
 		off  int64
@@ -710,7 +739,7 @@ func TestCompactionReclaimsBytes(t *testing.T) {
 		fe, _ := x.Get(f)
 		first := int64(-1)
 		for _, c := range fe.Chunks {
-			if ce, ok := x.Get(c.ID); ok && (first < 0 || ce.Loc.Offset < first) {
+			if ce, ok := locs.Get(c.ID); ok && (first < 0 || ce.Loc.Offset < first) {
 				first = ce.Loc.Offset
 			}
 		}
@@ -726,12 +755,26 @@ func TestCompactionReclaimsBytes(t *testing.T) {
 	}
 	clean(t, e.s, e.repo)
 
-	// Within the grace, retired packs stay; after it, they go.
+	// Within the grace, retired packs stay; after it, they go — the repository's alone, then
+	// every repository's.
 	if n, err := e.s.DeleteRetiredPacks(ctx, time.Now()); err != nil || n != 0 {
 		t.Fatalf("deleted %d retired packs within the grace (%v)", n, err)
 	}
-	if n, err := e.s.DeleteRetiredPacks(ctx, time.Now().Add(2*RetiredPackGrace)); err != nil || n != livePacks {
+	if rs, err := e.s.Retiring(ctx, time.Now()); err != nil || len(rs) != 0 {
+		t.Fatalf("repositories retiring packs within the grace: %v, %v", rs, err)
+	}
+	later := time.Now().Add(2 * RetiredPackGrace)
+	if rs, err := e.s.Retiring(ctx, later); err != nil || len(rs) != 1 || rs[0] != e.repo {
+		t.Fatalf("repositories retiring packs past the grace: %v, %v", rs, err)
+	}
+	if n, _, err := e.s.DeleteRetiredOf(ctx, e.repo+1, later); err != nil || n != 0 {
+		t.Fatalf("another repository's retired packs: %d, %v", n, err)
+	}
+	if n, _, err := e.s.DeleteRetiredOf(ctx, e.repo, later); err != nil || n != livePacks {
 		t.Fatalf("deleted %d retired packs, want %d (%v)", n, livePacks, err)
+	}
+	if n, err := e.s.DeleteRetiredPacks(ctx, later); err != nil || n != 0 {
+		t.Fatalf("deleted %d more retired packs (%v)", n, err)
 	}
 	s3After, objects := s3Bytes(t, e.s, e.repo)
 	if objects != 1 || s3After >= s3Before-int64(len(big))/2 {
@@ -793,7 +836,7 @@ func TestOrphanPacks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := e.s.blobs.Put(ctx, packKey(e.repo, id), &buf, size); err != nil {
+	if err := e.s.blobs.Put(ctx, packKey(netOf(t, e.s, e.repo), id), &buf, size); err != nil {
 		t.Fatal(err)
 	}
 	b := newBuilder(t)
@@ -819,7 +862,9 @@ func TestOrphanPacks(t *testing.T) {
 	clean(t, e.s, e.repo)
 }
 
-func TestGCScheduleAndLeader(t *testing.T) {
+// A repository is due its daily pass once the scheduled hour passes since its last, a failure
+// tried again an hour later; GCDue answers for one repository as DueForGC does for every one.
+func TestGCSchedule(t *testing.T) {
 	ctx := context.Background()
 	e := newCLEnv(t)
 	other := newRepo(t, e.s).ID
@@ -833,6 +878,11 @@ func TestGCScheduleAndLeader(t *testing.T) {
 		out := map[int64]bool{}
 		for _, id := range ids {
 			out[id] = true
+		}
+		for _, repo := range []int64{e.repo, other} {
+			if one, err := e.s.GCDue(ctx, repo, now, 9); err != nil || one != out[repo] {
+				t.Fatalf("GCDue(%d) at %s = %v, %v; DueForGC says %v", repo, now, one, err, out[repo])
+			}
 		}
 		return out
 	}
@@ -865,19 +915,8 @@ func TestGCScheduleAndLeader(t *testing.T) {
 	if d := due(at(28, 10)); !d[e.repo] {
 		t.Fatal("a dry run counted as a pass")
 	}
-
-	err := e.s.LeadGC(ctx, func(ctx context.Context) error {
-		if err := e.s.LeadGC(ctx, func(context.Context) error { t.Error("a second leader"); return nil }); !errors.Is(err, lock.ErrNotAcquired) {
-			t.Errorf("a second leader: %v, want lock.ErrNotAcquired", err)
-		}
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("leader: %v", err)
-	}
-	led := false
-	if err := e.s.LeadGC(ctx, func(context.Context) error { led = true; return nil }); err != nil || !led {
-		t.Fatalf("leader after the first gave up: %v", err)
+	if one, err := e.s.GCDue(ctx, 1<<40, at(28, 10), 9); err != nil || one {
+		t.Errorf("an unknown repository due a pass: %v, %v", one, err)
 	}
 }
 

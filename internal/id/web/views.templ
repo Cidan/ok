@@ -59,6 +59,26 @@ templ LoginPage(v LoginView) {
 				</button>
 			}
 		</div>
+		if v.Password {
+			<form method="post" action="/id/login/password" class="mt-8 space-y-3 border-t border-white/10 pt-6">
+				<input type="hidden" name="next" value={ v.Next }/>
+				<label class="block text-sm text-slate-300">
+					Email
+					<input name="email" type="email" autocomplete="username" required class="mt-1 block w-full rounded-lg bg-slate-800 px-3 py-2 text-slate-100 ring-1 ring-white/10 focus:outline-none focus:ring-2 focus:ring-sky-400"/>
+				</label>
+				<label class="block text-sm text-slate-300">
+					Password
+					<input name="password" type="password" autocomplete="current-password" required class="mt-1 block w-full rounded-lg bg-slate-800 px-3 py-2 text-slate-100 ring-1 ring-white/10 focus:outline-none focus:ring-2 focus:ring-sky-400"/>
+				</label>
+				<button type="submit" class="w-full rounded-xl bg-slate-700 px-5 py-3 text-base font-semibold text-white transition hover:bg-slate-600">Sign in</button>
+				<div class="flex justify-between text-sm">
+					<a href="/id/reset" class="text-sky-400 hover:text-sky-300">Forgot your password?</a>
+					<a href="/id/signup" class="text-sky-400 hover:text-sky-300">Make an account</a>
+				</div>
+			</form>
+		} else if v.SignUp {
+			<p class="mt-6 text-center text-sm"><a href="/id/signup" class="text-sky-400 hover:text-sky-300">Make an account</a></p>
+		}
 		if v.LDAP {
 			<form method="post" action="/id/login/ldap" class="mt-8 space-y-3 border-t border-white/10 pt-6">
 				<input type="hidden" name="next" value={ v.Next }/>
@@ -74,6 +94,97 @@ templ LoginPage(v LoginView) {
 			</form>
 		}
 		@statusLine()
+	}
+}
+
+// SignUpPage makes an account: an email to verify, a handle, and a password; or a provider's
+// sign-in.
+templ SignUpPage(v SignUpView) {
+	@page("Make an account", v.Installation) {
+		@errorText(v.Error)
+		<div class="mt-8 space-y-3">
+			for _, p := range v.Providers {
+				<a href={ templ.SafeURL("/id/login/oidc/" + p.ID) } class="flex w-full items-center justify-center rounded-xl bg-white px-5 py-3 text-base font-semibold text-slate-900 shadow transition hover:bg-slate-200">
+					Continue with { p.Name }
+				</a>
+			}
+		</div>
+		if v.EmailOn {
+			<form method="post" action="/id/signup" class="mt-8 space-y-3 border-t border-white/10 pt-6">
+				<label class="block text-sm text-slate-300">
+					Email
+					<input name="email" type="email" value={ v.Email } autocomplete="email" required class="mt-1 block w-full rounded-lg bg-slate-800 px-3 py-2 text-slate-100 ring-1 ring-white/10 focus:outline-none focus:ring-2 focus:ring-sky-400"/>
+				</label>
+				<label class="block text-sm text-slate-300">
+					Handle
+					<input name="handle" value={ v.Handle } autocomplete="username" pattern="[a-z0-9](?:[a-z0-9]|-[a-z0-9]){0,38}" required class="mt-1 block w-full rounded-lg bg-slate-800 px-3 py-2 text-slate-100 ring-1 ring-white/10 focus:outline-none focus:ring-2 focus:ring-sky-400"/>
+					<span class="mt-1 block text-xs text-slate-500">1 to 39 lowercase letters, digits, and single hyphens between them.</span>
+				</label>
+				<label class="block text-sm text-slate-300">
+					Password
+					<input name="password" type="password" autocomplete="new-password" minlength="12" required class="mt-1 block w-full rounded-lg bg-slate-800 px-3 py-2 text-slate-100 ring-1 ring-white/10 focus:outline-none focus:ring-2 focus:ring-sky-400"/>
+					<span class="mt-1 block text-xs text-slate-500">At least 12 characters. A passphrase is best.</span>
+				</label>
+				<button type="submit" class="w-full rounded-xl bg-sky-500 px-5 py-3 text-base font-semibold text-white transition hover:bg-sky-400">Make the account</button>
+			</form>
+		}
+		<p class="mt-6 text-center text-sm text-slate-400">Have an account? <a href="/id/login" class="text-sky-400 hover:text-sky-300">Sign in</a></p>
+	}
+}
+
+// ConfirmPage asks a person to confirm what an emailed link is for: a button, posting its token, so
+// a mail scanner that follows the link does nothing.
+templ ConfirmPage(v ConfirmView) {
+	@page(v.Title, v.Installation) {
+		<p class="mt-6 text-sm leading-relaxed text-slate-300">{ v.Text }</p>
+		<form method="post" action={ templ.SafeURL(v.Action) } class="mt-6">
+			<input type="hidden" name="token" value={ v.Token }/>
+			<button type="submit" class="w-full rounded-xl bg-sky-500 px-5 py-3 text-base font-semibold text-white transition hover:bg-sky-400">{ v.Button }</button>
+		</form>
+	}
+}
+
+// ResetPage asks for the email of an account whose password to reset.
+templ ResetPage(v ResetView) {
+	@page("Reset your password", v.Installation) {
+		@errorText(v.Error)
+		<form method="post" action="/id/reset" class="mt-8 space-y-3">
+			<label class="block text-sm text-slate-300">
+				Email
+				<input name="email" type="email" autocomplete="email" required class="mt-1 block w-full rounded-lg bg-slate-800 px-3 py-2 text-slate-100 ring-1 ring-white/10 focus:outline-none focus:ring-2 focus:ring-sky-400"/>
+			</label>
+			<button type="submit" class="w-full rounded-xl bg-sky-500 px-5 py-3 text-base font-semibold text-white transition hover:bg-sky-400">Email me a link</button>
+		</form>
+	}
+}
+
+// NewPasswordPage sets a password, a reset's link having proved the email.
+templ NewPasswordPage(v NewPasswordView) {
+	@page("Choose a new password", v.Installation) {
+		@errorText(v.Error)
+		<form method="post" action="/id/reset/confirm" class="mt-8 space-y-3">
+			<input type="hidden" name="token" value={ v.Token }/>
+			<label class="block text-sm text-slate-300">
+				New password
+				<input name="password" type="password" autocomplete="new-password" minlength="12" required class="mt-1 block w-full rounded-lg bg-slate-800 px-3 py-2 text-slate-100 ring-1 ring-white/10 focus:outline-none focus:ring-2 focus:ring-sky-400"/>
+			</label>
+			<button type="submit" class="w-full rounded-xl bg-sky-500 px-5 py-3 text-base font-semibold text-white transition hover:bg-sky-400">Set it, and sign me in</button>
+		</form>
+	}
+}
+
+// HandlePage chooses the handle of an account a provider's sign-in makes.
+templ HandlePage(v HandleView) {
+	@page("Choose your handle", v.Installation) {
+		<p class="mt-6 text-sm leading-relaxed text-slate-300">
+			You signed in with { v.Provider }. Choose the handle ok knows you by: your repositories are at /&lt;handle&gt;/….
+		</p>
+		@errorText(v.Error)
+		<form method="post" action="/id/signup/handle" class="mt-6 space-y-3">
+			<input type="hidden" name="ceremony" value={ v.Ceremony }/>
+			<input name="handle" value={ v.Handle } pattern="[a-z0-9](?:[a-z0-9]|-[a-z0-9]){0,38}" required class="mt-1 block w-full rounded-lg bg-slate-800 px-3 py-2 text-slate-100 ring-1 ring-white/10 focus:outline-none focus:ring-2 focus:ring-sky-400"/>
+			<button type="submit" class="w-full rounded-xl bg-sky-500 px-5 py-3 text-base font-semibold text-white transition hover:bg-sky-400">Make the account</button>
+		</form>
 	}
 }
 
@@ -113,6 +224,29 @@ templ DeviceConfirmPage(v DeviceConfirmView) {
 			<button type="submit" name="decision" value="deny" class="rounded-xl bg-slate-700 px-5 py-3 text-base font-semibold text-white transition hover:bg-slate-600">Deny</button>
 			<button type="submit" name="decision" value="approve" class="rounded-xl bg-emerald-500 px-5 py-3 text-base font-semibold text-white transition hover:bg-emerald-400">Approve</button>
 		</form>
+	}
+}
+
+// ApprovePage asks a person to approve what ok secrets asked, with their own passkey.
+templ ApprovePage(v ApproveView) {
+	@page("Approve with your passkey?", v.Installation) {
+		<div class="mt-8 space-y-2 rounded-xl bg-slate-800/60 px-4 py-4 text-sm ring-1 ring-white/5">
+			<p class="font-medium text-white">{ v.Description }</p>
+			<p><span class="text-slate-500">Asked</span> <span class="text-slate-200">{ v.Asked }</span></p>
+			<p><span class="text-slate-500">Until</span> <span class="text-slate-200">{ v.Expires }</span></p>
+		</div>
+		<p class="mt-6 text-sm leading-relaxed text-slate-300">
+			Approving lets
+			<span class="font-mono text-emerald-300">{ v.Principal }</span>
+			do this once. Approve only what you asked for yourself, just now.
+		</p>
+		if v.PasskeysOn {
+			<button id="passkey-approve" type="button" data-begin={ "/id/approve/" + v.ID + "/begin" } data-finish={ "/id/approve/" + v.ID + "/finish" } class="mt-6 w-full rounded-xl bg-emerald-500 px-5 py-3 text-base font-semibold text-white transition hover:bg-emerald-400 disabled:opacity-50">Approve with your passkey</button>
+		}
+		<form method="post" action={ templ.SafeURL("/id/approve/" + v.ID + "/decline") } class="mt-3">
+			<button type="submit" class="w-full rounded-xl bg-slate-700 px-5 py-3 text-base font-semibold text-white transition hover:bg-slate-600">Decline</button>
+		</form>
+		<div id="status" role="status"></div>
 	}
 }
 
@@ -158,6 +292,83 @@ templ AccountPage(v AccountView) {
 				</li>
 			}
 		</ul>
+		if len(v.Links) > 0 {
+			<h2 class="mt-8 text-sm font-semibold uppercase tracking-widest text-slate-500">Sign-in</h2>
+			<ul class="mt-2 divide-y divide-white/5">
+				for _, l := range v.Links {
+					<li class="flex items-center justify-between gap-4 py-3 text-sm">
+						<p class="font-medium text-white">{ l.Name }</p>
+						if l.Linked {
+							<form method="post" action="/id/account/links/remove">
+								<input type="hidden" name="provider" value={ l.Provider }/>
+								<button type="submit" class="rounded-lg bg-slate-700 px-3 py-1.5 text-xs font-semibold text-white hover:bg-rose-600">Unlink</button>
+							</form>
+						} else {
+							<a href={ templ.SafeURL("/id/login/oidc/" + l.Provider + "?link=1") } class="rounded-lg bg-slate-700 px-3 py-1.5 text-xs font-semibold text-white hover:bg-sky-600">Link</a>
+						}
+					</li>
+				}
+			</ul>
+		}
+		if v.PasswordOn {
+			<h2 class="mt-8 text-sm font-semibold uppercase tracking-widest text-slate-500">Password</h2>
+			<form method="post" action="/id/account/password" class="mt-3 space-y-3">
+				if v.HasPassword {
+					<label class="block text-sm text-slate-300">
+						Current password
+						<input name="current" type="password" autocomplete="current-password" required class="mt-1 block w-full rounded-lg bg-slate-800 px-3 py-2 text-slate-100 ring-1 ring-white/10 focus:outline-none focus:ring-2 focus:ring-sky-400"/>
+					</label>
+				}
+				<label class="block text-sm text-slate-300">
+					New password
+					<input name="password" type="password" autocomplete="new-password" minlength="12" required class="mt-1 block w-full rounded-lg bg-slate-800 px-3 py-2 text-slate-100 ring-1 ring-white/10 focus:outline-none focus:ring-2 focus:ring-sky-400"/>
+				</label>
+				<button type="submit" class="rounded-xl bg-slate-700 px-4 py-2 text-sm font-semibold text-white transition hover:bg-slate-600">
+					if v.HasPassword {
+						Change it
+					} else {
+						Set it
+					}
+				</button>
+			</form>
+		}
+		<h2 class="mt-8 text-sm font-semibold uppercase tracking-widest text-slate-500">Personal tokens</h2>
+		<p class="mt-2 text-sm text-slate-400">For a script or CI, where a device does not sign in: <span class="font-mono">OK_TOKEN</span>. A token reaches the repositories it names — or every one you may — with at most its role, and manages nothing of your account.</p>
+		if v.NewToken != "" {
+			<div class="mt-3 rounded-xl bg-emerald-950/40 px-4 py-3 ring-1 ring-emerald-500/30">
+				<p class="text-sm text-emerald-200">Your new token. Copy it now: it is not shown again.</p>
+				<p id="new-token" class="mt-2 select-all break-all font-mono text-sm text-white">{ v.NewToken }</p>
+			</div>
+		}
+		<ul class="mt-2 divide-y divide-white/5">
+			for _, t := range v.Tokens {
+				<li class="flex items-center justify-between gap-4 py-3 text-sm">
+					<div>
+						<p class="font-medium text-white">{ t.Label }</p>
+						<p class="text-slate-400">{ t.Detail }</p>
+					</div>
+					if t.Revocable {
+						<form method="post" action="/id/account/tokens/revoke">
+							<input type="hidden" name="id" value={ t.ID }/>
+							<button type="submit" class="rounded-lg bg-slate-700 px-3 py-1.5 text-xs font-semibold text-white hover:bg-rose-600">Revoke</button>
+						</form>
+					}
+				</li>
+			}
+		</ul>
+		<form method="post" action="/id/account/tokens" class="mt-4 grid gap-3 sm:grid-cols-2">
+			<input name="label" placeholder="What uses it" maxlength="100" required class="block rounded-lg bg-slate-800 px-3 py-2 text-sm text-slate-100 ring-1 ring-white/10 focus:outline-none focus:ring-2 focus:ring-sky-400"/>
+			<select name="role" class="block rounded-lg bg-slate-800 px-3 py-2 text-sm text-slate-100 ring-1 ring-white/10 focus:outline-none focus:ring-2 focus:ring-sky-400">
+				<option value="read">read</option>
+				<option value="triage">triage</option>
+				<option value="write">write</option>
+				<option value="maintain">maintain</option>
+				<option value="admin">admin</option>
+			</select>
+			<input name="repositories" placeholder="Repositories (acme/app, …); none: every one" class="block rounded-lg bg-slate-800 px-3 py-2 text-sm text-slate-100 ring-1 ring-white/10 focus:outline-none focus:ring-2 focus:ring-sky-400"/>
+			<input name="days" type="number" min="1" max="366" value="90" class="block rounded-lg bg-slate-800 px-3 py-2 text-sm text-slate-100 ring-1 ring-white/10 focus:outline-none focus:ring-2 focus:ring-sky-400"/>
+			<button type="submit" class="rounded-xl bg-sky-500 px-4 py-2 text-sm font-semibold text-white transition hover:bg-sky-400 sm:col-span-2">Make a token</button>
+		</form>
 		if v.PasskeysOn {
 			<h2 class="mt-8 text-sm font-semibold uppercase tracking-widest text-slate-500">Passkeys</h2>
 			<ul class="mt-2 divide-y divide-white/5">
@@ -178,6 +389,14 @@ templ AccountPage(v AccountView) {
 				<input id="passkey-label" placeholder="This passkey's name" maxlength="100" class="block flex-1 rounded-lg bg-slate-800 px-3 py-2 text-sm text-slate-100 ring-1 ring-white/10 focus:outline-none focus:ring-2 focus:ring-sky-400"/>
 				<button id="passkey-add" type="button" data-begin="/id/account/passkeys/begin" data-finish="/id/account/passkeys/finish" class="rounded-xl bg-sky-500 px-4 py-2 text-sm font-semibold text-white transition hover:bg-sky-400 disabled:opacity-50">Add a passkey</button>
 			</div>
+		}
+		if v.Deletable {
+			<h2 class="mt-8 text-sm font-semibold uppercase tracking-widest text-slate-500">Delete your account</h2>
+			<p class="mt-2 text-sm text-slate-400">Your repositories are deleted with it. An administrator can restore it within 30 days; after, it is gone for good, and your handle is never anyone's again.</p>
+			<form method="post" action="/id/account/delete" class="mt-3 flex gap-3">
+				<input name="confirm" placeholder="Type your handle" autocomplete="off" required class="block flex-1 rounded-lg bg-slate-800 px-3 py-2 text-sm text-slate-100 ring-1 ring-white/10 focus:outline-none focus:ring-2 focus:ring-rose-400"/>
+				<button type="submit" class="rounded-xl bg-rose-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-rose-500">Delete it</button>
+			</form>
 		}
 		@statusLine()
 		<div class="mt-10 flex items-center justify-between border-t border-white/10 pt-6">

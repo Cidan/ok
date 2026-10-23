@@ -19,6 +19,7 @@ use tonic::Code;
 use tonic::Status;
 
 use crate::cache::Manifest;
+use crate::client;
 use crate::ids::Id;
 use crate::ids::Key;
 use crate::ids::id_from;
@@ -237,7 +238,10 @@ async fn publish_batch(
         old_ids: h.old.iter().map(|i| i.to_vec()).collect(),
         new_id: h.new.to_vec(),
     });
-    let first = publish_once(shared, &batch.objects, &batch.files, heads_wire.clone()).await;
+    let first = client::while_frozen(|| {
+        publish_once(shared, &batch.objects, &batch.files, heads_wire.clone())
+    })
+    .await;
     let missing = match first {
         Ok(heads) => return Ok(heads),
         Err(status) => match rejection(&status) {
@@ -343,6 +347,8 @@ async fn publish_once(
     let begin = pb::publish_request::Begin {
         repository_id: shared.client.repository_id(),
         workspace: shared.client.workspace(),
+        // OkBackend::write_file refuses to stage a secret's value (docs/secrets.md).
+        guards_secrets: true,
         objects: objects
             .iter()
             .map(|k| pb::ObjectRef {

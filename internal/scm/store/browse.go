@@ -106,9 +106,9 @@ func (s *Store) Log(ctx context.Context, repo int64, from *encoding.ID, paths []
 		var rows []backend.GenCommit
 		var err error
 		if len(paths) == 0 {
-			rows, err = s.b.MainLog(ctx, repo, lo, hi, ascending, limit)
+			rows, err = s.mainLog(ctx, repo, lo, hi, ascending, limit)
 		} else {
-			rows, err = s.b.PathCommits(ctx, repo, paths, lo, hi, ascending, limit)
+			rows, err = s.pathCommits(ctx, repo, paths, lo, hi, ascending, limit)
 		}
 		if err != nil {
 			return nil, nil, err
@@ -170,9 +170,9 @@ func (s *Store) mainGeneration(ctx context.Context, repo int64, commit *encoding
 	if at == encoding.RootCommitID {
 		return 0, nil
 	}
-	gen, ok, err := s.b.HeadSeqOf(ctx, repo, at)
+	gen, ok, err := s.headSeqOf(ctx, s.ops(ctx), repo, at)
 	if err == nil && !ok {
-		if err := s.repositoryExists(ctx, s.b, repo); err != nil {
+		if err := s.repositoryExists(ctx, s.ops(ctx), repo); err != nil {
 			return 0, err
 		}
 		return 0, invalid("commit %s is not on main", at)
@@ -343,7 +343,7 @@ func (s *Store) lastCommits(ctx context.Context, repo int64, commit encoding.ID,
 	for i, e := range entries {
 		paths[i] = joinPath(dir, e.Name)
 	}
-	last, err := s.b.LastPathCommits(ctx, repo, gen, paths)
+	last, err := s.lastPathCommits(ctx, repo, gen, paths)
 	if err != nil {
 		return err
 	}

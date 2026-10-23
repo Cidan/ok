@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"regexp"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -35,12 +36,30 @@ const (
 //	      - //tools/lint:linters.bzl%golangci_lint
 //	    format: //tools/format:format   # a formatter run in check mode over the change's files
 //	identity: identity            # the folder holding the groups-and-ACLs tree, in the repository that holds it
+//	secrets:                      # the repository keeps secrets in //secret (docs/secrets.md)
+//	  store: default              # the installation's store their sealed values are kept in
 type Settings struct {
 	Build Build
 	Bazel Bazel
+	// Pool is the pool of workers the repository's jobs run in when a job names none
+	// (docs/hosted.md, "Hosted automation, as built"): "" for the default pool.
+	Pool string
 	// Identity is the folder, repository-relative, of the groups-and-ACLs tree, when this is the
 	// repository that holds the installation's.
 	Identity string
+	// Secrets is the repository's secrets' settings: nil when it keeps none, and //secret is an
+	// ordinary folder (docs/secrets.md).
+	Secrets *Secrets
+}
+
+// DefaultSecretStore is the store a repository's secrets' sealed values are kept in unless its
+// settings name another: ok secrets' own database.
+const DefaultSecretStore = "default"
+
+// Secrets is how a repository keeps its secrets.
+type Secrets struct {
+	// Store is the installation's store the sealed values are kept in (docs/secrets.md, "Stores").
+	Store string
 }
 
 // Bazel is how jobs run Bazel in a repository.
@@ -68,6 +87,10 @@ type repositoryFile struct {
 		} `yaml:"lint"`
 	} `yaml:"bazel"`
 	Identity string `yaml:"identity"`
+	Pool     string `yaml:"pool"`
+	Secrets  *struct {
+		Store string `yaml:"store"`
+	} `yaml:"secrets"`
 }
 
 // ParseSettings reads a repository's settings: present is whether SettingsFile exists, and
@@ -92,7 +115,21 @@ func ParseSettings(data []byte, present bool) (*Settings, error) {
 	if f.Build == nil {
 		return nil, fmt.Errorf("%s: build is required: bazel, or none", SettingsFile)
 	}
-	r := &Settings{Build: Build(*f.Build), Identity: f.Identity}
+	r := &Settings{Build: Build(*f.Build), Identity: f.Identity, Pool: f.Pool}
+	if f.Secrets != nil {
+		r.Secrets = &Secrets{Store: f.Secrets.Store}
+		if r.Secrets.Store == "" {
+			r.Secrets.Store = DefaultSecretStore
+		}
+		if !storeRE.MatchString(r.Secrets.Store) {
+			return nil, fmt.Errorf("%s: secrets: store %q is not a store's name (lowercase letters, digits, and dashes)", SettingsFile, r.Secrets.Store)
+		}
+	}
+	if r.Pool != "" {
+		if err := ValidPool(r.Pool); err != nil {
+			return nil, fmt.Errorf("%s: %w", SettingsFile, err)
+		}
+	}
 	switch r.Build {
 	case BuildBazel:
 	case BuildNone:
@@ -135,6 +172,13 @@ func ParseSettings(data []byte, present bool) (*Settings, error) {
 	}
 	return r, nil
 }
+
+// storeRE is a secret store's name, as an installation's configuration names its stores.
+var storeRE = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
+
+// ValidStoreName reports whether name may name a secret store: lowercase letters, digits, and
+// dashes.
+func ValidStoreName(name string) bool { return storeRE.MatchString(name) }
 
 // isLabel reports whether s is a Bazel label in the main repository or another
 // (@repo//package:name): an aspect may come from a dependency.

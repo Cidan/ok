@@ -232,6 +232,14 @@ pub struct RerunArgs {
     runs: Vec<i64>,
 }
 
+/// Run pre by hand on CLs: a draft, which runs none until it is sent for review, or a CL under
+/// its stack's top, whose pre runs there — over everything under it
+#[derive(clap::Args, Clone, Debug)]
+pub struct PreArgs {
+    #[command(flatten)]
+    target: Target,
+}
+
 /// Cancel runs of a CL's checks
 #[derive(clap::Args, Clone, Debug)]
 pub struct CancelArgs {
@@ -372,7 +380,9 @@ async fn resolve(
     numbers.sort_unstable();
     numbers.dedup();
     let endpoint = crate::commands::web_url(command, &shared.config.endpoint);
-    let control = Control::connect(&endpoint).await.map_err(control_error)?;
+    let control = Control::connect(&endpoint, &repository)
+        .await
+        .map_err(control_error)?;
     let refs = numbers
         .into_iter()
         .map(|number| pb::ClRef {
@@ -546,7 +556,9 @@ pub async fn run_ready(
 ) -> Result<(), CommandError> {
     let (control, cls) = resolve(ui, command, &args.target.cls).await?;
     let mut out = Vec::new();
-    for cl in cls {
+    // Highest first: a stack's CLs are numbered from the bottom up, and pre runs at its top in
+    // review, so the top is in review before any CL under it.
+    for cl in cls.into_iter().rev() {
         let req = pb::ReviewersRequest {
             cl: Some(cl),
             reviewers: args.reviewer.clone(),
@@ -554,6 +566,7 @@ pub async fn run_ready(
         };
         out.push(control.request_review(req).await.map_err(control_error)?);
     }
+    out.reverse();
     report(ui, &out)
 }
 
@@ -787,6 +800,19 @@ pub async fn run_rerun(
         .await
         .map_err(control_error)?;
     report(ui, &[st])
+}
+
+pub async fn run_pre(
+    ui: &mut Ui,
+    command: &CommandHelper,
+    args: PreArgs,
+) -> Result<(), CommandError> {
+    let (control, cls) = resolve(ui, command, &args.target.cls).await?;
+    let mut out = Vec::new();
+    for cl in cls {
+        out.push(control.run_pre(cl).await.map_err(control_error)?);
+    }
+    report(ui, &out)
 }
 
 pub async fn run_cancel(

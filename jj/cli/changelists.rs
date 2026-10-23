@@ -72,6 +72,7 @@ enum ClCommand {
     Restore(crate::lifecycle::RestoreArgs),
     Rollback(crate::lifecycle::RollbackArgs),
     Rerun(crate::lifecycle::RerunArgs),
+    Pre(crate::lifecycle::PreArgs),
     Cancel(crate::lifecycle::CancelArgs),
     Log(crate::lifecycle::LogArgs),
     Deployment(crate::lifecycle::DeploymentArgs),
@@ -94,8 +95,16 @@ struct GetArgs {
 /// edits you made after the patchset that landed), moves each `cl/<n>@ok` to its CL's
 /// current patchset, and rebases the rest of your changes onto main. Conflicts become
 /// jj conflicts; changes the rebase empties are abandoned.
+///
+/// In a fork, `--upstream` first has ok bring the fork its upstream's newer work: its main
+/// moves to the upstream's if the fork has landed nothing of its own since it forked or
+/// last synced.
 #[derive(clap::Args, Clone, Debug)]
-pub struct SyncArgs {}
+pub struct SyncArgs {
+    /// First bring this fork its upstream's newer work on ok
+    #[arg(long)]
+    upstream: bool,
+}
 
 /// The web page of CL `number` in the repository of `repo`.
 fn cl_url(command: &CommandHelper, repo: &dyn Repo, number: i64) -> Result<String, CommandError> {
@@ -162,6 +171,7 @@ pub async fn run_cl(
         Some(ClCommand::Restore(a)) => return l::run_restore(ui, command, a).await,
         Some(ClCommand::Rollback(a)) => return l::run_rollback(ui, command, a).await,
         Some(ClCommand::Rerun(a)) => return l::run_rerun(ui, command, a).await,
+        Some(ClCommand::Pre(a)) => return l::run_pre(ui, command, a).await,
         Some(ClCommand::Cancel(a)) => return l::run_cancel(ui, command, a).await,
         Some(ClCommand::Log(a)) => return l::run_log(ui, command, a).await,
         Some(ClCommand::Deployment(a)) => return l::run_deployment(ui, command, a).await,
@@ -352,9 +362,22 @@ fn changes(n: usize) -> String {
 pub async fn run_sync(
     ui: &mut Ui,
     command: &CommandHelper,
-    _args: SyncArgs,
+    args: SyncArgs,
 ) -> Result<(), CommandError> {
     let mut workspace_command = command.workspace_helper(ui).await?;
+    if args.upstream {
+        let moved = ok_cl::sync_fork(workspace_command.repo().as_ref())
+            .await
+            .map_err(cl_error)?;
+        if moved {
+            writeln!(ui.status(), "The fork's main moved to its upstream's")?;
+        } else {
+            writeln!(
+                ui.status(),
+                "The fork holds its upstream's work; its main stays where it is"
+            )?;
+        }
+    }
     let immutable = immutable_resolver(command, &workspace_command);
     let mut tx = workspace_command.start_transaction();
     let report = ok_cl::sync(tx.repo_mut(), &immutable)

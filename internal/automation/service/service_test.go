@@ -12,7 +12,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -39,7 +38,8 @@ const (
 func named(ctx context.Context) context.Context {
 	if md, ok := metadata.FromIncomingContext(ctx); ok {
 		if p := md.Get("principal"); len(p) == 1 {
-			return authn.NewContext(ctx, authn.Caller{Principal: p[0]})
+			// A principal's stable ID is its name here.
+			return authn.NewContext(ctx, authn.Caller{Principal: p[0], ID: p[0]})
 		}
 	}
 	return ctx
@@ -56,11 +56,7 @@ func newClients(t *testing.T) clients {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	pool, err := pgxpool.New(ctx, testdb.Postgres(t))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(pool.Close)
+	pool := testdb.Pool(t)
 	blobs := testobjects.Store(t)
 	b, err := autopostgres.Open(ctx, pool)
 	if err != nil {
@@ -68,7 +64,7 @@ func newClients(t *testing.T) clients {
 	}
 	st := store.New(b, blobs, store.DefaultConfig)
 	go st.Listen(ctx)
-	svc := New(st, 10*time.Second)
+	svc := New(st, 10*time.Second, false, nil)
 	srv := grpc.NewServer(
 		grpc.UnaryInterceptor(func(ctx context.Context, req any, _ *grpc.UnaryServerInfo, h grpc.UnaryHandler) (any, error) {
 			return h(named(ctx), req)
@@ -117,7 +113,7 @@ func startReq(forPerson string) *automationpb.StartRunRequest {
 		CommitId:     commit(),
 		Job:          &automationpb.Job{Kind: automationpb.Job_KIND_TEST, Targets: []string{"//a:test"}},
 		Origin:       &automationpb.Origin{Phase: automationpb.Origin_PHASE_PRE, ClNumber: 5, Patchset: 2, Job: "tests"},
-		ForPerson:    forPerson,
+		ForPersonId:  forPerson,
 	}
 }
 
@@ -141,8 +137,8 @@ func TestAuthorization(t *testing.T) {
 			t.Errorf("%s: %v, want %s", tc.name, err, tc.code)
 			continue
 		}
-		if err == nil && r.GetRequestedBy() != tc.requester {
-			t.Errorf("%s: requested by %q, want %q", tc.name, r.GetRequestedBy(), tc.requester)
+		if err == nil && r.GetRequestedById() != tc.requester {
+			t.Errorf("%s: requested by %q, want %q", tc.name, r.GetRequestedById(), tc.requester)
 		}
 	}
 	// A push is a deployment's: ok control cannot start one through Runs.
@@ -235,12 +231,12 @@ func TestRun(t *testing.T) {
 	if err != nil || len(list.GetRuns()) != 1 || list.GetRuns()[0].GetId() != started.GetId() {
 		t.Errorf("list: %v, %v", list, err)
 	}
-	rerun, err := c.runs.RerunRun(as(control), &automationpb.RerunRunRequest{Id: started.GetId(), ForPerson: "bob.human.example.com"})
-	if err != nil || rerun.GetRerunOf() != started.GetId() || rerun.GetRequestedBy() != "bob.human.example.com" {
+	rerun, err := c.runs.RerunRun(as(control), &automationpb.RerunRunRequest{Id: started.GetId(), ForPersonId: "bob.human.example.com"})
+	if err != nil || rerun.GetRerunOf() != started.GetId() || rerun.GetRequestedById() != "bob.human.example.com" {
 		t.Errorf("rerun: %v, %v", rerun, err)
 	}
-	canceled, err := c.runs.CancelRun(as(control), &automationpb.CancelRunRequest{Id: rerun.GetId(), ForPerson: person})
-	if err != nil || canceled.GetStatus() != automationpb.Run_STATUS_CANCELED || canceled.GetReason() != "canceled by "+person {
+	canceled, err := c.runs.CancelRun(as(control), &automationpb.CancelRunRequest{Id: rerun.GetId(), ForPersonId: person})
+	if err != nil || canceled.GetStatus() != automationpb.Run_STATUS_CANCELED || canceled.GetReason() != "canceled" || canceled.GetCanceledById() != person {
 		t.Errorf("cancel: %v, %v", canceled, err)
 	}
 }
@@ -254,7 +250,7 @@ func TestErrors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.runs.RerunRun(as(control), &automationpb.RerunRunRequest{Id: r.GetId(), ForPerson: person}); status.Code(err) != codes.FailedPrecondition {
+	if _, err := c.runs.RerunRun(as(control), &automationpb.RerunRunRequest{Id: r.GetId(), ForPersonId: person}); status.Code(err) != codes.FailedPrecondition {
 		t.Errorf("a queued run's rerun: %v", err)
 	}
 	bad := startReq(person)
@@ -343,7 +339,7 @@ func TestPre(t *testing.T) {
 	if pre, err := c.runs.GetPre(as(control), &automationpb.GetPreRequest{RepositoryId: 1, ClNumber: 3, Patchset: 2}); err != nil || pre.GetVerdict() != automationpb.Pre_VERDICT_NONE {
 		t.Errorf("an unplanned patchset: %v, %v", pre, err)
 	}
-	_, err = c.runs.StartRun(as(control), &automationpb.StartRunRequest{RepositoryId: 1, CommitId: commit(), ForPerson: person,
+	_, err = c.runs.StartRun(as(control), &automationpb.StartRunRequest{RepositoryId: 1, CommitId: commit(), ForPersonId: person,
 		Job:    &automationpb.Job{Kind: automationpb.Job_KIND_PLAN},
 		Origin: &automationpb.Origin{Phase: automationpb.Origin_PHASE_PRE, ClNumber: 3, Patchset: 1}})
 	if status.Code(err) != codes.InvalidArgument {
@@ -363,12 +359,12 @@ func TestSubmissions(t *testing.T) {
 	if _, err := c.runs.Submit(as(control), req); status.Code(err) != codes.InvalidArgument {
 		t.Errorf("control submitting for no one: %v", err)
 	}
-	req.ForPerson = person
+	req.ForPersonId = person
 	sub, err := c.runs.Submit(as(control), req)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if sub.GetStatus() != automationpb.Submission_STATUS_ACTIVE || sub.GetSubmittedBy() != person || len(sub.GetCls()) != 2 ||
+	if sub.GetStatus() != automationpb.Submission_STATUS_ACTIVE || sub.GetSubmittedById() != person || len(sub.GetCls()) != 2 ||
 		sub.GetCls()[0].GetNumber() != 5 || sub.GetCls()[0].GetPatchset() != 2 || len(sub.GetAttempts()) != 0 || sub.GetCreatedAt() == nil {
 		t.Fatalf("the submission: %v", sub)
 	}
@@ -398,8 +394,8 @@ func TestSubmissions(t *testing.T) {
 		t.Fatalf("CL 6's submissions: %v, %v", list, err)
 	}
 
-	canceled, err := c.runs.CancelSubmission(as(control), &automationpb.CancelSubmissionRequest{Id: sub.GetId(), ForPerson: person})
-	if err != nil || canceled.GetStatus() != automationpb.Submission_STATUS_CANCELED || canceled.GetReason() != "canceled by "+person ||
+	canceled, err := c.runs.CancelSubmission(as(control), &automationpb.CancelSubmissionRequest{Id: sub.GetId(), ForPersonId: person})
+	if err != nil || canceled.GetStatus() != automationpb.Submission_STATUS_CANCELED || canceled.GetReason() != "canceled" || canceled.GetCanceledById() != person ||
 		canceled.GetAttempts()[0].GetStatus() != automationpb.Attempt_STATUS_DISCARDED {
 		t.Fatalf("canceling: %v, %v", canceled, err)
 	}
@@ -420,7 +416,7 @@ func TestPushes(t *testing.T) {
 		Origin:       &automationpb.Origin{Phase: automationpb.Origin_PHASE_DEPLOY, Job: "a"},
 	}
 	r, err := c.pushes.StartRun(as(deployer), push)
-	if err != nil || r.GetRequestedBy() != deployer || r.GetStatus() != automationpb.Run_STATUS_QUEUED {
+	if err != nil || r.GetRequestedById() != deployer || r.GetStatus() != automationpb.Run_STATUS_QUEUED {
 		t.Fatalf("starting a push: %v (%v)", r, err)
 	}
 	if got, err := c.pushes.GetRun(as(deployer), &automationpb.GetRunRequest{Id: r.GetId()}); err != nil || got.GetId() != r.GetId() {
@@ -429,7 +425,7 @@ func TestPushes(t *testing.T) {
 	for name, req := range map[string]*automationpb.StartRunRequest{
 		"a test":          startReq(""),
 		"a push of pre":   {RepositoryId: 1, CommitId: commit(), Job: push.GetJob(), Origin: &automationpb.Origin{Phase: automationpb.Origin_PHASE_PRE, ClNumber: 5, Patchset: 1}},
-		"naming a person": {RepositoryId: 1, CommitId: commit(), Job: push.GetJob(), Origin: push.GetOrigin(), ForPerson: person},
+		"naming a person": {RepositoryId: 1, CommitId: commit(), Job: push.GetJob(), Origin: push.GetOrigin(), ForPersonId: person},
 	} {
 		if _, err := c.pushes.StartRun(as(deployer), req); status.Code(err) != codes.InvalidArgument {
 			t.Errorf("%s: %v, want InvalidArgument", name, err)
@@ -446,7 +442,7 @@ func TestPushes(t *testing.T) {
 		t.Errorf("canceling a run that is no push: %v", err)
 	}
 	canceled, err := c.pushes.CancelRun(as(deployer), &automationpb.CancelRunRequest{Id: r.GetId()})
-	if err != nil || canceled.GetStatus() != automationpb.Run_STATUS_CANCELED || canceled.GetReason() != "canceled by "+deployer {
+	if err != nil || canceled.GetStatus() != automationpb.Run_STATUS_CANCELED || canceled.GetReason() != "canceled" || canceled.GetCanceledById() != deployer {
 		t.Errorf("canceling the push: %v (%v)", canceled, err)
 	}
 }

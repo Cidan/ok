@@ -7,6 +7,7 @@ package queue
 
 import (
 	"fmt"
+	"maps"
 	"slices"
 	"strconv"
 	"strings"
@@ -104,6 +105,61 @@ type Action struct {
 
 // DefaultDepth is how many earlier submissions an attempt speculates on at most.
 const DefaultDepth = 8
+
+// AfterLanding is the queue as the next decision would read it once a submission lands on an
+// attempt: main moved by its CLs, each recorded as the submission's; the submission finished,
+// landed with the attempt's footprint. A batch's next landing is decided on it, so a batch lands
+// exactly what deciding again after each landing would.
+func (s Snapshot) AfterLanding(submission, attempt int64) Snapshot {
+	out := s
+	out.Submissions = nil
+	out.Main = slices.Clone(s.Main)
+	out.Finished = maps.Clone(s.Finished)
+	out.FinishedCLs = maps.Clone(s.FinishedCLs)
+	out.Landings = maps.Clone(s.Landings)
+	if out.Finished == nil {
+		out.Finished = map[int64]Outcome{}
+	}
+	if out.FinishedCLs == nil {
+		out.FinishedCLs = map[int64][]int64{}
+	}
+	if out.Landings == nil {
+		out.Landings = map[int64]*Footprint{}
+	}
+	for _, e := range s.Submissions {
+		if e.ID != submission {
+			out.Submissions = append(out.Submissions, e)
+			continue
+		}
+		for _, c := range e.CLs {
+			out.HeadSeq++
+			out.Main = append(out.Main, MainCommit{Seq: out.HeadSeq, CL: c, Submission: e.ID})
+		}
+		out.Finished[e.ID], out.FinishedCLs[e.ID] = Landed, e.CLs
+		for _, a := range e.Attempts {
+			if a.ID == attempt && a.Footprint != nil {
+				out.Landings[e.ID] = a.Footprint
+			}
+		}
+	}
+	return out
+}
+
+// Batch is the landings to make at once: the first Decide says, then each next that deciding on
+// the queue after the ones before it says, until one says anything but a landing, or max are
+// taken.
+func Batch(s Snapshot, max int) []Action {
+	var out []Action
+	for len(out) < max {
+		acts := Decide(s)
+		if len(acts) == 0 || acts[0].Kind != Land {
+			break
+		}
+		out = append(out, acts[0])
+		s = s.AfterLanding(acts[0].Submission, acts[0].Attempt)
+	}
+	return out
+}
 
 // Decide says what a repository's landing queue does next: landings (and adoptions) first, in
 // queue order, then everything else. Landing moves main, so a caller acts on the first landing

@@ -80,15 +80,15 @@ func TestRollback(t *testing.T) {
 		t.Errorf("rollback commit %+v", c)
 	}
 	var pinned bool
-	if err := poolOf(e.s).QueryRow(ctx, `SELECT pinned FROM commit WHERE repository_id = $1 AND id = $2`, e.repo, ps.Commit[:]).Scan(&pinned); err != nil || !pinned {
-		t.Errorf("rollback commit pinned=%v (%v)", pinned, err)
+	if dbOf(e.s).scan(t, `SELECT pinned FROM commit WHERE repository_id = @repo AND id = @id`, map[string]any{"repo": e.repo, "id": ps.Commit[:]}, &pinned); !pinned {
+		t.Error("the rollback commit is not pinned")
 	}
 	evs, err := e.s.ReadEvents(ctx, e.repo, r.Event.GetRepositorySeq()-1, 0)
 	if err != nil || len(evs) != 1 || evs[0].GetRepositorySeq() != r.Event.GetRepositorySeq() {
 		t.Fatalf("events %v (%v)", evs, err)
 	}
 	up := evs[0].GetUploaded()
-	if up.GetNumber() != cl.Number || !up.GetCreated() || up.GetUploader() != bob || !reflect.DeepEqual(up.GetReviewers(), []string{carol, alice}) ||
+	if up.GetNumber() != cl.Number || !up.GetCreated() || up.GetUploaderId() != bob || !reflect.DeepEqual(up.GetReviewerIds(), []string{carol, alice}) ||
 		up.GetStatus() != StatusOpen.proto() {
 		t.Errorf("uploaded event %v", up)
 	}

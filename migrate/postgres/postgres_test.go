@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"slices"
+	"strings"
 	"testing"
 	"testing/fstest"
 
@@ -103,5 +104,20 @@ func TestMigrator(t *testing.T) {
 	files["0003_index.sql"] = &fstest.MapFile{Data: []byte("CREATE INDEX widgets_name ON widgets (name);\n")}
 	if code, r = run("apply"); code != 0 || !r.Executed || len(r.Steps) != 1 || r.Steps[0].Description != "0003_index" {
 		t.Fatalf("a new file: %d %+v", code, r)
+	}
+}
+
+// -url-secret reads the URL from the secret the deployer gave the migration.
+func TestSecretFile(t *testing.T) {
+	t.Setenv("OK_SECRETS_DIR", "/dev/shm/ok-secrets-1")
+	if f, err := secretFile("//secret/prod/db-url"); err != nil || f != "/dev/shm/ok-secrets-1/prod/db-url" {
+		t.Errorf("the secret's file: %q, %v", f, err)
+	}
+	if _, err := secretFile("//lib/db-url"); err == nil {
+		t.Error("a path outside //secret was taken")
+	}
+	t.Setenv("OK_SECRETS_DIR", "")
+	if _, err := secretFile("//secret/prod/db-url"); err == nil || !strings.Contains(err.Error(), "is not set") {
+		t.Errorf("no secrets given: %v", err)
 	}
 }

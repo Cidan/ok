@@ -8,7 +8,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/jackc/pgx/v5/pgxpool"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -39,7 +38,8 @@ const (
 func named(ctx context.Context) context.Context {
 	if md, ok := metadata.FromIncomingContext(ctx); ok {
 		if p := md.Get("principal"); len(p) == 1 {
-			return authn.NewContext(ctx, authn.Caller{Principal: p[0]})
+			// A principal's stable ID is its name here.
+			return authn.NewContext(ctx, authn.Caller{Principal: p[0], ID: p[0]})
 		}
 	}
 	return ctx
@@ -54,11 +54,7 @@ func as(p string) context.Context {
 
 func newService(t *testing.T, objs ...runtime.Object) (deploypb.DeploymentsClient, *store.Store, *kubesim.Cluster) {
 	t.Helper()
-	pool, err := pgxpool.New(context.Background(), testdb.Postgres(t))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(pool.Close)
+	pool := testdb.Pool(t)
 	b, err := postgres.Open(context.Background(), pool)
 	st := store.New(b)
 	if err != nil {
@@ -94,13 +90,16 @@ func TestDeployments(t *testing.T) {
 	ctx := context.Background()
 	c, st, _ := newService(t)
 	for i, ev := range []store.FeedEvent{
-		{Seq: 1, Repository: 1, Name: "home", Created: true},
+		{Seq: 1, Repository: 1, Created: true},
 		{Seq: 2, Repository: 1, Head: commit(1), HeadSeq: 1},
 		{Seq: 3, Repository: 1, Head: commit(2), HeadSeq: 2},
 	} {
 		if err := st.Apply(ctx, ev); err != nil {
 			t.Fatalf("event %d: %v", i, err)
 		}
+	}
+	if err := st.ApplyDirectory(ctx, store.DirectoryEvent{Seq: 1, Repository: 1, FullName: "home"}); err != nil {
+		t.Fatal(err)
 	}
 	web := workflow.Deploy{File: ".ok/workflow/d.yaml", Name: "web", Migrate: []workflow.Ref{{Target: "//web/schema:apply"}},
 		Images:   []workflow.Image{{Container: "web", Target: "//web:push"}},
@@ -159,25 +158,25 @@ func TestDeployments(t *testing.T) {
 	if _, err := c.AllowHazards(as(control), &deploypb.AllowHazardsRequest{Id: id}); status.Code(err) != codes.InvalidArgument {
 		t.Errorf("control naming no one: %v", err)
 	}
-	d, err = c.AllowHazards(as(control), &deploypb.AllowHazardsRequest{Id: id, ForPerson: admin})
-	if err != nil || d.GetMigrations()[0].GetAllowedBy() != admin || d.GetStage() != deploypb.Deployment_STAGE_MIGRATE {
+	d, err = c.AllowHazards(as(control), &deploypb.AllowHazardsRequest{Id: id, ForPersonId: admin})
+	if err != nil || d.GetMigrations()[0].GetAllowedById() != admin || d.GetStage() != deploypb.Deployment_STAGE_MIGRATE {
 		t.Fatalf("allowing: %v (%v)", d, err)
 	}
-	if _, err := c.AllowHazards(as(control), &deploypb.AllowHazardsRequest{Id: id, ForPerson: admin}); status.Code(err) != codes.FailedPrecondition {
+	if _, err := c.AllowHazards(as(control), &deploypb.AllowHazardsRequest{Id: id, ForPersonId: admin}); status.Code(err) != codes.FailedPrecondition {
 		t.Errorf("allowing twice: %v", err)
 	}
-	if _, err := c.RetryDeployment(as(control), &deploypb.RetryDeploymentRequest{Id: id, ForPerson: person}); status.Code(err) != codes.FailedPrecondition {
+	if _, err := c.RetryDeployment(as(control), &deploypb.RetryDeploymentRequest{Id: id, ForPersonId: person}); status.Code(err) != codes.FailedPrecondition {
 		t.Errorf("retrying a running deployment: %v", err)
 	}
-	d, err = c.HaltDeployment(as(control), &deploypb.HaltDeploymentRequest{Id: id, ForPerson: person})
-	if err != nil || d.GetHaltBy() != person {
+	d, err = c.HaltDeployment(as(control), &deploypb.HaltDeploymentRequest{Id: id, ForPersonId: person})
+	if err != nil || d.GetHaltById() != person {
 		t.Fatalf("halting: %v (%v)", d, err)
 	}
-	if err := st.Finish(ctx, id, store.Halted, "halted by "+person); err != nil {
+	if err := st.Finish(ctx, id, store.Halted, "halted"); err != nil {
 		t.Fatal(err)
 	}
-	d, err = c.RetryDeployment(as(control), &deploypb.RetryDeploymentRequest{Id: id, ForPerson: admin})
-	if err != nil || d.GetRetryOf() != id || d.GetRequestedBy() != admin || d.GetStatus() != deploypb.Deployment_STATUS_WAITING {
+	d, err = c.RetryDeployment(as(control), &deploypb.RetryDeploymentRequest{Id: id, ForPersonId: admin})
+	if err != nil || d.GetRetryOf() != id || d.GetRequestedById() != admin || d.GetStatus() != deploypb.Deployment_STATUS_WAITING {
 		t.Errorf("retrying: %v (%v)", d, err)
 	}
 	if _, err := c.GetDeployment(as(control), &deploypb.GetDeploymentRequest{Id: 999}); status.Code(err) != codes.NotFound {
@@ -197,13 +196,16 @@ func TestServices(t *testing.T) {
 		return true, nil, errors.New("the API server is down")
 	})
 	for i, ev := range []store.FeedEvent{
-		{Seq: 1, Repository: 1, Name: "smoke", Created: true},
+		{Seq: 1, Repository: 1, Created: true},
 		{Seq: 2, Repository: 1, Head: commit(1), HeadSeq: 1},
 		{Seq: 3, Repository: 1, Head: commit(2), HeadSeq: 2},
 	} {
 		if err := st.Apply(ctx, ev); err != nil {
 			t.Fatalf("event %d: %v", i, err)
 		}
+	}
+	if err := st.ApplyDirectory(ctx, store.DirectoryEvent{Seq: 1, Repository: 1, FullName: "smoke"}); err != nil {
+		t.Fatal(err)
 	}
 	serve := workflow.Deploy{File: ".ok/workflow/deploy.yaml", Name: "serve", Images: []workflow.Image{{Container: "serve", Target: "//serve:push"}},
 		Workload: &workflow.Workload{Namespace: "smoke", Kind: workflow.Deployment, Name: "serve"}}

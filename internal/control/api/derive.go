@@ -13,7 +13,9 @@ import (
 // repository's admins, by handle, for a deployment waiting on one.
 //
 // The order is the lifecycle's: a closed CL is decided by how it closed; an active one by its
-// submission when it has one going, then its pre, then its review.
+// submission when it has one going, then its pre, then its review. Pre runs at a stack's top,
+// over every CL of it: a CL under the top (pre_at) is decided by its review alone, and a draft
+// runs none until it is sent for review (docs/automation.md, "pre").
 func derive(st *controlpb.CLStatus, admins []string) {
 	cl := st.GetCl()
 	switch cl.GetStatus() {
@@ -52,12 +54,21 @@ func derive(st *controlpb.CLStatus, admins []string) {
 	}
 
 	pre := st.GetPre()
-	switch pre.GetVerdict() {
-	case controlpb.Checks_VERDICT_FAILED:
+	draft := cl.GetStatus() == controlpb.CL_STATUS_DRAFT
+	var passed string
+	switch {
+	case st.GetPreAt() != 0:
+		passed = fmt.Sprintf("pre runs at CL %d, the top of its stack", st.GetPreAt())
+	case draft && pre.GetVerdict() == controlpb.Checks_VERDICT_NONE:
+		set(st, controlpb.Stage_STAGE_DRAFT, controlpb.WaitingOn_WAITING_ON_AUTHOR, []string{cl.GetAuthor()},
+			"Draft: pre runs once it is sent for review (jj cl ready), or now (jj cl pre)")
+		return
+	case pre.GetVerdict() == controlpb.Checks_VERDICT_FAILED:
 		set(st, controlpb.Stage_STAGE_PRE_FAILED, controlpb.WaitingOn_WAITING_ON_AUTHOR, []string{cl.GetAuthor()},
 			fmt.Sprintf("Pre failed (%d/%d passed)", pre.GetPassed(), pre.GetTotal()))
 		return
-	case controlpb.Checks_VERDICT_PASSED:
+	case pre.GetVerdict() == controlpb.Checks_VERDICT_PASSED:
+		passed = fmt.Sprintf("pre passed (%d/%d)", pre.GetPassed(), pre.GetTotal())
 	default:
 		what := "Pre is being planned"
 		if pre.GetVerdict() == controlpb.Checks_VERDICT_PENDING && pre.GetTotal() > 0 {
@@ -70,8 +81,7 @@ func derive(st *controlpb.CLStatus, admins []string) {
 		return
 	}
 
-	passed := fmt.Sprintf("pre passed (%d/%d)", pre.GetPassed(), pre.GetTotal())
-	if cl.GetStatus() == controlpb.CL_STATUS_DRAFT {
+	if draft {
 		set(st, controlpb.Stage_STAGE_DRAFT, controlpb.WaitingOn_WAITING_ON_AUTHOR, []string{cl.GetAuthor()},
 			"Draft; "+passed+": send it for review (jj cl ready)")
 		return
@@ -83,6 +93,9 @@ func derive(st *controlpb.CLStatus, admins []string) {
 		return
 	}
 	summary := "Approved and " + passed + ": submit it (jj cl submit)"
+	if st.GetPreAt() != 0 {
+		summary = fmt.Sprintf("Approved; %s: submit the stack from there (jj cl submit --stack %d)", passed, st.GetPreAt())
+	}
 	if rv.GetBlocked() != "" {
 		summary = "Approved and " + passed + ", but it cannot submit: " + rv.GetBlocked()
 	}

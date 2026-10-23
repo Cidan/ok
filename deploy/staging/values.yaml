@@ -1,0 +1,45 @@
+# ok's chart on staging (README.md): one installation — directory and cell together — on Spanner,
+# GCS, and NATS, its roles reaching them as staging's Google service account (workload identity).
+# The PROJECT placeholders are Terraform's outputs, and TAG the image's, which README.md's run fills
+# in.
+image: {repository: us-central1-docker.pkg.dev/PROJECT/ok/ok, tag: TAG}
+domain: ok-staging.example.com
+installation: ok staging
+# Its address in the cluster, with no ingress: the load's person signs in there, through Dex.
+publicURL: http://ok-server.ok.svc:8472
+identity:
+  bootstrapAdmins: [load]
+  # GKE's issuer of the cluster's ServiceAccount tokens (kubectl get --raw /.well-known/openid-configuration).
+  kubernetesIssuer: https://container.googleapis.com/v1/projects/PROJECT/locations/us-central1/clusters/ok-staging
+  # Its own robot for the load generator's synthetic workers: worker.ok, bound to the load job's
+  # ServiceAccount (the chart binds the workers' when they run; staging's are synthetic).
+  extraRobots:
+    - name: worker.ok
+      bindings: [{issuer: https://container.googleapis.com/v1/projects/PROJECT/locations/us-central1/clusters/ok-staging, subject: "system:serviceaccount:ok:ok-load"}]
+database:
+  spanner: {instance: projects/PROJECT/instances/ok-staging, prefix: staging}
+config:
+  profiling: true # Go's profiles on the metrics port: what a run under load spends its CPU on
+  bus:
+    stream: {type: nats, nats: {url: "nats://nats.nats.svc:4222", prefix: ok}}
+    queue: {type: nats, nats: {url: "nats://nats.nats.svc:4222", prefix: ok}}
+  identity:
+    sign_in:
+      oidc:
+        - {id: dex, name: Dex, issuer: "http://dex.dex.svc:5556", client_id: ok, client_secret_file: /etc/ok/secrets/oidc/client-secret}
+    system_of_record:
+      static: {file: /etc/ok/secrets/people/people.yaml}
+  scm:
+    objects: {type: gcs, bucket: PROJECT-ok-staging-objects}
+  automation:
+    logs: {type: gcs, bucket: PROJECT-ok-staging-logs}
+server:
+  replicas: 3
+  serviceAccountAnnotations: {iam.gke.io/gcp-service-account: ok-staging-ok@PROJECT.iam.gserviceaccount.com}
+  extraSecretMounts:
+    - {name: oidc, secretName: ok-oidc, mountPath: /etc/ok/secrets/oidc}
+    - {name: people, secretName: ok-people, mountPath: /etc/ok/secrets/people}
+worker:
+  enabled: false # the load generator's synthetic workers stand in
+deploy:
+  enabled: false

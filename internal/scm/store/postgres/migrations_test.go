@@ -4,8 +4,6 @@ import (
 	"context"
 	"testing"
 
-	"github.com/jackc/pgx/v5/pgxpool"
-
 	"github.com/Cidan/ok/internal/migrate"
 	"github.com/Cidan/ok/internal/scm/store/postgres"
 	"github.com/Cidan/ok/internal/testdb"
@@ -13,15 +11,10 @@ import (
 
 // The events written before repositories had logs of their own are numbered in their repositories'
 // logs, in the feed's order, and each repository's counter starts after its last; the feed's own
-// counter goes, its numbers kept for the events it numbered, and an event is keyed by its
-// repository's log.
+// counter and numbers go, and an event is keyed by its repository's log.
 func TestRepositoryEventsMigration(t *testing.T) {
 	ctx := context.Background()
-	pool, err := pgxpool.New(ctx, testdb.Postgres(t))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(pool.Close)
+	pool := testdb.Pool(t)
 	if _, err := migrate.Apply(ctx, pool, "scm", postgres.Migrations[:2]); err != nil {
 		t.Fatal(err)
 	}
@@ -39,7 +32,8 @@ func TestRepositoryEventsMigration(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if _, err := migrate.Apply(ctx, pool, "scm", postgres.Migrations); err != nil {
+	// Through 0006, which keeps the feed's numbers to read the order by.
+	if _, err := migrate.Apply(ctx, pool, "scm", postgres.Migrations[:6]); err != nil {
 		t.Fatal(err)
 	}
 	rows, err := pool.Query(ctx, `SELECT repository_id, repository_seq FROM event ORDER BY seq`)
@@ -85,12 +79,15 @@ func TestRepositoryEventsMigration(t *testing.T) {
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM event_pending`).Scan(&pending); err != nil || pending != 0 {
 		t.Errorf("%d events pending (%v): the old ones are read from the log, not relayed", pending, err)
 	}
-	var old int64
-	if err := pool.QueryRow(ctx, `SELECT seq FROM event WHERE repository_id = $1 AND repository_seq = 3`, repos[0]).Scan(&old); err != nil || old != 4 {
-		t.Errorf("a's third event's place in the old feed: %d, %v; want 4", old, err)
+	if _, err := migrate.Apply(ctx, pool, "scm", postgres.Migrations); err != nil {
+		t.Fatal(err)
+	}
+	var numbered bool
+	if err := pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'event' AND column_name = 'seq')`).Scan(&numbered); err != nil || numbered {
+		t.Errorf("events still carry the feed's numbers: %v, %v", numbered, err)
 	}
 	if _, err := pool.Exec(ctx, `INSERT INTO event (repository_id, repository_seq, body) VALUES ($1, 1, '')`, repos[2]); err != nil {
-		t.Errorf("an event with no place in the old feed: %v", err)
+		t.Errorf("an event: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `INSERT INTO event (repository_id, repository_seq, body) VALUES ($1, 1, '')`, repos[2]); err == nil {
 		t.Error("two events at one place in a repository's log")
@@ -98,5 +95,13 @@ func TestRepositoryEventsMigration(t *testing.T) {
 	var counter bool
 	if err := pool.QueryRow(ctx, `SELECT to_regclass('event_counter') IS NOT NULL`).Scan(&counter); err != nil || counter {
 		t.Errorf("the old feed's counter is still there: %v, %v", counter, err)
+	}
+	// The repositories keep the IDs their sequence gave them; a new one names its own.
+	var kept int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM repository WHERE id = ANY($1)`, repos[:]).Scan(&kept); err != nil || kept != 3 {
+		t.Errorf("%d of the 3 repositories keep their IDs (%v)", kept, err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO repository (name, head, created_by) VALUES ('d', $1, 'ada')`, make([]byte, 32)); err == nil {
+		t.Error("a repository made with no ID: its ID is the SCM's to choose")
 	}
 }

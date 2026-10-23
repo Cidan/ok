@@ -41,6 +41,11 @@ const (
 	Caller_CALLER_AUTOMATION Caller = 13
 	Caller_CALLER_WORKER     Caller = 14
 	Caller_CALLER_DEPLOY     Caller = 15
+	// ok's edge, which authenticates and routes people's requests to the cells (docs/hosted.md,
+	// "Cells, as built").
+	Caller_CALLER_EDGE Caller = 16
+	// ok secrets, which holds repositories' secrets' values (docs/secrets.md).
+	Caller_CALLER_SECRETS Caller = 17
 )
 
 // Enum value maps for Caller.
@@ -56,6 +61,8 @@ var (
 		13: "CALLER_AUTOMATION",
 		14: "CALLER_WORKER",
 		15: "CALLER_DEPLOY",
+		16: "CALLER_EDGE",
+		17: "CALLER_SECRETS",
 	}
 	Caller_value = map[string]int32{
 		"CALLER_UNSPECIFIED": 0,
@@ -68,6 +75,8 @@ var (
 		"CALLER_AUTOMATION":  13,
 		"CALLER_WORKER":      14,
 		"CALLER_DEPLOY":      15,
+		"CALLER_EDGE":        16,
+		"CALLER_SECRETS":     17,
 	}
 )
 
@@ -122,7 +131,7 @@ var File_proto_ok_v1_annotations_proto protoreflect.FileDescriptor
 
 const file_proto_ok_v1_annotations_proto_rawDesc = "" +
 	"\n" +
-	"\x1dproto/ok/v1/annotations.proto\x12\x05ok.v1\x1a google/protobuf/descriptor.proto*\xcf\x01\n" +
+	"\x1dproto/ok/v1/annotations.proto\x12\x05ok.v1\x1a google/protobuf/descriptor.proto*\xf4\x01\n" +
 	"\x06Caller\x12\x16\n" +
 	"\x12CALLER_UNSPECIFIED\x10\x00\x12\x11\n" +
 	"\rCALLER_ANYONE\x10\x01\x12\x11\n" +
@@ -135,7 +144,9 @@ const file_proto_ok_v1_annotations_proto_rawDesc = "" +
 	"\x0eCALLER_CONTROL\x10\f\x12\x15\n" +
 	"\x11CALLER_AUTOMATION\x10\r\x12\x11\n" +
 	"\rCALLER_WORKER\x10\x0e\x12\x11\n" +
-	"\rCALLER_DEPLOY\x10\x0f:J\n" +
+	"\rCALLER_DEPLOY\x10\x0f\x12\x0f\n" +
+	"\vCALLER_EDGE\x10\x10\x12\x12\n" +
+	"\x0eCALLER_SECRETS\x10\x11:J\n" +
 	"\acallers\x12\x1f.google.protobuf.ServiceOptions\x18\xb8\x8e\x03 \x03(\x0e2\r.ok.v1.CallerR\acallersB&Z$github.com/Cidan/ok/proto/ok/v1;okpbb\x06proto3"
 
 var (

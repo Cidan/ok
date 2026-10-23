@@ -98,6 +98,7 @@ jj cl resolve 31                 # resolve a thread (--reopen to reopen it)
 jj cl submit -f                  # submit, then follow it until deployed (--stack for its ancestors)
 jj cl submit --cancel            # stop its submission
 jj cl rerun                      # rerun every failed check of its pre (or name runs)
+jj cl pre                        # run a draft's pre by hand, or a CL's under its stack's top
 jj cl cancel 5012                # cancel runs
 jj cl log 5012 -f                # a run's log (--tail BYTES for its end)
 jj cl deployment retry 412       # retry, halt, or allow a deployment of a landed CL
@@ -110,7 +111,7 @@ jj cl rollback 87 -m 'broke prod'    # a new CL undoing a landed one
 
 | Stage | Means | Waits on |
 |---|---|---|
-| draft | pre passed; not sent for review | its author |
+| draft | not sent for review: its pre runs once it is (or by hand, `jj cl pre`) | its author |
 | pre running | its current patchset's pre is being planned or run | ok |
 | pre failed | | its author |
 | in review | pre passed; no LGTM, an owner set's Approval, or an unresolved thread | reviewers (and its author, for threads) |
@@ -122,6 +123,10 @@ jj cl rollback 87 -m 'broke prod'    # a new CL undoing a landed one
 | deployed | every one succeeded, or there were none | nobody |
 | deploy failed | one failed or was halted | its author |
 | abandoned | | nobody |
+
+Pre runs at a stack's top in review, over every CL of it (docs/automation.md, "pre"): a CL under
+the top (`pre_at`, the top's number) is in review or submittable on its review alone, and submits
+with its stack, from the top (`jj cl submit --stack`).
 
 **Following** (`-f`) prints a line whenever a CL's stage, summary, or who it waits on changes, and
 stops once it is **settled**: deployed, failed, or waiting on a person — so an agent never hangs on
@@ -178,7 +183,7 @@ Two shapes, differing only in what a new change is based on:
 - **Stacked CLs** (a dependent chain) — each on top of the last: `jj new 'trunk()' -m A`;
   `jj new -m B`. B's CL names A's as its parent.
 
-Server side a CL is named by its number (`ok.example.com/<repo>/cl/2`); locally by its change ID or
+Server side a CL is named by its number (`ok.example.com/<owner>/<repo>/cl/2`); locally by its change ID or
 description — the same object, two names. **Other people's CLs:** `jj cl get <n>` brings a CL's
 current patchset into your view as the immutable bookmark `cl/<n>@ok`; you can test it or stack
 your own changes on it, and `jj sync` follows it through new patchsets and its landing.
@@ -353,7 +358,7 @@ status change and its diffs keep rendering. What lingers is the author's own jj 
 `jj cl` of it is refused ("CL n is abandoned: restore it first, or drop the change with jj
 abandon"), and the abandoned CL's page shows the exact command, `jj abandon <change id>`, to copy.
 
-**The finder** (`/<repo>/cls?f=`) has views: **Open** (the default — open CLs plus the viewer's own
+**The finder** (`/<owner>/<repo>/cls?f=`) has views: **Open** (the default — open CLs plus the viewer's own
 drafts), **Drafts** (everyone's), **Needs My Review** (open CLs the viewer reviews and hasn't
 granted on), **Merged**, **Abandoned**, and **All**.
 

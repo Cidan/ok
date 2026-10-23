@@ -59,7 +59,10 @@ deploy:
       - //services/billing/db:migrate
 ```
 
-- **Keys.** A deploy's keys are `migrate`, `images`, `workload`, `group`, and `alone`. `images`
+- **Keys.** A deploy's keys are `migrate`, `images`, `workload`, `group`, `alone`, and `secrets`
+  — the secrets its migrations read, `//secret/<path>`, which its folder's `acl.yaml` must give the
+  deploy (`deploys:`), each a file in `$OK_SECRETS_DIR` while a migration runs
+  ([secrets.md](secrets.md), "Readers that are not people"). `images`
   and `workload` come together or not at all; a deploy has at least `migrate` or `images`.
   `workload` is `namespace` and exactly one of `deployment` and `statefulset`. `group` names the
   group its service is shown in, so only a deploy with a workload has one. `alone: true` makes its
@@ -271,13 +274,52 @@ ServiceAccount, and adds no host access.
 - **The deployer** is a role of its own (`ok deploy serve`), on its tables (the schema `deploy`).
   It follows `main`, checks each commit it plans out — through okfs, reading ahead only the build
   graph and the workflow files planning reads, or written to disk (`deploy.checkout`) — plans with
-  Bazel, runs migrations, rolls, and watches. One replica drives deployments at a time, under its
-  leader lock.
+  Bazel, runs migrations, rolls, and watches. No replica leads ([hosted.md](hosted.md), "Work
+  without leaders"): every replica plans each repository whose main moved under that repository's
+  lease, starts the deployments whose turn has come in one transaction at a time — so no two
+  deployments ever hold one deploy or workload, whichever replicas start them — and steps each
+  deployment under that deployment's lock, every write it makes fenced by it, so a replica that
+  stalled past its lease writes nothing after another has taken over.
 - **Workers build and push.** A push is a job the deployer asks ok automation to run (its `Pushes`
   service); the worker runs Bazel and reports the digest. Workers never hold the deployer's
   permissions, and the deployer never builds an image.
 - **ok control** shows deployments on the CLs they cover and asks the deployer to retry, halt, and
   allow a hazard, for a person it has authorized.
+
+## Deploy agents
+
+An organization's workloads may run in a cluster of its own, which ok's deployer holds no credential
+to: its **deploy agent** runs there and connects out to ok, and the deployer rolls and migrates
+through it ([hosted.md](hosted.md), "Deploy agents, as built"). A hosted service deploys every
+repository so; a single installation deploys to its own cluster unless an owner designates an agent.
+
+1. **A robot.** The organization's owners make a robot (`CreateOrganizationRobot`), designate it its
+   deploy agent (ok identity's `DeployAgents.SetDeployAgent`), and grant it read on the
+   repositories whose migrations it runs.
+2. **Its sign-in.** Either the owners trust the cluster's ServiceAccount issuer (`TrustIssuer`) and
+   bind the robot to the agent's ServiceAccount (`BindOrganizationRobot`,
+   `system:serviceaccount:<namespace>:<release>-agent`), its token's audience the organization's ID;
+   or they certify a key for it (`CertifyOrganizationRobot`) and keep it in a Secret.
+3. **The agent.** The `ok-agent` chart (`deploy/helm/ok-agent`) runs it: `address` (ok's public
+   address), `organizationID` or `credentialSecret`, `namespaces` (each granted what *Grants*
+   lists), and `migrations.env` (the environment migrations run with, from Secrets — where they find
+   their databases). It runs one agent: a newer connection of an organization's agent replaces the
+   older.
+
+```
+ok deploy agent -address ok.example.com:443 -token-file /var/run/secrets/ok/token/token -state /var/lib/ok-agent
+```
+
+What the agent does for a deployer is narrow, whatever its RBAC allows: it reads and rolls
+Deployments and StatefulSets, reads ReplicaSets and pods, and reads discovery — never a Secret, a
+pod's exec, attach, log, or port, a proxy, a token, a delete — and it passes on no header that
+authenticates or impersonates. It runs a migration only of its organization's repositories, only at
+a commit on main, checked out as its robot. While it is not connected, a repository's plans and
+deployments wait — the deployment's log and the Services page say so — and go on once it is.
+
+Each deployer replica advertises where the others reach it (`OK_DEPLOY_ADDRESS`, its pod's address
+and port; the chart sets it), so whichever replica an agent connected to, every replica's requests
+reach it.
 
 ## Resuming, and deploying the deployer
 
@@ -286,8 +328,8 @@ the deployer itself.
 
 - **Every decision is taken again from the database and the cluster.** A deployment's stage, what
   it rolled from, and when each stage began are stored; the watch reads pod start times, readiness,
-  and restart counts from the cluster, not from timers in memory. An instance that takes the lock
-  resumes each deployment where it stands.
+  and restart counts from the cluster, not from timers in memory. Whichever replica takes a
+  deployment's lock resumes it where it stands.
 - **Its own deployment is driven by the old version** until the new one has passed. Each copy of
   the deployer knows which it is — its pod's `deploy.ok.<domain>/color` label, given it as
   `OK_DEPLOY_COLOR` through the downward API — and the deployment records the copy that started it:
@@ -312,9 +354,10 @@ declared anywhere, and a service with no group is a group of its own. A group's 
 service's (Last Deploy Failed, then Degraded, Unknown, Drifted, Deploying, Not Deployed Yet,
 Healthy).
 
-**What runs is read in the background, never on a request.** The deployer's observer — one replica
-at a time — reads every service's workload from the cluster and records it, then waits ten seconds
-from the end of that round before the next. A request reads only what was recorded.
+**What runs is read in the background, never on a request.** The deployer's observer reads each
+service's workload from the cluster and records it, ten seconds after its last read ended: each
+service's reading is keyed work, taken by whichever replica is free, one at a time, its record
+fenced by its lease. A request reads only what was recorded.
 
 ## On the CL
 

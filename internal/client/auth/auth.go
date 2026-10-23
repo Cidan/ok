@@ -47,6 +47,9 @@ type Server struct {
 	URL  string `json:"url"`
 	Addr string `json:"addr"`
 	TLS  bool   `json:"tls"`
+	// WaitForReady has its calls wait for a connection (dial.Options), for a caller with a
+	// deadline of its own; never saved.
+	WaitForReady bool `json:"-"`
 }
 
 // ParseServer reads ok's public URL: https://ok.example.com is reached on 443 over TLS; http:// is
@@ -68,10 +71,15 @@ func ParseServer(raw string) (Server, error) {
 	return s, nil
 }
 
-// Dial connects to the server with options as given, its TLS added.
+// Dial connects to the server with options as given, its TLS added. A plaintext server on an
+// address that is not loopback is reached only with OK_PLAINTEXT=1, as ok's jj reaches one: a network
+// the installation trusts, such as its cluster's or a service mesh's.
 func (s Server) Dial(o dial.Options) (*grpc.ClientConn, error) {
+	o.WaitForReady = o.WaitForReady || s.WaitForReady
 	if s.TLS {
 		o.TLS = &tls.Config{MinVersion: tls.VersionTLS12}
+	} else if os.Getenv("OK_PLAINTEXT") == "1" {
+		o.Insecure = true
 	}
 	return dial.Dial(s.Addr, o)
 }

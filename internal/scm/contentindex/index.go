@@ -8,19 +8,23 @@ import (
 	"github.com/Cidan/ok/internal/scm/encoding"
 )
 
-// Index is one repository's whole content index in memory: the blocks of its generation and
-// every log row applied since, in the order they were written. Its methods are safe for
-// concurrent use; an entry's Chunks are shared and must not be changed.
+// Index is a content index in memory, as far as the database's tables hold it — the blocks of its
+// generation and every log row applied since, once each, in the order they apply — with the moves
+// logged of chunks it lacks, whose entries are in segments, and the drops logged since, which hide
+// whatever a segment holds of what they dropped until a fold writes their tombstones. Its methods
+// are safe for concurrent use; an entry's Chunks are shared and must not be changed.
 type Index struct {
 	mu         sync.RWMutex
 	generation int64
 	entries    map[encoding.ID]Entry
-	logs       map[int64]struct{}
+	moved      map[encoding.ID]Location
+	dropped    map[encoding.ID]encoding.Kind
 }
 
 // New returns an empty index of a generation.
 func New(generation int64) *Index {
-	return &Index{generation: generation, entries: map[encoding.ID]Entry{}, logs: map[int64]struct{}{}}
+	return &Index{generation: generation, entries: map[encoding.ID]Entry{}, moved: map[encoding.ID]Location{},
+		dropped: map[encoding.ID]encoding.Kind{}}
 }
 
 // Generation is the generation of the blocks it was built from.
@@ -54,44 +58,81 @@ func (x *Index) ApplyBlock(body []byte) error {
 	return nil
 }
 
-// ApplyLog applies a log row's updates, once: a row already applied is skipped.
-func (x *Index) ApplyLog(id int64, body []byte) error {
-	if x.HasLog(id) {
-		return nil
-	}
+// ApplyLog applies a log row's updates. The reader applies each row once — a drop applied again
+// after a later put of the entry would drop it — as its place in the log says (backend.LogPlace).
+func (x *Index) ApplyLog(body []byte) error {
 	updates, err := DecodeLog(body)
 	if err != nil {
 		return err
 	}
 	x.mu.Lock()
 	defer x.mu.Unlock()
-	if _, done := x.logs[id]; done {
-		return nil
-	}
 	for _, u := range updates {
 		switch u.Op {
 		case Drop:
 			delete(x.entries, u.ID)
+			delete(x.moved, u.ID)
+			x.dropped[u.ID] = u.Entry.Kind
 		case Move:
-			// A chunk dropped before compaction moved it stays dropped.
+			if _, gone := x.dropped[u.ID]; gone {
+				// A drop is final until the entry is put again: there is nothing to move.
+				continue
+			}
 			if e, ok := x.entries[u.ID]; ok && e.Body {
 				e.Loc = u.Entry.Loc
 				x.entries[u.ID] = e
+			} else {
+				x.moved[u.ID] = u.Entry.Loc
 			}
 		default:
+			if u.Op == Put {
+				delete(x.dropped, u.ID)
+			}
 			x.put(u.ID, u.entry())
 		}
 	}
-	x.logs[id] = struct{}{}
 	return nil
 }
 
-// HasLog reports whether a log row is applied.
-func (x *Index) HasLog(id int64) bool {
+// Dropped reports whether a drop of id was logged since, and none of its entries put after it:
+// whatever a segment holds of it is gone.
+func (x *Index) Dropped(id encoding.ID) bool {
 	x.mu.RLock()
 	defer x.mu.RUnlock()
-	_, ok := x.logs[id]
+	_, ok := x.dropped[id]
 	return ok
+}
+
+// DroppedIDs returns what Dropped reports, in ID order, each with its kind.
+func (x *Index) DroppedIDs() []Keyed {
+	x.mu.RLock()
+	out := make([]Keyed, 0, len(x.dropped))
+	for id, k := range x.dropped {
+		out = append(out, Keyed{ID: id, Entry: Entry{Kind: k}})
+	}
+	x.mu.RUnlock()
+	sort.Slice(out, func(i, j int) bool { return bytes.Compare(out[i].ID[:], out[j].ID[:]) < 0 })
+	return out
+}
+
+// Moved returns the location a move logged of a chunk the index lacks, if one was.
+func (x *Index) Moved(id encoding.ID) (Location, bool) {
+	x.mu.RLock()
+	defer x.mu.RUnlock()
+	l, ok := x.moved[id]
+	return l, ok
+}
+
+// MovedIDs returns the chunks the index lacks that a move was logged of, in ID order.
+func (x *Index) MovedIDs() []encoding.ID {
+	x.mu.RLock()
+	out := make([]encoding.ID, 0, len(x.moved))
+	for id := range x.moved {
+		out = append(out, id)
+	}
+	x.mu.RUnlock()
+	sort.Slice(out, func(i, j int) bool { return bytes.Compare(out[i][:], out[j][:]) < 0 })
+	return out
 }
 
 // Get returns a file's or chunk's entry, if the index knows its body.

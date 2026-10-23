@@ -84,8 +84,9 @@ type Bus struct {
 }
 
 var (
-	_ bus.Stream = (*Bus)(nil)
-	_ bus.Queue  = (*Bus)(nil)
+	_ bus.Stream  = (*Bus)(nil)
+	_ bus.Queue   = (*Bus)(nil)
+	_ bus.Signals = (*Bus)(nil)
 )
 
 // Open brings the database pool reaches (its search path the bus schema, internal/pgdb) to the

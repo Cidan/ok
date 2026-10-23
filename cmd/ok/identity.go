@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"text/tabwriter"
@@ -24,8 +25,6 @@ import (
 	"github.com/Cidan/ok/internal/id/ca"
 	"github.com/Cidan/ok/internal/id/role"
 	idstore "github.com/Cidan/ok/internal/id/store"
-	idpostgres "github.com/Cidan/ok/internal/id/store/postgres"
-	"github.com/Cidan/ok/internal/pgdb"
 	"github.com/Cidan/ok/internal/serve"
 	identitypb "github.com/Cidan/ok/proto/ok/identity/v1"
 )
@@ -52,7 +51,7 @@ func identityServe(args []string) error {
 		return err
 	}
 	defer r.Close()
-	opts := []serve.Option{serve.WithAuthn(r.Resolver), serve.WithListenAddr(cfg.Listen), serve.WithMetricsAddr(cfg.MetricsListen)}
+	opts := []serve.Option{serve.WithAuthn(r.Resolver), serve.WithListenAddr(cfg.Listen), serve.WithMetricsAddr(cfg.MetricsListen), serve.WithProfiling(cfg.Profiling)}
 	if cfg.TLS != nil {
 		tc, err := serve.LoadTLS(cfg.TLS.Cert, cfg.TLS.Key)
 		if err != nil {
@@ -133,19 +132,11 @@ func identityCertify(args []string, stdout io.Writer) error {
 	}
 
 	ctx := context.Background()
-	dsn, err := config.Secret(cfg.Database.URLFile)
-	if err != nil {
-		return fmt.Errorf("database.url_file: %w", err)
-	}
-	pool, err := pgdb.Open(ctx, dsn, role.Schema, 2)
+	b, _, done, err := role.OpenBackend(ctx, cfg, 2)
 	if err != nil {
 		return err
 	}
-	defer pool.Close()
-	b, err := idpostgres.Open(ctx, pool)
-	if err != nil {
-		return fmt.Errorf("the identity store: %w", err)
-	}
+	defer done()
 	st := idstore.New(b, names)
 	authority, err := ca.Load(cfg.Identity.CADir)
 	if err != nil {
@@ -305,6 +296,12 @@ const adminUsage = `ok admin — administering ok identity, as the signed-in adm
                                              write its credential to DIR (workload.credential_dir)
   ok admin credentials PRINCIPAL             list a principal's credentials
   ok admin revoke CREDENTIAL                 revoke a credential
+  ok admin move REPOSITORY CELL              move a repository's fork network to another cell
+  ok admin moves                             list the moves between cells, and where each is
+  ok admin cancel-move NETWORK               abandon a move the directory has not finished naming
+  ok admin quota ACCOUNT [-concurrent N] [-minutes M] [-weight W] [-reset]
+                                             show an account's quota of CI, or set it: concurrent
+                                             runs, run minutes a month (0: unlimited), fair-share weight
 `
 
 func admin(args []string, stdout io.Writer) error {
@@ -397,8 +394,54 @@ func admin(args []string, stdout io.Writer) error {
 		}
 		_, err := client.RevokeCredential(ctx, &identitypb.RevokeCredentialRequest{Id: args[1]})
 		return err
+	case "move":
+		if len(args) != 3 {
+			return usageError("ok admin move REPOSITORY CELL")
+		}
+		m, err := client.MoveNetwork(ctx, &identitypb.MoveNetworkRequest{Repository: args[1], Cell: args[2]})
+		if err != nil {
+			return err
+		}
+		printMove(stdout, m)
+		return nil
+	case "moves":
+		resp, err := client.ListMoves(ctx, &identitypb.ListMovesRequest{})
+		if err != nil {
+			return err
+		}
+		for _, m := range resp.GetMoves() {
+			printMove(stdout, m)
+		}
+		return nil
+	case "quota":
+		return adminQuota(ctx, client, args[1:], stdout)
+	case "cancel-move":
+		if len(args) != 2 {
+			return usageError("ok admin cancel-move NETWORK")
+		}
+		network, err := strconv.ParseInt(args[1], 10, 64)
+		if err != nil {
+			return usageError("ok admin cancel-move NETWORK: a network's ID, as ok admin moves shows it")
+		}
+		m, err := client.CancelMove(ctx, &identitypb.CancelMoveRequest{NetworkId: network})
+		if err != nil {
+			return err
+		}
+		printMove(stdout, m)
+		return nil
 	}
 	return usageError(fmt.Sprintf("unknown command ok admin %s\n%s", args[0], adminUsage))
+}
+
+// printMove shows a move: its network and repositories, where from and to, where it is, and why
+// its last step failed.
+func printMove(w io.Writer, m *identitypb.Move) {
+	fmt.Fprintf(w, "network %d  %s -> %s  %s  asked by %s %s\n", m.GetNetworkId(), m.GetSource(), m.GetDestination(), m.GetPhase(),
+		m.GetAskedBy(), m.GetAskedAt().AsTime().Format(time.RFC3339))
+	fmt.Fprintf(w, "  %s\n", strings.Join(m.GetRepositories(), ", "))
+	if m.GetError() != "" {
+		fmt.Fprintf(w, "  last step failed: %s\n", m.GetError())
+	}
 }
 
 func adminRobot(ctx context.Context, client identitypb.AdminClient, srv auth.Server, args []string, stdout io.Writer) error {
@@ -464,4 +507,63 @@ func or(s, def string) string {
 		return def
 	}
 	return s
+}
+
+// adminQuota shows an account's quota of CI, or sets it.
+func adminQuota(ctx context.Context, client identitypb.AdminClient, args []string, stdout io.Writer) error {
+	flags := flag.NewFlagSet("admin quota", flag.ContinueOnError)
+	concurrent := flags.Int("concurrent", -1, "concurrent runs (0: unlimited)")
+	minutes := flags.Int64("minutes", -1, "run minutes in a calendar month (0: unlimited)")
+	weight := flags.Int("weight", -1, "weight in fair share")
+	reset := flags.Bool("reset", false, "give the account the default quota again")
+	if len(args) == 0 {
+		return usageError("ok admin quota ACCOUNT [-concurrent N] [-minutes M] [-weight W] [-reset]")
+	}
+	account := args[0]
+	if err := flags.Parse(args[1:]); err != nil {
+		return flagError(err)
+	}
+	var q *identitypb.Quota
+	var err error
+	switch {
+	case *reset:
+		q, err = client.SetQuota(ctx, &identitypb.SetQuotaRequest{Account: account, Reset_: true})
+	case *concurrent >= 0 || *minutes >= 0 || *weight >= 0:
+		had, err := client.GetQuota(ctx, &identitypb.GetQuotaRequest{Account: account})
+		if err != nil {
+			return err
+		}
+		req := &identitypb.SetQuotaRequest{Account: account, Concurrent: had.GetConcurrent(), Minutes: had.GetMinutes(), Weight: had.GetWeight()}
+		if *concurrent >= 0 {
+			req.Concurrent = int32(*concurrent)
+		}
+		if *minutes >= 0 {
+			req.Minutes = *minutes
+		}
+		if *weight >= 0 {
+			req.Weight = int32(*weight)
+		}
+		q, err = client.SetQuota(ctx, req)
+		if err != nil {
+			return err
+		}
+	default:
+		q, err = client.GetQuota(ctx, &identitypb.GetQuotaRequest{Account: account})
+	}
+	if err != nil {
+		return err
+	}
+	limit := func(n int64, unit string) string {
+		if n == 0 {
+			return "unlimited " + unit
+		}
+		return fmt.Sprintf("%d %s", n, unit)
+	}
+	kind := ""
+	if q.GetDefault() {
+		kind = " (the default)"
+	}
+	fmt.Fprintf(stdout, "%s: %s, %s a month, weight %d%s\n", account, limit(int64(q.GetConcurrent()), "concurrent runs"),
+		limit(q.GetMinutes(), "minutes"), q.GetWeight(), kind)
+	return nil
 }

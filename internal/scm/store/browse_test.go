@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Cidan/ok/internal/data"
 	"github.com/Cidan/ok/internal/scm/encoding"
 )
 
@@ -509,20 +510,26 @@ func TestBrowseAnnotateAndAncestry(t *testing.T) {
 	}
 }
 
-func TestRepositoryNames(t *testing.T) {
+// A repository is made under the ID and network the directory chose, once: names are the
+// directory's.
+func TestCreateRepository(t *testing.T) {
 	ctx := context.Background()
 	s := testStore(t)
-	for _, name := range []string{"assets", "repositories", "services", "healthz", "readyz", "Upper", "-x", "a/b", ""} {
-		if _, err := s.CreateRepository(ctx, name, "alice.human.example.com"); !errors.Is(err, ErrInvalid) {
-			t.Errorf("created %q: %v", name, err)
+	for _, ids := range [][2]int64{{0, 1}, {1, 0}} {
+		if _, err := s.CreateRepository(ctx, ids[0], ids[1], "alice.human.example.com"); !errors.Is(err, ErrInvalid) {
+			t.Errorf("made under %v: %v", ids, err)
 		}
 	}
-	r, err := s.CreateRepository(ctx, "assets-2", "alice.human.example.com")
-	if err != nil {
-		t.Fatal(err)
+	id, net := data.NewID(), data.NewID()
+	r, err := s.CreateRepository(ctx, id, net, "alice.human.example.com")
+	if err != nil || r.ID != id || int64(r.Network) != net || r.Head != encoding.RootCommitID || r.CreatedBy != "alice.human.example.com" {
+		t.Fatalf("CreateRepository = %+v, %v", r, err)
 	}
-	if _, err := s.RenameRepository(ctx, r.ID, "assets"); !errors.Is(err, ErrInvalid) {
-		t.Errorf("renamed to a reserved name: %v", err)
+	if _, err := s.CreateRepository(ctx, id, data.NewID(), "bob.human.example.com"); !errors.Is(err, ErrAlreadyExists) {
+		t.Errorf("an ID made twice: %v, want ErrAlreadyExists", err)
+	}
+	if got, err := s.GetRepository(ctx, id); err != nil || got.ID != id {
+		t.Errorf("the repository by its ID: %+v, %v", got, err)
 	}
 }
 

@@ -5,13 +5,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/klauspost/compress/zstd"
 
+	"github.com/Cidan/ok/internal/scm/contentindex"
 	"github.com/Cidan/ok/internal/scm/encoding"
 	"github.com/Cidan/ok/internal/scm/pack"
+	"github.com/Cidan/ok/internal/scm/store/backend"
 )
 
 // goFile is a small source file, like the many a repository holds: what a dictionary learns.
@@ -57,6 +60,8 @@ func TestDictionaries(t *testing.T) {
 	commit := b.commit(b.tree(entries...), "many small files", encoding.RootCommitID)
 	op := b.operation(b.view(commit), "snapshot", encoding.RootOperationID)
 	mustPublish(t, e.s, e.repo, alice, b, &OpHeadsUpdate{New: op})
+	// Uploaded, so pinned: only pinned files train a dictionary.
+	e.mustUpload(alice, Ready, commit)
 
 	r, err := e.s.GC(ctx, e.repo, time.Now(), GCOptions{})
 	if err != nil {
@@ -65,11 +70,19 @@ func TestDictionaries(t *testing.T) {
 	if r.DictionaryTrained == 0 || r.DictionarySamples < 50 || r.Dictionary != r.DictionaryTrained || r.ChunksRecompressed == 0 || r.BytesRecompressed <= 0 {
 		t.Fatalf("no dictionary trained and used: %s", r)
 	}
+	// Pinned, the chunks' locations are folded into the chunk index's segments: read it whole.
 	var dictChunks int
-	for _, k := range indexOf(t, e.s, e.repo).Sorted() {
-		if k.Entry.Kind == encoding.KindChunk && pack.Codec(k.Entry.Loc.Codec) == pack.ZstdDict {
+	v, err := reopen(t, e.s).contentView(ctx, backend.NetworkScope(netOf(t, e.s, e.repo)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := v.each(ctx, func(_ encoding.ID, e contentindex.Entry) bool {
+		if e.Kind == encoding.KindChunk && pack.Codec(e.Loc.Codec) == pack.ZstdDict {
 			dictChunks++
 		}
+		return true
+	}); err != nil {
+		t.Fatal(err)
 	}
 	if int64(dictChunks) != r.ChunksRecompressed {
 		t.Fatalf("%d chunks name the dictionary; the pass compressed %d", dictChunks, r.ChunksRecompressed)
@@ -180,6 +193,69 @@ func TestDictionaries(t *testing.T) {
 }
 
 // A repository with too few small files trains none, and compaction is as without dictionaries.
+// A dictionary's ID is its network's: two networks' dictionaries of one ID — as a network moved in
+// from another cell may hold — each decode their own network's chunks, through one store and its
+// decoders, after its reads of the other's.
+func TestDictionariesPerNetwork(t *testing.T) {
+	ctx := context.Background()
+	e := newCLEnv(t)
+	e.s.dictionaryMinSamples = 50
+	other := &clEnv{t: t, s: e.s, repo: newRepo(t, e.s).ID}
+	// Each repository is a network of its own, its files unlike the other's.
+	train := func(env *clEnv, flavor string) (uint32, map[encoding.ID][]byte) {
+		t.Helper()
+		b := newBuilder(t)
+		contents := map[encoding.ID][]byte{}
+		var entries []encoding.TreeEntry
+		for i := range 200 {
+			c := append(goFile(i), fmt.Sprintf("// %s %d: %s\n", flavor, i, strings.Repeat(flavor, 20))...)
+			f := b.file(c)
+			contents[f] = c
+			entries = append(entries, fileEntry(fmt.Sprintf("p%03d.go", i), f))
+		}
+		commit := b.commit(b.tree(entries...), "many small files", encoding.RootCommitID)
+		mustPublish(t, e.s, env.repo, alice, b, &OpHeadsUpdate{New: b.operation(b.view(commit), "snapshot", encoding.RootOperationID)})
+		env.mustUpload(alice, Ready, commit)
+		r, err := e.s.GC(ctx, env.repo, time.Now(), GCOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if r.DictionaryTrained == 0 || r.ChunksRecompressed == 0 {
+			t.Fatalf("%s: no dictionary trained and used: %s", flavor, r)
+		}
+		return r.DictionaryTrained, contents
+	}
+	first, firstFiles := train(e, "alpha")
+	dbOf(e.s).numberDictionariesFrom(t, int64(first-dictionaryIDBase))
+	second, secondFiles := train(other, "omega")
+	if first != second {
+		t.Fatalf("the networks' dictionaries are %d and %d; want one ID", first, second)
+	}
+	for _, s := range []*Store{e.s, reopen(t, e.s)} {
+		for _, side := range []struct {
+			env   *clEnv
+			files map[encoding.ID][]byte
+		}{{e, firstFiles}, {other, secondFiles}} {
+			var ranges []FileRange
+			for f := range side.files {
+				ranges = append(ranges, FileRange{FileID: f})
+			}
+			got := map[encoding.ID][]byte{}
+			if err := s.ReadFiles(ctx, side.env.repo, ranges, RawChunks, func(f FileFrame) error {
+				got[f.FileID] = append(got[f.FileID], f.Data...)
+				return nil
+			}); err != nil {
+				t.Fatalf("repository %d's files: %v", side.env.repo, err)
+			}
+			for f, c := range side.files {
+				if !bytes.Equal(got[f], c) {
+					t.Fatalf("repository %d's file %s reads %q, want %q", side.env.repo, f, got[f], c)
+				}
+			}
+		}
+	}
+}
+
 func TestNoDictionaryForFewFiles(t *testing.T) {
 	ctx := context.Background()
 	e := newCLEnv(t)

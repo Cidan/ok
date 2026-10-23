@@ -23,6 +23,7 @@ memmap2.workspace = true
 ok-credential.workspace = true
 ok-encoding.workspace = true
 ok-proto.workspace = true
+ok-secret.workspace = true
 prost.workspace = true
 prost-types.workspace = true
 ruzstd.workspace = true

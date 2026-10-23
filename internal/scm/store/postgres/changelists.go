@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -60,12 +61,13 @@ func (x queries) ChangeLists(ctx context.Context, repo int64, numbers []int64, l
 	return changeLists(x.q.Query(ctx, sql, repo, numbers))
 }
 
-func (x queries) ListChangeLists(ctx context.Context, repo, before int64, statuses []int16, author string, limit int) ([]backend.ChangeList, error) {
+func (x queries) ListChangeLists(ctx context.Context, repo, before int64, statuses []int16, author string, parent int64, limit int) ([]backend.ChangeList, error) {
 	return changeLists(x.q.Query(ctx, `SELECT `+changelistColumns+` FROM changelist
-		WHERE repository_id = $1 AND ($2 = 0 OR number < $2)
+		WHERE repository_id = $1 AND ($2::bigint = 0 OR number < $2)
 		  AND (cardinality($3::smallint[]) = 0 OR status = ANY($3))
 		  AND ($4 = '' OR author = $4)
-		ORDER BY number DESC LIMIT $5`, repo, before, statuses, author, limit))
+		  AND ($6::bigint = 0 OR parent_number = $6)
+		ORDER BY number DESC LIMIT $5`, repo, before, statuses, author, limit, parent))
 }
 
 func (x queries) ChangeListsOfChanges(ctx context.Context, repo int64, changes [][]byte) ([]backend.ChangeList, error) {
@@ -181,40 +183,105 @@ func (x queries) RollingBack(ctx context.Context, repo int64, numbers []int64, s
 	return n, err == nil, err
 }
 
-func (x queries) StackLandings(ctx context.Context, repo, number int64, submitted int16) ([]backend.Landing, error) {
-	rows, err := x.q.Query(ctx, `WITH RECURSIVE above(number) AS (
-			SELECT $2::bigint
-			UNION
-			SELECT p.cl_number FROM patchset p
-			JOIN above a ON a.number = p.parent_number
-			WHERE p.repository_id = $1
-		)
-		SELECT h.cl_number, h.seq, h.new_head, h.old_head, c.description, c.author
-		FROM above a
-		JOIN changelist c ON c.repository_id = $1 AND c.number = a.number AND c.status = $3
-		JOIN head_log h ON h.repository_id = $1 AND h.cl_number = a.number
-		ORDER BY h.seq`, repo, number, submitted)
+func (x queries) StackedOn(ctx context.Context, repo int64, parents []int64) ([][2]int64, error) {
+	rows, err := x.q.Query(ctx, `SELECT DISTINCT parent_number, cl_number FROM patchset
+		WHERE repository_id = $1 AND parent_number = ANY($2)`, repo, parents)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []backend.Landing
+	var out [][2]int64
 	for rows.Next() {
-		var l backend.Landing
-		var commit, parent []byte
-		if err := rows.Scan(&l.Number, &l.Seq, &commit, &parent, &l.Description, &l.Author); err != nil {
+		var p [2]int64
+		if err := rows.Scan(&p[0], &p[1]); err != nil {
 			return nil, err
 		}
-		if l.Commit, err = toID(commit); err != nil {
-			return nil, err
-		}
-		if l.Parent, err = toID(parent); err != nil {
-			return nil, err
-		}
-		out = append(out, l)
+		out = append(out, p)
 	}
 	return out, rows.Err()
 }
+
+func (x queries) TailLandings(ctx context.Context, repo int64, cls []int64) ([]backend.HeadMove, error) {
+	moves, _, err := headMoves(x.q.Query(ctx, `SELECT seq, old_head, new_head, cl_number, patchset, landed_by, landed_at
+		FROM head_log WHERE repository_id = $1 AND cl_number = ANY($2) ORDER BY seq`, repo, cls))
+	return moves, err
+}
+
+// headMoves reads rows of main's moves, and when each was.
+func headMoves(rows pgx.Rows, err error) ([]backend.HeadMove, []time.Time, error) {
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+	var out []backend.HeadMove
+	var at []time.Time
+	for rows.Next() {
+		var h backend.HeadMove
+		var old, new []byte
+		var t time.Time
+		if err := rows.Scan(&h.Seq, &old, &new, &h.CL, &h.Patchset, &h.By, &t); err != nil {
+			return nil, nil, err
+		}
+		if h.Old, err = toID(old); err != nil {
+			return nil, nil, err
+		}
+		if h.New, err = toID(new); err != nil {
+			return nil, nil, err
+		}
+		out = append(out, h)
+		at = append(at, t)
+	}
+	return out, at, rows.Err()
+}
+
+func (x queries) SettledChangeLists(ctx context.Context, repo int64, limit int) ([]backend.SettledChangeList, error) {
+	cls, err := changeLists(x.q.Query(ctx, `SELECT `+changelistColumns+` FROM changelist
+		WHERE repository_id = $1 AND status = $2 AND landed_commit IS NOT NULL ORDER BY number LIMIT $3`,
+		repo, settledStatus, limit))
+	if err != nil || len(cls) == 0 {
+		return nil, err
+	}
+	numbers := make([]int64, len(cls))
+	for i, c := range cls {
+		numbers[i] = c.Number
+	}
+	pss, err := x.Patchsets(ctx, repo, numbers)
+	if err != nil {
+		return nil, err
+	}
+	moves, at, err := headMoves(x.q.Query(ctx, `SELECT seq, old_head, new_head, cl_number, patchset, landed_by, landed_at
+		FROM head_log WHERE repository_id = $1 AND cl_number = ANY($2)`, repo, numbers))
+	if err != nil {
+		return nil, err
+	}
+	out := make([]backend.SettledChangeList, 0, len(cls))
+	byNumber := map[int64]int{}
+	for _, c := range cls {
+		byNumber[c.Number] = len(out)
+		out = append(out, backend.SettledChangeList{ChangeList: c})
+	}
+	for _, p := range pss {
+		o := &out[byNumber[p.CL]]
+		o.Patchsets = append(o.Patchsets, p)
+	}
+	landed := map[int64]bool{}
+	for i, m := range moves {
+		o := &out[byNumber[m.CL]]
+		o.Landing, o.LandedAt = m, at[i]
+		landed[m.CL] = true
+	}
+	// A CL is settled with its landing: one without (which no landing writes) stays in the tail.
+	kept := out[:0]
+	for _, o := range out {
+		if landed[o.Number] {
+			kept = append(kept, o)
+		}
+	}
+	return kept, nil
+}
+
+// settledStatus is a landed CL's status (store.StatusSubmitted), which nothing moves a CL out of.
+const settledStatus = 3
 
 // ─── Candidates ───
 

@@ -137,7 +137,7 @@ func TestFileLists(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	commit := "/many/commit/" + hex.EncodeToString(cl.LandedCommit)
+	commit := "/example/many/commit/" + hex.EncodeToString(cl.LandedCommit)
 	p = e.get(bob, commit)
 	if all, pages := allRows(t, e, p); strings.Join(all, " ") != strings.Join(want, " ") || fmt.Sprint(pages) != "[100 100 100 50]" {
 		t.Errorf("the commit's pages: %v, %d rows", pages, len(all))

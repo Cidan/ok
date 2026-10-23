@@ -428,3 +428,52 @@ func TestPlanPostSincePre(t *testing.T) {
 		}
 	}
 }
+
+// Each job runs in its pool: a workflow job's own, else the repository's as main's settings name
+// it, as the built-in jobs do; else the default.
+func TestPlanPools(t *testing.T) {
+	main := map[string][]byte{}
+	for p, b := range mainWorkflows {
+		main[p] = b
+	}
+	main["lib/.ok/workflow/lib.yaml"] = []byte("pre:\n  e2e:\n    target: //app:test\n    pool: large\n")
+	for _, tc := range []struct {
+		repository, builtIn, e2e, smoke string
+	}{
+		{"", "default", "large", "default"},
+		{"gpu", "gpu", "large", "gpu"},
+	} {
+		pl, problems := New(Input{Context: change(), Affected: affected(), Main: main, Pool: tc.repository}).Plan(allTargets)
+		if len(problems) != 0 {
+			t.Fatalf("problems: %v", problems)
+		}
+		js := jobs(pl)
+		for job, want := range map[string]string{"build": tc.builtIn, "test //app:test": tc.builtIn, "lint": tc.builtIn,
+			"//lib/.ok/workflow/lib.yaml:pre:e2e": tc.e2e, "//far/.ok/workflow/far.yaml:pre:smoke": tc.smoke} {
+			if got := js[job].GetSpec().GetPool(); got != want {
+				t.Errorf("repository's pool %q: %s runs in %q, want %q", tc.repository, job, got, want)
+			}
+		}
+	}
+}
+
+// A post job naming secrets runs a binary: one whose target is a binary is planned to run; one
+// whose target is a test is a problem, as its actions are cached, and nothing is planned.
+func TestPlanPostSecrets(t *testing.T) {
+	c := change()
+	c.Phase = workflow.Post
+	targets := described(Description{Label: "//app:app", Kind: "go_binary", Binary: true}, Description{Label: "//app:test", Kind: "go_test", Test: true})
+	binary := map[string][]byte{".ok/workflow/root.yaml": []byte("post:\n  push:\n    target: //app:app\n    secrets: [//secret/registry/token]\n")}
+	pl, problems := New(Input{Context: c, Affected: affected(), Main: binary}).Plan(targets)
+	if len(problems) != 0 {
+		t.Fatalf("problems: %v", problems)
+	}
+	if push := jobs(pl)["//.ok/workflow/root.yaml:post:push"]; push.GetSpec().GetKind() != automationpb.Job_KIND_RUN {
+		t.Errorf("the job naming secrets of a binary: %v", push)
+	}
+	test := map[string][]byte{".ok/workflow/root.yaml": []byte("post:\n  e2e:\n    target: //app:test\n    secrets: [//secret/registry/token]\n")}
+	pl, problems = New(Input{Context: c, Affected: affected(), Main: test}).Plan(targets)
+	if pl != nil || len(problems) != 1 || !strings.Contains(problems[0], "job e2e names secrets, and //app:test is no binary") {
+		t.Errorf("a test naming secrets: %v, %v", pl, problems)
+	}
+}

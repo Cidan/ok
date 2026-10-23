@@ -26,6 +26,7 @@ import (
 	"syscall"
 	"time"
 
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -34,10 +35,12 @@ import (
 	"github.com/Cidan/ok/internal/checkout"
 	"github.com/Cidan/ok/internal/identity"
 	"github.com/Cidan/ok/internal/proc"
+	"github.com/Cidan/ok/internal/secrets"
 	"github.com/Cidan/ok/internal/workflow"
 	automationpb "github.com/Cidan/ok/proto/ok/automation/v1"
 	identitypb "github.com/Cidan/ok/proto/ok/identity/v1"
 	scmpb "github.com/Cidan/ok/proto/ok/scm/v1"
+	secretspb "github.com/Cidan/ok/proto/ok/secrets/v1"
 )
 
 // Config is a worker's configuration.
@@ -45,6 +48,9 @@ type Config struct {
 	// Name is the worker's name among the workers (its pod's). With several slots, each holds
 	// its runs' leases as Name/<slot>.
 	Name string
+	// Pool is the pool of workers it serves (docs/hosted.md, "Hosted automation, as built"): ""
+	// for the default one.
+	Pool string
 	Work automationpb.WorkClient
 	// Checkouts present each run's commit, one per slot: the worker runs a run in each at once.
 	// Bases, one per slot too, present a planning run's other commit — the change's base, or the
@@ -91,6 +97,16 @@ type Config struct {
 	// ones that started too recently to show in its use (MemoryRoom). Without it, the slots alone
 	// bound the runs.
 	Room func(starting int) bool
+	// Automation is ok automation, as the worker reaches it: the remote cache the worker's runs
+	// reach through it, when a lease says it serves one. Nil: the runs reach none.
+	Automation grpc.ClientConnInterface
+	// MicroVM, when set, runs each run in a microVM of its own, in a copy of its trust domain's
+	// checkouts and output bases, rather than in the slots' Checkouts and Bases (docs/hosted.md,
+	// "Hosted automation, as built").
+	MicroVM *MicroVM
+	// RunSecrets is ok secrets, which gives a post run the secrets its job names (docs/secrets.md,
+	// "Readers that are not people"); nil where the installation runs none, when such a run fails.
+	RunSecrets secretspb.RunSecretsClient
 
 	// A slot's: its checkouts and their output bases, its scratch (its runs' TMPDIRs), and the other
 	// slots', which its runs do not see.
@@ -98,6 +114,18 @@ type Config struct {
 	outputBase, baseOutputBase string
 	scratch                    string
 	others                     []string
+	// A run's in a microVM: its trust domain's copy, and the command prefix that runs a command in
+	// its guest.
+	domain  *domainCopy
+	wrapper []string
+	// A run's remote cache: whether its lease says there is one, and the socket of the run's own
+	// that its Bazel reaches it at.
+	cache       bool
+	cacheSocket string
+	// A run's lease's key, which proves to ok secrets that the run is this worker's; and the
+	// directory its secrets are in, on a memory file system, "" for none.
+	runKey     []byte
+	secretsDir string
 }
 
 // leaseWait is how long one Lease call waits for a run.
@@ -119,6 +147,9 @@ type slot struct {
 // for a free slot, and only while there is room for it. A run in progress when ctx ends goes
 // back to the queue.
 func Run(ctx context.Context, cfg Config) error {
+	if cfg.MicroVM != nil {
+		return runInMicroVMs(ctx, cfg)
+	}
 	if len(cfg.Checkouts) == 0 || len(cfg.Bases) != len(cfg.Checkouts) {
 		return errors.New("a worker runs its runs in at least one checkout, each with a checkout for a plan's other commit")
 	}
@@ -148,6 +179,32 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 		free <- &slot{cfg: sc, files: &changedFiles{browse: cfg.Browse}}
 	}
+	return lease(ctx, cfg, free)
+}
+
+// runInMicroVMs takes and runs runs, each in a microVM of its own, as many at once as the worker
+// has slots: what each keeps from run to run is its trust domain's.
+func runInMicroVMs(ctx context.Context, cfg Config) error {
+	m := cfg.MicroVM
+	if m.Slots < 1 {
+		return errors.New("a worker runs at least one microVM at once")
+	}
+	if err := m.open(); err != nil {
+		return err
+	}
+	free := make(chan *slot, m.Slots)
+	for i := range m.Slots {
+		sc := cfg
+		if m.Slots > 1 {
+			sc.Name = fmt.Sprintf("%s/%d", cfg.Name, i+1)
+		}
+		free <- &slot{cfg: sc, files: &changedFiles{browse: cfg.Browse}}
+	}
+	return lease(ctx, cfg, free)
+}
+
+// lease leases one run at a time, for a free slot, and only while there is room for it.
+func lease(ctx context.Context, cfg Config, free chan *slot) error {
 	var running sync.WaitGroup
 	defer running.Wait()
 	var started []time.Time
@@ -167,7 +224,7 @@ func Run(ctx context.Context, cfg Config) error {
 		if !waitForRoom(ctx, cfg, starting) {
 			return nil
 		}
-		resp, err := cfg.Work.Lease(ctx, &automationpb.LeaseRequest{Worker: s.cfg.Name, WaitSeconds: int32(leaseWait / time.Second)})
+		resp, err := cfg.Work.Lease(ctx, &automationpb.LeaseRequest{Worker: s.cfg.Name, WaitSeconds: int32(leaseWait / time.Second), Pool: cfg.Pool})
 		if err != nil {
 			free <- s
 			if ctx.Err() != nil {
@@ -196,7 +253,10 @@ func Run(ctx context.Context, cfg Config) error {
 		running.Add(1)
 		go func() {
 			defer running.Done()
-			execute(ctx, s.cfg, s.files, resp.GetRun(), resp.GetContext(), every)
+			c := s.cfg
+			c.cache = resp.GetCache() && c.Automation != nil
+			c.runKey = resp.GetRunKey()
+			execute(ctx, c, s.files, resp.GetRun(), resp.GetContext(), every)
 			free <- s
 		}()
 	}
@@ -279,6 +339,19 @@ func (s *stop) get() (automationpb.HeartbeatResponse_Stop, string) {
 // outcome. It renews the run's lease until the outcome is recorded.
 func execute(ctx context.Context, cfg Config, files *changedFiles, run *automationpb.Run, change []byte, every time.Duration) {
 	log := cfg.Log.With("run", run.GetId())
+	var domainErr error
+	if cfg.MicroVM != nil {
+		c, err := cfg.MicroVM.domains.take(domainOf(run))
+		if err == nil {
+			cfg = cfg.inDomain(c)
+			defer func() {
+				if err := cfg.MicroVM.domains.put(c); err != nil {
+					log.Warn("evicting trust domains", "err", err)
+				}
+			}()
+		}
+		domainErr = err
+	}
 	log.Info("running", "job", run.GetJob().GetKind().String(), "targets", run.GetJob().GetTargets(), "attempt", run.GetAttempt())
 
 	jobCtx, cancelJob := context.WithCancel(context.Background())
@@ -326,7 +399,12 @@ func execute(ctx context.Context, cfg Config, files *changedFiles, run *automati
 		}
 	}()
 
-	result := perform(jobCtx, cfg, files, run, change, stream)
+	var result outcome
+	if domainErr != nil {
+		result = outcome{status: automationpb.Run_STATUS_ERROR, reason: domainErr.Error()}
+	} else {
+		result = perform(jobCtx, cfg, files, run, change, stream)
+	}
 
 	kind, reason := st.get()
 	if !result.stopped && kind != automationpb.HeartbeatResponse_STOP_LEASE_LOST {
@@ -519,8 +597,9 @@ var (
 
 // sandbox is the prefix a run's own programs run within (bubblewrap): every file visible and
 // none writable but tmp, its own, no network, no other process, a session of its own, and gone
-// when the worker is.
-func sandbox(bwrap string, proc []string, tmp, contextFile string) []string {
+// when the worker is. A post run's secrets, in secretsDir, are visible within it alone, read-only,
+// and named by $OK_SECRETS_DIR.
+func sandbox(bwrap string, proc []string, tmp, contextFile, secretsDir string) []string {
 	if proc == nil {
 		proc = ProcFresh
 	}
@@ -530,6 +609,10 @@ func sandbox(bwrap string, proc []string, tmp, contextFile string) []string {
 		"--setenv", "TMPDIR", tmp, "--unshare-net", "--unshare-ipc", "--unshare-pid", "--new-session", "--die-with-parent")
 	if contextFile != "" {
 		out = append(out, "--setenv", workflow.ContextEnv, contextFile)
+	}
+	if secretsDir != "" {
+		// After --dev, whose /dev hides the host's /dev/shm.
+		out = append(out, "--ro-bind", secretsDir, secretsDir, "--setenv", secrets.DirEnv, secretsDir)
 	}
 	return out
 }
@@ -581,6 +664,10 @@ var emptyFile = sync.OnceValue(func() string {
 // the same for each of the slot's runs, so the Bazel server one starts — in its view — serves the
 // next. None without secrets to hide.
 func (cfg Config) hide() []string {
+	if cfg.wrapper != nil {
+		// In a microVM, nothing of the worker's is there to hide.
+		return cfg.wrapper
+	}
 	if len(cfg.Secrets) == 0 {
 		return nil
 	}
@@ -606,7 +693,7 @@ func CheckSandbox(bwrap string, secrets []string) ([]string, error) {
 	}
 	var failed []string
 	for _, proc := range [][]string{ProcFresh, ProcBound} {
-		args := append(sandbox(bwrap, proc, tmp, ""), "true")
+		args := append(sandbox(bwrap, proc, tmp, "", ""), "true")
 		out, err := exec.Command(args[0], args[1:]...).CombinedOutput()
 		if err == nil {
 			return proc, nil
@@ -704,6 +791,44 @@ func perform(ctx context.Context, cfg Config, files *changedFiles, run *automati
 		return outcome{status: automationpb.Run_STATUS_ERROR, reason: "checking out: " + err.Error()}
 	}
 	log.Printf("checked out in %s: %s", time.Since(start).Round(time.Millisecond), stats)
+	values, refused, err := runSecrets(ctx, cfg, run, log)
+	switch {
+	case ctx.Err() != nil:
+		return outcome{status: automationpb.Run_STATUS_CANCELED, reason: "stopped while reading the job's secrets", stopped: true}
+	case err != nil:
+		return outcome{status: automationpb.Run_STATUS_ERROR, reason: err.Error()}
+	case refused != "":
+		return outcome{status: automationpb.Run_STATUS_FAILED, reason: refused}
+	}
+	if len(values) > 0 {
+		// The log redacts the values until the run ends, then clears them.
+		log.hide(values)
+		defer log.reveal()
+		dir, remove, err := secrets.TempDir(values)
+		if err != nil {
+			return outcome{status: automationpb.Run_STATUS_ERROR, reason: "writing the job's secrets: " + err.Error()}
+		}
+		defer remove()
+		cfg.secretsDir = dir
+	}
+	if cfg.cache {
+		proxy, err := cfg.startCache(run)
+		if err != nil {
+			return outcome{status: automationpb.Run_STATUS_ERROR, reason: "the run's remote cache: " + err.Error()}
+		}
+		defer proxy.Stop()
+		cfg.cacheSocket = proxy.path
+	}
+	if cfg.MicroVM != nil {
+		booted := time.Now()
+		vm, err := cfg.startVM(ctx, run, log)
+		if err != nil {
+			return outcome{status: automationpb.Run_STATUS_ERROR, reason: "starting the run's microVM: " + err.Error()}
+		}
+		defer vm.Stop()
+		cfg.wrapper = vm.Exec(cfg.MicroVM.OK)
+		log.Printf("in a microVM of trust domain %s, booted in %s", cfg.domain.key, time.Since(booted).Round(time.Millisecond))
+	}
 
 	if err := os.RemoveAll(tmp); err != nil {
 		return outcome{status: automationpb.Run_STATUS_ERROR, reason: err.Error()}
@@ -713,6 +838,9 @@ func perform(ctx context.Context, cfg Config, files *changedFiles, run *automati
 	}
 	defer os.RemoveAll(tmp)
 	env := append(append([]string(nil), cfg.Env...), "TMPDIR="+tmp)
+	if cfg.MicroVM != nil {
+		env = cfg.vmEnv(env)
+	}
 	if contextFile != "" {
 		env = append(env, workflow.ContextEnv+"="+contextFile)
 	}
@@ -728,7 +856,7 @@ func perform(ctx context.Context, cfg Config, files *changedFiles, run *automati
 	}
 	d := cfg.driver(settings, env, log)
 	in := jobInput{job: run.GetJob(), jc: jc, settings: settings, driver: d, dir: cfg.checkout.Dir(), tree: tree,
-		sandbox: sandbox(cfg.Bwrap, cfg.Proc, tmp, contextFile), commit: run.GetCommitId()}
+		sandbox: sandbox(cfg.Bwrap, cfg.Proc, tmp, contextFile, cfg.secretsDir), commit: run.GetCommitId()}
 	if run.GetJob().GetKind() == automationpb.Job_KIND_LINT && !wholeLint(run.GetJob()) && jc != nil {
 		g, err := graphAt(ctx, cfg, d, run.GetRepositoryId(), run.GetCommitId(), cfg.checkout, log)
 		if err != nil || ctx.Err() != nil {
@@ -778,6 +906,66 @@ func perform(ctx context.Context, cfg Config, files *changedFiles, run *automati
 	return outcome{status: automationpb.Run_STATUS_PASSED}
 }
 
+// runSecrets are the secrets a post run's job names — read from its workflow file at the run's
+// commit, which the checkout holds — as ok secrets gives them to this run's lease; or why the run
+// cannot have them, failing it. Only a run job's binary, run in the sandbox, reads secrets: a
+// test's or a build's actions are cached.
+func runSecrets(ctx context.Context, cfg Config, run *automationpb.Run, log *logStream) (map[string][]byte, string, error) {
+	if run.GetOrigin().GetPhase() != automationpb.Origin_PHASE_POST {
+		return nil, "", nil
+	}
+	file, name, ok := strings.Cut(strings.TrimPrefix(run.GetOrigin().GetJob(), "//"), ":"+string(workflow.Post)+":")
+	if !ok || !workflow.IsWorkflowFile(file) {
+		return nil, "", nil
+	}
+	data, err := os.ReadFile(filepath.Join(cfg.checkout.Dir(), filepath.FromSlash(file)))
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, "", nil
+	}
+	if err != nil {
+		return nil, "", fmt.Errorf("reading %s: %w", file, err)
+	}
+	wf, _ := workflow.Parse(file, data)
+	var named []workflow.Secret
+	for _, j := range wf.Jobs {
+		if j.Phase == workflow.Post && j.Name == name {
+			named = j.Secrets
+		}
+	}
+	switch {
+	case len(named) == 0:
+		return nil, "", nil
+	case run.GetJob().GetKind() != automationpb.Job_KIND_RUN:
+		return nil, fmt.Sprintf("%s names secrets, and its target is no binary: only a binary, run in the sandbox, reads secrets", run.GetOrigin().GetJob()), nil
+	case cfg.RunSecrets == nil:
+		return nil, fmt.Sprintf("%s names secrets, and this worker reaches no ok secrets (services.secrets)", run.GetOrigin().GetJob()), nil
+	}
+	values := map[string][]byte{}
+	forget := func() {
+		for _, v := range values {
+			clear(v)
+		}
+	}
+	var paths []string
+	for _, s := range named {
+		resp, err := cfg.RunSecrets.ReadRunSecret(ctx, &secretspb.ReadRunSecretRequest{RepositoryId: run.GetRepositoryId(), RunId: run.GetId(),
+			Path: s.Path, RunKey: cfg.runKey})
+		switch status.Code(err) {
+		case codes.OK:
+		case codes.PermissionDenied, codes.FailedPrecondition, codes.InvalidArgument, codes.NotFound:
+			forget()
+			return nil, fmt.Sprintf("reading the secret //%s: %s", s.Path, status.Convert(err).Message()), nil
+		default:
+			forget()
+			return nil, "", fmt.Errorf("reading the secret //%s: %w", s.Path, err)
+		}
+		values[s.Path] = resp.GetValue()
+		paths = append(paths, "//"+s.Path)
+	}
+	log.Printf("the job reads %d secret(s), in $%s within its sandbox: %s", len(paths), secrets.DirEnv, strings.Join(paths, ", "))
+	return values, "", nil
+}
+
 // readSettings reads the repository's settings at the checkout's commit.
 func readSettings(dir string) (*workflow.Settings, error) {
 	data, err := os.ReadFile(filepath.Join(dir, workflow.SettingsFile))
@@ -797,7 +985,7 @@ func (cfg Config) driver(settings *workflow.Settings, env []string, log *logStre
 		Bazel:      cfg.Bazel,
 		Wrapper:    cfg.hide(),
 		OutputBase: cfg.outputBase,
-		Flags:      append(append([]string(nil), cfg.BazelFlags...), settings.Bazel.Flags...),
+		Flags:      append(append(cfg.runCacheFlags(), cfg.BazelFlags...), settings.Bazel.Flags...),
 		Env:        env,
 		Stderr:     log,
 	}

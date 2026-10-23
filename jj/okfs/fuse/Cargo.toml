@@ -14,3 +14,9 @@ libc.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 
+# The kernel test enters a user and mount namespace of its own first thing in main, which only a
+# single-threaded process may: it has a harness of its own (testns::run).
+[[test]]
+name = "kernel"
+path = "tests/kernel.rs"
+harness = false

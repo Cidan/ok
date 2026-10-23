@@ -8,29 +8,43 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
+	"google.golang.org/grpc"
 
 	"github.com/Cidan/ok/internal/bus"
 	"github.com/Cidan/ok/internal/bus/follow"
 	"github.com/Cidan/ok/internal/bus/pgbus"
 	"github.com/Cidan/ok/internal/config"
 	"github.com/Cidan/ok/internal/dial"
+	"github.com/Cidan/ok/internal/id/idtest"
 	"github.com/Cidan/ok/internal/pgdb"
+	"github.com/Cidan/ok/internal/scm/encoding"
 	"github.com/Cidan/ok/internal/scm/role"
 	"github.com/Cidan/ok/internal/scm/scmfeed"
+	"github.com/Cidan/ok/internal/scm/scmtest"
 	"github.com/Cidan/ok/internal/serve"
 	"github.com/Cidan/ok/internal/testdb"
 	"github.com/Cidan/ok/internal/testdb/testobjects"
 	scmpb "github.com/Cidan/ok/proto/ok/scm/v1"
 )
 
-// devSCM serves a development SCM over a database and bucket of its own, publishing its events on
-// the bus beside its database, and returns its Events as ok control calls them, its Repositories
-// as ada does, the bus, and its database.
-func devSCM(t *testing.T) (scmpb.EventsClient, scmpb.RepositoriesClient, *pgbus.Bus, *pgxpool.Pool) {
+// scmEnv is a development SCM, beside a development identity, over a database and bucket of its
+// own, publishing its events on the bus beside its database.
+type scmEnv struct {
+	events scmpb.EventsClient // as ok control calls it
+	review scmpb.ReviewClient
+	repos  scmpb.RepositoriesClient // as ada calls them
+	store  scmpb.StoreClient
+	cls    scmpb.ChangeListsClient
+	bus    *pgbus.Bus
+	ada    string // her stable ID
+	bumped map[int64]int
+}
+
+func devSCM(t *testing.T) *scmEnv {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
-	cfg, err := config.Parse([]byte("domain: example.com\npublic_url: http://127.0.0.1:1\nroles: {control: control.ok}\n"))
+	id := idtest.Start(t, "ada")
+	cfg, err := config.Parse([]byte("domain: example.com\npublic_url: http://127.0.0.1:1\nroles: " + idtest.Roles + "\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -49,7 +63,8 @@ func devSCM(t *testing.T) (scmpb.EventsClient, scmpb.RepositoriesClient, *pgbus.
 		t.Fatal(err)
 	}
 	t.Cleanup(b.Close)
-	scm, err := role.Build(ctx, cfg, role.Options{Dev: true, Pool: pool, Blobs: testobjects.Store(t), Stream: b})
+	scm, err := role.Build(ctx, cfg, role.Options{Dev: true, Pool: pool, Blobs: testobjects.Store(t), Stream: b,
+		Identity: id.As("scm.ok.robot.example.com")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,35 +76,63 @@ func devSCM(t *testing.T) (scmpb.EventsClient, scmpb.RepositoriesClient, *pgbus.
 	done := make(chan error, 1)
 	go func() { done <- serve.Run(ctx, scm.Root, serve.WithAuthn(scm.Resolver), serve.WithListener(lis)) }()
 	t.Cleanup(func() { cancel(); <-done })
-	as := func(p string) *dialed {
+	as := func(p string) *grpc.ClientConn {
 		conn, err := dial.Dial(lis.Addr().String(), dial.Options{DevPrincipal: p})
 		if err != nil {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { conn.Close() })
-		return &dialed{events: scmpb.NewEventsClient(conn), repos: scmpb.NewRepositoriesClient(conn)}
+		return conn
 	}
-	return as("control.ok.robot.example.com").events, as("ada.human.example.com").repos, b, pool
+	control, ada := as("control.ok.robot.example.com"), as("ada.human.example.com")
+	return &scmEnv{events: scmpb.NewEventsClient(control), review: scmpb.NewReviewClient(control), repos: scmpb.NewRepositoriesClient(ada),
+		store: scmpb.NewStoreClient(ada), cls: scmpb.NewChangeListsClient(ada), bus: b, ada: id.ID("ada.human.example.com"), bumped: map[int64]int{}}
 }
 
-type dialed struct {
-	events scmpb.EventsClient
-	repos  scmpb.RepositoriesClient
+// bump writes one event to a repository's log: ada uploads a CL, a draft, then ok control asks
+// for its review, and returns it to draft, in turn.
+func (e *scmEnv) bump(t *testing.T, repo int64) {
+	t.Helper()
+	ctx := context.Background()
+	n := e.bumped[repo]
+	e.bumped[repo]++
+	if n == 0 {
+		b := scmtest.NewObjects(t)
+		tree := b.Add(&encoding.Tree{Entries: []encoding.TreeEntry{{Name: "f", Value: encoding.TreeValue{Kind: encoding.TreeValueFile, ID: b.File([]byte("one"))}}}})
+		commit := b.Commit(tree, "one", encoding.RootCommitID)
+		if _, _, err := b.Publish(ctx, e.store, repo, nil); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := e.cls.Upload(ctx, &scmpb.UploadRequest{RepositoryId: repo, CommitIds: [][]byte{commit[:]}, Readiness: scmpb.UploadRequest_READINESS_WIP}); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	kind := scmpb.TransitionRequest_KIND_REQUEST_REVIEW
+	if n%2 == 0 {
+		kind = scmpb.TransitionRequest_KIND_RETURN_TO_DRAFT
+	}
+	if _, err := e.review.Transition(ctx, &scmpb.TransitionRequest{RepositoryId: repo, Number: 1, Kind: kind, ActorId: e.ada}); err != nil {
+		t.Fatal(err)
+	}
 }
 
-// applier applies in memory, telling changed when it does; legacy is its place in the SCM's feed.
+// applier applies in memory, telling changed when it does.
 type applier struct {
 	mu      sync.Mutex
 	cursors map[int64]int64
 	applied map[int64][]int64
-	legacy  int64
 	changed chan struct{}
 }
 
-func (a *applier) Cursor(_ context.Context, repo int64) (int64, error) {
+func (a *applier) Cursors(_ context.Context, repos []int64) (map[int64]int64, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return a.cursors[repo], nil
+	out := map[int64]int64{}
+	for _, r := range repos {
+		out[r] = a.cursors[r]
+	}
+	return out, nil
 }
 
 func (a *applier) Apply(_ context.Context, e bus.Event) error {
@@ -114,26 +157,6 @@ func (a *applier) Apply(_ context.Context, e bus.Event) error {
 	return nil
 }
 
-func (a *applier) LegacyCursor(context.Context) (int64, error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.legacy, nil
-}
-func (a *applier) Seed(_ context.Context, repo, seq int64) error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if _, ok := a.cursors[repo]; !ok {
-		a.cursors[repo] = seq
-	}
-	return nil
-}
-func (a *applier) LeaveLegacy(context.Context) error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.legacy = 0
-	return nil
-}
-
 // await waits until repo's events applied are want.
 func (a *applier) await(t *testing.T, repo int64, want []int64) {
 	t.Helper()
@@ -154,55 +177,37 @@ func (a *applier) await(t *testing.T, repo int64, want []int64) {
 	}
 }
 
-// A follower of the SCM's events leaves its place in the SCM's feed for each repository's log, catches
-// up the repositories whose logs went past it — none of which the stream brought, their events
-// published before its group was made — and applies what the stream brings next, once each.
+// A follower of the SCM's events catches up the repositories whose logs went past it — none of
+// which the stream brought, their events published before its group was made — and applies what
+// the stream brings next, once each.
 func TestFollowTheSCM(t *testing.T) {
 	ctx := context.Background()
-	events, repos, b, pool := devSCM(t)
+	e := devSCM(t)
 	create := func(name string) int64 {
-		r, err := repos.CreateRepository(ctx, &scmpb.CreateRepositoryRequest{Name: name})
+		r, err := e.repos.CreateRepository(ctx, &scmpb.CreateRepositoryRequest{Name: name})
 		if err != nil {
 			t.Fatal(err)
 		}
 		return r.GetId()
 	}
-	rename := func(id int64, name string) {
-		if _, err := repos.RenameRepository(ctx, &scmpb.RenameRepositoryRequest{RepositoryId: id, Name: name}); err != nil {
-			t.Fatal(err)
-		}
-	}
 	ra, rb := create("a"), create("b")
-	rename(ra, "a2")
-	// These three were written while the old feed numbered every repository's events together,
-	// and the legacy follower had applied it through a's rename.
-	for i, ev := range [][2]int64{{ra, 1}, {rb, 1}, {ra, 2}} {
-		if _, err := pool.Exec(ctx, `UPDATE event SET seq = $3 WHERE repository_id = $1 AND repository_seq = $2`, ev[0], ev[1], i+1); err != nil {
-			t.Fatal(err)
-		}
-	}
-	const legacy = 3
-	rename(rb, "b2")
+	e.bump(t, ra)
+	e.bump(t, rb)
 	rc := create("c")
 
-	a := &applier{cursors: map[int64]int64{}, applied: map[int64][]int64{}, legacy: legacy, changed: make(chan struct{}, 1)}
-	f := &follow.Follower{Stream: b, Topic: scmfeed.Topic, Group: "test", Log: scmfeed.Log{Events: events}, Apply: a}
+	a := &applier{cursors: map[int64]int64{}, applied: map[int64][]int64{}, changed: make(chan struct{}, 1)}
+	f := &follow.Follower{Stream: e.bus, Topic: scmfeed.Topic, Group: "test", Log: scmfeed.Log{Events: e.events}, Apply: a}
 	fctx, stop := context.WithCancel(ctx)
 	done := make(chan error, 1)
 	go func() { done <- f.Run(fctx) }()
 	defer func() { stop(); <-done }()
 
-	a.await(t, rb, []int64{2})
+	a.await(t, ra, []int64{1, 2})
+	a.await(t, rb, []int64{1, 2})
 	a.await(t, rc, []int64{1})
-	a.mu.Lock()
-	seeded, alone, left := a.cursors[ra], len(a.applied[ra]) == 0, a.legacy == 0
-	a.mu.Unlock()
-	if seeded != 2 || !alone || !left {
-		t.Errorf("a's cursor %d, none applied %v, the legacy feed left %v: want 2, true, and true", seeded, alone, left)
-	}
 	// Then what is written as it follows.
-	rename(rc, "c2")
-	rename(ra, "a3")
+	e.bump(t, rc)
+	e.bump(t, ra)
 	a.await(t, rc, []int64{1, 2})
-	a.await(t, ra, []int64{3})
+	a.await(t, ra, []int64{1, 2, 3})
 }

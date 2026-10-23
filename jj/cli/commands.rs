@@ -1,4 +1,4 @@
-//! ok's commands (docs/scm.md, "Commands"): `jj clone` and `jj create` here, and
+//! ok's commands (docs/scm.md, "Commands"): `jj clone`, `jj create`, and `jj fork` here, and
 //! the ChangeList commands `jj cl` and `jj sync` in `changelists`.
 
 use std::fs;
@@ -43,8 +43,11 @@ pub enum Command {
     Cl(crate::changelists::ClArgs),
     Clone(CloneArgs),
     Create(CreateArgs),
+    Fork(ForkArgs),
     #[command(subcommand)]
     Fs(crate::fs::FsCommand),
+    #[command(subcommand)]
+    Secret(crate::secrets::SecretCommand),
     Sync(crate::changelists::SyncArgs),
 }
 
@@ -98,6 +101,29 @@ pub struct CreateArgs {
     real: bool,
 }
 
+/// Fork a repository on ok and clone the fork
+///
+/// The fork is made on ok first — in the upstream's network, its main the upstream's, holding
+/// everything the upstream holds without copying it — with you as its creator, and then cloned
+/// exactly as `jj clone` would. `jj sync --upstream` brings it the upstream's later work.
+#[derive(clap::Args, Clone, Debug)]
+pub struct ForkArgs {
+    /// The repository to fork
+    #[arg(value_name = "UPSTREAM")]
+    upstream: String,
+    /// The fork's name, with its owner: `ada/app`, or `acme/app` for an organization's
+    name: String,
+    /// Where to create the workspace (default: the fork's name, without its owner)
+    #[arg(value_hint = clap::ValueHint::DirPath)]
+    destination: Option<String>,
+    /// The workspace's name (default: `<host>-<directory name>`)
+    #[arg(long)]
+    workspace: Option<WorkspaceNameBuf>,
+    /// A real checkout: every file written to disk
+    #[arg(long)]
+    real: bool,
+}
+
 /// How a clone lays out its workspace.
 #[derive(Clone, Debug)]
 pub enum Kind {
@@ -116,6 +142,7 @@ pub async fn run(ui: &mut Ui, command: &CommandHelper, cmd: Command) -> Result<(
         Command::Cl(args) => crate::changelists::run_cl(ui, command, args).await,
         Command::Sync(args) => crate::changelists::run_sync(ui, command, args).await,
         Command::Fs(cmd) => crate::fs::run(ui, command, cmd).await,
+        Command::Secret(cmd) => crate::secrets::run(ui, command, cmd).await,
         Command::Clone(args) => {
             let endpoint = scm_endpoint(command)?;
             let real = args.real || !VIRTUAL_WORKSPACES;
@@ -134,6 +161,33 @@ pub async fn run(ui: &mut Ui, command: &CommandHelper, cmd: Command) -> Result<(
             };
             dest.clone_into(ui, command, &endpoint, &repo, args.workspace, kind)
                 .await
+        }
+        Command::Fork(args) => {
+            let endpoint = scm_endpoint(command)?;
+            let real = args.real || !VIRTUAL_WORKSPACES;
+            if !real {
+                can_mount()?;
+            }
+            let short = args.name.rsplit('/').next().unwrap_or(&args.name);
+            let dest = Destination::prepare(command, args.destination.as_deref().unwrap_or(short))?;
+            let repo = ok_store::fork_repository(&endpoint, &args.upstream, &args.name)
+                .await
+                .map_err(|s| fork_error(&endpoint, &args.upstream, &args.name, s))?;
+            writeln!(
+                ui.status(),
+                "Forked {} on ok as {}",
+                args.upstream,
+                repo.name
+            )?;
+            let kind = if real { Kind::Real } else { Kind::Virtual };
+            dest.clone_into(ui, command, &endpoint, &repo, args.workspace, kind)
+                .await
+                .map_err(|e| {
+                    e.hinted(format!(
+                        "The fork exists on ok; `jj clone {}` clones it",
+                        repo.name
+                    ))
+                })
         }
         Command::Create(args) => {
             let endpoint = scm_endpoint(command)?;
@@ -207,6 +261,20 @@ fn scm_error(endpoint: &str, name: &str, s: Status) -> CommandError {
         )
         .hinted("Run `jj auth login`"),
         _ => user_error_with_message(format!("ok at {endpoint}"), s),
+    }
+}
+
+/// A failed fork, as the user should see it.
+fn fork_error(endpoint: &str, upstream: &str, name: &str, s: Status) -> CommandError {
+    match s.code() {
+        Code::NotFound => user_error(format!("ok has no repository named {upstream:?}")),
+        Code::AlreadyExists => {
+            user_error(format!("a repository named {name:?} already exists on ok"))
+        }
+        Code::InvalidArgument | Code::PermissionDenied | Code::FailedPrecondition => {
+            user_error(s.message().to_owned())
+        }
+        _ => scm_error(endpoint, upstream, s),
     }
 }
 

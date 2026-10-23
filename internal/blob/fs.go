@@ -19,7 +19,10 @@ import (
 // a file with ".obj" appended — so "p/a" (p.d/a.obj) and "p/a/b" (p.d/a.d/b.obj), which an object
 // store holds side by side, never contend for one name, and a listing walks only the directory
 // its prefix names. Writes are atomic: a file is written in tmpDir and renamed (or, IfAbsent,
-// linked) into place, so a reader never sees half an object.
+// linked) into place, so a reader never sees half an object. They are durable before Put returns:
+// the file's data is synced, then the directory that names it, and every directory made for it —
+// a caller records an object's key in a database once Put returns, and a power loss must not take
+// the name back.
 type FS struct {
 	root string
 }
@@ -138,14 +141,46 @@ func (f *FS) Put(ctx context.Context, key string, r io.Reader, size int64, opts 
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
+	if err := f.mkdirs(filepath.Dir(dst)); err != nil {
 		return f.wrap("put", key, err)
 	}
 	if o.ifAbsent {
 		// A link fails if the name is taken: the check and the write are one step.
-		return wrapNil(f.wrap, "put", key, os.Link(tmp.Name(), dst))
+		if err := os.Link(tmp.Name(), dst); err != nil {
+			return f.wrap("put", key, err)
+		}
+	} else if err := os.Rename(tmp.Name(), dst); err != nil {
+		return f.wrap("put", key, err)
 	}
-	return wrapNil(f.wrap, "put", key, os.Rename(tmp.Name(), dst))
+	return wrapNil(f.wrap, "put", key, syncDir(filepath.Dir(dst)))
+}
+
+// mkdirs makes dir and the directories above it under the root that are missing, each made
+// durable: synced into its parent before the next is made in it.
+func (f *FS) mkdirs(dir string) error {
+	if _, err := os.Stat(dir); err == nil {
+		return nil
+	}
+	parent := filepath.Dir(dir)
+	if dir != f.root && parent != dir {
+		if err := f.mkdirs(parent); err != nil {
+			return err
+		}
+	}
+	if err := os.Mkdir(dir, 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
+		return err
+	}
+	return syncDir(parent)
+}
+
+// syncDir syncs a directory, making the names it holds durable.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }
 
 func wrapNil(wrap func(op, key string, err error) error, op, key string, err error) error {

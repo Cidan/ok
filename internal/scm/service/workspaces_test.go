@@ -7,6 +7,7 @@ import (
 	"google.golang.org/grpc/codes"
 
 	"github.com/Cidan/ok/internal/scm/encoding"
+	"github.com/Cidan/ok/internal/scm/scmtest"
 	scmpb "github.com/Cidan/ok/proto/ok/scm/v1"
 )
 
@@ -17,9 +18,9 @@ func TestWorkspaces(t *testing.T) {
 	c := testServer(t)
 	repo := newRepo(t, c).GetId()
 	alice, bob := human("alice.human.example.com"), human("bob.human.example.com")
-	b := newObjects(t)
-	tree := b.add(&encoding.Tree{Entries: []encoding.TreeEntry{{Name: "a", Value: encoding.TreeValue{Kind: encoding.TreeValueSymlink, ID: b.add(&encoding.Symlink{Target: "b"})}}}})
-	if _, _, err := b.publish(alice, c, repo, nil); err != nil {
+	b := scmtest.NewObjects(t)
+	tree := b.Add(&encoding.Tree{Entries: []encoding.TreeEntry{{Name: "a", Value: encoding.TreeValue{Kind: encoding.TreeValueSymlink, ID: b.Add(&encoding.Symlink{Target: "b"})}}}})
+	if _, _, err := b.Publish(alice, c.store, repo, nil); err != nil {
 		t.Fatal(err)
 	}
 	_, err := c.ws.Attach(alice, &scmpb.AttachRequest{RepositoryId: repo, Workspace: "laptop-ada", Machine: "m1"})
@@ -119,12 +120,12 @@ func TestWorkspaceOperationLogs(t *testing.T) {
 	_, err = c.store.GetOpHeads(alice, &scmpb.GetOpHeadsRequest{RepositoryId: repo, Workspace: "never-made"})
 	wantCode(t, err, codes.NotFound)
 
-	b := newObjects(t)
-	commit := b.commit(b.add(&encoding.Tree{}), "x\n", encoding.RootCommitID)
-	view := b.add(&encoding.View{HeadIDs: []encoding.ID{commit}, WCCommitIDs: map[string]encoding.ID{"desk-ada": commit}})
-	op := b.operation(view, encoding.RootOperationID)
-	b.workspace = "laptop-ada"
-	_, _, err = b.publish(alice, c, repo, &scmpb.OpHeadsUpdate{OldIds: [][]byte{encoding.RootOperationID[:]}, NewId: op[:]})
+	b := scmtest.NewObjects(t)
+	commit := b.Commit(b.Add(&encoding.Tree{}), "x\n", encoding.RootCommitID)
+	view := b.Add(&encoding.View{HeadIDs: []encoding.ID{commit}, WCCommitIDs: map[string]encoding.ID{"desk-ada": commit}})
+	op := b.Operation(view, encoding.RootOperationID)
+	b.Workspace = "laptop-ada"
+	_, _, err = b.Publish(alice, c.store, repo, &scmpb.OpHeadsUpdate{OldIds: [][]byte{encoding.RootOperationID[:]}, NewId: op[:]})
 	wantCode(t, err, codes.InvalidArgument)
 
 	list, err := c.ws.ListWorkspaces(alice, &scmpb.ListWorkspacesRequest{RepositoryId: repo})

@@ -15,7 +15,9 @@ metadata:
   labels: {{- include "ok.labels" . | nindent 4 }}
     app.kubernetes.io/component: worker
 spec:
+  {{- if not .Values.worker.autoscale.enabled }}
   replicas: {{ .Values.worker.replicas }}
+  {{- end }}
   selector:
     matchLabels:
       app.kubernetes.io/instance: {{ .Release.Name }}
@@ -33,10 +35,19 @@ spec:
       {{- end }}
       # A worker shutting down gives its runs back: Bazel's grace, then the release.
       terminationGracePeriodSeconds: 60
+      {{- if eq .Values.worker.checkout "virtual" }}
+      # The pod's pause process is its init, reaping what Bazel leaves behind: ok is not PID 1.
+      shareProcessNamespace: true
+      {{- end }}
       containers:
         - name: worker
           image: {{ include "ok.runnerImage" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- if eq .Values.worker.checkout "virtual" }}
+          # A virtual checkout's okfs daemon mounts in a user and mount namespace of the worker's own,
+          # which unshare makes before ok starts (docs/okfs.md, "ok's roles").
+          command: [/usr/bin/unshare, --map-root-user, --mount, --propagation, private, --, /usr/local/bin/ok]
+          {{- end }}
           args: [worker, run, -config, /etc/ok/config/ok.yaml]
           env:
             - name: HOSTNAME
@@ -64,6 +75,9 @@ spec:
             {{- if and (eq .Values.worker.checkout "virtual") (not .Values.worker.fuseResource) }}
             - {name: fuse, mountPath: /dev/fuse}
             {{- end }}
+            {{- if and .Values.worker.microvm.enabled (not .Values.worker.microvm.kvmResource) }}
+            - {name: kvm, mountPath: /dev/kvm}
+            {{- end }}
             {{- if .Values.worker.dockerConfigSecret }}
             - {name: docker, mountPath: /etc/ok/docker, readOnly: true}
             {{- end }}
@@ -77,6 +91,10 @@ spec:
         {{- if and (eq .Values.worker.checkout "virtual") (not .Values.worker.fuseResource) }}
         - name: fuse
           hostPath: {path: /dev/fuse, type: CharDevice}
+        {{- end }}
+        {{- if and .Values.worker.microvm.enabled (not .Values.worker.microvm.kvmResource) }}
+        - name: kvm
+          hostPath: {path: /dev/kvm, type: CharDevice}
         {{- end }}
         {{- if .Values.worker.dockerConfigSecret }}
         - name: docker

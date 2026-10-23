@@ -6,24 +6,20 @@ import (
 	"sort"
 	"sync/atomic"
 	"testing"
-	"time"
-
-	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Cidan/ok/internal/blob"
+	"github.com/Cidan/ok/internal/data"
 	"github.com/Cidan/ok/internal/identity"
 	"github.com/Cidan/ok/internal/scm/encoding"
 	"github.com/Cidan/ok/internal/scm/pack"
-	scmpostgres "github.com/Cidan/ok/internal/scm/store/postgres"
-	"github.com/Cidan/ok/internal/testdb"
 	"github.com/Cidan/ok/internal/testdb/testobjects"
 )
 
 // testNames are the tests' installation's.
 var testNames = identity.MustNames("example.com")
 
-// mustOpen opens a Store over pool and blobs, with small caches unless cfg says otherwise.
-func mustOpen(t *testing.T, pool *pgxpool.Pool, blobs blob.Store, cfg Config) *Store {
+// mustOpen opens a Store over db and blobs, with small caches unless cfg says otherwise.
+func mustOpen(t *testing.T, db testDB, blobs blob.Store, cfg Config) *Store {
 	t.Helper()
 	cfg.Names = testNames
 	if cfg.ObjectCacheBytes == 0 {
@@ -32,20 +28,17 @@ func mustOpen(t *testing.T, pool *pgxpool.Pool, blobs blob.Store, cfg Config) *S
 	if cfg.ChunkCacheBytes == 0 {
 		cfg.ChunkCacheBytes = 8 << 20
 	}
-	b, err := scmpostgres.Open(context.Background(), pool)
+	s, err := New(db.open(t), blobs, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	s, err := New(b, blobs, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(s.Close)
+	testDBs.Store(s, db)
+	t.Cleanup(func() {
+		s.Close()
+		testDBs.Delete(s)
+	})
 	return s
 }
-
-// poolOf is the database a test's store is over: tests read and age its rows directly.
-func poolOf(s *Store) *pgxpool.Pool { return s.b.(*scmpostgres.Backend).Pool() }
 
 // ids converts IDs to the [][]byte pgx sends as bytea[].
 func ids(in []encoding.ID) [][]byte {
@@ -63,30 +56,22 @@ func toID(b []byte) (encoding.ID, error) {
 	return encoding.ID(b), nil
 }
 
-// testStore opens a Store over a new database (internal/testdb) and a new bucket of the store
-// OK_TEST_OBJECTS names (internal/testdb/testobjects), both dropped when the test ends; the
-// backend's Open brings the database to the schema.
-func testStore(t *testing.T) *Store {
+// testStore opens a Store over a new database of OK_TEST_DATABASE's (newTestDB) and a new bucket
+// of the store OK_TEST_OBJECTS names (internal/testdb/testobjects), both dropped when the test
+// ends; the backend's Open brings the database to the schema.
+func testStore(t *testing.T) *Store { return testStoreOf(t, 32) }
+
+// testStoreOf is testStore with, on PostgreSQL, a pool of conns connections.
+func testStoreOf(t *testing.T, conns int32) *Store {
 	t.Helper()
-	ctx := context.Background()
-	cfg, err := pgxpool.ParseConfig(testdb.Postgres(t))
-	if err != nil {
-		t.Fatal(err)
-	}
-	cfg.MaxConns = 32
-	pool, err := pgxpool.NewWithConfig(ctx, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(pool.Close)
-	blobs := testobjects.Store(t)
-	return mustOpen(t, pool, blobs, Config{})
+	return mustOpen(t, newTestDB(t, conns), testobjects.Store(t), Config{})
 }
 
-// reopen opens a second Store over s's database and bucket, with cold caches.
+// reopen opens a second Store over s's database and bucket, with cold caches: another replica,
+// hearing s's signals as s hears its.
 func reopen(t *testing.T, s *Store) *Store {
 	t.Helper()
-	return mustOpen(t, poolOf(s), s.blobs, Config{})
+	return mustOpen(t, dbOf(s), s.blobs, Config{Signals: s.signals})
 }
 
 var repoSeq atomic.Int64
@@ -100,8 +85,7 @@ var testPrincipals = []string{"alice", "bob", "carol", "alice.human.example.com"
 
 func newRepo(t *testing.T, s *Store) Repository {
 	t.Helper()
-	name := fmt.Sprintf("t%d-%d", time.Now().UnixNano(), repoSeq.Add(1))
-	r, err := s.CreateRepository(context.Background(), name, "alice.human.example.com")
+	r, err := s.CreateRepository(context.Background(), data.NewID(), data.NewID(), "alice.human.example.com")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,6 +105,10 @@ type builder struct {
 	files   map[encoding.ID][]byte
 	order   []ObjectRef
 	seq     int
+	// chunks are the chunks of the files indexed, by ID: files may be set directly, so chunk
+	// indexes those it has not seen when it misses.
+	chunks  map[encoding.ID][]byte
+	indexed map[encoding.ID]bool
 }
 
 func newBuilder(t *testing.T) *builder {
@@ -226,13 +214,24 @@ func (b *builder) manifests() []FileManifest {
 }
 
 func (b *builder) chunk(id encoding.ID) []byte {
-	for _, contents := range b.files {
+	if c, ok := b.chunks[id]; ok {
+		return c
+	}
+	if b.chunks == nil {
+		b.chunks, b.indexed = map[encoding.ID][]byte{}, map[encoding.ID]bool{}
+	}
+	for f, contents := range b.files {
+		if b.indexed[f] {
+			continue
+		}
+		b.indexed[f] = true
 		for off := 0; off < len(contents); off += testChunk {
 			c := contents[off:min(off+testChunk, len(contents))]
-			if pack.ChunkID(c) == id {
-				return c
-			}
+			b.chunks[pack.ChunkID(c)] = c
 		}
+	}
+	if c, ok := b.chunks[id]; ok {
+		return c
 	}
 	b.t.Fatalf("builder has no chunk %s", id)
 	return nil

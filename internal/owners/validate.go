@@ -25,7 +25,11 @@ func Validate(p string, data []byte, src Source, knownUser, knownACL func(name s
 		case o.Kind == User && !knownUser(o.Name):
 			add(line, "user: %s names no person", o.Name)
 		case o.Kind == ACL && !knownACL(o.Name):
-			add(line, "acl: %s names no ACL the groups-and-ACLs tree declares", o.Name)
+			if strings.Contains(o.Name, "/") {
+				add(line, "acl: @%s names no team", o.Name)
+			} else {
+				add(line, "acl: %s names no ACL the groups-and-ACLs tree declares", o.Name)
+			}
 		}
 	}
 	for _, o := range f.Owners {

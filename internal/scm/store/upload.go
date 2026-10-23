@@ -16,7 +16,8 @@ import (
 
 // People answers whether a handle names a person: ok identity's directory.
 type People interface {
-	KnownHuman(ctx context.Context, handle string) (bool, error)
+	// Human is the stable ID of the person with a handle; ok is false when no such person stands.
+	Human(ctx context.Context, handle string) (id string, ok bool, err error)
 	// KnownACL reports whether <name>.acl.<domain> is an ACL (docs/identity.md).
 	KnownACL(ctx context.Context, name string) (bool, error)
 }
@@ -49,6 +50,7 @@ const (
 	ReasonUnknownReviewer UploadReason = 11
 	ReasonNoNewChanges    UploadReason = 12
 	ReasonInvalidWorkflow UploadReason = 13
+	ReasonInvalidSecrets  UploadReason = 14
 )
 
 // UploadRejection refuses an upload: which commit, why, and what to run to fix it.
@@ -100,12 +102,17 @@ type uploadCommit struct {
 	parentTree encoding.ID
 	rule1      *UploadRejection // shape: one parent, resolved, described, not empty
 	rule4      *UploadRejection // at most one commit per change
-	rule5      *UploadRejection // valid configuration files
+	rule5      *UploadRejection // valid configuration files, and //secret
 }
 
 // handleOf is a person's handle; other principals are returned whole.
-func (s *Store) handleOf(principal string) string {
-	return strings.TrimSuffix(principal, s.names.Human(""))
+// handleOf is a person's handle, by stable ID, for a message; their ID when they cannot be named.
+func (s *Store) handleOf(ctx context.Context, id string) string {
+	name, err := s.nameOf(ctx, id)
+	if err != nil {
+		return id
+	}
+	return strings.TrimSuffix(name, s.names.Human(""))
 }
 
 // Upload creates and updates CLs from a stack of stored commits, bottom first
@@ -120,10 +127,10 @@ func (s *Store) Upload(ctx context.Context, repo int64, principal string, commit
 	if len(commits) > maxUpload {
 		return nil, invalid("an upload names at most %d commits, not %d", maxUpload, len(commits))
 	}
-	if err := s.repositoryExists(ctx, s.b, repo); err != nil {
+	if err := s.repositoryExists(ctx, s.ops(ctx), repo); err != nil {
 		return nil, err
 	}
-	staged, err := s.checkUpload(ctx, repo, commits, people)
+	staged, err := s.checkUpload(ctx, repo, principal, commits, people)
 	if err != nil {
 		return nil, err
 	}
@@ -132,7 +139,7 @@ func (s *Store) Upload(ctx context.Context, repo int64, principal string, commit
 		return nil, err
 	}
 	var results []UploadResult
-	err = s.inTx(ctx, func(tx *txn) error {
+	err = s.inTx(ctx, func(ctx context.Context, tx *txn) error {
 		var err error
 		results, err = s.applyUpload(ctx, tx, repo, principal, staged, readiness, assign, rej)
 		return err
@@ -140,9 +147,10 @@ func (s *Store) Upload(ctx context.Context, repo int64, principal string, commit
 	return results, err
 }
 
-// checkUpload loads the commits and runs the checks that depend only on them: rules 1, 4,
-// and 5. The objects are immutable, so this needs no transaction.
-func (s *Store) checkUpload(ctx context.Context, repo int64, commits []encoding.ID, people People) ([]*uploadCommit, error) {
+// checkUpload loads the commits and runs the checks that depend only on them, and on main as
+// ok secrets reads it: rules 1, 4, and 5. The objects are immutable, so this needs no
+// transaction.
+func (s *Store) checkUpload(ctx context.Context, repo int64, principal string, commits []encoding.ID, people People) ([]*uploadCommit, error) {
 	ts := s.pendingTrees(ctx, repo)
 	seenCommit := map[encoding.ID]bool{}
 	seenChange := map[encoding.ChangeID]encoding.ID{}
@@ -216,6 +224,20 @@ func (s *Store) checkUpload(ctx context.Context, repo int64, commits []encoding.
 				u.rule5.Problems = problems
 			}
 		}
+		if u.rule1 == nil && u.rule5 == nil {
+			problems, err := s.validateSecretEdits(ctx, repo, ts, u.parentTree, c.RootTree[0], principal, known)
+			if err != nil {
+				return nil, err
+			}
+			stanzas, err := s.validateSecretStanzas(ctx, repo, ts, u.parentTree, c.RootTree[0])
+			if err != nil {
+				return nil, err
+			}
+			if problems = append(problems, stanzas...); len(problems) > 0 {
+				u.rule5 = reject(ReasonInvalidSecrets, "its //secret breaks the rules (fix every problem listed, then upload again; docs/secrets.md)")
+				u.rule5.Problems = problems
+			}
+		}
 		out = append(out, u)
 	}
 	return out, nil
@@ -225,7 +247,9 @@ func (s *Store) checkUpload(ctx context.Context, repo int64, commits []encoding.
 type knownHumans struct {
 	people People
 	seen   map[string]bool
+	ids    map[string]string // a known person's stable ID, by handle
 	acls   map[string]bool
+	sets   map[string]bool // by full name
 	err    error
 }
 
@@ -252,22 +276,33 @@ func (k *knownHumans) knownACL(ctx context.Context, name string) bool {
 }
 
 func (k *knownHumans) known(ctx context.Context, handle string) bool {
+	_, ok := k.id(ctx, handle)
+	return ok
+}
+
+// id is the stable ID of the person with a handle — ada, or @ada as a hosted service writes it —
+// and whether there is one.
+func (k *knownHumans) id(ctx context.Context, handle string) (string, bool) {
+	handle = strings.TrimPrefix(handle, "@")
 	if ok, done := k.seen[handle]; done {
-		return ok
+		return k.ids[handle], ok
 	}
 	if !identity.ValidLabel(handle) {
 		k.seen[handle] = false
-		return false
+		return "", false
 	}
-	ok, err := k.people.KnownHuman(ctx, handle)
+	id, ok, err := k.people.Human(ctx, handle)
 	if err != nil {
 		if k.err == nil {
 			k.err = err
 		}
-		return false
+		return "", false
 	}
-	k.seen[handle] = ok
-	return ok
+	if k.ids == nil {
+		k.ids = map[string]string{}
+	}
+	k.seen[handle], k.ids[handle] = ok, id
+	return id, ok
 }
 
 // validateOwnersEdits validates every OWNERS-config file the change from parentTree to
@@ -383,8 +418,8 @@ func (s *Store) readSmallFile(ctx context.Context, repo int64, id encoding.ID, m
 	return s.readFile(ctx, repo, id)
 }
 
-// resolveReviewers maps reviewers — handles or <handle>@<email domain> — to principals, in
-// order without repeats. Unknown ones make a rejection, which applyUpload reports after
+// resolveReviewers maps reviewers — handles, @handles, or <handle>@<email domain> — to principals' stable
+// IDs, in order without repeats. Unknown ones make a rejection, which applyUpload reports after
 // the per-commit rules.
 func (s *Store) resolveReviewers(ctx context.Context, reviewers []string, people People) ([]string, *UploadRejection, error) {
 	known := &knownHumans{people: people, seen: map[string]bool{}}
@@ -392,36 +427,27 @@ func (s *Store) resolveReviewers(ctx context.Context, reviewers []string, people
 	seen := map[string]bool{}
 	for _, r := range reviewers {
 		handle := strings.TrimSuffix(strings.TrimSpace(r), "@"+s.email)
-		if !known.known(ctx, handle) {
+		id, ok := known.id(ctx, handle)
+		if !ok {
 			if known.err != nil {
 				return nil, nil, fmt.Errorf("check reviewers: %w", known.err)
 			}
 			unknown = append(unknown, r)
 			continue
 		}
-		if p := s.names.Human(handle); !seen[p] {
-			seen[p] = true
-			out = append(out, p)
+		if !seen[id] {
+			seen[id] = true
+			out = append(out, id)
 		}
 	}
 	if len(unknown) > 0 {
 		return nil, &UploadRejection{
 			Reason:   ReasonUnknownReviewer,
-			Message:  "a reviewer is not a person ok knows (name reviewers by handle or <handle>@" + s.email + ")",
+			Message:  "a reviewer is not a person ok knows (name reviewers by handle, @handle, or <handle>@" + s.email + ")",
 			Problems: unknown,
 		}, nil
 	}
 	return out, nil, nil
-}
-
-// onMain reports whether a commit is on main: the root, or a commit some landing made
-// main's head (main is linear, so that is all of it).
-func onMain(ctx context.Context, q backend.Ops, repo int64, id encoding.ID) (bool, error) {
-	if id == encoding.RootCommitID {
-		return true, nil
-	}
-	_, ok, err := q.HeadSeqOf(ctx, repo, id)
-	return ok, err
 }
 
 // plannedCL is what applyUpload does to one CL.
@@ -448,7 +474,22 @@ func (s *Store) applyUpload(ctx context.Context, tx *txn, repo int64, principal 
 	if err != nil {
 		return nil, err
 	}
-	locked, err := lockChangeLists(ctx, tx, repo, numbers)
+	// Landed CLs in segments: an upload of their changes, or stacked on their patchsets, is
+	// refused below, as it is of those in the tail.
+	ofChanges, err := s.settledByChange(ctx, repo, changeKeys)
+	if err != nil {
+		return nil, err
+	}
+	prefixes := make([][]byte, len(parentKeys))
+	for i, p := range parentKeys {
+		prefixes[i] = clKey(clByCommit, p)
+	}
+	ofParents, err := s.settledByPrefix(ctx, repo, prefixes)
+	if err != nil {
+		return nil, err
+	}
+	numbers = append(append(numbers, ofChanges...), ofParents...)
+	locked, err := s.lockChangeLists(ctx, tx, repo, numbers)
 	if err != nil {
 		return nil, err
 	}
@@ -475,7 +516,7 @@ func (s *Store) applyUpload(ctx context.Context, tx *txn, repo int64, principal 
 		p := &plannedCL{u: u, parentIdx: -1}
 		if j, ok := index[u.parent]; ok {
 			p.parentIdx = j
-		} else if main, err := onMain(ctx, tx, repo, u.parent); err != nil {
+		} else if main, err := s.onMain(ctx, tx, repo, u.parent); err != nil {
 			return nil, err
 		} else if !main {
 			c, ok := byPatchset[u.parent]
@@ -505,7 +546,7 @@ func (s *Store) applyUpload(ctx context.Context, tx *txn, repo int64, principal 
 			p.existing = c
 			results[i] = UploadResult{Commit: u.id, Number: c.Number, Patchset: c.CurrentPatchset, Outcome: Unchanged}
 		case c.Author != principal:
-			return nil, reject(ReasonNotAuthor, c.Number, "CL %d is %s's, and only its author uploads patchsets (to propose these edits yourself, jj duplicate the change and upload the copy)", c.Number, s.handleOf(c.Author))
+			return nil, reject(ReasonNotAuthor, c.Number, "CL %d is %s's, and only its author uploads patchsets (to propose these edits yourself, jj duplicate the change and upload the copy)", c.Number, s.handleOf(ctx, c.Author))
 		case c.Status == StatusSubmitted:
 			return nil, reject(ReasonClosed, c.Number, "CL %d has landed and takes no new patchsets (run jj sync)", c.Number)
 		case c.Status == StatusAbandoned:
@@ -620,13 +661,13 @@ func (s *Store) applyUpload(ctx context.Context, tx *txn, repo int64, principal 
 		}
 		events = append(events, &scmpb.Event{Kind: &scmpb.Event_Uploaded{Uploaded: &scmpb.ChangeListUploaded{
 			Number: p.number, Patchset: p.patchset, Created: results[i].Outcome == Created,
-			Uploader: principal, Reviewers: to, Status: p.status.proto(),
+			UploaderId: principal, ReviewerIds: to, Status: p.status.proto(),
 		}}})
 	}
 	for i, p := range plans {
 		if results[i].Outcome == NewPatchset && p.status != p.existing.Status {
 			events = append(events, &scmpb.Event{Kind: &scmpb.Event_Transitioned{Transitioned: &scmpb.ChangeListTransitioned{
-				Number: p.number, From: p.existing.Status.proto(), To: p.status.proto(), Actor: principal,
+				Number: p.number, From: p.existing.Status.proto(), To: p.status.proto(), ActorId: principal,
 			}}})
 		}
 	}

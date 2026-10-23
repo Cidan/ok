@@ -609,7 +609,7 @@ func (s *Store) Annotate(ctx context.Context, repo int64, commit encoding.ID, p 
 	// Off main: each commit's own changes to the path, back along first parents.
 	at := commit
 	for {
-		on, err := onMain(ctx, s.b, repo, at)
+		on, err := s.onMain(ctx, s.ops(ctx), repo, at)
 		if err != nil {
 			return nil, err
 		}
@@ -637,11 +637,11 @@ func (s *Store) Annotate(ctx context.Context, repo int64, commit encoding.ID, p 
 	}
 	// On main: the commits that changed the path, newest first.
 	if at != encoding.RootCommitID && left() {
-		gen, err := generation(ctx, s.b, repo, at)
+		gen, err := s.generation(ctx, repo, at)
 		if err != nil {
 			return nil, err
 		}
-		touching, err := s.b.PathHistory(ctx, repo, p, gen)
+		touching, err := s.pathHistory(ctx, repo, p, gen)
 		if err != nil {
 			return nil, err
 		}

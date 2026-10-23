@@ -1214,6 +1214,15 @@ func main() {
 		items := filtered(q)
 		pages.ServeHomeList(w, r, q, pageOf(items, 1), rowsURL(q), pageSize, len(items) > pageSize)
 	})
+	mux.HandleFunc("/acme/api/search", func(w http.ResponseWriter, r *http.Request) {
+		pages.ServeSearch(w, r, previewSearch)
+	})
+	mux.HandleFunc("/acme/api/webhooks", func(w http.ResponseWriter, r *http.Request) {
+		pages.ServeWebhooks(w, r, previewWebhooks)
+	})
+	mux.HandleFunc("/notifications", func(w http.ResponseWriter, r *http.Request) {
+		pages.ServeNotifications(w, r, previewNotifications)
+	})
 	mux.HandleFunc("/repositories/new", func(w http.ResponseWriter, r *http.Request) {
 		pages.ServeNewRepo(w, r, pages.NewRepoForm{}, "")
 	})
@@ -1229,11 +1238,76 @@ func main() {
 		}
 		q := r.URL.Query().Get("q")
 		items := filtered(q)
-		pages.ServeHome(w, r, "ada", q, pageOf(items, 1), rowsURL(q), pageSize, len(items) > pageSize)
+		pages.ServeHome(w, r, "ada", 3, previewInbox, q, pageOf(items, 1), rowsURL(q), pageSize, len(items) > pageSize)
 	})
 
 	log.Printf("ok-preview listening on %s", addr)
 	if err := http.ListenAndServe(addr, mux); err != nil {
 		log.Fatal(err)
 	}
+}
+
+// previewInbox is the home's inbox in the preview: a review waiting on ada, and her own CLs.
+var previewInbox = []pages.InboxItem{
+	{Repository: "acme/api", Number: 412, Title: "Rate-limit the search endpoint", Role: "reviewer", Attention: true, Status: "open",
+		Link: "/acme/api/cl/412", UpdatedAgo: "12m", UpdatedTitle: "2026-10-19 16:48 UTC"},
+	{Repository: "acme/web", Number: 97, Title: "Show inboxes on the home page", Role: "author", Attention: true, Status: "open",
+		Link: "/acme/web/cl/97", UpdatedAgo: "1h", UpdatedTitle: "2026-10-19 16:00 UTC"},
+	{Repository: "ada/notes", Number: 3, Title: "Draft: notes on cells", Role: "author", Status: "draft", Link: "/ada/notes/cl/3",
+		UpdatedAgo: "2d", UpdatedTitle: "2026-10-17 09:12 UTC"},
+}
+
+// previewNotifications are the notifications page in the preview.
+var previewNotifications = pages.NotificationsView{
+	Unread: 2,
+	Items: []pages.NotificationItem{
+		{Who: "bea", Text: "asked you to review it", Repository: "acme/api", Number: 412, Title: "Rate-limit the search endpoint",
+			Link: "/acme/api/cl/412", Ago: "12m", AgoTitle: "2026-10-19 16:48 UTC"},
+		{Who: "cal", Text: "commented on api/search.go: Should the limit be per token rather than per address?", Repository: "acme/web",
+			Number: 97, Title: "Show inboxes on the home page", Link: "/acme/web/cl/97", Ago: "1h", AgoTitle: "2026-10-19 16:00 UTC"},
+		{Who: "bea", Text: "granted LGTM on patchset 3", Repository: "acme/web", Number: 95, Title: "Search through the directory", Read: true,
+			Link: "/acme/web/cl/95", Ago: "1d", AgoTitle: "2026-10-18 14:20 UTC"},
+	},
+	Kinds: []pages.MailKind{
+		{Value: "1", Label: "Reviews asked of you", Mailed: true},
+		{Value: "2", Label: "Labels granted on your changes"},
+		{Value: "3", Label: "Comments on your changes, and in your threads"},
+		{Value: "4", Label: "Your changes landed"},
+		{Value: "5", Label: "Changes you review abandoned"},
+		{Value: "6", Label: "Your changes rolled back", Mailed: true},
+	},
+}
+
+// previewWebhooks are a repository's webhooks page in the preview, a webhook just added.
+var previewWebhooks = pages.WebhooksView{
+	Chrome: pages.RepoChrome{Name: "acme/api", Subtitle: "Created by ada", Link: "/acme/api", ChangesHref: "/acme/api/cls",
+		Clone: pages.CloneURLs{Command: "jj clone acme/api"}},
+	Enabled:    true,
+	Created:    &pages.NewWebhook{URL: "https://ci.example.com/ok", Secret: "4f1c9d0b7e2a6c58d3b1f0e9a7c4d2b6e8f1a3c5d7e9b2f4a6c8e0d1b3f5a7c9"},
+	CreateHref: "/acme/api/webhooks",
+	Hooks: []pages.WebhookItem{{
+		URL: "https://ci.example.com/ok", Events: "CL events, main moved", CreatedBy: "ada", Ago: "2d", DeleteHref: "/acme/api/webhooks/1/delete",
+		Deliveries: []pages.DeliveryItem{
+			{State: "delivered", Event: "cl", Detail: "HTTP 200", Ago: "3m", RedeliverHref: "/acme/api/webhooks/deliveries/3/redeliver"},
+			{State: "waiting", Event: "push", Detail: "HTTP 502 · the endpoint answered 502 Bad Gateway · 2 tries", Ago: "9m",
+				RedeliverHref: "/acme/api/webhooks/deliveries/2/redeliver"},
+			{State: "dead", Event: "cl", Detail: "dial tcp: connection refused · 14 tries", Ago: "2d", RedeliverHref: "/acme/api/webhooks/deliveries/1/redeliver"},
+		},
+	}},
+}
+
+// previewSearch is a repository's code search page in the preview.
+var previewSearch = pages.SearchView{
+	Chrome: pages.RepoChrome{Name: "acme/api", Subtitle: "Created by ada", Link: "/acme/api", ChangesHref: "/acme/api/cls",
+		Clone: pages.CloneURLs{Command: "jj clone acme/api"}},
+	Action: "/acme/api/search", Query: "ratelimit", Path: "*.go",
+	Files: []pages.SearchFile{
+		{Path: "api/limit.go", Href: "/acme/api/tree/main/api/limit.go", Lines: []pages.SearchLine{
+			{Number: 3, Href: "#", Before: "// ", Match: "RateLimit", After: " limits a caller to its token's quota."},
+			{Number: 4, Href: "#", Before: "func ", Match: "RateLimit", After: "(ctx context.Context, q string) error {"},
+		}},
+		{Path: "api/search.go", Href: "/acme/api/tree/main/api/search.go", Lines: []pages.SearchLine{
+			{Number: 17, Href: "#", Before: "\tif err := ", Match: "rateLimit", After: "(ctx, q); err != nil {"},
+		}},
+	},
 }

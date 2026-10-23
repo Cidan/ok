@@ -1,5 +1,6 @@
-// passkeys.js runs the browser half of ok's passkey ceremonies: signing in (#passkey-login) and
-// adding a passkey to a signed-in account (#passkey-add). Each asks the server to begin — the
+// passkeys.js runs the browser half of ok's passkey ceremonies: signing in (#passkey-login),
+// adding a passkey to a signed-in account (#passkey-add), and approving what ok secrets asked
+// (#passkey-approve). Each asks the server to begin — the
 // options for the authenticator and the ceremony's ID — runs the authenticator, and posts its
 // answer to finish the ceremony.
 (() => {
@@ -90,6 +91,31 @@
       } catch (err) {
         setStatus('error', errText(err));
         login.disabled = false;
+      }
+    });
+  }
+
+  const approve = document.getElementById('passkey-approve');
+  if (approve) {
+    approve.addEventListener('click', async () => {
+      approve.disabled = true;
+      setStatus('info', 'Waiting for your passkey…');
+      try {
+        const begun = await post(approve.dataset.begin);
+        const pk = begun.options.publicKey;
+        pk.challenge = b64uToBuf(pk.challenge);
+        if (Array.isArray(pk.allowCredentials)) {
+          pk.allowCredentials = pk.allowCredentials.map((c) => ({ ...c, id: b64uToBuf(c.id) }));
+        }
+        const cred = await navigator.credentials.get({ publicKey: pk });
+        await post(
+          approve.dataset.finish + '?ceremony=' + encodeURIComponent(begun.ceremony),
+          encodeCredential(cred),
+        );
+        setStatus('ok', 'Approved. You can close this page.');
+      } catch (err) {
+        setStatus('error', errText(err));
+        approve.disabled = false;
       }
     });
   }

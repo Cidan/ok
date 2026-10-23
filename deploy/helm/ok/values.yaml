@@ -20,6 +20,10 @@ publicURL: https://ok.example.com
 database:
   urlSecret: {name: ok-database, key: url}
   maxConnections: 20
+  # Spanner instead (projects/P/instances/I): each role's database there, made when it first
+  # starts, reached as the roles' workload identity (server.serviceAccountAnnotations, and the
+  # deployer's deploy.serviceAccountAnnotations); no URL.
+  spanner: {instance: "", prefix: ok}
 
 identity:
   # The identity CA (ok identity ca init -dir DIR): a Secret holding tls.crt and tls.key.
@@ -41,6 +45,9 @@ config: {}
 server:
   roles: [identity, scm, automation, control]
   replicas: 1
+  # Its ServiceAccount's annotations: a cloud's workload identity, say
+  # (iam.gke.io/gcp-service-account), by which it reaches Spanner and a bucket with no key.
+  serviceAccountAnnotations: {}
   resources: {}
   # Where the SCM spools what a publish uploads and a garbage collection compacts: an emptyDir, as
   # large as the largest push and the largest repository's packs.
@@ -84,6 +91,25 @@ worker:
   # works only where the runtime applies no device allowlist (an unprivileged LXC node's).
   checkout: real
   fuseResource: ""
+  # The pool of workers they serve (docs/hosted.md, "Hosted automation, as built"): jobs name it
+  # with pool:, in a workflow job or .ok/repository.yaml.
+  pool: default
+  # ok automation sizes the workers to their pool's runs — running, and queued of accounts under
+  # their quotas — between min and max (replicas is then only where they start), and may scale
+  # their Deployment and mark its pods (docs/hosted.md, "Hosted automation, as built").
+  autoscale:
+    enabled: false
+    min: 1
+    max: 10
+  # Each run in a microVM of its own: Cloud Hypervisor on KVM, with the kernel the runner image
+  # carries. The node offers /dev/kvm through a device plugin's resource (kvmResource: devic.es/kvm,
+  # generic-device-plugin's), else it is bound in from the node. egress unset is ok's default list
+  # of where Bazel downloads from (docs/configuration.md, worker.microvm.egress).
+  microvm:
+    enabled: false
+    kvmResource: ""
+    egress: null
+    pushEgress: []
   bazelFlags: []                # every Bazel command's: --remote_cache=…, --disk_cache=…
   # A Secret holding config.json with the registry credentials pushes use (DOCKER_CONFIG).
   dockerConfigSecret: ""
@@ -100,6 +126,32 @@ worker:
   tolerations: []
   affinity: {}
 
+# ok secrets (docs/secrets.md): repositories' secrets, sealed under keys of each repository's own,
+# in a Deployment of its own as the robot secrets.ok. Its root wraps every repository's key: a key
+# management service's key (root), which its ServiceAccount reaches by workload identity, or else
+# a keyring file in a Secret (ok secrets keyring -id ID > keyring; kubectl create secret generic
+# ok-secrets-keyring --from-file=keyring).
+secrets:
+  enabled: false
+  replicas: 2
+  root: ""                      # gcp-kms:projects/…/cryptoKeys/…, aws-kms:arn:aws:kms:…; empty: the keyring
+  keyringSecret: {name: "", key: keyring}
+  # Its own database credential, apart from the other roles' (PostgreSQL; its tables in the schema
+  # secrets): {name, key} of a Secret holding the URL. Empty: the installation's.
+  databaseSecret: {name: "", key: url}
+  # External stores a repository's settings may name (secrets: {store: NAME}), as the
+  # configuration's secrets.stores: each reached as this ServiceAccount — Vault by its Kubernetes
+  # auth method, AWS and Google by workload identity (serviceAccountAnnotations). For example:
+  #   vault: {kind: vault, address: "https://vault.internal:8200", mount: ok, role: ok-secrets}
+  #   aws: {kind: aws-secrets-manager, region: us-east-1}
+  #   gcp: {kind: gcp-secret-manager, project: acme-secrets}
+  stores: {}
+  serviceAccountAnnotations: {}
+  resources: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
 deploy:
   enabled: false
   checkout: real
@@ -107,6 +159,9 @@ deploy:
   bazelFlags: []
   # What the migrations it runs get: {NAME: {secretName, key}}, mounted and read as files.
   migrationEnv: {}
+  # Its ServiceAccount's, as the server's: where the installation's database or buckets are reached
+  # by workload identity (Spanner's always are), the deployer reaches its own the same way.
+  serviceAccountAnnotations: {}
   state: {sizeLimit: 50Gi}
   resources: {}
   # As a worker's: a virtual checkout makes user namespaces.

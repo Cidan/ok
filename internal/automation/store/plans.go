@@ -74,6 +74,7 @@ type PlanRequest struct {
 	WorkflowsCommit []byte
 	Context         []byte // the job context, JSON
 	RequestedBy     string // who uploaded the patchset
+	Why             string // why pre runs, as its planning run says; unset, the patchset's upload
 }
 
 // planJob is a planning run's job identity.
@@ -93,7 +94,7 @@ func (s *Store) CreatePlan(ctx context.Context, req PlanRequest) (plan *Plan, cr
 	case req.RequestedBy == "":
 		return nil, false, invalid("a run is requested by someone")
 	}
-	err = s.b.Txn(ctx, func(tx Ops) error {
+	err = s.txn(ctx, func(tx Ops) error {
 		created = false
 		if err := tx.LockCL(ctx, req.RepositoryID, req.CLNumber); err != nil {
 			return err
@@ -110,9 +111,9 @@ func (s *Store) CreatePlan(ctx context.Context, req PlanRequest) (plan *Plan, cr
 		}
 		created = true
 		if _, err := tx.InsertRun(ctx, NewRun{
-			RepositoryID: req.RepositoryID, CommitID: req.CommitID, Job: Job{Kind: KindPlan},
+			RepositoryID: req.RepositoryID, CommitID: req.CommitID, Job: Job{Kind: KindPlan, Pool: s.cfg.PlanPool},
 			Origin: Origin{Phase: PhasePre, CLNumber: req.CLNumber, Patchset: req.Patchset, Job: planJob}, PlanID: plan.ID,
-			Why: fmt.Sprintf("patchset %d was uploaded", req.Patchset), RequestedBy: req.RequestedBy, Status: StatusQueued,
+			Why: orElse(req.Why, fmt.Sprintf("patchset %d was uploaded", req.Patchset)), RequestedBy: req.RequestedBy, Status: StatusQueued,
 			TimeoutSeconds: int32(s.cfg.DefaultTimeout / time.Second),
 		}); err != nil {
 			return err
@@ -128,7 +129,7 @@ func (s *Store) CreatePlan(ctx context.Context, req PlanRequest) (plan *Plan, cr
 // EndPre cancels every pre run of a CL that has not finished: the CL landed, or was abandoned,
 // and no pre of it can matter now.
 func (s *Store) EndPre(ctx context.Context, repo, cl int64, reason string) error {
-	return s.b.Txn(ctx, func(tx Ops) error {
+	return s.txn(ctx, func(tx Ops) error {
 		if err := tx.LockCL(ctx, repo, cl); err != nil {
 			return err
 		}
@@ -142,7 +143,7 @@ func (s *Store) EndPre(ctx context.Context, repo, cl int64, reason string) error
 // heard the stop ends canceled; it is run again by hand.)
 func (s *Store) ResumePre(ctx context.Context, repo, cl int64, patchset int32, requestedBy string) (int, error) {
 	var n int
-	err := s.b.Txn(ctx, func(tx Ops) error {
+	err := s.txn(ctx, func(tx Ops) error {
 		n = 0
 		if err := tx.LockCL(ctx, repo, cl); err != nil {
 			return err
@@ -266,13 +267,13 @@ func (s *Store) queuePlan(ctx context.Context, tx Ops, run *Run, result *PlanRes
 	if newer > run.Origin.Patchset {
 		status, reason = StatusCanceled, fmt.Sprintf("patchset %d superseded it", newer)
 	}
-	return s.insertJobs(ctx, tx, run.RepositoryID, run.CommitID, run.Origin, run.PlanID, run.RequestedBy, result.Jobs, 0, status, reason)
+	return s.insertJobs(ctx, tx, run.RepositoryID, run.CommitID, run.Origin, run.PlanID, run.RequestedBy, result.Jobs, status, reason)
 }
 
 // insertJobs queues a plan's jobs as runs on its commit — or records them ended, canceled for
 // reason, when status says so.
 func (s *Store) insertJobs(ctx context.Context, tx Ops, repo int64, commit []byte, origin Origin, planID int64,
-	requestedBy string, jobs []PlannedJob, priority int16, status Status, reason string) error {
+	requestedBy string, jobs []PlannedJob, status Status, reason string) error {
 	if len(jobs) == 0 {
 		return nil
 	}
@@ -283,7 +284,7 @@ func (s *Store) insertJobs(ctx context.Context, tx Ops, repo int64, commit []byt
 		rs = append(rs, NewRun{
 			RepositoryID: repo, CommitID: commit, Job: j.Spec, Origin: o, PlanID: planID, Why: j.Why,
 			RequestedBy: requestedBy, Status: status, Reason: reason, TimeoutSeconds: int32(s.cfg.DefaultTimeout / time.Second),
-			Finished: status != StatusQueued, LogStored: status != StatusQueued, Priority: priority,
+			Finished: status != StatusQueued, LogStored: status != StatusQueued,
 		})
 	}
 	if err := tx.InsertRuns(ctx, rs); err != nil {
@@ -406,4 +407,12 @@ func verdict(plan *Run, jobs []*Run) Verdict {
 		return VerdictPending
 	}
 	return VerdictPassed
+}
+
+// orElse is s, or else when s is empty.
+func orElse(s, otherwise string) string {
+	if s == "" {
+		return otherwise
+	}
+	return s
 }

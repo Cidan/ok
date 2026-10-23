@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -14,7 +15,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -32,6 +32,7 @@ import (
 	"github.com/Cidan/ok/internal/workflow"
 	automationpb "github.com/Cidan/ok/proto/ok/automation/v1"
 	identitypb "github.com/Cidan/ok/proto/ok/identity/v1"
+	secretspb "github.com/Cidan/ok/proto/ok/secrets/v1"
 )
 
 const principal = "deploy.ok.robot.example.com"
@@ -119,6 +120,9 @@ type build struct {
 	migrate  map[string]string   // target → "ok" (the default), "refuse" (DELETES_DATA, until allowed), "fail"
 	applied  []string            // each migration run, "target allow…"
 	affected [][]string          // each Affected call's files
+	// secrets are the secrets each migration was given, by target: copies, as the engine clears
+	// its own once the migration ends.
+	secrets map[string]map[string]string
 }
 
 func (b *build) Affected(_ context.Context, _ int64, _, _ []byte, files []string) (*plan.Affected, error) {
@@ -150,10 +154,19 @@ func (b *build) Describe(_ context.Context, _ int64, _ []byte, targets []string)
 	return out, nil
 }
 
-func (b *build) Migrate(_ context.Context, target string, allow []string) (Applied, error) {
+func (b *build) Migrate(_ context.Context, target string, allow []string, values map[string][]byte) (Applied, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.applied = append(b.applied, strings.TrimSpace(target+" "+strings.Join(allow, " ")))
+	if len(values) > 0 {
+		if b.secrets == nil {
+			b.secrets = map[string]map[string]string{}
+		}
+		b.secrets[target] = map[string]string{}
+		for p, v := range values {
+			b.secrets[target][p] = string(v)
+		}
+	}
 	switch b.migrate[target] {
 	case "refuse":
 		if !slices.Contains(allow, "DELETES_DATA") {
@@ -256,15 +269,13 @@ type env struct {
 	repo           *repo
 	seq            int64
 	headSeq        int64
+	// secrets is ok secrets, when the test gives the deployer one.
+	secrets DeploySecrets
 }
 
 func newEnv(t *testing.T, objs ...runtime.Object) *env {
 	t.Helper()
-	pool, err := pgxpool.New(context.Background(), testdb.Postgres(t))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(pool.Close)
+	pool := testdb.Pool(t)
 	b, err := postgres.Open(context.Background(), pool)
 	st := store.New(b)
 	if err != nil {
@@ -289,7 +300,10 @@ func (e *env) feed(ev *storeEvent) {
 	e.seq++
 	fe := store.FeedEvent{Seq: e.seq, Repository: 1}
 	if ev.created {
-		fe.Name, fe.Created = "home", true
+		fe.Created = true
+		if err := e.store.ApplyDirectory(context.Background(), store.DirectoryEvent{Seq: 1, Repository: 1, FullName: "home"}); err != nil {
+			e.t.Fatal(err)
+		}
 	} else {
 		e.headSeq++
 		fe.Head, fe.HeadSeq = ev.head, e.headSeq
@@ -326,44 +340,43 @@ func (t *tree) Apply(_ context.Context, in *identitypb.ApplyRequest, _ ...grpc.C
 // engine is a deployer running in its blue or green copy.
 func (e *env) engine(color string) *Engine {
 	return New(Config{Store: e.store, Kube: e.cluster.Kube, Runs: e.runs, Build: e.build, Main: e.repo, Source: e.repo,
-		Tree: e.tree, TreeRepository: e.treeRepository, Labels: roll.LabelsFor("example.com"),
+		Tree: e.tree, TreeRepository: e.treeRepository, Labels: roll.LabelsFor("example.com"), Secrets: e.secrets,
 		Checkout: e.repo, Timing: roll.DefaultTiming, Self: Self{Namespace: "ok-deploy", Name: "ok-deploy", Color: color},
 		Principal: principal, Now: func() time.Time { return e.cluster.Now }})
 }
 
 // tick is one pass of the engine, its migrations waited for, and five seconds on.
-func (e *env) tick(en *Engine, leader bool) {
+func (e *env) tick(en *Engine) {
 	e.t.Helper()
-	if err := en.Tick(context.Background(), leader); err != nil {
+	if err := en.Tick(context.Background()); err != nil {
 		e.t.Fatalf("a pass: %v", err)
 	}
 	en.Wait()
 	e.cluster.Advance(5 * time.Second)
 }
 
-// until ticks the engine as the leader until cond holds.
+// until ticks the engine until cond holds.
 func (e *env) until(en *Engine, what string, cond func() bool) {
 	e.t.Helper()
 	for i := 0; i < 1000; i++ {
 		if cond() {
 			return
 		}
-		e.tick(en, true)
+		e.tick(en)
 	}
 	e.t.Fatalf("never: %s\n%s", what, e.dump())
 }
 
 // deployments are every deployment, newest last.
+// deployments are the repository's deployments, oldest first.
 func (e *env) deployments() []*store.Deployment {
 	e.t.Helper()
-	var out []*store.Deployment
-	for id := int64(1); ; id++ {
-		d, err := e.store.Get(context.Background(), id)
-		if err != nil {
-			return out
-		}
-		out = append(out, d)
+	ds, err := e.store.Latest(context.Background(), 1, 10_000)
+	if err != nil {
+		e.t.Fatal(err)
 	}
+	slices.Reverse(ds)
+	return ds
 }
 
 func (e *env) byName(name string) *store.Deployment {
@@ -446,7 +459,7 @@ func TestDeploy(t *testing.T) {
 	e.kinds()
 	c1 := e.land(1, map[string]string{".ok/workflow/deploy.yaml": workflowFile, "web/web.go": "v1"})
 	en := e.engine(roll.Blue)
-	e.tick(en, true)
+	e.tick(en)
 	ds := e.deployments()
 	if len(ds) != 3 {
 		t.Fatalf("%d deployments:\n%s", len(ds), e.dump())
@@ -500,7 +513,7 @@ func TestDeploy(t *testing.T) {
 	// A change to web alone deploys web alone; one to nothing deployed deploys nothing.
 	e.build.affects["web/web.go"] = []string{"//web:web", "//web:push"}
 	c2 := e.land(2, map[string]string{".ok/workflow/deploy.yaml": workflowFile, "web/web.go": "v2"})
-	e.tick(en, true)
+	e.tick(en)
 	if d := e.byName("web"); d.Status == store.Succeeded || !strings.Contains(d.Why, "container web's image //web:push is affected") || d.FromSeq != 1 || d.ToSeq != 2 {
 		t.Fatalf("web at c2: %+v", d)
 	}
@@ -512,7 +525,7 @@ func TestDeploy(t *testing.T) {
 		t.Errorf("web at c2: blue runs %s ×%d", got, e.cluster.Replicas("web", "web"))
 	}
 	e.land(3, map[string]string{".ok/workflow/deploy.yaml": workflowFile, "web/web.go": "v2", "README": "hi"})
-	e.tick(en, true)
+	e.tick(en)
 	if n := len(e.deployments()); n != 4 {
 		t.Errorf("%d deployments after a change to nothing deployed", n)
 	}
@@ -590,7 +603,7 @@ func TestHazard(t *testing.T) {
 	en := e.engine(roll.Blue)
 	e.until(en, "web to wait for an allowance", func() bool { d := e.find("web"); return d != nil && d.Stage == store.Hazard })
 	for range 5 {
-		e.tick(en, true)
+		e.tick(en)
 	}
 	web := e.byName("web")
 	if web.Stage != store.Hazard || web.Migrations[0].Status != store.MigrationWaiting || !slices.Equal(web.Migrations[0].Refused, []string{"DELETES_DATA"}) ||
@@ -615,7 +628,7 @@ func TestHazard(t *testing.T) {
 	e.build.affects["web/schema/web.sdl"] = []string{"//web/schema:apply"}
 	e.land(2, map[string]string{".ok/workflow/deploy.yaml": "deploy:\n  web:\n    migrate: [//web/schema:apply]\n    images: {web: //web:push}\n    workload: {namespace: web, deployment: web}\n",
 		"web/schema/web.sdl": "x"})
-	e.tick(en, true)
+	e.tick(en)
 	e.until(en, "web at 2 to settle", e.settled)
 	if got := e.byName("web"); got.Status != store.Failed || got.Reason != "migration //web/schema:apply failed" || got.Migrations[0].Output != "connecting: refused" {
 		t.Errorf("a failed migration: %s (%s)", got.Status, got.Reason)
@@ -634,7 +647,7 @@ func TestHalt(t *testing.T) {
 	}
 	e.until(en, "everything to settle", e.settled)
 	web := e.byName("web")
-	if web.Status != store.Halted || web.Reason != "halted by bob.human.example.com" || e.cluster.Replicas("web", "web-green") != 0 || e.cluster.Replicas("web", "web") != 3 {
+	if web.Status != store.Halted || web.Reason != "halted" || web.HaltBy != "bob.human.example.com" || e.cluster.Replicas("web", "web-green") != 0 || e.cluster.Replicas("web", "web") != 3 {
 		t.Errorf("web %s: %s; green %d", web.Status, web.Reason, e.cluster.Replicas("web", "web-green"))
 	}
 	if api := e.byName("api"); api.Status != store.Canceled {
@@ -676,21 +689,25 @@ func TestNewestWins(t *testing.T) {
 	e.build.affects["api/api.go"] = []string{"//api:push"}
 	e.land(1, map[string]string{".ok/workflow/deploy.yaml": workflowFile, "api/api.go": "v1"})
 	en := e.engine(roll.Blue)
-	e.tick(en, true)
+	e.tick(en)
 	// api waits behind web's wave; two more commits change api.
 	e.land(2, map[string]string{".ok/workflow/deploy.yaml": workflowFile, "api/api.go": "v2"})
-	e.tick(en, true)
+	e.tick(en)
 	c3 := e.land(3, map[string]string{".ok/workflow/deploy.yaml": workflowFile, "api/api.go": "v3"})
-	e.tick(en, true)
+	e.tick(en)
 	for e.find("web").Status != store.Succeeded || e.find("data").Status != store.Succeeded {
 		if d := e.find("api"); d.Status != store.Waiting && d.Status != store.Canceled {
 			t.Fatalf("api at %x began before the first plan's earlier waves succeeded:\n%s", d.Commit[:1], e.dump())
 		}
-		e.tick(en, true)
+		e.tick(en)
 	}
 	e.until(en, "everything to settle", e.settled)
-	if !strings.Contains(e.log(e.find("api")), "it takes the place of the deployment it replaced: wave 3 of plan 1, wave 1 of plan 2") {
-		t.Errorf("api's log:\n%s", e.log(e.find("api")))
+	plans, err := e.store.Plans(context.Background(), 1)
+	if err != nil || len(plans) != 3 {
+		t.Fatalf("plans: %d, %v", len(plans), err)
+	}
+	if want := fmt.Sprintf("it takes the place of the deployment it replaced: wave 3 of plan %d, wave 1 of plan %d", plans[0].ID, plans[1].ID); !strings.Contains(e.log(e.find("api")), want) {
+		t.Errorf("api's log, wanting %q:\n%s", want, e.log(e.find("api")))
 	}
 	var apis []string
 	for _, d := range e.deployments() {
@@ -714,25 +731,25 @@ func TestSelf(t *testing.T) {
 	e.kinds()
 	c1 := e.land(1, map[string]string{".ok/workflow/deploy.yaml": "deploy:\n  self:\n    images: {ok-deploy: //ok/deploy:push}\n    workload: {namespace: ok-deploy, deployment: ok-deploy}\n"})
 	blue, green := e.engine(roll.Blue), e.engine(roll.Green)
-	e.tick(blue, true)
+	e.tick(blue)
 	d := e.byName("self")
 	if !d.Self || d.Driver != roll.Blue {
 		t.Fatalf("self %+v", d)
 	}
-	// The green copy, even as the leader, leaves it alone.
+	// The green copy leaves it alone.
 	before := e.log(d)
 	for range 3 {
-		e.tick(green, true)
+		e.tick(green)
 	}
 	if after := e.log(e.byName("self")); after != before {
 		t.Errorf("the green copy stepped its own deployment:\n%s", after)
 	}
-	// The blue copy drives it without the leader lock.
+	// The blue copy drives it.
 	for i := 0; i < 1000 && !e.settled(); i++ {
 		if e.cluster.Replicas("ok-deploy", "ok-deploy") != 1 {
 			t.Fatalf("the driving copy went down mid-deployment:\n%s", e.dump())
 		}
-		e.tick(blue, false)
+		e.tick(blue)
 	}
 	d = e.byName("self")
 	if d.Status != store.Succeeded || e.cluster.Replicas("ok-deploy", "ok-deploy") != 0 || e.cluster.Replicas("ok-deploy", "ok-deploy-green") != 1 ||
@@ -759,7 +776,7 @@ func TestSelfGoesLast(t *testing.T) {
 	e.land(1, map[string]string{".ok/workflow/deploy.yaml": workflowFile,
 		"ok/.ok/workflow/deploy.yaml": "deploy:\n  self:\n    migrate: [//ok/deploy/schema:apply]\n    images: {ok-deploy: //ok/deploy:push}\n    workload: {namespace: ok-deploy, deployment: ok-deploy}\n"})
 	en := e.engine(roll.Blue)
-	e.tick(en, true)
+	e.tick(en)
 	waves := map[string]int{}
 	for _, d := range e.deployments() {
 		waves[d.Name] = d.Wave
@@ -772,7 +789,7 @@ func TestSelfGoesLast(t *testing.T) {
 		if s := e.byName("self"); s.Status != store.Waiting {
 			t.Fatalf("self is %s while api deploys:\n%s", s.Status, e.dump())
 		}
-		e.tick(en, true)
+		e.tick(en)
 	}
 	e.until(en, "everything to settle", e.settled)
 	for _, name := range []string{"web", "data", "api"} {
@@ -799,7 +816,7 @@ func TestAlone(t *testing.T) {
 	const database = "deploy:\n  database:\n    images: {postgres: //db:push}\n    workload: {namespace: postgres, statefulset: postgres}\n    alone: true\n"
 	e.land(1, map[string]string{".ok/workflow/deploy.yaml": workflowFile, "db/.ok/workflow/db.yaml": database})
 	en := e.engine(roll.Blue)
-	e.tick(en, true)
+	e.tick(en)
 	waves := map[string]int{}
 	for _, d := range e.deployments() {
 		waves[d.Name] = d.Wave
@@ -819,12 +836,12 @@ func TestAlone(t *testing.T) {
 	// A change to api lands while database rolls: api's new deployment waits for it.
 	e.build.affects["api/api.go"] = []string{"//api:push"}
 	e.land(2, map[string]string{".ok/workflow/deploy.yaml": workflowFile, "db/.ok/workflow/db.yaml": database, "api/api.go": "v2"})
-	e.tick(en, true)
+	e.tick(en)
 	for e.byName("database").Status.Open() {
 		if api := e.byName("api"); api.Status != store.Waiting && api.Status != store.Succeeded {
 			t.Fatalf("api is %s while database runs alone:\n%s", api.Status, e.dump())
 		}
-		e.tick(en, true)
+		e.tick(en)
 	}
 	if d := e.byName("database"); d.Status != store.Succeeded {
 		t.Fatalf("the database: %s (%s)\n%s", d.Status, d.Reason, e.log(d))
@@ -832,31 +849,6 @@ func TestAlone(t *testing.T) {
 	e.until(en, "everything to settle", e.settled)
 	if d := e.byName("api"); d.Status != store.Succeeded || d.ToSeq != 2 {
 		t.Errorf("api at c2: %s (%s), to %d", d.Status, d.Reason, d.ToSeq)
-	}
-}
-
-// A deployment that runs alone waits for every running deployment, and none starts while it
-// runs.
-func TestOccupancy(t *testing.T) {
-	w := func(ns, name string) *workflow.Workload {
-		return &workflow.Workload{Namespace: ns, Kind: workflow.Deployment, Name: name}
-	}
-	web := &store.Deployment{Deploy: "//a:deploy:web", Workload: w("web", "web")}
-	api := &store.Deployment{Deploy: "//a:deploy:api", Workload: w("api", "api")}
-	db := &store.Deployment{Deploy: "//a:deploy:db", Workload: w("postgres", "postgres"), Alone: true}
-	idle := occupancy{claims: map[string]bool{}}
-	if !idle.admits(db) || !idle.admits(web) {
-		t.Error("nothing running admits nothing")
-	}
-	busy := occupancy{claims: map[string]bool{}}
-	busy.take(web)
-	if busy.admits(db) || busy.admits(web) || !busy.admits(api) {
-		t.Errorf("with web running: db %v, web %v, api %v", busy.admits(db), busy.admits(web), busy.admits(api))
-	}
-	alone := occupancy{claims: map[string]bool{}}
-	alone.take(db)
-	if alone.admits(api) || alone.admits(web) {
-		t.Error("a deployment started while one that runs alone runs")
 	}
 }
 
@@ -893,15 +885,15 @@ func TestImported(t *testing.T) {
 	files := map[string]string{workflow.SettingsFile: "build: none\n", ".ok/workflow/deploy.yaml": workflowFile, "web/web.go": "package web\n"}
 	e.land(1, files)
 	en := e.engine(roll.Blue)
-	e.tick(en, true)
+	e.tick(en)
 	changed := map[string]string{}
 	for p, d := range files {
 		changed[p] = d
 	}
 	changed["web/web.go"] = "package web // changed\n"
 	e.land(2, changed)
-	e.tick(en, true)
-	e.tick(en, true)
+	e.tick(en)
+	e.tick(en)
 	if ds := e.deployments(); len(ds) != 0 {
 		t.Errorf("deployments of an imported repository:\n%s", e.dump())
 	}
@@ -936,7 +928,7 @@ func TestTree(t *testing.T) {
 		"identity/acl.yaml": "members: [ada.human.example.com]\n", "identity/eng/group.yaml": "members: []\n"}
 	c1 := e.land(1, files)
 	en := e.engine(roll.Blue)
-	e.tick(en, true)
+	e.tick(en)
 	e.until(en, "the first plan to settle", e.settled)
 	d := e.byName("identity")
 	if d == nil || d.Status != store.Succeeded || d.Deploy != "//.ok/repository.yaml:deploy:identity" || len(e.tree.applies) != 1 {
@@ -959,7 +951,7 @@ func TestTree(t *testing.T) {
 	next := maps.Clone(files)
 	next["web/web.go"] = "v2"
 	e.land(2, next)
-	e.tick(en, true)
+	e.tick(en)
 	e.until(en, "the second plan to settle", e.settled)
 	if len(e.tree.applies) != 1 {
 		t.Errorf("a change beside the tree applied it: %d applies", len(e.tree.applies))
@@ -968,7 +960,7 @@ func TestTree(t *testing.T) {
 	next = maps.Clone(next)
 	next["identity/eng/group.yaml"] = "members: [ada.human.example.com]\n"
 	e.land(3, next)
-	e.tick(en, true)
+	e.tick(en)
 	e.until(en, "the third plan to settle", e.settled)
 	if len(e.tree.applies) != 2 || e.tree.applies[1].GetSequence() != 3 {
 		t.Fatalf("a change to the tree: %d applies\n%s", len(e.tree.applies), e.dump())
@@ -978,11 +970,11 @@ func TestTree(t *testing.T) {
 	next = maps.Clone(next)
 	next["identity/acl.yaml"] = "members: []\n"
 	e.land(4, next)
-	e.tick(en, true)
+	e.tick(en)
 	e.until(en, "the fourth plan to settle", e.settled)
 	var last *store.Deployment
 	for _, d := range e.deployments() {
-		if d.Name == "identity" && (last == nil || d.ID > last.ID) {
+		if d.Name == "identity" && (last == nil || d.CreatedAt.After(last.CreatedAt)) {
 			last = d
 		}
 	}
@@ -996,7 +988,7 @@ func TestTree(t *testing.T) {
 	other.treeRepository = "infra"
 	other.land(1, files)
 	en = other.engine(roll.Blue)
-	other.tick(en, true)
+	other.tick(en)
 	other.until(en, "the plan to settle", other.settled)
 	if d := other.find("identity"); d != nil || len(other.tree.applies) != 0 {
 		t.Errorf("a repository other than the tree's applied it: %+v", d)
@@ -1014,5 +1006,95 @@ func TestMigrationNotABinary(t *testing.T) {
 	d := e.byName("data")
 	if d.Status != store.Failed || len(e.build.applied) != 0 || !strings.Contains(e.log(d), "//data:apply is a genrule: a migration is a binary that speaks the migrate protocol") {
 		t.Errorf("a genrule migration: %s (%s), applied %v\n%s", d.Status, d.Reason, e.build.applied, e.log(d))
+	}
+}
+
+// Two replicas of the deployer, neither leading, take turns: between them they plan the commit
+// once, start each deployment once, push each image once, apply each migration once, and roll
+// everything — whichever of them holds each piece when its turn comes.
+func TestTwoReplicas(t *testing.T) {
+	e := newEnv(t, kubesim.Deployment("web", "web", 3, "old/web:1"), kubesim.Deployment("api", "api", 1, "old/api:1"))
+	e.kinds()
+	c1 := e.land(1, map[string]string{".ok/workflow/deploy.yaml": workflowFile, "web/web.go": "v1"})
+	one, two := e.engine(roll.Blue), e.engine(roll.Blue)
+	for i := 0; i < 1000 && !e.settled(); i++ {
+		e.tick(one)
+		e.tick(two)
+	}
+	for _, d := range e.deployments() {
+		if d.Status != store.Succeeded {
+			t.Errorf("%s %s: %s\n%s", d.Name, d.Status, d.Reason, e.log(d))
+		}
+	}
+	if plans, err := e.store.Plans(context.Background(), 1); err != nil || len(plans) != 1 {
+		t.Errorf("plans = %d, %v; want one", len(plans), err)
+	}
+	pushes := map[string]int{}
+	e.runs.mu.Lock()
+	for _, r := range e.runs.runs {
+		pushes[r.GetJob().GetTargets()[0]]++
+	}
+	e.runs.mu.Unlock()
+	if pushes["//web:push"] != 1 || pushes["//api:push"] != 1 || len(pushes) != 2 {
+		t.Errorf("pushes %v: want each image pushed once", pushes)
+	}
+	if !slices.Equal(e.build.applied, []string{"//web/schema:apply", "//data:apply"}) {
+		t.Errorf("migrations applied %v: want each once, in its wave", e.build.applied)
+	}
+	if got := e.cluster.Running("api"); len(got) != 1 || got[0] != "deploy/api-green "+image("//api:push", c1) {
+		t.Errorf("api runs %v", got)
+	}
+}
+
+// fakeSecrets is ok secrets: hunter2 for secret/prod/db, to the deploy data alone; each request.
+type fakeSecrets struct {
+	mu   sync.Mutex
+	asks []*secretspb.ReadDeploySecretRequest
+}
+
+func (f *fakeSecrets) ReadDeploySecret(_ context.Context, in *secretspb.ReadDeploySecretRequest, _ ...grpc.CallOption) (*secretspb.ReadSecretResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.asks = append(f.asks, in)
+	if in.GetDeploy() != "//.ok/workflow/deploy.yaml:deploy:data" {
+		return nil, status.Errorf(codes.PermissionDenied, "main's secret/prod/acl.yaml does not give %s the folder's secrets (deploys:)", in.GetDeploy())
+	}
+	return &secretspb.ReadSecretResponse{Value: []byte("hunter2")}, nil
+}
+
+// A deploy's migrations are given the secrets its stanza at the deployment's commit names, as ok
+// secrets gives them; a deploy ok secrets refuses fails, saying why, its migration never run; and
+// with no ok secrets, a deploy naming secrets fails.
+func TestMigrationSecrets(t *testing.T) {
+	e := newEnv(t)
+	e.kinds()
+	sec := &fakeSecrets{}
+	e.secrets = sec
+	c1 := e.land(1, map[string]string{".ok/workflow/deploy.yaml": "deploy:\n  data:\n    migrate: [//data:apply]\n    secrets: [//secret/prod/db]\n" +
+		"  other:\n    migrate: [//other:apply]\n    secrets: [//secret/prod/db]\n"})
+	e.build.kinds["//other:apply"] = "go_binary"
+	en := e.engine(roll.Blue)
+	e.until(en, "the deploys to settle", e.settled)
+	if d := e.byName("data"); d.Status != store.Succeeded || !strings.Contains(e.log(d), "its migrations read 1 secret(s): //secret/prod/db") {
+		t.Errorf("data: %s (%s)\n%s", d.Status, d.Reason, e.log(d))
+	}
+	if got := e.build.secrets["//data:apply"]; got["secret/prod/db"] != "hunter2" || len(got) != 1 {
+		t.Errorf("//data:apply was given %v", got)
+	}
+	if len(sec.asks) == 0 || !bytes.Equal(sec.asks[0].GetCommitId(), c1) || sec.asks[0].GetPath() != "secret/prod/db" {
+		t.Errorf("ok secrets was asked %v", sec.asks)
+	}
+	d := e.byName("other")
+	if d.Status != store.Failed || slices.Contains(e.build.applied, "//other:apply") || !strings.Contains(e.log(d), "does not give //.ok/workflow/deploy.yaml:deploy:other") {
+		t.Errorf("other: %s, applied %v\n%s", d.Status, e.build.applied, e.log(d))
+	}
+
+	none := newEnv(t)
+	none.kinds()
+	none.land(1, map[string]string{".ok/workflow/deploy.yaml": "deploy:\n  data:\n    migrate: [//data:apply]\n    secrets: [//secret/prod/db]\n"})
+	en = none.engine(roll.Blue)
+	none.until(en, "data to settle", none.settled)
+	if d := none.byName("data"); d.Status != store.Failed || !strings.Contains(none.log(d), "this installation runs no ok secrets") {
+		t.Errorf("with no ok secrets: %s\n%s", d.Status, none.log(d))
 	}
 }

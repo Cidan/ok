@@ -14,6 +14,14 @@ spec:
   parentRefs: {{- required "httpRoute.parentRefs names the Gateway (or its listener) ok is reached through" .Values.httpRoute.parentRefs | toYaml | nindent 4 }}
   hostnames: {{- default (list (urlParse .Values.publicURL).hostname) .Values.httpRoute.hostnames | toYaml | nindent 4 }}
   rules:
+    {{- if .Values.secrets.enabled }}
+    # People's secrets service goes to ok secrets, which runs apart.
+    - matches:
+        - path: {type: PathPrefix, value: /ok.secrets.v1.Secrets}
+      backendRefs:
+        - name: {{ include "ok.name" . }}-secrets
+          port: 8472
+    {{- end }}
     - backendRefs:
         - name: {{ include "ok.name" . }}-server
           port: {{ .Values.service.port }}

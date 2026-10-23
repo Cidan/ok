@@ -64,7 +64,7 @@ func TestWorker(t *testing.T) {
 	startRun := func(commit []byte, job *automationpb.Job) int64 {
 		t.Helper()
 		r, err := e.runs.StartRun(e.ctx, &automationpb.StartRunRequest{RepositoryId: repo, CommitId: commit, Job: job,
-			Origin: &automationpb.Origin{Phase: automationpb.Origin_PHASE_MANUAL}, ForPerson: ada})
+			Origin: &automationpb.Origin{Phase: automationpb.Origin_PHASE_MANUAL}, ForPersonId: e.adaID})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -155,7 +155,7 @@ func TestWorker(t *testing.T) {
 	id := startRun(first, slow)
 	waitFor("the slow test to run", 2*time.Minute, running(id, "w1"))
 	time.Sleep(2 * time.Second) // into the test itself
-	if _, err := e.runs.CancelRun(e.ctx, &automationpb.CancelRunRequest{Id: id, Reason: "not needed", ForPerson: ada}); err != nil {
+	if _, err := e.runs.CancelRun(e.ctx, &automationpb.CancelRunRequest{Id: id, Reason: "not needed", ForPersonId: e.adaID}); err != nil {
 		t.Fatal(err)
 	}
 	began := time.Now()
@@ -174,7 +174,7 @@ func TestWorker(t *testing.T) {
 	}
 	w2 := e.startWorker("w2", 1)
 	waitFor("the slow test to run on w2", 2*time.Minute, running(id, "w2"))
-	if _, err := e.runs.CancelRun(e.ctx, &automationpb.CancelRunRequest{Id: id, ForPerson: ada}); err != nil {
+	if _, err := e.runs.CancelRun(e.ctx, &automationpb.CancelRunRequest{Id: id, ForPersonId: e.adaID}); err != nil {
 		t.Fatal(err)
 	}
 	expect("the released run, canceled", id, automationpb.Run_STATUS_CANCELED)
@@ -199,7 +199,7 @@ func TestWorker(t *testing.T) {
 		t.Errorf("two runs at once in one slot: %q", get(one).GetWorker())
 	}
 	for _, id := range []int64{one, two} {
-		if _, err := e.runs.CancelRun(e.ctx, &automationpb.CancelRunRequest{Id: id, ForPerson: ada}); err != nil {
+		if _, err := e.runs.CancelRun(e.ctx, &automationpb.CancelRunRequest{Id: id, ForPersonId: e.adaID}); err != nil {
 			t.Fatal(err)
 		}
 		expect("a slow test, canceled", id, automationpb.Run_STATUS_CANCELED)

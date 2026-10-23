@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -23,11 +24,15 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	"github.com/Cidan/ok/internal/authz"
+	"github.com/Cidan/ok/internal/config"
 	"github.com/Cidan/ok/internal/directory"
 	"github.com/Cidan/ok/internal/id/ca"
+	"github.com/Cidan/ok/internal/id/enterprise"
 	"github.com/Cidan/ok/internal/id/store"
 	"github.com/Cidan/ok/internal/identity"
 	"github.com/Cidan/ok/internal/serve/authn"
+	"github.com/Cidan/ok/internal/tenancy"
 	identitypb "github.com/Cidan/ok/proto/ok/identity/v1"
 )
 
@@ -45,10 +50,34 @@ type Config struct {
 	Syncer Syncer
 	// PublicURL is where people reach ok's web pages: https://ok.example.com.
 	PublicURL string
+	// Passkeys: people sign in, and approve, with passkeys — which WebAuthn binds to a host name,
+	// so a public URL at an address has none.
+	Passkeys bool
+	// Mail: a mail server is configured, so notifications whose kinds people have mailed are
+	// queued to be.
+	Mail bool
+	// PlaintextIssuers lets an organization trust an issuer reached over plaintext: a development
+	// server's (an issuer it runs on loopback), never a hosted service's.
+	PlaintextIssuers bool
+	// Enterprise syncs organizations' own identity providers, their secrets sealed with its
+	// sealer; nil where identity has no sealing key, and keeps none.
+	Enterprise *enterprise.Syncer
 	// BootstrapAdmins are the handles that administer ok before any tree is applied.
 	BootstrapAdmins []string
 	// SessionIdle is how long a browser session lives unused.
 	SessionIdle time.Duration
+	// Hosted: people make organizations (docs/hosted.md, "Tenancy, as built"). Otherwise the
+	// installation has one, Installation (by ID), whose owners are ok's administrators and whose
+	// members are its people and robots.
+	Hosted       bool
+	Installation string
+	// Roles are ok's roles' robots, by the caller each is: which of them calls.
+	Roles authn.Roles
+	// Cells are the cells repositories are placed in (config.Config.Cells), the first holding
+	// those made before there were cells.
+	Cells []config.IdentityCell
+	// MoveAsked, when set, is told a move was asked or canceled: the runner looks at once.
+	MoveAsked func()
 }
 
 // Server implements every identity service.
@@ -60,6 +89,20 @@ type Server struct {
 	identitypb.UnimplementedCredentialsServer
 	identitypb.UnimplementedAdminServer
 	identitypb.UnimplementedTreeServer
+	identitypb.UnimplementedAuthorizationServer
+	identitypb.UnimplementedTenancyServer
+	identitypb.UnimplementedDirectoryEventsServer
+	identitypb.UnimplementedTokensServer
+	identitypb.UnimplementedAppsServer
+	identitypb.UnimplementedAppTokensServer
+	identitypb.UnimplementedCellsServer
+	identitypb.UnimplementedQuotasServer
+	identitypb.UnimplementedInboxServer
+	identitypb.UnimplementedDeliveryServer
+	identitypb.UnimplementedNotificationsServer
+	identitypb.UnimplementedDeployAgentsServer
+	identitypb.UnimplementedApprovalsServer
+	identitypb.UnimplementedSecretsRootsServer
 
 	cfg   Config
 	names identity.Names
@@ -74,8 +117,10 @@ func New(cfg Config) *Server {
 	return &Server{cfg: cfg, names: cfg.Store.Names()}
 }
 
-// Register registers every service on a gRPC server.
-func (s *Server) Register(r grpc.ServiceRegistrar) {
+// Register registers every service on a gRPC server, each refusing a personal token but on the
+// methods it reaches (tokenMethods).
+func (s *Server) Register(reg grpc.ServiceRegistrar) {
+	r := tokenGate{reg: reg}
 	identitypb.RegisterDirectoryServer(r, s)
 	identitypb.RegisterVerifyServer(r, s)
 	identitypb.RegisterCAServer(r, s)
@@ -83,6 +128,67 @@ func (s *Server) Register(r grpc.ServiceRegistrar) {
 	identitypb.RegisterCredentialsServer(r, s)
 	identitypb.RegisterAdminServer(r, s)
 	identitypb.RegisterTreeServer(r, s)
+	identitypb.RegisterAuthorizationServer(r, s)
+	identitypb.RegisterTenancyServer(r, s)
+	identitypb.RegisterDirectoryEventsServer(r, s)
+	identitypb.RegisterTokensServer(r, s)
+	identitypb.RegisterAppsServer(r, s)
+	identitypb.RegisterAppTokensServer(r, s)
+	identitypb.RegisterCellsServer(r, s)
+	identitypb.RegisterQuotasServer(r, s)
+	identitypb.RegisterInboxServer(r, s)
+	identitypb.RegisterDeliveryServer(r, s)
+	identitypb.RegisterNotificationsServer(r, s)
+	identitypb.RegisterDeployAgentsServer(r, s)
+	identitypb.RegisterApprovalsServer(r, s)
+	identitypb.RegisterSecretsRootsServer(r, s)
+}
+
+// Route is where a repository is, for the edge: by its ID, or its full name or one it had, whatever
+// its state.
+func (s *Server) Route(ctx context.Context, req *identitypb.RouteRequest) (*identitypb.RouteResponse, error) {
+	r, err := s.repositoryOf(ctx, req.GetRepository())
+	if err != nil {
+		return nil, err
+	}
+	return &identitypb.RouteResponse{Id: r.ID, Cell: s.cfg.Store.CellOf(r)}, nil
+}
+
+// repositoryOf is the repository a request names by its ID, or by its full name or one it had,
+// whatever its state; NOT_FOUND for none.
+func (s *Server) repositoryOf(ctx context.Context, ref string) (store.Repository, error) {
+	var r store.Repository
+	var err error
+	if id, perr := strconv.ParseInt(ref, 10, 64); perr == nil {
+		r, err = s.cfg.Store.Repository(ctx, id)
+	} else {
+		owner, name, perr := tenancy.ParseFullName(ref)
+		if perr != nil {
+			return store.Repository{}, status.Errorf(codes.NotFound, "no repository is called %s", ref)
+		}
+		o, err := s.cfg.Store.Owner(ctx, owner)
+		if errors.Is(err, store.ErrNotFound) {
+			return store.Repository{}, status.Errorf(codes.NotFound, "no repository is called %s", ref)
+		}
+		if err != nil {
+			return store.Repository{}, grpcError(err)
+		}
+		r, _, err = s.cfg.Store.ResolveRepository(ctx, o.ID, name)
+	}
+	if errors.Is(err, store.ErrNotFound) {
+		return store.Repository{}, status.Errorf(codes.NotFound, "no repository is %s", ref)
+	}
+	return r, grpcError(err)
+}
+
+// ListCells lists the cells repositories are placed in, and where each one's roles are reached.
+func (s *Server) ListCells(context.Context, *identitypb.ListCellsRequest) (*identitypb.ListCellsResponse, error) {
+	out := &identitypb.ListCellsResponse{}
+	for _, c := range s.cfg.Cells {
+		out.Cells = append(out.Cells, &identitypb.Cell{Name: c.Name, Region: c.Region, Placement: !c.Closed, Scm: c.SCM, Control: c.Control,
+			Automation: c.Automation, Deploy: c.Deploy, Secrets: c.Secrets})
+	}
+	return out, nil
 }
 
 // grpcError maps the store's and the model's errors to gRPC statuses.
@@ -109,8 +215,11 @@ func grpcError(err error) error {
 }
 
 func kindPB(k store.Kind) identitypb.Kind {
-	if k == store.Human {
+	switch k {
+	case store.Human:
 		return identitypb.Kind_KIND_HUMAN
+	case store.Org:
+		return identitypb.Kind_KIND_ORG
 	}
 	return identitypb.Kind_KIND_ROBOT
 }
@@ -150,7 +259,7 @@ func (s *Server) tree(ctx context.Context) (*identity.Tree, store.Applied, error
 	if err != nil {
 		return nil, applied, err
 	}
-	synced, err := s.cfg.Store.SyncedGroups(ctx)
+	synced, err := s.groups(ctx)
 	if err != nil {
 		return nil, applied, err
 	}
@@ -235,23 +344,30 @@ func (s *Server) ListAdmins(ctx context.Context, _ *identitypb.ListAdminsRequest
 	} else if all, _, err = s.expand(ctx, s.names.Of(identity.ACL, identity.Root)); err != nil {
 		return nil, grpcError(err)
 	}
-	active, err := s.activeOnly(ctx, all)
+	sort.Strings(all)
+	active, ids, err := s.active(ctx, all)
 	if err != nil {
 		return nil, grpcError(err)
 	}
-	sort.Strings(active)
-	return &identitypb.ListAdminsResponse{Principals: active}, nil
+	return &identitypb.ListAdminsResponse{Principals: active, PrincipalIds: ids}, nil
 }
 
 func (s *Server) CheckAdmin(ctx context.Context, req *identitypb.CheckAdminRequest) (*identitypb.CheckAdminResponse, error) {
-	active, err := s.activeOnly(ctx, []string{req.GetPrincipal()})
+	name, found, err := s.principalNamed(ctx, req.GetPrincipal(), req.GetPrincipalId())
+	if err != nil {
+		return nil, grpcError(err)
+	}
+	if !found {
+		return &identitypb.CheckAdminResponse{}, nil
+	}
+	active, err := s.activeOnly(ctx, []string{name})
 	if err != nil {
 		return nil, grpcError(err)
 	}
 	if len(active) == 0 {
 		return &identitypb.CheckAdminResponse{}, nil
 	}
-	ok, _, err := s.isAdmin(ctx, req.GetPrincipal())
+	ok, _, err := s.isAdmin(ctx, name)
 	if err != nil {
 		return nil, grpcError(err)
 	}
@@ -294,6 +410,8 @@ func (s *Server) ListPrincipals(ctx context.Context, req *identitypb.ListPrincip
 		f.Kind = store.Human
 	case identitypb.Kind_KIND_ROBOT:
 		f.Kind = store.Robot
+	case identitypb.Kind_KIND_ORG:
+		f.Kind = store.Org
 	}
 	ps, err := s.cfg.Store.Principals(ctx, f)
 	if err != nil {
@@ -322,7 +440,7 @@ func (s *Server) ListRetiredNames(ctx context.Context, _ *identitypb.ListRetired
 	return resp, nil
 }
 
-// sets are every set — the tree's and the synced groups — by name.
+// sets are every set — the tree's, the synced groups, and organizations' teams — by name.
 func (s *Server) sets(ctx context.Context) (map[string]*identitypb.Set, error) {
 	treeSets, _, err := s.cfg.Store.Tree(ctx)
 	if err != nil {
@@ -347,6 +465,16 @@ func (s *Server) sets(ctx context.Context) (map[string]*identitypb.Set, error) {
 			out[name] = &identitypb.Set{Name: name, Kind: identitypb.SetKind_SET_KIND_GROUP, Source: identitypb.SetSource_SET_SOURCE_SYNCED, Owner: admins, Members: ms}
 		}
 	}
+	teams, err := s.cfg.Store.TeamSets(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for name, ms := range teams {
+		// A team's owner is its organization: <team>.<org>.team.<domain> is <org>'s.
+		labels := strings.SplitN(name, ".", 3)
+		out[name] = &identitypb.Set{Name: name, Kind: identitypb.SetKind_SET_KIND_GROUP, Source: identitypb.SetSource_SET_SOURCE_TEAM,
+			Owner: s.names.Org(labels[1]), Members: ms}
+	}
 	return out, nil
 }
 
@@ -356,6 +484,12 @@ func (s *Server) GetSet(ctx context.Context, req *identitypb.GetSetRequest) (*id
 		return nil, grpcError(err)
 	}
 	set, ok := all[req.GetName()]
+	if !ok {
+		// A name a move gave up names what took its place.
+		if name, err := s.cfg.Store.Alias(ctx, req.GetName()); err == nil {
+			set, ok = all[name]
+		}
+	}
 	if !ok {
 		return nil, status.Errorf(codes.NotFound, "no set is named %s", req.GetName())
 	}
@@ -382,8 +516,35 @@ func (s *Server) model(ctx context.Context) (*identity.Tree, map[string][]string
 	if err != nil {
 		return nil, nil, err
 	}
-	synced, err := s.cfg.Store.SyncedGroups(ctx)
+	synced, err := s.groups(ctx)
 	return t, synced, err
+}
+
+// groups are the sets the tree may hold besides its own: the system of record's groups, and
+// organizations' teams, each by name with its members' names.
+func (s *Server) groups(ctx context.Context) (map[string][]string, error) {
+	synced, err := s.cfg.Store.SyncedGroups(ctx)
+	if err != nil {
+		return nil, err
+	}
+	teams, err := s.cfg.Store.TeamSets(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for n, ms := range teams {
+		synced[n] = ms
+	}
+	// A group an installation moved in gave up is its team, under the name the tree may still use.
+	aliases, err := s.cfg.Store.Aliases(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for old, name := range aliases {
+		if ms, ok := teams[name]; ok {
+			synced[old] = ms
+		}
+	}
+	return synced, nil
 }
 
 // expand is every principal in a set, through the sets it holds.
@@ -424,20 +585,41 @@ func (s *Server) expand(ctx context.Context, name string) ([]string, bool, error
 
 // activeOnly keeps the names of active principals.
 func (s *Server) activeOnly(ctx context.Context, names []string) ([]string, error) {
-	var out []string
+	out, _, err := s.active(ctx, names)
+	return out, err
+}
+
+// active are the names that name active principals, and those principals' stable IDs, in order.
+func (s *Server) active(ctx context.Context, names []string) (out, ids []string, err error) {
 	for _, n := range names {
 		p, err := s.cfg.Store.Principal(ctx, n)
 		if errors.Is(err, store.ErrNotFound) {
 			continue
 		}
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if p.Active() {
-			out = append(out, n)
+			out, ids = append(out, n), append(ids, p.ID)
 		}
 	}
-	return out, nil
+	return out, ids, nil
+}
+
+// principalNamed is the name a request names a principal by — by name, or by stable ID, which
+// is its current name — and false for an ID no principal has.
+func (s *Server) principalNamed(ctx context.Context, name, id string) (string, bool, error) {
+	if id == "" {
+		return name, true, nil
+	}
+	p, err := s.cfg.Store.PrincipalByID(ctx, id)
+	if errors.Is(err, store.ErrNotFound) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return p.Name, true, nil
 }
 
 func (s *Server) ExpandSet(ctx context.Context, req *identitypb.ExpandSetRequest) (*identitypb.ExpandSetResponse, error) {
@@ -448,15 +630,22 @@ func (s *Server) ExpandSet(ctx context.Context, req *identitypb.ExpandSetRequest
 	if !ok {
 		return nil, status.Errorf(codes.NotFound, "no set is named %s", req.GetName())
 	}
-	active, err := s.activeOnly(ctx, ms)
+	active, ids, err := s.active(ctx, ms)
 	if err != nil {
 		return nil, grpcError(err)
 	}
-	return &identitypb.ExpandSetResponse{Principals: active}, nil
+	return &identitypb.ExpandSetResponse{Principals: active, PrincipalIds: ids}, nil
 }
 
 func (s *Server) CheckMembership(ctx context.Context, req *identitypb.CheckMembershipRequest) (*identitypb.CheckMembershipResponse, error) {
-	active, err := s.activeOnly(ctx, []string{req.GetPrincipal()})
+	name, found, err := s.principalNamed(ctx, req.GetPrincipal(), req.GetPrincipalId())
+	if err != nil {
+		return nil, grpcError(err)
+	}
+	if !found {
+		return &identitypb.CheckMembershipResponse{}, nil
+	}
+	active, err := s.activeOnly(ctx, []string{name})
 	if err != nil {
 		return nil, grpcError(err)
 	}
@@ -468,7 +657,7 @@ func (s *Server) CheckMembership(ctx context.Context, req *identitypb.CheckMembe
 		return nil, grpcError(err)
 	}
 	if t != nil {
-		if chain, ok := t.Contains(req.GetSet(), req.GetPrincipal()); ok {
+		if chain, ok := t.Contains(req.GetSet(), name); ok {
 			return &identitypb.CheckMembershipResponse{Member: true, Chain: chain}, nil
 		}
 		return &identitypb.CheckMembershipResponse{}, nil
@@ -478,7 +667,7 @@ func (s *Server) CheckMembership(ctx context.Context, req *identitypb.CheckMembe
 		return nil, grpcError(err)
 	}
 	for _, m := range ms {
-		if m == req.GetPrincipal() {
+		if m == name {
 			return &identitypb.CheckMembershipResponse{Member: true, Chain: []string{req.GetSet(), m}}, nil
 		}
 	}
@@ -493,6 +682,15 @@ func (s *Server) GetCredential(ctx context.Context, req *identitypb.GetCredentia
 		return nil, grpcError(err)
 	}
 	return &identitypb.GetCredentialResponse{Principal: principalPB(c.Principal), Active: c.Standing()}, nil
+}
+
+func (s *Server) GetToken(ctx context.Context, req *identitypb.GetTokenRequest) (*identitypb.GetTokenResponse, error) {
+	t, p, err := s.cfg.Store.TokenFor(ctx, req.GetToken())
+	if err != nil {
+		return nil, grpcError(err)
+	}
+	return &identitypb.GetTokenResponse{Principal: principalPB(p), TokenId: t.ID, Role: t.Role.String(), RepositoryIds: t.Repositories,
+		OwnerId: t.Owner}, nil
 }
 
 func (s *Server) GetSession(ctx context.Context, req *identitypb.GetSessionRequest) (*identitypb.GetSessionResponse, error) {
@@ -984,7 +1182,7 @@ func (s *Server) planTree(ctx context.Context, files []*identitypb.File) (*ident
 	for _, f := range files {
 		fs[f.GetPath()] = f.GetContent()
 	}
-	synced, err := s.cfg.Store.SyncedGroups(ctx)
+	synced, err := s.groups(ctx)
 	if err != nil {
 		return nil, store.Applied{}, nil, err
 	}
@@ -1051,8 +1249,19 @@ type Directory struct {
 	Idle  time.Duration
 }
 
+// Token returns the person a live personal token is theirs, and what it allows.
+func (d Directory) Token(ctx context.Context, secret string) (authn.Principal, error) {
+	t, p, err := d.Store.TokenFor(ctx, secret)
+	if err != nil {
+		return authn.Principal{}, mapNotFound(err)
+	}
+	out := toAuthn(p, true)
+	out.Scope = &authz.Token{Role: t.Role, Repositories: t.Repositories, Owner: t.Owner}
+	return out, nil
+}
+
 func toAuthn(p store.Principal, active bool) authn.Principal {
-	return authn.Principal{Name: p.Name, ID: p.ID, Human: p.Kind == store.Human, Active: active}
+	return authn.Principal{Name: p.Name, ID: p.ID, Human: p.Kind == store.Human, Org: p.Kind == store.Org, Active: active}
 }
 
 func mapNotFound(err error) error {
@@ -1064,6 +1273,14 @@ func mapNotFound(err error) error {
 
 func (d Directory) Principal(ctx context.Context, name string) (authn.Principal, error) {
 	p, err := d.Store.Principal(ctx, name)
+	if err != nil {
+		return authn.Principal{}, mapNotFound(err)
+	}
+	return toAuthn(p, p.Active()), nil
+}
+
+func (d Directory) PrincipalByID(ctx context.Context, id string) (authn.Principal, error) {
+	p, err := d.Store.PrincipalByID(ctx, id)
 	if err != nil {
 		return authn.Principal{}, mapNotFound(err)
 	}

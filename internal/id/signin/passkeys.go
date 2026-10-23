@@ -155,3 +155,39 @@ func (k *Passkeys) FinishLogin(ctx context.Context, session webauthn.SessionData
 	}
 	return who, nil
 }
+
+// BeginApproval starts an approval of something a person was asked, with one of their own
+// passkeys and its user verification: the assertion's options, and the session to keep until it
+// finishes.
+func (k *Passkeys) BeginApproval(ctx context.Context, p store.Principal) (*protocol.CredentialAssertion, *webauthn.SessionData, error) {
+	u, err := k.user(ctx, p)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(u.creds) == 0 {
+		return nil, nil, errors.New("you have no passkey to approve with: add one on your account page first")
+	}
+	return k.wa.BeginLogin(u, webauthn.WithUserVerification(protocol.VerificationRequired))
+}
+
+// FinishApproval checks the browser's answer to an approval: an assertion by one of the person's
+// own passkeys, their presence and identity verified in this ceremony (the session requires user
+// verification, which the assertion's own flags must show).
+func (k *Passkeys) FinishApproval(ctx context.Context, p store.Principal, session webauthn.SessionData, r *http.Request) error {
+	u, err := k.user(ctx, p)
+	if err != nil {
+		return err
+	}
+	c, err := k.wa.FinishLogin(u, session, r)
+	if err != nil {
+		return fmt.Errorf("the passkey: %w", err)
+	}
+	if c.Authenticator.CloneWarning {
+		return errors.New("the passkey's signature counter went backwards: the authenticator may be cloned; it is refused")
+	}
+	data, err := json.Marshal(c)
+	if err != nil {
+		return err
+	}
+	return k.store.PasskeyUsed(ctx, c.ID, data)
+}

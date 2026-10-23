@@ -31,7 +31,9 @@ const (
 // Owner is one owner: a user, an ACL, or anyone.
 type Owner struct {
 	Kind Kind
-	Name string // a handle or an ACL's name; "" for Anyone
+	// Name is a person's handle (ada, of user: ada or user: @ada); an ACL's name (eng), or an
+	// organization's team (acme/eng, of acl: @acme/eng); "" for Anyone.
+	Name string
 }
 
 func (o Owner) String() string {
@@ -39,6 +41,9 @@ func (o Owner) String() string {
 	case User:
 		return "user: " + o.Name
 	case ACL:
+		if strings.Contains(o.Name, "/") {
+			return "acl: @" + o.Name
+		}
 		return "acl: " + o.Name
 	}
 	return "*"
@@ -249,14 +254,15 @@ func importPath(from, target string) (string, string) {
 	return p, ""
 }
 
-// parseOwner reads one owner: user: <handle>, acl: <name>, or *.
+// parseOwner reads one owner: user: <handle> (or @<handle>, as a hosted service writes it), acl:
+// <name>, acl: @<organization>/<team>, or *.
 func parseOwner(tok string) (Owner, string) {
 	tok = strings.TrimSpace(tok)
 	if tok == "*" {
 		return Owner{Kind: Anyone}, ""
 	}
 	if name, ok := strings.CutPrefix(tok, "user:"); ok {
-		name = strings.ToLower(strings.TrimSpace(name))
+		name = strings.TrimPrefix(strings.ToLower(strings.TrimSpace(name)), "@")
 		if !handle(name) {
 			return Owner{}, fmt.Sprintf("%q is not a handle", strings.TrimSpace(tok[len("user:"):]))
 		}
@@ -265,12 +271,18 @@ func parseOwner(tok string) (Owner, string) {
 	if name, ok := strings.CutPrefix(tok, "acl:"); ok {
 		// A name the tree could not declare parses, and validation finds no such ACL.
 		name = strings.ToLower(strings.TrimSpace(name))
+		if org, team, ok := strings.Cut(strings.TrimPrefix(name, "@"), "/"); ok {
+			if !handle(org) || !handle(team) {
+				return Owner{}, fmt.Sprintf("%q is not an organization's team (@<organization>/<team>)", strings.TrimSpace(tok[len("acl:"):]))
+			}
+			return Owner{Kind: ACL, Name: org + "/" + team}, ""
+		}
 		if !handle(name) {
 			return Owner{}, fmt.Sprintf("%q is not an ACL's name", strings.TrimSpace(tok[len("acl:"):]))
 		}
 		return Owner{Kind: ACL, Name: name}, ""
 	}
-	return Owner{}, fmt.Sprintf("%q is not an owner (user: <handle>, acl: <name>, or *), a per-file rule, a set option, or an import", tok)
+	return Owner{}, fmt.Sprintf("%q is not an owner (user: <handle>, acl: <name>, acl: @<organization>/<team>, or *), a per-file rule, a set option, or an import", tok)
 }
 
 // handle reports whether s can be a person's handle, or an ACL's name: a letter or digit, then

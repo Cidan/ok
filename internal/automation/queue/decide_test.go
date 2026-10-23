@@ -407,3 +407,51 @@ func TestAnAttemptThatCouldNotBePrepared(t *testing.T) {
 	s.Submissions[0].Attempts[0].Active = false
 	check(t, "no footprint", Decide(s), "create 1 []")
 }
+
+// A batch lands what deciding again after each landing would: independent submissions together,
+// in queue order, up to its bound.
+func TestBatchLandsWhatDecidingAgainWould(t *testing.T) {
+	s := Snapshot{HeadSeq: 4, Submissions: []Submission{
+		sub(1, []int64{11}, attempt(1, 4, nil, Passed, libFP)),
+		sub(2, []int64{12, 13}, attempt(2, 4, nil, Passed, docsFP)),
+		sub(3, []int64{14}, attempt(3, 4, nil, Passed, fp("//other:other", "other/x.go"))),
+	}}
+	check(t, "three independent", Batch(s, 8), "land 1/1", "land 2/2", "land 3/3")
+	check(t, "bounded", Batch(s, 2), "land 1/1", "land 2/2")
+
+	// After the first two land, the queue reads main moved by their three CLs, each theirs.
+	after := s.AfterLanding(1, 1).AfterLanding(2, 2)
+	if after.HeadSeq != 7 || len(after.Submissions) != 1 || after.Finished[2] != Landed || after.Landings[2] != docsFP {
+		t.Errorf("after two landings: %+v", after)
+	}
+	if want := []MainCommit{{Seq: 5, CL: 11, Submission: 1}, {Seq: 6, CL: 12, Submission: 2}, {Seq: 7, CL: 13, Submission: 2}}; !reflect.DeepEqual(after.Main, want) {
+		t.Errorf("main after two landings: %+v", after.Main)
+	}
+	if len(s.Main) != 0 || len(s.Submissions) != 3 {
+		t.Error("AfterLanding changed the snapshot it was given")
+	}
+
+	// Nothing to land, or an adoption first: no batch.
+	s.Submissions[0].Attempts[0].State = Testing
+	check(t, "the first still testing", Batch(Snapshot{HeadSeq: 4, Submissions: s.Submissions[:1]}, 8))
+	adopt := Snapshot{HeadSeq: 5, Submissions: []Submission{
+		{ID: 1, CLs: []int64{11}, Landed: []int64{11}, Attempts: []Attempt{attempt(1, 4, nil, Passed, libFP)}},
+	}}
+	check(t, "an adoption", Batch(adopt, 8))
+}
+
+// A landing whose footprint interacts with the next submission ends the batch, though deciding
+// on the queue before it would land both: the next is tested again on top of it, as deciding
+// after the landing says.
+func TestBatchStopsWhereALandingInteracts(t *testing.T) {
+	// 1 is grouped by an attempt on main alone that changed only docs; the attempt that passed,
+	// on top of 9, changed the library 2's app uses.
+	one := sub(1, []int64{11}, ended(attempt(1, 4, nil, Passed, docsFP)), attempt(2, 4, []int64{9}, Passed, libFP))
+	two := sub(2, []int64{12}, attempt(3, 5, nil, Passed, appFP))
+	s := Snapshot{HeadSeq: 5, From: 4, Submissions: []Submission{one, two},
+		Finished: map[int64]Outcome{9: Landed}, FinishedCLs: map[int64][]int64{9: {10}},
+		Main: []MainCommit{{Seq: 5, CL: 10, Submission: 9}}, Landings: map[int64]*Footprint{9: docsFP}}
+	check(t, "deciding before either lands", Decide(s), "land 1/2", "land 2/3")
+	check(t, "the batch", Batch(s, 8), "land 1/2")
+	check(t, "deciding after 1 lands", Decide(s.AfterLanding(1, 2)), "discard 2/3", "create 2 []")
+}

@@ -27,13 +27,14 @@ import (
 	idrole "github.com/Cidan/ok/internal/id/role"
 	"github.com/Cidan/ok/internal/idclient"
 	scmrole "github.com/Cidan/ok/internal/scm/role"
+	secretsrole "github.com/Cidan/ok/internal/secrets/role"
 	"github.com/Cidan/ok/internal/serve"
 	"github.com/Cidan/ok/internal/serve/node"
 )
 
 // serverRoles are the roles ok serve runs, in the order they are built: each after those it
 // calls.
-var serverRoles = []string{"identity", "scm", "automation", "deploy", "control"}
+var serverRoles = []string{"identity", "scm", "automation", "deploy", "control", "secrets"}
 
 // serveRoles runs several server roles in one process, on one port: a small installation's whole
 // ok. ok identity is among them, and certifies the others' keys directly, each its own robot's; the
@@ -49,7 +50,7 @@ func serveRoles(args []string) error {
 func serveRolesUntil(ctx context.Context, args []string) error {
 	flags := flag.NewFlagSet("serve", flag.ContinueOnError)
 	path := flags.String("config", "ok.yaml", "the installation's configuration")
-	list := flags.String("roles", "all", "the roles to run, comma-separated: identity, scm, automation, deploy, control; or all")
+	list := flags.String("roles", "all", "the roles to run, comma-separated: identity, scm, automation, deploy, control, secrets; or all (secrets when secrets.root names a root)")
 	dev := flags.Bool("dev", false, "accept development principals (ok-dev-principal), on a loopback address only")
 	if err := flags.Parse(args); err != nil {
 		return flagError(err)
@@ -64,9 +65,10 @@ func serveRolesUntil(ctx context.Context, args []string) error {
 		case slices.Contains(serverRoles, r):
 			run[r] = true
 		default:
-			return usageError(fmt.Sprintf("%q is no server role: identity, scm, automation, deploy, control, or all", r))
+			return usageError(fmt.Sprintf("%q is no server role: identity, scm, automation, deploy, control, secrets, or all", r))
 		}
 	}
+	all := strings.Contains(","+strings.ReplaceAll(*list, " ", "")+",", ",all,")
 	if !run["identity"] {
 		return usageError("ok serve runs ok identity among its roles, which certifies the others' keys: run one role alone with ok <role> serve")
 	}
@@ -77,8 +79,12 @@ func serveRolesUntil(ctx context.Context, args []string) error {
 	if *dev && !loopback(cfg.Listen) {
 		return fmt.Errorf("-dev serves only on loopback, and listen is %s", cfg.Listen)
 	}
+	// All runs ok secrets where the installation keeps secrets: where it names their root.
+	if all && cfg.Secrets.Root == "" {
+		run["secrets"] = false
+	}
 	if run["deploy"] && cfg.Deploy.Checkout == "virtual" {
-		if err := checkout.Isolate(); err != nil {
+		if err := checkout.RequireIsolated(); err != nil {
 			return err
 		}
 	}
@@ -133,7 +139,8 @@ func serveRolesUntil(ctx context.Context, args []string) error {
 	}
 	// dialAs is as, for each of the roles a role calls: its connections, by role.
 	dialAs := func(robot string, roles ...string) (map[string]grpc.ClientConnInterface, error) {
-		addrs := map[string]string{"identity": cfg.Services.Identity, "scm": cfg.Services.SCM, "automation": cfg.Services.Automation, "deploy": cfg.Services.Deploy}
+		addrs := map[string]string{"identity": cfg.Services.Identity, "scm": cfg.Services.SCM, "automation": cfg.Services.Automation, "deploy": cfg.Services.Deploy,
+			"secrets": cfg.Services.Secrets}
 		out := map[string]grpc.ClientConnInterface{}
 		for _, r := range roles {
 			c, _, err := as(robot, r, addrs[r])
@@ -151,11 +158,11 @@ func serveRolesUntil(ctx context.Context, args []string) error {
 		}
 	}()
 	if run["scm"] {
-		c, err := dialAs(cfg.Roles.SCM, "identity")
+		c, err := dialAs(cfg.Roles.SCM, "identity", "secrets")
 		if err != nil {
 			return err
 		}
-		scm, err := scmrole.Build(ctx, cfg, scmrole.Options{Dev: *dev, Identity: c["identity"], Roots: idclient.LocalRoots(id.CA, "scm")})
+		scm, err := scmrole.Build(ctx, cfg, scmrole.Options{Dev: *dev, Identity: c["identity"], Secrets: c["secrets"], Roots: idclient.LocalRoots(id.CA, "scm")})
 		if err != nil {
 			return fmt.Errorf("the SCM: %w", err)
 		}
@@ -176,7 +183,7 @@ func serveRolesUntil(ctx context.Context, args []string) error {
 	}
 	if run["deploy"] {
 		r := cfg.Roles.Deploy
-		c, err := dialAs(r, "identity", "automation")
+		c, err := dialAs(r, "identity", "automation", "secrets")
 		if err != nil {
 			return err
 		}
@@ -198,13 +205,26 @@ func serveRolesUntil(ctx context.Context, args []string) error {
 		}
 		closers = append(closers, parts.close)
 		dep, err := deployrole.Build(ctx, cfg, deployrole.Options{Dev: *dev, Color: deployColor(""), Checkout: parts.checkout, Source: parts.source,
-			Bazel: parts.bazel, Env: parts.env, Identity: c["identity"], SCM: scmc, Automation: c["automation"],
+			Bazel: parts.bazel, Env: parts.env, Identity: c["identity"], SCM: scmc, Automation: c["automation"], Secrets: c["secrets"],
 			Roots: idclient.LocalRoots(id.CA, "deploy")})
 		if err != nil {
 			return fmt.Errorf("the deployer: %w", err)
 		}
 		closers = append(closers, dep.Close)
 		roots = append(roots, dep.Root)
+	}
+	if run["secrets"] {
+		c, err := dialAs(cfg.Roles.Secrets, "identity", "scm", "automation")
+		if err != nil {
+			return err
+		}
+		sec, err := secretsrole.Build(ctx, cfg, secretsrole.Options{Dev: *dev, Identity: c["identity"], SCM: c["scm"], Automation: c["automation"],
+			Roots: idclient.LocalRoots(id.CA, "secrets")})
+		if err != nil {
+			return fmt.Errorf("ok secrets: %w", err)
+		}
+		closers = append(closers, sec.Close)
+		roots = append(roots, sec.Root)
 	}
 	if run["control"] {
 		c, err := dialAs(cfg.Roles.Control, "identity", "scm", "automation", "deploy")
@@ -220,7 +240,7 @@ func serveRolesUntil(ctx context.Context, args []string) error {
 		roots = append(roots, ctl.Root)
 	}
 
-	opts := []serve.Option{serve.WithAuthn(id.Resolver), serve.WithListener(lis), serve.WithMetricsAddr(cfg.MetricsListen),
+	opts := []serve.Option{serve.WithAuthn(id.Resolver), serve.WithListener(lis), serve.WithMetricsAddr(cfg.MetricsListen), serve.WithProfiling(cfg.Profiling),
 		serve.WithStopTimeout(workerStopTimeout)}
 	if cfg.TLS != nil {
 		tc, err := serve.LoadTLS(cfg.TLS.Cert, cfg.TLS.Key)

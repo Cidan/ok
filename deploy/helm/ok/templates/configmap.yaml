@@ -5,31 +5,57 @@
 {{- if .Values.deploy.enabled -}}
 {{- $robots = append $robots (dict "name" "deploy.ok" "bindings" (list (dict "issuer" .Values.identity.kubernetesIssuer "subject" (include "ok.subject" (dict "root" . "account" "deploy"))))) -}}
 {{- end -}}
+{{- if .Values.secrets.enabled -}}
+{{- $robots = append $robots (dict "name" "secrets.ok" "bindings" (list (dict "issuer" .Values.identity.kubernetesIssuer "subject" (include "ok.subject" (dict "root" . "account" "secrets"))))) -}}
+{{- end -}}
 {{- $federation := list (dict "issuer" .Values.identity.kubernetesIssuer "audience" "ok" "jwks_url" "https://kubernetes.default.svc/openid/v1/jwks" "ca_file" "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt" "token_file" "/var/run/secrets/kubernetes.io/serviceaccount/token") -}}
 {{- $identity := dict "ca_dir" "/etc/ok/ca" "federation" (concat $federation .Values.identity.extraFederation) "robots" (concat $robots .Values.identity.extraRobots) -}}
 {{- with .Values.identity.bootstrapAdmins }}{{- $_ := set $identity "bootstrap_admins" . -}}{{- end }}
 {{- with .Values.identity.treeRepository }}{{- $_ := set $identity "tree_repository" . -}}{{- end }}
 {{- $services := dict "identity" (include "ok.serverAddr" .) "scm" (include "ok.serverAddr" .) "automation" (include "ok.serverAddr" .) -}}
+{{- $database := dict "url_file" "/etc/ok/secrets/database/url" "max_connections" .Values.database.maxConnections -}}
+{{- with .Values.database.spanner.instance }}{{- $database = dict "type" "spanner" "spanner" (dict "instance" . "prefix" $.Values.database.spanner.prefix) -}}{{- end }}
 {{- if .Values.deploy.enabled }}{{- $_ := set $services "deploy" (include "ok.deployAddr" .) -}}{{- end }}
+{{- if .Values.secrets.enabled }}{{- $_ := set $services "secrets" (include "ok.secretsAddr" .) -}}{{- end }}
 {{- $cfg := dict
   "domain" .Values.domain
   "installation" .Values.installation
   "public_url" .Values.publicURL
   "listen" ":8472"
   "metrics_listen" ":8473"
-  "database" (dict "url_file" "/etc/ok/secrets/database/url" "max_connections" .Values.database.maxConnections)
-  "roles" (dict "identity" "identity.ok" "scm" "scm.ok" "control" "control.ok" "automation" "automation.ok" "worker" "worker.ok" "deploy" "deploy.ok")
+  "database" $database
+  "roles" (dict "identity" "identity.ok" "scm" "scm.ok" "control" "control.ok" "automation" "automation.ok" "worker" "worker.ok" "deploy" "deploy.ok" "secrets" "secrets.ok")
   "services" $services
   "workload" (dict "token_file" "/var/run/secrets/ok/token")
   "identity" $identity
 -}}
 {{- if .Values.worker.enabled -}}
-{{- $_ := set $cfg "worker" (dict "state" "/var/lib/ok" "slots" .Values.worker.slots "run_memory_gib" .Values.worker.runMemoryGiB "checkout" .Values.worker.checkout "bazel_flags" .Values.worker.bazelFlags) -}}
+{{- $worker := dict "state" "/var/lib/ok" "slots" .Values.worker.slots "run_memory_gib" .Values.worker.runMemoryGiB "checkout" .Values.worker.checkout "bazel_flags" .Values.worker.bazelFlags "pool" .Values.worker.pool -}}
+{{- if .Values.worker.microvm.enabled -}}
+{{- $vm := dict "kernel" "/usr/local/lib/ok/kernel" "push_egress" .Values.worker.microvm.pushEgress -}}
+{{- if kindIs "slice" .Values.worker.microvm.egress -}}
+{{- $_ := set $vm "egress" .Values.worker.microvm.egress -}}
+{{- end -}}
+{{- $_ := set $worker "microvm" $vm -}}
+{{- end -}}
+{{- $_ := set $cfg "worker" $worker -}}
+{{- if .Values.worker.autoscale.enabled -}}
+{{- $pool := dict "name" .Values.worker.pool "namespace" .Release.Namespace "deployment" (printf "%s-worker" (include "ok.name" .)) "slots" .Values.worker.slots "min" .Values.worker.autoscale.min "max" .Values.worker.autoscale.max -}}
+{{- $_ := set $cfg "automation" (dict "pools" (list $pool)) -}}
+{{- end -}}
 {{- end -}}
 {{- if .Values.deploy.enabled -}}
 {{- $env := dict -}}
 {{- range $name, $_ := .Values.deploy.migrationEnv }}{{- $_ := set $env $name (dict "file" (printf "/etc/ok/migration-env/%s/value" ($name | lower))) -}}{{- end }}
 {{- $_ := set $cfg "deploy" (dict "state" "/var/lib/ok" "checkout" .Values.deploy.checkout "bazel_flags" .Values.deploy.bazelFlags "migration_env" $env "self" (dict "namespace" .Release.Namespace "deployment" (printf "%s-deploy" (include "ok.name" .)))) -}}
+{{- end -}}
+{{- if .Values.secrets.enabled -}}
+{{- $secrets := dict "root" (default "keyring:/etc/ok/keyring/keyring" .Values.secrets.root) -}}
+{{- if .Values.secrets.databaseSecret.name -}}
+{{- $_ := set $secrets "database" (dict "url_file" "/etc/ok/secrets/secrets-database/url" "max_connections" .Values.database.maxConnections) -}}
+{{- end -}}
+{{- with .Values.secrets.stores }}{{- $_ := set $secrets "stores" . -}}{{- end }}
+{{- $_ := set $cfg "secrets" $secrets -}}
 {{- end -}}
 {{- $cfg = mustMergeOverwrite $cfg (deepCopy .Values.config) -}}
 apiVersion: v1

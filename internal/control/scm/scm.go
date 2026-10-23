@@ -26,6 +26,7 @@ type Client struct {
 	LandingChecks scmpb.LandingChecksClient
 	Browse        scmpb.BrowseClient
 	Events        scmpb.EventsClient
+	Search        scmpb.SearchClient
 }
 
 // New builds a client over a connection.
@@ -37,6 +38,7 @@ func New(conn grpc.ClientConnInterface) *Client {
 		LandingChecks: scmpb.NewLandingChecksClient(conn),
 		Browse:        scmpb.NewBrowseClient(conn),
 		Events:        scmpb.NewEventsClient(conn),
+		Search:        scmpb.NewSearchClient(conn),
 	}
 }
 
@@ -95,13 +97,13 @@ func ChangeListOut(c *scmpb.ChangeList) db.ChangeList {
 		Repo:            c.GetRepositoryId(),
 		Number:          c.GetNumber(),
 		ChangeID:        c.GetChangeId(),
-		Author:          c.GetAuthor(),
+		Author:          c.GetAuthorId(),
 		Status:          db.Status(c.GetStatus()),
 		ParentNumber:    c.GetParentNumber(),
 		CurrentPatchset: c.GetCurrentPatchset(),
 		Description:     c.GetDescription(),
 		LandedCommit:    c.GetLandedCommit(),
-		SubmittedBy:     c.GetSubmittedBy(),
+		SubmittedBy:     c.GetSubmittedById(),
 		CreatedAt:       c.GetCreatedAt().AsTime(),
 		UpdatedAt:       c.GetUpdatedAt().AsTime(),
 		RollsBack:       c.GetRollback().GetChangeLists(),

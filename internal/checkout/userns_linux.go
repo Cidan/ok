@@ -6,9 +6,19 @@ import (
 )
 
 // UserNamespaces says why this host refuses the user namespaces a worker's sandbox and a virtual
-// checkout make, as its kernel settings tell — what to change, and where (docs/install.md,
-// "Workers' nodes").
+// checkout's launcher make, as its kernel settings tell — what to change, and where
+// (docs/install.md, "Workers' nodes").
 func UserNamespaces() string {
+	if r := userNamespaceRestriction(); r != "" {
+		return r
+	}
+	return "the container may not make user namespaces: its seccomp profile must allow them (the chart runs workers and the deployer " +
+		"with seccomp Unconfined), and so must its node (docs/install.md, \"Workers' nodes\")"
+}
+
+// userNamespaceRestriction is what in this host's kernel settings restricts unprivileged user
+// namespaces, and what to change; "" when nothing does.
+func userNamespaceRestriction() string {
 	sysctl := func(name string) string {
 		b, err := os.ReadFile("/proc/sys/" + name)
 		if err != nil {
@@ -29,6 +39,5 @@ func UserNamespaces() string {
 		return "this node allows no unprivileged user namespaces (kernel.unprivileged_userns_clone = 0): set it to 1 on the node " +
 			"(docs/install.md, \"Workers' nodes\")"
 	}
-	return "the container may not make user namespaces: its seccomp profile must allow them (the chart runs workers and the deployer " +
-		"with seccomp Unconfined), and so must its node (docs/install.md, \"Workers' nodes\")"
+	return ""
 }

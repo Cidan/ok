@@ -45,6 +45,10 @@ type Input struct {
 	// ran on and the candidate affect — none when they are the same tree. nil when there is no
 	// pre to compare with: every job then runs.
 	SincePre *Affected
+	// Pool is the repository's pool of workers, as main's settings name it ("" for none): its
+	// built-in jobs', and its workflow jobs' that name none. Read from main, as the workflow files
+	// are, so a change does not choose where it runs.
+	Pool string
 }
 
 // BuildSincePre is the post job that builds the affected targets that changed since pre; the
@@ -310,7 +314,7 @@ func (p *Planner) Plan(d *Described) (*automationpb.Plan, []string) {
 			problems = append(problems, fmt.Sprintf("%s:%d: job %s: %v", s.job.File, s.job.Line, s.job.Name, err))
 			continue
 		}
-		spec := &automationpb.Job{Targets: []string{s.job.Target}}
+		spec := &automationpb.Job{Targets: []string{s.job.Target}, Pool: workflow.PoolOf(s.job.Pool, p.in.Pool)}
 		switch {
 		case t.Test:
 			spec.Kind, spec.Args = automationpb.Job_KIND_TEST, s.job.Args
@@ -318,6 +322,12 @@ func (p *Planner) Plan(d *Described) (*automationpb.Plan, []string) {
 			spec.Kind, spec.Args = automationpb.Job_KIND_RUN, s.job.Args
 		default:
 			spec.Kind = automationpb.Job_KIND_BUILD
+		}
+		// A test's and a build's actions are cached: only a binary, run in the sandbox, reads secrets.
+		if len(s.job.Secrets) > 0 && spec.Kind != automationpb.Job_KIND_RUN {
+			problems = append(problems, fmt.Sprintf("%s:%d: job %s names secrets, and %s is no binary: only a binary, run in its sandbox, reads secrets (docs/secrets.md)",
+				s.job.File, s.job.Line, s.job.Name, s.job.Target))
+			continue
 		}
 		// A run job reads the job context, which names the commit under test; so does a job whose
 		// arguments carry a placeholder.
@@ -353,7 +363,7 @@ func (p *Planner) builtins() []*automationpb.PlannedJob {
 		}
 	}
 	build := func(id string, targets []string, unchanged bool, why string) *automationpb.PlannedJob {
-		return &automationpb.PlannedJob{Job: id, Spec: &automationpb.Job{Kind: automationpb.Job_KIND_BUILD, Targets: targets},
+		return &automationpb.PlannedJob{Job: id, Spec: &automationpb.Job{Kind: automationpb.Job_KIND_BUILD, Targets: targets, Pool: p.pool()},
 			Why: "every target the change affects must build: " + why, UnchangedSincePre: unchanged}
 	}
 	switch {
@@ -371,7 +381,7 @@ func (p *Planner) builtins() []*automationpb.PlannedJob {
 	for _, label := range p.in.Affected.Tests {
 		t := p.affected[label]
 		out = append(out, &automationpb.PlannedJob{Job: "test " + label,
-			Spec:              &automationpb.Job{Kind: automationpb.Job_KIND_TEST, Targets: []string{label}},
+			Spec:              &automationpb.Job{Kind: automationpb.Job_KIND_TEST, Targets: []string{label}, Pool: p.pool()},
 			Why:               "the test is affected: " + Chain(t.Because),
 			UnchangedSincePre: p.unchanged(label)})
 	}
@@ -382,7 +392,7 @@ func (p *Planner) builtins() []*automationpb.PlannedJob {
 	if p.in.Standing == workflow.Graduates {
 		// Nothing in an imported repository was ever linted.
 		return append(out, &automationpb.PlannedJob{Job: "lint",
-			Spec: &automationpb.Job{Kind: automationpb.Job_KIND_LINT, Targets: []string{"//..."}},
+			Spec: &automationpb.Job{Kind: automationpb.Job_KIND_LINT, Targets: []string{"//..."}, Pool: p.pool()},
 			Why:  "the change makes an imported repository a Bazel workspace: every file in it is linted"})
 	}
 	files := p.in.Context.Existing()
@@ -404,7 +414,7 @@ func (p *Planner) builtins() []*automationpb.PlannedJob {
 			why += fmt.Sprintf(", and the %s that held what it removes", count(len(owners), "target", "targets"))
 		}
 		out = append(out, &automationpb.PlannedJob{Job: "lint",
-			Spec:              &automationpb.Job{Kind: automationpb.Job_KIND_LINT, Targets: owners},
+			Spec:              &automationpb.Job{Kind: automationpb.Job_KIND_LINT, Targets: owners, Pool: p.pool()},
 			Why:               why,
 			UnchangedSincePre: p.lintUnchanged()})
 	}
@@ -532,3 +542,6 @@ func (m mapSource) Read(p string) ([]byte, bool, error) {
 	d, ok := m[p]
 	return d, ok, nil
 }
+
+// pool is the pool the repository's built-in jobs run in.
+func (p *Planner) pool() string { return workflow.PoolOf("", p.in.Pool) }

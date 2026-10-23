@@ -6,9 +6,11 @@
 //
 // Everything it decides is taken again from its database and the cluster on each pass, so a
 // deployer that restarts, or another replica that takes over, resumes every deployment where
-// it stands. One replica plans and drives at a time (the leader lock); each deployment is
-// stepped under a lock of its own, and a deployment of the deployer itself is driven only by
-// the copy that started it (docs/deploy.md, "Resuming, and deploying the deployer").
+// it stands. No replica leads (docs/hosted.md, "Work without leaders"): each repository is planned
+// under its planning's lease, which deployments start is decided by one transaction at a time,
+// each deployment is stepped under a lock of its own — whose holder alone writes it — and a
+// deployment of the deployer itself is driven only by the copy that started it (docs/deploy.md,
+// "Resuming, and deploying the deployer").
 package engine
 
 import (
@@ -36,10 +38,13 @@ import (
 	"github.com/Cidan/ok/internal/deploy/plan"
 	"github.com/Cidan/ok/internal/deploy/roll"
 	"github.com/Cidan/ok/internal/deploy/store"
-	"github.com/Cidan/ok/internal/lock"
+	"github.com/Cidan/ok/internal/deploy/tunnel"
+	"github.com/Cidan/ok/internal/names"
+	"github.com/Cidan/ok/internal/work"
 	"github.com/Cidan/ok/internal/workflow"
 	automationpb "github.com/Cidan/ok/proto/ok/automation/v1"
 	identitypb "github.com/Cidan/ok/proto/ok/identity/v1"
+	secretspb "github.com/Cidan/ok/proto/ok/secrets/v1"
 )
 
 // Runs is what the deployer asks of ok automation: its pushes.
@@ -58,9 +63,16 @@ type Build interface {
 	// is missing.
 	Describe(ctx context.Context, repo int64, commit []byte, targets []string) (map[string]buildsys.Description, error)
 	// Migrate runs a migration — a target speaking ok's migrate protocol — at the checkout,
-	// allowing the gated hazard classes allow. An error is one worth trying again; the
-	// migration's own failure is in Applied.
-	Migrate(ctx context.Context, target string, allow []string) (Applied, error)
+	// allowing the gated hazard classes allow, with secrets, by path, written for it alone
+	// ($OK_SECRETS_DIR) and redacted from what it printed. An error is one worth trying again;
+	// the migration's own failure is in Applied.
+	Migrate(ctx context.Context, target string, allow []string, secrets map[string][]byte) (Applied, error)
+}
+
+// DeploySecrets is ok secrets', which gives a deploy's migrations the secrets its stanza names
+// (docs/secrets.md, "Readers that are not people").
+type DeploySecrets interface {
+	ReadDeploySecret(ctx context.Context, in *secretspb.ReadDeploySecretRequest, opts ...grpc.CallOption) (*secretspb.ReadSecretResponse, error)
 }
 
 // Tree is ok identity's, which applies the groups-and-ACLs tree.
@@ -96,8 +108,11 @@ func (s Self) Workload() string {
 
 // Config is what the engine works with.
 type Config struct {
-	Store     *store.Store
+	Store *store.Store
+	// Kube is the deployer's own cluster; Clusters, when set, choose each repository's (docs/
+	// hosted.md, "Deploy agents, as built"), every one deploying to Kube when unset.
 	Kube      kubernetes.Interface
+	Clusters  Clusters
 	Runs      Runs
 	Build     Build
 	Main      Main
@@ -106,10 +121,17 @@ type Config struct {
 	Timing    roll.Timing
 	Labels    roll.Labels
 	Self      Self
-	Principal string // the deployer's: plans are its, and pushes are started as it
+	Principal string // the deployer's name: plans are its, and pushes are started as it
+	// Principals resolves Principal to the stable ID plans record (docs/hosted.md, "Tenancy, as
+	// built"), when the engine first plans: identity may not serve yet when the deployer starts.
+	// With none (tests), Principal is its ID.
+	Principals *names.Resolver
 	// Tree is ok identity's, and TreeRepository the repository whose groups-and-ACLs tree is ok's:
 	// its plans have the built-in deploy that applies it.
-	Tree           Tree
+	Tree Tree
+	// Secrets is ok secrets, which a deploy's migrations' secrets are read from; nil where the
+	// installation runs none, when a deploy naming secrets fails.
+	Secrets        DeploySecrets
 	TreeRepository string
 	Now            func() time.Time // the clock; time.Now when nil
 	Log            *slog.Logger
@@ -117,13 +139,17 @@ type Config struct {
 
 // Engine is the deployer.
 type Engine struct {
-	cfg    Config
-	roller *roll.Roller
+	cfg Config
 	// checkoutMu makes planning and migrations take the one checkout in turn.
 	checkoutMu sync.Mutex
 	mu         sync.Mutex
 	migrating  map[int64]bool
-	wg         sync.WaitGroup
+	// waiting are the deployments whose log says they wait for their owner's agent; unplannable
+	// the repositories whose plans do.
+	waiting, unplannable map[int64]bool
+	wg                   sync.WaitGroup
+	// holder names this replica's leases on keyed work (internal/work).
+	holder string
 }
 
 // New makes an engine.
@@ -134,19 +160,30 @@ func New(cfg Config) *Engine {
 	if cfg.Log == nil {
 		cfg.Log = slog.Default()
 	}
-	return &Engine{cfg: cfg, roller: &roll.Roller{Kube: cfg.Kube, Timing: cfg.Timing, Labels: cfg.Labels}, migrating: map[int64]bool{}}
+	return &Engine{cfg: cfg, migrating: map[int64]bool{}, waiting: map[int64]bool{}, unplannable: map[int64]bool{}, holder: work.NewHolder()}
 }
 
-// Run plans and drives until ctx ends, every interval: as the leader when it holds the leader
-// lock — a pass that loses it ends — and otherwise only its own deployment when this copy
-// drives it.
+// cluster is where a repository deploys.
+func (e *Engine) cluster(ctx context.Context, repo int64) (Cluster, error) {
+	if e.cfg.Clusters == nil {
+		return Cluster{Kube: e.cfg.Kube}, nil
+	}
+	return e.cfg.Clusters.For(ctx, repo)
+}
+
+// rollerFor rolls a repository's workloads in its cluster.
+func (e *Engine) rollerFor(ctx context.Context, repo int64) (*roll.Roller, error) {
+	c, err := e.cluster(ctx, repo)
+	if err != nil {
+		return nil, err
+	}
+	return &roll.Roller{Kube: c.Kube, Timing: e.cfg.Timing, Labels: e.cfg.Labels}, nil
+}
+
+// Run plans and drives until ctx ends, a pass (Tick) every interval. Every replica runs it.
 func (e *Engine) Run(ctx context.Context, interval time.Duration) error {
 	for {
-		err := e.cfg.Store.Lead(ctx, func(ctx context.Context) error { return e.Tick(ctx, true) })
-		if errors.Is(err, lock.ErrNotAcquired) {
-			err = e.Tick(ctx, false)
-		}
-		if err != nil && ctx.Err() == nil {
+		if err := e.Tick(ctx); err != nil && ctx.Err() == nil {
 			e.cfg.Log.Warn("deploy: a pass", "err", err)
 		}
 		select {
@@ -158,25 +195,63 @@ func (e *Engine) Run(ctx context.Context, interval time.Duration) error {
 	}
 }
 
-// Tick is one pass: as the leader, it plans each repository whose main moved and drives every
-// deployment; otherwise it drives only a deployment of the deployer this copy started.
-func (e *Engine) Tick(ctx context.Context, leader bool) error {
+// Tick is one pass: it plans each repository whose main moved and no other replica is planning,
+// starts the waiting deployments whose turn has come, and retires and steps each deployment no
+// other replica holds — one of the deployer itself only in the copy that started it.
+func (e *Engine) Tick(ctx context.Context) error {
 	var errs []error
-	if leader {
-		repos, err := e.cfg.Store.Unplanned(ctx)
-		if err != nil {
-			return err
-		}
-		for _, r := range repos {
-			if err := e.planRepository(ctx, r); err != nil {
-				errs = append(errs, fmt.Errorf("planning repository %d at %d: %w", r.ID, r.HeadSeq, err))
+	repos, err := e.cfg.Store.Unplanned(ctx)
+	if err != nil {
+		return err
+	}
+	for _, r := range repos {
+		err := e.planHeld(ctx, r.ID)
+		e.mu.Lock()
+		said := e.unplannable[r.ID]
+		if errors.Is(err, tunnel.ErrNoAgent) {
+			// Its plan waits for its owner's deploy agent.
+			e.unplannable[r.ID] = true
+			e.mu.Unlock()
+			if !said {
+				e.cfg.Log.Info("deploy: a plan waits for its repository's deploy agent", "repository", r.ID, "err", err)
 			}
+			continue
+		}
+		delete(e.unplannable, r.ID)
+		e.mu.Unlock()
+		if err != nil {
+			errs = append(errs, fmt.Errorf("planning repository %d at %d: %w", r.ID, r.HeadSeq, err))
 		}
 	}
-	if err := e.drive(ctx, leader); err != nil {
+	if err := e.drive(ctx); err != nil {
 		errs = append(errs, err)
 	}
 	return errors.Join(errs...)
+}
+
+// planLease is how long a replica's lease on a repository's planning lasts unrenewed; it is
+// renewed every third of it while the replica plans.
+const planLease = 30 * time.Second
+
+// planHeld plans a repository holding its planning's lease (store.PlanWork) — its plan recorded
+// only while the lease holds — if no other replica holds it, and if its main is still unplanned
+// once the lease is taken: another replica may have planned it since this pass looked.
+func (e *Engine) planHeld(ctx context.Context, repo int64) error {
+	held, release, ok, err := work.Claim(ctx, e.cfg.Store.Work(), store.PlanWork, repo, e.holder, planLease)
+	if err != nil || !ok {
+		return err
+	}
+	defer release()
+	repos, err := e.cfg.Store.Unplanned(held)
+	if err != nil {
+		return err
+	}
+	for _, r := range repos {
+		if r.ID == repo {
+			return e.planRepository(held, r)
+		}
+	}
+	return nil
 }
 
 // Wait waits for the migrations running in the background.
@@ -195,8 +270,24 @@ func (e *Engine) checkOut(ctx context.Context, repo int64, commit []byte) error 
 	return nil
 }
 
+// self is the deployer's stable ID, which its plans record.
+func (e *Engine) self(ctx context.Context) (string, error) {
+	if e.cfg.Principals == nil {
+		return e.cfg.Principal, nil
+	}
+	id, err := e.cfg.Principals.ID(ctx, e.cfg.Principal)
+	if err != nil {
+		return "", fmt.Errorf("resolving the deployer's principal %s: %w", e.cfg.Principal, err)
+	}
+	return id, nil
+}
+
 // planRepository plans a repository at its head (docs/deploy.md, "When a deploy runs").
 func (e *Engine) planRepository(ctx context.Context, r store.Repository) error {
+	self, err := e.self(ctx)
+	if err != nil {
+		return err
+	}
 	e.checkoutMu.Lock()
 	defer e.checkoutMu.Unlock()
 	if err := e.checkOut(ctx, r.ID, r.Head); err != nil {
@@ -209,7 +300,7 @@ func (e *Engine) planRepository(ctx context.Context, r store.Repository) error {
 	}
 	if settings.Build == workflow.BuildNone {
 		if _, err := e.cfg.Store.RecordPlan(ctx, store.PlanResult{Repository: r.ID, Head: r.Head, HeadSeq: r.HeadSeq, BaseSeq: r.PlannedSeq,
-			Notes: []string{"the repository is imported: ok deploys nothing from it"}, By: e.cfg.Principal}); err != nil {
+			Notes: []string{"the repository is imported: ok deploys nothing from it"}, By: self}); err != nil {
 			return err
 		}
 		e.cfg.Log.Info("deploy: planned an imported repository", "repository", r.Name, "head", short(r.Head))
@@ -241,7 +332,7 @@ func (e *Engine) planRepository(ctx context.Context, r store.Repository) error {
 			}
 		}
 	}
-	if in.Replicas, err = e.replicas(ctx, deploys); err != nil {
+	if in.Replicas, err = e.replicas(ctx, r.ID, deploys); err != nil {
 		return err
 	}
 	var news []store.NewDeployment
@@ -250,7 +341,7 @@ func (e *Engine) planRepository(ctx context.Context, r store.Repository) error {
 			Self: d.Deploy.Workload != nil && d.Deploy.Workload.String() == e.cfg.Self.Workload()})
 	}
 	if _, err := e.cfg.Store.RecordPlan(ctx, store.PlanResult{Repository: r.ID, Head: r.Head, HeadSeq: r.HeadSeq, BaseSeq: r.PlannedSeq,
-		Notes: notes, Deployments: news, Services: deploys, By: e.cfg.Principal}); err != nil {
+		Notes: notes, Deployments: news, Services: deploys, By: self}); err != nil {
 		return err
 	}
 	e.cfg.Log.Info("deploy: planned", "repository", r.Name, "head", short(r.Head), "deployments", len(news), "notes", len(notes))
@@ -277,15 +368,24 @@ func (e *Engine) workflowFiles(ctx context.Context, repo int64, commit []byte) (
 	return out, nil
 }
 
-// replicas are each deploy's workload's replicas now: a Deployment's live copy's.
-func (e *Engine) replicas(ctx context.Context, deploys []workflow.Deploy) (map[string]int32, error) {
+// replicas are each deploy's workload's replicas now, in its repository's cluster: a Deployment's
+// live copy's.
+func (e *Engine) replicas(ctx context.Context, repo int64, deploys []workflow.Deploy) (map[string]int32, error) {
 	out := map[string]int32{}
+	var kube kubernetes.Interface
 	for _, d := range deploys {
 		w := d.Workload
 		if w == nil {
 			continue
 		}
-		n, err := e.liveReplicas(ctx, *w)
+		if kube == nil {
+			c, err := e.cluster(ctx, repo)
+			if err != nil {
+				return nil, err
+			}
+			kube = c.Kube
+		}
+		n, err := e.liveReplicas(ctx, kube, *w)
 		if err != nil {
 			return nil, err
 		}
@@ -297,8 +397,8 @@ func (e *Engine) replicas(ctx context.Context, deploys []workflow.Deploy) (map[s
 }
 
 // liveReplicas are a workload's replicas now, or -1 when it does not exist.
-func (e *Engine) liveReplicas(ctx context.Context, w workflow.Workload) (int32, error) {
-	apps := e.cfg.Kube.AppsV1()
+func (e *Engine) liveReplicas(ctx context.Context, kube kubernetes.Interface, w workflow.Workload) (int32, error) {
+	apps := kube.AppsV1()
 	count := func(n *int32) int32 {
 		if n == nil {
 			return 1
@@ -332,64 +432,32 @@ func (e *Engine) liveReplicas(ctx context.Context, w workflow.Workload) (int32, 
 // ─── Driving ───
 
 // drive retires what a finished deployment of the deployer leaves behind, starts the waiting
-// deployments whose turn it is, and steps every running one this copy drives.
-func (e *Engine) drive(ctx context.Context, leader bool) error {
+// deployments whose turn it is, and steps every running one — a deployment of the deployer itself
+// only in the copy that started it — each under its lock, skipping one another replica holds.
+func (e *Engine) drive(ctx context.Context) error {
 	var errs []error
 	retiring, err := e.cfg.Store.Retiring(ctx)
 	if err != nil {
 		return err
 	}
 	for _, d := range retiring {
-		if !leader && d.Driver != e.cfg.Self.Color {
-			continue
-		}
-		st, err := loadRoll(d)
-		if err == nil {
-			err = e.retire(ctx, d, &st)
-		}
-		if err != nil {
+		if err := e.retireLocked(ctx, d.ID); err != nil {
 			errs = append(errs, fmt.Errorf("deployment %d: %w", d.ID, err))
 		}
 	}
+	if _, err := e.cfg.Store.StartTurns(ctx, e.cfg.Self.Color); err != nil {
+		errs = append(errs, fmt.Errorf("starting deployments: %w", err))
+	}
 	ds, err := e.cfg.Store.Unfinished(ctx)
 	if err != nil {
-		return err
-	}
-	busy := occupancy{claims: map[string]bool{}}
-	for _, d := range ds {
-		if d.Status == store.Running {
-			busy.take(d)
-		}
+		return errors.Join(append(errs, err)...)
 	}
 	for _, d := range ds {
-		if d.Status == store.Waiting {
-			if !leader {
-				continue
-			}
-			ok, err := e.mayStart(ctx, d, busy)
-			if err != nil {
-				errs = append(errs, err)
-				continue
-			}
-			if !ok {
-				continue
-			}
-			driver := ""
-			if d.Self {
-				driver = e.cfg.Self.Color
-			}
-			if err := e.cfg.Store.Start(ctx, d.ID, driver); err != nil {
-				errs = append(errs, err)
-				continue
-			}
-			busy.take(d)
-			d.Driver = driver
+		if d.Status != store.Running {
+			continue
 		}
 		if d.Self && d.Driver != e.cfg.Self.Color {
 			continue // the copy that started it drives it
-		}
-		if !leader && !d.Self {
-			continue
 		}
 		if err := e.stepLocked(ctx, d.ID); err != nil {
 			errs = append(errs, fmt.Errorf("deployment %d: %w", d.ID, err))
@@ -398,79 +466,33 @@ func (e *Engine) drive(ctx context.Context, leader bool) error {
 	return errors.Join(errs...)
 }
 
-// occupancy is what the running deployments hold.
-type occupancy struct {
-	claims  map[string]bool // their deploys and workloads
-	running int
-	alone   bool // one of them runs alone
-}
-
-// take records a deployment as running.
-func (o *occupancy) take(d *store.Deployment) {
-	for _, k := range claims(d) {
-		o.claims[k] = true
+// retireLocked retires, under the deployment's lock, what a finished deployment of the deployer
+// leaves behind: whoever finds the success finishes it.
+func (e *Engine) retireLocked(ctx context.Context, id int64) error {
+	held, release, ok, err := e.cfg.Store.LockDeployment(ctx, id)
+	if err != nil || !ok {
+		return err
 	}
-	o.running++
-	o.alone = o.alone || d.Alone
-}
-
-// admits reports whether d may run beside what is running: nothing else deploys its deploy or
-// workload, no deployment that runs alone is running, and — for one that runs alone — nothing
-// is running at all.
-func (o *occupancy) admits(d *store.Deployment) bool {
-	if o.alone || (d.Alone && o.running > 0) {
-		return false
+	defer release()
+	d, err := e.cfg.Store.Get(held, id)
+	if err != nil {
+		return err
 	}
-	for _, k := range claims(d) {
-		if o.claims[k] {
-			return false
-		}
+	st, err := loadRoll(d)
+	if err != nil || !st.Retire {
+		return err
 	}
-	return true
-}
-
-// claims are what a running deployment holds: its deploy, and its workload.
-func claims(d *store.Deployment) []string {
-	out := []string{fmt.Sprintf("deploy %d %s", d.Repository, d.Deploy)}
-	if d.Workload != nil {
-		out = append(out, d.Workload.String())
-	}
-	return out
-}
-
-// mayStart reports whether a waiting deployment's turn has come: what is running admits it
-// (occupancy.admits), and every deployment of its plan's earlier waves — and of the earlier
-// waves of each place it took in an earlier plan — succeeded (or was replaced).
-func (e *Engine) mayStart(ctx context.Context, d *store.Deployment, busy occupancy) (bool, error) {
-	if !busy.admits(d) {
-		return false, nil
-	}
-	gates := d.Gates
-	if d.PlanID != 0 {
-		gates = append(gates, store.Gate{Plan: d.PlanID, Wave: d.Wave})
-	}
-	for _, g := range gates {
-		waves, err := e.cfg.Store.PlanStatuses(ctx, g.Plan)
-		if err != nil {
-			return false, err
-		}
-		for w := 1; w < g.Wave; w++ {
-			for _, st := range waves[w] {
-				if st != store.Succeeded && st != store.Canceled {
-					return false, nil
-				}
-			}
-		}
-	}
-	return true, nil
+	return e.retire(held, d, &st)
 }
 
 // stepLocked steps a deployment under its lock; a deployment someone else steps is skipped.
 func (e *Engine) stepLocked(ctx context.Context, id int64) error {
-	release, ok, err := e.cfg.Store.LockDeployment(ctx, id)
+	held, release, ok, err := e.cfg.Store.LockDeployment(ctx, id)
 	if err != nil || !ok {
 		return err
 	}
+	// What the step writes, it writes while it holds the lock (data.Fence).
+	ctx = held
 	kept := false
 	defer func() {
 		if !kept {
@@ -484,7 +506,7 @@ func (e *Engine) stepLocked(ctx context.Context, id int64) error {
 	if !d.Status.Open() || d.Status != store.Running {
 		return nil
 	}
-	if d.HaltBy != "" {
+	if d.HaltBy != "" || d.HaltReason != "" {
 		return e.halt(ctx, d)
 	}
 	switch d.Stage {
@@ -492,11 +514,29 @@ func (e *Engine) stepLocked(ctx context.Context, id int64) error {
 		return e.push(ctx, d)
 	case store.Migrate:
 		kept, err = e.migrate(ctx, d, release)
-		return err
+		return e.waitingFor(ctx, d, err)
 	case store.Roll:
-		return e.roll(ctx, d)
+		return e.waitingFor(ctx, d, e.roll(ctx, d))
 	}
 	return nil // a hazard waits for a person
+}
+
+// waitingFor says once, in a deployment's log, that it waits for its owner's deploy agent, when
+// err is that: the next pass tries again.
+func (e *Engine) waitingFor(ctx context.Context, d *store.Deployment, err error) error {
+	if !errors.Is(err, tunnel.ErrNoAgent) {
+		return err
+	}
+	e.mu.Lock()
+	said := e.waiting[d.ID]
+	e.waiting[d.ID] = true
+	e.mu.Unlock()
+	if !said {
+		if lerr := e.cfg.Store.Log(ctx, d.ID, "waiting: "+err.Error()); lerr != nil {
+			return lerr
+		}
+	}
+	return nil
 }
 
 // fail ends a deployment failed, and stops its plan.
@@ -505,6 +545,9 @@ func (e *Engine) fail(ctx context.Context, d *store.Deployment, reason string) e
 }
 
 func (e *Engine) end(ctx context.Context, d *store.Deployment, st store.Status, reason string) error {
+	e.mu.Lock()
+	delete(e.waiting, d.ID)
+	e.mu.Unlock()
 	if err := e.cfg.Store.Finish(ctx, d.ID, st, reason); err != nil {
 		return err
 	}
@@ -639,7 +682,7 @@ func (e *Engine) migrate(ctx context.Context, d *store.Deployment, release func(
 				delete(e.migrating, d.ID)
 				e.mu.Unlock()
 			}()
-			if err := e.apply(context.WithoutCancel(ctx), d, m); err != nil {
+			if err := e.waitingFor(context.WithoutCancel(ctx), d, e.apply(context.WithoutCancel(ctx), d, m)); err != nil {
 				e.cfg.Log.Warn("deploy: a migration", "deployment", d.ID, "migration", m.Target, "err", err)
 			}
 		}()
@@ -669,10 +712,35 @@ func (e *Engine) apply(ctx context.Context, d *store.Deployment, m store.Migrati
 	case !desc.Binary:
 		return e.recordMigration(ctx, d, m, store.MigrationFailed, Applied{Failed: fmt.Sprintf("%s is a %s: a migration is a binary that speaks the migrate protocol", m.Target, desc.Kind)})
 	}
-	if err := e.cfg.Store.Log(ctx, d.ID, fmt.Sprintf("applying %s", m.Target)); err != nil {
+	c, err := e.cluster(ctx, d.Repository)
+	if err != nil {
 		return err
 	}
-	a, err := e.cfg.Build.Migrate(ctx, m.Target, m.Allowed)
+	where := ""
+	if c.Migrate != nil {
+		where = ", in its cluster by its organization's deploy agent"
+	}
+	values, failed, err := e.deploySecrets(ctx, d)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		for _, v := range values {
+			clear(v)
+		}
+	}()
+	if failed != "" {
+		return e.recordMigration(ctx, d, m, store.MigrationFailed, Applied{Failed: failed})
+	}
+	if err := e.cfg.Store.Log(ctx, d.ID, fmt.Sprintf("applying %s%s", m.Target, where)); err != nil {
+		return err
+	}
+	var a Applied
+	if c.Migrate != nil {
+		a, err = c.Migrate(ctx, d.Repository, d.Commit, m.Target, m.Allowed, values)
+	} else {
+		a, err = e.cfg.Build.Migrate(ctx, m.Target, m.Allowed, values)
+	}
 	if err != nil {
 		return err
 	}
@@ -683,6 +751,58 @@ func (e *Engine) apply(ctx context.Context, d *store.Deployment, m store.Migrati
 		return e.recordMigration(ctx, d, m, store.MigrationWaiting, a)
 	}
 	return e.recordMigration(ctx, d, m, store.MigrationFailed, a)
+}
+
+// deploySecrets are the secrets the deploy's stanza at the deployment's commit names — read from
+// the checkout, which holds it — as ok secrets gives them for that commit of main, by path; or why
+// the deployment cannot have them, failing its migration; an error is worth trying again.
+func (e *Engine) deploySecrets(ctx context.Context, d *store.Deployment) (map[string][]byte, string, error) {
+	file, name, ok := strings.Cut(strings.TrimPrefix(d.Deploy, "//"), ":"+string(workflow.DeployPhase)+":")
+	if !ok {
+		return nil, "", nil
+	}
+	data, err := os.ReadFile(filepath.Join(e.cfg.Checkout.Dir(), filepath.FromSlash(file)))
+	if err != nil {
+		return nil, "", fmt.Errorf("reading %s: %w", file, err)
+	}
+	wf, _ := workflow.Parse(file, data)
+	var named []workflow.Secret
+	for _, dep := range wf.Deploys {
+		if dep.Name == name {
+			named = dep.Secrets
+		}
+	}
+	if len(named) == 0 {
+		return nil, "", nil
+	}
+	if e.cfg.Secrets == nil {
+		return nil, fmt.Sprintf("%s names secrets, and this installation runs no ok secrets (services.secrets)", d.Deploy), nil
+	}
+	values := map[string][]byte{}
+	var paths []string
+	for _, s := range named {
+		resp, err := e.cfg.Secrets.ReadDeploySecret(ctx, &secretspb.ReadDeploySecretRequest{RepositoryId: d.Repository, CommitId: d.Commit,
+			Deploy: d.Deploy, Path: s.Path})
+		switch status.Code(err) {
+		case codes.OK:
+		case codes.PermissionDenied, codes.FailedPrecondition, codes.InvalidArgument, codes.NotFound:
+			for _, v := range values {
+				clear(v)
+			}
+			return nil, fmt.Sprintf("reading the secret //%s: %s", s.Path, status.Convert(err).Message()), nil
+		default:
+			for _, v := range values {
+				clear(v)
+			}
+			return nil, "", fmt.Errorf("reading the secret //%s: %w", s.Path, err)
+		}
+		values[s.Path] = resp.GetValue()
+		paths = append(paths, "//"+s.Path)
+	}
+	if err := e.cfg.Store.Log(ctx, d.ID, fmt.Sprintf("its migrations read %d secret(s): %s", len(paths), strings.Join(paths, ", "))); err != nil {
+		return nil, "", err
+	}
+	return values, "", nil
 }
 
 // applyTree applies the groups-and-ACLs tree at the deployment's commit — the checkout holds it —
@@ -803,8 +923,12 @@ func (e *Engine) roll(ctx context.Context, d *store.Deployment) error {
 	if err != nil {
 		return err
 	}
+	roller, err := e.rollerFor(ctx, d.Repository)
+	if err != nil {
+		return err
+	}
 	tgt := e.target(d)
-	err = e.roller.Step(ctx, tgt, &st, e.cfg.Now())
+	err = roller.Step(ctx, tgt, &st, e.cfg.Now())
 	if serr := e.saveRoll(ctx, d, &st); serr != nil {
 		return serr
 	}
@@ -835,7 +959,11 @@ func (e *Engine) roll(ctx context.Context, d *store.Deployment) error {
 // retire ends the old copy of a successful deployment of the deployer — likely this process —
 // and records that it did.
 func (e *Engine) retire(ctx context.Context, d *store.Deployment, st *roll.State) error {
-	if err := e.roller.Retire(ctx, e.target(d), st); err != nil {
+	roller, err := e.rollerFor(ctx, d.Repository)
+	if err != nil {
+		return err
+	}
+	if err := roller.Retire(ctx, e.target(d), st); err != nil {
 		return err
 	}
 	return e.saveRoll(ctx, d, st)
@@ -846,7 +974,10 @@ func (e *Engine) retire(ctx context.Context, d *store.Deployment, st *roll.State
 // halt stops a deployment someone asked to halt: its pushes are canceled, and a roll under way
 // rolls back first.
 func (e *Engine) halt(ctx context.Context, d *store.Deployment) error {
-	reason := "halted by " + d.HaltBy
+	reason := "halted"
+	if d.HaltReason != "" {
+		reason = "halted: " + d.HaltReason
+	}
 	switch d.Stage {
 	case store.Queued, store.Push:
 		for _, im := range d.Images {
@@ -865,13 +996,17 @@ func (e *Engine) halt(ctx context.Context, d *store.Deployment) error {
 		if err != nil {
 			return err
 		}
+		roller, err := e.rollerFor(ctx, d.Repository)
+		if err != nil {
+			return err
+		}
 		tgt := e.target(d)
 		switch {
 		case st.Done():
 		case st.Stage == roll.StageRollback:
-			err = e.roller.Step(ctx, tgt, &st, e.cfg.Now())
+			err = roller.Step(ctx, tgt, &st, e.cfg.Now())
 		default:
-			err = e.roller.Abort(ctx, tgt, &st, e.cfg.Now(), reason)
+			err = roller.Abort(ctx, tgt, &st, e.cfg.Now(), reason)
 		}
 		if serr := e.saveRoll(ctx, d, &st); serr != nil {
 			return serr

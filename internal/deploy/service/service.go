@@ -31,15 +31,18 @@ func New(s *store.Store) *Service {
 	return &Service{store: s}
 }
 
+// caller returns the stable ID of the principal a request is for: the deployer records
+// principals by ID (docs/hosted.md, "Tenancy, as built").
 func caller(ctx context.Context) (string, error) {
 	c, ok := authn.FromContext(ctx)
 	if !ok {
 		return "", status.Error(codes.Unauthenticated, "the deployer serves identified principals only")
 	}
-	return c.Principal, nil
+	return c.ID, nil
 }
 
-// requester is who a request that changes a deployment is for: the person ok control names.
+// requester is who a request that changes a deployment is for: the person ok control names, by
+// stable ID.
 func (s *Service) requester(ctx context.Context, forPerson string) (string, error) {
 	if _, err := caller(ctx); err != nil {
 		return "", err
@@ -125,7 +128,7 @@ func (s *Service) get(ctx context.Context, id int64) (*deploypb.Deployment, erro
 }
 
 func (s *Service) RetryDeployment(ctx context.Context, req *deploypb.RetryDeploymentRequest) (*deploypb.Deployment, error) {
-	who, err := s.requester(ctx, req.GetForPerson())
+	who, err := s.requester(ctx, req.GetForPersonId())
 	if err != nil {
 		return nil, err
 	}
@@ -137,7 +140,7 @@ func (s *Service) RetryDeployment(ctx context.Context, req *deploypb.RetryDeploy
 }
 
 func (s *Service) HaltDeployment(ctx context.Context, req *deploypb.HaltDeploymentRequest) (*deploypb.Deployment, error) {
-	who, err := s.requester(ctx, req.GetForPerson())
+	who, err := s.requester(ctx, req.GetForPersonId())
 	if err != nil {
 		return nil, err
 	}
@@ -148,7 +151,7 @@ func (s *Service) HaltDeployment(ctx context.Context, req *deploypb.HaltDeployme
 }
 
 func (s *Service) AllowHazards(ctx context.Context, req *deploypb.AllowHazardsRequest) (*deploypb.Deployment, error) {
-	who, err := s.requester(ctx, req.GetForPerson())
+	who, err := s.requester(ctx, req.GetForPersonId())
 	if err != nil {
 		return nil, err
 	}
@@ -248,9 +251,9 @@ func timeOut(t time.Time) *timestamppb.Timestamp {
 func deploymentOut(d *store.Deployment, evs []store.Event) *deploypb.Deployment {
 	out := &deploypb.Deployment{
 		Id: d.ID, RepositoryId: d.Repository, PlanId: d.PlanID, RetryOf: d.RetryOf, Deploy: d.Deploy, Name: d.Name,
-		CommitId: d.Commit, FromSeq: d.FromSeq, ToSeq: d.ToSeq, Why: d.Why, Wave: int32(d.Wave), RequestedBy: d.RequestedBy,
+		CommitId: d.Commit, FromSeq: d.FromSeq, ToSeq: d.ToSeq, Why: d.Why, Wave: int32(d.Wave), RequestedById: d.RequestedBy,
 		Status: deploypb.Deployment_Status(d.Status), Stage: deploypb.Deployment_Stage(d.Stage), Reason: d.Reason,
-		Self: d.Self, HaltBy: d.HaltBy,
+		Self: d.Self, HaltById: d.HaltBy, HaltReason: d.HaltReason,
 		CreatedAt: timeOut(d.CreatedAt), StartedAt: timeOut(d.StartedAt), FinishedAt: timeOut(d.FinishedAt),
 	}
 	if w := d.Workload; w != nil {
@@ -261,7 +264,7 @@ func deploymentOut(d *store.Deployment, evs []store.Event) *deploypb.Deployment 
 	}
 	for _, m := range d.Migrations {
 		out.Migrations = append(out.Migrations, &deploypb.Migration{Target: m.Target, Status: deploypb.Migration_Status(m.Status),
-			Output: m.Output, Plan: planOut(m.Report), Refused: m.Refused, Allowed: m.Allowed, AllowedBy: m.AllowedBy})
+			Output: m.Output, Plan: planOut(m.Report), Refused: m.Refused, Allowed: m.Allowed, AllowedById: m.AllowedBy})
 	}
 	if len(d.Roll) > 0 {
 		var st roll.State

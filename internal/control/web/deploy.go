@@ -41,7 +41,7 @@ func (s *Server) clDeploys(ctx context.Context, repo *scmpb.Repository, cl db.Ch
 	for _, dep := range resp.GetDeployments() {
 		label, kind := deploymentStatus(dep)
 		item := pages.CLDeployment{ID: dep.GetId(), Name: dep.GetName(), Workload: workloadName(dep.GetWorkload()), StatusLabel: label,
-			StatusKind: kind, Stage: stageLabel(dep), Reason: dep.GetReason(), Href: deploymentHref(repo.GetName(), dep.GetId(), cl.Number),
+			StatusKind: kind, Stage: stageLabel(dep), Reason: people.HaltReason(ctx, dep.GetReason(), dep.GetHaltById()), Href: deploymentHref(repo.GetName(), dep.GetId(), cl.Number),
 			Unfinished: dep.GetStatus() == deploypb.Deployment_STATUS_WAITING || dep.GetStatus() == deploypb.Deployment_STATUS_RUNNING}
 		item.Age, item.AgeTitle = age(deploymentTime(dep))
 		d.Items = append(d.Items, item)
@@ -85,7 +85,7 @@ func deploymentStatus(d *deploypb.Deployment) (label, kind string) {
 		if d.GetStage() == deploypb.Deployment_STAGE_HAZARD {
 			return "Needs Allowance", "hazard"
 		}
-		if d.GetHaltBy() != "" {
+		if d.GetHaltById() != "" || d.GetHaltReason() != "" {
 			return "Halting", "halted"
 		}
 		return "Running", "running"
@@ -247,8 +247,8 @@ func (s *Server) deploymentView(ctx context.Context, t *deployTarget, me, notice
 		Chrome: chrome(t.repo, "main", t.repo.GetHead(), ""),
 		ID:     d.GetId(), Name: d.GetName(), Deploy: d.GetDeploy(),
 		Commit: scm.Short(d.GetCommitId()), CommitHref: commitHref(repoName, d.GetCommitId()),
-		Why: d.GetWhy(), Workload: workloadName(d.GetWorkload()), RequestedBy: people.Handle(d.GetRequestedBy()),
-		StatusLabel: label, StatusKind: kind, Stage: stageLabel(d), Reason: d.GetReason(), Roll: rollLabel(d),
+		Why: d.GetWhy(), Workload: workloadName(d.GetWorkload()), RequestedBy: people.Handle(ctx, d.GetRequestedById()),
+		StatusLabel: label, StatusKind: kind, Stage: stageLabel(d), Reason: people.HaltReason(ctx, d.GetReason(), d.GetHaltById()), Roll: rollLabel(d),
 		Live:       d.GetStatus() == deploypb.Deployment_STATUS_WAITING || d.GetStatus() == deploypb.Deployment_STATUS_RUNNING,
 		StatusHref: base + "/status" + query,
 		Notice:     notice,
@@ -273,8 +273,8 @@ func (s *Server) deploymentView(ctx context.Context, t *deployTarget, me, notice
 	}
 	for _, m := range d.GetMigrations() {
 		mv := pages.DeploymentMigration{Target: m.GetTarget(), Refused: m.GetRefused(), Allowed: m.GetAllowed(), Output: m.GetOutput()}
-		if m.GetAllowedBy() != "" {
-			mv.AllowedBy = people.Handle(m.GetAllowedBy())
+		if m.GetAllowedById() != "" {
+			mv.AllowedBy = people.Handle(ctx, m.GetAllowedById())
 		}
 		switch m.GetStatus() {
 		case deploypb.Migration_STATUS_APPLIED:
@@ -313,7 +313,7 @@ func (s *Server) deploymentView(ctx context.Context, t *deployTarget, me, notice
 			v.RetryHref = base + "/retry" + query
 		}
 	case deploypb.Deployment_STATUS_WAITING, deploypb.Deployment_STATUS_RUNNING:
-		if may && d.GetHaltBy() == "" {
+		if may && d.GetHaltById() == "" && d.GetHaltReason() == "" {
 			v.HaltHref = base + "/halt" + query
 		}
 		if d.GetStage() == deploypb.Deployment_STAGE_HAZARD && s.review.MayActOnDeployment(ctx, t.repo, me, review.DeploymentAllow, author) == nil {
@@ -370,11 +370,11 @@ func (s *Server) deploymentAction(action string) http.HandlerFunc {
 		var d *deploypb.Deployment
 		switch action {
 		case "retry":
-			d, err = s.deploys.RetryDeployment(ctx, &deploypb.RetryDeploymentRequest{Id: t.d.GetId(), ForPerson: me})
+			d, err = s.deploys.RetryDeployment(ctx, &deploypb.RetryDeploymentRequest{Id: t.d.GetId(), ForPersonId: me})
 		case "halt":
-			d, err = s.deploys.HaltDeployment(ctx, &deploypb.HaltDeploymentRequest{Id: t.d.GetId(), ForPerson: me})
+			d, err = s.deploys.HaltDeployment(ctx, &deploypb.HaltDeploymentRequest{Id: t.d.GetId(), ForPersonId: me})
 		case "allow":
-			d, err = s.deploys.AllowHazards(ctx, &deploypb.AllowHazardsRequest{Id: t.d.GetId(), ForPerson: me})
+			d, err = s.deploys.AllowHazards(ctx, &deploypb.AllowHazardsRequest{Id: t.d.GetId(), ForPersonId: me})
 		}
 		if status.Code(err) == codes.FailedPrecondition {
 			s.serveDeployment(w, r, upperFirst(status.Convert(err).Message()), pages.ServeDeploymentView)

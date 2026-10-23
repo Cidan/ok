@@ -32,7 +32,8 @@ include ../OWNERS_shared # import everything: owners, per-file rules, set allows
 
 | Directive | Meaning |
 |---|---|
-| `user: <handle>` | A person. The handle is the name before `.human.<domain>`. |
+| `user: <handle>` | A person. The handle is the name before `.human.<domain>`; `user: @<handle>`, as a hosted service writes it, is the same. |
+| `acl: @<organization>/<team>` | Every member of an organization's team, `<team>.<organization>.team.<domain>`, and of the teams below it — read from ok identity when approval is evaluated, as an ACL's are. |
 | `acl: <name>` | Every member of an ACL of the groups-and-ACLs tree, `<name>.acl.<domain>` ([identity.md](identity.md)), through the sets it holds — read from ok identity when approval is evaluated. A member who authors the change satisfies the set, as a listed user does. |
 | `*` | Anyone may approve (but the author only with `set allowself`). |
 | `set noparent` | Accepted for compatibility with Google-style files. Owners are never inherited from parent directories anyway (nearest-only), so it changes nothing. |

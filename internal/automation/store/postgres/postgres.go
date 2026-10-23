@@ -1,6 +1,5 @@
 // Package postgres is automation's store backend (internal/automation/store) on PostgreSQL, in
-// the schema automation: a queued run claimed with FOR UPDATE SKIP LOCKED, the waits woken with
-// LISTEN and NOTIFY.
+// the schema automation: a queued run claimed with FOR UPDATE SKIP LOCKED.
 package postgres
 
 import (
@@ -9,7 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"hash/fnv"
+	"strconv"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -17,9 +16,12 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Cidan/ok/internal/automation/store"
+	"github.com/Cidan/ok/internal/data"
 	"github.com/Cidan/ok/internal/data/pgdata"
 	"github.com/Cidan/ok/internal/lock"
 	"github.com/Cidan/ok/internal/migrate"
+	"github.com/Cidan/ok/internal/move"
+	"github.com/Cidan/ok/internal/scm/scmfeed"
 )
 
 //go:embed migrations/*.sql
@@ -32,7 +34,7 @@ var Migrations = migrate.MustLoad(migrations, "migrations")
 type Backend struct {
 	queries
 	pool  *pgxpool.Pool
-	locks *lock.Lock
+	moves *move.PostgresRows
 }
 
 var _ store.Backend = (*Backend)(nil)
@@ -42,27 +44,74 @@ func Open(ctx context.Context, pool *pgxpool.Pool) (*Backend, error) {
 	if _, err := migrate.Apply(ctx, pool, "automation", Migrations); err != nil {
 		return nil, err
 	}
-	return &Backend{queries: queries{pool}, pool: pool, locks: lock.New(pool)}, nil
+	return &Backend{queries: queries{move.GatedPool{Pool: pool, Tables: moveTableSet}}, pool: pool,
+		moves: &move.PostgresRows{Pool: pool, Tables: moveTables, Where: moveWhere}}, nil
+}
+
+// moveTables are the tables of rows about repositories this cell holds, which a move copies
+// (docs/hosted.md, "Cells, as built"): their plans, runs, submissions, main's commits, and where
+// the SCM's feed of each was applied to.
+var moveTables = []string{"plan", "run", "pushed_image", "submission", "submission_cl", "attempt", "attempt_candidate", "main_commit",
+	"landed_change", "follow_cursor"}
+
+var moveTableSet = func() map[string]bool {
+	m := map[string]bool{}
+	for _, t := range moveTables {
+		m[t] = true
+	}
+	return m
+}()
+
+// moveWhere is the condition a table's rows about repositories (@repos) meet: a submission's rows
+// go with it, whichever repositories its CLs name.
+func moveWhere(table string) string {
+	const submissions = "SELECT id FROM submission WHERE repository_id = ANY(@repos)"
+	switch table {
+	case "pushed_image":
+		return "run_id IN (SELECT id FROM run WHERE repository_id = ANY(@repos))"
+	case "submission_cl", "attempt":
+		return "submission_id IN (" + submissions + ")"
+	case "attempt_candidate":
+		return "attempt_id IN (SELECT id FROM attempt WHERE submission_id IN (" + submissions + "))"
+	case "follow_cursor":
+		return "topic = '" + scmfeed.Topic + "' AND key = ANY(@repos)"
+	}
+	return "repository_id = ANY(@repos)"
+}
+
+// Moves are the backend's rows about repositories, for a move.
+func (b *Backend) Moves() move.Rows { return b.moves }
+
+func (x queries) RunningRuns(ctx context.Context, repos []int64) ([]int64, error) {
+	rows, err := x.q.Query(ctx, `SELECT id FROM run WHERE repository_id = ANY($1) AND status = $2 ORDER BY id`, repos, store.StatusRunning)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, pgx.RowTo[int64])
+}
+
+func (x queries) Gate(ctx context.Context, repo int64) error {
+	return move.GateRepository(ctx, x.q, repo)
 }
 
 // Txn runs fn in a transaction, again if PostgreSQL aborts it to break a deadlock or a
 // serialization conflict.
 func (b *Backend) Txn(ctx context.Context, fn func(store.Ops) error) error {
-	return pgdata.Txn(ctx, b.pool, func(tx pgx.Tx) error { return fn(queries{tx}) })
+	return pgdata.Txn(ctx, b.pool, func(tx pgx.Tx) error {
+		// What ctx's lease guards is written only while its holder holds it (data.Fence).
+		if err := pgdata.CheckFence(ctx, tx); err != nil {
+			return err
+		}
+		if err := move.PostgresGate(ctx, tx); err != nil {
+			return err
+		}
+		return fn(queries{&move.CheckedTx{Tx: tx, Tables: moveTableSet}})
+	})
 }
 
 // Snapshot runs fn in a read-only, repeatable-read transaction.
 func (b *Backend) Snapshot(ctx context.Context, fn func(store.Ops) error) error {
 	return pgdata.Snapshot(ctx, b.pool, func(tx pgx.Tx) error { return fn(queries{tx}) })
-}
-
-func (b *Backend) Lead(ctx context.Context, role string, fn lock.LockFn) error {
-	return b.locks.LockFn(ctx, "leaders", role, 0, fn)
-}
-
-// Listen holds a connection of its own, out of the pool, listening on channels.
-func (b *Backend) Listen(ctx context.Context, channels []string, ready func(), deliver func(channel, payload string)) error {
-	return pgdata.Listen(ctx, b.pool, channels, ready, deliver)
 }
 
 type querier interface {
@@ -74,11 +123,6 @@ type querier interface {
 
 // queries are the backend's operations over a pool or a transaction.
 type queries struct{ q querier }
-
-func (x queries) Notify(ctx context.Context, channel, payload string) error {
-	_, err := x.q.Exec(ctx, `SELECT pg_notify($1, $2)`, channel, payload)
-	return err
-}
 
 // nullable is a positive number, or SQL NULL.
 func nullable[T int16 | int32 | int64](v T) *T {
@@ -124,7 +168,8 @@ func commitsByRepository(rows pgx.Rows, err error) (map[int64][][]byte, error) {
 // runColumns are a run's columns, in scanRun's order.
 const runColumns = `id, repository_id, commit_id, kind, targets, args, phase, cl_number, patchset, job,
 	requested_by, rerun_of, status, attempt, coalesce(worker, ''), coalesce(exit_code, 0), reason, log_size,
-	log_stored, timeout_seconds, coalesce(plan_id, 0), why, queued_at, started_at, finished_at, coalesce(carried_from, 0)`
+	log_stored, timeout_seconds, coalesce(plan_id, 0), why, queued_at, started_at, finished_at, coalesce(carried_from, 0),
+	coalesce(canceled_by, ''), pool`
 
 func scanRun(row pgx.Row) (*store.Run, error) {
 	var r store.Run
@@ -134,7 +179,7 @@ func scanRun(row pgx.Row) (*store.Run, error) {
 	err := row.Scan(&r.ID, &r.RepositoryID, &r.CommitID, &r.Job.Kind, &r.Job.Targets, &r.Job.Args,
 		&r.Origin.Phase, &cl, &patchset, &r.Origin.Job, &r.RequestedBy, &rerun, &r.Status, &r.Attempt, &r.Worker,
 		&r.ExitCode, &r.Reason, &r.LogSize, &r.LogStored, &r.TimeoutSeconds, &r.PlanID, &r.Why, &r.QueuedAt, &started, &finished,
-		&r.CarriedFrom)
+		&r.CarriedFrom, &r.CanceledBy, &r.Job.Pool)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, store.ErrNotFound
 	}
@@ -175,17 +220,19 @@ func collectRuns(rows pgx.Rows, err error) ([]*store.Run, error) {
 	return out, rows.Err()
 }
 
+// insertRun makes a run under a random ID ($23). Its queue time is the clock's, not the
+// transaction's start, so the runs one transaction queues keep their order.
 const insertRun = `INSERT INTO run (repository_id, commit_id, kind, targets, args, phase, cl_number, patchset, job,
 		plan_id, why, requested_by, rerun_of, status, reason, timeout_seconds, priority,
-		started_at, finished_at, log_stored, carried_from)
+		started_at, finished_at, log_stored, carried_from, log_size, id, queued_at, pool)
 	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
-		CASE WHEN $18::boolean THEN now() END, CASE WHEN $19::boolean THEN now() END, $20, $21)`
+		CASE WHEN $18::boolean THEN now() END, CASE WHEN $19::boolean THEN now() END, $20, $21, $22, $23, clock_timestamp(), coalesce(nullif($24, ''), 'default'))`
 
 func runArgs(r store.NewRun) []any {
 	return []any{r.RepositoryID, r.CommitID, r.Job.Kind, orEmpty(r.Job.Targets), orEmpty(r.Job.Args), r.Origin.Phase,
 		nullable(r.Origin.CLNumber), nullable(r.Origin.Patchset), r.Origin.Job, nullable(r.PlanID), r.Why, r.RequestedBy,
 		nullable(r.RerunOf), r.Status, r.Reason, r.TimeoutSeconds, r.Priority, r.Started, r.Finished, r.LogStored,
-		nullable(r.CarriedFrom)}
+		nullable(r.CarriedFrom), r.LogSize, data.NewID(), r.Job.Pool}
 }
 
 func (x queries) InsertRun(ctx context.Context, r store.NewRun) (*store.Run, error) {
@@ -213,18 +260,19 @@ func (x queries) LockRun(ctx context.Context, id int64) (*store.Run, error) {
 
 func (x queries) RunsOfCL(ctx context.Context, repo, cl int64, patchset int32, before int64, limit int) ([]*store.Run, error) {
 	return collectRuns(x.q.Query(ctx, `SELECT `+runColumns+` FROM run
-		WHERE repository_id = $1 AND cl_number = $2 AND ($3 = 0 OR patchset = $3) AND id < $4
-		ORDER BY id DESC LIMIT $5`, repo, cl, patchset, before, limit))
+		WHERE repository_id = $1 AND cl_number = $2 AND ($3 = 0 OR patchset = $3)
+			AND ($4::bigint = 0 OR (queued_at, id) < (SELECT queued_at, id FROM run WHERE id = $4))
+		ORDER BY queued_at DESC, id DESC LIMIT $5`, repo, cl, patchset, before, limit))
 }
 
 func (x queries) RunsOfCommit(ctx context.Context, repo int64, commit []byte, before int64, limit int) ([]*store.Run, error) {
 	return collectRuns(x.q.Query(ctx, `SELECT `+runColumns+` FROM run
-		WHERE repository_id = $1 AND commit_id = $2 AND id < $3
-		ORDER BY id DESC LIMIT $4`, repo, commit, before, limit))
+		WHERE repository_id = $1 AND commit_id = $2 AND ($3::bigint = 0 OR (queued_at, id) < (SELECT queued_at, id FROM run WHERE id = $3))
+		ORDER BY queued_at DESC, id DESC LIMIT $4`, repo, commit, before, limit))
 }
 
 func (x queries) PlanRuns(ctx context.Context, plans []int64) ([]*store.Run, error) {
-	return collectRuns(x.q.Query(ctx, `SELECT `+runColumns+` FROM run WHERE plan_id = ANY($1) ORDER BY id`, plans))
+	return collectRuns(x.q.Query(ctx, `SELECT `+runColumns+` FROM run WHERE plan_id = ANY($1) ORDER BY queued_at, id`, plans))
 }
 
 func (x queries) Pushed(ctx context.Context, runs []int64) (map[int64][]store.Pushed, error) {
@@ -255,17 +303,6 @@ func (x queries) InsertPushed(ctx context.Context, run int64, pushed []store.Pus
 	return x.q.SendBatch(ctx, batch).Close()
 }
 
-func (x queries) ClaimRun(ctx context.Context, worker string, ttl time.Duration) (*store.Run, error) {
-	r, err := scanRun(x.q.QueryRow(ctx, `UPDATE run
-		SET status = $2, worker = $3, lease_expires = now() + make_interval(secs => $4), started_at = now()
-		WHERE id = (SELECT id FROM run WHERE status = $1 ORDER BY priority DESC, id LIMIT 1 FOR UPDATE SKIP LOCKED)
-		RETURNING `+runColumns, store.StatusQueued, store.StatusRunning, worker, ttl.Seconds()))
-	if errors.Is(err, store.ErrNotFound) {
-		return nil, nil
-	}
-	return r, err
-}
-
 func (x queries) RenewLease(ctx context.Context, id int64, worker string, ttl time.Duration) (store.Lease, bool, error) {
 	var l store.Lease
 	var stop *string
@@ -285,48 +322,73 @@ func (x queries) RenewLease(ctx context.Context, id int64, worker string, ttl ti
 	return l, true, nil
 }
 
-func (x queries) LapsedRuns(ctx context.Context) ([]store.Lapsed, error) {
-	rows, err := x.q.Query(ctx, `SELECT id, attempt, coalesce(worker, ''), stop_reason FROM run
-		WHERE status = $1 AND lease_expires < now() ORDER BY id FOR UPDATE SKIP LOCKED`, store.StatusRunning)
+func (x queries) LapsedRunIDs(ctx context.Context) ([]int64, error) {
+	rows, err := x.q.Query(ctx, `SELECT id FROM run WHERE status = $1 AND lease_expires < now()
+			AND NOT EXISTS (SELECT 1 FROM move_gate g WHERE g.repository_id = run.repository_id AND g.move_state <> '')
+		ORDER BY id`, store.StatusRunning)
 	if err != nil {
 		return nil, err
 	}
-	return pgx.CollectRows(rows, func(r pgx.CollectableRow) (store.Lapsed, error) {
-		var l store.Lapsed
-		var stop *string
-		if err := r.Scan(&l.ID, &l.Attempt, &l.Worker, &stop); err != nil {
-			return l, err
-		}
-		if stop != nil {
-			l.Stopping, l.StopReason = true, *stop
-		}
-		return l, nil
-	})
+	return pgx.CollectRows(rows, pgx.RowTo[int64])
 }
 
+// LapsedRun locks the run if it is still lapsed; one another sweep holds is left to it.
+func (x queries) LapsedRun(ctx context.Context, id int64) (store.Lapsed, bool, error) {
+	l := store.Lapsed{ID: id}
+	var stop *string
+	err := x.q.QueryRow(ctx, `SELECT repository_id, phase, attempt, coalesce(worker, ''), stop_reason FROM run
+		WHERE id = $1 AND status = $2 AND lease_expires < now() FOR UPDATE SKIP LOCKED`, id, store.StatusRunning).
+		Scan(&l.RepositoryID, &l.Phase, &l.Attempt, &l.Worker, &stop)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return l, false, nil
+	}
+	if err != nil {
+		return l, false, err
+	}
+	if stop != nil {
+		l.Stopping, l.StopReason = true, *stop
+	}
+	return l, true, nil
+}
+
+// stopRunning is a statement's first part that charges a run that was running ($1) its seconds
+// since it started to its account's month, and lets its slot go, as it is read before the
+// statement changes it.
+const stopRunning = `WITH ran AS (
+		SELECT r.repository_id, r.started_at FROM run r WHERE r.id = $1 AND r.status = 2 AND r.started_at IS NOT NULL
+	), freed AS (
+		DELETE FROM account_slot s USING run r WHERE r.id = $1 AND r.status = 2 AND s.account_id = r.slot_account AND s.slot = r.slot
+	), charged AS (
+		INSERT INTO account_usage (account_id, month, seconds)
+		SELECT coalesce(o.account_id, ''), to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM'),
+			greatest(0, floor(extract(epoch FROM now() - ran.started_at)))::bigint
+		FROM ran LEFT JOIN repository_owner o ON o.repository_id = ran.repository_id
+		ON CONFLICT (account_id, month) DO UPDATE SET seconds = account_usage.seconds + EXCLUDED.seconds
+	) `
+
 func (x queries) RequeueRun(ctx context.Context, id int64, reason string, nextAttempt bool) error {
-	_, err := x.q.Exec(ctx, `WITH cleared AS (DELETE FROM log_chunk WHERE run_id = $1)
-		UPDATE run SET status = $2, reason = $3, attempt = attempt + CASE WHEN $4::boolean THEN 1 ELSE 0 END,
-			worker = NULL, lease_expires = NULL, started_at = NULL, finished_at = NULL, stop_reason = NULL, log_size = 0
+	_, err := x.q.Exec(ctx, stopRunning+`UPDATE run SET status = $2, reason = $3, attempt = attempt + CASE WHEN $4::boolean THEN 1 ELSE 0 END,
+			worker = NULL, lease_expires = NULL, started_at = NULL, finished_at = NULL, stop_reason = NULL, log_size = 0,
+			slot_account = NULL, slot = NULL
 		WHERE id = $1`, id, store.StatusQueued, reason, nextAttempt)
 	return err
 }
 
 func (x queries) FinishRun(ctx context.Context, id int64, status store.Status, exitCode int32, reason string) error {
-	_, err := x.q.Exec(ctx, `UPDATE run SET status = $2, exit_code = $3, reason = $4, finished_at = now(),
-		lease_expires = NULL, stop_reason = NULL WHERE id = $1`, id, status, exitCode, reason)
+	_, err := x.q.Exec(ctx, stopRunning+`UPDATE run SET status = $2, exit_code = $3, reason = $4, finished_at = now(),
+		lease_expires = NULL, stop_reason = NULL, slot_account = NULL, slot = NULL WHERE id = $1`, id, status, exitCode, reason)
 	return err
 }
 
-func (x queries) CancelQueuedRun(ctx context.Context, id int64, reason string) (bool, error) {
-	tag, err := x.q.Exec(ctx, `UPDATE run SET status = $2, reason = $3, finished_at = now(), log_stored = true
-		WHERE id = $1 AND status = $4`, id, store.StatusCanceled, reason, store.StatusQueued)
+func (x queries) CancelQueuedRun(ctx context.Context, id int64, reason, by string) (bool, error) {
+	tag, err := x.q.Exec(ctx, `UPDATE run SET status = $2, reason = $3, finished_at = now(), log_stored = true,
+		canceled_by = nullif($5, '') WHERE id = $1 AND status = $4`, id, store.StatusCanceled, reason, store.StatusQueued, by)
 	return tag.RowsAffected() > 0, err
 }
 
-func (x queries) RequestStop(ctx context.Context, id int64, reason string) error {
-	_, err := x.q.Exec(ctx, `UPDATE run SET stop_reason = $2 WHERE id = $1 AND status = $3 AND stop_reason IS NULL`,
-		id, reason, store.StatusRunning)
+func (x queries) RequestStop(ctx context.Context, id int64, reason, by string) error {
+	_, err := x.q.Exec(ctx, `UPDATE run SET stop_reason = $2, canceled_by = nullif($4, '')
+		WHERE id = $1 AND status = $3 AND stop_reason IS NULL`, id, reason, store.StatusRunning, by)
 	return err
 }
 
@@ -344,39 +406,32 @@ func (x queries) StopRequest(ctx context.Context, id int64) (bool, string, error
 
 // ─── Logs ───
 
-func (x queries) AppendLogChunk(ctx context.Context, id, at int64, data []byte) error {
-	_, err := x.q.Exec(ctx, `WITH chunk AS (INSERT INTO log_chunk (run_id, at, data) VALUES ($1, $2, $3))
-		UPDATE run SET log_size = $4 WHERE id = $1`, id, at, data, at+int64(len(data)))
-	return err
-}
-
-func (x queries) LogChunks(ctx context.Context, id, from int64) ([]store.LogChunk, error) {
-	rows, err := x.q.Query(ctx, `SELECT at, data FROM log_chunk
-		WHERE run_id = $1 AND at + length(data) > $2 ORDER BY at`, id, from)
-	if err != nil {
-		return nil, err
-	}
-	return pgx.CollectRows(rows, func(r pgx.CollectableRow) (store.LogChunk, error) {
-		var c store.LogChunk
-		err := r.Scan(&c.At, &c.Data)
-		return c, err
-	})
+func (x queries) AdvanceLog(ctx context.Context, id int64, worker string, started time.Time, from, to int64) (bool, error) {
+	tag, err := x.q.Exec(ctx, `UPDATE run SET log_size = $5
+		WHERE id = $1 AND status = $6 AND worker = $2 AND started_at = $3 AND log_size = $4`,
+		id, worker, started, from, to, store.StatusRunning)
+	return tag.RowsAffected() > 0, err
 }
 
 func (x queries) MarkLogStored(ctx context.Context, id int64) error {
-	_, err := x.q.Exec(ctx, `WITH cleared AS (DELETE FROM log_chunk WHERE run_id = $1)
-		UPDATE run SET log_stored = true WHERE id = $1`, id)
+	_, err := x.q.Exec(ctx, `UPDATE run SET log_stored = true WHERE id = $1`, id)
 	return err
 }
 
 func (x queries) UnstoredLogs(ctx context.Context, limit int) ([]int64, error) {
-	return ids(x.q.Query(ctx, `SELECT id FROM run WHERE status >= $1 AND NOT log_stored ORDER BY id LIMIT $2`, store.StatusPassed, limit))
+	return ids(x.q.Query(ctx, `SELECT id FROM run WHERE status >= $1 AND NOT log_stored
+		AND NOT EXISTS (SELECT 1 FROM move_gate g WHERE g.repository_id = run.repository_id AND g.move_state <> '')
+		ORDER BY id LIMIT $2`, store.StatusPassed, limit))
 }
 
 // ─── The feed, and the build cache's commits ───
 
 func (x queries) MarkWork(ctx context.Context, kind string, key int64) error {
 	return pgdata.MarkWork(ctx, x.q, kind, key)
+}
+
+func (x queries) MarkWorkAt(ctx context.Context, kind string, key int64, at time.Time) error {
+	return pgdata.MarkWorkAt(ctx, x.q, kind, key, at)
 }
 
 func (x queries) TakeWork(ctx context.Context, kind string, key int64, holder string, ttl time.Duration) (bool, error) {
@@ -395,15 +450,8 @@ func (x queries) DueWork(ctx context.Context, kind string, limit int) ([]int64, 
 	return pgdata.DueWork(ctx, x.q, kind, limit)
 }
 
-func (x queries) LegacyCursor(ctx context.Context) (int64, error) {
-	var seq int64
-	err := x.q.QueryRow(ctx, `SELECT coalesce((SELECT seq FROM feed_cursor), 0)`).Scan(&seq)
-	return seq, err
-}
-
-func (x queries) ForgetLegacyCursor(ctx context.Context) error {
-	_, err := x.q.Exec(ctx, `DELETE FROM feed_cursor`)
-	return err
+func (x queries) FollowCursors(ctx context.Context, topic string, keys []int64) (map[int64]int64, error) {
+	return pgdata.Cursors(ctx, x.q, topic, keys)
 }
 
 func (x queries) FollowCursor(ctx context.Context, topic string, key int64) (int64, error) {
@@ -412,10 +460,6 @@ func (x queries) FollowCursor(ctx context.Context, topic string, key int64) (int
 
 func (x queries) AdvanceFollowCursor(ctx context.Context, topic string, key, seq int64) error {
 	return pgdata.AdvanceCursor(ctx, x.q, topic, key, seq)
-}
-
-func (x queries) SeedFollowCursor(ctx context.Context, topic string, key, seq int64) error {
-	return pgdata.SeedCursor(ctx, x.q, topic, key, seq)
 }
 
 func (x queries) MainCommits(ctx context.Context, n int) (map[int64][][]byte, error) {
@@ -433,10 +477,7 @@ func (x queries) RunCommits(ctx context.Context, since time.Time) (map[int64][][
 // ─── Plans ───
 
 func (x queries) LockCL(ctx context.Context, repo, cl int64) error {
-	h := fnv.New64a()
-	fmt.Fprintf(h, "ok-automation plan %d/%d", repo, cl)
-	_, err := x.q.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, int64(h.Sum64()))
-	return err
+	return lock.InTx(ctx, x.q, "plans", fmt.Sprintf("%d/%d", repo, cl))
 }
 
 const planColumns = `id, repository_id, cl_number, patchset, phase, commit_id, workflows_commit, context, touched,
@@ -470,10 +511,10 @@ func (x queries) InsertPlan(ctx context.Context, p store.NewPlan) (*store.Plan, 
 	if err != nil {
 		return nil, err
 	}
-	return scanPlan(x.q.QueryRow(ctx, `INSERT INTO plan (repository_id, cl_number, patchset, phase, commit_id,
-			workflows_commit, context, touched, pre_commit)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING `+planColumns,
-		p.RepositoryID, p.CLNumber, p.Patchset, p.Phase, p.CommitID, p.WorkflowsCommit, p.Context, touched, p.PreCommit))
+	return scanPlan(x.q.QueryRow(ctx, `INSERT INTO plan (id, repository_id, cl_number, patchset, phase, commit_id,
+			workflows_commit, context, touched, pre_commit, created_at)
+		VALUES ($10, $1, $2, $3, $4, $5, $6, $7, $8, $9, clock_timestamp()) RETURNING `+planColumns,
+		p.RepositoryID, p.CLNumber, p.Patchset, p.Phase, p.CommitID, p.WorkflowsCommit, p.Context, touched, p.PreCommit, data.NewID()))
 }
 
 func (x queries) Plan(ctx context.Context, id int64) (*store.Plan, error) {
@@ -485,7 +526,7 @@ func (x queries) LockPlan(ctx context.Context, id int64) (*store.Plan, error) {
 }
 
 func (x queries) Plans(ctx context.Context, ids []int64) ([]*store.Plan, error) {
-	rows, err := x.q.Query(ctx, `SELECT `+planColumns+` FROM plan WHERE id = ANY($1) ORDER BY id`, ids)
+	rows, err := x.q.Query(ctx, `SELECT `+planColumns+` FROM plan WHERE id = ANY($1) ORDER BY created_at, id`, ids)
 	if err != nil {
 		return nil, err
 	}
@@ -565,7 +606,7 @@ func (x queries) ClearPreStops(ctx context.Context, repo, cl int64, patchset int
 func (x queries) ActiveSubmissionOf(ctx context.Context, repo int64, cls []int64) (int64, int64, bool, error) {
 	var cl, sub int64
 	err := x.q.QueryRow(ctx, `SELECT sc.cl_number, s.id FROM submission_cl sc JOIN submission s ON s.id = sc.submission_id
-		WHERE sc.repository_id = $1 AND sc.cl_number = ANY($2) AND s.status = $3 ORDER BY s.id LIMIT 1`,
+		WHERE sc.repository_id = $1 AND sc.cl_number = ANY($2) AND s.status = $3 ORDER BY s.created_at, s.id LIMIT 1`,
 		repo, cls, store.SubmissionActive).Scan(&cl, &sub)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return 0, 0, false, nil
@@ -580,15 +621,16 @@ func (x queries) InsertSubmission(ctx context.Context, repo int64, by string, cl
 	}
 	var id int64
 	err := x.q.QueryRow(ctx, `WITH s AS (
-			INSERT INTO submission (repository_id, submitted_by, status) VALUES ($1, $2, $3) RETURNING id),
+			INSERT INTO submission (id, repository_id, submitted_by, status, created_at) VALUES ($6, $1, $2, $3, clock_timestamp()) RETURNING id),
 		c AS (
 			INSERT INTO submission_cl (submission_id, position, repository_id, cl_number, patchset)
 			SELECT s.id, u.ord - 1, $1, u.cl, u.ps FROM s, unnest($4::bigint[], $5::int[]) WITH ORDINALITY AS u(cl, ps, ord))
-		SELECT id FROM s`, repo, by, store.SubmissionActive, numbers, patchsets).Scan(&id)
+		SELECT id FROM s`, repo, by, store.SubmissionActive, numbers, patchsets, data.NewID()).Scan(&id)
 	return id, err
 }
 
-const submissionColumns = `id, repository_id, submitted_by, status, reason, note, created_at, finished_at`
+const submissionColumns = `id, repository_id, submitted_by, status, reason, note, created_at, finished_at,
+	coalesce(canceled_by, '')`
 
 // loadSubmissions reads the submissions a query selects (by submissionColumns), with their CLs,
 // in the query's order.
@@ -603,7 +645,7 @@ func (x queries) loadSubmissions(ctx context.Context, sql string, args ...any) (
 		var sub store.Submission
 		var finished *time.Time
 		if err := rows.Scan(&sub.ID, &sub.RepositoryID, &sub.SubmittedBy, &sub.Status, &sub.Reason, &sub.Note,
-			&sub.CreatedAt, &finished); err != nil {
+			&sub.CreatedAt, &finished, &sub.CanceledBy); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -639,18 +681,18 @@ func (x queries) loadSubmissions(ctx context.Context, sql string, args ...any) (
 }
 
 func (x queries) Submissions(ctx context.Context, ids []int64) ([]*store.Submission, error) {
-	return x.loadSubmissions(ctx, `SELECT `+submissionColumns+` FROM submission WHERE id = ANY($1) ORDER BY id`, ids)
+	return x.loadSubmissions(ctx, `SELECT `+submissionColumns+` FROM submission WHERE id = ANY($1) ORDER BY created_at, id`, ids)
 }
 
 func (x queries) ActiveSubmissions(ctx context.Context, repo int64) ([]*store.Submission, error) {
 	return x.loadSubmissions(ctx, `SELECT `+submissionColumns+` FROM submission
-		WHERE repository_id = $1 AND status = $2 ORDER BY id`, repo, store.SubmissionActive)
+		WHERE repository_id = $1 AND status = $2 ORDER BY created_at, id`, repo, store.SubmissionActive)
 }
 
 func (x queries) SubmissionsOfCL(ctx context.Context, repo, cl int64, limit int) ([]*store.Submission, error) {
 	return x.loadSubmissions(ctx, `SELECT `+submissionColumns+` FROM submission WHERE id IN (
 			SELECT submission_id FROM submission_cl WHERE repository_id = $1 AND cl_number = $2)
-		ORDER BY id DESC LIMIT $3`, repo, cl, limit)
+		ORDER BY created_at DESC, id DESC LIMIT $3`, repo, cl, limit)
 }
 
 func (x queries) LockSubmission(ctx context.Context, id int64) (*store.Submission, error) {
@@ -664,10 +706,11 @@ func (x queries) LockSubmission(ctx context.Context, id int64) (*store.Submissio
 	return subs[0], nil
 }
 
-func (x queries) FinishSubmission(ctx context.Context, id int64, status store.SubmissionStatus, reason string) (int64, bool, error) {
+func (x queries) FinishSubmission(ctx context.Context, id int64, status store.SubmissionStatus, reason, by string) (int64, bool, error) {
 	var repo int64
-	err := x.q.QueryRow(ctx, `UPDATE submission SET status = $3, reason = $4, note = '', finished_at = now()
-		WHERE id = $1 AND status = $2 RETURNING repository_id`, id, store.SubmissionActive, status, reason).Scan(&repo)
+	err := x.q.QueryRow(ctx, `UPDATE submission SET status = $3, reason = $4, note = '', finished_at = now(),
+		canceled_by = nullif($5, '') WHERE id = $1 AND status = $2 RETURNING repository_id`,
+		id, store.SubmissionActive, status, reason, by).Scan(&repo)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return 0, false, nil
 	}
@@ -677,7 +720,7 @@ func (x queries) FinishSubmission(ctx context.Context, id int64, status store.Su
 func (x queries) ActiveSubmissionsOfCL(ctx context.Context, repo, cl int64, below int32) ([]int64, error) {
 	return ids(x.q.Query(ctx, `SELECT s.id FROM submission s JOIN submission_cl sc ON sc.submission_id = s.id
 		WHERE sc.repository_id = $1 AND sc.cl_number = $2 AND s.status = $3 AND ($4 = 0 OR sc.patchset < $4)
-		ORDER BY s.id`, repo, cl, store.SubmissionActive, below))
+		ORDER BY s.created_at, s.id`, repo, cl, store.SubmissionActive, below))
 }
 
 func (x queries) SetNote(ctx context.Context, id int64, note string) error {
@@ -738,12 +781,12 @@ func (x queries) loadAttempts(ctx context.Context, sql string, args ...any) ([]*
 
 func (x queries) Attempts(ctx context.Context, submissions []int64, status store.AttemptStatus) ([]*store.Attempt, error) {
 	return x.loadAttempts(ctx, `SELECT `+attemptColumns+` FROM attempt
-		WHERE submission_id = ANY($1) AND ($2 = 0 OR status = $2) ORDER BY id`, submissions, status)
+		WHERE submission_id = ANY($1) AND ($2 = 0 OR status = $2) ORDER BY created_at, id`, submissions, status)
 }
 
 func (x queries) ActiveAttempt(ctx context.Context, submission int64) (int64, bool, error) {
 	var id int64
-	err := x.q.QueryRow(ctx, `SELECT id FROM attempt WHERE submission_id = $1 AND status = $2 ORDER BY id LIMIT 1`,
+	err := x.q.QueryRow(ctx, `SELECT id FROM attempt WHERE submission_id = $1 AND status = $2 ORDER BY created_at, id LIMIT 1`,
 		submission, store.AttemptActive).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return 0, false, nil
@@ -764,9 +807,9 @@ func (x queries) LockAttempt(ctx context.Context, id int64) (*store.Attempt, err
 
 func (x queries) InsertAttempt(ctx context.Context, a store.NewAttemptRow) (int64, error) {
 	var id int64
-	err := x.q.QueryRow(ctx, `INSERT INTO attempt (submission_id, base, base_seq, chain, status, prepare_error)
-		VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`, a.SubmissionID, a.Base, a.BaseSeq, orEmpty(a.Chain), store.AttemptActive,
-		a.PrepareError).Scan(&id)
+	err := x.q.QueryRow(ctx, `INSERT INTO attempt (id, submission_id, base, base_seq, chain, status, prepare_error, created_at)
+		VALUES ($7, $1, $2, $3, $4, $5, $6, clock_timestamp()) RETURNING id`, a.SubmissionID, a.Base, a.BaseSeq, orEmpty(a.Chain), store.AttemptActive,
+		a.PrepareError, data.NewID()).Scan(&id)
 	return id, err
 }
 
@@ -800,14 +843,14 @@ func (x queries) EndActiveAttempts(ctx context.Context, submission int64, status
 
 func (x queries) UnfinishedRunsOfAttempts(ctx context.Context, attempts []int64) ([]int64, error) {
 	return ids(x.q.Query(ctx, `SELECT r.id FROM run r JOIN attempt_candidate ac ON ac.plan_id = r.plan_id
-		WHERE ac.attempt_id = ANY($1) AND r.status IN ($2, $3) ORDER BY r.id`, attempts, store.StatusQueued, store.StatusRunning))
+		WHERE ac.attempt_id = ANY($1) AND r.status IN ($2, $3) ORDER BY r.queued_at, r.id`, attempts, store.StatusQueued, store.StatusRunning))
 }
 
 func (x queries) ReusableCandidate(ctx context.Context, repo int64, base []byte, cl int64, patchset int32) ([]byte, bool, error) {
 	var commit []byte
 	err := x.q.QueryRow(ctx, `SELECT ac.commit_id FROM attempt_candidate ac JOIN attempt a ON a.id = ac.attempt_id
 		WHERE ac.repository_id = $1 AND ac.base = $2 AND ac.cl_number = $3 AND ac.patchset = $4 AND a.status = $5
-		ORDER BY a.id DESC LIMIT 1`, repo, base, cl, patchset, store.AttemptActive).Scan(&commit)
+		ORDER BY a.created_at DESC, a.id DESC LIMIT 1`, repo, base, cl, patchset, store.AttemptActive).Scan(&commit)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, false, nil
 	}
@@ -832,12 +875,6 @@ func (x queries) CandidatesInUse(ctx context.Context, repo int64) (map[string]bo
 	return out, rows.Err()
 }
 
-func (x queries) QueueRepositories(ctx context.Context, recent time.Duration) ([]int64, error) {
-	return ids(x.q.Query(ctx, `SELECT DISTINCT repository_id FROM submission
-		WHERE status = $1 OR finished_at > now() - make_interval(secs => $2) ORDER BY repository_id`,
-		store.SubmissionActive, recent.Seconds()))
-}
-
 func (x queries) SetLandedCommit(ctx context.Context, submission, cl int64, commit []byte) error {
 	_, err := x.q.Exec(ctx, `UPDATE submission_cl SET landed_commit = $3 WHERE submission_id = $1 AND cl_number = $2`,
 		submission, cl, commit)
@@ -850,8 +887,15 @@ func (x queries) InsertLandedChange(ctx context.Context, repo int64, commit []by
 	return err
 }
 
+func (x queries) LockMain(ctx context.Context, repo int64) error {
+	return lock.InTx(ctx, x.q, "main", strconv.FormatInt(repo, 10))
+}
+
 func (x queries) InsertMainCommit(ctx context.Context, repo, seq int64, commit []byte) error {
-	_, err := x.q.Exec(ctx, `INSERT INTO main_commit (repository_id, seq, commit_id) VALUES ($1, $2, $3)
+	_, err := x.q.Exec(ctx, `INSERT INTO main_commit (repository_id, seq, commit_id, submission_id)
+		VALUES ($1, $2, $3, (SELECT sc.submission_id FROM landed_change lc
+			JOIN submission_cl sc ON sc.repository_id = lc.repository_id AND sc.cl_number = lc.cl_number AND sc.landed_commit = lc.commit_id
+			WHERE lc.repository_id = $1 AND lc.commit_id = $3 LIMIT 1))
 		ON CONFLICT DO NOTHING`, repo, seq, commit)
 	return err
 }

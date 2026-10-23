@@ -1,2 +1,4 @@
 # Cargo's build output.
 /target/
+# Go test binaries (go test -c).
+*.test

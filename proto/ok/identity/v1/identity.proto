@@ -14,6 +14,9 @@ enum Kind {
   KIND_HUMAN = 1;
   // A workload: one of ok's roles, CI, a service; administrators make robots.
   KIND_ROBOT = 2;
+  // An organization, which owns repositories and acts as no one (docs/hosted.md, "Tenancy, as
+  // built").
+  KIND_ORG = 3;
 }
 
 // Status is where a principal stands.
@@ -54,6 +57,8 @@ enum SetSource {
   SET_SOURCE_TREE = 1;
   // Mirrored from the system of record's groups.
   SET_SOURCE_SYNCED = 2;
+  // An organization's team, its members set by its owners (docs/hosted.md, "Tenancy, as built").
+  SET_SOURCE_TEAM = 3;
 }
 
 // Set is a group or an ACL.
@@ -105,10 +110,15 @@ message ListAdminsRequest {}
 
 message ListAdminsResponse {
   repeated string principals = 1;
+  repeated string principal_ids = 2;  // each principal's stable ID, in principals' order
 }
 
 message CheckAdminRequest {
-  string principal = 1;
+  // The principal, by name or by stable ID.
+  oneof key {
+    string principal = 1;
+    string principal_id = 2;
+  }
 }
 
 message CheckAdminResponse {
@@ -168,17 +178,118 @@ message ExpandSetRequest {
 
 message ExpandSetResponse {
   repeated string principals = 1;
+  repeated string principal_ids = 2;  // each principal's stable ID, in principals' order
 }
 
 message CheckMembershipRequest {
   string set = 1;
-  string principal = 2;
+  // The principal, by name or by stable ID.
+  oneof key {
+    string principal = 2;
+    string principal_id = 3;
+  }
 }
 
 message CheckMembershipResponse {
   bool member = 1;
   // chain is how: the set, the sets between, and the principal.
   repeated string chain = 2;
+}
+
+// Authorization serves ok's roles the facts Authorize decides from (internal/authz; docs/hosted.md,
+// "Tenancy, as built"): a repository's, its owner's, and a caller's place in them. A role keeps
+// each answer a few seconds.
+service Authorization {
+  option (ok.v1.callers) = CALLER_SCM;
+  option (ok.v1.callers) = CALLER_CONTROL;
+  option (ok.v1.callers) = CALLER_AUTOMATION;
+  option (ok.v1.callers) = CALLER_DEPLOY;
+  // Facts are what decides what a caller may do to a repository; NOT_FOUND for a repository there
+  // is none of, or being created.
+  rpc Facts(FactsRequest) returns (FactsResponse);
+  // Admins are the active people who administer a repository: its owner, if a person; its
+  // organization's owners; and those granted admin on it, directly or through a set.
+  rpc Admins(AdminsRequest) returns (AdminsResponse);
+}
+
+message AdminsRequest {
+  int64 repository_id = 1;
+}
+
+message AdminsResponse {
+  repeated string principals = 1;  // by name, sorted
+  repeated string principal_ids = 2;
+}
+
+message FactsRequest {
+  // caller_id is the caller's stable ID; empty for no one signed in.
+  string caller_id = 1;
+  int64 repository_id = 2;
+}
+
+message FactsResponse {
+  message Repository {
+    int64 id = 1;
+    string visibility = 2;  // private, internal, public
+    string propose = 3;     // the role proposing needs: read or write
+    bool deleted = 4;
+    string owner_id = 5;
+    bool owned_by_org = 6;
+    string base_role = 7;  // the owning organization's members' role
+    bool private_forks = 8;
+    string cell = 9;  // the cell holding it
+  }
+  message Caller {
+    bool active = 1;
+    string membership = 2;        // in the owning organization: none, member, or owner
+    repeated string granted = 3;  // the roles granted the caller, directly and through sets
+    bool internal = 4;            // reads the repository's internal visibility
+  }
+  Repository repository = 1;
+  Caller caller = 2;
+}
+
+// Cells are the cells the directory places repositories in (docs/hosted.md, "Cells, as built"),
+// for ok's roles to reach another cell's.
+service Cells {
+  option (ok.v1.callers) = CALLER_SCM;
+  option (ok.v1.callers) = CALLER_CONTROL;
+  option (ok.v1.callers) = CALLER_AUTOMATION;
+  option (ok.v1.callers) = CALLER_DEPLOY;
+  option (ok.v1.callers) = CALLER_EDGE;
+  option (ok.v1.callers) = CALLER_SECRETS;
+
+  rpc ListCells(ListCellsRequest) returns (ListCellsResponse);
+  // Route is where a repository is, whatever its state: its ID and cell, by its ID or its full
+  // name — or a name it had. The edge routes requests by it; NOT_FOUND for none.
+  rpc Route(RouteRequest) returns (RouteResponse);
+}
+
+message Cell {
+  string name = 1;
+  string region = 2;   // empty for none
+  bool placement = 3;  // new repositories are placed there
+  // Where its roles are reached, host:port each.
+  string scm = 4;
+  string control = 5;
+  string automation = 6;
+  string deploy = 7;
+  string secrets = 8;
+}
+
+message ListCellsRequest {}
+
+message RouteRequest {
+  string repository = 1;  // its ID, or its full name (a bare name is the installation's)
+}
+
+message RouteResponse {
+  int64 id = 1;
+  string cell = 2;
+}
+
+message ListCellsResponse {
+  repeated Cell cells = 1;  // the first holds the repositories made before there were cells
 }
 
 // Verify is how ok's other roles check what their callers present: a device credential, a
@@ -189,12 +300,199 @@ service Verify {
   option (ok.v1.callers) = CALLER_AUTOMATION;
   option (ok.v1.callers) = CALLER_WORKER;
   option (ok.v1.callers) = CALLER_DEPLOY;
+  option (ok.v1.callers) = CALLER_EDGE;
+  option (ok.v1.callers) = CALLER_SECRETS;
 
   // GetCredential returns the principal a credential belongs to; active is false when the
   // credential is revoked or the principal does not stand. NOT_FOUND for no such credential.
   rpc GetCredential(GetCredentialRequest) returns (GetCredentialResponse);
   // GetSession returns the principal a live browser session belongs to; NOT_FOUND for none.
   rpc GetSession(GetSessionRequest) returns (GetSessionResponse);
+  // GetToken returns whose a live token is — a person's personal token, an app's installation
+  // token — and what it allows; NOT_FOUND for one there is none of, revoked, or expired, or whose
+  // holder (or installation) does not stand.
+  rpc GetToken(GetTokenRequest) returns (GetTokenResponse);
+}
+
+message GetTokenRequest {
+  string token = 1;  // the secret, okp_…
+}
+
+message GetTokenResponse {
+  Principal principal = 1;
+  string token_id = 2;
+  string role = 3;                    // the most it allows
+  repeated int64 repository_ids = 4;  // none: every one its holder may reach
+  // owner_id, for an installation token, is the installing organization, whose repositories alone
+  // it reaches.
+  string owner_id = 5;
+}
+
+// Apps are an organization's robots with a public key (docs/hosted.md, "Robots and tokens per
+// organization"). Its owners make and delete them, and replace their keys; an organization's owners
+// install one — their own, or another's made public — with a role on its repositories (named, or
+// every one), and uninstall it; its members list both.
+service Apps {
+  option (ok.v1.callers) = CALLER_PEOPLE;
+  rpc CreateApp(CreateAppRequest) returns (AppInfo);
+  rpc ListApps(ListAppsRequest) returns (ListAppsResponse);
+  rpc SetAppKey(SetAppKeyRequest) returns (AppInfo);
+  rpc DeleteApp(AppRef) returns (DeleteAppResponse);
+  rpc InstallApp(InstallAppRequest) returns (AppInstallation);
+  rpc ListInstallations(ListInstallationsRequest) returns (ListInstallationsResponse);
+  rpc UninstallApp(UninstallAppRequest) returns (UninstallAppResponse);
+}
+
+// AppTokens is how an app signs in: with a JWT it signs with its key — ES256 or EdDSA; its iss the
+// app's ID, its aud ok's public URL, issued now and expiring within ten minutes — carried in the
+// request, it lists its installations, and trades it for an installation's token, oki_…, good for
+// an hour, which reaches the installing organization's repositories alone, as far as the
+// installation allows.
+service AppTokens {
+  option (ok.v1.callers) = CALLER_ANYONE;
+  rpc ListAppInstallations(AppAssertion) returns (ListInstallationsResponse);
+  rpc CreateInstallationToken(CreateInstallationTokenRequest)
+      returns (CreateInstallationTokenResponse);
+}
+
+message AppInfo {
+  string id = 1;
+  Principal robot = 2;
+  string organization = 3;  // its maker's handle
+  bool public = 4;
+  bytes public_key = 5;
+  google.protobuf.Timestamp created = 6;
+}
+
+message CreateAppRequest {
+  string handle = 1;  // the organization's
+  string name = 2;    // a lowercase DNS label: its robot is <name>.<org>.robot.<domain>
+  bool public = 3;
+  bytes public_key = 4;  // PKIX DER: ECDSA P-256 or Ed25519
+  string for_person_id = 5;
+}
+
+message ListAppsRequest {
+  string handle = 1;
+  string for_person_id = 2;
+}
+
+message ListAppsResponse {
+  repeated AppInfo apps = 1;
+}
+
+message SetAppKeyRequest {
+  string id = 1;
+  bytes public_key = 2;
+  string for_person_id = 3;
+}
+
+message AppRef {
+  string id = 1;
+  string for_person_id = 2;
+}
+
+message DeleteAppResponse {}
+
+message AppInstallation {
+  string id = 1;
+  string app_id = 2;
+  string organization = 3;  // where it is installed: its handle
+  string role = 4;
+  repeated string repositories = 5;  // full names; none: every one of the organization's
+  google.protobuf.Timestamp created = 6;
+}
+
+message InstallAppRequest {
+  string app_id = 1;
+  string handle = 2;  // the organization installing it
+  string role = 3;
+  repeated string repositories = 4;  // full names of the organization's; none: every one
+  string for_person_id = 5;
+}
+
+message ListInstallationsRequest {
+  string handle = 1;
+  string for_person_id = 2;
+}
+
+message ListInstallationsResponse {
+  repeated AppInstallation installations = 1;
+}
+
+message UninstallAppRequest {
+  string id = 1;
+  string for_person_id = 2;
+}
+
+message UninstallAppResponse {
+  bool uninstalled = 1;
+}
+
+message AppAssertion {
+  string jwt = 1;  // signed by the app's key
+}
+
+message CreateInstallationTokenRequest {
+  string jwt = 1;
+  string installation_id = 2;
+}
+
+message CreateInstallationTokenResponse {
+  string token = 1;  // oki_…
+  google.protobuf.Timestamp expires = 2;
+  AppInstallation installation = 3;
+}
+
+// Tokens are a person's personal tokens (docs/hosted.md, "Robots and tokens per organization"):
+// for what a device credential does not suit — a script, CI — each reaching the repositories it
+// names (none: every one its holder may) with at most a role, until it expires or is revoked. A
+// token narrows its holder, and reaches repositories alone: it is never the way to manage an
+// account, so a token is not taken here.
+service Tokens {
+  option (ok.v1.callers) = CALLER_PEOPLE;
+  // CreateToken makes one, answering its secret, which is shown this once.
+  rpc CreateToken(CreateTokenRequest) returns (CreateTokenResponse);
+  rpc ListTokens(ListTokensRequest) returns (ListTokensResponse);
+  rpc RevokeToken(RevokeTokenRequest) returns (RevokeTokenResponse);
+}
+
+message PersonalToken {
+  string id = 1;
+  string label = 2;
+  string role = 3;
+  repeated string repositories = 4;  // full names; none: every one the person may reach
+  google.protobuf.Timestamp created = 5;
+  google.protobuf.Timestamp expires = 6;
+  google.protobuf.Timestamp last_used = 7;  // unset before its first use
+  google.protobuf.Timestamp revoked = 8;    // unset while it stands
+}
+
+message CreateTokenRequest {
+  string label = 1;
+  string role = 2;  // read when empty
+  repeated string repositories =
+      3;                    // full names the person may see; none: every one they may reach
+  int64 lifetime_days = 4;  // 1 to 366; 90 when 0
+}
+
+message CreateTokenResponse {
+  PersonalToken token = 1;
+  string secret = 2;
+}
+
+message ListTokensRequest {}
+
+message ListTokensResponse {
+  repeated PersonalToken tokens = 1;
+}
+
+message RevokeTokenRequest {
+  string id = 1;
+}
+
+message RevokeTokenResponse {
+  bool revoked = 1;
 }
 
 message GetCredentialRequest {
@@ -377,6 +675,9 @@ service Admin {
 
   // Sync runs the sync from the system of record now, and returns what it did.
   rpc Sync(SyncRequest) returns (SyncResponse);
+  // RestoreAccount restores an account deleted within 30 days, and the repositories its deletion
+  // deleted.
+  rpc RestoreAccount(RestoreAccountRequest) returns (RestoreResponse);
   // GetSyncStatus says when the sync last ran, how it ended, and what waits.
   rpc GetSyncStatus(GetSyncStatusRequest) returns (GetSyncStatusResponse);
   // SetName sets the handle a person gets, or the name a group gets, over the system of record's:
@@ -395,6 +696,116 @@ service Admin {
   rpc RevokeCredential(RevokeCredentialRequest) returns (RevokeCredentialResponse);
   // ListCredentials lists a principal's credentials.
   rpc ListCredentials(AdminListCredentialsRequest) returns (AdminListCredentialsResponse);
+
+  // MoveNetwork moves a repository's fork network — every repository in it — to another cell
+  // (docs/hosted.md, "Cells, as built"): the directory records the move and runs it, frozen only
+  // while its rows are copied. ALREADY_EXISTS while another move of it is unfinished.
+  rpc MoveNetwork(MoveNetworkRequest) returns (Move);
+  // ListMoves lists the moves, the latest of each network, newest first.
+  rpc ListMoves(ListMovesRequest) returns (ListMovesResponse);
+  // CancelMove abandons a move the directory has not yet named the destination of: what was
+  // copied is dropped, and the network thawed where it is. FAILED_PRECONDITION once named.
+  rpc CancelMove(CancelMoveRequest) returns (Move);
+
+  // SetQuota sets an account's quota of CI (docs/hosted.md, "Hosted automation, as built"): a
+  // person's or an organization's, by its handle; reset, the default (identity.default_quota).
+  // GetQuota reads it.
+  rpc SetQuota(SetQuotaRequest) returns (Quota);
+  rpc GetQuota(GetQuotaRequest) returns (Quota);
+}
+
+message SetQuotaRequest {
+  string account = 1;  // a person's or an organization's handle
+  int32 concurrent = 2;
+  int64 minutes = 3;
+  int32 weight = 4;
+  bool reset = 5;  // to the default; the rest unset
+}
+
+message GetQuotaRequest {
+  string account = 1;
+}
+
+// Quota is an account's quota of CI: its concurrent runs and its run minutes in a calendar month
+// (UTC), zero for unlimited, and its weight in fair share among the accounts whose runs wait.
+message Quota {
+  string account_id = 1;
+  string account = 2;  // its handle; empty where only its ID was asked
+  int32 concurrent = 3;
+  int64 minutes = 4;
+  int32 weight = 5;
+  bool default = 6;  // identity.default_quota: none set
+  // GetQuotas': the account's running runs and this month's run seconds in the cells but the one
+  // asking, as each last reported them (ReportUsage) — running runs only from reports of the last
+  // two minutes.
+  int64 running_elsewhere = 7;
+  int64 seconds_elsewhere = 8;
+}
+
+// Quotas are accounts' quotas of CI, for ok automation's admission (docs/hosted.md, "Hosted
+// automation, as built").
+service Quotas {
+  option (ok.v1.callers) = CALLER_AUTOMATION;
+
+  rpc GetQuotas(GetQuotasRequest) returns (GetQuotasResponse);
+  // ReportUsage records a cell's use this month by each account that ran or runs there: what its
+  // admission and the others' check quotas against.
+  rpc ReportUsage(ReportUsageRequest) returns (ReportUsageResponse);
+}
+
+message GetQuotasRequest {
+  repeated string account_ids = 1;
+  string cell = 2;   // the cell asking, whose own use is not elsewhere
+  string month = 3;  // YYYY-MM, UTC
+}
+
+message ReportUsageRequest {
+  string cell = 1;
+  string month = 2;  // YYYY-MM, UTC
+  repeated AccountUsage usage = 3;
+}
+
+message AccountUsage {
+  string account_id = 1;
+  int64 seconds = 2;  // this month's, in the cell
+  int64 running = 3;  // now, in the cell
+}
+
+message ReportUsageResponse {}
+
+message GetQuotasResponse {
+  repeated Quota quotas = 1;  // one per account asked, in order
+}
+
+message MoveNetworkRequest {
+  string repository = 1;  // its full name, or its ID
+  string cell = 2;        // the cell it moves to
+}
+
+// Move is a fork network's move between cells.
+message Move {
+  int64 network_id = 1;
+  repeated string repositories = 2;  // its repositories' full names
+  string source = 3;
+  string destination = 4;
+  // copying (its objects, while it is written), frozen (its rows being copied), imported, named
+  // (the directory names the destination), done; or abandoning, abandoned.
+  string phase = 5;
+  string asked_by = 6;  // the administrator's name
+  google.protobuf.Timestamp asked_at = 7;
+  google.protobuf.Timestamp frozen_at = 8;  // unset until frozen
+  google.protobuf.Timestamp updated_at = 9;
+  string error = 10;  // why its last step failed, which it tries again; empty for none
+}
+
+message ListMovesRequest {}
+
+message ListMovesResponse {
+  repeated Move moves = 1;
+}
+
+message CancelMoveRequest {
+  int64 network_id = 1;
 }
 
 message SyncRequest {}
@@ -534,4 +945,911 @@ message GetAppliedResponse {
   string commit = 1;
   int64 sequence = 2;
   google.protobuf.Timestamp applied = 3;
+}
+
+// DirectoryEvents serves the directory's log of repositories' entries to ok's roles, which follow
+// it (internal/bus/follow) on the bus's topic directory.repositories: each repository's changes,
+// numbered by their place in its log (docs/hosted.md, "Tenancy, as built").
+service DirectoryEvents {
+  option (ok.v1.callers) = CALLER_SCM;
+  option (ok.v1.callers) = CALLER_CONTROL;
+  option (ok.v1.callers) = CALLER_AUTOMATION;
+  option (ok.v1.callers) = CALLER_DEPLOY;
+  // Read returns up to a page of a repository's events after a place in its log.
+  rpc Read(ReadDirectoryEventsRequest) returns (ReadDirectoryEventsResponse);
+  // Heads returns how far each repository's log reaches, a page of repositories at a time, by
+  // repository.
+  rpc Heads(DirectoryHeadsRequest) returns (DirectoryHeadsResponse);
+}
+
+// DirectoryEvent is a change to a repository's entry: what happened, and the entry as it stands
+// after. Its owner is named by ID alone — an owner's handle changes apart from its repositories —
+// which a follower names as it shows it. An entry being made is in no event until it is made.
+message DirectoryEvent {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    KIND_CREATED = 1;  // made, its storage too
+    KIND_RENAMED = 2;
+    KIND_TRANSFERRED = 3;
+    KIND_SETTINGS = 4;  // its visibility, or who proposes
+    KIND_DELETED = 5;
+    KIND_RESTORED = 6;
+    KIND_PURGED = 7;  // gone, its entry with it
+    KIND_GRANTS = 8;  // its grants changed
+    // Its upstream changed: GitHub's rules gave the fork a new one, or none (docs/hosted.md,
+    // "GitHub's rules").
+    KIND_UPSTREAM = 9;
+    // Its cell changed: its network moved between cells (docs/hosted.md, "Cells, as built").
+    KIND_MOVED = 10;
+  }
+  int64 repository_id = 1;
+  int64 seq = 2;
+  google.protobuf.Timestamp at = 3;
+  Kind kind = 4;
+  // The entry after the change, with its owner's handle and its full name as they are then; unset
+  // when purged. Its role and redirected are not set. An owner's handle changing renames each of
+  // its repositories, an event each.
+  RepositoryEntry repository = 5;
+  // Renamed or transferred: the owner and name it had, and its full name then.
+  string old_owner_id = 6;
+  string old_name = 7;
+  string old_full_name = 8;
+}
+
+message ReadDirectoryEventsRequest {
+  int64 repository_id = 1;
+  int64 after_seq = 2;
+}
+
+message ReadDirectoryEventsResponse {
+  repeated DirectoryEvent events = 1;
+}
+
+message DirectoryHeadsRequest {
+  int64 after_repository_id = 1;
+}
+
+message DirectoryHeadsResponse {
+  message Head {
+    int64 repository_id = 1;
+    int64 seq = 2;
+  }
+  repeated Head heads = 1;
+}
+
+// Tenancy is the directory's tenancy (docs/hosted.md, "Tenancy, as built"): organizations, their
+// members and teams, every repository's entry and its names, and the roles granted on it. A person
+// calls it as themselves; ok control and the SCM call it for a person they authenticated
+// (for_person_id), and the SCM reserves and activates the entries of repositories it makes.
+// Authorize decides what each caller may do to a repository; an organization's owners manage it.
+service Tenancy {
+  option (ok.v1.callers) = CALLER_PEOPLE;
+  option (ok.v1.callers) = CALLER_CONTROL;
+  option (ok.v1.callers) = CALLER_SCM;
+
+  // CreateOrganization makes an organization the person owns: a hosted service's people only; an
+  // installation has one.
+  rpc CreateOrganization(CreateOrganizationRequest) returns (Organization);
+  rpc GetOrganization(GetOrganizationRequest) returns (Organization);
+  // DeleteOrganization deletes an organization (its owners'): suspended, its repositories deleted,
+  // restorable for 30 days by an owner (RestoreOrganization); then for good — its handle retired,
+  // its teams, robots, apps, identity provider, and the people it provided gone. An installation's
+  // is never deleted.
+  rpc DeleteOrganization(OrganizationDeletionRequest) returns (DeletionInfo);
+  rpc RestoreOrganization(OrganizationDeletionRequest) returns (RestoreResponse);
+  // DeleteAccount deletes the caller's own account, in a hosted service: suspended, its sessions
+  // ended, its repositories deleted, restorable for 30 days by an administrator
+  // (Admin.RestoreAccount); then for good — its handle retired, its credentials and tokens revoked.
+  // Some organization's only owner is refused; so is a person a system of record or an
+  // organization's identity provider made, which deletes them.
+  rpc DeleteAccount(DeleteAccountRequest) returns (DeletionInfo);
+  // UpdateOrganization changes an organization's settings: its owners.
+  rpc UpdateOrganization(UpdateOrganizationRequest) returns (Organization);
+  // SetRegion sets the region an owner's new repositories are placed in (docs/hosted.md, "Cells,
+  // as built"): a person's own, or an organization's, by its owners; empty for the directory's
+  // default. One no cell is in is refused. GetRegion reads it, and where new ones go.
+  rpc SetRegion(SetRegionRequest) returns (Region);
+  rpc GetRegion(GetRegionRequest) returns (Region);
+  // SetSecretsRoot names an organization's own root for its repositories' secrets — a key in its
+  // own KMS that ok's workload is granted to use (docs/secrets.md, "Keys"): its owners'. Empty
+  // forgets it, for the installation's. GetSecretsRoot reads it: its members'.
+  rpc SetSecretsRoot(SetSecretsRootRequest) returns (SecretsRoot);
+  rpc GetSecretsRoot(GetSecretsRootRequest) returns (SecretsRoot);
+  // ListMembers lists an organization's members: for its members.
+  rpc ListMembers(ListMembersRequest) returns (ListMembersResponse);
+  // SetMember makes a person a member or an owner: its owners. An installation's members are its
+  // people and robots, and its owners its administrators: none is set here.
+  rpc SetMember(SetMemberRequest) returns (SetMemberResponse);
+  // RemoveMember takes a person out: its owners, or the person themselves.
+  rpc RemoveMember(RemoveMemberRequest) returns (RemoveMemberResponse);
+
+  // Teams are an organization's owners' to make and fill; its members list them. An installation's
+  // teams are its groups, which the groups-and-ACLs tree declares and the system of record syncs.
+  rpc CreateTeam(CreateTeamRequest) returns (Team);
+  rpc ListTeams(ListTeamsRequest) returns (ListTeamsResponse);
+  rpc AddTeamMember(TeamMemberRequest) returns (Team);
+  rpc RemoveTeamMember(TeamMemberRequest) returns (Team);
+  rpc DeleteTeam(DeleteTeamRequest) returns (DeleteTeamResponse);
+
+  // An organization's robots — CI identities, deploy agents — are its owners' to make, certify, and
+  // delete; its members list them. One is named <name>.<org>.robot.<domain>, and reaches the
+  // organization's repositories through its grants alone. An installation's robots are its
+  // administrators' (Admin).
+  rpc CreateOrganizationRobot(CreateOrganizationRobotRequest) returns (OrganizationRobot);
+  rpc ListOrganizationRobots(ListOrganizationRobotsRequest)
+      returns (ListOrganizationRobotsResponse);
+  // CertifyOrganizationRobot enrolls a key one of the organization's robots holds, and issues its
+  // first certificate, which it renews as a command line does.
+  rpc CertifyOrganizationRobot(CertifyOrganizationRobotRequest) returns (CertifyRobotResponse);
+  rpc DeleteOrganizationRobot(DeleteOrganizationRobotRequest)
+      returns (DeleteOrganizationRobotResponse);
+
+  // Federation per organization: the OpenID Connect issuers an organization trusts to sign its
+  // robots in — a CI system's — and its robots' bindings to their subjects. A token for the
+  // organization carries its ID as the audience (OrganizationIssuers.audience). Its owners trust,
+  // distrust, bind, and unbind; its members list. ok reaches an issuer over HTTPS, at a public
+  // address.
+  rpc TrustIssuer(OrganizationIssuerRequest) returns (OrganizationIssuers);
+  rpc DistrustIssuer(OrganizationIssuerRequest) returns (OrganizationIssuers);
+  rpc ListIssuers(ListIssuersRequest) returns (OrganizationIssuers);
+  rpc BindOrganizationRobot(OrganizationRobotBindingRequest) returns (OrganizationRobot);
+  rpc UnbindOrganizationRobot(OrganizationRobotBindingRequest) returns (OrganizationRobot);
+
+  // An enterprise organization's own identity provider (docs/hosted.md, "Enterprise
+  // organizations"): its system of record — Google Workspace, Entra ID, LDAP, or SCIM — which
+  // provisions and deprovisions its people (named <handle>-<org>) and syncs its groups as its
+  // teams; and its single sign-on, OpenID Connect. Its owners set it (secrets kept sealed: one left
+  // empty keeps what was set), read it (secrets never answered), sync it at once, remove it, and
+  // reset its SCIM token. An installation's is its configuration's.
+  rpc SetIdentityProvider(SetIdentityProviderRequest) returns (IdentityProviderInfo);
+  rpc GetIdentityProvider(IdentityProviderRequest) returns (IdentityProviderInfo);
+  rpc SyncIdentityProvider(IdentityProviderRequest) returns (IdentityProviderInfo);
+  rpc RemoveIdentityProvider(IdentityProviderRequest) returns (RemoveIdentityProviderResponse);
+  rpc ResetSCIMToken(IdentityProviderRequest) returns (ResetSCIMTokenResponse);
+
+  // ReserveRepository makes a repository's entry, creating, for a person who may make repositories
+  // of its owner (or fork its parent): the SCM's, before it makes the repository's storage.
+  rpc ReserveRepository(ReserveRepositoryRequest) returns (RepositoryEntry);
+  // ActivateRepository marks an entry active once its storage is made; AbandonRepository removes
+  // one whose storage could not be. The SCM's.
+  rpc ActivateRepository(RepositoryRef) returns (RepositoryEntry);
+  rpc AbandonRepository(RepositoryRef) returns (AbandonRepositoryResponse);
+  // Expired repositories — deleted more than 30 days ago, or still being made after an hour — are
+  // the SCM's to remove (docs/hosted.md, "Deleting, renaming, transferring"): it lists them, asks
+  // again of each by the directory's clock, deletes its storage, then purges the entry — a deleted
+  // one's purge logged for the other roles to delete what they hold. Nothing brings an expired
+  // repository back: neither a restore nor its creation resumed.
+  rpc ListExpiredRepositories(ListExpiredRepositoriesRequest)
+      returns (ListExpiredRepositoriesResponse);
+  rpc GetExpiry(RepositoryRef) returns (Expiry);
+  rpc PurgeRepository(RepositoryRef) returns (Expiry);
+  // ResolveRepository is the repository an owner's name names — or names no longer, a redirect
+  // answering — as the caller may see it; NOT_FOUND otherwise.
+  rpc ResolveRepository(ResolveRepositoryRequest) returns (RepositoryEntry);
+  rpc GetRepositoryEntry(RepositoryRef) returns (RepositoryEntry);
+  // ListRepositoryEntries lists an owner's repositories the caller may see.
+  rpc ListRepositoryEntries(ListRepositoryEntriesRequest) returns (ListRepositoryEntriesResponse);
+  // Search finds repositories, people, and organizations by part of their names — owner/name to
+  // narrow a repository by its owner — as the caller, or the person ok control names, may see
+  // them: the closest first (docs/hosted.md, "ok control at scale, as built").
+  rpc Search(SearchRequest) returns (SearchResponse);
+  // UpdateRepository changes who proposes (maintain), and its visibility (admin).
+  rpc UpdateRepository(UpdateRepositoryRequest) returns (RepositoryEntry);
+  // RenameRepository and TransferRepository move it (admin), its old name redirecting; a transfer
+  // is to an owner the caller may make repositories of.
+  rpc RenameRepository(RenameRepositoryEntryRequest) returns (RepositoryEntry);
+  rpc TransferRepository(TransferRepositoryRequest) returns (RepositoryEntry);
+  // DeleteRepository soft-deletes it (admin); RestoreRepository brings it back within 30 days.
+  rpc DeleteRepository(RepositoryRef) returns (RepositoryEntry);
+  rpc RestoreRepository(RepositoryRef) returns (RepositoryEntry);
+  // Grants are a repository's admins' to set and list.
+  rpc ListGrants(RepositoryRef) returns (ListGrantsResponse);
+  rpc SetGrant(SetGrantRequest) returns (SetGrantResponse);
+  rpc RemoveGrant(RemoveGrantRequest) returns (RemoveGrantResponse);
+}
+
+// Inbox is a person's CLs across every cell (docs/hosted.md, "ok control at scale, as built"):
+// those they wrote and those they review, as ok control's cells last set them.
+service Inbox {
+  option (ok.v1.callers) = CALLER_PEOPLE;
+  option (ok.v1.callers) = CALLER_CONTROL;
+
+  // ListInbox lists a person's entries — the caller's, or the person ok control names — of
+  // repositories they may still see: those that wait on them first, then the latest changed.
+  rpc ListInbox(ListInboxRequest) returns (ListInboxResponse);
+}
+
+// Delivery is how ok control's cells deliver what their outboxes cause to the directory.
+service Delivery {
+  option (ok.v1.callers) = CALLER_CONTROL;
+
+  // SetInbox sets a CL's every inbox entry at once, at a version: an older one than the directory
+  // holds changes nothing.
+  rpc SetInbox(SetInboxRequest) returns (SetInboxResponse);
+  // Notify records notifications, each once however often it is sent (by its recipient and
+  // source), and mails each new one whose kind its recipient has mailed.
+  rpc Notify(NotifyRequest) returns (NotifyResponse);
+}
+
+// Notifications are a person's: what asks something of them, from every cell (docs/hosted.md, "ok
+// control at scale, as built"), and which kinds they are mailed.
+service Notifications {
+  option (ok.v1.callers) = CALLER_PEOPLE;
+  option (ok.v1.callers) = CALLER_CONTROL;
+
+  // ListNotifications lists a person's latest — the caller's, or the person ok control names — of
+  // repositories they may still see, and how many are unread.
+  rpc ListNotifications(ListNotificationsRequest) returns (ListNotificationsResponse);
+  // MarkRead marks some of a person's notifications read, or all of them.
+  rpc MarkRead(MarkReadRequest) returns (MarkReadResponse);
+  rpc GetNotificationPreferences(GetNotificationPreferencesRequest)
+      returns (NotificationPreferences);
+  rpc SetNotificationPreferences(NotificationPreferences) returns (NotificationPreferences);
+}
+
+message Notification {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    KIND_REVIEW_REQUESTED = 1;  // their review is asked for
+    KIND_REPLIED = 2;           // a label granted on their CL
+    KIND_COMMENTED = 3;         // a comment on their CL, or in a thread they are in
+    KIND_SUBMITTED = 4;         // their CL landed
+    KIND_ABANDONED = 5;         // a CL they review was abandoned
+    KIND_ROLLED_BACK = 6;       // their CL is being rolled back
+  }
+  // source names what caused it, which with the recipient makes it once: the cell's event's, or
+  // comment's.
+  string source = 1;
+  string principal_id = 2;
+  Kind kind = 3;
+  int64 repository_id = 4;
+  int64 number = 5;
+  string repository = 6;  // its full name
+  string title = 7;       // its CL's
+  string actor_id = 8;    // who did it
+  string text = 9;        // what they did, after their handle: "granted LGTM on patchset 2"
+  string link = 10;       // the CL's path on ok control
+  google.protobuf.Timestamp at = 11;
+  bool read = 12;
+}
+
+message NotifyRequest {
+  repeated Notification notifications = 1;
+}
+
+message NotifyResponse {
+  int32 added = 1;   // new ones; the rest were had already
+  int32 mailed = 2;  // of those, queued to be mailed
+}
+
+message ListNotificationsRequest {
+  string for_person_id = 1;
+  bool unread = 2;  // unread ones alone
+  int32 limit = 3;  // 50 unless set, at most 200
+}
+
+message ListNotificationsResponse {
+  repeated Notification notifications = 1;
+  int64 unread = 2;  // every unread one's, of the repositories listed or not
+}
+
+message MarkReadRequest {
+  string for_person_id = 1;
+  repeated string sources = 2;
+  bool all = 3;
+}
+
+message MarkReadResponse {}
+
+message GetNotificationPreferencesRequest {
+  string for_person_id = 1;
+}
+
+// NotificationPreferences are which kinds of notification a person is mailed: by default, reviews
+// asked of them and their CLs rolled back.
+message NotificationPreferences {
+  string for_person_id = 1;
+  repeated Notification.Kind mailed = 2;
+  bool default = 3;  // answered: none set
+}
+
+message InboxEntry {
+  enum Relation {
+    RELATION_UNSPECIFIED = 0;
+    RELATION_AUTHORED = 1;
+    RELATION_REVIEWING = 2;
+  }
+  string principal_id = 1;
+  int64 repository_id = 2;
+  int64 number = 3;
+  Relation relation = 4;
+  // The CL waits on them: a reviewer owes its current patchset a reply; its author, answers to
+  // unresolved threads.
+  bool attention = 5;
+  string repository = 6;  // its full name
+  string title = 7;
+  string status = 8;  // draft, open, submitted, abandoned
+  google.protobuf.Timestamp updated_at = 9;
+}
+
+message SetInboxRequest {
+  int64 repository_id = 1;
+  int64 number = 2;
+  int64 version = 3;
+  repeated InboxEntry entries = 4;  // every one of the CL's; none removes them all
+}
+
+message SetInboxResponse {
+  bool applied = 1;  // false: the directory holds a newer version
+}
+
+message ListInboxRequest {
+  string for_person_id = 1;
+  InboxEntry.Relation relation = 2;  // unspecified: both
+  bool closed = 3;                   // submitted and abandoned CLs too
+  int32 limit = 4;                   // 50 unless set, at most 200
+}
+
+message ListInboxResponse {
+  repeated InboxEntry entries = 1;
+}
+
+// DeployAgents are organizations' deploy agents (docs/hosted.md, "Deploy agents, as built"): the
+// robot of each that runs in its cluster, through which the deployer rolls its repositories and
+// runs their migrations.
+service DeployAgents {
+  option (ok.v1.callers) = CALLER_PEOPLE;
+  option (ok.v1.callers) = CALLER_ROBOTS;
+  option (ok.v1.callers) = CALLER_CONTROL;
+  option (ok.v1.callers) = CALLER_DEPLOY;
+
+  // SetDeployAgent designates one of an organization's robots its deploy agent, or none (no
+  // robot_id): its owners', as themselves or through ok control.
+  rpc SetDeployAgent(SetDeployAgentRequest) returns (DeployAgent);
+  // GetDeployAgent is an organization's agent, by its handle or ID: its members', ok control's for
+  // one, and the deployer's. By robot_id, the deployer's alone: the organization a robot is the
+  // agent of, as it connects. NOT_FOUND when there is none.
+  rpc GetDeployAgent(GetDeployAgentRequest) returns (DeployAgent);
+  // DeployCells are the cells holding the caller's organization's repositories: an agent's own,
+  // which connects to each one's deployer.
+  rpc DeployCells(DeployCellsRequest) returns (DeployCellsResponse);
+  // AgentRepository says whether a repository is the calling agent's organization's: an agent
+  // runs no other's migrations, whatever a deployer asks.
+  rpc AgentRepository(RepositoryRef) returns (AgentRepositoryResponse);
+}
+
+message AgentRepositoryResponse {
+  bool owned = 1;
+  string full_name = 2;
+}
+
+message SetDeployAgentRequest {
+  string handle = 1;
+  string robot_id = 2;
+  string for_person_id = 3;
+}
+
+message GetDeployAgentRequest {
+  oneof key {
+    string handle = 1;
+    string account_id = 2;
+    string robot_id = 3;
+  }
+  string for_person_id = 4;
+}
+
+message DeployAgent {
+  string account_id = 1;
+  string handle = 2;
+  string robot_id = 3;
+  string robot = 4;  // its name
+  string set_by_id = 5;
+  google.protobuf.Timestamp set_at = 6;
+}
+
+message DeployCellsRequest {}
+
+message DeployCellsResponse {
+  string account_id = 1;
+  repeated string cells = 2;  // "" for an installation of no cells
+}
+
+message SearchRequest {
+  string query = 1;
+  int32 limit = 2;  // of each kind: 10 unless set, at most 50
+  string for_person_id = 3;
+}
+
+message SearchResponse {
+  repeated RepositoryEntry repositories = 1;
+  repeated SearchHit people = 2;
+  repeated SearchHit organizations = 3;
+}
+
+// SearchHit is a person or an organization found: its handle, and a person's display name.
+message SearchHit {
+  string id = 1;
+  string handle = 2;
+  string display_name = 3;
+}
+
+message Organization {
+  string id = 1;
+  string handle = 2;
+  string base_role = 3;  // none, read, triage, write, maintain, admin
+  bool members_create = 4;
+  bool private_forks = 5;
+  string enterprise = 6;
+  bool installation = 7;  // the installation's own
+}
+
+message CreateOrganizationRequest {
+  string handle = 1;
+  string base_role = 2;  // read when empty
+  bool members_create = 3;
+  bool private_forks = 4;
+  string for_person_id = 5;
+}
+
+message GetOrganizationRequest {
+  string handle = 1;
+}
+
+message OrganizationDeletionRequest {
+  string handle = 1;
+  string for_person_id = 2;
+}
+
+message DeleteAccountRequest {
+  // confirm is the account's handle, typed again.
+  string confirm = 1;
+  string for_person_id = 2;
+}
+
+// DeletionInfo is a deletion: when it was asked for, and when it is for good.
+message DeletionInfo {
+  google.protobuf.Timestamp requested = 1;
+  google.protobuf.Timestamp final = 2;
+}
+
+message RestoreAccountRequest {
+  string name = 1;  // the account's principal name
+}
+
+message RestoreResponse {}
+
+message SetRegionRequest {
+  string owner = 1;  // a person's or an organization's handle
+  string region = 2;
+  string for_person_id = 3;
+}
+
+message GetRegionRequest {
+  string owner = 1;
+}
+
+message Region {
+  string owner = 1;
+  string region = 2;     // the owner's; empty for none
+  string placed_in = 3;  // where its new repositories go: its region, or the directory's default
+}
+
+message UpdateOrganizationRequest {
+  string handle = 1;
+  string base_role = 2;
+  bool members_create = 3;
+  bool private_forks = 4;
+  string enterprise = 5;
+  string for_person_id = 6;
+}
+
+message Member {
+  string principal_id = 1;
+  string principal = 2;  // the member's name
+  string role = 3;       // member or owner
+}
+
+message ListMembersRequest {
+  string handle = 1;
+  string for_person_id = 2;
+}
+
+message ListMembersResponse {
+  repeated Member members = 1;
+}
+
+message SetMemberRequest {
+  string handle = 1;
+  string principal_id = 2;
+  string role = 3;  // member or owner
+  string for_person_id = 4;
+}
+
+message SetMemberResponse {}
+
+message RemoveMemberRequest {
+  string handle = 1;
+  string principal_id = 2;
+  string for_person_id = 3;
+}
+
+message RemoveMemberResponse {
+  bool removed = 1;
+}
+
+message Team {
+  string name = 1;    // <team>.<org>.team.<domain>
+  string parent = 2;  // the team above; empty for none
+  repeated Member members = 3;
+}
+
+message CreateTeamRequest {
+  string handle = 1;  // the organization's
+  string team = 2;    // a lowercase DNS label
+  string parent = 3;  // a team of the organization, by name; empty for none
+  string for_person_id = 4;
+}
+
+message ListTeamsRequest {
+  string handle = 1;
+  string for_person_id = 2;
+}
+
+message ListTeamsResponse {
+  repeated Team teams = 1;
+}
+
+message OrganizationRobot {
+  Principal principal = 1;
+  repeated Binding bindings = 2;
+}
+
+message OrganizationIssuerRequest {
+  string handle = 1;
+  string issuer =
+      2;  // as its tokens' iss claim says it: https://token.actions.githubusercontent.com
+  string for_person_id = 3;
+}
+
+message ListIssuersRequest {
+  string handle = 1;
+  string for_person_id = 2;
+}
+
+message OrganizationIssuers {
+  repeated string issuers = 1;
+  // audience is what a token for the organization must carry as its aud: the organization's ID.
+  string audience = 2;
+}
+
+message IdentityProviderSettings {
+  // Exactly one system of record.
+  GoogleProvider google = 1;
+  EntraProvider entra = 2;
+  LDAPProvider ldap = 3;
+  SCIMProvider scim = 4;
+  OIDCSignIn sign_in = 5;
+  int64 interval_secs = 6;  // how often it is read: at least 300
+}
+
+message GoogleProvider {
+  string subject = 1;  // the administrator read as
+  string customer = 2;
+  string group_query = 3;
+  bytes service_account_key = 4;  // a secret: never answered
+}
+
+message EntraProvider {
+  string tenant_id = 1;
+  string client_id = 2;
+  string group_filter = 3;
+  bool include_guests = 4;
+  string client_secret = 5;  // a secret: never answered
+}
+
+message LDAPProvider {
+  string url = 1;  // ldaps://…, or ldap://… with start_tls
+  bool start_tls = 2;
+  string ca = 3;  // PEM, for a server behind the organization's own CA
+  string bind_dn = 4;
+  string bind_password = 5;  // a secret: never answered
+  LDAPPeople people = 6;
+  LDAPGroups groups = 7;
+}
+
+message LDAPPeople {
+  string base_dn = 1;
+  string filter = 2;
+  string disabled_filter = 3;
+  string id_attribute = 4;
+  string handle_attribute = 5;
+  string email_attribute = 6;
+  string name_attribute = 7;
+}
+
+message LDAPGroups {
+  string base_dn = 1;
+  string filter = 2;
+  string id_attribute = 3;
+  string name_attribute = 4;
+  string member_attribute = 5;
+}
+
+// SCIMProvider pushes to ok at the organization's SCIM endpoint, with the token ResetSCIMToken
+// makes.
+message SCIMProvider {}
+
+message OIDCSignIn {
+  string issuer = 1;
+  string client_id = 2;
+  string client_secret = 3;  // a secret: never answered
+  string match = 4;          // external_id, or email
+  string claim = 5;          // for external_id: sub, or oid (Entra)
+}
+
+message SetIdentityProviderRequest {
+  string handle = 1;
+  IdentityProviderSettings settings = 2;
+  string for_person_id = 3;
+}
+
+message IdentityProviderRequest {
+  string handle = 1;
+  string for_person_id = 2;
+}
+
+message IdentityProviderInfo {
+  IdentityProviderSettings settings = 1;  // its secrets cleared
+  google.protobuf.Timestamp last_run = 2;
+  string last_error = 3;
+  repeated string waiting = 4;  // what the sync could not do yet, and why
+  repeated string notes = 5;
+  string scim_url = 6;     // a SCIM provider's endpoint
+  string sign_in_url = 7;  // where its people sign in
+}
+
+message RemoveIdentityProviderResponse {
+  bool removed = 1;
+}
+
+message ResetSCIMTokenResponse {
+  string token = 1;  // shown once
+  string scim_url = 2;
+}
+
+message OrganizationRobotBindingRequest {
+  string handle = 1;
+  string robot = 2;  // its full name
+  Binding binding = 3;
+  string for_person_id = 4;
+}
+
+message CreateOrganizationRobotRequest {
+  string handle = 1;  // the organization's
+  string name = 2;    // a lowercase DNS label
+  string for_person_id = 3;
+}
+
+message ListOrganizationRobotsRequest {
+  string handle = 1;
+  string for_person_id = 2;
+}
+
+message ListOrganizationRobotsResponse {
+  repeated OrganizationRobot robots = 1;
+}
+
+message CertifyOrganizationRobotRequest {
+  string handle = 1;
+  string robot = 2;      // its full name
+  bytes public_key = 3;  // PKIX DER: ECDSA P-256
+  string label = 4;
+  string for_person_id = 5;
+}
+
+message DeleteOrganizationRobotRequest {
+  string handle = 1;
+  string robot = 2;  // its full name
+  string for_person_id = 3;
+}
+
+message DeleteOrganizationRobotResponse {}
+
+message TeamMemberRequest {
+  string team = 1;
+  string principal_id = 2;
+  string for_person_id = 3;
+}
+
+message DeleteTeamRequest {
+  string team = 1;
+  string for_person_id = 2;
+}
+
+message DeleteTeamResponse {}
+
+message RepositoryEntry {
+  int64 id = 1;
+  string owner_id = 2;
+  string owner = 3;  // the owner's handle
+  string name = 4;
+  string visibility = 5;  // private, internal, public
+  string propose = 6;     // read or write
+  int64 parent_id = 7;
+  int64 network_id = 8;
+  string cell = 9;
+  string state = 10;  // creating, active, deleted
+  google.protobuf.Timestamp state_at = 11;
+  string created_by_id = 12;
+  google.protobuf.Timestamp created_at = 13;
+  bool redirected = 14;  // resolved through a name it had
+  string role = 15;      // the caller's role on it
+  // Its name as ok shows it: its name alone for the installation's organization's, else its
+  // owner's handle and its name, acme/app.
+  string full_name = 16;
+}
+
+message RepositoryRef {
+  int64 id = 1;
+  string for_person_id = 2;
+}
+
+message AbandonRepositoryResponse {}
+
+// Expiry is whether a repository's time is up, and how.
+message Expiry {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    KIND_NONE = 1;      // standing, restorable, or gone
+    KIND_DELETED = 2;   // deleted more than 30 days ago
+    KIND_CREATING = 3;  // still being made after an hour
+  }
+  int64 repository_id = 1;
+  Kind kind = 2;
+}
+
+message ListExpiredRepositoriesRequest {
+  int32 limit = 1;  // of each kind; 100 when 0
+}
+
+message ListExpiredRepositoriesResponse {
+  repeated Expiry repositories = 1;
+}
+
+message ReserveRepositoryRequest {
+  string owner = 1;  // the owner's handle; empty for the installation's organization
+  string name = 2;
+  string visibility = 3;  // private when empty; internal for an installation's
+  int64 parent_id = 4;    // the repository forked; 0 for none
+  string cell = 5;
+  string for_person_id = 6;
+}
+
+message ResolveRepositoryRequest {
+  string owner = 1;  // a handle; empty for the installation's organization
+  string name = 2;
+  string for_person_id = 3;
+}
+
+message ListRepositoryEntriesRequest {
+  string owner = 1;
+  string for_person_id = 2;
+}
+
+message ListRepositoryEntriesResponse {
+  repeated RepositoryEntry repositories = 1;
+}
+
+message UpdateRepositoryRequest {
+  int64 id = 1;
+  string visibility = 2;  // unchanged when empty
+  string propose = 3;     // unchanged when empty
+  string for_person_id = 4;
+}
+
+message RenameRepositoryEntryRequest {
+  int64 id = 1;
+  string name = 2;
+  string for_person_id = 3;
+}
+
+message TransferRepositoryRequest {
+  int64 id = 1;
+  string owner = 2;  // the new owner's handle
+  string for_person_id = 3;
+}
+
+message RepositoryGrant {
+  string subject = 1;  // a principal's ID, or a set's name
+  string role = 2;
+}
+
+message ListGrantsResponse {
+  repeated RepositoryGrant grants = 1;
+}
+
+message SetGrantRequest {
+  int64 id = 1;
+  RepositoryGrant grant = 2;
+  string for_person_id = 3;
+}
+
+message SetGrantResponse {}
+
+message RemoveGrantRequest {
+  int64 id = 1;
+  string subject = 2;
+  string for_person_id = 3;
+}
+
+message RemoveGrantResponse {
+  bool removed = 1;
+}
+
+// Approvals is ok secrets': a person's approval, with their passkey, of exactly what ok secrets
+// asks — unsealing secrets in a folder that asks for one (docs/secrets.md, "Unsealing").
+service Approvals {
+  option (ok.v1.callers) = CALLER_SECRETS;
+  // StartApproval asks a person to approve scope, shown description, on the page url, for five
+  // minutes. A person with no passkey is refused (FAILED_PRECONDITION): they add one on their
+  // account page first.
+  rpc StartApproval(StartApprovalRequest) returns (Approval);
+  // GetApproval reads an approval: whether its person answered.
+  rpc GetApproval(GetApprovalRequest) returns (Approval);
+}
+
+message StartApprovalRequest {
+  string principal_id = 1;
+  // scope is exactly what is approved, as ok secrets names it; description is what the person is
+  // shown.
+  string scope = 2;
+  string description = 3;
+}
+
+message GetApprovalRequest {
+  string id = 1;
+}
+
+message Approval {
+  enum State {
+    STATE_UNSPECIFIED = 0;
+    STATE_WAITING = 1;
+    STATE_APPROVED = 2;
+    STATE_DECLINED = 3;
+    STATE_EXPIRED = 4;
+  }
+  string id = 1;
+  string principal_id = 2;
+  string scope = 3;
+  string url = 4;  // where the person answers: <public_url>/id/approve/<id>
+  google.protobuf.Timestamp expires_at = 5;
+  State state = 6;
+}
+
+message SetSecretsRootRequest {
+  string handle = 1;  // the organization's
+  string root = 2;    // gcp-kms:<crypto key>, aws-kms:<key ARN>, or empty
+  string for_person_id = 3;
+}
+
+message GetSecretsRootRequest {
+  string handle = 1;
+  string for_person_id = 2;
+}
+
+message SecretsRoot {
+  string owner = 1;  // the organization's handle, or the repository's owner's ID
+  string root = 2;   // empty: the installation's
+}
+
+// SecretsRoots is ok secrets': the root a repository's keys are wrapped by.
+service SecretsRoots {
+  option (ok.v1.callers) = CALLER_SECRETS;
+  // GetRepositorySecretsRoot is a repository's owner's own root: empty for a person's, or an
+  // organization that names none.
+  rpc GetRepositorySecretsRoot(GetRepositorySecretsRootRequest) returns (SecretsRoot);
+}
+
+message GetRepositorySecretsRootRequest {
+  int64 repository_id = 1;
 }

@@ -19,8 +19,10 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
+	"github.com/Cidan/ok/internal/authz"
 	"github.com/Cidan/ok/internal/credential"
 	_ "github.com/Cidan/ok/internal/serve/serving/echotest"
+	"github.com/Cidan/ok/internal/tenancy"
 	okpb "github.com/Cidan/ok/proto/ok/v1"
 )
 
@@ -30,6 +32,8 @@ type directory struct {
 	credentials map[string]string // credential ID -> principal
 	revoked     map[string]bool
 	sessions    map[string]string // id -> principal
+	pats        map[string]string // personal token -> principal
+	aliases     map[string]string // a name a move gave up -> the name that took its place
 	down        bool
 	asked       int
 }
@@ -41,9 +45,22 @@ func (d *directory) Principal(_ context.Context, name string) (Principal, error)
 	}
 	p, ok := d.principals[name]
 	if !ok {
+		if to, aliased := d.aliases[name]; aliased {
+			return d.principals[to], nil
+		}
 		return Principal{}, ErrNotFound
 	}
 	return p, nil
+}
+
+func (d *directory) PrincipalByID(_ context.Context, id string) (Principal, error) {
+	d.asked++
+	for _, p := range d.principals {
+		if p.ID == id {
+			return p, nil
+		}
+	}
+	return Principal{}, ErrNotFound
 }
 
 func (d *directory) Credential(ctx context.Context, id string) (Principal, error) {
@@ -62,6 +79,18 @@ func (d *directory) Session(ctx context.Context, id string) (Principal, error) {
 		return Principal{}, ErrNotFound
 	}
 	return d.Principal(ctx, name)
+}
+
+func (d *directory) Token(ctx context.Context, secret string) (Principal, error) {
+	name, ok := d.pats[secret]
+	if !ok {
+		return Principal{}, ErrNotFound
+	}
+	p, err := d.Principal(ctx, name)
+	if err == nil {
+		p.Scope = &authz.Token{Role: tenancy.Read, Repositories: []int64{7}}
+	}
+	return p, err
 }
 
 type tokens map[string]string
@@ -121,10 +150,16 @@ func setup(t *testing.T, dev bool) (*Resolver, *directory, *ca) {
 			"gone.human.example.com":       {Name: "gone.human.example.com", ID: "p2", Human: true},
 			"control.ok.robot.example.com": {Name: "control.ok.robot.example.com", ID: "p3", Active: true},
 			"ci.ci.robot.example.com":      {Name: "ci.ci.robot.example.com", ID: "p4", Active: true},
+			"acme.org.example.com":         {Name: "acme.org.example.com", ID: "p5", Org: true, Active: true},
+			"ci.acme.robot.example.com":    {Name: "ci.acme.robot.example.com", ID: "p6", Active: true},
+			"bea.human.example.com":        {Name: "bea.human.example.com", ID: "p7", Human: true, Active: true},
 		},
-		credentials: map[string]string{"10": "ada.human.example.com", "11": "ada.human.example.com", "12": "gone.human.example.com"},
-		revoked:     map[string]bool{"11": true},
-		sessions:    map[string]string{"s1": "ada.human.example.com", "s2": "gone.human.example.com"},
+		credentials: map[string]string{"10": "ada.human.example.com", "11": "ada.human.example.com", "12": "gone.human.example.com",
+			"13": "ci.acme.robot.example.com", "14": "bea.human.example.com"},
+		aliases:  map[string]string{"ci.robot.example.com": "ci.acme.robot.example.com"},
+		revoked:  map[string]bool{"11": true},
+		sessions: map[string]string{"s1": "ada.human.example.com", "s2": "gone.human.example.com"},
+		pats:     map[string]string{"okp_ada": "ada.human.example.com", "okp_gone": "gone.human.example.com"},
 	}
 	c := newCA(t)
 	r := NewResolver(Config{
@@ -163,12 +198,19 @@ func TestResolve(t *testing.T) {
 		{"an inactive principal's credential", withCredential(t, c, "gone.human.example.com", 0x12), "", codes.Unauthenticated},
 		{"a credential the directory does not hold", withCredential(t, c, "ada.human.example.com", 0x99), "", codes.Unauthenticated},
 		{"a credential naming another principal", withCredential(t, c, "eve.human.example.com", 0x10), "", codes.Unauthenticated},
+		{"a credential under a name a move gave up", withCredential(t, c, "ci.robot.example.com", 0x13), "ci.acme.robot.example.com", codes.OK},
+		{"a credential under a renamed person's old name", withCredential(t, c, "old-bea.human.example.com", 0x14), "", codes.Unauthenticated},
+		{"a credential under another principal's alias", withCredential(t, c, "ci.robot.example.com", 0x10), "", codes.Unauthenticated},
 		{"a token", metadata.Pairs("authorization", "Bearer good"), "ci.ci.robot.example.com", codes.OK},
 		{"a bad token", metadata.Pairs("authorization", "Bearer bad"), "", codes.Unauthenticated},
+		{"a personal token", metadata.Pairs("authorization", "Bearer okp_ada"), "ada.human.example.com", codes.OK},
+		{"a personal token there is none of", metadata.Pairs("authorization", "Bearer okp_nobody"), "", codes.Unauthenticated},
+		{"an inactive person's personal token", metadata.Pairs("authorization", "Bearer okp_gone"), "", codes.Unauthenticated},
 		{"a session", metadata.Pairs("cookie", "a=b; ok_session=s1"), "ada.human.example.com", codes.OK},
 		{"an inactive principal's session", metadata.Pairs("cookie", "ok_session=s2"), "", codes.OK},
 		{"an unknown session", metadata.Pairs("cookie", "ok_session=nope"), "", codes.OK},
 		{"the trusted header", metadata.Pairs("x-auth-principal", "ada.human.example.com"), "ada.human.example.com", codes.OK},
+		{"the trusted header naming an organization", metadata.Pairs("x-auth-principal", "acme.org.example.com"), "", codes.Unauthenticated},
 		{"a development principal, to a production server", metadata.Pairs(DevPrincipalKey, "ada.human.example.com"), "", codes.Unauthenticated},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -181,9 +223,18 @@ func TestResolve(t *testing.T) {
 			}
 		})
 	}
+	// A personal token's caller carries what it allows, and how they came.
+	if got, ok, err := r.Resolve(ctx, metadata.Pairs("authorization", "Bearer okp_ada"), echoMethod); err != nil || !ok ||
+		got.Via != ViaPersonalToken || got.Token == nil || got.Token.Role != tenancy.Read || len(got.Token.Repositories) != 1 {
+		t.Errorf("a personal token's caller: %+v, %v, %v", got, ok, err)
+	}
 	dev, _, _ := setup(t, true)
 	if got, ok, err := dev.Resolve(ctx, metadata.Pairs(DevPrincipalKey, "ada.human.example.com"), echoMethod); err != nil || !ok || !got.Human || got.Via != ViaDev {
 		t.Errorf("a development principal, to a development server: %+v, %v, %v", got, ok, err)
+	}
+	// An organization acts as no one.
+	if got, ok, err := dev.Resolve(ctx, metadata.Pairs(DevPrincipalKey, "acme.org.example.com"), echoMethod); status.Code(err) != codes.Unauthenticated || ok {
+		t.Errorf("an organization as a development principal: %+v, %v, %v", got, ok, err)
 	}
 }
 
@@ -231,6 +282,12 @@ func TestCallers(t *testing.T) {
 	}
 	if !r.Allowed(Callers("grpc.health.v1.Health"), Caller{}, false) {
 		t.Error("health is not open")
+	}
+	// Bazel's remote cache, outside ok's protocols, is workers' alone.
+	for _, svc := range []string{"build.bazel.remote.execution.v2.ActionCache", "google.bytestream.ByteStream"} {
+		if got := Callers(svc); len(got) != 1 || got[0] != okpb.Caller_CALLER_WORKER {
+			t.Errorf("%s admits %v, want workers alone", svc, got)
+		}
 	}
 	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-auth-principal", "ci.ci.robot.example.com"))
 	if _, err := r.admit(ctx, echoMethod); status.Code(err) != codes.PermissionDenied {

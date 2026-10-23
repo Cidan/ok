@@ -17,6 +17,7 @@ bazel:
       - "@aspect_rules_lint//lint:shellcheck.bzl%shellcheck"
     format: //tools/format
 identity: identity
+pool: gpu
 `), true)
 	if err != nil {
 		t.Fatal(err)
@@ -31,6 +32,7 @@ identity: identity
 			},
 		},
 		Identity: "identity",
+		Pool:     "gpu",
 	}
 	if !reflect.DeepEqual(r, want) {
 		t.Errorf("ParseSettings = %+v, want %+v", r, want)
@@ -57,6 +59,7 @@ func TestParseSettingsRefuses(t *testing.T) {
 		"bad format":      {"build: bazel\nbazel:\n  lint:\n    format: tools/format\n", "lint format"},
 		"identity escape": {"build: bazel\nidentity: ../x\n", "is not a folder"},
 		"identity hidden": {"build: bazel\nidentity: .ok\n", "is not a folder"},
+		"bad pool":        {"build: bazel\npool: -gpu\n", `pool "-gpu" is lowercase letters`},
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, err := ParseSettings([]byte(tc.in), true)
@@ -80,6 +83,47 @@ func TestStandingOf(t *testing.T) {
 	} {
 		if got := StandingOf(tc.change, tc.base); got != tc.want {
 			t.Errorf("StandingOf(%s, %s) = %v, want %v", tc.change.Build, tc.base.Build, got, tc.want)
+		}
+	}
+}
+
+func TestPoolOf(t *testing.T) {
+	for _, tc := range []struct{ job, repo, want string }{
+		{"", "", DefaultPool},
+		{"", "gpu", "gpu"},
+		{"large", "gpu", "large"},
+	} {
+		if got := PoolOf(tc.job, tc.repo); got != tc.want {
+			t.Errorf("PoolOf(%q, %q) = %q, want %q", tc.job, tc.repo, got, tc.want)
+		}
+	}
+	for name, ok := range map[string]bool{"default": true, "arm64-large": true, "a": true, "A": false, "-a": false, "a-": false, "": false,
+		"a_b": false} {
+		if err := ValidPool(name); (err == nil) != ok {
+			t.Errorf("ValidPool(%q) = %v", name, err)
+		}
+	}
+}
+
+// A repository keeps secrets when its settings say so, in the store they name or the default.
+func TestSecretSettings(t *testing.T) {
+	for in, want := range map[string]*Secrets{
+		"build: none\n":                            nil,
+		"build: none\nsecrets: {}\n":               {Store: DefaultSecretStore},
+		"build: bazel\nsecrets:\n  store: vault\n": {Store: "vault"},
+	} {
+		s, err := ParseSettings([]byte(in), true)
+		if err != nil {
+			t.Errorf("%q: %v", in, err)
+			continue
+		}
+		if (s.Secrets == nil) != (want == nil) || (want != nil && *s.Secrets != *want) {
+			t.Errorf("%q: secrets %+v, want %+v", in, s.Secrets, want)
+		}
+	}
+	for _, bad := range []string{"build: none\nsecrets: {store: Vault}\n", "build: none\nsecrets: {backend: x}\n"} {
+		if _, err := ParseSettings([]byte(bad), true); err == nil {
+			t.Errorf("%q was taken", bad)
 		}
 	}
 }

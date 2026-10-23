@@ -14,22 +14,27 @@ import (
 	"os"
 	"sync"
 	"time"
+
+	"github.com/Cidan/ok/internal/cells"
+	"github.com/Cidan/ok/internal/data"
 )
 
 // Store is where a role keeps its keyed work (pgdata's work operations, on PostgreSQL).
 type Store interface {
-	// Mark marks key's work of kind.
+	// Mark marks key's work of kind, due now.
 	Mark(ctx context.Context, kind string, key int64) error
+	// MarkAt marks key's work of kind, due at at — or sooner, if it is marked so already.
+	MarkAt(ctx context.Context, kind string, key int64, at time.Time) error
 	// Take leases key's work to holder for ttl, clearing its mark, if no one holds it or its
-	// holder's lease lapsed; it reports whether it did.
+	// holder's lease lapsed — making its row if it has none; it reports whether it did.
 	Take(ctx context.Context, kind string, key int64, holder string, ttl time.Duration) (bool, error)
 	// Renew extends holder's lease by ttl from now; false if the lease is another's.
 	Renew(ctx context.Context, kind string, key int64, holder string, ttl time.Duration) (bool, error)
-	// Release ends holder's lease, unless the work was marked meanwhile, when it clears the mark
-	// and keeps the lease, reporting again.
+	// Release ends holder's lease, unless the work was marked meanwhile, due now, when it clears
+	// the mark and keeps the lease, reporting again; a mark due later stays.
 	Release(ctx context.Context, kind string, key int64, holder string) (again bool, err error)
-	// Due are up to limit keys of kind's work marked and held by no one, or whose holder's lease
-	// lapsed.
+	// Due are up to limit keys of kind's work marked, due, and held by no one, or whose holder's
+	// lease lapsed.
 	Due(ctx context.Context, kind string, limit int) ([]int64, error)
 }
 
@@ -40,8 +45,10 @@ var ErrLost = errors.New("work: the lease was lost")
 type Runner struct {
 	Kind  string
 	Store Store
-	// Do does key's work, with a context that ends if the lease is lost. An error is logged, and
-	// the work is marked to be done again a while later.
+	// Do does key's work, with a context that ends if the lease is lost and carries the lease's
+	// fence (data.WithFence), so what it writes through a store that checks it is never written
+	// once another holds the lease. An error is logged, and the work is marked to be done again a
+	// while later.
 	Do func(ctx context.Context, key int64) error
 	// Watch, if set, starts watching for marks and returns the wait, which returns once one came,
 	// max passes, or ctx ends; unset, the runner looks every Idle.
@@ -148,12 +155,63 @@ func (r *Runner) defaults() {
 		r.Workers = 4
 	}
 	if r.Holder == "" {
-		host, _ := os.Hostname()
-		r.Holder = fmt.Sprintf("%s-%d-%s", host, os.Getpid(), rand.Text()[:8])
+		r.Holder = NewHolder()
 	}
 	if r.Log == nil {
 		r.Log = slog.Default()
 	}
+}
+
+// NewHolder names this process's leases: its host, its process, and a random suffix.
+func NewHolder() string {
+	host, _ := os.Hostname()
+	return fmt.Sprintf("%s-%d-%s", host, os.Getpid(), rand.Text()[:8])
+}
+
+// hold keeps holder's lease on key's work, renewing it every third of ttl, until stop is called:
+// the context it returns ends with ErrLost if a renewal fails, and with ctx otherwise.
+func hold(ctx context.Context, s Store, kind string, key int64, holder string, ttl time.Duration, log *slog.Logger) (held context.Context, stop func()) {
+	held, lost := context.WithCancelCause(ctx)
+	renewed := make(chan struct{})
+	go func() {
+		defer close(renewed)
+		tick := time.NewTicker(ttl / 3)
+		defer tick.Stop()
+		for {
+			select {
+			case <-held.Done():
+				return
+			case <-tick.C:
+				if ok, err := s.Renew(held, kind, key, holder, ttl); err != nil || !ok {
+					if held.Err() == nil {
+						log.Warn("work: lost a lease", "kind", kind, "key", key, "err", err)
+					}
+					lost(ErrLost)
+					return
+				}
+			}
+		}
+	}()
+	return held, func() { lost(nil); <-renewed }
+}
+
+// Claim takes holder's lease on key's work, if no one holds it — ok false if another does — and
+// keeps it, renewed, until release: the context it returns ends with ErrLost if the lease is lost,
+// and carries its fence, as Runner.Do's does.
+// release lets the lease go at once, rather than when it would lapse.
+func Claim(ctx context.Context, s Store, kind string, key int64, holder string, ttl time.Duration) (held context.Context, release func(), ok bool, err error) {
+	if ok, err = s.Take(ctx, kind, key, holder, ttl); err != nil || !ok {
+		return nil, nil, ok, err
+	}
+	held, stop := hold(ctx, s, kind, key, holder, ttl, slog.Default())
+	return data.WithFence(held, data.Fence{Kind: kind, Key: key, Holder: holder}), func() {
+		stop()
+		bg, done := context.WithTimeout(context.WithoutCancel(ctx), ttl)
+		defer done()
+		if _, err := s.Release(bg, kind, key, holder); err != nil {
+			slog.Warn("work: letting go", "kind", kind, "key", key, "err", err)
+		}
+	}, true, nil
 }
 
 // one takes key's work, if no one holds it, and does it until it stays unmarked.
@@ -168,33 +226,18 @@ func (r *Runner) one(ctx context.Context, key int64) {
 	if !taken {
 		return
 	}
-	held, lost := context.WithCancelCause(ctx)
-	defer lost(nil)
-	renewed := make(chan struct{})
-	go func() {
-		defer close(renewed)
-		tick := time.NewTicker(r.TTL / 3)
-		defer tick.Stop()
-		for {
-			select {
-			case <-held.Done():
-				return
-			case <-tick.C:
-				if ok, err := r.Store.Renew(held, r.Kind, key, r.Holder, r.TTL); err != nil || !ok {
-					if held.Err() == nil {
-						r.Log.Warn("work: lost a lease", "kind", r.Kind, "key", key, "err", err)
-					}
-					lost(ErrLost)
-					return
-				}
-			}
-		}
-	}()
-	defer func() { lost(nil); <-renewed }()
+	held, stop := hold(ctx, r.Store, r.Kind, key, r.Holder, r.TTL, r.Log)
+	defer stop()
+	held = data.WithFence(held, data.Fence{Kind: r.Kind, Key: key, Holder: r.Holder})
 	for {
 		err := r.Do(held, key)
 		if errors.Is(context.Cause(held), ErrLost) {
 			return // another holds it now
+		}
+		if _, moved := cells.MovedOf(err); moved {
+			// Its repository moved to another cell, which does its work now (docs/hosted.md,
+			// "Cells, as built").
+			err = nil
 		}
 		// Released with a context of its own: on shutdown, what this replica held is let go at
 		// once, rather than when its lease lapses.

@@ -67,8 +67,14 @@ templ RepoViewContent(v RepoView) {
 		<div class="shrink-0">
 			@PageHead(v.Chrome.Name, v.Chrome.Subtitle, "") {
 				@changesLink(v.Chrome.ChangesHref, "#repo-main")
+				<a id="search-link" href={ templ.SafeURL(v.Chrome.Link + "/search") } class={ btnClass(btnSecondary) }>Search</a>
+				if v.Chrome.WebhooksHref != "" {
+					<a id="webhooks-link" href={ templ.SafeURL(v.Chrome.WebhooksHref) } class={ btnClass(btnSecondary) }>Webhooks</a>
+				}
+				@forkControls(v.Chrome)
 				@codeButton(v.Chrome.Clone)
 			}
+			@upstreamLine(v.Chrome)
 		</div>
 		<div id="repo-main" data-hydrate class="hydrating flex-1 overflow-y-auto">
 			@RepoViewMain(v)
@@ -284,6 +290,27 @@ templ emptyRepo(c RepoChrome) {
 // changesLink is the repo-header "Changes" button → the ChangeList (CL) finder: an htmx swap of
 // target — the landing's #repo-main (the header + rail stay put), or #content from the browser,
 // whose layout the finder does not share.
+// upstreamLine says which repository a fork is of.
+templ upstreamLine(c RepoChrome) {
+	if c.Upstream != "" {
+		<p class="mx-auto -mt-4 w-full max-w-5xl px-6 pb-4 text-sm text-zinc-500 sm:px-10">
+			Fork of <a href={ templ.SafeURL(c.UpstreamHref) } hx-get={ c.UpstreamHref } hx-target="#content" hx-swap={ swapNav } hx-push-url="true" class="font-mono text-zinc-300 hover:text-zinc-100">{ c.Upstream }</a>
+		</p>
+	}
+}
+
+// forkControls are a fork's Sync button, and every repository's Fork link, where the person may.
+templ forkControls(c RepoChrome) {
+	if c.SyncAction != "" {
+		<form method="post" action={ templ.SafeURL(c.SyncAction) }>
+			<button type="submit" class={ btnClass(btnSecondary) } title={ "Bring it " + c.Upstream + "'s newer work" }>Sync Fork</button>
+		</form>
+	}
+	if c.ForkHref != "" {
+		<a href={ templ.SafeURL(c.ForkHref) } hx-get={ c.ForkHref } hx-target="#content" hx-swap={ swapNav } hx-push-url="true" class={ btnClass(btnSecondary) }>Fork</a>
+	}
+}
+
 templ changesLink(href, target string) {
 	if href != "" {
 		<a href={ templ.SafeURL(href) } hx-get={ href } hx-target={ target } hx-swap={ swapNav } hx-push-url="true" class={ btnClass(btnSecondary) }>

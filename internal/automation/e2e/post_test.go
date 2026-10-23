@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Cidan/ok/internal/serve/metrics"
 	automationpb "github.com/Cidan/ok/proto/ok/automation/v1"
 	scmpb "github.com/Cidan/ok/proto/ok/scm/v1"
 )
@@ -53,7 +54,7 @@ func TestPost(t *testing.T) {
 	repo := e.repository("post")
 	e.land(repo, base, 1)
 	a.jj("post", "sync")
-	e.startWorker("w1", 1)
+	w1 := e.startWorker("w1", 1)
 	fix := postFixture()
 
 	change := func(msg string, files map[string]*string) int64 {
@@ -64,7 +65,7 @@ func TestPost(t *testing.T) {
 	}
 	submit := func(numbers ...int64) int64 {
 		t.Helper()
-		req := &automationpb.SubmitRequest{RepositoryId: repo, ForPerson: ada}
+		req := &automationpb.SubmitRequest{RepositoryId: repo, ForPersonId: e.adaID}
 		for _, n := range numbers {
 			req.Cls = append(req.Cls, &automationpb.SubmitRequest_CL{Number: n, Patchset: e.cl(repo, n).GetCurrentPatchset()})
 		}
@@ -217,8 +218,13 @@ func TestPost(t *testing.T) {
 		t.Errorf("X:\n%s", describe(subX))
 	}
 	subS := landed("the stack", sstack)
-	if on := landedOn(subS); len(on.GetCandidates()) != 2 {
-		t.Errorf("the stack's post ran on %d candidates, not 2:\n%s", len(on.GetCandidates()), describe(subS))
+	// Post is planned once, at the stack's top, over both CLs' paths; the CL under it lands with
+	// it and runs nothing of its own.
+	if on := landedOn(subS); len(on.GetCandidates()) != 2 || on.GetCandidates()[0].GetPlan() != nil || len(on.GetCandidates()[0].GetJobs()) != 0 ||
+		on.GetCandidates()[1].GetPlan().GetStatus() != automationpb.Run_STATUS_PASSED {
+		t.Errorf("the stack's post was not planned once, at its top:\n%s", describe(subS))
+	} else if log := e.logOf(on.GetCandidates()[1].GetPlan().GetId()); !strings.Contains(log, "the change touches 2 paths") {
+		t.Errorf("the stack's post did not plan both CLs' paths:\n%s", log)
 	}
 
 	// Round four: a change whose pre passed, with main moving under it before it is submitted —
@@ -247,6 +253,66 @@ func TestPost(t *testing.T) {
 	if want := []string{"test //other:other_test", "lint"}; strings.Join(carried, ",") != strings.Join(want, ",") ||
 		!strings.Contains(e.logOf(on.GetPlan().GetId()), "since pre, on patchset 1's commit") {
 		t.Errorf("K's post carried %v, want %v:\n%s", carried, want, describe(subK))
+	}
+
+	// Round four, in a batch: two independent changes whose pre passed, both planned while the
+	// queue was held — with no worker until both were prepared, so neither could pass alone — are
+	// released in one pass, pass at once on pre's results, and land in one landing: one
+	// transaction in the SCM, main moved once, each submission recorded landed.
+	a.jj("post", "sync")
+	n1 := change("a first note", map[string]*string{"notes/one.txt": ptr("one\n")})
+	n2 := change("a second note", map[string]*string{"notes/two.txt": ptr("two\n")})
+	for _, n := range []int64{n1, n2} {
+		if p := e.settled(repo, n, 1); p.GetVerdict() != automationpb.Pre_VERDICT_PASSED {
+			t.Fatalf("CL %d's pre: %s", n, e.describe(p))
+		}
+	}
+	w1.stop()
+	s1, s2 := submit(n1), submit(n2)
+	attempted := func(id int64, planned bool) bool {
+		s, err := e.runs.GetSubmission(e.ctx, &automationpb.GetSubmissionRequest{Id: id})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, at := range s.GetAttempts() {
+			if at.GetStatus() != automationpb.Attempt_STATUS_ACTIVE {
+				continue
+			}
+			if !planned {
+				return true
+			}
+			for _, c := range at.GetCandidates() {
+				if c.GetPlan().GetStatus() != automationpb.Run_STATUS_PASSED {
+					return false
+				}
+			}
+			return len(at.GetCandidates()) > 0
+		}
+		return false
+	}
+	waitFor := func(what string, done func() bool) {
+		t.Helper()
+		for deadline := time.Now().Add(5 * time.Minute); !done(); time.Sleep(200 * time.Millisecond) {
+			if time.Now().After(deadline) {
+				t.Fatalf("waiting for %s", what)
+			}
+		}
+	}
+	waitFor("both prepared", func() bool { return attempted(s1, false) && attempted(s2, false) })
+	letGo := e.holdQueue(repo)
+	e.startWorker("w2", 1)
+	waitFor("both planned", func() bool { return attempted(s1, true) && attempted(s2, true) })
+	before := []float64{metrics.Default().Read("ok_automation_landings_total").Value,
+		metrics.Default().Read("ok_automation_landed_submissions_total").Value}
+	letGo()
+	b1, b2 := landed("the first note", s1), landed("the second note", s2)
+	if got := []float64{metrics.Default().Read("ok_automation_landings_total").Value - before[0],
+		metrics.Default().Read("ok_automation_landed_submissions_total").Value - before[1]}; got[0] != 1 || got[1] != 2 {
+		t.Errorf("the two landed in %v landings, %v submissions: want one landing of both", got[0], got[1])
+	}
+	one, two := b1.GetCls()[0].GetLandedCommit(), b2.GetCls()[0].GetLandedCommit()
+	if parents := e.parentsOf(repo, two); len(parents) != 1 || string(parents[0]) != string(one) {
+		t.Errorf("the second note landed on %x, not on the first's %x", parents, one)
 	}
 
 	// Round five, in an imported repository: its change lands with nothing to run, whatever its

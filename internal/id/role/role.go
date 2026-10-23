@@ -5,33 +5,44 @@ package role
 
 import (
 	"context"
+	"crypto/tls"
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"google.golang.org/grpc"
 
+	"github.com/Cidan/ok/internal/bus"
+	"github.com/Cidan/ok/internal/bus/busconfig"
 	"github.com/Cidan/ok/internal/config"
 	"github.com/Cidan/ok/internal/credential"
+	"github.com/Cidan/ok/internal/dial"
 	"github.com/Cidan/ok/internal/directory"
 	"github.com/Cidan/ok/internal/directory/entra"
 	"github.com/Cidan/ok/internal/directory/google"
 	"github.com/Cidan/ok/internal/directory/ldapdir"
 	"github.com/Cidan/ok/internal/directory/scim"
 	"github.com/Cidan/ok/internal/id/ca"
+	"github.com/Cidan/ok/internal/id/enterprise"
 	"github.com/Cidan/ok/internal/id/federation"
+	"github.com/Cidan/ok/internal/id/mail"
+	"github.com/Cidan/ok/internal/id/mover"
+	"github.com/Cidan/ok/internal/id/seal"
 	"github.com/Cidan/ok/internal/id/service"
 	"github.com/Cidan/ok/internal/id/signin"
 	"github.com/Cidan/ok/internal/id/store"
 	idpostgres "github.com/Cidan/ok/internal/id/store/postgres"
+	idspanner "github.com/Cidan/ok/internal/id/store/spannerstore"
 	"github.com/Cidan/ok/internal/id/syncer"
 	"github.com/Cidan/ok/internal/id/web"
 	"github.com/Cidan/ok/internal/idclient"
@@ -39,6 +50,10 @@ import (
 	"github.com/Cidan/ok/internal/pgdb"
 	"github.com/Cidan/ok/internal/serve/authn"
 	"github.com/Cidan/ok/internal/serve/node"
+	"github.com/Cidan/ok/internal/spannerdb"
+	"github.com/Cidan/ok/internal/tenancy"
+	"github.com/Cidan/ok/internal/work"
+	okpb "github.com/Cidan/ok/proto/ok/v1"
 )
 
 // Schema is the PostgreSQL schema the identity role keeps its tables in.
@@ -56,12 +71,22 @@ type Role struct {
 	Services *service.Server
 	// CA is the identity CA's certificates, which credentials are checked against: for roles in
 	// the same process (ok serve).
-	CA   func() *x509.CertPool
-	pool *pgxpool.Pool
+	CA func() *x509.CertPool
+	// Mover runs the directory's moves of fork networks between cells.
+	Mover   *mover.Runner
+	pool    *pgxpool.Pool
+	closers []func()
 }
 
 // Close releases what the role holds.
-func (r *Role) Close() { r.pool.Close() }
+func (r *Role) Close() {
+	for i := len(r.closers) - 1; i >= 0; i-- {
+		r.closers[i]()
+	}
+	if r.pool != nil {
+		r.pool.Close()
+	}
+}
 
 // Options are how the role runs beside its configuration.
 type Options struct {
@@ -71,37 +96,106 @@ type Options struct {
 	Pool *pgxpool.Pool
 	// Source, when set, is the system of record instead of the configuration's: tests.
 	Source directory.Source
+	// Stream, when set, is the bus's stream the directory's events are published on instead of
+	// the configuration's: tests, and roles sharing one.
+	Stream bus.Stream
+	// Peers, when set, connects to a cell's role at an address, as ok identity: tests.
+	Peers func(addr string) grpc.ClientConnInterface
+	// MailLook, when set, is how often marked mail is looked for: tests.
+	MailLook time.Duration
+}
+
+// OpenBackend opens identity's store backend in the database the configuration names, with what
+// closes it: on PostgreSQL its pool, returned too for a bus kept beside it; on Spanner a database
+// of identity's own, and no pool. The admin commands that work on identity's tables beside the
+// role open it so.
+func OpenBackend(ctx context.Context, cfg *config.Config, maxConns int32) (store.Backend, *pgxpool.Pool, func(), error) {
+	if cfg.Database.Type == "spanner" {
+		db, err := spannerdb.Open(ctx, cfg.Database.Spanner, "identity")
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		b, err := idspanner.Open(ctx, db.Admin, db.Client)
+		if err != nil {
+			db.Close()
+			return nil, nil, nil, fmt.Errorf("the identity store: %w", err)
+		}
+		return b, nil, db.Close, nil
+	}
+	dsn, err := config.Secret(cfg.Database.URLFile)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("database.url_file: %w", err)
+	}
+	if dsn == "" {
+		return nil, nil, nil, errors.New("database.url_file names no database")
+	}
+	pool, err := pgdb.Open(ctx, dsn, Schema, maxConns)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	b, err := idpostgres.Open(ctx, pool)
+	if err != nil {
+		pool.Close()
+		return nil, nil, nil, fmt.Errorf("the identity store: %w", err)
+	}
+	return b, pool, pool.Close, nil
 }
 
 // Build assembles the identity role from its configuration.
 func Build(ctx context.Context, cfg *config.Config, opts Options) (*Role, error) {
 	names := cfg.Names()
+	var b store.Backend
 	pool := opts.Pool
+	r := &Role{pool: pool}
 	if pool == nil {
-		dsn, err := config.Secret(cfg.Database.URLFile)
-		if err != nil {
-			return nil, fmt.Errorf("database.url_file: %w", err)
-		}
-		if dsn == "" {
-			return nil, errors.New("database.url_file names no database")
-		}
-		if pool, err = pgdb.Open(ctx, dsn, Schema, cfg.Database.MaxConnections); err != nil {
+		var closeDB func()
+		var err error
+		if b, pool, closeDB, err = OpenBackend(ctx, cfg, cfg.Database.MaxConnections); err != nil {
 			return nil, err
 		}
+		r.closers = append(r.closers, closeDB)
+	} else {
+		pb, err := idpostgres.Open(ctx, pool)
+		if err != nil {
+			return nil, fmt.Errorf("the identity store: %w", err)
+		}
+		b = pb
 	}
-	r := &Role{pool: pool}
 	ok := false
 	defer func() {
-		if !ok && opts.Pool == nil {
-			pool.Close()
+		if ok {
+			return
+		}
+		for i := len(r.closers) - 1; i >= 0; i-- {
+			r.closers[i]()
 		}
 	}()
-	b, err := idpostgres.Open(ctx, pool)
 	st := store.New(b, names)
-	if err != nil {
-		return nil, fmt.Errorf("the identity store: %w", err)
-	}
 	r.Store = st
+	// An installation's one organization (docs/hosted.md, "Tenancy, as built"): its members are its
+	// people and robots, its owners its administrators, and every person may make and land.
+	var installation string
+	moveWake := make(chan struct{}, 1)
+	movedIn, err := st.CheckMode(ctx, cfg.Tenancy.Hosted())
+	if err != nil {
+		return nil, fmt.Errorf("tenancy.mode: %w", err)
+	}
+	st.SetMovedIn(movedIn)
+	var cells []store.Cell
+	for _, c := range cfg.Cells() {
+		cells = append(cells, store.Cell{Name: c.Name, Region: c.Region, Open: !c.Closed})
+	}
+	st.SetCells(cells, cfg.Identity.DefaultRegion)
+	dq := cfg.Identity.DefaultQuota
+	st.SetDefaultQuota(store.Quota{Concurrent: dq.Concurrent, Minutes: dq.Minutes, Weight: dq.Weight})
+	if !cfg.Tenancy.Hosted() {
+		o, err := st.EnsureOrganization(ctx, cfg.Tenancy.Organization, store.OrganizationSettings{BaseRole: tenancy.Write, MembersCreate: true})
+		if err != nil {
+			return nil, fmt.Errorf("tenancy.organization %s: %w", cfg.Tenancy.Organization, err)
+		}
+		installation = o.ID
+		st.SetInstallation(o.ID)
+	}
 	authority, err := ca.Load(cfg.Identity.CADir)
 	if err != nil {
 		return nil, fmt.Errorf("identity.ca_dir: %w (make one with: ok identity ca init)", err)
@@ -159,15 +253,84 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (*Role, error)
 		}
 	}
 	nodes = append(nodes, syncer.Housekeeper{Store: st})
+	// The directory's events, published for ok's roles to follow.
+	stream := opts.Stream
+	if stream == nil {
+		b, err := busconfig.Open(ctx, cfg.Bus, pool)
+		if err != nil {
+			return nil, err
+		}
+		r.closers = append(r.closers, b.Close)
+		stream = b.Stream
+	}
+	nodes = append(nodes, relay{store: st, stream: stream})
 
 	var syncerFor service.Syncer
 	if sync != nil {
 		syncerFor = sync
 	}
-	svc := service.New(service.Config{Store: st, CA: authority, Syncer: syncerFor, PublicURL: cfg.PublicURL,
-		BootstrapAdmins: cfg.Identity.BootstrapAdmins, SessionIdle: cfg.Identity.Session.Idle})
+	// Organizations' own identity providers, their secrets sealed with the installation's key.
+	var ent *enterprise.Syncer
+	if cfg.Identity.SealingKeyFile != "" {
+		sealer, err := seal.Load(cfg.Identity.SealingKeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("identity.sealing_key_file: %w", err)
+		}
+		ent = &enterprise.Syncer{Store: st, Sealer: sealer, AllowPrivate: opts.Dev}
+		nodes = append(nodes, enterpriseSync{ent}, &orgSCIM{st: st, sync: ent, base: strings.TrimSuffix(cfg.PublicURL, "/"), pending: map[string]bool{}})
+	}
+	// Notifications' mail, sent as keyed work (docs/hosted.md, "ok control at scale, as built").
+	if m := cfg.Identity.Mail; m != nil {
+		sender, err := smtpSender("identity.mail.smtp", m.SMTP)
+		if err != nil {
+			return nil, err
+		}
+		nodes = append(nodes, &mailer{store: st, send: sender.Send, look: opts.MailLook})
+	}
+	// WebAuthn binds a passkey to a domain: ok reached at an IP address — in development — has none.
+	publicURL, err := url.Parse(cfg.PublicURL)
+	if err != nil {
+		return nil, fmt.Errorf("public_url: %w", err)
+	}
+	passkeys := net.ParseIP(publicURL.Hostname()) == nil
+	svc := service.New(service.Config{Store: st, CA: authority, Syncer: syncerFor, PublicURL: cfg.PublicURL, Passkeys: passkeys, Mail: cfg.Identity.Mail != nil,
+		Enterprise:      ent,
+		BootstrapAdmins: cfg.Identity.BootstrapAdmins, SessionIdle: cfg.Identity.Session.Idle,
+		Hosted: cfg.Tenancy.Hosted(), Installation: installation, Roles: idclient.Roles(cfg), PlaintextIssuers: opts.Dev,
+		Cells: cfg.Cells(), MoveAsked: func() {
+			select {
+			case moveWake <- struct{}{}:
+			default:
+			}
+		}})
 	r.Services = svc
 	nodes = append(nodes, services{s: svc, ca: authority})
+
+	// Moves of fork networks between cells, driven here, each cell's roles reached as ok
+	// identity's robot (docs/hosted.md, "Cells, as built").
+	local := idclient.NewLocal(svc, cfg.Roles.Identity)
+	dialer := &moveDialer{conns: map[string]okpb.MovesClient{}, dial: func(addr string) (grpc.ClientConnInterface, error) {
+		if opts.Peers != nil {
+			return opts.Peers(addr), nil
+		}
+		o, err := idclient.Options(cfg.Services)
+		if err != nil {
+			return nil, err
+		}
+		if opts.Dev {
+			o.DevPrincipal = cfg.RobotName(cfg.Roles.Identity)
+		} else {
+			o.Credential = local
+		}
+		c, err := dial.Dial(addr, o)
+		if err != nil {
+			return nil, err
+		}
+		r.closers = append(r.closers, func() { c.Close() })
+		return c, nil
+	}}
+	r.Mover = &mover.Runner{Store: st, Cells: cfg.Cells(), Wake: moveWake, Log: slog.Default(), Moves: dialer.moves}
+	nodes = append(nodes, r.Mover)
 
 	wc := web.Config{Store: st, Services: svc, Installation: cfg.Installation, PublicURL: cfg.PublicURL,
 		SessionLifetime: cfg.Identity.Session.Lifetime, SessionIdle: cfg.Identity.Session.Idle}
@@ -200,23 +363,37 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (*Role, error)
 			wc.LDAPName = "your directory"
 		}
 	}
-	// WebAuthn binds a passkey to a domain: ok reached at an IP address — in development — has none.
-	if u, _ := url.Parse(cfg.PublicURL); net.ParseIP(u.Hostname()) == nil {
-		if wc.Passkeys, err = signin.NewPasskeys(u.Hostname(), cfg.Installation, strings.TrimSuffix(cfg.PublicURL, "/"), st); err != nil {
+	if passkeys {
+		if wc.Passkeys, err = signin.NewPasskeys(publicURL.Hostname(), cfg.Installation, strings.TrimSuffix(cfg.PublicURL, "/"), st); err != nil {
 			return nil, err
+		}
+	}
+	wc.Enterprise = ent
+	wc.Hosted = cfg.Tenancy.Hosted()
+	if su := cfg.Identity.SignUp; su != nil {
+		wc.SignUp = &web.SignUp{Social: map[string]bool{}}
+		for _, id := range su.OIDC {
+			wc.SignUp.Social[id] = true
+		}
+		if e := su.Email; e != nil {
+			sender, err := smtpSender("identity.sign_up.email.smtp", e.SMTP)
+			if err != nil {
+				return nil, err
+			}
+			wc.SignUp.Mail = sender
 		}
 	}
 	nodes = append(nodes, web.New(wc))
 
-	var tokens authn.TokenVerifier
-	if len(cfg.Identity.Federation) > 0 {
-		var issuers []federation.Issuer
-		for _, i := range cfg.Identity.Federation {
-			issuers = append(issuers, federation.Issuer{URL: i.Issuer, Audience: i.Audience, JWKSURL: i.JWKSURL, CAFile: i.CAFile, TokenFile: i.TokenFile})
-		}
-		if tokens, err = federation.New(ctx, issuers, st); err != nil {
-			return nil, err
-		}
+	// Robots sign in with tokens from the configuration's issuers, and from each organization's
+	// (a development server reaching an organization's at any address, over plaintext too).
+	var issuers []federation.Issuer
+	for _, i := range cfg.Identity.Federation {
+		issuers = append(issuers, federation.Issuer{URL: i.Issuer, Audience: i.Audience, JWKSURL: i.JWKSURL, CAFile: i.CAFile, TokenFile: i.TokenFile})
+	}
+	tokens, err := federation.New(ctx, issuers, st, federation.Options{AllowPrivate: opts.Dev})
+	if err != nil {
+		return nil, err
 	}
 	r.CA = authority.Pool
 	r.Resolver = authn.NewResolver(authn.Config{
@@ -312,4 +489,107 @@ func (scimWeb) AuthenticatesItself()         {}
 func (s scimWeb) Mount(r *chi.Mux) (string, error) {
 	r.Handle("/*", http.Handler(s.h))
 	return "/id/scim", nil
+}
+
+// relay publishes the directory's events: every replica runs one, each publishing pending events
+// beside the others (store.Relay).
+// mailer sends the notifications' mail, each message on one replica at a time, as it is queued and
+// as its retries fall due; a message whose mark was lost is marked again each minute.
+type mailer struct {
+	store *store.Store
+	send  store.Sender
+	look  time.Duration
+}
+
+var _ node.Application = (*mailer)(nil)
+
+func (mailer) Name() string                 { return "ok/identity/mail" }
+func (mailer) Dependencies() []node.Node    { return nil }
+func (mailer) Setup(context.Context) error  { return nil }
+func (mailer) Healthy(context.Context) bool { return true }
+
+func (m mailer) Start(ctx context.Context) error {
+	look := m.look
+	if look <= 0 {
+		look = 2 * time.Second
+	}
+	var swept time.Time
+	return (&work.Runner{
+		Kind:  store.MailWork,
+		Store: m.store.Work(),
+		Do:    func(ctx context.Context, id int64) error { return m.store.SendMail(ctx, id, m.send) },
+		Sweep: func(ctx context.Context) error {
+			if time.Since(swept) < time.Minute {
+				return nil
+			}
+			swept = time.Now()
+			return m.store.MarkDueMail(ctx)
+		},
+		Idle: look,
+		Log:  slog.Default(),
+	}).Run(ctx)
+}
+
+type relay struct {
+	store  *store.Store
+	stream bus.Stream
+}
+
+var _ node.Application = relay{}
+
+func (relay) Name() string                 { return "ok/identity/relay" }
+func (relay) Dependencies() []node.Node    { return nil }
+func (relay) Setup(context.Context) error  { return nil }
+func (relay) Healthy(context.Context) bool { return true }
+
+func (n relay) Start(ctx context.Context) error {
+	if err := n.store.Relay(ctx, n.stream); ctx.Err() == nil {
+		return err
+	}
+	return nil
+}
+
+// moveDialer reaches cells' roles' Moves, each address dialed once.
+type moveDialer struct {
+	dial  func(addr string) (grpc.ClientConnInterface, error)
+	mu    sync.Mutex
+	conns map[string]okpb.MovesClient
+}
+
+func (d *moveDialer) moves(addr string) (okpb.MovesClient, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if c, ok := d.conns[addr]; ok {
+		return c, nil
+	}
+	conn, err := d.dial(addr)
+	if err != nil {
+		return nil, err
+	}
+	d.conns[addr] = okpb.NewMovesClient(conn)
+	return d.conns[addr], nil
+}
+
+// smtpSender is a mail server's sender, as the configuration at what names it.
+func smtpSender(what string, c config.SMTP) (mail.SMTP, error) {
+	sender := mail.SMTP{Addr: c.Address, Username: c.Username, From: c.From}
+	if c.PasswordFile != "" {
+		pw, err := os.ReadFile(c.PasswordFile)
+		if err != nil {
+			return mail.SMTP{}, fmt.Errorf("%s.password_file: %w", what, err)
+		}
+		sender.Password = strings.TrimSpace(string(pw))
+	}
+	if c.CAFile != "" {
+		pem, err := os.ReadFile(c.CAFile)
+		if err != nil {
+			return mail.SMTP{}, fmt.Errorf("%s.ca_file: %w", what, err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pem) {
+			return mail.SMTP{}, fmt.Errorf("%s.ca_file %s holds no certificate", what, c.CAFile)
+		}
+		sender.TLS = &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
+	}
+	return sender, nil
 }

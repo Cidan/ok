@@ -1,21 +1,23 @@
 // Package migrate brings a role's PostgreSQL database to its schema: ordered SQL files, each
 // applied once, in a transaction of its own, recorded in the database. Roles starting together
-// apply them once, under an advisory lock; a database ahead of the binary — a migration it does not
-// know — is refused, never undone.
+// apply them once, under the schema's migrate lock (internal/lock), whose table is made first; a
+// database ahead of the binary — a migration it does not know — is refused, never undone.
 package migrate
 
 import (
 	"context"
 	"fmt"
-	"hash/fnv"
 	"io/fs"
 	"path"
 	"regexp"
 	"sort"
 	"strconv"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/Cidan/ok/internal/lock"
 )
 
 // Migration is one step of a schema.
@@ -69,50 +71,51 @@ func MustLoad(fsys fs.FS, dir string) []Migration {
 	return ms
 }
 
+// wait is how long Apply waits for another replica's migrations of a schema to finish.
+const wait = 10 * time.Minute
+
 // Apply brings the database pool reaches to schema's migrations, recording them in
 // <schema>_migrations. It returns the versions it applied.
 func Apply(ctx context.Context, pool *pgxpool.Pool, schema string, migrations []Migration) ([]int, error) {
-	conn, err := pool.Acquire(ctx)
-	if err != nil {
-		return nil, err
+	if err := lock.Ensure(ctx, pool); err != nil {
+		return nil, fmt.Errorf("migrate %s: the locks table: %w", schema, err)
 	}
-	defer conn.Release()
-	h := fnv.New64a()
-	h.Write([]byte("ok-migrate:" + schema))
-	key := int64(h.Sum64())
-	if _, err := conn.Exec(ctx, "SELECT pg_advisory_lock($1)", key); err != nil {
-		return nil, fmt.Errorf("migrate %s: taking the lock: %w", schema, err)
-	}
-	defer conn.Exec(context.WithoutCancel(ctx), "SELECT pg_advisory_unlock($1)", key)
-
-	table := pgx.Identifier{schema + "_migrations"}.Sanitize()
-	if _, err := conn.Exec(ctx, "CREATE TABLE IF NOT EXISTS "+table+` (
-		version    integer PRIMARY KEY,
-		name       text NOT NULL,
-		applied_at timestamptz NOT NULL DEFAULT now()
-	)`); err != nil {
-		return nil, fmt.Errorf("migrate %s: %w", schema, err)
-	}
-	applied, err := appliedVersions(ctx, conn, schema, migrations)
-	if err != nil {
-		return nil, err
-	}
+	locks := lock.New(pool)
+	defer locks.WaitForRefreshers()
 	var did []int
-	for _, m := range migrations {
-		if applied[m.Version] {
-			continue
-		}
-		err := pgx.BeginFunc(ctx, conn, func(tx pgx.Tx) error {
-			if _, err := tx.Exec(ctx, m.SQL); err != nil {
-				return err
-			}
-			_, err := tx.Exec(ctx, "INSERT INTO "+table+" (version, name) VALUES ($1, $2)", m.Version, m.Name)
+	err := locks.LockFn(ctx, "migrate", schema, wait, func(ctx context.Context) error {
+		table := pgx.Identifier{schema + "_migrations"}.Sanitize()
+		if _, err := pool.Exec(ctx, "CREATE TABLE IF NOT EXISTS "+table+` (
+			version    integer PRIMARY KEY,
+			name       text NOT NULL,
+			applied_at timestamptz NOT NULL DEFAULT now()
+		)`); err != nil {
 			return err
-		})
-		if err != nil {
-			return did, fmt.Errorf("migrate %s: %04d_%s: %w", schema, m.Version, m.Name, err)
 		}
-		did = append(did, m.Version)
+		applied, err := appliedVersions(ctx, pool, schema, migrations)
+		if err != nil {
+			return err
+		}
+		for _, m := range migrations {
+			if applied[m.Version] {
+				continue
+			}
+			err := pgx.BeginFunc(ctx, pool, func(tx pgx.Tx) error {
+				if _, err := tx.Exec(ctx, m.SQL); err != nil {
+					return err
+				}
+				_, err := tx.Exec(ctx, "INSERT INTO "+table+" (version, name) VALUES ($1, $2)", m.Version, m.Name)
+				return err
+			})
+			if err != nil {
+				return fmt.Errorf("%04d_%s: %w", m.Version, m.Name, err)
+			}
+			did = append(did, m.Version)
+		}
+		return nil
+	})
+	if err != nil {
+		return did, fmt.Errorf("migrate %s: %w", schema, err)
 	}
 	return did, nil
 }

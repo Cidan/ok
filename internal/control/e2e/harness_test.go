@@ -24,6 +24,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Cidan/ok/internal/bus/bustest"
+
 	"github.com/jackc/pgx/v5/pgxpool"
 	"google.golang.org/grpc"
 
@@ -31,18 +33,17 @@ import (
 	"github.com/Cidan/ok/internal/blob"
 	"github.com/Cidan/ok/internal/config"
 	"github.com/Cidan/ok/internal/control/db"
-	"github.com/Cidan/ok/internal/control/db/postgres"
-	"github.com/Cidan/ok/internal/control/people"
 	"github.com/Cidan/ok/internal/control/role"
 	"github.com/Cidan/ok/internal/dial"
 	"github.com/Cidan/ok/internal/id/ca"
+	"github.com/Cidan/ok/internal/id/mail/mailtest"
 	idrole "github.com/Cidan/ok/internal/id/role"
-	"github.com/Cidan/ok/internal/pgdb"
+	"github.com/Cidan/ok/internal/id/seal"
 	scmrole "github.com/Cidan/ok/internal/scm/role"
 	"github.com/Cidan/ok/internal/serve"
 	"github.com/Cidan/ok/internal/serve/authn"
 	"github.com/Cidan/ok/internal/serve/node"
-	"github.com/Cidan/ok/internal/testdb"
+	"github.com/Cidan/ok/internal/testdb/roledb"
 	"github.com/Cidan/ok/internal/testdb/testobjects"
 	"github.com/Cidan/ok/internal/testjj"
 	automationpb "github.com/Cidan/ok/proto/ok/automation/v1"
@@ -87,6 +88,27 @@ type env struct {
 	stopAutomation func()
 	// deployer is ok's deployer, which a test plays (deploy_test.go).
 	deployer *deployer
+	// dir is ok identity's directory, as ok control asks it.
+	dir identitypb.DirectoryClient
+	// idAddr is where ok identity serves; mail is the server it mails notifications through.
+	idAddr string
+	mail   *mailtest.Server
+}
+
+// tenancy is ok identity's Tenancy as a person calls it.
+func (e *env) tenancy(person string) identitypb.TenancyClient {
+	return identitypb.NewTenancyClient(as(e.t, e.idAddr, person))
+}
+
+// id is a principal's stable ID, as ok identity minted it: what pages carry in their forms, and
+// ok control names principals by to the other roles.
+func (e *env) id(name string) string {
+	e.t.Helper()
+	resp, err := e.dir.GetPrincipal(context.Background(), &identitypb.GetPrincipalRequest{Key: &identitypb.GetPrincipalRequest_Name{Name: name}})
+	if err != nil {
+		e.t.Fatalf("the ID of %s: %v", name, err)
+	}
+	return resp.GetPrincipal().GetId()
 }
 
 // serveRole runs a role's root on lis, or a loopback port, until the test ends or the returned stop
@@ -184,10 +206,15 @@ func (e *env) landed(path string) bool {
 	e.t.Helper()
 	parts := strings.Split(strings.TrimPrefix(path, "/"), "/")
 	n, err := strconv.ParseInt(parts[len(parts)-1], 10, 64)
-	if len(parts) != 3 || err != nil {
+	if len(parts) != 4 || parts[2] != "cl" || err != nil {
 		e.t.Fatalf("%s is not a CL's path", path)
 	}
-	cl, ok, err := dbChangeList(e, parts[0], n)
+	// The installation's organization's repositories' full names are their names alone.
+	repo := parts[1]
+	if parts[0] != "example" {
+		repo = parts[0] + "/" + parts[1]
+	}
+	cl, ok, err := dbChangeList(e, repo, n)
 	if err != nil {
 		e.t.Fatal(err)
 	}
@@ -203,12 +230,10 @@ func (e *env) prePassed(repo string, n int64) {
 	})
 }
 
-// newEnvWithoutWorker is a test's ok whose worker the test plays itself.
-func newEnvWithoutWorker(t *testing.T) *env {
+// testConfig is a test's ok configuration, ok control's public URL base: its CA, and its people —
+// alice, bob, carol, and dana — under a directory of its own.
+func testConfig(t *testing.T, base string) *config.Config {
 	t.Helper()
-	jj := testjj.Path(t)
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
 	dir := t.TempDir()
 	if err := ca.Init(filepath.Join(dir, "ca"), "Example"); err != nil {
 		t.Fatal(err)
@@ -219,13 +244,6 @@ func newEnvWithoutWorker(t *testing.T) *env {
 		fmt.Fprintf(&people, "  - {id: \"%d\", email: %s@example.com, name: %s}\n", i+1, h, strings.ToUpper(h[:1])+h[1:])
 	}
 	os.WriteFile(filepath.Join(dir, "people.yaml"), []byte(people.String()), 0o644)
-	// ok control's address is its public URL: the links it gives, and the origin its forms and
-	// ChangeLists service accept.
-	controlLis, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	base := "http://" + controlLis.Addr().String()
 	cfg, err := config.Parse([]byte(`
 domain: example.com
 public_url: ` + base + `
@@ -239,23 +257,41 @@ identity:
 	if err != nil {
 		t.Fatal(err)
 	}
-	url := testdb.Postgres(t)
-	open := func(schema string) *pgxpool.Pool {
-		p, err := pgdb.Open(ctx, url, schema, 0)
-		if err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(p.Close)
-		return p
-	}
+	cfg.Bus = bustest.Config(t)
+	return cfg
+}
 
-	// ok identity, its people synced, and a tree applied — admins.acl holding dana, and the
-	// reviewers ACL holding bob — after one that declared the group old, now retired.
-	id, err := idrole.Build(ctx, cfg, idrole.Options{Dev: true, Pool: open(idrole.Schema)})
+// opener makes a test's roles' databases (roledb, as OK_TEST_DATABASE names them), pointing cfg at
+// them, and opens pools on them, each with a role's schema, closed when the test ends: pools that
+// fail the test when a goroutine holding a connection asks for another (testdb.NoNestedConns), as
+// do the bus's pools the roles open beside them. On Spanner it opens none: each role opens its
+// database as cfg says.
+func opener(t *testing.T, cfg *config.Config) func(schema string) *pgxpool.Pool {
+	dbs := roledb.New(t)
+	dbs.Configure(cfg)
+	return func(schema string) *pgxpool.Pool {
+		t.Helper()
+		return dbs.Pool(t, schema, 0)
+	}
+}
+
+// startIdentity serves ok identity, its people synced, and a tree applied — admins.acl holding
+// dana, and the reviewers ACL holding bob — after one that declared the group old, now retired.
+// It returns where it serves.
+func startIdentity(t *testing.T, ctx context.Context, cfg *config.Config, open func(string) *pgxpool.Pool) string {
+	t.Helper()
+	id, err := idrole.Build(ctx, cfg, idrole.Options{Dev: true, Pool: open(idrole.Schema), MailLook: 100 * time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
 	}
 	idAddr, _ := serveRole(t, ctx, nil, id.Root, serve.WithAuthn(id.Resolver))
+	seedIdentity(t, ctx, id, idAddr)
+	return idAddr
+}
+
+// seedIdentity waits for identity's people to be synced, then applies its seed tree.
+func seedIdentity(t *testing.T, ctx context.Context, id *idrole.Role, idAddr string) {
+	t.Helper()
 	for i := 0; ; i++ {
 		if _, err := id.Store.Principal(ctx, dana); err == nil {
 			break
@@ -278,40 +314,128 @@ identity:
 			t.Fatalf("applying the seed tree: %v", err)
 		}
 	}
+}
+
+// newEnvWithoutWorker is a test's ok whose worker the test plays itself.
+func newEnvWithoutWorker(t *testing.T) *env {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	// ok control's address is its public URL: the links it gives, and the origin its forms and
+	// ChangeLists service accept.
+	controlLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := "http://" + controlLis.Addr().String()
+	cfg := testConfig(t, base)
+	// The directory mails notifications through a mail server of the test's own.
+	mail := mailtest.New(t)
+	cfg.Identity.Mail = &config.Mail{SMTP: config.SMTP{Address: mail.Addr, From: "ok <no-reply@example.com>"}}
+	// Webhooks, whose endpoints in a test are on loopback.
+	key := filepath.Join(t.TempDir(), "sealing.key")
+	if err := os.WriteFile(key, []byte(seal.NewKey()+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg.Control.SealingKeyFile, cfg.Control.Webhooks.AllowPrivateNetworks = key, true
+	res := &resources{cfg: cfg, open: opener(t, cfg), blobs: bucket(t), logs: bucket(t), seed: true, mail: mail}
+	res.deployer, res.deployAddr = startDeployer(t)
+	e, _ := startStack(t, ctx, res, controlLis)
+	return e
+}
+
+// resources are what a test's roles are built on, which a test may stop and build again on
+// (movein_test.go): the configuration, the databases, the buckets, the deployer's stand-in, and,
+// once built, the addresses each role serves at.
+type resources struct {
+	cfg             *config.Config
+	open            func(string) *pgxpool.Pool
+	blobs, logs     blob.Store
+	deployer        *deployer
+	deployAddr      string
+	seed            bool // apply the seed tree once identity serves
+	mail            *mailtest.Server
+	idAddr, scmAddr string
+	autoAddr        string
+}
+
+// listen listens at addr — again, after the role that served there stopped — or anywhere.
+func listen(t *testing.T, addr string) net.Listener {
+	t.Helper()
+	if addr == "" {
+		addr = "127.0.0.1:0"
+	}
+	for i := 0; ; i++ {
+		lis, err := net.Listen("tcp", addr)
+		if err == nil {
+			return lis
+		}
+		if i == 100 {
+			t.Fatal(err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// startStack builds and serves identity, the SCM, ok automation, and ok control on res, ok control
+// on controlLis, and returns the test's env, and what stops them all.
+func startStack(t *testing.T, ctx context.Context, res *resources, controlLis net.Listener) (*env, func()) {
+	t.Helper()
+	jj := testjj.Path(t)
+	cfg, open := res.cfg, res.open
+	var stops []func()
+	stopAll := func() {
+		for i := len(stops) - 1; i >= 0; i-- {
+			stops[i]()
+		}
+	}
+	id, err := idrole.Build(ctx, cfg, idrole.Options{Dev: true, Pool: open(idrole.Schema), MailLook: 100 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	idAddr, stopID := serveRole(t, ctx, listen(t, res.idAddr), id.Root, serve.WithAuthn(id.Resolver))
+	stops = append(stops, stopID)
+	res.idAddr = idAddr
+	if res.seed {
+		seedIdentity(t, ctx, id, idAddr)
+		res.seed = false
+	}
 
 	// The SCM, and ok automation following its change feed.
-	scm, err := scmrole.Build(ctx, cfg, scmrole.Options{Dev: true, Pool: open(scmrole.Schema), Blobs: bucket(t), Identity: as(t, idAddr, scmSelf)})
+	scm, err := scmrole.Build(ctx, cfg, scmrole.Options{Dev: true, Pool: open(scmrole.Schema), Blobs: res.blobs, Identity: as(t, idAddr, scmSelf)})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(scm.Close)
-	scmAddr, _ := serveRole(t, ctx, nil, scm.Root, serve.WithAuthn(scm.Resolver))
-	auto, err := autorole.Build(ctx, cfg, autorole.Options{Dev: true, Pool: open(autorole.Schema), Logs: bucket(t),
+	scmAddr, stopSCM := serveRole(t, ctx, listen(t, res.scmAddr), scm.Root, serve.WithAuthn(scm.Resolver))
+	stops = append(stops, stopSCM)
+	res.scmAddr = scmAddr
+	auto, err := autorole.Build(ctx, cfg, autorole.Options{Dev: true, Pool: open(autorole.Schema), Logs: res.logs,
 		Identity: as(t, idAddr, automation), SCM: as(t, scmAddr, automation)})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(auto.Close)
-	autoAddr, stopAutomation := serveRole(t, ctx, nil, auto.Root, serve.WithAuthn(auto.Resolver))
+	autoAddr, stopAutomation := serveRole(t, ctx, listen(t, res.autoAddr), auto.Root, serve.WithAuthn(auto.Resolver))
+	stops = append(stops, stopAutomation)
+	res.autoAddr = autoAddr
 
 	// ok control, as its robot, with the deployer's stand-in.
-	dep, deployAddr := startDeployer(t)
 	ctl, err := role.Build(ctx, cfg, role.Options{Dev: true, Pool: open(role.Schema), Identity: as(t, idAddr, control), SCM: as(t, scmAddr, control),
-		Automation: as(t, autoAddr, control), Deploy: as(t, deployAddr, control), Poll: 100 * time.Millisecond})
+		Automation: as(t, autoAddr, control), Deploy: as(t, res.deployAddr, control), Poll: 100 * time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(ctl.Close)
-	serveRole(t, ctx, controlLis, ctl.Root, serve.WithAuthn(ctl.Resolver))
-	d, err := postgres.Open(ctx, open(role.Schema))
-	if err != nil {
-		t.Fatal(err)
-	}
+	_, stopControl := serveRole(t, ctx, controlLis, ctl.Root, serve.WithAuthn(ctl.Resolver))
+	stops = append(stops, stopControl)
+	base := "http://" + controlLis.Addr().String()
 	return &env{
-		t: t, jj: jj, endpoint: "http://" + scmAddr, control: base, db: d, deployer: dep,
-		work: automationpb.NewWorkClient(as(t, autoAddr, worker)), stopAutomation: stopAutomation,
+		mail: res.mail,
+		t:    t, jj: jj, endpoint: "http://" + scmAddr, control: base, db: ctl.DB, deployer: res.deployer, dir: identitypb.NewDirectoryClient(as(t, idAddr, control)),
+		idAddr: idAddr, work: automationpb.NewWorkClient(as(t, autoAddr, worker)), stopAutomation: stopAutomation,
 		client: &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }},
-	}
+	}, stopAll
 }
 
 // page is one response: its status, its body with HTML entities decoded, and its headers.
@@ -446,7 +570,7 @@ func realCheckout(args []string) []string {
 
 // command is jj as the person runs it in dir.
 func (p *person) command(dir string, args ...string) *exec.Cmd {
-	handle := people.Handle(p.principal)
+	handle, _, _ := strings.Cut(p.principal, ".")
 	cwd := filepath.Join(p.home, dir)
 	if err := os.MkdirAll(cwd, 0o755); err != nil {
 		p.e.t.Fatal(err)
@@ -500,7 +624,8 @@ func uploaded(out string) []int64 {
 	return ns
 }
 
-func clPath(repo string, n int64) string { return fmt.Sprintf("/%s/cl/%d", repo, n) }
+// clPath is a CL's page, of a repository of the installation's organization, example.
+func clPath(repo string, n int64) string { return fmt.Sprintf("/example/%s/cl/%d", repo, n) }
 
 // hasEvent reports whether a CL's change log has an entry of kind.
 func (e *env) hasEvent(repo string, n int64, kind db.EventKind) bool {

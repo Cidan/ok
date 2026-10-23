@@ -1,10 +1,13 @@
-// Package people names the people ok control shows: principals under the installation's domain
-// (docs/identity.md), displayed by handle — ada.human.example.com is "ada" — and the directory of
-// people the reviewer search offers, read from ok identity.
+// Package people names the people ok control shows and answers who they are. ok control records
+// every principal by stable ID (docs/hosted.md, "Tenancy, as built") and shows each by their
+// current name — a person by handle, ada.human.example.com as "ada" — resolved through ok
+// identity; it also holds the directory of people the reviewer search offers, ACLs' members, and
+// ok's administrators, all by ID.
 package people
 
 import (
 	"context"
+	"errors"
 	"sort"
 	"strings"
 	"sync"
@@ -15,65 +18,170 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/Cidan/ok/internal/identity"
+	"github.com/Cidan/ok/internal/names"
 	identitypb "github.com/Cidan/ok/proto/ok/identity/v1"
 )
 
-// The installation's names, and the domain a person's handle is an address at: set once, by Use,
-// before anything is shown.
+// The installation's names, the domain a person's handle is an address at, and how principals'
+// IDs are named: set once, by Use, before anything is shown.
 var (
-	names       = identity.MustNames("example.com")
-	emailDomain = "example.com"
+	installation = identity.MustNames("example.com")
+	emailDomain  = "example.com"
+	resolver     *names.Resolver
+	hosted       bool
 )
 
-// Use sets the installation's names, and the domain a person's handle is an address at (the
-// commits ok writes carry <handle>@<emailDomain>, as the SCM's do). Call it once, at start.
-func Use(n identity.Names, email string) {
-	names = n
+// Use sets the installation's names, the domain a person's handle is an address at (the commits
+// ok writes carry <handle>@<emailDomain>, as the SCM's do), the resolver of principals' IDs, and
+// whether ok is a hosted service, which shows names as one does (@ada). Call it once, at start.
+// With no resolver (tests), a principal's ID is its name.
+func Use(n identity.Names, email string, r *names.Resolver, isHosted bool) {
+	installation = n
+	hosted = isHosted
 	emailDomain = email
 	if emailDomain == "" {
 		emailDomain = n.Domain()
 	}
+	resolver = r
 }
 
 // Names are the installation's.
-func Names() identity.Names { return names }
+func Names() identity.Names { return installation }
 
-func humanSuffix() string { return ".human." + names.Domain() }
+func humanSuffix() string { return ".human." + installation.Domain() }
 
-// Handle is how a principal is shown: a person's handle, or any other principal whole.
-func Handle(principal string) string {
-	if h, ok := strings.CutSuffix(principal, humanSuffix()); ok {
-		return h
+// HandleOf is how a principal's name is shown, as the mode has it (identity.Names.Present): an
+// installation's people by handle and any other principal whole; a hosted service's @ada,
+// @acme/eng, acme/ci.
+func HandleOf(name string) string { return installation.Present(name, hosted) }
+
+// Name is the current name of the principal with a stable ID; one the directory cannot name now
+// is shown by its ID.
+func Name(ctx context.Context, id string) string {
+	if resolver == nil || id == "" {
+		return id
 	}
-	return principal
+	n, err := resolver.Name(ctx, id)
+	if err != nil {
+		return id
+	}
+	return n
 }
 
-// Principal is the principal a person names: a handle ("ada"), an address
+// Handle is how the principal with a stable ID is shown: HandleOf its current name.
+func Handle(ctx context.Context, id string) string { return HandleOf(Name(ctx, id)) }
+
+// Handles are Handle of each ID, in order.
+func Handles(ctx context.Context, ids []string) []string {
+	if len(ids) == 0 {
+		return nil
+	}
+	out := make([]string, len(ids))
+	for i, id := range ids {
+		out[i] = Handle(ctx, id)
+	}
+	return out
+}
+
+// Principal is the principal's name a person writes: a handle ("ada"), an address
 // ("ada@example.com"), or a principal's full name.
 func Principal(name string) string {
 	name = strings.ToLower(strings.TrimSpace(name))
-	if h, ok := strings.CutSuffix(name, "@"+emailDomain); ok {
-		return names.Human(h)
+	if h, ok := strings.CutSuffix(name, "@"+emailDomain); ok && !strings.HasPrefix(name, "@") {
+		return installation.Human(h)
 	}
-	if strings.HasSuffix(name, "."+names.Domain()) {
-		return name
+	if p, ok := installation.ParsePrincipal(name); ok {
+		return p
 	}
-	return names.Human(name)
+	return installation.Human(name)
 }
 
-// IsHuman reports whether a principal names a person.
-func IsHuman(principal string) bool { return strings.HasSuffix(principal, humanSuffix()) }
+// Reason is why something ended, as people read it: by is who ended it, by stable ID, which the
+// reason never names — "canceled by ada", or "not wanted (canceled by ada)"; "" when no one did.
+func Reason(ctx context.Context, reason, by string) string {
+	if by == "" {
+		return reason
+	}
+	who := "canceled by " + Handle(ctx, by)
+	if reason == "" || reason == "canceled" {
+		return who
+	}
+	return reason + " (" + who + ")"
+}
 
-// Email is the address a person's commits carry, <handle>@<email domain>.
-func Email(principal string) string { return Handle(principal) + "@" + emailDomain }
+// HaltReason is why a deployment ended or stands, as people read it: haltBy is who asked it to
+// halt, by stable ID, which the reason never names; "" when no one did.
+func HaltReason(ctx context.Context, reason, haltBy string) string {
+	if haltBy == "" {
+		return reason
+	}
+	who := "halted by " + Handle(ctx, haltBy)
+	switch reason {
+	case "", "halted":
+		return who
+	case "halted before it started":
+		return who + " before it started"
+	}
+	return reason + " (" + who + ")"
+}
 
-// FromEmail is the person an address at the email domain names, or "" for any other address.
-func FromEmail(email string) string {
+// ErrUnknown is a name no principal has.
+var ErrUnknown = names.ErrUnknown
+
+// ID is the stable ID of the principal a person writes (Principal's forms); ErrUnknown for none.
+func ID(ctx context.Context, written string) (string, error) {
+	name := Principal(written)
+	if resolver == nil {
+		return name, nil
+	}
+	return resolver.ID(ctx, name)
+}
+
+// IDOfName is the stable ID of the principal with a full name; ErrUnknown for none.
+func IDOfName(ctx context.Context, name string) (string, error) {
+	if resolver == nil {
+		return name, nil
+	}
+	return resolver.ID(ctx, name)
+}
+
+// IsHuman reports whether a principal's name names a person.
+func IsHuman(name string) bool { return strings.HasSuffix(name, humanSuffix()) }
+
+// IsHumanID reports whether the principal with a stable ID is a person.
+func IsHumanID(ctx context.Context, id string) bool {
+	if resolver == nil {
+		return IsHuman(id)
+	}
+	p, err := resolver.ByID(ctx, id)
+	return err == nil && p.Human
+}
+
+// Email is the address a person's commits carry, <handle>@<email domain>, by stable ID.
+func Email(ctx context.Context, id string) string { return Handle(ctx, id) + "@" + emailDomain }
+
+// EmailHandle is the handle an address at the email domain names, as written — a commit's author,
+// which no rename changes — or "" for any other address.
+func EmailHandle(email string) string {
 	h, ok := strings.CutSuffix(strings.ToLower(strings.TrimSpace(email)), "@"+emailDomain)
 	if !ok || h == "" || strings.ContainsAny(h, "@ ") {
 		return ""
 	}
-	return names.Human(h)
+	return h
+}
+
+// FromEmail is the stable ID of the person an address at the email domain names, or "" for any
+// other address, or one no person has.
+func FromEmail(ctx context.Context, email string) string {
+	h := EmailHandle(email)
+	if h == "" {
+		return ""
+	}
+	id, err := IDOfName(ctx, installation.Human(h))
+	if err != nil {
+		return ""
+	}
+	return id
 }
 
 // DirectoryClient is the part of ok identity's Directory the people need; identitypb's client is
@@ -88,75 +196,94 @@ type DirectoryClient interface {
 	ListSets(ctx context.Context, in *identitypb.ListSetsRequest, opts ...grpc.CallOption) (*identitypb.ListSetsResponse, error)
 }
 
-// Directory lists the active people in ok identity's directory, cached briefly: people join and
-// leave rarely, and the reviewer search asks on every keystroke.
+// Directory lists the active people in ok identity's directory, by stable ID, cached briefly:
+// people join and leave rarely, and the reviewer search asks on every keystroke.
 type Directory struct {
 	client DirectoryClient
 	ttl    time.Duration
 
 	aclMu sync.Mutex
-	acls  map[string]cached // ACL name -> its principals
+	acls  map[string]cached // ACL name -> its principals' IDs
 
 	adminMu   sync.Mutex
-	admins    map[string]cached // principal -> whether they administer ok (one member when so)
-	adminList cached            // every administrator
+	admins    map[string]cached // a principal's ID -> whether they administer ok (one member when so)
+	adminList cached            // every administrator's ID
 
 	syncedMu sync.Mutex
-	synced   map[string][]string // the system of record's groups, by name: their members
+	synced   map[string][]string // the system of record's groups, by name: their members' names
 	syncedAt time.Time
 
 	mu      sync.Mutex
-	humans  []string
+	humans  []person // by name
+	byID    map[string]bool
 	fetched time.Time
 }
+
+// person is an active person: their stable ID, and their name now.
+type person struct{ id, name string }
 
 // NewDirectory reads people from ok identity's Directory.
 func NewDirectory(client DirectoryClient) *Directory {
 	return &Directory{client: client, ttl: time.Minute}
 }
 
-// Humans returns every active person, sorted.
-func (d *Directory) Humans(ctx context.Context) ([]string, error) {
+func (d *Directory) people(ctx context.Context) ([]person, map[string]bool, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.humans != nil && time.Since(d.fetched) < d.ttl {
-		return d.humans, nil
+		return d.humans, d.byID, nil
 	}
-	var out []string
+	var out []person
 	token := ""
 	for {
 		resp, err := d.client.ListPrincipals(ctx, &identitypb.ListPrincipalsRequest{Kind: identitypb.Kind_KIND_HUMAN, PageSize: 500, PageToken: token})
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		for _, p := range resp.GetPrincipals() {
 			if p.GetStatus() == identitypb.Status_STATUS_ACTIVE {
-				out = append(out, p.GetName())
+				out = append(out, person{id: p.GetId(), name: p.GetName()})
 			}
 		}
 		if token = resp.GetNextPageToken(); token == "" {
 			break
 		}
 	}
-	sort.Strings(out)
-	d.humans, d.fetched = out, time.Now()
+	sort.Slice(out, func(i, j int) bool { return out[i].name < out[j].name })
+	byID := make(map[string]bool, len(out))
+	for _, p := range out {
+		byID[p.id] = true
+	}
+	d.humans, d.byID, d.fetched = out, byID, time.Now()
+	return out, byID, nil
+}
+
+// Humans returns every active person's ID, in their names' order.
+func (d *Directory) Humans(ctx context.Context) ([]string, error) {
+	ps, _, err := d.people(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, len(ps))
+	for i, p := range ps {
+		out[i] = p.id
+	}
 	return out, nil
 }
 
-// IsActiveHuman reports whether a principal is an active person in the directory.
-func (d *Directory) IsActiveHuman(ctx context.Context, principal string) (bool, error) {
-	humans, err := d.Humans(ctx)
+// IsActiveHuman reports whether the principal with a stable ID is an active person.
+func (d *Directory) IsActiveHuman(ctx context.Context, id string) (bool, error) {
+	_, byID, err := d.people(ctx)
 	if err != nil {
 		return false, err
 	}
-	i := sort.SearchStrings(humans, principal)
-	return i < len(humans) && humans[i] == principal, nil
+	return byID[id], nil
 }
 
-// Search returns up to limit active people whose handle contains keyword, handles that start
-// with it first, skipping those in exclude.
+// Search returns the IDs of up to limit active people whose handle contains keyword, handles that
+// start with it first, skipping the IDs in exclude.
 func (d *Directory) Search(ctx context.Context, keyword string, exclude map[string]bool, limit int) ([]string, error) {
-	humans, err := d.Humans(ctx)
+	ps, _, err := d.people(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -165,16 +292,16 @@ func (d *Directory) Search(ctx context.Context, keyword string, exclude map[stri
 		return nil, nil
 	}
 	var prefix, inside []string
-	for _, p := range humans {
-		if exclude[p] {
+	for _, p := range ps {
+		if exclude[p.id] {
 			continue
 		}
-		h := Handle(p)
+		h := HandleOf(p.name)
 		switch {
 		case strings.HasPrefix(h, keyword):
-			prefix = append(prefix, p)
+			prefix = append(prefix, p.id)
 		case strings.Contains(h, keyword):
-			inside = append(inside, p)
+			inside = append(inside, p.id)
 		}
 	}
 	out := append(prefix, inside...)
@@ -206,7 +333,7 @@ func (d *Directory) RetiredSetNames(ctx context.Context) (map[string]bool, error
 	}
 	out := map[string]bool{}
 	for _, r := range resp.GetNames() {
-		if k, ok := names.KindOf(r.GetName()); ok && (k == identity.GroupMember || k == identity.ACLMember) {
+		if k, ok := installation.KindOf(r.GetName()); ok && (k == identity.GroupMember || k == identity.ACLMember) {
 			out[r.GetName()] = true
 		}
 	}
@@ -218,8 +345,8 @@ type cached struct {
 	fetched time.Time
 }
 
-// ACLMembers returns every principal in an ACL, through the sets it holds, sorted, cached as
-// briefly as the people: an ACL that is no ACL has none.
+// ACLMembers returns the stable ID of every active principal in an ACL, through the sets it
+// holds, sorted, cached as briefly as the people: an ACL that is no ACL has none.
 func (d *Directory) ACLMembers(ctx context.Context, acl string) ([]string, error) {
 	d.aclMu.Lock()
 	if e, ok := d.acls[acl]; ok && time.Since(e.fetched) < d.ttl {
@@ -231,7 +358,10 @@ func (d *Directory) ACLMembers(ctx context.Context, acl string) ([]string, error
 	var members []string
 	switch status.Code(err) {
 	case codes.OK:
-		members = append(members, resp.GetPrincipals()...)
+		members, err = idsOf(resp.GetPrincipals(), resp.GetPrincipalIds())
+		if err != nil {
+			return nil, err
+		}
 		sort.Strings(members)
 	case codes.NotFound:
 	default:
@@ -246,44 +376,53 @@ func (d *Directory) ACLMembers(ctx context.Context, acl string) ([]string, error
 	return members, nil
 }
 
-// InACL reports whether a principal is in an ACL.
-func (d *Directory) InACL(ctx context.Context, acl, principal string) (bool, error) {
+// idsOf are the IDs ok identity answered beside the names, which it always does.
+func idsOf(names, ids []string) ([]string, error) {
+	if len(ids) != len(names) {
+		return nil, errors.New("ok identity answered principals' names without their IDs")
+	}
+	return append([]string(nil), ids...), nil
+}
+
+// InACL reports whether the principal with a stable ID is in an ACL.
+func (d *Directory) InACL(ctx context.Context, acl, id string) (bool, error) {
 	members, err := d.ACLMembers(ctx, acl)
 	if err != nil {
 		return false, err
 	}
-	i := sort.SearchStrings(members, principal)
-	return i < len(members) && members[i] == principal, nil
+	i := sort.SearchStrings(members, id)
+	return i < len(members) && members[i] == id, nil
 }
 
-// IsAdmin reports whether a principal administers ok — every repository among it — as ok identity
-// decides: a member of admins.acl.<domain>, or, before any tree declares it, a bootstrap
-// administrator. Cached as briefly as the people.
-func (d *Directory) IsAdmin(ctx context.Context, principal string) (bool, error) {
+// IsAdmin reports whether the principal with a stable ID administers ok — every repository among
+// it — as ok identity decides: a member of admins.acl.<domain>, or, before any tree declares it, a
+// bootstrap administrator. Cached as briefly as the people.
+func (d *Directory) IsAdmin(ctx context.Context, id string) (bool, error) {
 	d.adminMu.Lock()
-	if e, ok := d.admins[principal]; ok && time.Since(e.fetched) < d.ttl {
+	if e, ok := d.admins[id]; ok && time.Since(e.fetched) < d.ttl {
 		d.adminMu.Unlock()
 		return len(e.members) > 0, nil
 	}
 	d.adminMu.Unlock()
-	resp, err := d.client.CheckAdmin(ctx, &identitypb.CheckAdminRequest{Principal: principal})
+	resp, err := d.client.CheckAdmin(ctx, &identitypb.CheckAdminRequest{Key: &identitypb.CheckAdminRequest_PrincipalId{PrincipalId: id}})
 	if err != nil {
 		return false, err
 	}
 	e := cached{fetched: time.Now()}
 	if resp.GetAdmin() {
-		e.members = []string{principal}
+		e.members = []string{id}
 	}
 	d.adminMu.Lock()
 	if d.admins == nil {
 		d.admins = map[string]cached{}
 	}
-	d.admins[principal] = e
+	d.admins[id] = e
 	d.adminMu.Unlock()
 	return resp.GetAdmin(), nil
 }
 
-// Admins lists the principals who administer ok, sorted, cached as briefly as the people.
+// Admins lists the stable IDs of the principals who administer ok, in their names' order, cached
+// as briefly as the people.
 func (d *Directory) Admins(ctx context.Context) ([]string, error) {
 	d.adminMu.Lock()
 	if !d.adminList.fetched.IsZero() && time.Since(d.adminList.fetched) < d.ttl {
@@ -295,14 +434,18 @@ func (d *Directory) Admins(ctx context.Context) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	ids, err := idsOf(resp.GetPrincipals(), resp.GetPrincipalIds())
+	if err != nil {
+		return nil, err
+	}
 	d.adminMu.Lock()
-	d.adminList = cached{members: resp.GetPrincipals(), fetched: time.Now()}
+	d.adminList = cached{members: ids, fetched: time.Now()}
 	d.adminMu.Unlock()
-	return resp.GetPrincipals(), nil
+	return ids, nil
 }
 
 // SyncedGroups are the groups the system of record syncs, by name, with their members as
-// declared: what a tree's ACLs may hold. Cached as briefly as the people.
+// declared, by name: what a tree's ACLs may hold. Cached as briefly as the people.
 func (d *Directory) SyncedGroups(ctx context.Context) (map[string][]string, error) {
 	d.syncedMu.Lock()
 	defer d.syncedMu.Unlock()

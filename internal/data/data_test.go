@@ -41,3 +41,20 @@ func TestRetry(t *testing.T) {
 		t.Errorf("a context that ends: %v after %d attempts", err, n)
 	}
 }
+
+// IDs are positive, and do not repeat.
+func TestNewID(t *testing.T) {
+	seen := map[int64]bool{}
+	var high bool
+	for range 10_000 {
+		id := data.NewID()
+		if id <= 0 || seen[id] {
+			t.Fatalf("id %d: not positive, or seen before", id)
+		}
+		seen[id] = true
+		high = high || id > 1<<62
+	}
+	if !high {
+		t.Error("no id above 2^62 in 10,000: they do not span 63 bits")
+	}
+}

@@ -14,6 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/protobuf/types/known/timestamppb"
+
 	"github.com/Cidan/ok/internal/serve/authn"
 	automationpb "github.com/Cidan/ok/proto/ok/automation/v1"
 	deploypb "github.com/Cidan/ok/proto/ok/deploy/v1"
@@ -158,17 +160,26 @@ func TestCommandLineLifecycle(t *testing.T) {
 	}
 	a.jj("svc", "sync")
 
-	// A draft: its pre runs, then it waits on its author.
+	// A draft runs no pre until it is sent for review: it waits on its author. Run by hand
+	// (jj cl pre), its pre runs, and it waits on its author again.
 	a.jj("svc", "new", "main@ok", "-m", "two from lib")
 	a.write("svc/lib/lib.go", "package lib\n\nfunc One() int { return 1 }\n\nfunc Two() int { return 2 }\n")
 	n := uploaded(a.jj("svc", "cl"))[0]
 	cl := itoa(n)
-	if out := a.expect(2, "svc", "cl", "status", "-f"); !strings.Contains(out, "cl/"+cl+"  draft") || !strings.Contains(out, "[waiting on its author: alice]") {
+	if out := a.expect(2, "svc", "cl", "status", "-f"); !strings.Contains(out, "cl/"+cl+"  draft") || !strings.Contains(out, "pre runs once it is sent for review") ||
+		!strings.Contains(out, "[waiting on its author: alice]") {
 		t.Fatalf("following a draft:\n%s", out)
+	}
+	if st := statusJSON(t, a.expect(0, "svc", "cl", "status", "--json")); field(st, "pre", "verdict") != "VERDICT_NONE" {
+		t.Fatalf("a draft's pre: %v", st)
+	}
+	a.expect(0, "svc", "cl", "pre")
+	if out := a.expect(2, "svc", "cl", "status", "-f"); !strings.Contains(out, "cl/"+cl+"  draft") || !strings.Contains(out, "[waiting on its author: alice]") {
+		t.Fatalf("following a draft whose pre was run by hand:\n%s", out)
 	}
 	st := statusJSON(t, a.expect(0, "svc", "cl", "status", "--json"))
 	if field(st, "stage") != "STAGE_DRAFT" || field(st, "waitingOn") != "WAITING_ON_AUTHOR" || field(st, "pre", "verdict") != "VERDICT_PASSED" || field(st, "cl", "number") != cl {
-		t.Fatalf("a draft's JSON: %v", st)
+		t.Fatalf("a draft's JSON, its pre run by hand: %v", st)
 	}
 
 	// Sent for review: it waits on bob, lib's owner.
@@ -213,7 +224,7 @@ func TestCommandLineLifecycle(t *testing.T) {
 
 	// Its deployments: following waits while one rolls, and ends once it succeeded.
 	dep := &deploypb.Deployment{Id: 1, RepositoryId: repoID, Deploy: "//lib/.ok/workflow/d.yaml:deploy:lib", Name: "lib",
-		Status: deploypb.Deployment_STATUS_RUNNING, Stage: deploypb.Deployment_STAGE_ROLL}
+		Status: deploypb.Deployment_STATUS_RUNNING, Stage: deploypb.Deployment_STAGE_ROLL, CreatedAt: timestamppb.New(time.Now().Add(-time.Minute))}
 	e.deployer.add(dep, landed)
 	wait := a.background("svc", "cl", "status", "-f", "--until", "deployed", cl)
 	e.waitFor("the follow to see the roll", func() bool {
@@ -234,7 +245,7 @@ func TestCommandLineLifecycle(t *testing.T) {
 
 	// A later deployment of the commit failed: retried from the command line by its author.
 	failed := &deploypb.Deployment{Id: 2, RepositoryId: repoID, Deploy: "//lib/.ok/workflow/d.yaml:deploy:lib", Name: "lib",
-		Status: deploypb.Deployment_STATUS_FAILED, Stage: deploypb.Deployment_STAGE_ROLL, Reason: "a pod restarted"}
+		Status: deploypb.Deployment_STATUS_FAILED, Stage: deploypb.Deployment_STAGE_ROLL, Reason: "a pod restarted", CreatedAt: timestamppb.Now()}
 	e.deployer.add(failed, landed)
 	if out := a.expect(1, "svc", "cl", "status", "-f", cl); !strings.Contains(out, "deploy failed") || !strings.Contains(out, "deployment failed: lib — a pod restarted") {
 		t.Fatalf("a failed deployment:\n%s", out)
@@ -243,7 +254,7 @@ func TestCommandLineLifecycle(t *testing.T) {
 		t.Errorf("carol retrying: %d\n%s", code, out)
 	}
 	a.expect(0, "svc", "cl", "deployment", "--cl", cl, "retry", "2")
-	if got := e.deployer.actions(); len(got) != 1 || got[0] != "retry 2 for "+alice {
+	if got := e.deployer.actions(); len(got) != 1 || got[0] != "retry 2 for "+e.id(alice) {
 		t.Errorf("the deployer was asked: %v", got)
 	}
 
@@ -251,7 +262,7 @@ func TestCommandLineLifecycle(t *testing.T) {
 	a.jj("svc", "new", "main@ok", "-m", "three from lib")
 	a.write("svc/lib/three.go", "package lib\n\nfunc Three() int { return 3 }\n")
 	w.fail(n + 1)
-	bad := uploaded(a.jj("svc", "cl"))[0]
+	bad := uploaded(a.jj("svc", "cl", "--ready"))[0]
 	if bad != n+1 {
 		t.Fatalf("CL %d, want %d", bad, n+1)
 	}
@@ -275,7 +286,7 @@ func TestCommandLineLifecycle(t *testing.T) {
 		t.Fatalf("abandon:\n%s", out)
 	}
 	a.expect(1, "svc", "cl", "status", "-f")
-	if out := a.expect(0, "svc", "cl", "restore"); !strings.Contains(out, "draft") {
+	if out := a.expect(0, "svc", "cl", "restore"); !strings.Contains(out, "in review") {
 		t.Fatalf("restore:\n%s", out)
 	}
 
@@ -321,7 +332,7 @@ func TestCommandLineLifecycle(t *testing.T) {
 		t.Errorf("REST, from ok's own page: %d %s", code, body)
 	}
 	// The site still answers beside the service, on the same port.
-	req, _ := http.NewRequest(http.MethodGet, e.control+"/svc/cl/"+cl, nil)
+	req, _ := http.NewRequest(http.MethodGet, e.control+"/example/svc/cl/"+cl, nil)
 	req.Header.Set(authn.DevPrincipalKey, carol)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {

@@ -87,6 +87,7 @@ script_binary(
     script = """allowed=no
 for a in "$@"; do [ "$a" = DELETES_DATA ] && allowed=yes; done
 echo "migrating" >&2
+if [ -n "$OK_SECRETS_DIR" ]; then echo "the password is $(cat "$OK_SECRETS_DIR/prod/db")" >&2; fi
 if [ $allowed = no ]; then
   echo '{"database":"app","steps":[{"description":"0002_drop","hazards":[{"class":"DELETES_DATA","gated":true}]}],"refused":["DELETES_DATA"],"executed":false,"error":"the plan carries gated hazards that were not allowed: DELETES_DATA"}'
   exit 2
@@ -143,7 +144,7 @@ echo '{"database":"app","steps":[{"description":"0002_drop"}],"executed":true}'
 		t.Error("a target that does not exist was described")
 	}
 
-	refused, err := b.Migrate(ctx, "//db:migrate", nil)
+	refused, err := b.Migrate(ctx, "//db:migrate", nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,8 +152,16 @@ echo '{"database":"app","steps":[{"description":"0002_drop"}],"executed":true}'
 		!strings.Contains(refused.Output, "migrating") || !strings.Contains(string(refused.Report), `"0002_drop"`) {
 		t.Errorf("refused: %+v", refused)
 	}
-	applied, err := b.Migrate(ctx, "//db:migrate", []string{migrate.DeletesData})
+	// Its secrets are files for it alone, and nothing it printed holds them.
+	values := map[string][]byte{"secret/prod/db": []byte("hunter2-correct")}
+	applied, err := b.Migrate(ctx, "//db:migrate", []string{migrate.DeletesData}, values)
 	if err != nil || applied.Failed != "" || len(applied.Refused) != 0 || !strings.Contains(string(applied.Report), `"executed":true`) {
 		t.Errorf("applied: %+v (%v)", applied, err)
+	}
+	if !strings.Contains(applied.Output, "the password is [secret //secret/prod/db]") || strings.Contains(applied.Output, "hunter2") {
+		t.Errorf("the migration's output: %q", applied.Output)
+	}
+	if left, _ := filepath.Glob("/dev/shm/ok-secrets-*"); len(left) != 0 {
+		t.Errorf("secrets left behind: %v", left)
 	}
 }

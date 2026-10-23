@@ -16,6 +16,7 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{/* The server's address inside the cluster, and the deployer's. */}}
 {{- define "ok.serverAddr" -}}{{ include "ok.name" . }}-server.{{ .Release.Namespace }}.svc:{{ .Values.service.port }}{{- end -}}
 {{- define "ok.deployAddr" -}}{{ include "ok.name" . }}-deploy.{{ .Release.Namespace }}.svc:8472{{- end -}}
+{{- define "ok.secretsAddr" -}}{{ include "ok.name" . }}-secrets.{{ .Release.Namespace }}.svc:8472{{- end -}}
 
 {{/* A ServiceAccount's subject, as its tokens name it. */}}
 {{- define "ok.subject" -}}system:serviceaccount:{{ .root.Release.Namespace }}:{{ include "ok.name" .root }}-{{ .account }}{{- end -}}
@@ -35,15 +36,19 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{/* The database's URL, with its password: the server's and the deployer's, which keep tables.
      Never a worker's, which runs a change's code and keeps none. */}}
 {{- define "ok.databaseVolumes" -}}
+{{- if not .Values.database.spanner.instance -}}
 - name: database
   secret:
     secretName: {{ .Values.database.urlSecret.name }}
     items: [{key: {{ .Values.database.urlSecret.key }}, path: url}]
 {{- end -}}
+{{- end -}}
 {{- define "ok.databaseMounts" -}}
+{{- if not .Values.database.spanner.instance -}}
 - name: database
   mountPath: /etc/ok/secrets/database
   readOnly: true
+{{- end -}}
 {{- end -}}
 
 {{/* A worker's or the deployer's resources: its own, and, for a virtual checkout, the FUSE device
@@ -53,6 +58,11 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- if and (eq .checkout "virtual") .fuseResource -}}
 {{- $limits := deepCopy (default dict $r.limits) -}}
 {{- $_ := set $limits .fuseResource 1 -}}
+{{- $_ := set $r "limits" $limits -}}
+{{- end -}}
+{{- if and .microvm .microvm.enabled .microvm.kvmResource -}}
+{{- $limits := deepCopy (default dict $r.limits) -}}
+{{- $_ := set $limits .microvm.kvmResource 1 -}}
 {{- $_ := set $r "limits" $limits -}}
 {{- end -}}
 {{- if $r }}{{ toYaml $r }}{{ end -}}

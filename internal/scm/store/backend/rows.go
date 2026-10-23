@@ -1,15 +1,72 @@
 package backend
 
 import (
+	"strconv"
 	"time"
 
 	"github.com/Cidan/ok/internal/scm/encoding"
+	"github.com/Cidan/ok/internal/scm/segment"
 )
+
+// Deletion is a deleted repository whose deletion is not finished, and its network.
+type Deletion struct {
+	Repo int64
+	Net  Network
+}
+
+// NoBound is a segment read whole.
+const NoBound = -1
+
+// Network is a fork network's ID: random, as a repository's (docs/hosted.md, "Fork networks, as
+// built"). A network holds what its repositories share — packs, dictionaries, and where each chunk
+// is — and every repository is in one.
+type Network int64
+
+// Scope is what a content index or a segment is of: a repository, or a network.
+type Scope struct {
+	Network bool
+	ID      int64
+}
+
+// RepositoryScope is a repository's scope.
+func RepositoryScope(repo int64) Scope { return Scope{ID: repo} }
+
+// NetworkScope is a network's scope.
+func NetworkScope(net Network) Scope { return Scope{Network: true, ID: int64(net)} }
+
+// String is the scope as a notification names it: r or n, then the ID.
+func (s Scope) String() string {
+	if s.Network {
+		return "n" + strconv.FormatInt(s.ID, 10)
+	}
+	return "r" + strconv.FormatInt(s.ID, 10)
+}
+
+// Name is the scope in words: "repository 7", "network 7".
+func (s Scope) Name() string {
+	if s.Network {
+		return "network " + strconv.FormatInt(s.ID, 10)
+	}
+	return "repository " + strconv.FormatInt(s.ID, 10)
+}
+
+// ParseScope reads a scope String wrote.
+func ParseScope(v string) (Scope, bool) {
+	if len(v) < 2 || (v[0] != 'r' && v[0] != 'n') {
+		return Scope{}, false
+	}
+	id, err := strconv.ParseInt(v[1:], 10, 64)
+	return Scope{Network: v[0] == 'n', ID: id}, err == nil
+}
 
 // Repository is a repository's row.
 type Repository struct {
-	ID        int64
-	Name      string
+	ID      int64
+	Network Network
+	Parent  int64 // 0: a fork of none
+	// ParentSeq is, of a fork, the place in its parent's main history its own follows up to — kept
+	// when its parent is deleted, as its inherited segments are bounded there.
+	ParentSeq int64
 	Head      encoding.ID
 	HeadSeq   int64
 	CreatedAt time.Time
@@ -23,11 +80,15 @@ type Event struct {
 	Body          []byte
 }
 
-// ContentLog is one content log row.
+// ContentLog is a content log row: one transaction's changes to a content index, or a part of them.
 type ContentLog struct {
-	ID   int64
 	Body []byte
 }
+
+// LogPlace is a reader's place in a content index's log: what it has read of it, as the backend
+// tells — a Spanner read timestamp, a PostgreSQL snapshot. The store keeps and hands it back,
+// never looking inside.
+type LogPlace []byte
 
 // Pack is a pack's row: its number, size, and the dictionary that last considered it (nil:
 // none).
@@ -38,11 +99,94 @@ type Pack struct {
 	Dictionary *int64
 }
 
+// Segment is a manifest's reference to a segment: its scope's, a repository's or a network's. Net
+// is the network whose object it names; Inherited, whether a fork took it from its parent; and
+// Bound, for a kind read along main, the place in main's history it is read up to (NoBound: all of
+// it).
+type Segment struct {
+	Scope     Scope
+	Net       Network
+	Inherited bool
+	Bound     int64
+	Kind      segment.Kind
+	ID        encoding.ID
+	Level     int16
+	Records   int64
+	Size      int64
+	CreatedAt time.Time
+	// Age orders a kind's segments, newest first: InsertSegments gives one written from the tail
+	// (Age 0) the next; a merged one carries the newest of its inputs'.
+	Age int64
+}
+
+// Compacted is what one compaction moved out of the tail into segments: objects, trees' sizes
+// records, copies' parent edges, commits, main's path history, and events.
+type Compacted struct {
+	Objects   []encoding.ID
+	TreeSizes []encoding.ID
+	CopyEdges [][2]encoding.ID // copy, parent
+	Commits   []encoding.ID
+	Paths     []PathRow
+	Events    []int64 // places in the repository's log
+	// Ops are operations and views, deleted only if still touched before OpsBefore: a re-publish
+	// since keeps its row. OpTombstones are tombstones.
+	Ops          []OpRecord
+	OpsBefore    time.Time
+	OpTombstones []OpKey
+	// ChangeLists are landed CLs, deleted with their patchsets; MainLog, main's moves by place.
+	ChangeLists []int64
+	MainLog     []int64
+}
+
+// OpKey names an operation or a view in an operation log.
+type OpKey struct {
+	Log  int64
+	Kind encoding.Kind
+	ID   encoding.ID
+}
+
+// OpRecord is an operation or a view of an operation log: an operation's view, its body, and when
+// it was last published.
+type OpRecord struct {
+	OpKey
+	View      encoding.ID
+	Body      []byte
+	TouchedAt time.Time
+}
+
+// PathRow is a row of main's path history: a commit of main that changed a path, or a path below
+// a directory, at its generation.
+type PathRow struct {
+	Path       string
+	Generation int64
+	Commit     encoding.ID
+}
+
+// PathIndex is a landing whose path history is yet to be written: the commit at a generation on
+// main, and its parent.
+type PathIndex struct {
+	Generation     int64
+	Commit, Parent encoding.ID
+}
+
+// GraphCommit is a commit as the commit graph knows it: its generation and its parents, in order.
+type GraphCommit struct {
+	ID         encoding.ID
+	Generation int64
+	Parents    []encoding.ID
+}
+
+// PinnedCommit is a pinned commit in the tail, with its body, for compaction.
+type PinnedCommit struct {
+	GraphCommit
+	Body []byte
+}
+
 // RetiredPack is a retired pack.
 type RetiredPack struct {
-	Repo int64
-	ID   encoding.ID
-	Num  uint64
+	Net Network
+	ID  encoding.ID
+	Num uint64
 }
 
 // Object is a tree, symlink, copy history, operation, or view: its kind, ID, and canonical body
@@ -139,6 +283,15 @@ type Patchset struct {
 	UploadedAt time.Time
 }
 
+// SettledChangeList is a landed CL: its row, its patchsets, and the move of main that landed it,
+// with when.
+type SettledChangeList struct {
+	ChangeList
+	Patchsets []Patchset
+	Landing   HeadMove
+	LandedAt  time.Time
+}
+
 // Landing is a CL's landing on main: the commit it landed as, its parent on main, its place in
 // main's history, and the CL's description and author.
 type Landing struct {
@@ -189,6 +342,11 @@ type Workspace struct {
 	Name string
 	WorkspaceLease
 	OwnLog bool
+}
+
+// WorkspaceKey names a workspace: its principal's, by name.
+type WorkspaceKey struct {
+	Principal, Name string
 }
 
 // Checkpoint is a checkpoint's row.

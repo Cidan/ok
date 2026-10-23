@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"slices"
 	"strings"
 	"sync"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/Cidan/ok/internal/automation/store"
 	"github.com/Cidan/ok/internal/blob"
+	"github.com/Cidan/ok/internal/bus"
 )
 
 // env makes a test's stores, each over a new backend open makes and a bucket of its own, its
@@ -25,6 +27,9 @@ import (
 type env struct {
 	open     func(t *testing.T) store.Backend
 	backends map[*store.Store]store.Backend
+	blobs    map[*store.Store]blob.Store
+	// signals are the test's replicas', each store's among them.
+	signals bus.Signals
 }
 
 func (e *env) newStore(t *testing.T, cfg store.Config) *store.Store {
@@ -36,8 +41,10 @@ func (e *env) newStore(t *testing.T, cfg store.Config) *store.Store {
 		t.Fatal(err)
 	}
 	b := e.open(t)
+	cfg.Signals = e.signals
 	s := store.New(b, blobs, cfg)
 	e.backends[s] = b
+	e.blobs[s] = blobs
 	go s.Listen(ctx)
 	return s
 }
@@ -53,8 +60,12 @@ func Run(t *testing.T, open func(t *testing.T) store.Backend) {
 		{"LeaseIsFIFOAndExclusive", testLeaseIsFIFOAndExclusive},
 		{"LeaseWaits", testLeaseWaits},
 		{"Heartbeat", testHeartbeat},
+		{"LeaseKeys", testLeaseKeys},
 		{"LogAndFinish", testLogAndFinish},
 		{"LogFull", testLogFull},
+		{"LogRaces", testLogRaces},
+		{"LogGatheredAsRead", testLogGatheredAsRead},
+		{"LogLeftSegment", testLogLeftSegment},
 		{"ReadLogFollows", testReadLogFollows},
 		{"Cancel", testCancel},
 		{"SweepLapsedLeases", testSweepLapsedLeases},
@@ -69,15 +80,28 @@ func Run(t *testing.T, open func(t *testing.T) store.Backend) {
 		{"PlanRefuses", testPlanRefuses},
 		{"FeedCursor", testFeedCursor},
 		{"QueueWork", testQueueWork},
+		{"PostRunLostMarksTheQueue", testPostRunLostMarksTheQueue},
 		{"EndAndResumePre", testEndAndResumePre},
 		{"Submit", testSubmit},
 		{"Attempts", testAttempts},
+		{"StackPlannedAtItsTop", testStackPlannedAtItsTop},
 		{"DiscardAndFail", testDiscardAndFail},
 		{"OneActiveAttempt", testOneActiveAttempt},
+		{"FirstLanding", testFirstLanding},
+		{"AdoptedLandingAtOnce", testAdoptedLandingAtOnce},
 		{"QueueState", testQueueState},
 		{"CarryFromPre", testCarryFromPre},
+		{"Purge", testPurge},
+		{"Moves", testMoves},
+		{"FairShare", testFairShare},
+		{"ConcurrentClaims", testConcurrentClaims},
+		{"Flood", testFlood},
+		{"Pools", testPools},
+		{"Usage", testUsage},
 	} {
-		t.Run(tc.name, func(t *testing.T) { tc.fn(t, &env{open: open, backends: map[*store.Store]store.Backend{}}) })
+		t.Run(tc.name, func(t *testing.T) {
+			tc.fn(t, &env{open: open, backends: map[*store.Store]store.Backend{}, blobs: map[*store.Store]blob.Store{}, signals: bus.NewLocal()})
+		})
 	}
 }
 
@@ -103,7 +127,7 @@ func start(t *testing.T, s *store.Store, repo int64, job store.Job) *store.Run {
 
 func lease(t *testing.T, s *store.Store, worker string) *store.Run {
 	t.Helper()
-	r, err := s.Lease(context.Background(), worker, 0)
+	r, err := s.Lease(context.Background(), worker, "", 0)
 	if err != nil || r == nil {
 		t.Fatalf("lease for %s: %v, %v", worker, r, err)
 	}
@@ -187,7 +211,7 @@ func testLeaseIsFIFOAndExclusive(t *testing.T, e *env) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			r, err := s.Lease(context.Background(), fmt.Sprintf("w%d", i+1), 0)
+			r, err := s.Lease(context.Background(), fmt.Sprintf("w%d", i+1), "", 0)
 			if err != nil {
 				t.Error(err)
 				return
@@ -200,9 +224,11 @@ func testLeaseIsFIFOAndExclusive(t *testing.T, e *env) {
 		}()
 	}
 	wg.Wait()
+	rest := slices.Clone(want[1:])
 	slices.Sort(got)
-	if !slices.Equal(got, want[1:]) {
-		t.Errorf("leased %v, want each of %v once", got, want[1:])
+	slices.Sort(rest)
+	if !slices.Equal(got, rest) {
+		t.Errorf("leased %v, want each of %v once", got, rest)
 	}
 }
 
@@ -214,7 +240,7 @@ func testLeaseWaits(t *testing.T, e *env) {
 	time.Sleep(200 * time.Millisecond) // the listener is up
 	got := make(chan *store.Run, 1)
 	go func() {
-		r, err := s.Lease(context.Background(), "w", 30*time.Second)
+		r, err := s.Lease(context.Background(), "w", "", 30*time.Second)
 		if err != nil {
 			t.Error(err)
 		}
@@ -231,7 +257,7 @@ func testLeaseWaits(t *testing.T, e *env) {
 		t.Fatal("the waiting worker was not woken")
 	}
 	// With nothing queued, a wait ends empty.
-	if r, err := s.Lease(context.Background(), "w", 300*time.Millisecond); r != nil || err != nil {
+	if r, err := s.Lease(context.Background(), "w", "", 300*time.Millisecond); r != nil || err != nil {
 		t.Errorf("an empty queue: %+v, %v", r, err)
 	}
 }
@@ -247,7 +273,7 @@ func testHeartbeat(t *testing.T, e *env) {
 	if stop, reason, _ := s.Heartbeat(ctx, r.ID, "other"); stop != store.StopLeaseLost || reason != store.ErrLeaseLost.Error() {
 		t.Errorf("another worker's heartbeat: stop %v %q", stop, reason)
 	}
-	if _, err := s.Cancel(ctx, r.ID, "not needed"); err != nil {
+	if _, err := s.Cancel(ctx, r.ID, "not needed", ""); err != nil {
 		t.Fatal(err)
 	}
 	if stop, reason, _ := s.Heartbeat(ctx, r.ID, "w"); stop != store.StopCanceled || reason != "not needed" {
@@ -312,6 +338,10 @@ func testLogAndFinish(t *testing.T, e *env) {
 	if got, end := read(0); got != "hello world\nmore\n" || end {
 		t.Errorf("the running log: %q, end %v", got, end)
 	}
+	// A running run's log is its appends' segments in the bucket: three that each moved it.
+	if live, err := e.blobs[s].List(ctx, "live/"); err != nil || len(live) != 3 {
+		t.Errorf("the running log's segments: %v, %v", live, err)
+	}
 	if err := s.Finish(ctx, r.ID, "other", store.StatusPassed, 0, "", nil); !errors.Is(err, store.ErrLeaseLost) {
 		t.Errorf("another worker's finish: %v", err)
 	}
@@ -326,8 +356,8 @@ func testLogAndFinish(t *testing.T, e *env) {
 		done.FinishedAt.IsZero() || done.LogSize != 17 {
 		t.Errorf("finished run %+v", done)
 	}
-	if chunks, err := e.backends[s].LogChunks(ctx, r.ID, 0); err != nil || len(chunks) != 0 {
-		t.Errorf("chunks left behind: %d, %v", len(chunks), err)
+	if live, err := e.blobs[s].List(ctx, "live/"); err != nil || len(live) != 0 {
+		t.Errorf("segments left behind: %v, %v", live, err)
 	}
 	if got, end := read(0); got != "hello world\nmore\n" || !end {
 		t.Errorf("the stored log: %q, end %v", got, end)
@@ -371,6 +401,222 @@ func testLogFull(t *testing.T, e *env) {
 	}
 	if int64(b.Len()) != cfg.MaxLog || !strings.HasSuffix(b.String(), "at the 1 MiB a run keeps]\n") {
 		t.Errorf("the full log: %d bytes, ending %q", b.Len(), b.String()[b.Len()-60:])
+	}
+}
+
+// Appends racing at one offset — a request and its resends, longer as more is written — make
+// the log the worker's bytes, once each, however they interleave.
+func testLogRaces(t *testing.T, e *env) {
+	ctx := context.Background()
+	s := e.newStore(t, store.DefaultConfig)
+	r := start(t, s, 1, build("//a:b"))
+	lease(t, s, "w")
+	var log []byte
+	for i := 0; len(log) < 20_000; i++ {
+		log = fmt.Appendf(log, "line %d\n", i)
+	}
+	var wg sync.WaitGroup
+	for g := range 8 {
+		wg.Go(func() {
+			// Each sends from where it last saw the log end, a different length each time.
+			for at, n := int64(0), 1; at < int64(len(log)); n++ {
+				end := min(int64(len(log)), at+int64(1+(n*37+g*101)%900))
+				size, err := s.AppendLog(ctx, r.ID, "w", at, log[at:end])
+				if err != nil {
+					t.Errorf("an append at %d: %v", at, err)
+					return
+				}
+				at = size
+			}
+		})
+	}
+	wg.Wait()
+	var got bytes.Buffer
+	if err := s.ReadLog(ctx, r.ID, 0, false, func(_ int64, d []byte, _ bool) error { got.Write(d); return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got.Bytes(), log) {
+		t.Fatalf("the log after racing appends: %d bytes, want the worker's %d", got.Len(), len(log))
+	}
+	if err := s.Finish(ctx, r.ID, "w", store.StatusPassed, 0, "", nil); err != nil {
+		t.Fatal(err)
+	}
+	got.Reset()
+	if err := s.ReadLog(ctx, r.ID, 0, false, func(_ int64, d []byte, _ bool) error { got.Write(d); return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got.Bytes(), log) {
+		t.Fatalf("the stored log: %d bytes, want the worker's %d", got.Len(), len(log))
+	}
+}
+
+// hookedBlobs is a bucket that runs a hook, once, before a range read of a key under a prefix, and
+// fails a put of a key under another, once.
+type hookedBlobs struct {
+	blob.Store
+	mu        sync.Mutex
+	getPrefix string
+	beforeGet func()
+	failPut   string
+}
+
+func (h *hookedBlobs) GetRange(ctx context.Context, key string, offset, length int64) ([]byte, error) {
+	h.mu.Lock()
+	hook := h.beforeGet
+	if hook != nil && strings.HasPrefix(key, h.getPrefix) {
+		h.beforeGet = nil
+	} else {
+		hook = nil
+	}
+	h.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	return h.Store.GetRange(ctx, key, offset, length)
+}
+
+func (h *hookedBlobs) Put(ctx context.Context, key string, r io.Reader, size int64, opts ...blob.PutOption) error {
+	h.mu.Lock()
+	fail := h.failPut != "" && strings.HasPrefix(key, h.failPut)
+	if fail {
+		h.failPut = ""
+	}
+	h.mu.Unlock()
+	if fail {
+		return errors.New("the bucket refused it")
+	}
+	return h.Store.Put(ctx, key, r, size, opts...)
+}
+
+// A log another replica gathers into the run's object while this one reads its segments — the
+// segments deleted under the reader — is read whole: the reader finds the rest in the object. And a
+// gathering that finds another finished it first, the segments gone as it read them, ends without
+// an error.
+func testLogGatheredAsRead(t *testing.T, e *env) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	b := e.open(t)
+	plain, err := blob.NewFS(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	hooked := &hookedBlobs{Store: plain}
+	cfg := store.DefaultConfig
+	cfg.Signals = e.signals
+	s := store.New(b, hooked, cfg)
+	other := store.New(b, plain, cfg)
+	go s.Listen(ctx)
+	go other.Listen(ctx)
+	// Another replica's sweep gathers every finished run's log.
+	gatherElsewhere := func() {
+		if err := other.Sweep(ctx); err != nil {
+			t.Errorf("the other replica's sweep: %v", err)
+		}
+	}
+	logged := func() (int64, string) {
+		t.Helper()
+		r := start(t, s, 1, build("//a:b"))
+		lease(t, s, "w")
+		var want strings.Builder
+		for i := range 20 {
+			line := fmt.Sprintf("line %d\n", i)
+			if _, err := s.AppendLog(ctx, r.ID, "w", int64(want.Len()), []byte(line)); err != nil {
+				t.Fatal(err)
+			}
+			want.WriteString(line)
+		}
+		return r.ID, want.String()
+	}
+	read := func(id int64) string {
+		t.Helper()
+		var got strings.Builder
+		if err := s.ReadLog(ctx, id, 0, false, func(_ int64, d []byte, _ bool) error { got.Write(d); return nil }); err != nil {
+			t.Fatalf("reading run %d's log: %v", id, err)
+		}
+		return got.String()
+	}
+
+	// Two gatherings at once: this replica's, as the run finishes, and another's.
+	id, want := logged()
+	hooked.mu.Lock()
+	hooked.getPrefix, hooked.beforeGet = "live/", gatherElsewhere
+	hooked.mu.Unlock()
+	if err := s.Finish(ctx, id, "w", store.StatusPassed, 0, "", nil); err != nil {
+		t.Errorf("finishing as another replica gathered the log: %v", err)
+	}
+	if r, _ := s.Get(ctx, id); !r.LogStored {
+		t.Errorf("the log is not stored: %+v", r)
+	}
+	if got := read(id); got != want {
+		t.Errorf("the log gathered twice at once: %q, want %q", got, want)
+	}
+
+	// A reader of a finished log not yet gathered, gathered as it reads.
+	id, want = logged()
+	hooked.mu.Lock()
+	hooked.failPut = "runs/"
+	hooked.mu.Unlock()
+	if err := s.Finish(ctx, id, "w", store.StatusPassed, 0, "", nil); err == nil {
+		t.Fatal("the gathering the bucket refused succeeded")
+	}
+	hooked.mu.Lock()
+	hooked.getPrefix, hooked.beforeGet = "live/", gatherElsewhere
+	hooked.mu.Unlock()
+	if got := read(id); got != want {
+		t.Errorf("the log read as it was gathered: %q, want %q", got, want)
+	}
+}
+
+// A segment a request wrote where the log ends, and could not then move the log past — it lost a
+// race — holds the worker's bytes: the next append there takes it as it is, and sends what it has
+// beyond the segment after it.
+func testLogLeftSegment(t *testing.T, e *env) {
+	ctx := context.Background()
+	s := e.newStore(t, store.DefaultConfig)
+	r := start(t, s, 1, build("//a:b"))
+	lease(t, s, "w")
+	if _, err := s.AppendLog(ctx, r.ID, "w", 0, []byte("one\n")); err != nil {
+		t.Fatal(err)
+	}
+	run, err := s.Get(ctx, r.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A segment is live/<run>/<the lease's start, in microseconds>/<its offset, in hex> (logs.go).
+	leave := func(at int64, data string) {
+		t.Helper()
+		key := fmt.Sprintf("live/%d/%d/%016x", r.ID, run.StartedAt.UnixMicro(), at)
+		if err := e.blobs[s].Put(ctx, key, strings.NewReader(data), int64(len(data))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	leave(4, "two\nthr")
+	if size, err := s.AppendLog(ctx, r.ID, "w", 4, []byte("two\n")); err != nil || size != 11 {
+		t.Fatalf("an append where a longer segment was left: %d, %v; want 11", size, err)
+	}
+	if size, err := s.AppendLog(ctx, r.ID, "w", 11, []byte("ee\n")); err != nil || size != 14 {
+		t.Fatalf("the append after it: %d, %v; want 14", size, err)
+	}
+	leave(14, "fo")
+	if size, err := s.AppendLog(ctx, r.ID, "w", 14, []byte("four\n")); err != nil || size != 19 {
+		t.Fatalf("an append where a shorter segment was left: %d, %v; want 19", size, err)
+	}
+	read := func() string {
+		t.Helper()
+		var b strings.Builder
+		if err := s.ReadLog(ctx, r.ID, 0, false, func(_ int64, d []byte, _ bool) error { b.Write(d); return nil }); err != nil {
+			t.Fatal(err)
+		}
+		return b.String()
+	}
+	if got := read(); got != "one\ntwo\nthree\nfour\n" {
+		t.Fatalf("the log: %q", got)
+	}
+	if err := s.Finish(ctx, r.ID, "w", store.StatusPassed, 0, "", nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := read(); got != "one\ntwo\nthree\nfour\n" {
+		t.Fatalf("the stored log: %q", got)
 	}
 }
 
@@ -433,17 +679,17 @@ func testCancel(t *testing.T, e *env) {
 	ctx := context.Background()
 	s := e.newStore(t, store.DefaultConfig)
 	queued := start(t, s, 1, build("//a:b"))
-	c, err := s.Cancel(ctx, queued.ID, "superseded")
-	if err != nil || c.Status != store.StatusCanceled || c.Reason != "superseded" || !c.LogStored || c.FinishedAt.IsZero() {
+	c, err := s.Cancel(ctx, queued.ID, "superseded", "prn_ada")
+	if err != nil || c.Status != store.StatusCanceled || c.Reason != "superseded" || c.CanceledBy != "prn_ada" || !c.LogStored || c.FinishedAt.IsZero() {
 		t.Fatalf("a queued run: %+v, %v", c, err)
 	}
-	if r, _ := s.Lease(ctx, "w", 0); r != nil {
+	if r, _ := s.Lease(ctx, "w", "", 0); r != nil {
 		t.Errorf("a canceled run was leased: %+v", r)
 	}
 	running := start(t, s, 1, build("//a:c"))
 	lease(t, s, "w")
-	c, err = s.Cancel(ctx, running.ID, "")
-	if err != nil || c.Status != store.StatusRunning {
+	c, err = s.Cancel(ctx, running.ID, "", "prn_bob")
+	if err != nil || c.Status != store.StatusRunning || c.CanceledBy != "prn_bob" {
 		t.Fatalf("a running run is canceled by its worker: %+v, %v", c, err)
 	}
 	if stop, reason, _ := s.Heartbeat(ctx, running.ID, "w"); stop != store.StopCanceled || reason != "canceled" {
@@ -452,8 +698,8 @@ func testCancel(t *testing.T, e *env) {
 	if err := s.Finish(ctx, running.ID, "w", store.StatusCanceled, 0, "canceled", nil); err != nil {
 		t.Fatal(err)
 	}
-	c, err = s.Cancel(ctx, running.ID, "again")
-	if err != nil || c.Status != store.StatusCanceled || c.Reason != "canceled" {
+	c, err = s.Cancel(ctx, running.ID, "again", "prn_ada")
+	if err != nil || c.Status != store.StatusCanceled || c.Reason != "canceled" || c.CanceledBy != "prn_bob" {
 		t.Errorf("a finished run is left as it is: %+v, %v", c, err)
 	}
 	var b strings.Builder
@@ -506,9 +752,17 @@ func testSweepLapsedLeases(t *testing.T, e *env) {
 	if lost.Status != store.StatusError || !strings.Contains(lost.Reason, "last attempt") || !lost.LogStored {
 		t.Errorf("after two lapses: %+v", lost)
 	}
+	// Its log is its last lease's alone, each lease's segments gone with the log stored.
+	var log strings.Builder
+	if err := s.ReadLog(ctx, r.ID, 0, false, func(_ int64, d []byte, _ bool) error { log.Write(d); return nil }); err != nil || log.String() != "fresh" {
+		t.Errorf("the lost run's log: %q, %v", log.String(), err)
+	}
+	if live, err := e.blobs[s].List(ctx, "live/"); err != nil || len(live) != 0 {
+		t.Errorf("segments left behind: %v, %v", live, err)
+	}
 	c := start(t, s, 1, build("//a:c"))
 	lease(t, s, "w3")
-	if _, err := s.Cancel(ctx, c.ID, "stop it"); err != nil {
+	if _, err := s.Cancel(ctx, c.ID, "stop it", ""); err != nil {
 		t.Fatal(err)
 	}
 	lapse(c.ID)
@@ -612,7 +866,7 @@ func testRelease(t *testing.T, e *env) {
 	if size, err := s.AppendLog(ctx, r.ID, "w2", 0, []byte("whole")); err != nil || size != 5 {
 		t.Errorf("the new holder's log: %d, %v", size, err)
 	}
-	if _, err := s.Cancel(ctx, r.ID, "not wanted"); err != nil {
+	if _, err := s.Cancel(ctx, r.ID, "not wanted", ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Release(ctx, r.ID, "w2", ""); err != nil {
@@ -715,7 +969,7 @@ func testCommitsTheBuildCacheKeeps(t *testing.T, e *env) {
 	queued := start(t, s, 6, build("//a:a"))
 	done := start(t, s, 6, build("//b:b"))
 	// done finishes now: a run finished before since is not kept.
-	if _, err := s.Cancel(ctx, done.ID, "done"); err != nil {
+	if _, err := s.Cancel(ctx, done.ID, "done", ""); err != nil {
 		t.Fatal(err)
 	}
 	runs, err := s.RunCommits(ctx, time.Now().Add(time.Hour))
@@ -971,8 +1225,44 @@ func testQueueWork(t *testing.T, e *env) {
 	}
 }
 
-// Each repository's cursor is its own and never moves back; seeding sets one only where there is
-// none; a store that never followed the SCM's feed has no place in it to leave.
+// A post run lost with its worker on its last attempt ends in error, and its repository's landing
+// queue is marked to act on it, as it is for a post run that finishes.
+func testPostRunLostMarksTheQueue(t *testing.T, e *env) {
+	ctx := context.Background()
+	cfg := store.DefaultConfig
+	cfg.Heartbeat, cfg.Attempts = 100*time.Millisecond, 1
+	s := e.newStore(t, cfg)
+	sub := submit(t, s, 7, store.SubmittedCL{Number: 1, Patchset: 1})
+	if _, err := s.CreateAttempt(ctx, store.NewAttempt{SubmissionID: sub.ID, Base: commit(), BaseSeq: 1,
+		Candidates: []store.NewCandidate{{SubmissionID: sub.ID, CLNumber: 1, Patchset: 1, Commit: commit(), Base: commit(), Own: true,
+			WorkflowsCommit: commit(), Context: postContext(t, 1)}}}); err != nil {
+		t.Fatal(err)
+	}
+	plan := lease(t, s, "w") // the attempt's planning run, post's
+	if plan.Origin.Phase != store.PhasePost {
+		t.Fatalf("leased %+v, want the post plan's run", plan)
+	}
+	// The queue has acted on everything so far.
+	w := s.Work()
+	if ok, err := w.Take(ctx, store.QueueWork, 7, "queue", time.Minute); err != nil || !ok {
+		t.Fatalf("taking the queue's work: %v, %v", ok, err)
+	}
+	if _, err := w.Release(ctx, store.QueueWork, 7, "queue"); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(3*cfg.Heartbeat + 200*time.Millisecond)
+	if err := s.Sweep(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if r, _ := s.Get(ctx, plan.ID); r.Status != store.StatusError {
+		t.Fatalf("the lost post run: %+v", r)
+	}
+	if due, err := w.Due(ctx, store.QueueWork, 10); err != nil || !slices.Contains(due, 7) {
+		t.Errorf("the queue's work due after a post run was lost: %v, %v; want repository 7's", due, err)
+	}
+}
+
+// Each repository's cursor is its own and never moves back.
 func testFeedCursor(t *testing.T, e *env) {
 	ctx := context.Background()
 	s := e.newStore(t, store.DefaultConfig)
@@ -987,21 +1277,10 @@ func testFeedCursor(t *testing.T, e *env) {
 	if err := s.SetCursor(ctx, 2, 3); err != nil {
 		t.Fatal(err)
 	}
-	for _, seed := range [][2]int64{{3, 4}, {3, 8}, {1, 1}} {
-		if err := s.Seed(ctx, seed[0], seed[1]); err != nil {
-			t.Fatal(err)
-		}
-	}
-	for repo, want := range map[int64]int64{1: 9, 2: 3, 3: 4, 4: 0} {
+	for repo, want := range map[int64]int64{1: 9, 2: 3, 3: 0} {
 		if c, err := s.Cursor(ctx, repo); err != nil || c != want {
 			t.Errorf("repository %d's cursor: %d, %v; want %d", repo, c, err, want)
 		}
-	}
-	if at, err := s.LegacyCursor(ctx); err != nil || at != 0 {
-		t.Errorf("a new store's place in the legacy feed: %d, %v", at, err)
-	}
-	if err := s.LeaveLegacy(ctx); err != nil {
-		t.Errorf("leaving a legacy feed it never followed: %v", err)
 	}
 }
 
@@ -1104,8 +1383,8 @@ func testSubmit(t *testing.T, e *env) {
 	// Another repository's CL 6 is another CL.
 	submit(t, s, 2, store.SubmittedCL{Number: 6, Patchset: 1})
 
-	canceled, err := s.CancelSubmission(ctx, stack.ID, "not now")
-	if err != nil || canceled.Status != store.SubmissionCanceled || canceled.Reason != "not now" || canceled.FinishedAt.IsZero() {
+	canceled, err := s.CancelSubmission(ctx, stack.ID, "not now", "prn_ada")
+	if err != nil || canceled.Status != store.SubmissionCanceled || canceled.Reason != "not now" || canceled.CanceledBy != "prn_ada" || canceled.FinishedAt.IsZero() {
 		t.Fatalf("canceling: %+v, %v", canceled, err)
 	}
 	again := submit(t, s, 1, store.SubmittedCL{Number: 6, Patchset: 2})
@@ -1195,7 +1474,7 @@ func testAttempts(t *testing.T, e *env) {
 		t.Fatalf("the post job: %+v", job)
 	}
 	// A post run is its submission's: no one cancels or reruns it alone.
-	if _, err := s.Cancel(ctx, job.ID, "no"); err == nil {
+	if _, err := s.Cancel(ctx, job.ID, "no", ""); err == nil {
 		t.Error("a post run was canceled alone")
 	}
 	if err := s.Finish(ctx, job.ID, "w", store.StatusPassed, 0, "", nil); err != nil {
@@ -1240,9 +1519,225 @@ func testAttempts(t *testing.T, e *env) {
 		st.Main[0].CLNumber != 5 || st.Others[sub.ID] == nil || st.Landings[sub.ID] == nil || st.Landings[sub.ID].ID != id {
 		t.Errorf("the queue after landing: %+v", st)
 	}
-	if err := s.RecordLanding(ctx, sub.ID, id, nil, 0); err == nil {
+	if err := s.RecordLanding(ctx, sub.ID, id, nil, store.MainUnknown); err == nil {
 		t.Error("a submission landed twice")
 	}
+}
+
+// A repository's first landing is main's history from its first place, by its submission, and
+// so is a landing whose place the queue does not know, whichever of it and the SCM's event of
+// main's move is recorded first.
+// An adopted landing and the SCM's event of it, recorded at once, take turns (LockMain): each
+// waits while another transaction holds the repository's main, and either way main's commit has
+// its submission — which, at once without the lock, each could miss.
+// A stack's attempt plans post once, at its top (docs/automation.md, "post"): every CL of the
+// submission is its own, and lands; the top alone is planned. A top with no plan, or a plan on
+// another submission's candidate, is refused.
+func testStackPlannedAtItsTop(t *testing.T, e *env) {
+	ctx := context.Background()
+	s := e.newStore(t, store.DefaultConfig)
+	sub := submit(t, s, 1, store.SubmittedCL{Number: 5, Patchset: 1}, store.SubmittedCL{Number: 6, Patchset: 2})
+	base, low, top := commit(), commit(), commit()
+	var inv *store.InvalidError
+	for name, cands := range map[string][]store.NewCandidate{
+		"an unplanned top": {
+			{SubmissionID: sub.ID, CLNumber: 5, Patchset: 1, Commit: low, Base: base, Own: true},
+			{SubmissionID: sub.ID, CLNumber: 6, Patchset: 2, Commit: top, Base: low, Own: true},
+		},
+		"a planned chain candidate": {
+			{SubmissionID: 99, CLNumber: 4, Patchset: 1, Commit: low, Base: base, WorkflowsCommit: base, Context: postContext(t, 4)},
+			{SubmissionID: sub.ID, CLNumber: 6, Patchset: 2, Commit: top, Base: low, Own: true, WorkflowsCommit: base, Context: postContext(t, 6)},
+		},
+	} {
+		if _, err := s.CreateAttempt(ctx, store.NewAttempt{SubmissionID: sub.ID, Base: base, Candidates: cands}); !errors.As(err, &inv) {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	if _, err := s.CreateAttempt(ctx, store.NewAttempt{SubmissionID: sub.ID, Base: base, Why: "the stack was submitted", Candidates: []store.NewCandidate{
+		{SubmissionID: sub.ID, CLNumber: 5, Patchset: 1, Commit: low, Base: base, Own: true},
+		{SubmissionID: sub.ID, CLNumber: 6, Patchset: 2, Commit: top, Base: low, Own: true, WorkflowsCommit: base, Context: postContext(t, 6),
+			Touched: []string{"a/a.go", "b/b.go"}},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	plan := lease(t, s, "w")
+	if plan.Job.Kind != store.KindPlan || plan.Origin.CLNumber != 6 || !bytes.Equal(plan.CommitID, top) {
+		t.Fatalf("the planning run: %+v", plan)
+	}
+	if r, err := s.Lease(ctx, "w", "", 50*time.Millisecond); err != nil || r != nil {
+		t.Fatalf("a second planning run: %+v, %v", r, err)
+	}
+	attempts, err := s.Attempts(ctx, sub.ID)
+	if err != nil || len(attempts) != 1 {
+		t.Fatalf("attempts: %v, %v", attempts, err)
+	}
+	a := attempts[0]
+	own, planned := a.Own(), a.Planned()
+	if len(own) != 2 || own[0].CLNumber != 5 || own[0].PlanID != 0 || own[1].CLNumber != 6 || len(planned) != 1 || planned[0].CLNumber != 6 {
+		t.Fatalf("own %+v, planned %+v", own, planned)
+	}
+	if p, err := s.GetPlan(ctx, planned[0].PlanID); err != nil || !slices.Equal(p.Touched, []string{"a/a.go", "b/b.go"}) {
+		t.Errorf("the top's plan's footprint: %v (%v)", p.Touched, err)
+	}
+}
+
+func testAdoptedLandingAtOnce(t *testing.T, e *env) {
+	ctx := context.Background()
+	s := e.newStore(t, store.DefaultConfig)
+	b := e.backends[s]
+	adopt := func(repo int64) (*store.Submission, int64, []byte) {
+		t.Helper()
+		sub := submit(t, s, repo, store.SubmittedCL{Number: 1, Patchset: 1})
+		id, err := s.CreateAttempt(ctx, store.NewAttempt{SubmissionID: sub.ID, Base: commit(), BaseSeq: 0,
+			Candidates: []store.NewCandidate{{SubmissionID: sub.ID, CLNumber: 1, Patchset: 1, Commit: commit(), Base: commit(), Own: true,
+				WorkflowsCommit: commit(), Context: postContext(t, 1)}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return sub, id, commit()
+	}
+	both := func(repo int64, sub *store.Submission, attempt int64, c []byte) (landing, event chan error) {
+		landing, event = make(chan error, 1), make(chan error, 1)
+		go func() {
+			landing <- s.RecordLanding(ctx, sub.ID, attempt, []store.LandedCL{{CLNumber: 1, Commit: c}}, store.MainUnknown)
+		}()
+		go func() { event <- s.RecordMainCommit(ctx, repo, 1, c) }()
+		return landing, event
+	}
+	submitted := func(repo int64) int64 {
+		t.Helper()
+		st, err := s.QueueState(ctx, repo, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(st.Main) != 1 {
+			t.Fatalf("repository %d's main: %+v", repo, st.Main)
+		}
+		return st.Main[0].SubmissionID
+	}
+
+	// Each waits for a transaction holding repository 100's main.
+	sub, attempt, c := adopt(100)
+	held, release := make(chan struct{}), make(chan struct{})
+	holder := make(chan error, 1)
+	go func() {
+		holder <- b.Txn(ctx, func(tx store.Ops) error {
+			if err := tx.LockMain(ctx, 100); err != nil {
+				return err
+			}
+			close(held)
+			<-release
+			return nil
+		})
+	}()
+	<-held
+	landing, event := both(100, sub, attempt, c)
+	select {
+	case err := <-landing:
+		close(release)
+		t.Fatalf("the landing recorded while another held main: %v", err)
+	case err := <-event:
+		close(release)
+		t.Fatalf("the event recorded while another held main: %v", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+	close(release)
+	if err := errors.Join(<-holder, <-landing, <-event); err != nil {
+		t.Fatal(err)
+	}
+	if got := submitted(100); got != sub.ID {
+		t.Errorf("repository 100's main records submission %d, want %d", got, sub.ID)
+	}
+
+	// Many at once, each repository's main its submission's.
+	var wg sync.WaitGroup
+	subs := map[int64]int64{}
+	for repo := int64(101); repo <= 140; repo++ {
+		sub, attempt, c := adopt(repo)
+		subs[repo] = sub.ID
+		wg.Go(func() {
+			landing, event := both(repo, sub, attempt, c)
+			if err := errors.Join(<-landing, <-event); err != nil {
+				t.Error(err)
+			}
+		})
+	}
+	wg.Wait()
+	for repo, want := range subs {
+		if got := submitted(repo); got != want {
+			t.Errorf("repository %d's main records submission %d, want %d", repo, got, want)
+		}
+	}
+}
+
+func testFirstLanding(t *testing.T, e *env) {
+	ctx := context.Background()
+	s := e.newStore(t, store.DefaultConfig)
+	land := func(repo int64, fromSeq int64) (*store.Submission, []byte) {
+		t.Helper()
+		sub := submit(t, s, repo, store.SubmittedCL{Number: 1, Patchset: 1})
+		cand := commit()
+		id, err := s.CreateAttempt(ctx, store.NewAttempt{SubmissionID: sub.ID, Base: commit(), BaseSeq: 0,
+			Candidates: []store.NewCandidate{{SubmissionID: sub.ID, CLNumber: 1, Patchset: 1, Commit: cand, Base: commit(), Own: true,
+				WorkflowsCommit: commit(), Context: postContext(t, 1)}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		landed := commit()
+		if err := s.RecordLanding(ctx, sub.ID, id, []store.LandedCL{{CLNumber: 1, Commit: landed}}, fromSeq); err != nil {
+			t.Fatal(err)
+		}
+		return sub, landed
+	}
+	mainAt := func(repo int64) []store.MainCommit {
+		t.Helper()
+		st, err := s.QueueState(ctx, repo, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return st.Main
+	}
+	check := func(what string, repo int64, sub *store.Submission, landed []byte) {
+		t.Helper()
+		m := mainAt(repo)
+		if len(m) != 1 || m[0].Seq != 1 || !bytes.Equal(m[0].Commit, landed) || m[0].SubmissionID != sub.ID || m[0].CLNumber != 1 {
+			t.Errorf("%s: main %+v, want the submission %d's CL 1 at 1", what, m, sub.ID)
+		}
+	}
+
+	// The queue landed on a main with nothing on it, then the SCM's event came.
+	sub, landed := land(1, 0)
+	check("the first landing", 1, sub, landed)
+	if err := s.RecordMainCommit(ctx, 1, 1, landed); err != nil {
+		t.Fatal(err)
+	}
+	check("the first landing, its event recorded", 1, sub, landed)
+
+	// Adopted, the queue not knowing where: the SCM's event recorded after it, then before it.
+	sub, landed = land(2, store.MainUnknown)
+	if m := mainAt(2); len(m) != 0 {
+		t.Errorf("an adopted landing placed on main before its event: %+v", m)
+	}
+	if err := s.RecordMainCommit(ctx, 2, 1, landed); err != nil {
+		t.Fatal(err)
+	}
+	check("an adopted landing, its event after", 2, sub, landed)
+	early := commit()
+	if err := s.RecordMainCommit(ctx, 3, 1, early); err != nil {
+		t.Fatal(err)
+	}
+	sub3 := submit(t, s, 3, store.SubmittedCL{Number: 1, Patchset: 1})
+	cand := commit()
+	id, err := s.CreateAttempt(ctx, store.NewAttempt{SubmissionID: sub3.ID, Base: commit(), BaseSeq: 0,
+		Candidates: []store.NewCandidate{{SubmissionID: sub3.ID, CLNumber: 1, Patchset: 1, Commit: cand, Base: commit(), Own: true,
+			WorkflowsCommit: commit(), Context: postContext(t, 1)}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordLanding(ctx, sub3.ID, id, []store.LandedCL{{CLNumber: 1, Commit: early}}, store.MainUnknown); err != nil {
+		t.Fatal(err)
+	}
+	check("an adopted landing, its event before", 3, sub3, early)
 }
 
 func testDiscardAndFail(t *testing.T, e *env) {
@@ -1347,7 +1842,7 @@ func testQueueState(t *testing.T, e *env) {
 	if _, err := s.CreateAttempt(ctx, store.NewAttempt{SubmissionID: two.ID, Base: commit(), BaseSeq: 4, Chain: []int64{one.ID}}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.CancelSubmission(ctx, one.ID, "no"); err != nil {
+	if _, err := s.CancelSubmission(ctx, one.ID, "no", ""); err != nil {
 		t.Fatal(err)
 	}
 	c5, c6 := commit(), commit()
@@ -1368,8 +1863,8 @@ func testQueueState(t *testing.T, e *env) {
 		st.Others[one.ID] == nil || st.Others[one.ID].Status != store.SubmissionCanceled || !bytes.Equal(st.LandedCLs[3], c6) {
 		t.Fatalf("the queue: %+v", st)
 	}
-	if repos, err := s.QueueRepositories(ctx, 0); err != nil || len(repos) != 1 || repos[0] != 3 {
-		t.Errorf("the queue's repositories: %v, %v", repos, err)
+	if due, err := s.Work().Due(ctx, store.QueueWork, 10); err != nil || !slices.Contains(due, 3) {
+		t.Errorf("the queue's work due: %v, %v; want repository 3's", due, err)
 	}
 }
 
@@ -1493,4 +1988,68 @@ func attemptVerdict(t *testing.T, s *store.Store, sub int64) (string, string, er
 		}
 	}
 	return "finished", "", nil
+}
+
+// A repository the directory purged is forgotten whole: its runs' logs — gathered, and a lease's
+// segments — and its runs and submissions, however often it is purged; another repository keeps
+// all of its own.
+func testPurge(t *testing.T, e *env) {
+	ctx := context.Background()
+	s := e.newStore(t, store.DefaultConfig)
+	finished := start(t, s, 1, build("//a:b"))
+	lease(t, s, "w")
+	if _, err := s.AppendLog(ctx, finished.ID, "w", 0, []byte("done\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Finish(ctx, finished.ID, "w", store.StatusPassed, 0, "", nil); err != nil {
+		t.Fatal(err)
+	}
+	running := start(t, s, 1, build("//a:c"))
+	lease(t, s, "w")
+	if _, err := s.AppendLog(ctx, running.ID, "w", 0, []byte("going\n")); err != nil {
+		t.Fatal(err)
+	}
+	other := start(t, s, 2, build("//a:b"))
+	if _, err := s.Submit(ctx, store.SubmitRequest{RepositoryID: 1, CLs: []store.SubmittedCL{{Number: 1, Patchset: 1}}, SubmittedBy: submitter}); err != nil {
+		t.Fatal(err)
+	}
+	objects := func(prefix string) int {
+		t.Helper()
+		os, err := e.blobs[s].List(ctx, prefix)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return len(os)
+	}
+	if objects(fmt.Sprintf("runs/%d", finished.ID)) != 1 || objects(fmt.Sprintf("live/%d/", running.ID)) == 0 {
+		t.Fatalf("the logs before the purge: %d gathered, %d segments", objects(fmt.Sprintf("runs/%d", finished.ID)), objects(fmt.Sprintf("live/%d/", running.ID)))
+	}
+	for i := 0; i < 2; i++ {
+		if err := s.PurgeRepository(ctx, 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, id := range []int64{finished.ID, running.ID} {
+		if _, err := s.Get(ctx, id); !errors.Is(err, store.ErrNotFound) {
+			t.Errorf("run %d after the purge: %v", id, err)
+		}
+	}
+	if n := objects(fmt.Sprintf("runs/%d", finished.ID)) + objects(fmt.Sprintf("live/%d/", running.ID)); n != 0 {
+		t.Errorf("log objects after the purge: %d", n)
+	}
+	if subs, err := s.ListSubmissions(ctx, 1, 1, 10); err != nil || len(subs) != 0 {
+		t.Errorf("submissions after the purge: %v, %v", subs, err)
+	}
+	if _, err := s.Get(ctx, other.ID); err != nil {
+		t.Errorf("another repository's run: %v", err)
+	}
+	if err := s.SetDirectoryCursor(ctx, 1, 4); err != nil {
+		t.Fatal(err)
+	}
+	if c, err := s.DirectoryCursor(ctx, 1); err != nil || c != 4 {
+		t.Errorf("the directory's cursor = %d, %v", c, err)
+	}
+	if c, _ := s.Cursor(ctx, 1); c != 0 {
+		t.Errorf("the SCM's cursor moved with the directory's: %d", c)
+	}
 }

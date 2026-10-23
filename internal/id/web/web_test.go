@@ -8,10 +8,10 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"regexp"
 	"strings"
 	"testing"
 
-	"github.com/jackc/pgx/v5/pgxpool"
 	"google.golang.org/grpc"
 
 	"github.com/Cidan/ok/internal/credential"
@@ -62,14 +62,13 @@ type env struct {
 	client *http.Client
 }
 
-func newEnv(t *testing.T) *env {
+func newEnv(t *testing.T) *env { return newEnvWith(t, nil) }
+
+// newEnvWith is newEnv with its pages' configuration changed by with.
+func newEnvWith(t *testing.T, with func(*web.Config)) *env {
 	t.Helper()
 	ctx := context.Background()
-	pool, err := pgxpool.New(ctx, testdb.Postgres(t))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(pool.Close)
+	pool := testdb.Pool(t)
 	b, err := idpostgres.Open(ctx, pool)
 	st := store.New(b, names)
 	if err != nil {
@@ -103,8 +102,13 @@ func newEnv(t *testing.T) *env {
 	if err != nil {
 		t.Fatal(err)
 	}
-	svc := service.New(service.Config{Store: st, CA: authority, PublicURL: base, BootstrapAdmins: []string{"ada"}})
-	pages := web.New(web.Config{Store: st, Services: svc, Installation: "Example ok", PublicURL: base, OIDC: []*signin.OIDC{provider}, Passkeys: passkeys})
+	wc := web.Config{Store: st, Installation: "Example ok", PublicURL: base, OIDC: []*signin.OIDC{provider}, Passkeys: passkeys}
+	if with != nil {
+		with(&wc)
+	}
+	svc := service.New(service.Config{Store: st, CA: authority, PublicURL: base, BootstrapAdmins: []string{"ada"}, Hosted: wc.Hosted})
+	wc.Services = svc
+	pages := web.New(wc)
 	resolver := authn.NewResolver(authn.Config{Directory: service.Directory{Store: st}, Credentials: credential.NewVerifier(authority.Pool)})
 	chain := interceptor.New()
 	chain.UseUnary(resolver.UnaryInterceptor())
@@ -290,4 +294,57 @@ func TestAdminAndPasskeyBegin(t *testing.T) {
 	if code, _, _ := e.get(t, "/id/assets/app.css"); code != 200 {
 		t.Errorf("app.css: %d", code)
 	}
+}
+
+// A person makes a personal token on their account page, its secret shown that once, and revokes
+// it there; a token signs no one in to these pages, which manage an account.
+func TestTokensPage(t *testing.T) {
+	e := newEnv(t)
+	if _, _, where := e.signIn(t, map[string]any{"email": "bea@example.com", "email_verified": true}); where.Path != "/id/account" {
+		t.Fatalf("signed in to %s", where)
+	}
+	code, body, _ := e.post(t, "/id/account/tokens", url.Values{"label": {"ci"}, "role": {"read"}, "days": {"30"}}, e.base)
+	secret := regexp.MustCompile(`okp_[A-Za-z0-9_-]{40,}`).FindString(body)
+	if code != http.StatusOK || secret == "" || !strings.Contains(body, "not shown again") || !strings.Contains(body, "read on every repository you may reach") {
+		t.Fatalf("making a token: %d\n%s", code, body)
+	}
+	if _, body, _ := e.get(t, "/id/account"); strings.Contains(body, secret) || !strings.Contains(body, ">ci<") {
+		t.Errorf("the account page after: the secret shown again, or the token not listed:\n%s", body)
+	}
+	if code, body, _ := e.post(t, "/id/account/tokens", url.Values{"label": {"x"}, "repositories": {"nobody/none"}}, e.base); code != http.StatusOK ||
+		!strings.Contains(body, "no repository is called nobody/none") {
+		t.Errorf("a token for a repository there is none of: %d\n%s", code, body)
+	}
+
+	// A bearer token is no one here.
+	req, _ := http.NewRequest(http.MethodGet, e.base+"/id/account", nil)
+	req.Header.Set("Authorization", "Bearer "+secret)
+	resp, err := (&http.Client{}).Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.Request.URL.Path != "/id/login" {
+		t.Errorf("the account page with a bearer token: %s", resp.Request.URL)
+	}
+
+	ts, err := e.store.Tokens(context.Background(), principalID(t, e, "bea.human.example.com"))
+	if err != nil || len(ts) != 1 {
+		t.Fatalf("Tokens = %v, %v", ts, err)
+	}
+	if _, _, where := e.post(t, "/id/account/tokens/revoke", url.Values{"id": {ts[0].ID}}, e.base); where.Path != "/id/account" {
+		t.Errorf("revoking: %s", where)
+	}
+	if _, _, err := e.store.TokenFor(context.Background(), secret); err == nil {
+		t.Error("the revoked token still stands")
+	}
+}
+
+func principalID(t *testing.T, e *env, name string) string {
+	t.Helper()
+	p, err := e.store.Principal(context.Background(), name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p.ID
 }

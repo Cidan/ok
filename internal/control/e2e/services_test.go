@@ -1,6 +1,7 @@
 package e2e
 
 import (
+	"context"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -34,6 +35,15 @@ func TestServices(t *testing.T) {
 		t.Fatal(err)
 	}
 	repo := cl.Repo
+	// Another repository, which a service of the group deploys from; a service whose repository no
+	// one may read is listed to no one.
+	e.post(dana, "/repositories/new", url.Values{"name": {"other"}})
+	var otherRepo int64
+	e.waitFor("the other repository in ok control", func() bool {
+		r, ok, err := e.db.RepositoryByName(context.Background(), "other")
+		otherRepo = r.ID
+		return err == nil && ok
+	})
 	now := timestamppb.New(time.Now())
 	const good = "registry.example.com/smoke/serve@sha256:674607bcb740114a2514ec3520eaa59f5e3199e9b364623042f8304bca02b019"
 	const other = "registry.example.com/smoke/serve@sha256:badac5eedca09b2b87de1aa2d2af68f359d9416d5435518b6d30f81facc85253"
@@ -77,7 +87,7 @@ func TestServices(t *testing.T) {
 			Deployed: dep(1, deploypb.Deployment_STATUS_SUCCEEDED, good, ""), Latest: dep(1, deploypb.Deployment_STATUS_SUCCEEDED, good, ""),
 			Running: running(1, good, pods(1, good, good))},
 		// edge spans repositories: one name, one group.
-		{Id: 7, RepositoryId: 999, Repository: "other", Name: "cache", Group: "edge", Workload: wl("cache"), Declared: true, Running: &deploypb.Running{}},
+		{Id: 7, RepositoryId: otherRepo, Repository: "other", Name: "cache", Group: "edge", Workload: wl("cache"), Declared: true, Running: &deploypb.Running{}},
 	}
 	e.deployer.mu.Unlock()
 
@@ -126,7 +136,7 @@ func TestServices(t *testing.T) {
 	// A group's overview: its status, its services, and its latest deployments across them,
 	// beside the sub-nav — the overview selected.
 	p = e.get(carol, "/services/group/edge")
-	for _, want := range []string{"edge", "Last Deploy Failed", "1 of 4 services", "Recent Deployments", "Deployment 1", `href="/svc/deploy/1"`,
+	for _, want := range []string{"edge", "Last Deploy Failed", "1 of 4 services", "Recent Deployments", "Deployment 1", `href="/example/svc/deploy/1"`,
 		`href="/services/7"`, "other · deployment smoke/cache", `aria-current="page"`, `hx-get="/services/group/edge" hx-trigger="every 5s"`} {
 		if !p.has(want) {
 			t.Errorf("edge's overview lacks %q: %s", want, excerpt(p.body))
@@ -140,7 +150,7 @@ func TestServices(t *testing.T) {
 	// service selected in the sub-nav and its group in the breadcrumb.
 	p = e.get(carol, "/services/1")
 	for _, want := range []string{"serve", "Healthy", "Live Copy", "green", "2 of 2 pods", "Deployment 1", "CL #" + itoa(n), good,
-		"serve-green-a", "Ready", "Recent Deployments", `href="/svc/deploy/1"`, ">edge</a>", "Overview"} {
+		"serve-green-a", "Ready", "Recent Deployments", `href="/example/svc/deploy/1"`, ">edge</a>", "Overview"} {
 		if !p.has(want) {
 			t.Errorf("serve's page lacks %q: %s", want, excerpt(p.body))
 		}
