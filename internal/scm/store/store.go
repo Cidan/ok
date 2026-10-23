@@ -1,32 +1,24 @@
-// Package store is ok's SCM's storage core (docs/scm.md, "The server"): the
-// PostgreSQL schema and the S3 packs behind it, the Publish protocol with full
-// verification, closure, transitive touching, and atomicity, every Store read, the
-// per-principal operation logs, operation collection, and fsck.
+// Package store is ok's SCM's storage core (docs/scm.md, "The server"): the Publish protocol
+// with full verification, closure, transitive touching, and atomicity, every Store read, the
+// per-principal operation logs, operation collection, and fsck — over a database (a
+// backend.Backend: internal/scm/store/postgres) and the packs in object storage.
 //
-// Every object a repository holds lives in PostgreSQL as its canonical body, except file
-// contents, which live as chunks in packs on S3. Replicas are stateless: all coordination
-// is PostgreSQL row locks, and every mutation is one transaction.
+// Every object a repository holds lives in the database as its canonical body, except file
+// contents, which live as chunks in packs in object storage. Replicas are stateless: all
+// coordination is the database's row locks, and every mutation is one transaction.
 package store
 
 import (
 	"context"
-	"embed"
 	"errors"
 	"fmt"
-	"math/rand/v2"
 	"sort"
-	"sync"
-	"time"
-
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Cidan/ok/internal/blob"
+	"github.com/Cidan/ok/internal/data"
 	"github.com/Cidan/ok/internal/identity"
-	"github.com/Cidan/ok/internal/lock"
-	"github.com/Cidan/ok/internal/migrate"
 	"github.com/Cidan/ok/internal/scm/encoding"
+	"github.com/Cidan/ok/internal/scm/store/backend"
 )
 
 // Errors a caller maps to a gRPC status. Wrap them with %w.
@@ -90,12 +82,6 @@ const (
 	DefaultDiffCacheBytes   = 64 << 20
 )
 
-//go:embed migrations/*.sql
-var migrations embed.FS
-
-// Migrations are the SCM's schema.
-var Migrations = migrate.MustLoad(migrations, "migrations")
-
 // readLimits bound how files are read (read.go, browse_diff.go).
 type readLimits struct {
 	// windowBytes and windowChunks bound the chunks ReadFiles reads together: their bytes, and
@@ -128,12 +114,11 @@ const MaxChunkLen = 256 << 10
 // verifies on every write"). ok's jj snapshots nothing larger by default.
 const MaxFileSize = 50 << 20
 
-// Store is the storage core over one PostgreSQL database and one bucket.
+// Store is the storage core over one database and one bucket.
 type Store struct {
-	pool    *pgxpool.Pool
+	b       backend.Backend
 	names   identity.Names
 	email   string // the email domain
-	locks   *lock.Lock
 	blobs   blob.Store
 	objects *cache[[]byte]
 	chunks  *cache[storedChunk]
@@ -141,8 +126,6 @@ type Store struct {
 	dicts   *dictionaries
 	reads   readLimits
 	events  eventHub
-	// txLogs holds each open transaction's content index changes (cindex.go), by transaction.
-	txLogs sync.Map
 	// indexes are the content indexes this replica reads files and chunks through.
 	indexes liveIndexes
 	// txAttempts counts transaction attempts (a test observes deadlock retries).
@@ -157,14 +140,10 @@ type Store struct {
 	dictionaryMinSamples int
 }
 
-// Open brings the database behind pool to the SCM's schema and returns a Store over it and the
-// bucket behind blobs.
-func Open(ctx context.Context, pool *pgxpool.Pool, blobs blob.Store, cfg Config) (*Store, error) {
+// New is a Store over a database and the bucket behind blobs.
+func New(b backend.Backend, blobs blob.Store, cfg Config) (*Store, error) {
 	if cfg.Names.Domain() == "" {
 		return nil, errors.New("the SCM's store needs the installation's names")
-	}
-	if _, err := migrate.Apply(ctx, pool, "scm", Migrations); err != nil {
-		return nil, err
 	}
 	if cfg.EmailDomain == "" {
 		cfg.EmailDomain = cfg.Names.Domain()
@@ -179,10 +158,9 @@ func Open(ctx context.Context, pool *pgxpool.Pool, blobs blob.Store, cfg Config)
 		cfg.DiffCacheBytes = DefaultDiffCacheBytes
 	}
 	s := &Store{
-		pool:    pool,
+		b:       b,
 		names:   cfg.Names,
 		email:   cfg.EmailDomain,
-		locks:   lock.New(pool),
 		blobs:   blobs,
 		objects: newCache[[]byte]("objects", cfg.ObjectCacheBytes),
 		chunks:  newCache[storedChunk]("chunks", cfg.ChunkCacheBytes),
@@ -201,25 +179,30 @@ func (s *Store) Names() identity.Names { return s.names }
 // EmailDomain is what a person's handle is an address at.
 func (s *Store) EmailDomain() string { return s.email }
 
-// retryable reports a transaction PostgreSQL aborted to break a deadlock or a
-// serialization conflict, or one that lost a race the store detects itself (errRace);
-// running it again is safe.
-func retryable(err error) bool {
-	var pg *pgconn.PgError
-	return errors.Is(err, errRace) || errors.As(err, &pg) && (pg.Code == "40P01" || pg.Code == "40001")
+// txn is one attempt at a read-write transaction: the database's operations, bound to it, and
+// what it changed in a repository's content index (cindex.go), written as it commits.
+type txn struct {
+	backend.Ops
+	log *txLog
 }
 
-// inTx runs fn in a transaction, re-running it when PostgreSQL aborts it as a deadlock
-// victim. fn must have no effects outside the transaction.
-func (s *Store) inTx(ctx context.Context, fn func(pgx.Tx) error) error {
-	const attempts = 10
-	for attempt := 1; ; attempt++ {
+// retryable reports a transaction the database aborted to break a deadlock or a conflict, or
+// one that lost a race the store detects itself (errRace); running it again is safe.
+func (s *Store) retryable(err error) bool {
+	return errors.Is(err, errRace) || s.b.Retryable(err)
+}
+
+// inTx runs fn in a transaction, re-running it (data.Retry) when the database aborts it as a
+// deadlock victim or it loses a race the store detects. fn must have no effects outside the
+// transaction.
+func (s *Store) inTx(ctx context.Context, fn func(*txn) error) error {
+	return data.Retry(ctx, s.retryable, func() error {
 		if s.txAttempts != nil {
 			s.txAttempts()
 		}
 		var logged *loggedRow
-		err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-			defer s.txLogs.Delete(tx)
+		err := s.b.Txn(ctx, func(ops backend.Ops) error {
+			tx := &txn{Ops: ops}
 			if err := fn(tx); err != nil {
 				return err
 			}
@@ -230,32 +213,8 @@ func (s *Store) inTx(ctx context.Context, fn func(pgx.Tx) error) error {
 		if err == nil && logged != nil {
 			s.indexChanged(logged.repo)
 		}
-		if err == nil || !retryable(err) || attempt == attempts {
-			return err
-		}
-		backoff := time.Duration(attempt*attempt) * 5 * time.Millisecond
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(backoff/2 + rand.N(backoff/2+1)):
-		}
-	}
-}
-
-// ids converts IDs to the [][]byte pgx sends as bytea[].
-func ids(in []encoding.ID) [][]byte {
-	out := make([][]byte, len(in))
-	for i := range in {
-		out[i] = in[i][:]
-	}
-	return out
-}
-
-func toID(b []byte) (encoding.ID, error) {
-	if len(b) != encoding.IDLen {
-		return encoding.ID{}, fmt.Errorf("stored ID of %d bytes", len(b))
-	}
-	return encoding.ID(b), nil
+		return err
+	})
 }
 
 // sortIDs sorts IDs bytewise, the order every multi-row write takes its row locks in, so
@@ -265,4 +224,4 @@ func sortIDs(in []encoding.ID) {
 }
 
 // Healthy reports whether the database answers.
-func (s *Store) Healthy(ctx context.Context) bool { return s.pool.Ping(ctx) == nil }
+func (s *Store) Healthy(ctx context.Context) bool { return s.b.Ping(ctx) == nil }

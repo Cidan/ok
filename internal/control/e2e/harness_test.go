@@ -31,6 +31,7 @@ import (
 	"github.com/Cidan/ok/internal/blob"
 	"github.com/Cidan/ok/internal/config"
 	"github.com/Cidan/ok/internal/control/db"
+	"github.com/Cidan/ok/internal/control/db/postgres"
 	"github.com/Cidan/ok/internal/control/people"
 	"github.com/Cidan/ok/internal/control/role"
 	"github.com/Cidan/ok/internal/dial"
@@ -42,6 +43,7 @@ import (
 	"github.com/Cidan/ok/internal/serve/authn"
 	"github.com/Cidan/ok/internal/serve/node"
 	"github.com/Cidan/ok/internal/testdb"
+	"github.com/Cidan/ok/internal/testdb/testobjects"
 	"github.com/Cidan/ok/internal/testjj"
 	automationpb "github.com/Cidan/ok/proto/ok/automation/v1"
 	identitypb "github.com/Cidan/ok/proto/ok/identity/v1"
@@ -77,7 +79,7 @@ type env struct {
 	// control is ok control as it is deployed: its pages and its ChangeLists service on one port —
 	// what ok's jj calls (ok.web-url).
 	control string
-	db      *db.DB
+	db      db.Store
 	client  *http.Client
 	// work is ok automation's side for workers, which a test plays; stopAutomation takes
 	// automation away.
@@ -125,12 +127,7 @@ func as(t *testing.T, addr, principal string) *grpc.ClientConn {
 
 func bucket(t *testing.T) blob.Store {
 	t.Helper()
-	s3 := testdb.S3(t)
-	b, err := blob.NewS3(blob.Config{Endpoint: s3.Endpoint, Bucket: testdb.Bucket(t), AccessKey: s3.AccessKey, SecretKey: s3.SecretKey, Region: s3.Region})
-	if err != nil {
-		t.Fatal(err)
-	}
-	return b
+	return testobjects.Store(t)
 }
 
 func members(names ...string) string {
@@ -306,7 +303,7 @@ identity:
 	}
 	t.Cleanup(ctl.Close)
 	serveRole(t, ctx, controlLis, ctl.Root, serve.WithAuthn(ctl.Resolver))
-	d, err := db.Open(ctx, open(role.Schema))
+	d, err := postgres.Open(ctx, open(role.Schema))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -508,12 +505,11 @@ func clPath(repo string, n int64) string { return fmt.Sprintf("/%s/cl/%d", repo,
 // hasEvent reports whether a CL's change log has an entry of kind.
 func (e *env) hasEvent(repo string, n int64, kind db.EventKind) bool {
 	e.t.Helper()
-	var id int64
-	err := e.db.Q().QueryRow(context.Background(), `SELECT r.id FROM repository r WHERE r.name = $1`, repo).Scan(&id)
-	if err != nil {
+	r, ok, err := e.db.RepositoryByName(context.Background(), repo)
+	if err != nil || !ok {
 		return false
 	}
-	evs, err := db.Events(context.Background(), e.db.Q(), id, n)
+	evs, err := e.db.Events(context.Background(), r.ID, n)
 	if err != nil {
 		e.t.Fatal(err)
 	}

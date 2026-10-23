@@ -10,7 +10,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -18,12 +17,13 @@ import (
 	"github.com/Cidan/ok/internal/control/people"
 	"github.com/Cidan/ok/internal/control/scm"
 	"github.com/Cidan/ok/internal/owners"
+	"github.com/Cidan/ok/internal/scm/scmfeed"
 	scmpb "github.com/Cidan/ok/proto/ok/scm/v1"
 )
 
 // Service is ok control's review process over its database and the SCM.
 type Service struct {
-	db     *db.DB
+	db     db.Store
 	scm    *scm.Client
 	auto   Automation
 	people *people.Directory
@@ -40,7 +40,7 @@ type Service struct {
 // gates submit, and its landing queue lands what is submitted. dir is ok identity's directory:
 // its people, its sets, and who administers ok — every repository, besides each one's creator.
 // treeRepository names the repository whose groups-and-ACLs tree is ok's, if any.
-func New(d *db.DB, c *scm.Client, auto Automation, dir *people.Directory, treeRepository string) *Service {
+func New(d db.Store, c *scm.Client, auto Automation, dir *people.Directory, treeRepository string) *Service {
 	s := &Service{db: d, scm: c, auto: auto, people: dir, treeRepository: treeRepository, feedWait: 10 * time.Second}
 	if dir != nil {
 		s.identityDir = dir
@@ -103,10 +103,10 @@ func (s *Service) ChangeList(ctx context.Context, repo, number int64) (db.Change
 		return db.ChangeList{}, nil, err
 	}
 	// The SCM is authoritative: bring the projection up to it before reading.
-	if _, err := db.UpsertChangeList(ctx, s.db.Q(), scm.ChangeListOut(c)); err != nil {
+	if _, err := s.db.UpsertChangeList(ctx, scm.ChangeListOut(c)); err != nil {
 		return db.ChangeList{}, nil, err
 	}
-	p, ok, err := db.GetChangeList(ctx, s.db.Q(), repo, number)
+	p, ok, err := s.db.GetChangeList(ctx, repo, number)
 	if err != nil {
 		return db.ChangeList{}, nil, err
 	}
@@ -263,11 +263,11 @@ func (s *Service) Evaluate(ctx context.Context, cl db.ChangeList, c *scmpb.Chang
 			return nil, fmt.Errorf("the files rollback CL %d edits by hand: %w", cl.Number, err)
 		}
 	}
-	rows, err := db.Grants(ctx, s.db.Q(), cl.Repo, cl.Number)
+	rows, err := s.db.Grants(ctx, cl.Repo, cl.Number)
 	if err != nil {
 		return nil, err
 	}
-	unresolved, err := db.UnresolvedThreads(ctx, s.db.Q(), cl.Repo, cl.Number)
+	unresolved, err := s.db.UnresolvedThreads(ctx, cl.Repo, cl.Number)
 	if err != nil {
 		return nil, err
 	}
@@ -363,8 +363,8 @@ func (s *Service) Refresh(ctx context.Context, repo, number int64) error {
 		return err
 	}
 	ok := ev.Status.Satisfied()
-	return s.db.InTx(ctx, func(tx pgx.Tx) error {
-		changed, err := db.SetApproved(ctx, tx, repo, number, ok)
+	return s.db.Txn(ctx, func(tx db.Ops) error {
+		changed, err := tx.SetApproved(ctx, repo, number, ok)
 		if err != nil || !changed {
 			return err
 		}
@@ -372,20 +372,20 @@ func (s *Service) Refresh(ctx context.Context, repo, number int64) error {
 		if ok {
 			kind = db.EventApproved
 		}
-		return db.RecordEvent(ctx, tx, repo, number, db.Event{Kind: kind, Patchset: cl.CurrentPatchset})
+		return tx.RecordEvent(ctx, repo, number, db.Event{Kind: kind, Patchset: cl.CurrentPatchset})
 	})
 }
 
-// WaitForFeed waits until the change feed has applied the SCM event seq, so a page
-// rendered after an action shows it; after feedWait it gives up and the page renders
-// from the projection the action already updated.
-func (s *Service) WaitForFeed(ctx context.Context, seq int64) error {
+// WaitForFeed waits until the change feed has applied a repository's event seq (its place in
+// the repository's log), so a page rendered after an action shows it; after feedWait it gives
+// up and the page renders from the projection the action already updated.
+func (s *Service) WaitForFeed(ctx context.Context, repo, seq int64) error {
 	if seq == 0 {
 		return nil
 	}
 	deadline := time.Now().Add(s.feedWait)
 	for {
-		cur, err := db.Cursor(ctx, s.db.Q())
+		cur, err := s.db.FollowCursor(ctx, scmfeed.Topic, repo)
 		if err != nil || cur >= seq || time.Now().After(deadline) {
 			return err
 		}
@@ -408,10 +408,10 @@ func (s *Service) transition(ctx context.Context, cl db.ChangeList, kind scmpb.T
 	if err != nil {
 		return err
 	}
-	if _, err := db.UpsertChangeList(ctx, s.db.Q(), scm.ChangeListOut(resp.GetChangeList())); err != nil {
+	if _, err := s.db.UpsertChangeList(ctx, scm.ChangeListOut(resp.GetChangeList())); err != nil {
 		return err
 	}
-	return s.WaitForFeed(ctx, resp.GetEventSeq())
+	return s.WaitForFeed(ctx, cl.Repo, resp.GetRepositorySeq())
 }
 
 func (s *Service) requireManage(ctx context.Context, repo *scmpb.Repository, cl db.ChangeList, principal, action string) error {
@@ -445,14 +445,14 @@ func (s *Service) checkReviewers(ctx context.Context, cl db.ChangeList, principa
 }
 
 // assign adds reviewers inside a transaction, recording each new one.
-func assign(ctx context.Context, tx pgx.Tx, cl db.ChangeList, by string, reviewers []string) error {
+func assign(ctx context.Context, tx db.Ops, cl db.ChangeList, by string, reviewers []string) error {
 	for _, p := range reviewers {
-		added, err := db.AddReviewer(ctx, tx, cl.Repo, cl.Number, p, by)
+		added, err := tx.AddReviewer(ctx, cl.Repo, cl.Number, p, by)
 		if err != nil {
 			return err
 		}
 		if added {
-			if err := db.RecordEvent(ctx, tx, cl.Repo, cl.Number, db.Event{Actor: by, Kind: db.EventReviewerAdded, Subject: p, Patchset: cl.CurrentPatchset}); err != nil {
+			if err := tx.RecordEvent(ctx, cl.Repo, cl.Number, db.Event{Actor: by, Kind: db.EventReviewerAdded, Subject: p, Patchset: cl.CurrentPatchset}); err != nil {
 				return err
 			}
 		}
@@ -461,12 +461,12 @@ func assign(ctx context.Context, tx pgx.Tx, cl db.ChangeList, by string, reviewe
 }
 
 // postMessage posts a CL-level comment ("" posts nothing).
-func postMessage(ctx context.Context, tx pgx.Tx, cl db.ChangeList, by, message string) error {
+func postMessage(ctx context.Context, tx db.Ops, cl db.ChangeList, by, message string) error {
 	message = strings.TrimSpace(message)
 	if message == "" {
 		return nil
 	}
-	_, err := db.CreateComment(ctx, tx, cl.Repo, db.Comment{Number: cl.Number, Patchset: cl.CurrentPatchset, Author: by, Body: message})
+	_, err := tx.CreateComment(ctx, cl.Repo, db.Comment{Number: cl.Number, Patchset: cl.CurrentPatchset, Author: by, Body: message})
 	return err
 }
 
@@ -484,7 +484,7 @@ func (s *Service) RequestReview(ctx context.Context, repo *scmpb.Repository, cl 
 	if err := s.transition(ctx, cl, scmpb.TransitionRequest_KIND_REQUEST_REVIEW, principal, ""); err != nil {
 		return err
 	}
-	if err := s.db.InTx(ctx, func(tx pgx.Tx) error {
+	if err := s.db.Txn(ctx, func(tx db.Ops) error {
 		if err := assign(ctx, tx, cl, principal, reviewers); err != nil {
 			return err
 		}
@@ -540,7 +540,7 @@ func (s *Service) Rollback(ctx context.Context, cl db.ChangeList, principal, rea
 	if reason == "" {
 		return 0, refuse("Say why CL %d is rolled back", cl.Number)
 	}
-	rs, err := db.Reviewers(ctx, s.db.Q(), cl.Repo, cl.Number)
+	rs, err := s.db.Reviewers(ctx, cl.Repo, cl.Number)
 	if err != nil {
 		return 0, err
 	}
@@ -559,10 +559,10 @@ func (s *Service) Rollback(ctx context.Context, cl db.ChangeList, principal, rea
 	if err != nil {
 		return 0, err
 	}
-	if _, err := db.UpsertChangeList(ctx, s.db.Q(), scm.ChangeListOut(resp.GetChangeList())); err != nil {
+	if _, err := s.db.UpsertChangeList(ctx, scm.ChangeListOut(resp.GetChangeList())); err != nil {
 		return 0, err
 	}
-	if err := s.WaitForFeed(ctx, resp.GetEventSeq()); err != nil {
+	if err := s.WaitForFeed(ctx, cl.Repo, resp.GetRepositorySeq()); err != nil {
 		return 0, err
 	}
 	return resp.GetChangeList().GetNumber(), nil
@@ -570,7 +570,7 @@ func (s *Service) Rollback(ctx context.Context, cl db.ChangeList, principal, rea
 
 // IsReviewer reports whether principal reviews the CL.
 func (s *Service) IsReviewer(ctx context.Context, cl db.ChangeList, principal string) (bool, error) {
-	rs, err := db.Reviewers(ctx, s.db.Q(), cl.Repo, cl.Number)
+	rs, err := s.db.Reviewers(ctx, cl.Repo, cl.Number)
 	if err != nil {
 		return false, err
 	}
@@ -578,8 +578,8 @@ func (s *Service) IsReviewer(ctx context.Context, cl db.ChangeList, principal st
 }
 
 // lockActive locks a CL's projection row and refuses a closed CL.
-func lockActive(ctx context.Context, tx pgx.Tx, cl db.ChangeList, what string) (db.ChangeList, error) {
-	cur, ok, err := db.LockChangeList(ctx, tx, cl.Repo, cl.Number)
+func lockActive(ctx context.Context, tx db.Ops, cl db.ChangeList, what string) (db.ChangeList, error) {
+	cur, ok, err := tx.LockChangeList(ctx, cl.Repo, cl.Number)
 	if err != nil {
 		return db.ChangeList{}, err
 	}
@@ -626,7 +626,7 @@ func (s *Service) AddReviewers(ctx context.Context, repo *scmpb.Repository, cl d
 	if len(reviewers) == 0 {
 		return refuse("Choose at least one reviewer")
 	}
-	return s.db.InTx(ctx, func(tx pgx.Tx) error {
+	return s.db.Txn(ctx, func(tx db.Ops) error {
 		cur, err := lockActive(ctx, tx, cl, "its reviewers can't change")
 		if err != nil {
 			return err
@@ -647,21 +647,21 @@ func (s *Service) RemoveReviewer(ctx context.Context, repo *scmpb.Repository, cl
 			return err
 		}
 	}
-	if err := s.db.InTx(ctx, func(tx pgx.Tx) error {
+	if err := s.db.Txn(ctx, func(tx db.Ops) error {
 		cur, err := lockActive(ctx, tx, cl, "its reviewers can't change")
 		if err != nil {
 			return err
 		}
-		removed, err := db.RemoveReviewer(ctx, tx, cl.Repo, cl.Number, reviewer)
+		removed, err := tx.RemoveReviewer(ctx, cl.Repo, cl.Number, reviewer)
 		if err != nil || !removed {
 			return err
 		}
 		for _, l := range db.Labels {
-			if _, err := db.SetGrant(ctx, tx, cl.Repo, cl.Number, reviewer, l, false, cur.CurrentPatchset); err != nil {
+			if _, err := tx.SetGrant(ctx, cl.Repo, cl.Number, reviewer, l, false, cur.CurrentPatchset); err != nil {
 				return err
 			}
 		}
-		return db.RecordEvent(ctx, tx, cl.Repo, cl.Number, db.Event{Actor: principal, Kind: db.EventReviewerRemoved, Subject: reviewer, Patchset: cur.CurrentPatchset})
+		return tx.RecordEvent(ctx, cl.Repo, cl.Number, db.Event{Actor: principal, Kind: db.EventReviewerRemoved, Subject: reviewer, Patchset: cur.CurrentPatchset})
 	}); err != nil {
 		return err
 	}
@@ -674,7 +674,7 @@ func (s *Service) RemoveReviewer(ctx context.Context, repo *scmpb.Repository, cl
 // on an active CL; a comment may be left on any. Granting makes the granter a reviewer
 // (never the author).
 func (s *Service) Reply(ctx context.Context, cl db.ChangeList, principal string, grants map[db.Label]bool, comment string) error {
-	if err := s.db.InTx(ctx, func(tx pgx.Tx) error {
+	if err := s.db.Txn(ctx, func(tx db.Ops) error {
 		cur := cl
 		if len(grants) > 0 {
 			var err error
@@ -687,7 +687,7 @@ func (s *Service) Reply(ctx context.Context, cl db.ChangeList, principal string,
 			if !ok {
 				continue
 			}
-			changed, err := db.SetGrant(ctx, tx, cl.Repo, cl.Number, principal, l, g, cur.CurrentPatchset)
+			changed, err := tx.SetGrant(ctx, cl.Repo, cl.Number, principal, l, g, cur.CurrentPatchset)
 			if err != nil {
 				return err
 			}
@@ -698,11 +698,11 @@ func (s *Service) Reply(ctx context.Context, cl db.ChangeList, principal string,
 			if g {
 				kind = db.EventLabelGranted
 			}
-			if err := db.RecordEvent(ctx, tx, cl.Repo, cl.Number, db.Event{Actor: principal, Kind: kind, Label: l, Patchset: cur.CurrentPatchset}); err != nil {
+			if err := tx.RecordEvent(ctx, cl.Repo, cl.Number, db.Event{Actor: principal, Kind: kind, Label: l, Patchset: cur.CurrentPatchset}); err != nil {
 				return err
 			}
 			if g && principal != cl.Author {
-				if _, err := db.AddReviewer(ctx, tx, cl.Repo, cl.Number, principal, principal); err != nil {
+				if _, err := tx.AddReviewer(ctx, cl.Repo, cl.Number, principal, principal); err != nil {
 					return err
 				}
 			}
@@ -727,7 +727,7 @@ func (s *Service) Comment(ctx context.Context, cl db.ChangeList, principal strin
 	}
 	c := db.Comment{Number: cl.Number, Patchset: patchset, Author: principal, ParentID: parent, FilePath: file, Line: line, Side: side, Body: body}
 	if parent != 0 {
-		root, ok, err := db.GetComment(ctx, s.db.Q(), cl.Repo, cl.Number, parent)
+		root, ok, err := s.db.GetComment(ctx, cl.Repo, cl.Number, parent)
 		if err != nil {
 			return err
 		}
@@ -740,7 +740,7 @@ func (s *Service) Comment(ctx context.Context, cl db.ChangeList, principal strin
 	} else if line != 0 && side != db.SideBase && side != db.SidePatchset {
 		return refuse("An inline comment names a side of the diff")
 	}
-	if _, err := db.CreateComment(ctx, s.db.Q(), cl.Repo, c); err != nil {
+	if _, err := s.db.CreateComment(ctx, cl.Repo, c); err != nil {
 		return err
 	}
 	if parent == 0 {
@@ -751,14 +751,14 @@ func (s *Service) Comment(ctx context.Context, cl db.ChangeList, principal strin
 
 // Resolve sets a thread's resolution, then re-derives the CL's approval.
 func (s *Service) Resolve(ctx context.Context, cl db.ChangeList, root int64, resolved bool) error {
-	c, ok, err := db.GetComment(ctx, s.db.Q(), cl.Repo, cl.Number, root)
+	c, ok, err := s.db.GetComment(ctx, cl.Repo, cl.Number, root)
 	if err != nil {
 		return err
 	}
 	if !ok || c.ParentID != 0 {
 		return refuse("That thread is not on this changelist")
 	}
-	if _, err := db.SetResolved(ctx, s.db.Q(), cl.Repo, cl.Number, root, resolved); err != nil {
+	if _, err := s.db.SetResolved(ctx, cl.Repo, cl.Number, root, resolved); err != nil {
 		return err
 	}
 	return s.Refresh(ctx, cl.Repo, cl.Number)
@@ -767,7 +767,7 @@ func (s *Service) Resolve(ctx context.Context, cl db.ChangeList, root int64, res
 // DeleteComment deletes one of principal's own comments (a thread root takes its replies
 // with it), then re-derives the CL's approval.
 func (s *Service) DeleteComment(ctx context.Context, cl db.ChangeList, principal string, id int64) error {
-	c, ok, err := db.GetComment(ctx, s.db.Q(), cl.Repo, cl.Number, id)
+	c, ok, err := s.db.GetComment(ctx, cl.Repo, cl.Number, id)
 	if err != nil {
 		return err
 	}
@@ -777,7 +777,7 @@ func (s *Service) DeleteComment(ctx context.Context, cl db.ChangeList, principal
 	if c.Author != principal {
 		return refuse("Only its author can delete a comment")
 	}
-	if err := db.DeleteComment(ctx, s.db.Q(), cl.Repo, cl.Number, id); err != nil {
+	if err := s.db.DeleteComment(ctx, cl.Repo, cl.Number, id); err != nil {
 		return err
 	}
 	return s.Refresh(ctx, cl.Repo, cl.Number)
@@ -785,7 +785,7 @@ func (s *Service) DeleteComment(ctx context.Context, cl db.ChangeList, principal
 
 // Suggest builds the review dialog's suggestions for a CL from its evaluation.
 func (s *Service) Suggest(ctx context.Context, cl db.ChangeList, ev *Evaluation) (*Suggestions, error) {
-	rs, err := db.Reviewers(ctx, s.db.Q(), cl.Repo, cl.Number)
+	rs, err := s.db.Reviewers(ctx, cl.Repo, cl.Number)
 	if err != nil {
 		return nil, err
 	}
@@ -824,7 +824,7 @@ func (s *Service) CreateRepository(ctx context.Context, name, principal string) 
 	switch status.Code(err) {
 	case codes.OK:
 		// The feed records it too; recording it now lists it before the feed catches up.
-		return r, db.CreateRepository(ctx, s.db.Q(), db.Repository{ID: r.GetId(), Name: r.GetName(), CreatedBy: r.GetCreatedBy(), CreatedAt: r.GetCreatedAt().AsTime()})
+		return r, s.db.CreateRepository(ctx, db.Repository{ID: r.GetId(), Name: r.GetName(), CreatedBy: r.GetCreatedBy(), CreatedAt: r.GetCreatedAt().AsTime()})
 	case codes.AlreadyExists:
 		return nil, refuse("A repository named %s already exists", name)
 	case codes.InvalidArgument:

@@ -8,9 +8,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jackc/pgx/v5"
-
 	"github.com/Cidan/ok/internal/scm/encoding"
+	"github.com/Cidan/ok/internal/scm/store/backend"
 	scmpb "github.com/Cidan/ok/proto/ok/scm/v1"
 )
 
@@ -55,14 +54,7 @@ type Landed struct {
 }
 
 // Candidate is a commit prepared as exactly what a CL would land as onto Base.
-type Candidate struct {
-	Commit     encoding.ID
-	Base       encoding.ID
-	Number     int64
-	Patchset   int32
-	PreparedBy string
-	PreparedAt time.Time
-}
+type Candidate = backend.Candidate
 
 // actorSignature is the committer of a commit the SCM writes for actor: a person by handle
 // and <handle>@<email domain>, anything else by its principal.
@@ -158,38 +150,41 @@ func (s *Store) landOnto(lc *landCommits, ts treeStore, number int64, ps Patchse
 }
 
 // generation is a stored commit's generation; the root's is 0.
-func generation(ctx context.Context, q querier, repo int64, id encoding.ID) (int64, error) {
+func generation(ctx context.Context, q backend.Ops, repo int64, id encoding.ID) (int64, error) {
 	if id == encoding.RootCommitID {
 		return 0, nil
 	}
-	var g int64
-	err := q.QueryRow(ctx, `SELECT generation FROM commit WHERE repository_id = $1 AND id = $2`, repo, id[:]).Scan(&g)
-	if errors.Is(err, pgx.ErrNoRows) {
+	gens, err := q.CommitGenerations(ctx, repo, []encoding.ID{id})
+	if err != nil {
+		return 0, err
+	}
+	g, ok := gens[id]
+	if !ok {
 		return 0, notFound("commit %s", id)
 	}
-	return g, err
+	return g, nil
 }
 
 // insertCommits stores commits the SCM made (landed commits and candidates), written by
 // actor, each one generation above its parent.
-func (s *Store) insertCommits(ctx context.Context, tx pgx.Tx, repo int64, commits []*encoding.Commit, gens []int64, actor string) error {
+func (s *Store) insertCommits(ctx context.Context, tx *txn, repo int64, commits []*encoding.Commit, gens []int64, actor string) error {
 	for i, c := range commits {
 		canonical, err := encoding.Encode(c)
 		if err != nil {
 			return err
 		}
 		id := encoding.Hash(canonical)
-		tag, err := tx.Exec(ctx, `INSERT INTO commit (repository_id, id, change_id, body, generation, conflicted, committed_at, written_by)
-			VALUES ($1, $2, $3, $4, $5, false, $6, $7) ON CONFLICT DO NOTHING`,
-			repo, id[:], c.ChangeID[:], canonical[1:], gens[i], time.UnixMilli(c.Committer.Time.Millis), actor)
+		inserted, err := tx.InsertCommits(ctx, repo, []backend.Commit{{
+			ID: id, ChangeID: c.ChangeID[:], Body: canonical[1:], Generation: gens[i],
+			CommittedAt: time.UnixMilli(c.Committer.Time.Millis),
+		}}, actor)
 		if err != nil {
 			return err
 		}
-		if tag.RowsAffected() == 0 {
+		if len(inserted) == 0 {
 			continue
 		}
-		if _, err := tx.Exec(ctx, `INSERT INTO commit_parent (repository_id, commit_id, ord, parent_id) VALUES ($1, $2, 0, $3)`,
-			repo, id[:], c.Parents[0][:]); err != nil {
+		if err := tx.InsertCommitParents(ctx, repo, []backend.ParentEdge{{Commit: id, Ord: 0, Parent: c.Parents[0]}}); err != nil {
 			return err
 		}
 	}
@@ -203,17 +198,17 @@ func (s *Store) insertCommits(ctx context.Context, tx pgx.Tx, repo int64, commit
 // running head, then — unless dryRun — writes the new commits, advances main, marks the
 // CLs submitted, indexes the landed paths, pins everything, and emits the events. A
 // refusal is a *LandRejection, and nothing is written. It returns each landed commit,
-// main's new head (the would-be head on a dry run), and the sequence number of the last
-// event it emitted (0 on a dry run).
-func (s *Store) Land(ctx context.Context, repo int64, items []LandItem, expectedHead encoding.ID, actor string, dryRun bool) ([]Landed, encoding.ID, int64, error) {
+// main's new head (the would-be head on a dry run), and the last event it emitted (nil on a
+// dry run).
+func (s *Store) Land(ctx context.Context, repo int64, items []LandItem, expectedHead encoding.ID, actor string, dryRun bool) ([]Landed, encoding.ID, *scmpb.Event, error) {
 	if len(items) == 0 {
-		return nil, encoding.ID{}, 0, invalid("a landing names at least one CL")
+		return nil, encoding.ID{}, nil, invalid("a landing names at least one CL")
 	}
 	numbers := make([]int64, len(items))
 	seen := map[int64]bool{}
 	for i, it := range items {
 		if seen[it.Number] {
-			return nil, encoding.ID{}, 0, invalid("CL %d is named twice", it.Number)
+			return nil, encoding.ID{}, nil, invalid("CL %d is named twice", it.Number)
 		}
 		seen[it.Number] = true
 		numbers[i] = it.Number
@@ -221,41 +216,21 @@ func (s *Store) Land(ctx context.Context, repo int64, items []LandItem, expected
 	var landed []Landed
 	var newHead encoding.ID
 	var last *scmpb.Event
-	err := s.inTx(ctx, func(tx pgx.Tx) error {
+	err := s.inTx(ctx, func(tx *txn) error {
 		landed, newHead, last = nil, encoding.ID{}, nil
-		lock := " FOR UPDATE"
-		if dryRun {
-			lock = ""
+		head, headSeq, ok, err := tx.Head(ctx, repo, !dryRun)
+		if err != nil {
+			return err
 		}
-		var headB []byte
-		var headSeq int64
-		err := tx.QueryRow(ctx, `SELECT head, head_seq FROM repository WHERE id = $1`+lock, repo).Scan(&headB, &headSeq)
-		if errors.Is(err, pgx.ErrNoRows) {
+		if !ok {
 			return notFound("repository %d", repo)
-		}
-		if err != nil {
-			return err
-		}
-		head, err := toID(headB)
-		if err != nil {
-			return err
 		}
 		if head != expectedHead {
 			return &LandRejection{Number: items[0].Number, Reason: LandHeadMoved,
 				Message: fmt.Sprintf("main is at %s, not %s (validate against the new head and land again)", head, expectedHead)}
 		}
-		var cls map[int64]*ChangeList
-		if dryRun {
-			list, err := loadChangeLists(ctx, tx, repo, `SELECT `+changelistColumns+` FROM changelist
-				WHERE repository_id = $1 AND number = ANY($2)`, repo, numbers)
-			if err != nil {
-				return err
-			}
-			cls = map[int64]*ChangeList{}
-			for _, c := range list {
-				cls[c.Number] = c
-			}
-		} else if cls, err = lockChangeLists(ctx, tx, repo, numbers); err != nil {
+		cls, err := readChangeLists(ctx, tx, repo, numbers, !dryRun)
+		if err != nil {
 			return err
 		}
 
@@ -351,20 +326,18 @@ func (s *Store) Land(ctx context.Context, repo int64, items []LandItem, expected
 		if err := s.insertCommits(ctx, tx, repo, newCommits, newGens, actor); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(ctx, `UPDATE repository SET head = $2, head_seq = $3 WHERE id = $1`,
-			repo, newHead[:], headSeq+int64(len(steps))); err != nil {
+		if err := tx.SetHead(ctx, repo, newHead, headSeq+int64(len(steps))); err != nil {
 			return err
 		}
 		var roots []ref
 		var events, moves []*scmpb.Event
 		for i, st := range steps {
 			seq := headSeq + int64(i) + 1
-			if _, err := tx.Exec(ctx, `INSERT INTO head_log (repository_id, seq, old_head, new_head, cl_number, patchset, landed_by)
-				VALUES ($1, $2, $3, $4, $5, $6, $7)`, repo, seq, st.parent[:], st.id[:], st.cl.Number, st.ps.Number, actor); err != nil {
+			if err := tx.InsertHeadLog(ctx, repo, backend.HeadMove{Seq: seq, Old: st.parent, New: st.id, CL: st.cl.Number,
+				Patchset: st.ps.Number, By: actor}); err != nil {
 				return err
 			}
-			if _, err := tx.Exec(ctx, `UPDATE changelist SET status = $3, landed_commit = $4, submitted_by = $5, updated_at = now()
-				WHERE repository_id = $1 AND number = $2`, repo, st.cl.Number, int16(StatusSubmitted), st.id[:], actor); err != nil {
+			if err := tx.SetLanded(ctx, repo, st.cl.Number, int16(StatusSubmitted), st.id, actor); err != nil {
 				return err
 			}
 			if err := s.indexPaths(ctx, tx, repo, lc, ts, st.parent, st.id, st.gen); err != nil {
@@ -378,7 +351,7 @@ func (s *Store) Land(ctx context.Context, repo int64, items []LandItem, expected
 				OldHead: st.parent[:], NewHead: st.id[:], HeadSeq: seq,
 			}}})
 		}
-		if _, err := tx.Exec(ctx, `DELETE FROM candidate WHERE repository_id = $1 AND cl_number = ANY($2)`, repo, numbers); err != nil {
+		if err := tx.DeleteCandidatesOf(ctx, repo, numbers); err != nil {
 			return err
 		}
 		if err := s.pin(ctx, tx, repo, roots); err != nil {
@@ -394,15 +367,15 @@ func (s *Store) Land(ctx context.Context, repo int64, items []LandItem, expected
 		return appendEvents(ctx, tx, repo, all)
 	})
 	if err != nil {
-		return nil, encoding.ID{}, 0, err
+		return nil, encoding.ID{}, nil, err
 	}
-	return landed, newHead, last.GetSeq(), nil
+	return landed, newHead, last, nil
 }
 
 // indexPaths records the paths a commit on main changed from its parent, for Log and
 // Browse: each changed leaf, and every directory above one, so a directory's history is
 // its own rows.
-func (s *Store) indexPaths(ctx context.Context, tx pgx.Tx, repo int64, lc *landCommits, ts treeStore, parent, id encoding.ID, gen int64) error {
+func (s *Store) indexPaths(ctx context.Context, tx *txn, repo int64, lc *landCommits, ts treeStore, parent, id encoding.ID, gen int64) error {
 	from, _, err := lc.tree(parent)
 	if err != nil {
 		return err
@@ -424,9 +397,7 @@ func (s *Store) indexPaths(ctx context.Context, tx pgx.Tx, repo int64, lc *landC
 	}
 	for start := 0; start < len(paths); start += 10_000 {
 		batch := paths[start:min(start+10_000, len(paths))]
-		if _, err := tx.Exec(ctx, `INSERT INTO commit_path (repository_id, path, generation, commit_id)
-			SELECT $1, u.path, $2, $3 FROM unnest($4::text[]) AS u(path) ON CONFLICT DO NOTHING`,
-			repo, gen, id[:], batch); err != nil {
+		if err := tx.InsertCommitPaths(ctx, repo, gen, id, batch); err != nil {
 			return err
 		}
 	}
@@ -434,29 +405,17 @@ func (s *Store) indexPaths(ctx context.Context, tx pgx.Tx, repo int64, lc *landC
 }
 
 // clStatus reads a CL's status.
-func clStatus(ctx context.Context, q querier, repo, number int64) (Status, error) {
-	var st int16
-	err := q.QueryRow(ctx, `SELECT status FROM changelist WHERE repository_id = $1 AND number = $2`, repo, number).Scan(&st)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return 0, notFound("CL %d", number)
+func clStatus(ctx context.Context, q backend.Ops, repo, number int64) (Status, error) {
+	st, ok, err := q.ChangeListStatus(ctx, repo, number)
+	if err == nil && !ok {
+		err = notFound("CL %d", number)
 	}
 	return Status(st), err
 }
 
 // candidate reads a pending candidate.
-func (s *Store) candidate(ctx context.Context, q querier, repo int64, id encoding.ID) (Candidate, bool, error) {
-	var base []byte
-	c := Candidate{Commit: id}
-	err := q.QueryRow(ctx, `SELECT cl_number, patchset, base FROM candidate WHERE repository_id = $1 AND commit_id = $2`,
-		repo, id[:]).Scan(&c.Number, &c.Patchset, &base)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return c, false, nil
-	}
-	if err != nil {
-		return c, false, err
-	}
-	c.Base, err = toID(base)
-	return c, err == nil, err
+func (s *Store) candidate(ctx context.Context, q backend.Ops, repo int64, id encoding.ID) (Candidate, bool, error) {
+	return q.Candidate(ctx, repo, id)
 }
 
 // PrepareCandidate computes, writes, and records the commit a CL's patchset would land as
@@ -466,7 +425,7 @@ func (s *Store) candidate(ctx context.Context, q querier, repo int64, id encodin
 // candidate stays a GC root until it lands or is discarded.
 func (s *Store) PrepareCandidate(ctx context.Context, repo, number int64, patchset int32, base encoding.ID, actor string) (Candidate, error) {
 	var out Candidate
-	err := s.inTx(ctx, func(tx pgx.Tx) error {
+	err := s.inTx(ctx, func(tx *txn) error {
 		// The CLs base's candidate chain lands, down to main.
 		chain := map[int64]bool{}
 		cur := base
@@ -536,13 +495,8 @@ func (s *Store) PrepareCandidate(ctx context.Context, repo, number int64, patchs
 				return err
 			}
 		}
-		out = Candidate{Commit: id, Base: base, Number: number, Patchset: patchset}
-		if err := tx.QueryRow(ctx, `WITH added AS (
-				INSERT INTO candidate (repository_id, commit_id, cl_number, patchset, base, prepared_by)
-				VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING RETURNING prepared_by, created_at)
-			SELECT prepared_by, created_at FROM added
-			UNION ALL SELECT prepared_by, created_at FROM candidate WHERE repository_id = $1 AND commit_id = $2
-			LIMIT 1`, repo, id[:], number, patchset, base[:], actor).Scan(&out.PreparedBy, &out.PreparedAt); err != nil {
+		out, err = tx.PutCandidate(ctx, repo, Candidate{Commit: id, Base: base, Number: number, Patchset: patchset, PreparedBy: actor})
+		if err != nil {
 			return err
 		}
 		// A candidate is not pinned, only a root of garbage collection's mark. Refreshing
@@ -563,37 +517,15 @@ func (s *Store) PrepareCandidate(ctx context.Context, repo, number int64, patchs
 // not pending is not an error: it may have landed.
 // ListCandidates lists a repository's pending candidates, oldest first.
 func (s *Store) ListCandidates(ctx context.Context, repo int64) ([]Candidate, error) {
-	if err := s.repositoryExists(ctx, s.pool, repo); err != nil {
+	if err := s.repositoryExists(ctx, s.b, repo); err != nil {
 		return nil, err
 	}
-	rows, err := s.pool.Query(ctx, `SELECT commit_id, base, cl_number, patchset, prepared_by, created_at FROM candidate
-		WHERE repository_id = $1 ORDER BY created_at, commit_id`, repo)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []Candidate
-	for rows.Next() {
-		var commit, base []byte
-		var c Candidate
-		if err := rows.Scan(&commit, &base, &c.Number, &c.Patchset, &c.PreparedBy, &c.PreparedAt); err != nil {
-			return nil, err
-		}
-		if c.Commit, err = toID(commit); err != nil {
-			return nil, err
-		}
-		if c.Base, err = toID(base); err != nil {
-			return nil, err
-		}
-		out = append(out, c)
-	}
-	return out, rows.Err()
+	return s.b.Candidates(ctx, repo)
 }
 
 func (s *Store) DiscardCandidate(ctx context.Context, repo int64, id encoding.ID) error {
-	if err := s.repositoryExists(ctx, s.pool, repo); err != nil {
+	if err := s.repositoryExists(ctx, s.b, repo); err != nil {
 		return err
 	}
-	_, err := s.pool.Exec(ctx, `DELETE FROM candidate WHERE repository_id = $1 AND commit_id = $2`, repo, id[:])
-	return err
+	return s.b.DeleteCandidate(ctx, repo, id)
 }

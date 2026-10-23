@@ -6,23 +6,22 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/jackc/pgx/v5"
-
 	"github.com/Cidan/ok/internal/scm/encoding"
+	"github.com/Cidan/ok/internal/scm/store/backend"
 )
 
 // walkMode is what a walk over repository objects does to each row it reaches.
-type walkMode int
+type walkMode = backend.Walk
 
 const (
-	// touchWalk sets an unpinned row's touched_at to today, if it is older, and recurses
-	// only through rows it updated: a row touched today already has its subgraph fresh.
-	touchWalk walkMode = iota
-	// refreshWalk sets every unpinned row's touched_at to today and recurses through all
-	// of them, for a subgraph whose new rows are fresh but reuse older ones.
-	refreshWalk
+	// touchWalk sets an unpinned row's day to today, if it is older, and recurses only through
+	// rows it updated: a row touched today already has its subgraph fresh.
+	touchWalk = backend.TouchWalk
+	// refreshWalk sets every unpinned row's day to today and recurses through all of them, for
+	// a subgraph whose new rows are fresh but reuse older ones.
+	refreshWalk = backend.RefreshWalk
 	// pinWalk pins an unpinned row.
-	pinWalk
+	pinWalk = backend.PinWalk
 )
 
 // touch runs the freshness walk (docs/scm.md, "Garbage collection and
@@ -33,7 +32,7 @@ const (
 // already touched today is walked at most once. A reference to an object that no longer
 // exists is returned as missing, attributed to the root it was reached from; the caller
 // fails its transaction on any.
-func (s *Store) touch(ctx context.Context, tx pgx.Tx, repo int64, roots []ref) ([]ref, error) {
+func (s *Store) touch(ctx context.Context, tx *txn, repo int64, roots []ref) ([]ref, error) {
 	return s.walk(ctx, tx, repo, roots, touchWalk)
 }
 
@@ -45,7 +44,7 @@ var errMissing = errors.New("missing object")
 // references, stopping at objects already pinned, so the cost is proportional to what is
 // newly reachable. A reference to an object that does not exist fails the transaction
 // (with errMissing) instead of pinning a dangling graph.
-func (s *Store) pin(ctx context.Context, tx pgx.Tx, repo int64, roots []ref) error {
+func (s *Store) pin(ctx context.Context, tx *txn, repo int64, roots []ref) error {
 	missing, err := s.walk(ctx, tx, repo, roots, pinWalk)
 	if err != nil {
 		return err
@@ -61,7 +60,7 @@ func (s *Store) pin(ctx context.Context, tx pgx.Tx, repo int64, roots []ref) err
 // new rows (fresh by default) over older ones it reuses refreshes those too. It fails with
 // errMissing if any root reaches an object with no row, so its transaction never commits
 // a fresh object over a missing one.
-func (s *Store) refresh(ctx context.Context, tx pgx.Tx, repo int64, roots []ref) error {
+func (s *Store) refresh(ctx context.Context, tx *txn, repo int64, roots []ref) error {
 	missing, err := s.walk(ctx, tx, repo, roots, refreshWalk)
 	if err != nil {
 		return err
@@ -74,7 +73,7 @@ func (s *Store) refresh(ctx context.Context, tx pgx.Tx, repo int64, roots []ref)
 
 // walk updates the rows reachable from roots under mode, recursing only through rows it
 // updated, and returns the references that resolve to no row.
-func (s *Store) walk(ctx context.Context, tx pgx.Tx, repo int64, roots []ref, mode walkMode) ([]ref, error) {
+func (s *Store) walk(ctx context.Context, tx *txn, repo int64, roots []ref, mode walkMode) ([]ref, error) {
 	origin := map[ref]ref{}
 	frontier := make([]ref, 0, len(roots))
 	for _, r := range roots {
@@ -142,27 +141,17 @@ func (s *Store) walk(ctx context.Context, tx pgx.Tx, repo int64, roots []ref, mo
 // walkGroup updates the rows among ids that mode applies to — unpinned and stale for a
 // touch, unpinned for a refresh or a pin — and returns, for each row it updated, the
 // references the walk continues into. Files and chunks are updated in the content index.
-func (s *Store) walkGroup(ctx context.Context, tx pgx.Tx, repo int64, t table, kind encoding.Kind, members []encoding.ID, mode walkMode) (map[encoding.ID][]ref, error) {
+func (s *Store) walkGroup(ctx context.Context, tx *txn, repo int64, t table, kind encoding.Kind, members []encoding.ID, mode walkMode) (map[encoding.ID][]ref, error) {
 	if t == tFile || t == tChunk {
 		return s.walkContent(ctx, tx, repo, t, members, mode)
 	}
-	var set string
-	switch mode {
-	case touchWalk:
-		set = ` SET touched_at = current_date WHERE repository_id = $1 AND id = ANY($2) AND NOT pinned AND touched_at < current_date`
-	case refreshWalk:
-		set = ` SET touched_at = current_date WHERE repository_id = $1 AND id = ANY($2) AND NOT pinned`
-	case pinWalk:
-		set = ` SET pinned = true WHERE repository_id = $1 AND id = ANY($2) AND NOT pinned`
-	}
-	out := map[encoding.ID][]ref{}
-	var rows pgx.Rows
+	var updated map[encoding.ID][]byte
 	var err error
 	switch t {
 	case tObject:
-		rows, err = tx.Query(ctx, `UPDATE object`+set+` AND kind = $3 RETURNING id, body`, repo, ids(members), int16(kind))
+		updated, err = tx.WalkObjects(ctx, repo, kind, members, mode)
 	case tCommit:
-		rows, err = tx.Query(ctx, `UPDATE commit`+set+` RETURNING id, body`, repo, ids(members))
+		updated, err = tx.WalkCommits(ctx, repo, members, mode)
 		kind = encoding.KindCommit
 	default:
 		return nil, fmt.Errorf("touch: %v is not a repository object table", t)
@@ -170,16 +159,8 @@ func (s *Store) walkGroup(ctx context.Context, tx pgx.Tx, repo int64, t table, k
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var idb, body []byte
-		if err := rows.Scan(&idb, &body); err != nil {
-			return nil, err
-		}
-		id, err := toID(idb)
-		if err != nil {
-			return nil, err
-		}
+	out := make(map[encoding.ID][]ref, len(updated))
+	for id, body := range updated {
 		o, err := decodeStored(kind, id, body)
 		if err != nil {
 			return nil, err
@@ -188,12 +169,12 @@ func (s *Store) walkGroup(ctx context.Context, tx pgx.Tx, repo int64, t table, k
 		gcRefs(rs, o)
 		out[id] = rs.sorted()
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 // walkContent is walkGroup for files and chunks, in the transaction's content index: a file
 // it updates continues into its chunks.
-func (s *Store) walkContent(ctx context.Context, tx pgx.Tx, repo int64, t table, members []encoding.ID, mode walkMode) (map[encoding.ID][]ref, error) {
+func (s *Store) walkContent(ctx context.Context, tx *txn, repo int64, t table, members []encoding.ID, mode walkMode) (map[encoding.ID][]ref, error) {
 	lg, err := s.txIndex(ctx, tx, repo)
 	if err != nil {
 		return nil, err
@@ -236,9 +217,7 @@ func (s *Store) walkContent(ctx context.Context, tx pgx.Tx, repo int64, t table,
 
 // existing returns which of ids the repository holds in t (with kind, for the object table):
 // files and chunks in its content index — in tx's, when q is a transaction.
-func (s *Store) existing(ctx context.Context, q interface {
-	Query(context.Context, string, ...any) (pgx.Rows, error)
-}, repo int64, t table, kind encoding.Kind, members []encoding.ID) (map[encoding.ID]bool, error) {
+func (s *Store) existing(ctx context.Context, q backend.Ops, repo int64, t table, kind encoding.Kind, members []encoding.ID) (map[encoding.ID]bool, error) {
 	out := map[encoding.ID]bool{}
 	if len(members) == 0 {
 		return out, nil
@@ -248,7 +227,7 @@ func (s *Store) existing(ctx context.Context, q interface {
 		if t == tFile {
 			kind = encoding.KindFile
 		}
-		if tx, ok := q.(pgx.Tx); ok {
+		if tx, ok := q.(*txn); ok {
 			lg, err := s.txIndex(ctx, tx, repo)
 			if err != nil {
 				return nil, err
@@ -269,32 +248,13 @@ func (s *Store) existing(ctx context.Context, q interface {
 		}
 		return out, nil
 	}
-	var rows pgx.Rows
-	var err error
 	switch t {
 	case tObject:
-		rows, err = q.Query(ctx, `SELECT id FROM object WHERE repository_id = $1 AND id = ANY($2) AND kind = $3`, repo, ids(members), int16(kind))
+		return q.ExistingObjects(ctx, repo, kind, members)
 	case tCommit:
-		rows, err = q.Query(ctx, `SELECT id FROM commit WHERE repository_id = $1 AND id = ANY($2)`, repo, ids(members))
-	default:
-		return nil, fmt.Errorf("existing: %v is not a repository object table", t)
+		return q.ExistingCommits(ctx, repo, members)
 	}
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var b []byte
-		if err := rows.Scan(&b); err != nil {
-			return nil, err
-		}
-		id, err := toID(b)
-		if err != nil {
-			return nil, err
-		}
-		out[id] = true
-	}
-	return out, rows.Err()
+	return nil, fmt.Errorf("existing: %v is not a repository object table", t)
 }
 
 // decodeStored decodes a stored canonical body, which the store verified on the way in;

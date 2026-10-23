@@ -6,7 +6,6 @@ import (
 	"reflect"
 	"strings"
 	"testing"
-	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -98,7 +97,7 @@ func TestChangeListsService(t *testing.T) {
 	transition := &scmpb.TransitionRequest{RepositoryId: repo, Number: 1, Kind: scmpb.TransitionRequest_KIND_RETURN_TO_DRAFT, Actor: "alice.human.example.com"}
 	_, err = c.review.Transition(control(), &scmpb.TransitionRequest{RepositoryId: repo, Number: 1, Kind: scmpb.TransitionRequest_KIND_RETURN_TO_DRAFT})
 	wantCode(t, err, codes.InvalidArgument)
-	if resp, err := c.review.Transition(control(), transition); err != nil || resp.GetChangeList().GetStatus() != scmpb.ChangeListStatus_CHANGE_LIST_STATUS_DRAFT || resp.GetEventSeq() == 0 {
+	if resp, err := c.review.Transition(control(), transition); err != nil || resp.GetChangeList().GetStatus() != scmpb.ChangeListStatus_CHANGE_LIST_STATUS_DRAFT || resp.GetRepositorySeq() == 0 {
 		t.Fatalf("transition: %v (%v)", resp, err)
 	}
 	_, err = c.review.Transition(control(), transition)
@@ -138,7 +137,7 @@ func TestChangeListsService(t *testing.T) {
 	}
 	land.Items[0].Candidate = cand.GetCommitId()
 	landed, err := c.landing.Land(automation(), land)
-	if err != nil || !bytes.Equal(landed.GetHead(), commit[:]) || len(landed.GetLanded()) != 1 || landed.GetEventSeq() == 0 {
+	if err != nil || !bytes.Equal(landed.GetHead(), commit[:]) || len(landed.GetLanded()) != 1 || landed.GetRepositorySeq() == 0 {
 		t.Fatalf("land: %v (%v)", landed, err)
 	}
 	_, err = c.landing.Land(automation(), land)
@@ -167,7 +166,7 @@ func TestChangeListsService(t *testing.T) {
 	}
 	rb := rolled.GetChangeList()
 	if rb.GetNumber() != 2 || rb.GetAuthor() != "bob.human.example.com" || rb.GetStatus() != scmpb.ChangeListStatus_CHANGE_LIST_STATUS_OPEN ||
-		rolled.GetEventSeq() == 0 || !strings.HasPrefix(rb.GetDescription(), "Roll back CL 1: one\n\nit broke the build\n") {
+		rolled.GetRepositorySeq() == 0 || !strings.HasPrefix(rb.GetDescription(), "Roll back CL 1: one\n\nit broke the build\n") {
 		t.Fatalf("rollback: %v", rolled)
 	}
 	if got, err := c.cls.GetChangeList(alice, &scmpb.GetChangeListRequest{RepositoryId: repo, Number: 2}); err != nil ||
@@ -190,40 +189,18 @@ func TestChangeListsService(t *testing.T) {
 		t.Errorf("a second rollback: %v", err)
 	}
 
-	// The change feed is ok control's, ok automation's, and ok's deployer's.
-	actx, acancel := context.WithTimeout(automation(), 30*time.Second)
-	defer acancel()
-	astream, err := c.events.Watch(actx, &scmpb.WatchRequest{})
-	if err == nil {
-		_, err = astream.Recv()
+	// The SCM's events are ok control's, ok automation's, and ok's deployer's to read.
+	for name, ctx := range map[string]context.Context{"ok automation": automation(), "a follower": follower()} {
+		if _, err := c.events.Read(ctx, &scmpb.ReadEventsRequest{RepositoryId: repo, Limit: 1}); err != nil {
+			t.Fatalf("%s reading the repository's log: %v", name, err)
+		}
 	}
-	if err != nil {
-		t.Fatalf("ok automation watching the feed: %v", err)
-	}
-	fctx, fcancel := context.WithTimeout(follower(), 30*time.Second)
-	defer fcancel()
-	fstream, err := c.events.Watch(fctx, &scmpb.WatchRequest{})
-	if err == nil {
-		_, err = fstream.Recv()
-	}
-	if err != nil {
-		t.Fatalf("a follower watching the feed: %v", err)
-	}
-	ctx, cancel := context.WithTimeout(control(), 30*time.Second)
-	defer cancel()
-	stream, err := c.events.Watch(ctx, &scmpb.WatchRequest{})
+	all, err := c.events.Read(control(), &scmpb.ReadEventsRequest{RepositoryId: repo})
 	if err != nil {
 		t.Fatal(err)
 	}
 	var kinds []string
-	for len(kinds) < 5 {
-		ev, err := stream.Recv()
-		if err != nil {
-			t.Fatalf("watch: %v (saw %v)", err, kinds)
-		}
-		if ev.GetRepositoryId() != repo {
-			continue
-		}
+	for _, ev := range all.GetEvents() {
 		switch ev.GetKind().(type) {
 		case *scmpb.Event_RepositoryCreated:
 			kinds = append(kinds, "created")
@@ -237,9 +214,31 @@ func TestChangeListsService(t *testing.T) {
 			kinds = append(kinds, "head moved")
 		}
 	}
-	if want := "created uploaded transitioned transitioned landed"; join(kinds) != want {
-		t.Fatalf("events %q, want %q", join(kinds), want)
+	if want := "created uploaded transitioned transitioned landed"; len(kinds) < 5 || join(kinds[:5]) != want {
+		t.Fatalf("events %q, want them to begin %q", join(kinds), want)
 	}
+
+	// A repository's log, read from a place in it: the follower's way to fill a gap.
+	log, err := c.events.Read(control(), &scmpb.ReadEventsRequest{RepositoryId: repo})
+	if err != nil || len(log.GetEvents()) < 5 {
+		t.Fatalf("reading the repository's log: %v, %v", log, err)
+	}
+	for i, ev := range log.GetEvents() {
+		if ev.GetRepositoryId() != repo || ev.GetRepositorySeq() != int64(i+1) {
+			t.Fatalf("event %d of the log: %v", i+1, ev)
+		}
+	}
+	page, err := c.events.Read(control(), &scmpb.ReadEventsRequest{RepositoryId: repo, AfterSeq: 1, Limit: 2})
+	if err != nil || len(page.GetEvents()) != 2 || page.GetEvents()[0].GetRepositorySeq() != 2 ||
+		page.GetEvents()[0].GetKind() == nil {
+		t.Fatalf("the page after 1: %v, %v", page, err)
+	}
+	_, err = c.events.Read(alice, &scmpb.ReadEventsRequest{RepositoryId: repo})
+	wantCode(t, err, codes.PermissionDenied)
+	_, err = c.events.Read(control(), &scmpb.ReadEventsRequest{RepositoryId: repo, Limit: -1})
+	wantCode(t, err, codes.InvalidArgument)
+	_, err = c.events.Read(control(), &scmpb.ReadEventsRequest{RepositoryId: 1 << 40})
+	wantCode(t, err, codes.NotFound)
 }
 
 func join(s []string) string {

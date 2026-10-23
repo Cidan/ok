@@ -22,6 +22,7 @@ import (
 	"github.com/Cidan/ok/internal/id/signin"
 	"github.com/Cidan/ok/internal/id/signin/oidctest"
 	"github.com/Cidan/ok/internal/id/store"
+	idpostgres "github.com/Cidan/ok/internal/id/store/postgres"
 	"github.com/Cidan/ok/internal/id/web"
 	"github.com/Cidan/ok/internal/identity"
 	"github.com/Cidan/ok/internal/serve/authn"
@@ -69,7 +70,8 @@ func newEnv(t *testing.T) *env {
 		t.Fatal(err)
 	}
 	t.Cleanup(pool.Close)
-	st, err := store.Open(ctx, pool, names)
+	b, err := idpostgres.Open(ctx, pool)
+	st := store.New(b, names)
 	if err != nil {
 		t.Fatal(err)
 	}

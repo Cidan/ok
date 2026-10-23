@@ -6,12 +6,11 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/jackc/pgx/v5"
-
 	"github.com/Cidan/ok/internal/blob"
 	"github.com/Cidan/ok/internal/lock"
 	"github.com/Cidan/ok/internal/scm/contentindex"
 	"github.com/Cidan/ok/internal/scm/encoding"
+	"github.com/Cidan/ok/internal/scm/store/backend"
 )
 
 // Garbage collection's parameters (docs/scm.md, "Garbage collection and
@@ -96,9 +95,9 @@ type GCReport struct {
 //
 // A pass is safe beside publishes, uploads, landings, and other passes: nothing reachable
 // or just touched is ever deleted (see the design's argument). Freshness days are the
-// database's current_date, which on PostgreSQL and the test server is UTC; now is UTC.
+// database's current day, which is UTC; now is UTC.
 func (s *Store) GC(ctx context.Context, repo int64, now time.Time, opts GCOptions) (*GCReport, error) {
-	if err := s.repositoryExists(ctx, s.pool, repo); err != nil {
+	if err := s.repositoryExists(ctx, s.b, repo); err != nil {
 		return nil, err
 	}
 	now = now.UTC()
@@ -139,10 +138,12 @@ func (s *Store) GC(ctx context.Context, repo int64, now time.Time, opts GCOption
 // operation log (docs/scm.md, "Decisions", 3): the operation logs of no workspace, and
 // the workspaces with no log of their own. A workspace and its log are made in one
 // transaction, so a workspace being made is never among them.
-var unreachable = []struct{ what, from, where string }{
-	{"operation logs of no workspace", "op_log", `repository_id = $1 AND workspace = ''`},
-	{"workspaces with no operation log", "workspace w", `w.repository_id = $1 AND NOT EXISTS (SELECT 1 FROM op_log l
-		WHERE l.repository_id = w.repository_id AND l.principal = w.principal AND l.workspace = w.name)`},
+var unreachable = []struct {
+	what   string
+	delete func(backend.Ops, context.Context, int64, bool) (int64, error)
+}{
+	{"operation logs of no workspace", backend.Ops.DeleteOrphanOpLogs},
+	{"workspaces with no operation log", backend.Ops.DeleteOrphanWorkspaces},
 }
 
 // collectRepository collects every operation log of a repository, first deleting what no request
@@ -150,23 +151,13 @@ var unreachable = []struct{ what, from, where string }{
 func (s *Store) collectRepository(ctx context.Context, repo int64, keepNewer time.Time, opts GCOptions, r *GCReport) error {
 	for i, u := range unreachable {
 		n := []*int64{&r.OpLogsDeleted, &r.WorkspacesDeleted}[i]
-		if opts.DryRun {
-			if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM `+u.from+` WHERE `+u.where, repo).Scan(n); err != nil {
-				return err
-			}
-			continue
-		}
-		tag, err := s.pool.Exec(ctx, `DELETE FROM `+u.from+` WHERE `+u.where, repo)
+		got, err := u.delete(s.b, ctx, repo, opts.DryRun)
 		if err != nil {
 			return fmt.Errorf("deleting the %s: %w", u.what, err)
 		}
-		*n = tag.RowsAffected()
+		*n = got
 	}
-	rows, err := s.pool.Query(ctx, `SELECT id FROM op_log WHERE repository_id = $1 AND workspace <> '' ORDER BY id`, repo)
-	if err != nil {
-		return err
-	}
-	logs, err := pgx.CollectRows(rows, pgx.RowTo[int64])
+	logs, err := s.b.WorkspaceOpLogs(ctx, repo)
 	if err != nil {
 		return err
 	}
@@ -186,40 +177,30 @@ func (s *Store) collectRepository(ctx context.Context, repo int64, keepNewer tim
 // one already gone.
 var sweepTables = []table{tCommit, tObject, tFile, tChunk}
 
-func tableName(t table) string {
-	switch t {
-	case tCommit:
-		return "commit"
-	case tObject:
-		return "object"
-	}
-	panic(fmt.Sprintf("table %d is not a table of repository objects", t))
-}
-
 // candidates lists a table's unpinned rows not touched since cutoff: what the sweep may
 // delete, if the mark does not reach it.
 func (s *Store) candidates(ctx context.Context, repo int64, t table, cutoff time.Time) ([]encoding.ID, error) {
-	if t == tFile || t == tChunk {
+	switch t {
+	case tFile, tChunk:
 		return s.staleContent(ctx, repo, t, cutoff)
+	case tCommit:
+		return s.b.StaleCommitIDs(ctx, repo, cutoff)
+	case tObject:
+		return s.b.StaleObjectIDs(ctx, repo, cutoff)
 	}
-	rows, err := s.pool.Query(ctx, `SELECT id FROM `+tableName(t)+` WHERE repository_id = $1 AND NOT pinned AND touched_at < $2 ORDER BY id`, repo, cutoff)
-	if err != nil {
-		return nil, err
+	return nil, fmt.Errorf("table %d is not a table of repository objects", t)
+}
+
+// sweepRows deletes — or, dry, counts — the commits or objects among batch still unpinned and
+// stale.
+func sweepRows(ctx context.Context, q backend.Ops, repo int64, t table, batch []encoding.ID, cutoff time.Time, dry bool) (int64, error) {
+	switch t {
+	case tCommit:
+		return q.SweepCommits(ctx, repo, batch, cutoff, dry)
+	case tObject:
+		return q.SweepObjects(ctx, repo, batch, cutoff, dry)
 	}
-	defer rows.Close()
-	var out []encoding.ID
-	for rows.Next() {
-		var b []byte
-		if err := rows.Scan(&b); err != nil {
-			return nil, err
-		}
-		id, err := toID(b)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, id)
-	}
-	return out, rows.Err()
+	return 0, fmt.Errorf("table %d is not a table of repository objects", t)
 }
 
 // staleContent lists the files or chunks the content index has unpinned and untouched since
@@ -316,19 +297,17 @@ func (s *Store) sweepBatch(ctx context.Context, repo int64, t table, batch []enc
 			}
 			return n, bytes, nil
 		}
-		err := s.pool.QueryRow(ctx, `SELECT count(*), 0::bigint FROM `+tableName(t)+` WHERE repository_id = $1 AND id = ANY($2) AND NOT pinned AND touched_at < $3`,
-			repo, ids(batch), cutoff).Scan(&n, &bytes)
-		return n, bytes, err
+		n, err := sweepRows(ctx, s.b, repo, t, batch, cutoff, true)
+		return n, 0, err
 	}
 	var n, bytes int64
-	err := s.inTx(ctx, func(tx pgx.Tx) error {
+	err := s.inTx(ctx, func(tx *txn) error {
 		n, bytes = 0, 0
 		if t == tFile || t == tChunk {
 			return s.sweepContent(ctx, tx, repo, t, batch, cutoff, &n, &bytes)
 		}
-		tag, err := tx.Exec(ctx, `DELETE FROM `+tableName(t)+` WHERE repository_id = $1 AND id = ANY($2) AND NOT pinned AND touched_at < $3`,
-			repo, ids(batch), cutoff)
-		n = tag.RowsAffected()
+		var err error
+		n, err = sweepRows(ctx, tx, repo, t, batch, cutoff, false)
 		return err
 	})
 	return n, bytes, err
@@ -338,7 +317,7 @@ func (s *Store) sweepBatch(ctx context.Context, repo int64, t table, batch []enc
 // untouched since cutoff, deciding under the index's row lock, so no transaction touches,
 // pins, or relies on one meanwhile. It adds to n what it drops, and to bytes their chunks'
 // stored bytes.
-func (s *Store) sweepContent(ctx context.Context, tx pgx.Tx, repo int64, t table, batch []encoding.ID, cutoff time.Time, n, bytes *int64) error {
+func (s *Store) sweepContent(ctx context.Context, tx *txn, repo int64, t table, batch []encoding.ID, cutoff time.Time, n, bytes *int64) error {
 	doomed, err := s.staleInIndex(ctx, tx, repo, t, batch, cutoff)
 	if err != nil || len(doomed) == 0 {
 		return err
@@ -361,8 +340,8 @@ func (s *Store) sweepContent(ctx context.Context, tx pgx.Tx, repo int64, t table
 
 // staleInIndex takes the content index's row lock in tx and returns the IDs among batch whose
 // entries are of t's kind, unpinned, and untouched since cutoff.
-func (s *Store) staleInIndex(ctx context.Context, tx pgx.Tx, repo int64, t table, batch []encoding.ID, cutoff time.Time) ([]encoding.ID, error) {
-	if _, err := tx.Exec(ctx, `SELECT generation FROM content_index WHERE repository_id = $1 FOR UPDATE`, repo); err != nil {
+func (s *Store) staleInIndex(ctx context.Context, tx *txn, repo int64, t table, batch []encoding.ID, cutoff time.Time) ([]encoding.ID, error) {
+	if _, err := tx.LockContentIndex(ctx, repo); err != nil {
 		return nil, err
 	}
 	li := s.live(repo)
@@ -393,30 +372,19 @@ func (s *Store) staleInIndex(ctx context.Context, tx pgx.Tx, repo int64, t table
 func (s *Store) mark(ctx context.Context, repo int64, cutoff time.Time) (map[ref]bool, error) {
 	roots := map[encoding.ID]bool{}
 	for _, q := range []struct {
-		kind  encoding.Kind
-		query string
+		kind encoding.Kind
+		read func(backend.Ops, context.Context, int64) ([]backend.Object, error)
 	}{
-		{encoding.KindView, `SELECT v.id, v.body FROM view v JOIN op_log l ON l.id = v.op_log_id WHERE l.repository_id = $1`},
-		{encoding.KindOperation, `SELECT o.id, o.body FROM operation o JOIN op_log l ON l.id = o.op_log_id WHERE l.repository_id = $1`},
+		{encoding.KindView, backend.Ops.RepositoryViews},
+		{encoding.KindOperation, backend.Ops.RepositoryOperations},
 	} {
-		rows, err := s.pool.Query(ctx, q.query, repo)
+		rows, err := q.read(s.b, ctx, repo)
 		if err != nil {
 			return nil, err
 		}
-		for rows.Next() {
-			var idb, body []byte
-			if err := rows.Scan(&idb, &body); err != nil {
-				rows.Close()
-				return nil, err
-			}
-			id, err := toID(idb)
+		for _, row := range rows {
+			o, err := decodeStored(q.kind, row.ID, row.Body)
 			if err != nil {
-				rows.Close()
-				return nil, err
-			}
-			o, err := decodeStored(q.kind, id, body)
-			if err != nil {
-				rows.Close()
 				return nil, err
 			}
 			switch o := o.(type) {
@@ -433,25 +401,13 @@ func (s *Store) mark(ctx context.Context, repo int64, cutoff time.Time) (map[ref
 				}
 			}
 		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
-			return nil, err
-		}
 	}
-	crows, err := s.pool.Query(ctx, `SELECT commit_id FROM candidate WHERE repository_id = $1`, repo)
+	cands, err := s.b.Candidates(ctx, repo)
 	if err != nil {
 		return nil, err
 	}
-	cands, err := pgx.CollectRows(crows, pgx.RowTo[[]byte])
-	if err != nil {
-		return nil, err
-	}
-	for _, b := range cands {
-		id, err := toID(b)
-		if err != nil {
-			return nil, err
-		}
-		roots[id] = true
+	for _, c := range cands {
+		roots[c.Commit] = true
 	}
 	delete(roots, encoding.RootCommitID)
 
@@ -466,38 +422,23 @@ func (s *Store) mark(ctx context.Context, repo int64, cutoff time.Time) (map[ref
 	var frontier []ref
 	for start := 0; start < len(rootIDs); start += gcBatch {
 		batch := rootIDs[start:min(start+gcBatch, len(rootIDs))]
-		rows, err := s.pool.Query(ctx, `WITH RECURSIVE m(id) AS (
-				SELECT c.id FROM commit c
-				WHERE c.repository_id = $1 AND c.id = ANY($2) AND NOT c.pinned AND c.touched_at < $3
-			UNION
-				SELECT c.id FROM m
-				JOIN commit_parent p ON p.repository_id = $1 AND p.commit_id = m.id
-				JOIN commit c ON c.repository_id = $1 AND c.id = p.parent_id
-				WHERE NOT c.pinned AND c.touched_at < $3
-			)
-			SELECT c.id, c.body FROM m JOIN commit c ON c.repository_id = $1 AND c.id = m.id`, repo, ids(batch), cutoff)
+		reached, err := s.b.StaleAncestry(ctx, repo, batch, cutoff)
 		if err != nil {
 			return nil, err
 		}
-		for rows.Next() {
-			var idb, body []byte
-			if err := rows.Scan(&idb, &body); err != nil {
-				rows.Close()
-				return nil, err
-			}
-			id, err := toID(idb)
-			if err != nil {
-				rows.Close()
-				return nil, err
-			}
+		ids := make([]encoding.ID, 0, len(reached))
+		for id := range reached {
+			ids = append(ids, id)
+		}
+		sortIDs(ids)
+		for _, id := range ids {
 			r := ref{table: tCommit, id: id}
 			if marked[r] {
 				continue
 			}
 			marked[r] = true
-			o, err := decodeStored(encoding.KindCommit, id, body)
+			o, err := decodeStored(encoding.KindCommit, id, reached[id])
 			if err != nil {
-				rows.Close()
 				return nil, err
 			}
 			for _, t := range o.(*encoding.Commit).RootTree {
@@ -505,10 +446,6 @@ func (s *Store) mark(ctx context.Context, repo int64, cutoff time.Time) (map[ref
 					frontier = append(frontier, ref{table: tObject, id: t})
 				}
 			}
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
-			return nil, err
 		}
 	}
 
@@ -556,24 +493,13 @@ func (s *Store) markBatch(ctx context.Context, repo int64, t table, batch []enco
 	var next []ref
 	switch t {
 	case tObject:
-		rows, err := s.pool.Query(ctx, `SELECT id, kind, body FROM object
-			WHERE repository_id = $1 AND id = ANY($2) AND NOT pinned AND touched_at < $3`, repo, ids(batch), cutoff)
+		objs, err := s.b.StaleObjects(ctx, repo, batch, cutoff)
 		if err != nil {
 			return nil, err
 		}
-		defer rows.Close()
-		for rows.Next() {
-			var idb, body []byte
-			var kind int16
-			if err := rows.Scan(&idb, &kind, &body); err != nil {
-				return nil, err
-			}
-			id, err := toID(idb)
-			if err != nil {
-				return nil, err
-			}
-			marked[ref{table: tObject, id: id}] = true
-			o, err := decodeStored(encoding.Kind(kind), id, body)
+		for _, row := range objs {
+			marked[ref{table: tObject, id: row.ID}] = true
+			o, err := decodeStored(row.Kind, row.ID, row.Body)
 			if err != nil {
 				return nil, err
 			}
@@ -581,7 +507,7 @@ func (s *Store) markBatch(ctx context.Context, repo int64, t table, batch []enco
 			gcRefs(rs, o)
 			next = append(next, rs.sorted()...)
 		}
-		return next, rows.Err()
+		return next, nil
 	case tFile, tChunk:
 		kind := encoding.KindChunk
 		if t == tFile {
@@ -619,20 +545,12 @@ func (s *Store) deletePacks(ctx context.Context, repo int64, now time.Time, opts
 	if err != nil {
 		return err
 	}
-	rows, err := s.pool.Query(ctx, `SELECT id FROM pack WHERE repository_id = $1`, repo)
-	if err != nil {
-		return err
-	}
-	packIDs, err := pgx.CollectRows(rows, pgx.RowTo[[]byte])
+	packIDs, err := s.b.PackIDs(ctx, repo)
 	if err != nil {
 		return err
 	}
 	known := make(map[string]bool, len(packIDs))
-	for _, b := range packIDs {
-		id, err := toID(b)
-		if err != nil {
-			return err
-		}
+	for _, id := range packIDs {
 		known[packKey(repo, id)] = true
 	}
 	// Every pack is unique (it carries a random nonce), so a key with no row is never
@@ -663,9 +581,7 @@ func (s *Store) DeleteRetiredPacks(ctx context.Context, now time.Time) (int, err
 // nothing moves chunks into a retired pack, and every pack written is unique — so its S3
 // object goes first and its row after; an interrupted deletion finishes next time.
 func (s *Store) deleteRetiredPacks(ctx context.Context, repo *int64, now time.Time, dryRun bool) (int, error) {
-	rows, err := s.pool.Query(ctx, `SELECT p.repository_id, p.id, p.num FROM pack p
-		WHERE p.retired_at < $1 AND ($2::bigint IS NULL OR p.repository_id = $2)
-		ORDER BY p.repository_id, p.id`, now.Add(-RetiredPackGrace), repo)
+	rows, err := s.b.RetiredPacksBefore(ctx, now.Add(-RetiredPackGrace), repo)
 	if err != nil {
 		return 0, err
 	}
@@ -674,23 +590,9 @@ func (s *Store) deleteRetiredPacks(ctx context.Context, repo *int64, now time.Ti
 		id   encoding.ID
 		num  uint64
 	}
-	var candidates []retired
-	for rows.Next() {
-		var p retired
-		var b []byte
-		if err := rows.Scan(&p.repo, &b, &p.num); err != nil {
-			rows.Close()
-			return 0, err
-		}
-		if p.id, err = toID(b); err != nil {
-			rows.Close()
-			return 0, err
-		}
-		candidates = append(candidates, p)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return 0, err
+	candidates := make([]retired, len(rows))
+	for i, p := range rows {
+		candidates[i] = retired{repo: p.Repo, id: p.ID, num: p.Num}
 	}
 	// A retired pack no chunk in its repository's index is in — retirement ensured none, and
 	// nothing moves a chunk into one.
@@ -724,21 +626,23 @@ func (s *Store) deleteRetiredPacks(ctx context.Context, repo *int64, now time.Ti
 		if err := s.blobs.Delete(ctx, packKey(p.repo, p.id)); err != nil && !errors.Is(err, blob.ErrNotFound) {
 			return n, err
 		}
-		tag, err := s.pool.Exec(ctx, `DELETE FROM pack WHERE repository_id = $1 AND id = $2 AND retired_at IS NOT NULL`, p.repo, p.id[:])
+		deleted, err := s.b.DeleteRetiredPack(ctx, p.repo, p.id)
 		if err != nil {
 			return n, err
 		}
-		n += int(tag.RowsAffected())
+		if deleted {
+			n++
+		}
 	}
 	return n, nil
 }
 
-// LeadGC runs fn holding the lock (internal/lock) whose holder runs garbage collection,
+// LeadGC runs fn holding the lock whose holder runs garbage collection,
 // with a context that ends if the lock is lost, and gives the lock up when fn returns. Passes
 // are safe to overlap; one runner at a time keeps them from doing the same work twice. It
 // returns lock.ErrNotAcquired when another replica holds the lock, and otherwise fn's error.
 func (s *Store) LeadGC(ctx context.Context, fn lock.LockFn) error {
-	return s.locks.LockFn(ctx, "leaders", "gc", 0, fn)
+	return s.b.Lead(ctx, "gc", fn)
 }
 
 // GCRetry is how long after a failed pass a repository is tried again.
@@ -753,14 +657,7 @@ func (s *Store) DueForGC(ctx context.Context, now time.Time, hour int) ([]int64,
 	if now.Before(scheduled) {
 		scheduled = scheduled.AddDate(0, 0, -1)
 	}
-	rows, err := s.pool.Query(ctx, `SELECT r.id FROM repository r
-		WHERE NOT EXISTS (SELECT 1 FROM gc_pass g WHERE g.repository_id = r.id AND g.started_at >= $1 AND g.error IS NULL)
-		  AND NOT EXISTS (SELECT 1 FROM gc_pass g WHERE g.repository_id = r.id AND g.error IS NOT NULL AND g.started_at > $2)
-		ORDER BY r.id`, scheduled, now.Add(-GCRetry))
-	if err != nil {
-		return nil, err
-	}
-	return pgx.CollectRows(rows, pgx.RowTo[int64])
+	return s.b.DueForGC(ctx, scheduled, now.Add(-GCRetry))
 }
 
 // RecordGC records a pass, with the error that ended it if it failed. A dry run is not
@@ -778,15 +675,14 @@ func (s *Store) RecordGC(ctx context.Context, r *GCReport, passErr error) error 
 		m := passErr.Error()
 		msg = &m
 	}
-	_, err := s.pool.Exec(ctx, `INSERT INTO gc_pass (repository_id, started_at, finished_at, operations_deleted, views_deleted,
-			marked, commits_swept, objects_swept, files_swept, chunks_swept, chunk_bytes_swept,
-			packs_written, packs_retired, bytes_read, bytes_reclaimed, packs_deleted, orphan_packs, error, checkpoints_deleted, op_logs_deleted, workspaces_deleted)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
-		ON CONFLICT DO NOTHING`,
-		r.Repository, r.Started, finished, r.OperationsDeleted, r.ViewsDeleted,
-		r.Marked, r.CommitsSwept, r.ObjectsSwept, r.FilesSwept, r.ChunksSwept, r.ChunkBytesSwept,
-		r.PacksWritten, r.PacksRetired, r.BytesRead, r.BytesReclaimed, r.PacksDeleted, r.OrphanPacks, msg, r.CheckpointsDeleted, r.OpLogsDeleted, r.WorkspacesDeleted)
-	return err
+	return s.b.InsertGCPass(ctx, backend.GCPass{
+		Repository: r.Repository, Started: r.Started, Finished: finished,
+		OperationsDeleted: r.OperationsDeleted, ViewsDeleted: r.ViewsDeleted, Marked: r.Marked,
+		CommitsSwept: r.CommitsSwept, ObjectsSwept: r.ObjectsSwept, FilesSwept: r.FilesSwept, ChunksSwept: r.ChunksSwept,
+		ChunkBytesSwept: r.ChunkBytesSwept, PacksWritten: r.PacksWritten, PacksRetired: r.PacksRetired,
+		BytesRead: r.BytesRead, BytesReclaimed: r.BytesReclaimed, PacksDeleted: r.PacksDeleted, OrphanPacks: r.OrphanPacks,
+		Error: msg, CheckpointsDeleted: r.CheckpointsDeleted, OpLogsDeleted: r.OpLogsDeleted, WorkspacesDeleted: r.WorkspacesDeleted,
+	})
 }
 
 // String renders a report for the gc command and the log.

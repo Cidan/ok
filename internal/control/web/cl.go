@@ -62,7 +62,7 @@ func (s *Server) clList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	f := db.ParseFilter(r.URL.Query().Get("f"))
-	cls, err := db.ListChangeLists(r.Context(), s.db.Q(), repo.GetId(), f, principal(r), clListLimit)
+	cls, err := s.db.ListChangeLists(r.Context(), repo.GetId(), f, principal(r), clListLimit)
 	if err != nil {
 		fail(w, r, err)
 		return
@@ -168,23 +168,23 @@ func (s *Server) buildCL(r *http.Request, t *clTarget) (*pages.CLView, error) {
 	if err != nil {
 		return nil, err
 	}
-	reviewers, err := db.Reviewers(ctx, s.db.Q(), cl.Repo, cl.Number)
+	reviewers, err := s.db.Reviewers(ctx, cl.Repo, cl.Number)
 	if err != nil {
 		return nil, err
 	}
-	grants, err := db.Grants(ctx, s.db.Q(), cl.Repo, cl.Number)
+	grants, err := s.db.Grants(ctx, cl.Repo, cl.Number)
 	if err != nil {
 		return nil, err
 	}
-	comments, err := db.Comments(ctx, s.db.Q(), cl.Repo, cl.Number)
+	comments, err := s.db.Comments(ctx, cl.Repo, cl.Number)
 	if err != nil {
 		return nil, err
 	}
-	events, err := db.Events(ctx, s.db.Q(), cl.Repo, cl.Number)
+	events, err := s.db.Events(ctx, cl.Repo, cl.Number)
 	if err != nil {
 		return nil, err
 	}
-	stack, err := db.Stack(ctx, s.db.Q(), cl.Repo, cl.Number)
+	stack, err := s.db.Stack(ctx, cl.Repo, cl.Number)
 	if err != nil {
 		return nil, err
 	}
@@ -579,7 +579,7 @@ func (s *Server) clFiles(w http.ResponseWriter, r *http.Request) {
 		fail(w, r, err)
 		return
 	}
-	comments, err := db.Comments(ctx, s.db.Q(), t.cl.Repo, t.cl.Number)
+	comments, err := s.db.Comments(ctx, t.cl.Repo, t.cl.Number)
 	if err != nil {
 		fail(w, r, err)
 		return
@@ -625,7 +625,7 @@ func (s *Server) clFile(w http.ResponseWriter, r *http.Request) {
 		fail(w, r, err)
 		return
 	}
-	comments, err := db.Comments(ctx, s.db.Q(), t.cl.Repo, t.cl.Number)
+	comments, err := s.db.Comments(ctx, t.cl.Repo, t.cl.Number)
 	if err != nil {
 		fail(w, r, err)
 		return
@@ -725,7 +725,7 @@ func (s *Server) rollbacks(ctx context.Context, v *pages.CLView, repo *scmpb.Rep
 	if rb := c.GetRollback(); rb != nil {
 		v.IsRollback = true
 		for _, n := range rb.GetChangeLists() {
-			rolled, ok, err := db.GetChangeList(ctx, s.db.Q(), cl.Repo, n)
+			rolled, ok, err := s.db.GetChangeList(ctx, cl.Repo, n)
 			if err != nil {
 				return err
 			}
@@ -742,7 +742,7 @@ func (s *Server) rollbacks(ctx context.Context, v *pages.CLView, repo *scmpb.Rep
 	if cl.Status != db.StatusSubmitted {
 		return nil
 	}
-	by, err := db.RollbacksOf(ctx, s.db.Q(), cl.Repo, cl.Number)
+	by, err := s.db.RollbacksOf(ctx, cl.Repo, cl.Number)
 	if err != nil {
 		return err
 	}
@@ -1019,7 +1019,7 @@ func (s *Server) clReviewerSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	exclude := formReviewers(r)
-	rs, err := db.Reviewers(r.Context(), s.db.Q(), t.cl.Repo, t.cl.Number)
+	rs, err := s.db.Reviewers(r.Context(), t.cl.Repo, t.cl.Number)
 	if err != nil {
 		fail(w, r, err)
 		return

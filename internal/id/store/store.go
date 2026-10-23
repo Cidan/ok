@@ -1,39 +1,32 @@
-// Package store is ok identity's directory in PostgreSQL: principals and retired names, the system
-// of record's mirror (a directory.Store), the groups-and-ACLs tree, robots' bindings, credentials,
-// sessions, device logins, passkeys, and sign-in ceremonies. Every change that must hold together
-// is one transaction.
+// Package store is ok identity's directory: principals and retired names, the system of record's
+// mirror (a directory.Store), the groups-and-ACLs tree, robots' bindings, credentials, sessions,
+// device logins, passkeys, and sign-in ceremonies. Store holds the rules; a Backend (postgres) is
+// the database it keeps them in, and every change that must hold together is one transaction.
 package store
 
 import (
 	"context"
 	"crypto/rand"
-	"embed"
 	"encoding/base32"
 	"errors"
 	"fmt"
 	"strings"
 	"time"
 
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/pgx/v5/pgxpool"
-
 	"github.com/Cidan/ok/internal/directory"
 	"github.com/Cidan/ok/internal/identity"
-	"github.com/Cidan/ok/internal/migrate"
+	"github.com/Cidan/ok/internal/lock"
 )
-
-//go:embed migrations/*.sql
-var migrations embed.FS
-
-// Migrations are the store's schema.
-var Migrations = migrate.MustLoad(migrations, "migrations")
 
 // Errors the store answers with.
 var (
 	ErrNotFound = errors.New("not found")
 	// ErrTaken is a name held, or once held, by another.
 	ErrTaken = errors.New("the name is taken, or was, and a name is never given to another")
+	// ErrBindingTaken is a binding that names another robot already.
+	ErrBindingTaken = errors.New("the binding names a robot already")
+	// ErrUserCodeTaken is a device login's user code another holds.
+	ErrUserCodeTaken = errors.New("the user code is in use")
 )
 
 // Kind is what a principal is.
@@ -61,24 +54,31 @@ func (p Principal) Active() bool { return p.Status == directory.Active }
 
 // Store is the directory's store.
 type Store struct {
-	pool  *pgxpool.Pool
+	b     Backend
 	names identity.Names
 	now   func() time.Time
 }
 
-// Open migrates the database pool reaches and returns its store.
-func Open(ctx context.Context, pool *pgxpool.Pool, names identity.Names) (*Store, error) {
-	if _, err := migrate.Apply(ctx, pool, "identity", Migrations); err != nil {
-		return nil, err
-	}
-	return &Store{pool: pool, names: names, now: time.Now}, nil
+// New is a store over a backend, its principals and sets named under names.
+func New(b Backend, names identity.Names) *Store {
+	return &Store{b: b, names: names, now: time.Now}
 }
+
+// SetClock replaces the store's clock, which times device logins, sessions, and ceremonies: for
+// tests.
+func (s *Store) SetClock(now func() time.Time) { s.now = now }
 
 // Names is the naming the store's principals and sets are under.
 func (s *Store) Names() identity.Names { return s.names }
 
 // Healthy reports whether the database answers.
-func (s *Store) Healthy(ctx context.Context) bool { return s.pool.Ping(ctx) == nil }
+func (s *Store) Healthy(ctx context.Context) bool { return s.b.Ping(ctx) == nil }
+
+// LockSync runs fn holding the sync's lock, which one replica holds at a time, waiting up to wait
+// for it; it returns lock.ErrNotAcquired when it could not take it, and otherwise fn's error.
+func (s *Store) LockSync(ctx context.Context, wait time.Duration, fn lock.LockFn) error {
+	return s.b.Lock(ctx, "identity", "sync", wait, fn)
+}
 
 // newID makes an ID: prefix and 26 random base32 characters.
 func newID(prefix string) string {
@@ -87,57 +87,20 @@ func newID(prefix string) string {
 	return prefix + strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(b[:]))
 }
 
-func statusText(s directory.Status) string {
-	switch s {
-	case directory.Suspended:
-		return "suspended"
-	case directory.Deleted:
-		return "deleted"
-	}
-	return "active"
-}
-
-func parseStatus(s string) directory.Status {
-	switch s {
-	case "suspended":
-		return directory.Suspended
-	case "deleted":
-		return directory.Deleted
-	}
-	return directory.Active
-}
-
-const principalColumns = `id, name, kind, status, COALESCE(external_id, ''), email, display_name, created_at`
-
-type scanner interface{ Scan(...any) error }
-
-func scanPrincipal(row scanner) (Principal, error) {
-	var p Principal
-	var kind, status string
-	if err := row.Scan(&p.ID, &p.Name, &kind, &status, &p.ExternalID, &p.Email, &p.DisplayName, &p.Created); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return Principal{}, ErrNotFound
-		}
-		return Principal{}, err
-	}
-	p.Kind, p.Status = Kind(kind), parseStatus(status)
-	return p, nil
-}
-
 // Principal returns the principal with a name.
 func (s *Store) Principal(ctx context.Context, name string) (Principal, error) {
-	return scanPrincipal(s.pool.QueryRow(ctx, `SELECT `+principalColumns+` FROM principals WHERE name = $1`, name))
+	return s.b.PrincipalByName(ctx, name)
 }
 
 // PrincipalByID returns the principal with an ID.
 func (s *Store) PrincipalByID(ctx context.Context, id string) (Principal, error) {
-	return scanPrincipal(s.pool.QueryRow(ctx, `SELECT `+principalColumns+` FROM principals WHERE id = $1`, id))
+	return s.b.PrincipalByID(ctx, id)
 }
 
 // Filter selects principals to list.
 type Filter struct {
 	Kind            Kind   // "" for both
-	Query           string // a substring of the name, email, or display name
+	Query           string // a substring of the name, email, or display name, case-insensitively
 	IncludeInactive bool
 	After           string // list names after this one
 	Limit           int
@@ -145,42 +108,7 @@ type Filter struct {
 
 // Principals lists principals by name, from after f.After, at most f.Limit (all for 0).
 func (s *Store) Principals(ctx context.Context, f Filter) ([]Principal, error) {
-	q := `SELECT ` + principalColumns + ` FROM principals WHERE name > $1`
-	args := []any{f.After}
-	if f.Kind != "" {
-		args = append(args, string(f.Kind))
-		q += fmt.Sprintf(" AND kind = $%d", len(args))
-	}
-	if !f.IncludeInactive {
-		q += " AND status = 'active'"
-	}
-	if f.Query != "" {
-		args = append(args, "%"+likeEscape(strings.ToLower(f.Query))+"%")
-		q += fmt.Sprintf(` AND (lower(name) LIKE $%[1]d OR lower(email) LIKE $%[1]d OR lower(display_name) LIKE $%[1]d)`, len(args))
-	}
-	q += " ORDER BY name"
-	if f.Limit > 0 {
-		args = append(args, f.Limit)
-		q += fmt.Sprintf(" LIMIT $%d", len(args))
-	}
-	rows, err := s.pool.Query(ctx, q, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []Principal
-	for rows.Next() {
-		p, err := scanPrincipal(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, p)
-	}
-	return out, rows.Err()
-}
-
-func likeEscape(s string) string {
-	return strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(s)
+	return s.b.Principals(ctx, f)
 }
 
 // RetiredName is a name no one will have again.
@@ -192,35 +120,7 @@ type RetiredName struct {
 
 // RetiredNames lists every retired name.
 func (s *Store) RetiredNames(ctx context.Context) ([]RetiredName, error) {
-	rows, err := s.pool.Query(ctx, `SELECT name, retired_at, reason FROM retired_names ORDER BY name`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []RetiredName
-	for rows.Next() {
-		var r RetiredName
-		if err := rows.Scan(&r.Name, &r.Retired, &r.Reason); err != nil {
-			return nil, err
-		}
-		out = append(out, r)
-	}
-	return out, rows.Err()
-}
-
-// nameFree reports whether no principal or set holds a name, and none ever did.
-func nameFree(ctx context.Context, tx pgx.Tx, name string) (bool, error) {
-	var held bool
-	err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM principals WHERE name = $1)
-		OR EXISTS (SELECT 1 FROM retired_names WHERE name = $1)
-		OR EXISTS (SELECT 1 FROM synced_groups WHERE name = $1)
-		OR EXISTS (SELECT 1 FROM tree_sets WHERE name = $1)`, name).Scan(&held)
-	return !held, err
-}
-
-func retire(ctx context.Context, tx pgx.Tx, name, reason string) error {
-	_, err := tx.Exec(ctx, `INSERT INTO retired_names (name, reason) VALUES ($1, $2) ON CONFLICT (name) DO NOTHING`, name, reason)
-	return err
+	return s.b.RetiredNames(ctx)
 }
 
 // Audit records what an actor did.
@@ -228,8 +128,7 @@ func (s *Store) Audit(ctx context.Context, actor, action string, detail map[stri
 	if detail == nil {
 		detail = map[string]any{}
 	}
-	_, err := s.pool.Exec(ctx, `INSERT INTO audit (actor, action, detail) VALUES ($1, $2, $3)`, actor, action, detail)
-	return err
+	return s.b.AppendAudit(ctx, actor, action, detail)
 }
 
 // CreateRobot makes a robot: name is its full name, <name>.robot.<domain>.
@@ -238,16 +137,18 @@ func (s *Store) CreateRobot(ctx context.Context, name string) (Principal, error)
 		return Principal{}, fmt.Errorf("%q is not a robot's name under %s", name, s.names.Domain())
 	}
 	var p Principal
-	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		free, err := nameFree(ctx, tx, name)
+	err := s.b.Txn(ctx, func(tx Ops) error {
+		if err := tx.LockNames(ctx); err != nil {
+			return err
+		}
+		held, err := tx.NameHeld(ctx, name)
 		if err != nil {
 			return err
 		}
-		if !free {
+		if held {
 			return ErrTaken
 		}
-		p, err = scanPrincipal(tx.QueryRow(ctx, `INSERT INTO principals (id, name, kind, status) VALUES ($1, $2, 'robot', 'active')
-			RETURNING `+principalColumns, newID("prn_"), name))
+		p, err = tx.InsertPrincipal(ctx, Principal{ID: newID("prn_"), Name: name, Kind: Robot, Status: directory.Active})
 		return err
 	})
 	return p, err
@@ -275,8 +176,8 @@ func (s *Store) EnsureRobot(ctx context.Context, name string) (Principal, error)
 // DeleteRobot deletes a robot: a tombstone, its name retired, its credentials revoked, its
 // bindings gone.
 func (s *Store) DeleteRobot(ctx context.Context, name string) error {
-	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		p, err := scanPrincipal(tx.QueryRow(ctx, `SELECT `+principalColumns+` FROM principals WHERE name = $1 FOR UPDATE`, name))
+	return s.b.Txn(ctx, func(tx Ops) error {
+		p, err := tx.LockPrincipalByName(ctx, name)
 		if err != nil {
 			return err
 		}
@@ -286,16 +187,16 @@ func (s *Store) DeleteRobot(ctx context.Context, name string) error {
 		if p.Status == directory.Deleted {
 			return nil
 		}
-		if _, err := tx.Exec(ctx, `UPDATE principals SET status = 'deleted', updated_at = now() WHERE id = $1`, p.ID); err != nil {
+		if err := tx.SetStatus(ctx, p.ID, directory.Deleted); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(ctx, `UPDATE credentials SET revoked_at = now() WHERE principal_id = $1 AND revoked_at IS NULL`, p.ID); err != nil {
+		if err := tx.RevokeCredentialsOf(ctx, p.ID); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(ctx, `DELETE FROM robot_bindings WHERE principal_id = $1`, p.ID); err != nil {
+		if err := tx.DeleteBindingsOf(ctx, p.ID); err != nil {
 			return err
 		}
-		return retire(ctx, tx, name, "the robot was deleted")
+		return tx.RetireName(ctx, name, "the robot was deleted")
 	})
 }
 
@@ -316,19 +217,18 @@ func (s *Store) Bind(ctx context.Context, robot string, b Binding) error {
 	if p.Kind != Robot || !p.Active() {
 		return fmt.Errorf("%s is not an active robot", robot)
 	}
-	_, err = s.pool.Exec(ctx, `INSERT INTO robot_bindings (issuer, subject, principal_id) VALUES ($1, $2, $3)`, b.Issuer, b.Subject, p.ID)
-	var pg *pgconn.PgError
-	if errors.As(err, &pg) && pg.Code == "23505" {
+	if err := s.b.InsertBinding(ctx, p.ID, b); errors.Is(err, ErrBindingTaken) {
 		return fmt.Errorf("issuer %s's subject %s already names a robot", b.Issuer, b.Subject)
+	} else if err != nil {
+		return err
 	}
-	return err
+	return nil
 }
 
 // Unbind removes a binding from a robot.
 func (s *Store) Unbind(ctx context.Context, robot string, b Binding) error {
-	tag, err := s.pool.Exec(ctx, `DELETE FROM robot_bindings rb USING principals p
-		WHERE rb.principal_id = p.id AND p.name = $1 AND rb.issuer = $2 AND rb.subject = $3`, robot, b.Issuer, b.Subject)
-	if err == nil && tag.RowsAffected() == 0 {
+	ok, err := s.b.DeleteBinding(ctx, robot, b)
+	if err == nil && !ok {
 		return ErrNotFound
 	}
 	return err
@@ -336,8 +236,7 @@ func (s *Store) Unbind(ctx context.Context, robot string, b Binding) error {
 
 // BoundRobot returns the robot a binding names.
 func (s *Store) BoundRobot(ctx context.Context, b Binding) (Principal, error) {
-	return scanPrincipal(s.pool.QueryRow(ctx, `SELECT `+prefixed("p")+` FROM robot_bindings rb JOIN principals p ON p.id = rb.principal_id
-		WHERE rb.issuer = $1 AND rb.subject = $2`, b.Issuer, b.Subject))
+	return s.b.BoundPrincipal(ctx, b)
 }
 
 // RobotWithBindings is a robot and its bindings.
@@ -352,21 +251,8 @@ func (s *Store) Robots(ctx context.Context) ([]RobotWithBindings, error) {
 	if err != nil {
 		return nil, err
 	}
-	rows, err := s.pool.Query(ctx, `SELECT principal_id, issuer, subject FROM robot_bindings ORDER BY issuer, subject`)
+	bindings, err := s.b.Bindings(ctx)
 	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	bindings := map[string][]Binding{}
-	for rows.Next() {
-		var id string
-		var b Binding
-		if err := rows.Scan(&id, &b.Issuer, &b.Subject); err != nil {
-			return nil, err
-		}
-		bindings[id] = append(bindings[id], b)
-	}
-	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 	out := make([]RobotWithBindings, 0, len(robots))
@@ -376,30 +262,14 @@ func (s *Store) Robots(ctx context.Context) ([]RobotWithBindings, error) {
 	return out, nil
 }
 
-// prefixed is principalColumns qualified by a table alias.
-func prefixed(alias string) string {
-	return alias + `.id, ` + alias + `.name, ` + alias + `.kind, ` + alias + `.status, COALESCE(` + alias + `.external_id, ''), ` +
-		alias + `.email, ` + alias + `.display_name, ` + alias + `.created_at`
-}
-
 // ByEmail returns the person with an email, compared case-insensitively. Two people with the
 // email are no answer: an authenticator's email must name one.
 func (s *Store) ByEmail(ctx context.Context, email string) (Principal, error) {
-	rows, err := s.pool.Query(ctx, `SELECT `+principalColumns+` FROM principals
-		WHERE kind = 'human' AND email <> '' AND lower(email) = lower($1) LIMIT 2`, email)
+	if email == "" {
+		return Principal{}, ErrNotFound
+	}
+	found, err := s.b.PeopleByEmail(ctx, email)
 	if err != nil {
-		return Principal{}, err
-	}
-	defer rows.Close()
-	var found []Principal
-	for rows.Next() {
-		p, err := scanPrincipal(rows)
-		if err != nil {
-			return Principal{}, err
-		}
-		found = append(found, p)
-	}
-	if err := rows.Err(); err != nil {
 		return Principal{}, err
 	}
 	if len(found) != 1 {
@@ -410,11 +280,8 @@ func (s *Store) ByEmail(ctx context.Context, email string) (Principal, error) {
 
 // ByExternalID returns the person the system of record knows by an ID.
 func (s *Store) ByExternalID(ctx context.Context, id string) (Principal, error) {
-	return scanPrincipal(s.pool.QueryRow(ctx, `SELECT `+principalColumns+` FROM principals WHERE external_id = $1`, id))
+	return s.b.PrincipalByExternalID(ctx, id)
 }
-
-// Pool is the store's database, for what keeps its own tables in it: locks.
-func (s *Store) Pool() *pgxpool.Pool { return s.pool }
 
 // EnsureBinding binds a robot to b unless it is bound already; b bound to another robot is an
 // error.

@@ -87,24 +87,7 @@ func (s *Store) TreeSizes(ctx context.Context, repo int64, trees []encoding.ID) 
 
 // keptTreeSizes reads the records already kept for trees.
 func (s *Store) keptTreeSizes(ctx context.Context, repo int64, trees []encoding.ID) (map[encoding.ID][]byte, error) {
-	rows, err := s.pool.Query(ctx, `SELECT tree_id, body FROM tree_sizes WHERE repository_id = $1 AND tree_id = ANY($2)`, repo, ids(trees))
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := make(map[encoding.ID][]byte, len(trees))
-	for rows.Next() {
-		var idb, body []byte
-		if err := rows.Scan(&idb, &body); err != nil {
-			return nil, err
-		}
-		id, err := toID(idb)
-		if err != nil {
-			return nil, err
-		}
-		out[id] = body
-	}
-	return out, rows.Err()
+	return s.b.TreeSizes(ctx, repo, trees)
 }
 
 // deriveTreeSizes derives the records of trees never read before, from each tree's entries alone,
@@ -155,7 +138,8 @@ func (s *Store) deriveTreeSizes(ctx context.Context, repo int64, trees []encodin
 		return nil, err
 	}
 	out := make(map[encoding.ID][]byte, len(decoded))
-	var keepIDs, keepBodies [][]byte
+	var keepIDs []encoding.ID
+	var keepBodies [][]byte
 	for id, t := range decoded {
 		rec := &encoding.TreeSizes{Sizes: make([]uint64, len(t.Entries))}
 		for i, e := range t.Entries {
@@ -176,15 +160,13 @@ func (s *Store) deriveTreeSizes(ctx context.Context, repo int64, trees []encodin
 		}
 		b := encoding.EncodeTreeSizes(rec)
 		out[id] = b
-		keepIDs = append(keepIDs, id[:])
+		keepIDs = append(keepIDs, id)
 		keepBodies = append(keepBodies, b)
 	}
 	if len(keepIDs) > 0 {
 		// Keeping is what spares the next reader the derivation; a record not kept — its tree
 		// collected meanwhile, or the database busy — is still correct to serve.
-		if _, err := s.pool.Exec(ctx, `INSERT INTO tree_sizes (repository_id, tree_id, body)
-			SELECT $1, t.id, t.body FROM unnest($2::bytea[], $3::bytea[]) AS t(id, body)
-			ON CONFLICT DO NOTHING`, repo, keepIDs, keepBodies); err != nil {
+		if err := s.b.InsertTreeSizes(ctx, repo, keepIDs, keepBodies); err != nil {
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}

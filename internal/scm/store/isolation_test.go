@@ -159,7 +159,7 @@ func TestCreateWorkspace(t *testing.T) {
 		t.Errorf("creating it again: %v, want ErrAlreadyExists", err)
 	}
 	// Nor a workspace okfs recorded before workspaces had their own logs.
-	if _, err := s.pool.Exec(ctx, `INSERT INTO workspace (repository_id, principal, name) VALUES ($1, $2, 'old-vfs')`, repo, alice); err != nil {
+	if _, err := poolOf(s).Exec(ctx, `INSERT INTO workspace (repository_id, principal, name) VALUES ($1, $2, 'old-vfs')`, repo, alice); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.CreateWorkspace(ctx, alice, repo, "old-vfs"); !errors.Is(err, ErrAlreadyExists) {
@@ -199,7 +199,7 @@ func TestNoWorkspaceNoLog(t *testing.T) {
 	repo := newRepo(t, s).ID
 	const alice, ghost = "alice.human.example.com", "ghost"
 	logs := func() (n int) {
-		if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM op_log WHERE repository_id = $1`, repo).Scan(&n); err != nil {
+		if err := poolOf(s).QueryRow(ctx, `SELECT count(*) FROM op_log WHERE repository_id = $1`, repo).Scan(&n); err != nil {
 			t.Fatal(err)
 		}
 		return n
@@ -338,7 +338,7 @@ func TestNoWorkspaceNamed(t *testing.T) {
 		t.Errorf("moving heads, naming no workspace: %v, want ErrInvalid", err)
 	}
 	var logs int
-	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM op_log WHERE repository_id = $1 AND principal = $2`, repo, carol).Scan(&logs); err != nil || logs != 0 {
+	if err := poolOf(s).QueryRow(ctx, `SELECT count(*) FROM op_log WHERE repository_id = $1 AND principal = $2`, repo, carol).Scan(&logs); err != nil || logs != 0 {
 		t.Errorf("carol's operation logs: %d (%v), want none", logs, err)
 	}
 }
@@ -356,29 +356,29 @@ func TestGCDeletesLogsOfNoWorkspace(t *testing.T) {
 	}
 	_, op := workOf(t, s, repo, alice, "laptop")
 	var shared int64
-	if err := s.pool.QueryRow(ctx, `INSERT INTO op_log (repository_id, principal, workspace) VALUES ($1, $2, '') RETURNING id`, repo, alice).Scan(&shared); err != nil {
+	if err := poolOf(s).QueryRow(ctx, `INSERT INTO op_log (repository_id, principal, workspace) VALUES ($1, $2, '') RETURNING id`, repo, alice).Scan(&shared); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.pool.Exec(ctx, `INSERT INTO op_head (op_log_id, op_id) VALUES ($1, $2)`, shared, encoding.RootOperationID[:]); err != nil {
+	if _, err := poolOf(s).Exec(ctx, `INSERT INTO op_head (op_log_id, op_id) VALUES ($1, $2)`, shared, encoding.RootOperationID[:]); err != nil {
 		t.Fatal(err)
 	}
 	// And a workspace okfs recorded then, with no log of its own, and its checkpoint.
-	if _, err := s.pool.Exec(ctx, `INSERT INTO workspace (repository_id, principal, name) VALUES ($1, $2, 'old-vfs')`, repo, alice); err != nil {
+	if _, err := poolOf(s).Exec(ctx, `INSERT INTO workspace (repository_id, principal, name) VALUES ($1, $2, 'old-vfs')`, repo, alice); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.pool.Exec(ctx, `INSERT INTO checkpoint (repository_id, principal, workspace, machine, tree_ids, base_commit_id, fork)
+	if _, err := poolOf(s).Exec(ctx, `INSERT INTO checkpoint (repository_id, principal, workspace, machine, tree_ids, base_commit_id, fork)
 		VALUES ($1, $2, 'old-vfs', 'm1', ARRAY[$3::bytea], $4, false)`, repo, alice, encoding.EmptyTreeID[:], encoding.RootCommitID[:]); err != nil {
 		t.Fatal(err)
 	}
 	logs := func() (n int) {
-		if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM op_log WHERE repository_id = $1 AND workspace = ''`, repo).Scan(&n); err != nil {
+		if err := poolOf(s).QueryRow(ctx, `SELECT count(*) FROM op_log WHERE repository_id = $1 AND workspace = ''`, repo).Scan(&n); err != nil {
 			t.Fatal(err)
 		}
 		return n
 	}
 
 	workspaces := func() (n int) {
-		if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM workspace WHERE repository_id = $1 AND principal = $2 AND name = 'old-vfs'`, repo, alice).Scan(&n); err != nil {
+		if err := poolOf(s).QueryRow(ctx, `SELECT count(*) FROM workspace WHERE repository_id = $1 AND principal = $2 AND name = 'old-vfs'`, repo, alice).Scan(&n); err != nil {
 			t.Fatal(err)
 		}
 		return n
@@ -396,7 +396,7 @@ func TestGCDeletesLogsOfNoWorkspace(t *testing.T) {
 		t.Errorf("the report: %s", r)
 	}
 	var checkpoints int
-	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM checkpoint WHERE repository_id = $1 AND workspace = 'old-vfs'`, repo).Scan(&checkpoints); err != nil || checkpoints != 0 {
+	if err := poolOf(s).QueryRow(ctx, `SELECT count(*) FROM checkpoint WHERE repository_id = $1 AND workspace = 'old-vfs'`, repo).Scan(&checkpoints); err != nil || checkpoints != 0 {
 		t.Errorf("the deleted workspace's checkpoints: %d (%v)", checkpoints, err)
 	}
 	// Every workspace jj clone made is kept, with its log.
@@ -405,7 +405,7 @@ func TestGCDeletesLogsOfNoWorkspace(t *testing.T) {
 		t.Errorf("alice's workspaces after the pass: %+v (%v)", ws, err)
 	}
 	var heads int
-	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM op_head WHERE op_log_id = $1`, shared).Scan(&heads); err != nil || heads != 0 {
+	if err := poolOf(s).QueryRow(ctx, `SELECT count(*) FROM op_head WHERE op_log_id = $1`, shared).Scan(&heads); err != nil || heads != 0 {
 		t.Errorf("the deleted log's heads: %d (%v)", heads, err)
 	}
 	if h, err := s.GetOpHeads(ctx, repo, alice, "laptop"); err != nil || len(h) != 1 || h[0] != op {
@@ -416,7 +416,7 @@ func TestGCDeletesLogsOfNoWorkspace(t *testing.T) {
 	}
 	var recorded int64
 	var recordedWorkspaces int64
-	if err := s.pool.QueryRow(ctx, `SELECT op_logs_deleted, workspaces_deleted FROM gc_pass WHERE repository_id = $1 ORDER BY started_at DESC LIMIT 1`, repo).Scan(&recorded, &recordedWorkspaces); err != nil || recorded != 1 || recordedWorkspaces != 1 {
+	if err := poolOf(s).QueryRow(ctx, `SELECT op_logs_deleted, workspaces_deleted FROM gc_pass WHERE repository_id = $1 ORDER BY started_at DESC LIMIT 1`, repo).Scan(&recorded, &recordedWorkspaces); err != nil || recorded != 1 || recordedWorkspaces != 1 {
 		t.Errorf("the recorded pass: %d logs, %d workspaces (%v)", recorded, recordedWorkspaces, err)
 	}
 }

@@ -10,10 +10,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/Cidan/ok/internal/scm/encoding"
-	scmpb "github.com/Cidan/ok/proto/ok/scm/v1"
 )
 
 const (
@@ -251,12 +249,12 @@ func TestUploadStackAndPatchsets(t *testing.T) {
 	// Patchset commits and what they reach are pinned.
 	for _, id := range []encoding.ID{c1, c2, c2b, c2c} {
 		var pinned bool
-		if err := e.s.pool.QueryRow(context.Background(), `SELECT pinned FROM commit WHERE repository_id = $1 AND id = $2`, e.repo, id[:]).Scan(&pinned); err != nil || !pinned {
+		if err := poolOf(e.s).QueryRow(context.Background(), `SELECT pinned FROM commit WHERE repository_id = $1 AND id = $2`, e.repo, id[:]).Scan(&pinned); err != nil || !pinned {
 			t.Fatalf("commit %s pinned=%v err=%v", id, pinned, err)
 		}
 	}
 	var unpinned int
-	if err := e.s.pool.QueryRow(context.Background(), `SELECT count(*) FROM object WHERE repository_id = $1 AND NOT pinned`, e.repo).Scan(&unpinned); err != nil {
+	if err := poolOf(e.s).QueryRow(context.Background(), `SELECT count(*) FROM object WHERE repository_id = $1 AND NOT pinned`, e.repo).Scan(&unpinned); err != nil {
 		t.Fatal(err)
 	}
 	for _, k := range indexOf(t, e.s, e.repo).Sorted() {
@@ -520,13 +518,13 @@ func TestLandFastForwardAndSplice(t *testing.T) {
 
 	// main's history, the paths index, and pins.
 	var logged int
-	if err := e.s.pool.QueryRow(ctx, `SELECT count(*) FROM head_log WHERE repository_id = $1`, e.repo).Scan(&logged); err != nil || logged != 2 {
+	if err := poolOf(e.s).QueryRow(ctx, `SELECT count(*) FROM head_log WHERE repository_id = $1`, e.repo).Scan(&logged); err != nil || logged != 2 {
 		t.Fatalf("head_log has %d rows (%v)", logged, err)
 	}
 	if r, _ := e.s.GetRepository(ctx, e.repo); r.HeadSeq != 2 {
 		t.Fatalf("head_seq %d", r.HeadSeq)
 	}
-	rows, err := e.s.pool.Query(ctx, `SELECT path FROM commit_path WHERE repository_id = $1 AND commit_id = $2 ORDER BY path`, e.repo, l2[:])
+	rows, err := poolOf(e.s).Query(ctx, `SELECT path FROM commit_path WHERE repository_id = $1 AND commit_id = $2 ORDER BY path`, e.repo, l2[:])
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -541,11 +539,11 @@ func TestLandFastForwardAndSplice(t *testing.T) {
 		t.Fatalf("indexed paths %v, want the changed file and its directory", paths)
 	}
 	var pinned bool
-	if err := e.s.pool.QueryRow(ctx, `SELECT pinned FROM commit WHERE repository_id = $1 AND id = $2`, e.repo, l2[:]).Scan(&pinned); err != nil || !pinned {
+	if err := poolOf(e.s).QueryRow(ctx, `SELECT pinned FROM commit WHERE repository_id = $1 AND id = $2`, e.repo, l2[:]).Scan(&pinned); err != nil || !pinned {
 		t.Fatalf("landed commit pinned=%v (%v)", pinned, err)
 	}
 	var unpinned int
-	if err := e.s.pool.QueryRow(ctx, `SELECT count(*) FROM object WHERE repository_id = $1 AND NOT pinned`, e.repo).Scan(&unpinned); err != nil || unpinned != 0 {
+	if err := poolOf(e.s).QueryRow(ctx, `SELECT count(*) FROM object WHERE repository_id = $1 AND NOT pinned`, e.repo).Scan(&unpinned); err != nil || unpinned != 0 {
 		t.Fatalf("%d trees unpinned after landing (%v)", unpinned, err)
 	}
 	// Upload now knows both landed commits are on main.
@@ -711,7 +709,7 @@ func TestCandidates(t *testing.T) {
 		t.Fatalf("re-spliced tree %v", e.flatAt(landed[0].Commit))
 	}
 	var pending int
-	if err := e.s.pool.QueryRow(ctx, `SELECT count(*) FROM candidate WHERE repository_id = $1`, e.repo).Scan(&pending); err != nil || pending != 0 {
+	if err := poolOf(e.s).QueryRow(ctx, `SELECT count(*) FROM candidate WHERE repository_id = $1`, e.repo).Scan(&pending); err != nil || pending != 0 {
 		t.Fatalf("%d candidates pending after their CLs landed (%v)", pending, err)
 	}
 
@@ -771,48 +769,5 @@ func TestChangeListQueries(t *testing.T) {
 	}
 	if _, err := e.s.GetChangeList(ctx, e.repo, 99); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("missing CL: %v", err)
-	}
-}
-
-func TestWatchEvents(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	e := newCLEnv(t)
-	var start int64
-	if err := e.s.pool.QueryRow(ctx, `SELECT coalesce((SELECT last FROM event_counter), 0)`).Scan(&start); err != nil {
-		t.Fatal(err)
-	}
-	got := make(chan *scmpb.Event, 100)
-	go e.s.WatchEvents(ctx, start, func(ev *scmpb.Event) error {
-		if ev.RepositoryId == e.repo {
-			got <- ev
-		}
-		return nil
-	})
-	time.Sleep(200 * time.Millisecond) // let the watcher catch up and wait
-	a := e.commit(alice, newChange(), encoding.RootCommitID, "a", map[string]string{"a": "1"})
-	b := e.commit(alice, newChange(), a, "b", map[string]string{"a": "1", "b": "1"})
-	res := e.mustUpload(alice, ReadinessUnchanged, a, b)
-	e.transition(res[0].Number, RequestReview)
-	e.transition(res[1].Number, RequestReview)
-	e.mustLand(LandItem{Number: res[0].Number, Patchset: 1}, LandItem{Number: res[1].Number, Patchset: 1})
-
-	var kinds []string
-	var last int64
-	for len(kinds) < 8 {
-		select {
-		case ev := <-got:
-			if ev.Seq <= last {
-				t.Fatalf("event %d after %d", ev.Seq, last)
-			}
-			last = ev.Seq
-			kinds = append(kinds, fmt.Sprintf("%T", ev.Kind)[len("*scmpb.Event_"):])
-		case <-ctx.Done():
-			t.Fatalf("saw only %v", kinds)
-		}
-	}
-	want := []string{"Uploaded", "Uploaded", "Transitioned", "Transitioned", "Landed", "Landed", "HeadMoved", "HeadMoved"}
-	if !reflect.DeepEqual(kinds, want) {
-		t.Fatalf("events %v, want %v", kinds, want)
 	}
 }

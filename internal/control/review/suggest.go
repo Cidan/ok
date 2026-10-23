@@ -235,7 +235,7 @@ func (s *Service) recentPeople(ctx context.Context, repo int64, files []string) 
 	for i, c := range commits {
 		ids[i] = c.GetId()
 	}
-	landed, err := db.LandedBy(ctx, s.db.Q(), repo, ids)
+	landed, err := s.db.LandedBy(ctx, repo, ids)
 	if err != nil {
 		return nil, err
 	}
@@ -243,7 +243,7 @@ func (s *Service) recentPeople(ctx context.Context, repo int64, files []string) 
 	for _, n := range landed {
 		numbers = append(numbers, n)
 	}
-	grants, err := db.GrantsOf(ctx, s.db.Q(), repo, numbers)
+	grants, err := s.db.GrantsOf(ctx, repo, numbers)
 	if err != nil {
 		return nil, err
 	}

@@ -6,11 +6,10 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/jackc/pgx/v5"
-
 	"github.com/Cidan/ok/internal/identity"
 	"github.com/Cidan/ok/internal/owners"
 	"github.com/Cidan/ok/internal/scm/encoding"
+	"github.com/Cidan/ok/internal/scm/store/backend"
 	"github.com/Cidan/ok/internal/workflow"
 	scmpb "github.com/Cidan/ok/proto/ok/scm/v1"
 )
@@ -121,7 +120,7 @@ func (s *Store) Upload(ctx context.Context, repo int64, principal string, commit
 	if len(commits) > maxUpload {
 		return nil, invalid("an upload names at most %d commits, not %d", maxUpload, len(commits))
 	}
-	if err := s.repositoryExists(ctx, s.pool, repo); err != nil {
+	if err := s.repositoryExists(ctx, s.b, repo); err != nil {
 		return nil, err
 	}
 	staged, err := s.checkUpload(ctx, repo, commits, people)
@@ -133,7 +132,7 @@ func (s *Store) Upload(ctx context.Context, repo int64, principal string, commit
 		return nil, err
 	}
 	var results []UploadResult
-	err = s.inTx(ctx, func(tx pgx.Tx) error {
+	err = s.inTx(ctx, func(tx *txn) error {
 		var err error
 		results, err = s.applyUpload(ctx, tx, repo, principal, staged, readiness, assign, rej)
 		return err
@@ -417,12 +416,11 @@ func (s *Store) resolveReviewers(ctx context.Context, reviewers []string, people
 
 // onMain reports whether a commit is on main: the root, or a commit some landing made
 // main's head (main is linear, so that is all of it).
-func onMain(ctx context.Context, q querier, repo int64, id encoding.ID) (bool, error) {
+func onMain(ctx context.Context, q backend.Ops, repo int64, id encoding.ID) (bool, error) {
 	if id == encoding.RootCommitID {
 		return true, nil
 	}
-	var ok bool
-	err := q.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM head_log WHERE repository_id = $1 AND new_head = $2)`, repo, id[:]).Scan(&ok)
+	_, ok, err := q.HeadSeqOf(ctx, repo, id)
 	return ok, err
 }
 
@@ -437,7 +435,7 @@ type plannedCL struct {
 	parentCL  int64 // the stack parent's CL when it is not in the upload, or 0
 }
 
-func (s *Store) applyUpload(ctx context.Context, tx pgx.Tx, repo int64, principal string, staged []*uploadCommit, readiness Readiness, assign []string, reviewerRejection *UploadRejection) ([]UploadResult, error) {
+func (s *Store) applyUpload(ctx context.Context, tx *txn, repo int64, principal string, staged []*uploadCommit, readiness Readiness, assign []string, reviewerRejection *UploadRejection) ([]UploadResult, error) {
 	// Find and lock every CL the upload can touch — those of its changes, and those whose
 	// patchsets are its commits' parents — in number order.
 	changeKeys := make([][]byte, len(staged))
@@ -446,22 +444,8 @@ func (s *Store) applyUpload(ctx context.Context, tx pgx.Tx, repo int64, principa
 		changeKeys[i] = u.c.ChangeID[:]
 		parentKeys = append(parentKeys, u.parent[:])
 	}
-	rows, err := tx.Query(ctx, `SELECT number FROM changelist WHERE repository_id = $1 AND change_id = ANY($2)
-		UNION SELECT cl_number FROM patchset WHERE repository_id = $1 AND commit_id = ANY($3)`, repo, changeKeys, parentKeys)
+	numbers, err := tx.UploadChangeLists(ctx, repo, changeKeys, parentKeys)
 	if err != nil {
-		return nil, err
-	}
-	var numbers []int64
-	for rows.Next() {
-		var n int64
-		if err := rows.Scan(&n); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		numbers = append(numbers, n)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 	locked, err := lockChangeLists(ctx, tx, repo, numbers)
@@ -573,10 +557,8 @@ func (s *Store) applyUpload(ctx context.Context, tx pgx.Tx, repo int64, principa
 	// New CLs take their numbers from the repository's counter, the upload's last lock
 	// before the event counter.
 	if created > 0 {
-		var last int64
-		if err := tx.QueryRow(ctx, `INSERT INTO changelist_counter (repository_id, last) VALUES ($1, $2)
-			ON CONFLICT (repository_id) DO UPDATE SET last = changelist_counter.last + EXCLUDED.last RETURNING last`,
-			repo, created).Scan(&last); err != nil {
+		last, err := tx.NextChangeListNumbers(ctx, repo, created)
+		if err != nil {
 			return nil, err
 		}
 		next := last - created + 1
@@ -604,22 +586,19 @@ func (s *Store) applyUpload(ctx context.Context, tx pgx.Tx, repo int64, principa
 			parentNumber = &parent
 		}
 		if results[i].Outcome == Created {
-			_, err := tx.Exec(ctx, `INSERT INTO changelist (repository_id, number, change_id, author, status, parent_number, current_patchset, description)
-				VALUES ($1, $2, $3, $4, $5, $6, 1, $7)`,
-				repo, p.number, p.u.c.ChangeID[:], principal, int16(p.status), parentNumber, p.u.c.Description)
-			if isUniqueViolation(err) {
+			err := tx.InsertChangeList(ctx, repo, backend.ChangeList{Number: p.number, ChangeID: p.u.c.ChangeID[:], Author: principal,
+				Status: int16(p.status), Parent: parent, CurrentPatchset: 1, Description: p.u.c.Description})
+			if errors.Is(err, backend.ErrDuplicate) {
 				return nil, errRace
 			}
 			if err != nil {
 				return nil, err
 			}
-		} else if _, err := tx.Exec(ctx, `UPDATE changelist SET current_patchset = $3, description = $4, parent_number = $5,
-				status = $6, updated_at = now() WHERE repository_id = $1 AND number = $2`,
-			repo, p.number, p.patchset, p.u.c.Description, parentNumber, int16(p.status)); err != nil {
+		} else if err := tx.UpdateChangeList(ctx, repo, p.number, p.patchset, p.u.c.Description, parentNumber, int16(p.status)); err != nil {
 			return nil, err
 		}
-		if _, err := tx.Exec(ctx, `INSERT INTO patchset (repository_id, cl_number, number, commit_id, base_commit_id, parent_number, uploaded_by)
-			VALUES ($1, $2, $3, $4, $5, $6, $7)`, repo, p.number, p.patchset, p.u.id[:], p.u.parent[:], parentNumber, principal); err != nil {
+		if err := tx.InsertPatchset(ctx, repo, backend.Patchset{CL: p.number, Number: p.patchset, Commit: p.u.id, Base: p.u.parent,
+			Parent: parent, UploadedBy: principal}); err != nil {
 			return nil, err
 		}
 	}

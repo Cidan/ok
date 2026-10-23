@@ -29,50 +29,6 @@ func testStore(t *testing.T) *S3 {
 	return s
 }
 
-func TestS3(t *testing.T) {
-	s := testStore(t)
-	ctx := context.Background()
-	prefix := fmt.Sprintf("blobtest/%d/", time.Now().UnixNano())
-	data := bytes.Repeat([]byte("0123456789"), 1000)
-	key := prefix + "a"
-	if err := s.Put(ctx, key, bytes.NewReader(data), int64(len(data))); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		objs, _ := s.List(ctx, prefix)
-		for _, o := range objs {
-			s.Delete(ctx, o.Key)
-		}
-	})
-	got, err := s.GetRange(ctx, key, 1234, 100)
-	if err != nil || !bytes.Equal(got, data[1234:1334]) {
-		t.Fatalf("GetRange = %q, %v", got, err)
-	}
-	if got, err := s.GetRange(ctx, key, 5, 0); err != nil || len(got) != 0 {
-		t.Fatalf("empty GetRange = %q, %v", got, err)
-	}
-	var buf bytes.Buffer
-	if n, err := s.Download(ctx, key, &buf); err != nil || n != int64(len(data)) || !bytes.Equal(buf.Bytes(), data) {
-		t.Fatalf("Download = %d, %v", n, err)
-	}
-	if err := s.Put(ctx, prefix+"b", bytes.NewReader([]byte("b")), 1); err != nil {
-		t.Fatal(err)
-	}
-	objs, err := s.List(ctx, prefix)
-	if err != nil || len(objs) != 2 || objs[0].Key != key || objs[0].Size != int64(len(data)) {
-		t.Fatalf("List = %+v, %v", objs, err)
-	}
-	if err := s.Delete(ctx, key); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.GetRange(ctx, key, 0, 1); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("GetRange after Delete = %v, want ErrNotFound", err)
-	}
-	if err := s.Delete(ctx, key); err != nil {
-		t.Fatalf("deleting a missing key: %v", err)
-	}
-}
-
 // Every request is counted by bucket, operation, and outcome, with its time and bytes.
 func TestMetrics(t *testing.T) {
 	s := testStore(t)

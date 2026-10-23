@@ -615,17 +615,19 @@ fn a_starting_server_waits_for_its_exports() {
     let other = server.handle(EXPORT + 1, ROOT);
     let call = std::thread::spawn(move || {
         let mut c = Client::connect(addr, OWNER, OWNER).unwrap();
-        let started = std::time::Instant::now();
         let attr = c.getattr(&root).unwrap();
-        (attr, started.elapsed())
+        (attr, std::time::Instant::now())
     });
     std::thread::sleep(std::time::Duration::from_millis(300));
+    // The call answers once the export is served, however long the client took to connect.
+    let exported = std::time::Instant::now();
     server.export(EXPORT, ROOT, Arc::new(MemFs::new()));
-    let (attr, waited) = call.join().unwrap();
+    let (attr, answered) = call.join().unwrap();
     assert_eq!(attr.unwrap().fileid, ROOT);
     assert!(
-        waited >= std::time::Duration::from_millis(250),
-        "it did not wait: {waited:?}"
+        answered >= exported,
+        "it did not wait: answered {:?} before the export",
+        exported - answered
     );
     server.ready();
     let mut c = Client::connect(addr, OWNER, OWNER).unwrap();

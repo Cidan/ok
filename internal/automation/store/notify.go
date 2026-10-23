@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-// notifier wakes the store's waiters on PostgreSQL notifications: a worker waiting for a
+// notifier wakes the store's waiters on the database's notifications: a worker waiting for a
 // queued run, a reader following a log. Each wait is also bounded by the poll interval, so a
 // lost notification — or no Listen at all — delays a waiter and never strands it.
 type notifier struct {
@@ -93,7 +93,7 @@ func (n *notifier) waitAny(ctx context.Context, max time.Duration, chs ...<-chan
 // reconnecting after a failure.
 func (s *Store) Listen(ctx context.Context) error {
 	for ctx.Err() == nil {
-		err := s.listen(ctx)
+		err := s.b.Listen(ctx, []string{chanQueue, chanLog, chanDone, chanSubmission}, s.notify.fireAll, s.notify.fire)
 		if ctx.Err() != nil {
 			return nil
 		}
@@ -105,27 +105,4 @@ func (s *Store) Listen(ctx context.Context) error {
 		}
 	}
 	return nil
-}
-
-func (s *Store) listen(ctx context.Context) error {
-	pc, err := s.pool.Acquire(ctx)
-	if err != nil {
-		return err
-	}
-	// The connection leaves the pool: it listens for as long as this runs, then closes.
-	conn := pc.Hijack()
-	defer conn.Close(context.Background())
-	for _, ch := range []string{chanQueue, chanLog, chanDone, chanSubmission} {
-		if _, err := conn.Exec(ctx, `LISTEN `+ch); err != nil {
-			return err
-		}
-	}
-	s.notify.fireAll()
-	for {
-		n, err := conn.WaitForNotification(ctx)
-		if err != nil {
-			return err
-		}
-		s.notify.fire(n.Channel, n.Payload)
-	}
 }

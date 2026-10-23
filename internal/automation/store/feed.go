@@ -4,40 +4,34 @@ import (
 	"context"
 
 	"github.com/Cidan/ok/internal/lock"
+	"github.com/Cidan/ok/internal/scm/scmfeed"
 )
 
-// Cursor returns the last SCM change-feed event automation has applied (0: none).
-func (s *Store) Cursor(ctx context.Context) (int64, error) {
-	var seq int64
-	err := s.pool.QueryRow(ctx, `SELECT coalesce((SELECT seq FROM feed_cursor), 0)`).Scan(&seq)
-	return seq, err
+// Cursor returns the place in a repository's log of the last of its events automation has
+// applied (0: none).
+func (s *Store) Cursor(ctx context.Context, repo int64) (int64, error) {
+	return s.b.FollowCursor(ctx, scmfeed.Topic, repo)
 }
 
-// SetCursor records the last change-feed event applied. It never moves the cursor back, so an
-// event is never applied twice however many followers there are.
-func (s *Store) SetCursor(ctx context.Context, seq int64) error {
-	_, err := s.pool.Exec(ctx, `INSERT INTO feed_cursor (seq) VALUES ($1)
-		ON CONFLICT (id) DO UPDATE SET seq = greatest(feed_cursor.seq, EXCLUDED.seq)`, seq)
-	return err
+// SetCursor records the last of a repository's events applied. It never moves the cursor back,
+// so an event is never applied twice however many followers there are.
+func (s *Store) SetCursor(ctx context.Context, repo, seq int64) error {
+	return s.b.AdvanceFollowCursor(ctx, scmfeed.Topic, repo, seq)
 }
 
-// leaders is the bucket of the locks (internal/lock) whose holders follow the SCM's change
-// feed and run the landing queue: one replica holds each at a time.
-const leaders = "leaders"
+// LegacyCursor, Seed, and LeaveLegacy are a follow.Legacy's: automation's place in the SCM's feed
+// before it followed each repository's log, which it leaves once.
+func (s *Store) LegacyCursor(ctx context.Context) (int64, error) { return s.b.LegacyCursor(ctx) }
 
-// LeadFeed runs fn holding the change feed's lock, with a context that ends if the lock is lost,
-// and gives the lock up when fn returns. It returns lock.ErrNotAcquired when another replica
-// holds the lock, and otherwise fn's error.
-func (s *Store) LeadFeed(ctx context.Context, fn lock.LockFn) error {
-	return s.locks.LockFn(ctx, leaders, "feed", 0, fn)
+func (s *Store) Seed(ctx context.Context, repo, seq int64) error {
+	return s.b.SeedFollowCursor(ctx, scmfeed.Topic, repo, seq)
 }
 
-// LeadBuildCache runs fn holding the build cache sweep's lock, as LeadFeed does the feed's.
+func (s *Store) LeaveLegacy(ctx context.Context) error { return s.b.ForgetLegacyCursor(ctx) }
+
+// LeadBuildCache runs fn holding the build cache sweep's lock, with a context that ends if the
+// lock is lost, and gives the lock up when fn returns. It returns lock.ErrNotAcquired when
+// another replica holds the lock, and otherwise fn's error.
 func (s *Store) LeadBuildCache(ctx context.Context, fn lock.LockFn) error {
-	return s.locks.LockFn(ctx, leaders, "buildcache", 0, fn)
-}
-
-// LeadQueue runs fn holding the landing queue's lock, as LeadFeed does the feed's.
-func (s *Store) LeadQueue(ctx context.Context, fn lock.LockFn) error {
-	return s.locks.LockFn(ctx, leaders, "queue", 0, fn)
+	return s.b.Lead(ctx, "buildcache", fn)
 }

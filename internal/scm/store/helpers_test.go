@@ -14,7 +14,9 @@ import (
 	"github.com/Cidan/ok/internal/identity"
 	"github.com/Cidan/ok/internal/scm/encoding"
 	"github.com/Cidan/ok/internal/scm/pack"
+	scmpostgres "github.com/Cidan/ok/internal/scm/store/postgres"
 	"github.com/Cidan/ok/internal/testdb"
+	"github.com/Cidan/ok/internal/testdb/testobjects"
 )
 
 // testNames are the tests' installation's.
@@ -30,7 +32,11 @@ func mustOpen(t *testing.T, pool *pgxpool.Pool, blobs blob.Store, cfg Config) *S
 	if cfg.ChunkCacheBytes == 0 {
 		cfg.ChunkCacheBytes = 8 << 20
 	}
-	s, err := Open(context.Background(), pool, blobs, cfg)
+	b, err := scmpostgres.Open(context.Background(), pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := New(b, blobs, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -38,9 +44,28 @@ func mustOpen(t *testing.T, pool *pgxpool.Pool, blobs blob.Store, cfg Config) *S
 	return s
 }
 
-// testStore opens a Store over a new database and a new S3 bucket on the servers the test is
-// given (internal/testdb), both dropped when the test ends; Open brings the database to the
-// schema.
+// poolOf is the database a test's store is over: tests read and age its rows directly.
+func poolOf(s *Store) *pgxpool.Pool { return s.b.(*scmpostgres.Backend).Pool() }
+
+// ids converts IDs to the [][]byte pgx sends as bytea[].
+func ids(in []encoding.ID) [][]byte {
+	out := make([][]byte, len(in))
+	for i := range in {
+		out[i] = in[i][:]
+	}
+	return out
+}
+
+func toID(b []byte) (encoding.ID, error) {
+	if len(b) != encoding.IDLen {
+		return encoding.ID{}, fmt.Errorf("stored ID of %d bytes", len(b))
+	}
+	return encoding.ID(b), nil
+}
+
+// testStore opens a Store over a new database (internal/testdb) and a new bucket of the store
+// OK_TEST_OBJECTS names (internal/testdb/testobjects), both dropped when the test ends; the
+// backend's Open brings the database to the schema.
 func testStore(t *testing.T) *Store {
 	t.Helper()
 	ctx := context.Background()
@@ -54,24 +79,14 @@ func testStore(t *testing.T) *Store {
 		t.Fatal(err)
 	}
 	t.Cleanup(pool.Close)
-	s3 := testdb.S3(t)
-	blobs, err := blob.NewS3(blob.Config{
-		Endpoint:  s3.Endpoint,
-		Bucket:    testdb.Bucket(t),
-		AccessKey: s3.AccessKey,
-		SecretKey: s3.SecretKey,
-		Region:    s3.Region,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	blobs := testobjects.Store(t)
 	return mustOpen(t, pool, blobs, Config{})
 }
 
 // reopen opens a second Store over s's database and bucket, with cold caches.
 func reopen(t *testing.T, s *Store) *Store {
 	t.Helper()
-	return mustOpen(t, s.pool, s.blobs, Config{})
+	return mustOpen(t, poolOf(s), s.blobs, Config{})
 }
 
 var repoSeq atomic.Int64

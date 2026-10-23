@@ -11,8 +11,10 @@ import (
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 
-	"github.com/Cidan/ok/internal/blob"
+	"github.com/Cidan/ok/internal/bus"
+	"github.com/Cidan/ok/internal/bus/pgbus"
 	"github.com/Cidan/ok/internal/config"
 	"github.com/Cidan/ok/internal/credential"
 	"github.com/Cidan/ok/internal/dial"
@@ -22,8 +24,10 @@ import (
 	"github.com/Cidan/ok/internal/idclient"
 	"github.com/Cidan/ok/internal/pgdb"
 	"github.com/Cidan/ok/internal/scm/role"
+	"github.com/Cidan/ok/internal/scm/store"
 	"github.com/Cidan/ok/internal/serve"
 	"github.com/Cidan/ok/internal/testdb"
+	"github.com/Cidan/ok/internal/testdb/testobjects"
 	identitypb "github.com/Cidan/ok/proto/ok/identity/v1"
 	scmpb "github.com/Cidan/ok/proto/ok/scm/v1"
 )
@@ -97,11 +101,7 @@ identity:
 		t.Fatal(err)
 	}
 	defer scmPool.Close()
-	s3 := testdb.S3(t)
-	blobs, err := blob.NewS3(blob.Config{Endpoint: s3.Endpoint, Bucket: testdb.Bucket(t), AccessKey: s3.AccessKey, SecretKey: s3.SecretKey, Region: s3.Region})
-	if err != nil {
-		t.Fatal(err)
-	}
+	blobs := testobjects.Store(t)
 	scm, err := role.Build(ctx, cfg, role.Options{Pool: scmPool, Blobs: blobs, Identity: idConn})
 	if err != nil {
 		t.Fatal(err)
@@ -179,16 +179,36 @@ func TestSCMDevWithoutIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer pool.Close()
-	s3 := testdb.S3(t)
-	blobs, err := blob.NewS3(blob.Config{Endpoint: s3.Endpoint, Bucket: testdb.Bucket(t), AccessKey: s3.AccessKey, SecretKey: s3.SecretKey, Region: s3.Region})
-	if err != nil {
-		t.Fatal(err)
-	}
+	blobs := testobjects.Store(t)
 	scm, err := role.Build(ctx, cfg, role.Options{Dev: true, Pool: pool, Blobs: blobs})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer scm.Close()
+	// The SCM publishes its events on the bus the configuration names: PostgreSQL's, beside its
+	// own tables.
+	busPool, err := pgdb.Beside(ctx, pool, pgbus.Schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer busPool.Close()
+	b, err := pgbus.Open(ctx, busPool, pgbus.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	if err := b.CreateGroup(ctx, store.EventTopic, "test"); err != nil {
+		t.Fatal(err)
+	}
+	published := make(chan *scmpb.Event, 16)
+	go b.Subscribe(ctx, store.EventTopic, "test", func(_ context.Context, e bus.Event) error {
+		ev := &scmpb.Event{}
+		if err := proto.Unmarshal(e.Body, ev); err != nil || e.Key != ev.GetRepositoryId() || e.Seq != ev.GetRepositorySeq() {
+			t.Errorf("a published event %+v: %v, %v", e, ev, err)
+		}
+		published <- ev
+		return nil
+	})
 	lis, _ := net.Listen("tcp", "127.0.0.1:0")
 	done := make(chan error, 1)
 	go func() { done <- serve.Run(ctx, scm.Root, serve.WithAuthn(scm.Resolver), serve.WithListener(lis)) }()
@@ -204,6 +224,14 @@ func TestSCMDevWithoutIdentity(t *testing.T) {
 	r, err := as("ada.human.example.com").CreateRepository(ctx, &scmpb.CreateRepositoryRequest{Name: "dev"})
 	if err != nil || r.GetCreatedBy() != "ada.human.example.com" {
 		t.Fatalf("CreateRepository = %v, %v", r, err)
+	}
+	select {
+	case ev := <-published:
+		if ev.GetRepositoryId() != r.GetId() || ev.GetRepositorySeq() != 1 || ev.GetRepositoryCreated().GetName() != "dev" {
+			t.Errorf("the published event: %v", ev)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the repository's creation was never published")
 	}
 	if _, err := as("not a name").GetRepository(ctx, &scmpb.GetRepositoryRequest{Key: &scmpb.GetRepositoryRequest_Name{Name: "dev"}}); status.Code(err) != codes.Unauthenticated {
 		t.Errorf("a name that is no principal's: %v", err)

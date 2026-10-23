@@ -10,9 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jackc/pgx/v5"
-
 	"github.com/Cidan/ok/internal/scm/encoding"
+	"github.com/Cidan/ok/internal/scm/store/backend"
 	scmpb "github.com/Cidan/ok/proto/ok/scm/v1"
 )
 
@@ -36,11 +35,10 @@ type RollbackRejection struct {
 
 func (r *RollbackRejection) Error() string { return "rollback refused: " + r.Message }
 
-// RollbackResult is a rollback CL the SCM created, and the sequence number of the last event
-// it wrote.
+// RollbackResult is a rollback CL the SCM created, and the last event it wrote.
 type RollbackResult struct {
 	ChangeList *ChangeList
-	Seq        int64
+	Event      *scmpb.Event
 }
 
 // landedCommit is a CL's landing on main: the commit it landed as, its parent on main, and
@@ -68,7 +66,7 @@ func (s *Store) Rollback(ctx context.Context, repo, number int64, actor, reason 
 		return nil, invalid("a rollback says why")
 	}
 	var out *RollbackResult
-	err := s.inTx(ctx, func(tx pgx.Tx) error {
+	err := s.inTx(ctx, func(tx *txn) error {
 		out = nil
 		if err := s.repositoryExists(ctx, tx, repo); err != nil {
 			return err
@@ -86,22 +84,16 @@ func (s *Store) Rollback(ctx context.Context, repo, number int64, actor, reason 
 		if _, err := lockChangeLists(ctx, tx, repo, numbers); err != nil {
 			return err
 		}
-		var underway int64
-		err = tx.QueryRow(ctx, `SELECT number FROM changelist WHERE repository_id = $1 AND rolls_back && $2
-			AND status IN ($3, $4) ORDER BY number LIMIT 1`, repo, numbers, int16(StatusDraft), int16(StatusOpen)).Scan(&underway)
-		switch {
-		case err == nil:
+		underway, ok, err := tx.RollingBack(ctx, repo, numbers, []int16{int16(StatusDraft), int16(StatusOpen)})
+		if err != nil {
+			return err
+		}
+		if ok {
 			return &RollbackRejection{Number: number, Reason: RollbackUnderway,
 				Message: fmt.Sprintf("CL %d already rolls it back (review it, or abandon it and roll back again)", underway)}
-		case !errors.Is(err, pgx.ErrNoRows):
-			return err
 		}
 
-		var headB []byte
-		if err := tx.QueryRow(ctx, `SELECT head FROM repository WHERE id = $1`, repo).Scan(&headB); err != nil {
-			return err
-		}
-		head, err := toID(headB)
+		head, _, _, err := tx.Head(ctx, repo, false)
 		if err != nil {
 			return err
 		}
@@ -169,22 +161,19 @@ func (s *Store) Rollback(ctx context.Context, repo, number int64, actor, reason 
 
 		// The CL's number comes from the repository's counter, the last lock before the event
 		// counter, as an upload's does.
-		var cl int64
-		if err := tx.QueryRow(ctx, `INSERT INTO changelist_counter (repository_id, last) VALUES ($1, 1)
-			ON CONFLICT (repository_id) DO UPDATE SET last = changelist_counter.last + 1 RETURNING last`, repo).Scan(&cl); err != nil {
+		cl, err := tx.NextChangeListNumbers(ctx, repo, 1)
+		if err != nil {
 			return err
 		}
 		if left == nil {
 			left = []string{}
 		}
-		if _, err := tx.Exec(ctx, `INSERT INTO changelist (repository_id, number, change_id, author, status, current_patchset,
-				description, rolls_back, rollback_paths, rollback_left)
-			VALUES ($1, $2, $3, $4, $5, 1, $6, $7, $8, $9)`,
-			repo, cl, change[:], actor, int16(StatusOpen), commit.Description, numbers, paths, left); err != nil {
+		if err := tx.InsertChangeList(ctx, repo, backend.ChangeList{Number: cl, ChangeID: change[:], Author: actor,
+			Status: int16(StatusOpen), CurrentPatchset: 1, Description: commit.Description,
+			RollsBack: numbers, RollbackPaths: paths, RollbackLeft: left}); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(ctx, `INSERT INTO patchset (repository_id, cl_number, number, commit_id, base_commit_id, uploaded_by)
-			VALUES ($1, $2, 1, $3, $4, $5)`, repo, cl, id[:], head[:], actor); err != nil {
+		if err := tx.InsertPatchset(ctx, repo, backend.Patchset{CL: cl, Number: 1, Commit: id, Base: head, UploadedBy: actor}); err != nil {
 			return err
 		}
 		var assign []string
@@ -204,12 +193,11 @@ func (s *Store) Rollback(ctx context.Context, repo, number int64, actor, reason 
 		if err := appendEvents(ctx, tx, repo, []*scmpb.Event{ev}); err != nil {
 			return err
 		}
-		created, err := loadChangeLists(ctx, tx, repo, `SELECT `+changelistColumns+` FROM changelist
-			WHERE repository_id = $1 AND number = $2`, repo, cl)
+		created, err := readChangeLists(ctx, tx, repo, []int64{cl}, false)
 		if err != nil {
 			return err
 		}
-		out = &RollbackResult{ChangeList: created[0], Seq: ev.GetSeq()}
+		out = &RollbackResult{ChangeList: created[cl], Event: ev}
 		return nil
 	})
 	return out, err
@@ -218,7 +206,7 @@ func (s *Store) Rollback(ctx context.Context, repo, number int64, actor, reason 
 // rollbackStack is what rolling back CL number rolls back, in the order it landed: the CL, and
 // every landed CL above it in its stack — one with a patchset uploaded stacked on it, or on one
 // above it. main never keeps a stack's top without its bottom.
-func (s *Store) rollbackStack(ctx context.Context, tx pgx.Tx, repo, number int64) ([]landedCommit, error) {
+func (s *Store) rollbackStack(ctx context.Context, tx *txn, repo, number int64) ([]landedCommit, error) {
 	st, err := clStatus(ctx, tx, repo, number)
 	if err != nil {
 		return nil, err
@@ -227,41 +215,14 @@ func (s *Store) rollbackStack(ctx context.Context, tx pgx.Tx, repo, number int64
 		return nil, &RollbackRejection{Number: number, Reason: RollbackNotLanded,
 			Message: fmt.Sprintf("CL %d is %s: only a landed CL is rolled back", number, st)}
 	}
-	rows, err := tx.Query(ctx, `WITH RECURSIVE above(number) AS (
-			SELECT $2::bigint
-			UNION
-			SELECT p.cl_number FROM patchset p
-			JOIN above a ON a.number = p.parent_number
-			WHERE p.repository_id = $1
-		)
-		SELECT h.cl_number, h.seq, h.new_head, h.old_head, c.description, c.author
-		FROM above a
-		JOIN changelist c ON c.repository_id = $1 AND c.number = a.number AND c.status = $3
-		JOIN head_log h ON h.repository_id = $1 AND h.cl_number = a.number
-		ORDER BY h.seq`, repo, number, int16(StatusSubmitted))
+	landings, err := tx.StackLandings(ctx, repo, number, int16(StatusSubmitted))
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var out []landedCommit
-	for rows.Next() {
-		var l landedCommit
-		var commit, parent []byte
-		var description string
-		if err := rows.Scan(&l.number, &l.seq, &commit, &parent, &description, &l.creator); err != nil {
-			return nil, err
-		}
-		if l.commit, err = toID(commit); err != nil {
-			return nil, err
-		}
-		if l.parent, err = toID(parent); err != nil {
-			return nil, err
-		}
-		l.title, _, _ = strings.Cut(strings.TrimSpace(description), "\n")
-		out = append(out, l)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
+	out := make([]landedCommit, 0, len(landings))
+	for _, l := range landings {
+		title, _, _ := strings.Cut(strings.TrimSpace(l.Description), "\n")
+		out = append(out, landedCommit{number: l.Number, seq: l.Seq, commit: l.Commit, parent: l.Parent, title: title, creator: l.Author})
 	}
 	if len(out) == 0 || out[0].number != number {
 		return nil, fmt.Errorf("CL %d is submitted but main's history has no landing of it", number)

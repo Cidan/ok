@@ -13,7 +13,8 @@ ok is being built in the open from a working system, part by part. What runs tod
   in, and the credentials every other part of ok checks. See [docs/identity.md](docs/identity.md).
 - **The SCM**: repositories, their objects and operation logs, `main`, and ChangeLists — upload,
   path-level landing, rollbacks, the change feed, browsing, and garbage collection — with file
-  contents in an S3 bucket and everything else in PostgreSQL. See [docs/scm.md](docs/scm.md).
+  contents in object storage (S3, GCS, or a directory) and everything else in PostgreSQL. See
+  [docs/scm.md](docs/scm.md).
 - **ok's jj**: upstream jj with ok's stores and commands — `jj auth login`, `jj clone`, `jj cl`,
   `jj sync` — and **okfs**, virtual workspaces: a clone ready at once, files read from ok as they
   are used, every write kept in ok within a second. See [docs/jj.md](docs/jj.md) and
@@ -36,7 +37,9 @@ ok is being built in the open from a working system, part by part. What runs tod
   for Linux and macOS. See [docs/install.md](docs/install.md).
 
 Every role reads one configuration file, and is reached at one public address:
-[docs/configuration.md](docs/configuration.md).
+[docs/configuration.md](docs/configuration.md). The plan for running ok as a hosted, multi-tenant
+service — a million accounts, cells, Spanner, and pluggable queues and object stores — is
+[docs/hosted.md](docs/hosted.md).
 
 | Package | What it is |
 |---|---|

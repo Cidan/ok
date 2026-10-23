@@ -1192,8 +1192,17 @@ fn redirections_run() {
         "{tracked:?}"
     );
     let out = alice.ok("w", &["st"]);
+    // The paths it lists, not its change IDs, which may spell "out".
+    let listed: Vec<&str> = out
+        .lines()
+        .filter_map(|l| l.split_once(' '))
+        .filter(|(status, _)| status.len() == 1)
+        .map(|(_, path)| path)
+        .collect();
     assert!(
-        !out.contains("out") && !out.contains("node_modules"),
+        listed
+            .iter()
+            .all(|p| !p.starts_with("out") && !p.contains("node_modules")),
         "{out}"
     );
     // Kept across a checkout; a redirection no longer declared goes.

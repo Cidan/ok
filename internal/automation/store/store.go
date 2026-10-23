@@ -1,27 +1,22 @@
-// Package store is ok automation's storage core (docs/automation.md, "Execution"):
-// runs — one job on one commit — in its schema, their queue and the leases
-// workers hold while they run them, and their logs: appended to the database while a run is in
-// progress, moved to the bucket as one object once it finishes.
+// Package store is ok automation's storage core (docs/automation.md, "Execution"): runs — one
+// job on one commit — their queue and the leases workers hold while they run them, plans,
+// submissions and their attempts, and runs' logs: appended to the database while a run is in
+// progress, moved to the bucket as one object once it finishes. Store holds the rules; a Backend
+// (postgres) is the database it keeps them in.
 //
-// Every state change is one statement or one transaction, so any number of the service's
-// replicas can serve workers at once: a queued run is claimed with FOR UPDATE SKIP LOCKED, and
-// a lease is renewed, used, and ended only by the worker that holds it.
+// Every state change is one operation or one transaction, so any number of the service's
+// replicas can serve workers at once: a queued run is claimed by one worker, and a lease is
+// renewed, used, and ended only by the worker that holds it.
 package store
 
 import (
 	"context"
-	"embed"
 	"errors"
 	"fmt"
 	"strings"
 	"time"
 
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
-
 	"github.com/Cidan/ok/internal/blob"
-	"github.com/Cidan/ok/internal/lock"
-	"github.com/Cidan/ok/internal/migrate"
 )
 
 // Kind is what a job runs.
@@ -170,72 +165,24 @@ func (e *ConflictError) Error() string { return e.Message }
 
 // Store is ok automation's storage core.
 type Store struct {
-	pool   *pgxpool.Pool
+	b      Backend
 	blobs  blob.Store
 	cfg    Config
 	notify *notifier
-	locks  *lock.Lock
 }
 
-//go:embed migrations/*.sql
-var migrations embed.FS
-
-// Migrations are ok automation's schema.
-var Migrations = migrate.MustLoad(migrations, "migrations")
-
-// Open brings the database behind pool to ok automation's schema and builds a store over it and
-// the logs' bucket. Run Listen for prompt wake-ups; without it every wait polls.
-func Open(ctx context.Context, pool *pgxpool.Pool, blobs blob.Store, cfg Config) (*Store, error) {
-	if _, err := migrate.Apply(ctx, pool, "automation", Migrations); err != nil {
-		return nil, err
-	}
-	return &Store{pool: pool, blobs: blobs, cfg: cfg, notify: newNotifier(), locks: lock.New(pool)}, nil
+// New builds a store over a backend and the logs' bucket. Run Listen for prompt wake-ups;
+// without it every wait polls.
+func New(b Backend, blobs blob.Store, cfg Config) *Store {
+	return &Store{b: b, blobs: blobs, cfg: cfg, notify: newNotifier()}
 }
 
 // leaseTTL is how long a lease lasts without renewal.
 func (s *Store) leaseTTL() time.Duration { return 3 * s.cfg.Heartbeat }
 
-// runColumns are a run's columns, in scanRun's order.
-const runColumns = `id, repository_id, commit_id, kind, targets, args, phase, cl_number, patchset, job,
-	requested_by, rerun_of, status, attempt, coalesce(worker, ''), coalesce(exit_code, 0), reason, log_size,
-	log_stored, timeout_seconds, coalesce(plan_id, 0), why, queued_at, started_at, finished_at, coalesce(carried_from, 0)`
-
-func scanRun(row pgx.Row) (*Run, error) {
-	var r Run
-	var cl, rerun *int64
-	var patchset *int32
-	var started, finished *time.Time
-	err := row.Scan(&r.ID, &r.RepositoryID, &r.CommitID, &r.Job.Kind, &r.Job.Targets, &r.Job.Args,
-		&r.Origin.Phase, &cl, &patchset, &r.Origin.Job, &r.RequestedBy, &rerun, &r.Status, &r.Attempt, &r.Worker,
-		&r.ExitCode, &r.Reason, &r.LogSize, &r.LogStored, &r.TimeoutSeconds, &r.PlanID, &r.Why, &r.QueuedAt, &started, &finished,
-		&r.CarriedFrom)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, ErrNotFound
-	}
-	if err != nil {
-		return nil, err
-	}
-	if cl != nil {
-		r.Origin.CLNumber = *cl
-	}
-	if patchset != nil {
-		r.Origin.Patchset = *patchset
-	}
-	if rerun != nil {
-		r.RerunOf = *rerun
-	}
-	if started != nil {
-		r.StartedAt = *started
-	}
-	if finished != nil {
-		r.FinishedAt = *finished
-	}
-	return &r, nil
-}
-
 // Get returns a run.
 func (s *Store) Get(ctx context.Context, id int64) (*Run, error) {
-	r, err := scanRun(s.pool.QueryRow(ctx, `SELECT `+runColumns+` FROM run WHERE id = $1`, id))
+	r, err := s.b.Run(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -258,21 +205,14 @@ func (s *Store) loadPushed(ctx context.Context, runs []*Run) error {
 	if len(ids) == 0 {
 		return nil
 	}
-	rows, err := s.pool.Query(ctx, `SELECT run_id, target, registry, repository, digest, tags FROM pushed_image
-		WHERE run_id = ANY($1) ORDER BY run_id, position`, ids)
+	pushed, err := s.b.Pushed(ctx, ids)
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var id int64
-		var p Pushed
-		if err := rows.Scan(&id, &p.Target, &p.Registry, &p.Repository, &p.Digest, &p.Tags); err != nil {
-			return err
-		}
-		byID[id].Pushed = append(byID[id].Pushed, p)
+	for id, ps := range pushed {
+		byID[id].Pushed = ps
 	}
-	return rows.Err()
+	return nil
 }
 
 // ListQuery selects runs: a CL's (Patchset 0: every patchset's), or a commit's.
@@ -306,33 +246,16 @@ func (s *Store) List(ctx context.Context, q ListQuery) ([]*Run, error) {
 	if before <= 0 {
 		before = 1<<63 - 1
 	}
-	var rows pgx.Rows
+	var out []*Run
 	var err error
 	if q.CLNumber > 0 {
-		rows, err = s.pool.Query(ctx, `SELECT `+runColumns+` FROM run
-			WHERE repository_id = $1 AND cl_number = $2 AND ($3 = 0 OR patchset = $3) AND id < $4
-			ORDER BY id DESC LIMIT $5`, q.RepositoryID, q.CLNumber, q.Patchset, before, q.Limit)
+		out, err = s.b.RunsOfCL(ctx, q.RepositoryID, q.CLNumber, q.Patchset, before, q.Limit)
 	} else {
-		rows, err = s.pool.Query(ctx, `SELECT `+runColumns+` FROM run
-			WHERE repository_id = $1 AND commit_id = $2 AND id < $3
-			ORDER BY id DESC LIMIT $4`, q.RepositoryID, q.CommitID, before, q.Limit)
+		out, err = s.b.RunsOfCommit(ctx, q.RepositoryID, q.CommitID, before, q.Limit)
 	}
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var out []*Run
-	for rows.Next() {
-		r, err := scanRun(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, r)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	rows.Close()
 	if err := s.loadPushed(ctx, out); err != nil {
 		return nil, err
 	}
@@ -404,14 +327,6 @@ func validOrigin(o Origin) error {
 		return invalid("unknown phase %d", o.Phase)
 	}
 	return nil
-}
-
-// nullable is a positive number, or SQL NULL.
-func nullable[T int32 | int64](v T) *T {
-	if v <= 0 {
-		return nil
-	}
-	return &v
 }
 
 func orEmpty(s []string) []string {

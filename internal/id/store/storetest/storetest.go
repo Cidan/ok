@@ -1,4 +1,6 @@
-package store
+// Package storetest is the conformance suite every backend of identity's store
+// (internal/id/store) passes: run it with Run, giving it a new, empty backend for each test.
+package storetest
 
 import (
 	"context"
@@ -7,33 +9,33 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
-
 	"github.com/Cidan/ok/internal/directory"
 	"github.com/Cidan/ok/internal/directory/scim"
 	"github.com/Cidan/ok/internal/directory/scim/scimtest"
+	"github.com/Cidan/ok/internal/id/store"
 	"github.com/Cidan/ok/internal/identity"
-	"github.com/Cidan/ok/internal/testdb"
 )
 
 var names = identity.MustNames("example.com")
 
-func open(t *testing.T) *Store {
-	t.Helper()
-	ctx := context.Background()
-	pool, err := pgxpool.New(ctx, testdb.Postgres(t))
-	if err != nil {
-		t.Fatal(err)
+// Run runs the suite, each test on a store over a new, empty backend that open makes.
+func Run(t *testing.T, open func(t *testing.T) store.Backend) {
+	for _, tc := range []struct {
+		name string
+		fn   func(t *testing.T, s *store.Store)
+	}{
+		{"Robots", testRobots},
+		{"Sync", testSync},
+		{"Tree", testTree},
+		{"DeviceLogin", testDeviceLogin},
+		{"Credentials", testCredentials},
+		{"SessionsAndCeremonies", testSessionsAndCeremonies},
+	} {
+		t.Run(tc.name, func(t *testing.T) { tc.fn(t, store.New(open(t), names)) })
 	}
-	t.Cleanup(pool.Close)
-	s, err := Open(ctx, pool, names)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := Open(ctx, pool, names); err != nil {
-		t.Fatalf("opening again: %v", err)
-	}
-	return s
+	t.Run("SCIM", func(t *testing.T) {
+		scimtest.Run(t, func(t *testing.T) scim.Store { return store.New(open(t), names).SCIM() })
+	})
 }
 
 // source is a system of record in memory.
@@ -48,7 +50,7 @@ func person(id, handle string, active bool) directory.Person {
 	return directory.Person{ExternalID: id, Handle: handle, Email: handle + "@example.com", Name: handle, Active: active}
 }
 
-func sync(t *testing.T, s *Store, src *source) *directory.Plan {
+func sync(t *testing.T, s *store.Store, src *source) *directory.Plan {
 	t.Helper()
 	opts, err := s.SyncOptions(context.Background())
 	if err != nil {
@@ -61,14 +63,13 @@ func sync(t *testing.T, s *Store, src *source) *directory.Plan {
 	return plan
 }
 
-func TestRobots(t *testing.T) {
-	s := open(t)
+func testRobots(t *testing.T, s *store.Store) {
 	ctx := context.Background()
 	r, err := s.CreateRobot(ctx, "ci.robot.example.com")
-	if err != nil || r.Kind != Robot || !r.Active() {
+	if err != nil || r.Kind != store.Robot || !r.Active() {
 		t.Fatalf("CreateRobot = %+v, %v", r, err)
 	}
-	if _, err := s.CreateRobot(ctx, "ci.robot.example.com"); !errors.Is(err, ErrTaken) {
+	if _, err := s.CreateRobot(ctx, "ci.robot.example.com"); !errors.Is(err, store.ErrTaken) {
 		t.Errorf("a robot twice: %v", err)
 	}
 	if _, err := s.CreateRobot(ctx, "ada.human.example.com"); err == nil {
@@ -77,7 +78,7 @@ func TestRobots(t *testing.T) {
 	if got, err := s.EnsureRobot(ctx, "ci.robot.example.com"); err != nil || got.ID != r.ID {
 		t.Errorf("EnsureRobot of an existing robot = %+v, %v", got, err)
 	}
-	b := Binding{Issuer: "https://kubernetes.default.svc", Subject: "system:serviceaccount:ci:runner"}
+	b := store.Binding{Issuer: "https://kubernetes.default.svc", Subject: "system:serviceaccount:ci:runner"}
 	if err := s.Bind(ctx, "ci.robot.example.com", b); err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +90,7 @@ func TestRobots(t *testing.T) {
 		t.Error("one binding named two robots")
 	}
 	robots, err := s.Robots(ctx)
-	if err != nil || len(robots) != 2 || !reflect.DeepEqual(robots[0].Bindings, []Binding{b}) {
+	if err != nil || len(robots) != 2 || !reflect.DeepEqual(robots[0].Bindings, []store.Binding{b}) {
 		t.Errorf("Robots = %+v, %v", robots, err)
 	}
 	c, err := s.EnrollKey(ctx, r.ID, "runner", []byte("key-1"))
@@ -102,10 +103,10 @@ func TestRobots(t *testing.T) {
 	if c, _ = s.Credential(ctx, c.ID); c.Standing() {
 		t.Error("a deleted robot's credential stands")
 	}
-	if _, err := s.BoundRobot(ctx, b); !errors.Is(err, ErrNotFound) {
+	if _, err := s.BoundRobot(ctx, b); !errors.Is(err, store.ErrNotFound) {
 		t.Errorf("a deleted robot's binding: %v", err)
 	}
-	if _, err := s.CreateRobot(ctx, "ci.robot.example.com"); !errors.Is(err, ErrTaken) {
+	if _, err := s.CreateRobot(ctx, "ci.robot.example.com"); !errors.Is(err, store.ErrTaken) {
 		t.Errorf("a deleted robot's name given again: %v", err)
 	}
 	if _, err := s.EnsureRobot(ctx, "ci.robot.example.com"); err == nil {
@@ -113,8 +114,7 @@ func TestRobots(t *testing.T) {
 	}
 }
 
-func TestSync(t *testing.T) {
-	s := open(t)
+func testSync(t *testing.T, s *store.Store) {
 	ctx := context.Background()
 	if _, err := s.CreateRobot(ctx, "build.robot.example.com"); err != nil {
 		t.Fatal(err)
@@ -125,7 +125,7 @@ func TestSync(t *testing.T) {
 	}}
 	sync(t, s, src)
 	ada, err := s.Principal(ctx, "ada.human.example.com")
-	if err != nil || ada.Kind != Human || ada.ExternalID != "1" {
+	if err != nil || ada.Kind != store.Human || ada.ExternalID != "1" {
 		t.Fatalf("ada = %+v, %v", ada, err)
 	}
 	groups, _ := s.SyncedGroups(ctx)
@@ -151,7 +151,7 @@ func TestSync(t *testing.T) {
 	if err != nil || got.Name != "ada-l.human.example.com" || got.Status != directory.Suspended {
 		t.Errorf("ada after = %+v, %v", got, err)
 	}
-	if _, err := s.Session(ctx, session, time.Hour); !errors.Is(err, ErrNotFound) {
+	if _, err := s.Session(ctx, session, time.Hour); !errors.Is(err, store.ErrNotFound) {
 		t.Errorf("a suspended person's session: %v", err)
 	}
 	if c, _ := s.Credential(ctx, key.ID); c.Standing() || !c.Revoked.IsZero() {
@@ -208,8 +208,7 @@ func tree(t *testing.T, files map[string]string, synced map[string][]string) *id
 	return tr
 }
 
-func TestTree(t *testing.T) {
-	s := open(t)
+func testTree(t *testing.T, s *store.Store) {
 	ctx := context.Background()
 	sync(t, s, &source{snap: &directory.Snapshot{
 		People: []directory.Person{person("1", "ada", true)},
@@ -221,7 +220,7 @@ func TestTree(t *testing.T) {
 		"eng/acl.yaml":       "members: [it.group.example.com]\n",
 		"eng/ops/group.yaml": "members: []\n",
 	}, synced)
-	if err := s.ReplaceTree(ctx, Applied{}, "c1", 1, first); err != nil {
+	if err := s.ReplaceTree(ctx, store.Applied{}, "c1", 1, first); err != nil {
 		t.Fatal(err)
 	}
 	sets, applied, err := s.Tree(ctx)
@@ -236,10 +235,10 @@ func TestTree(t *testing.T) {
 	}
 
 	second := tree(t, map[string]string{"acl.yaml": "members: [ada.human.example.com]\n"}, synced)
-	if err := s.ReplaceTree(ctx, Applied{}, "c2", 2, second); !errors.Is(err, ErrStale) {
+	if err := s.ReplaceTree(ctx, store.Applied{}, "c2", 2, second); !errors.Is(err, store.ErrStale) {
 		t.Errorf("an apply over a tree it did not see: %v", err)
 	}
-	if err := s.ReplaceTree(ctx, applied, "c0", 0, second); !errors.Is(err, ErrStale) {
+	if err := s.ReplaceTree(ctx, applied, "c0", 0, second); !errors.Is(err, store.ErrStale) {
 		t.Errorf("an older commit: %v", err)
 	}
 	if err := s.ReplaceTree(ctx, applied, "c2", 2, second); err != nil {
@@ -250,13 +249,12 @@ func TestTree(t *testing.T) {
 		t.Errorf("retired = %+v", retired)
 	}
 	_, applied, _ = s.Tree(ctx)
-	if err := s.ReplaceTree(ctx, applied, "c3", 3, first); !errors.Is(err, ErrTaken) {
+	if err := s.ReplaceTree(ctx, applied, "c3", 3, first); !errors.Is(err, store.ErrTaken) {
 		t.Errorf("a retired name declared again: %v", err)
 	}
 }
 
-func TestDeviceLogin(t *testing.T) {
-	s := open(t)
+func testDeviceLogin(t *testing.T, s *store.Store) {
 	ctx := context.Background()
 	sync(t, s, &source{snap: &directory.Snapshot{People: []directory.Person{person("1", "ada", true)}}})
 	ada, _ := s.Principal(ctx, "ada.human.example.com")
@@ -265,10 +263,10 @@ func TestDeviceLogin(t *testing.T) {
 	if err != nil || len(code) != 9 || code[4] != '-' || time.Until(expires) < 9*time.Minute {
 		t.Fatalf("Start = %q, %q, %v, %v", device, code, expires, err)
 	}
-	if state, _, _ := s.PollDeviceLogin(ctx, device); state != PollPending {
+	if state, _, _ := s.PollDeviceLogin(ctx, device); state != store.PollPending {
 		t.Errorf("first poll: %s", state)
 	}
-	if state, _, _ := s.PollDeviceLogin(ctx, device); state != PollSlowDown {
+	if state, _, _ := s.PollDeviceLogin(ctx, device); state != store.PollSlowDown {
 		t.Errorf("a fast poll: %s", state)
 	}
 	typed := " " + code[:4] + code[5:] + " "
@@ -279,11 +277,11 @@ func TestDeviceLogin(t *testing.T) {
 	if err := s.DecideDeviceLogin(ctx, code, ada.ID, true); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.DecideDeviceLogin(ctx, code, ada.ID, false); !errors.Is(err, ErrNotFound) {
+	if err := s.DecideDeviceLogin(ctx, code, ada.ID, false); !errors.Is(err, store.ErrNotFound) {
 		t.Errorf("deciding twice: %v", err)
 	}
 	state, d, err := s.PollDeviceLogin(ctx, device)
-	if err != nil || state != PollApproved || d.PrincipalID != ada.ID || string(d.PublicKey) != "laptop-key" {
+	if err != nil || state != store.PollApproved || d.PrincipalID != ada.ID || string(d.PublicKey) != "laptop-key" {
 		t.Fatalf("an approved poll: %s, %+v, %v", state, d, err)
 	}
 	c, err := s.EnrollKey(ctx, ada.ID, d.Label, d.PublicKey)
@@ -293,28 +291,27 @@ func TestDeviceLogin(t *testing.T) {
 	if err := s.CompleteDeviceLogin(ctx, device, c.ID); err != nil {
 		t.Fatal(err)
 	}
-	if state, _, _ := s.PollDeviceLogin(ctx, device); state != PollExpired {
+	if state, _, _ := s.PollDeviceLogin(ctx, device); state != store.PollExpired {
 		t.Errorf("a poll after completion: %s", state)
 	}
-	if state, _, _ := s.PollDeviceLogin(ctx, "no-such-code"); state != PollExpired {
+	if state, _, _ := s.PollDeviceLogin(ctx, "no-such-code"); state != store.PollExpired {
 		t.Errorf("an unknown device code: %s", state)
 	}
 
 	device, code, _, _ = s.StartDeviceLogin(ctx, []byte("other-key"), "phone", "")
 	s.DecideDeviceLogin(ctx, code, ada.ID, false)
-	if state, _, _ := s.PollDeviceLogin(ctx, device); state != PollDenied {
+	if state, _, _ := s.PollDeviceLogin(ctx, device); state != store.PollDenied {
 		t.Errorf("a denied poll: %s", state)
 	}
 
 	device, code, _, _ = s.StartDeviceLogin(ctx, []byte("late-key"), "late", "")
-	s.now = func() time.Time { return time.Now().Add(DeviceLoginLifetime + time.Minute) }
-	if state, _, _ := s.PollDeviceLogin(ctx, device); state != PollExpired {
+	s.SetClock(func() time.Time { return time.Now().Add(store.DeviceLoginLifetime + time.Minute) })
+	if state, _, _ := s.PollDeviceLogin(ctx, device); state != store.PollExpired {
 		t.Errorf("an expired poll: %s", state)
 	}
 }
 
-func TestCredentials(t *testing.T) {
-	s := open(t)
+func testCredentials(t *testing.T, s *store.Store) {
 	ctx := context.Background()
 	sync(t, s, &source{snap: &directory.Snapshot{People: []directory.Person{person("1", "ada", true), person("2", "bea", true)}}})
 	ada, _ := s.Principal(ctx, "ada.human.example.com")
@@ -326,7 +323,7 @@ func TestCredentials(t *testing.T) {
 	if again, err := s.EnrollKey(ctx, ada.ID, "laptop", []byte("k1")); err != nil || again.ID != c.ID {
 		t.Errorf("the same key again: %+v, %v", again, err)
 	}
-	if _, err := s.EnrollKey(ctx, bea.ID, "laptop", []byte("k1")); !errors.Is(err, ErrKeyEnrolled) {
+	if _, err := s.EnrollKey(ctx, bea.ID, "laptop", []byte("k1")); !errors.Is(err, store.ErrKeyEnrolled) {
 		t.Errorf("another's key: %v", err)
 	}
 	notAfter := time.Now().Add(24 * time.Hour).Truncate(time.Second)
@@ -340,10 +337,10 @@ func TestCredentials(t *testing.T) {
 	if c.Standing() || c.LastIssued.IsZero() || !c.NotAfter.Equal(notAfter) {
 		t.Errorf("after revoking: %+v", c)
 	}
-	if _, err := s.EnrollKey(ctx, ada.ID, "laptop", []byte("k1")); !errors.Is(err, ErrKeyEnrolled) {
+	if _, err := s.EnrollKey(ctx, ada.ID, "laptop", []byte("k1")); !errors.Is(err, store.ErrKeyEnrolled) {
 		t.Errorf("a revoked key again: %v", err)
 	}
-	if err := s.Revoke(ctx, "crd_nope"); !errors.Is(err, ErrNotFound) {
+	if err := s.Revoke(ctx, "crd_nope"); !errors.Is(err, store.ErrNotFound) {
 		t.Errorf("revoking nothing: %v", err)
 	}
 	list, _ := s.CredentialsOf(ctx, ada.ID)
@@ -352,8 +349,7 @@ func TestCredentials(t *testing.T) {
 	}
 }
 
-func TestSessionsAndCeremonies(t *testing.T) {
-	s := open(t)
+func testSessionsAndCeremonies(t *testing.T, s *store.Store) {
 	ctx := context.Background()
 	sync(t, s, &source{snap: &directory.Snapshot{People: []directory.Person{person("1", "ada", true)}}})
 	ada, _ := s.Principal(ctx, "ada.human.example.com")
@@ -364,13 +360,13 @@ func TestSessionsAndCeremonies(t *testing.T) {
 	if p, err := s.Session(ctx, tok, 10*time.Minute); err != nil || p.ID != ada.ID {
 		t.Errorf("Session = %+v, %v", p, err)
 	}
-	if _, err := s.Session(ctx, "forged", time.Hour); !errors.Is(err, ErrNotFound) {
+	if _, err := s.Session(ctx, "forged", time.Hour); !errors.Is(err, store.ErrNotFound) {
 		t.Errorf("a forged session: %v", err)
 	}
 	if err := s.EndSession(ctx, tok); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Session(ctx, tok, time.Hour); !errors.Is(err, ErrNotFound) {
+	if _, err := s.Session(ctx, tok, time.Hour); !errors.Is(err, store.ErrNotFound) {
 		t.Errorf("an ended session: %v", err)
 	}
 
@@ -380,17 +376,17 @@ func TestSessionsAndCeremonies(t *testing.T) {
 		t.Fatal(err)
 	}
 	var got state
-	if err := s.EndCeremony(ctx, id, "webauthn", &got); !errors.Is(err, ErrNotFound) {
+	if err := s.EndCeremony(ctx, id, "webauthn", &got); !errors.Is(err, store.ErrNotFound) {
 		t.Errorf("another kind's ceremony: %v", err)
 	}
 	if err := s.EndCeremony(ctx, id, "oidc", &got); err != nil || got != (state{"n1", "/cl/7"}) {
 		t.Errorf("EndCeremony = %+v, %v", got, err)
 	}
-	if err := s.EndCeremony(ctx, id, "oidc", &got); !errors.Is(err, ErrNotFound) {
+	if err := s.EndCeremony(ctx, id, "oidc", &got); !errors.Is(err, store.ErrNotFound) {
 		t.Errorf("a ceremony ended twice: %v", err)
 	}
 
-	if err := s.AddPasskey(ctx, Passkey{ID: []byte("pk1"), PrincipalID: ada.ID, Data: []byte(`{"n":1}`), Label: "phone"}); err != nil {
+	if err := s.AddPasskey(ctx, store.Passkey{ID: []byte("pk1"), PrincipalID: ada.ID, Data: []byte(`{"n":1}`), Label: "phone"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.PasskeyUsed(ctx, []byte("pk1"), []byte(`{"n":2}`)); err != nil {
@@ -406,8 +402,4 @@ func TestSessionsAndCeremonies(t *testing.T) {
 	if list, _ := s.Passkeys(ctx, ada.ID); len(list) != 0 {
 		t.Errorf("Passkeys after removing = %+v", list)
 	}
-}
-
-func TestSCIM(t *testing.T) {
-	scimtest.Run(t, func(t *testing.T) scim.Store { return open(t).SCIM() })
 }

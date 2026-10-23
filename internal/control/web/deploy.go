@@ -199,7 +199,7 @@ func (s *Server) loadDeployment(r *http.Request) (*deployTarget, error) {
 	}
 	t := &deployTarget{repo: repo, d: d}
 	if n, err := strconv.ParseInt(r.URL.Query().Get("cl"), 10, 64); err == nil && n > 0 {
-		cl, ok, err := db.GetChangeList(r.Context(), s.db.Q(), repo.GetId(), n)
+		cl, ok, err := s.db.GetChangeList(r.Context(), repo.GetId(), n)
 		if err != nil {
 			return nil, err
 		}

@@ -12,6 +12,8 @@ import (
 	"google.golang.org/grpc"
 
 	"github.com/Cidan/ok/internal/blob"
+	"github.com/Cidan/ok/internal/bus"
+	"github.com/Cidan/ok/internal/bus/busconfig"
 	"github.com/Cidan/ok/internal/config"
 	"github.com/Cidan/ok/internal/credential"
 	"github.com/Cidan/ok/internal/devdir"
@@ -20,6 +22,7 @@ import (
 	"github.com/Cidan/ok/internal/pgdb"
 	"github.com/Cidan/ok/internal/scm/server"
 	"github.com/Cidan/ok/internal/scm/store"
+	scmpostgres "github.com/Cidan/ok/internal/scm/store/postgres"
 	"github.com/Cidan/ok/internal/serve/authn"
 	"github.com/Cidan/ok/internal/serve/node"
 	identitypb "github.com/Cidan/ok/proto/ok/identity/v1"
@@ -56,6 +59,9 @@ type Options struct {
 	// Pool and Blobs, when set, are the database and bucket instead of the configuration's: tests.
 	Pool  *pgxpool.Pool
 	Blobs blob.Store
+	// Stream, when set, is the bus's stream the relay publishes the SCM's events on, instead of
+	// the configuration's: tests.
+	Stream bus.Stream
 	// Identity, when set, is ok identity, dialed as the role: tests.
 	Identity grpc.ClientConnInterface
 	// Roots, when set, are the identity CA's certificates as identity in the same process holds
@@ -66,18 +72,24 @@ type Options struct {
 // OpenStore opens the SCM's store as the configuration says, or over the pool and bucket the
 // options give; close what it returns when done.
 func OpenStore(ctx context.Context, cfg *config.Config, opts Options) (*store.Store, func(), error) {
+	st, _, done, err := open(ctx, cfg, opts)
+	return st, done, err
+}
+
+// open is OpenStore, with the pool the store is over.
+func open(ctx context.Context, cfg *config.Config, opts Options) (*store.Store, *pgxpool.Pool, func(), error) {
 	done := func() {}
 	pool := opts.Pool
 	if pool == nil {
 		dsn, err := config.Secret(cfg.Database.URLFile)
 		if err != nil {
-			return nil, nil, fmt.Errorf("database.url_file: %w", err)
+			return nil, nil, nil, fmt.Errorf("database.url_file: %w", err)
 		}
 		if dsn == "" {
-			return nil, nil, errors.New("database.url_file names no database")
+			return nil, nil, nil, errors.New("database.url_file names no database")
 		}
 		if pool, err = pgdb.Open(ctx, dsn, Schema, cfg.Database.MaxConnections); err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		done = pool.Close
 	}
@@ -86,19 +98,24 @@ func OpenStore(ctx context.Context, cfg *config.Config, opts Options) (*store.St
 		s3, err := cfg.SCM.Objects.Open(ctx, "scm.objects", opts.Dev)
 		if err != nil {
 			done()
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		blobs = s3
 	}
-	st, err := store.Open(ctx, pool, blobs, store.Config{
+	b, err := scmpostgres.Open(ctx, pool)
+	if err != nil {
+		done()
+		return nil, nil, nil, fmt.Errorf("the SCM's store: %w", err)
+	}
+	st, err := store.New(b, blobs, store.Config{
 		Names: cfg.Names(), EmailDomain: cfg.SCM.EmailDomain,
 		ObjectCacheBytes: cfg.SCM.Cache.Objects, ChunkCacheBytes: cfg.SCM.Cache.Chunks, DiffCacheBytes: cfg.SCM.Cache.Diffs,
 	})
 	if err != nil {
 		done()
-		return nil, nil, fmt.Errorf("the SCM's store: %w", err)
+		return nil, nil, nil, fmt.Errorf("the SCM's store: %w", err)
 	}
-	return st, func() { st.Close(); done() }, nil
+	return st, pool, func() { st.Close(); done() }, nil
 }
 
 // Build assembles the SCM role from its configuration.
@@ -110,12 +127,21 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (*Role, error)
 			r.Close()
 		}
 	}()
-	st, done, err := OpenStore(ctx, cfg, opts)
+	st, pool, done, err := open(ctx, cfg, opts)
 	if err != nil {
 		return nil, err
 	}
 	r.Store = st
 	r.closers = append(r.closers, done)
+	stream := opts.Stream
+	if stream == nil {
+		b, err := busconfig.Open(ctx, cfg.Bus, pool)
+		if err != nil {
+			return nil, err
+		}
+		r.closers = append(r.closers, b.Close)
+		stream = b.Stream
+	}
 
 	hour := DefaultGCHour
 	if cfg.SCM.GCHour != nil {
@@ -128,7 +154,7 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (*Role, error)
 		dir := devdir.Directory{Names: cfg.Names()}
 		r.Resolver = authn.NewResolver(authn.Config{Directory: dir, Dev: true, Roles: idclient.Roles(cfg)})
 		svc := server.New(st, dir)
-		r.Root = &assembly{deps: []node.Node{svc, server.NewGC(svc, hour)}}
+		r.Root = &assembly{deps: []node.Node{svc, server.NewGC(svc, hour), server.NewRelay(svc, stream)}}
 		ok = true
 		return r, nil
 	}
@@ -167,7 +193,7 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (*Role, error)
 		Roles:         idclient.Roles(cfg),
 	})
 	svc := server.New(st, identitypb.NewDirectoryClient(conn))
-	r.Root = &assembly{deps: []node.Node{svc, server.NewGC(svc, hour), roots}}
+	r.Root = &assembly{deps: []node.Node{svc, server.NewGC(svc, hour), server.NewRelay(svc, stream), roots}}
 	ok = true
 	return r, nil
 }

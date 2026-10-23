@@ -7,9 +7,8 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/jackc/pgx/v5"
-
 	"github.com/Cidan/ok/internal/scm/encoding"
+	"github.com/Cidan/ok/internal/scm/store/backend"
 )
 
 // Browse serves code to ok control and automation as structured values rather than jj
@@ -104,40 +103,22 @@ func (s *Store) Log(ctx context.Context, repo int64, from *encoding.ID, paths []
 		if lo > hi {
 			return nil, nil, nil
 		}
-		order := "DESC"
-		if ascending {
-			order = "ASC"
-		}
-		var rows pgx.Rows
+		var rows []backend.GenCommit
 		var err error
 		if len(paths) == 0 {
-			rows, err = s.pool.Query(ctx, `SELECT new_head, seq FROM head_log
-				WHERE repository_id = $1 AND seq BETWEEN $2 AND $3 ORDER BY seq `+order+` LIMIT $4`, repo, lo, hi, limit)
+			rows, err = s.b.MainLog(ctx, repo, lo, hi, ascending, limit)
 		} else {
-			rows, err = s.pool.Query(ctx, `SELECT commit_id, generation FROM commit_path
-				WHERE repository_id = $1 AND path = ANY($2::text[]) AND generation BETWEEN $3 AND $4
-				GROUP BY commit_id, generation ORDER BY generation `+order+` LIMIT $5`, repo, paths, lo, hi, limit)
+			rows, err = s.b.PathCommits(ctx, repo, paths, lo, hi, ascending, limit)
 		}
 		if err != nil {
 			return nil, nil, err
 		}
-		defer rows.Close()
-		var out []encoding.ID
-		var gens []int64
-		for rows.Next() {
-			var b []byte
-			var g int64
-			if err := rows.Scan(&b, &g); err != nil {
-				return nil, nil, err
-			}
-			id, err := toID(b)
-			if err != nil {
-				return nil, nil, err
-			}
-			out = append(out, id)
-			gens = append(gens, g)
+		out := make([]encoding.ID, len(rows))
+		gens := make([]int64, len(rows))
+		for i, r := range rows {
+			out[i], gens[i] = r.Commit, r.Generation
 		}
-		return out, gens, rows.Err()
+		return out, gens, nil
 	}
 	var ids []encoding.ID
 	var gens []int64
@@ -189,10 +170,9 @@ func (s *Store) mainGeneration(ctx context.Context, repo int64, commit *encoding
 	if at == encoding.RootCommitID {
 		return 0, nil
 	}
-	var gen int64
-	err := s.pool.QueryRow(ctx, `SELECT seq FROM head_log WHERE repository_id = $1 AND new_head = $2`, repo, at[:]).Scan(&gen)
-	if errors.Is(err, pgx.ErrNoRows) {
-		if err := s.repositoryExists(ctx, s.pool, repo); err != nil {
+	gen, ok, err := s.b.HeadSeqOf(ctx, repo, at)
+	if err == nil && !ok {
+		if err := s.repositoryExists(ctx, s.b, repo); err != nil {
 			return 0, err
 		}
 		return 0, invalid("commit %s is not on main", at)
@@ -363,30 +343,14 @@ func (s *Store) lastCommits(ctx context.Context, repo int64, commit encoding.ID,
 	for i, e := range entries {
 		paths[i] = joinPath(dir, e.Name)
 	}
-	rows, err := s.pool.Query(ctx, `SELECT u.i, (SELECT cp.commit_id FROM commit_path cp
-			WHERE cp.repository_id = $1 AND cp.path = u.path AND cp.generation <= $2
-			ORDER BY cp.generation DESC LIMIT 1)
-		FROM unnest($3::text[]) WITH ORDINALITY AS u(path, i)`, repo, gen, paths)
+	last, err := s.b.LastPathCommits(ctx, repo, gen, paths)
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var i int64
-		var b []byte
-		if err := rows.Scan(&i, &b); err != nil {
-			return err
-		}
-		if b == nil {
-			continue
-		}
-		id, err := toID(b)
-		if err != nil {
-			return err
-		}
-		entries[i-1].LastCommit = &id
+	for i, id := range last {
+		entries[i].LastCommit = &id
 	}
-	return rows.Err()
+	return nil
 }
 
 // lookup resolves a path of a commit's tree to its value, with size or target filled

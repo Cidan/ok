@@ -10,8 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5"
-
 	"github.com/Cidan/ok/internal/lock"
 	"github.com/Cidan/ok/internal/scm/contentindex"
 	"github.com/Cidan/ok/internal/scm/encoding"
@@ -24,12 +22,12 @@ func age(t *testing.T, s *Store, repo int64, days int) {
 	t.Helper()
 	ctx := context.Background()
 	for _, tbl := range []string{"commit", "object"} {
-		if _, err := s.pool.Exec(ctx, `UPDATE `+tbl+` SET touched_at = current_date - $2::int WHERE repository_id = $1 AND NOT pinned`, repo, days); err != nil {
+		if _, err := poolOf(s).Exec(ctx, `UPDATE `+tbl+` SET touched_at = current_date - $2::int WHERE repository_id = $1 AND NOT pinned`, repo, days); err != nil {
 			t.Fatal(err)
 		}
 	}
 	for _, tbl := range []string{"operation", "view"} {
-		if _, err := s.pool.Exec(ctx, `UPDATE `+tbl+` x SET touched_at = now() - make_interval(days => $2::int)
+		if _, err := poolOf(s).Exec(ctx, `UPDATE `+tbl+` x SET touched_at = now() - make_interval(days => $2::int)
 			FROM op_log l WHERE l.id = x.op_log_id AND l.repository_id = $1`, repo, days); err != nil {
 			t.Fatal(err)
 		}
@@ -41,7 +39,7 @@ func age(t *testing.T, s *Store, repo int64, days int) {
 func ageIndex(t *testing.T, s *Store, repo int64, days int) {
 	t.Helper()
 	var today time.Time
-	if err := s.pool.QueryRow(context.Background(), `SELECT current_date`).Scan(&today); err != nil {
+	if err := poolOf(s).QueryRow(context.Background(), `SELECT current_date`).Scan(&today); err != nil {
 		t.Fatal(err)
 	}
 	old := contentindex.DayOf(today) - contentindex.Day(days)
@@ -66,17 +64,25 @@ func rewriteIndex(t *testing.T, s *Store, repo int64, f func(encoding.ID, *conte
 		f(k.ID, &k.Entry)
 		entries = append(entries, k)
 	}
-	if err := s.inTx(ctx, func(tx pgx.Tx) error {
-		var gen int64
-		if err := tx.QueryRow(ctx, `UPDATE content_index SET generation = generation + 1 WHERE repository_id = $1 RETURNING generation`, repo).Scan(&gen); err != nil {
+	if err := s.inTx(ctx, func(tx *txn) error {
+		gen, err := tx.LockContentIndex(ctx, repo)
+		if err != nil {
 			return err
 		}
-		for _, q := range []string{`DELETE FROM index_block WHERE repository_id = $1`, `DELETE FROM content_log WHERE repository_id = $1`} {
-			if _, err := tx.Exec(ctx, q, repo); err != nil {
-				return err
-			}
+		if err := tx.DeleteIndexBlocks(ctx, repo, gen); err != nil {
+			return err
 		}
-		return writeBlocks(ctx, tx, repo, gen, entries)
+		logs, err := tx.ContentLogIDs(ctx, repo)
+		if err != nil {
+			return err
+		}
+		if err := tx.DeleteContentLogs(ctx, repo, logs); err != nil {
+			return err
+		}
+		if err := tx.SetContentIndexGeneration(ctx, repo, gen+1); err != nil {
+			return err
+		}
+		return writeBlocks(ctx, tx, repo, gen+1, entries)
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -96,7 +102,7 @@ func indexOf(t *testing.T, s *Store, repo int64) *contentindex.Index {
 // dropFromIndex drops a file or chunk from a repository's content index, as a sweep does.
 func dropFromIndex(t *testing.T, s *Store, repo int64, kind encoding.Kind, id encoding.ID) {
 	t.Helper()
-	if err := s.inTx(context.Background(), func(tx pgx.Tx) error {
+	if err := s.inTx(context.Background(), func(tx *txn) error {
 		s.logIndex(tx, repo, contentindex.Update{Op: contentindex.Drop, ID: id, Entry: contentindex.Entry{Kind: kind}})
 		return nil
 	}); err != nil {
@@ -121,7 +127,7 @@ func has(t *testing.T, s *Store, repo int64, tbl string, id encoding.ID) bool {
 		return ok
 	}
 	var ok bool
-	if err := s.pool.QueryRow(context.Background(), `SELECT EXISTS (SELECT 1 FROM `+tbl+` WHERE repository_id = $1 AND id = $2)`, repo, id[:]).Scan(&ok); err != nil {
+	if err := poolOf(s).QueryRow(context.Background(), `SELECT EXISTS (SELECT 1 FROM `+tbl+` WHERE repository_id = $1 AND id = $2)`, repo, id[:]).Scan(&ok); err != nil {
 		t.Fatal(err)
 	}
 	return ok
@@ -223,7 +229,7 @@ func TestGCSweepsWhatNothingReaches(t *testing.T) {
 	keptSizes := func(tree encoding.ID) bool {
 		t.Helper()
 		var n int
-		if err := e.s.pool.QueryRow(ctx, `SELECT count(*) FROM tree_sizes WHERE repository_id = $1 AND tree_id = $2`, e.repo, tree[:]).Scan(&n); err != nil {
+		if err := poolOf(e.s).QueryRow(ctx, `SELECT count(*) FROM tree_sizes WHERE repository_id = $1 AND tree_id = $2`, e.repo, tree[:]).Scan(&n); err != nil {
 			t.Fatal(err)
 		}
 		return n == 1
@@ -444,7 +450,7 @@ func TestExchangeNeverFreshensOverAMissingObject(t *testing.T) {
 		t.Fatalf("missing %v, chunks %v", objs, chunks)
 	}
 	var fresh bool
-	if err := e.s.pool.QueryRow(ctx, `SELECT touched_at >= current_date FROM object WHERE repository_id = $1 AND id = $2`, e.repo, tree[:]).Scan(&fresh); err != nil || fresh {
+	if err := poolOf(e.s).QueryRow(ctx, `SELECT touched_at >= current_date FROM object WHERE repository_id = $1 AND id = $2`, e.repo, tree[:]).Scan(&fresh); err != nil || fresh {
 		t.Fatalf("the tree over the missing chunk was freshened (%v)", err)
 	}
 	mustPublish(t, e.s, e.repo, alice, g, nil)
@@ -589,14 +595,14 @@ func TestSpliceReusingGarbageKeepsIt(t *testing.T) {
 		t.Fatal(err)
 	}
 	var fresh, pinned bool
-	if err := e.s.pool.QueryRow(ctx, `SELECT touched_at >= current_date, pinned FROM object WHERE repository_id = $1 AND id = $2`, e.repo, spliced[:]).Scan(&fresh, &pinned); err != nil || !fresh {
+	if err := poolOf(e.s).QueryRow(ctx, `SELECT touched_at >= current_date, pinned FROM object WHERE repository_id = $1 AND id = $2`, e.repo, spliced[:]).Scan(&fresh, &pinned); err != nil || !fresh {
 		t.Fatalf("the candidate's reused tree was not refreshed (%v)", err)
 	}
 	if r, err := e.s.GC(ctx, e.repo, time.Now(), GCOptions{}); err != nil || r.ObjectsSwept != 0 {
 		t.Fatalf("GC beside a candidate: %s, %v", r, err)
 	}
 	landedAs := e.mustLand(LandItem{Number: ny, Patchset: 1, Candidate: &cand.Commit})
-	if err := e.s.pool.QueryRow(ctx, `SELECT pinned FROM object WHERE repository_id = $1 AND id = $2`, e.repo, spliced[:]).Scan(&pinned); err != nil || !pinned {
+	if err := poolOf(e.s).QueryRow(ctx, `SELECT pinned FROM object WHERE repository_id = $1 AND id = $2`, e.repo, spliced[:]).Scan(&pinned); err != nil || !pinned {
 		t.Fatalf("the landing did not pin its reused tree (%v)", err)
 	}
 	if landedAs[0].Commit != cand.Commit {
@@ -607,7 +613,7 @@ func TestSpliceReusingGarbageKeepsIt(t *testing.T) {
 
 func packsOf(t *testing.T, s *Store, repo int64) (live, retired int) {
 	t.Helper()
-	if err := s.pool.QueryRow(context.Background(), `SELECT count(*) FILTER (WHERE retired_at IS NULL), count(*) FILTER (WHERE retired_at IS NOT NULL)
+	if err := poolOf(s).QueryRow(context.Background(), `SELECT count(*) FILTER (WHERE retired_at IS NULL), count(*) FILTER (WHERE retired_at IS NOT NULL)
 		FROM pack WHERE repository_id = $1`, repo).Scan(&live, &retired); err != nil {
 		t.Fatal(err)
 	}
@@ -666,7 +672,7 @@ func TestCompactionReclaimsBytes(t *testing.T) {
 		v.files[f] = c
 	}
 	mustPublish(t, e.s, e.repo, alice, v, &OpHeadsUpdate{Old: []encoding.ID{encoding.RootOperationID}, New: op})
-	if _, err := e.s.pool.Exec(ctx, `UPDATE repository SET head = $2 WHERE id = $1`, e.repo, onMain[:]); err != nil {
+	if _, err := poolOf(e.s).Exec(ctx, `UPDATE repository SET head = $2 WHERE id = $1`, e.repo, onMain[:]); err != nil {
 		t.Fatal(err)
 	}
 	// And one large unreachable file, whose pack the sweep leaves nearly empty.

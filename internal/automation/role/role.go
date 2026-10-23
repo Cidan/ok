@@ -19,7 +19,10 @@ import (
 	"github.com/Cidan/ok/internal/automation/queue"
 	"github.com/Cidan/ok/internal/automation/service"
 	"github.com/Cidan/ok/internal/automation/store"
+	autopostgres "github.com/Cidan/ok/internal/automation/store/postgres"
 	"github.com/Cidan/ok/internal/blob"
+	"github.com/Cidan/ok/internal/bus"
+	"github.com/Cidan/ok/internal/bus/busconfig"
 	"github.com/Cidan/ok/internal/config"
 	"github.com/Cidan/ok/internal/credential"
 	"github.com/Cidan/ok/internal/dial"
@@ -56,9 +59,11 @@ func (r *Role) Close() {
 type Options struct {
 	// Dev accepts development principals, and makes the logs' bucket: a role on loopback.
 	Dev bool
-	// Pool and Logs, when set, are the database and bucket instead of the configuration's: tests.
-	Pool *pgxpool.Pool
-	Logs blob.Store
+	// Pool, Logs, and Stream, when set, are the database, bucket, and bus's stream instead of the
+	// configuration's: tests.
+	Pool   *pgxpool.Pool
+	Logs   blob.Store
+	Stream bus.Stream
 	// Identity and SCM, when set, are dialed as ok automation already: tests.
 	Identity, SCM grpc.ClientConnInterface
 	// Roots, when set, are the identity CA's certificates as identity in the same process holds
@@ -97,9 +102,19 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (*Role, error)
 		}
 		logs = s3
 	}
-	st, err := store.Open(ctx, pool, logs, store.DefaultConfig)
+	b, err := autopostgres.Open(ctx, pool)
 	if err != nil {
 		return nil, fmt.Errorf("ok automation's store: %w", err)
+	}
+	st := store.New(b, logs, store.DefaultConfig)
+	stream := opts.Stream
+	if stream == nil {
+		bb, err := busconfig.Open(ctx, cfg.Bus, pool)
+		if err != nil {
+			return nil, err
+		}
+		r.closers = append(r.closers, bb.Close)
+		stream = bb.Stream
 	}
 	r.Store = st
 
@@ -152,7 +167,7 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (*Role, error)
 	}
 	svc := &services{svc: service.New(st, store.DefaultConfig.Heartbeat)}
 	sweep := &sweeper{store: st}
-	follow := &follower{f: feed.New(st, feed.SCM{
+	follow := &follower{f: feed.New(st, stream, feed.SCM{
 		Events:       scmpb.NewEventsClient(scmConn),
 		ChangeLists:  scmpb.NewChangeListsClient(scmConn),
 		Repositories: scmpb.NewRepositoriesClient(scmConn),

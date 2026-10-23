@@ -41,7 +41,7 @@ const (
 type API struct {
 	controlpb.UnimplementedChangeListsServer
 
-	db      *db.DB
+	db      db.Store
 	scm     *scm.Client
 	runs    automationpb.RunsClient
 	deploys deploypb.DeploymentsClient
@@ -51,7 +51,7 @@ type API struct {
 }
 
 // New returns the service over ok control's clients; base is its public address.
-func New(d *db.DB, s *scm.Client, runs automationpb.RunsClient, deploys deploypb.DeploymentsClient, rv *review.Service, base string) *API {
+func New(d db.Store, s *scm.Client, runs automationpb.RunsClient, deploys deploypb.DeploymentsClient, rv *review.Service, base string) *API {
 	return &API{db: d, scm: s, runs: runs, deploys: deploys, review: rv, base: strings.TrimRight(base, "/"), poll: Poll}
 }
 

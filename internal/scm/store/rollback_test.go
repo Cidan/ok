@@ -8,7 +8,6 @@ import (
 	"testing"
 
 	"github.com/Cidan/ok/internal/scm/encoding"
-	scmpb "github.com/Cidan/ok/proto/ok/scm/v1"
 )
 
 // rollback asks for a rollback of number as bob, naming reviewers.
@@ -81,15 +80,11 @@ func TestRollback(t *testing.T) {
 		t.Errorf("rollback commit %+v", c)
 	}
 	var pinned bool
-	if err := e.s.pool.QueryRow(ctx, `SELECT pinned FROM commit WHERE repository_id = $1 AND id = $2`, e.repo, ps.Commit[:]).Scan(&pinned); err != nil || !pinned {
+	if err := poolOf(e.s).QueryRow(ctx, `SELECT pinned FROM commit WHERE repository_id = $1 AND id = $2`, e.repo, ps.Commit[:]).Scan(&pinned); err != nil || !pinned {
 		t.Errorf("rollback commit pinned=%v (%v)", pinned, err)
 	}
-	after := r.Seq - 1
-	var evs []*scmpb.Event
-	if _, err := e.s.readEvents(ctx, &after, func(ev *scmpb.Event) error {
-		evs = append(evs, ev)
-		return nil
-	}); err != nil || len(evs) != 1 || evs[0].GetSeq() != r.Seq {
+	evs, err := e.s.ReadEvents(ctx, e.repo, r.Event.GetRepositorySeq()-1, 0)
+	if err != nil || len(evs) != 1 || evs[0].GetRepositorySeq() != r.Event.GetRepositorySeq() {
 		t.Fatalf("events %v (%v)", evs, err)
 	}
 	up := evs[0].GetUploaded()

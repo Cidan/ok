@@ -39,6 +39,7 @@ import (
 	"github.com/Cidan/ok/internal/serve/node"
 	"github.com/Cidan/ok/internal/testbazel"
 	"github.com/Cidan/ok/internal/testdb"
+	"github.com/Cidan/ok/internal/testdb/testobjects"
 	"github.com/Cidan/ok/internal/testjj"
 	automationpb "github.com/Cidan/ok/proto/ok/automation/v1"
 	identitypb "github.com/Cidan/ok/proto/ok/identity/v1"
@@ -96,12 +97,7 @@ func as(t *testing.T, addr, principal string) *grpc.ClientConn {
 // bucket is a new bucket of the test's S3 server.
 func bucket(t *testing.T) blob.Store {
 	t.Helper()
-	s3 := testdb.S3(t)
-	b, err := blob.NewS3(blob.Config{Endpoint: s3.Endpoint, Bucket: testdb.Bucket(t), AccessKey: s3.AccessKey, SecretKey: s3.SecretKey, Region: s3.Region})
-	if err != nil {
-		t.Fatal(err)
-	}
-	return b
+	return testobjects.Store(t)
 }
 
 // start runs ok identity, the SCM, and ok automation for a test.

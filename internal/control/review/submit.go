@@ -166,7 +166,7 @@ func (s *Service) StackSize(ctx context.Context, cl db.ChangeList) (int, error) 
 	n := 1
 	cur := cl
 	for cur.ParentNumber != 0 {
-		parent, ok, err := db.GetChangeList(ctx, s.db.Q(), cur.Repo, cur.ParentNumber)
+		parent, ok, err := s.db.GetChangeList(ctx, cur.Repo, cur.ParentNumber)
 		if err != nil || !ok || parent.Status == db.StatusSubmitted {
 			return n, err
 		}

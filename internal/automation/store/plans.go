@@ -5,13 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"math"
-	"strconv"
+	"sort"
 	"strings"
 	"time"
-
-	"github.com/jackc/pgx/v5"
 )
 
 // Plan is what a patchset's pre runs, or post on one of a submission's candidates: the commit
@@ -82,41 +79,6 @@ type PlanRequest struct {
 // planJob is a planning run's job identity.
 const planJob = "plan"
 
-// lockCL serializes, within a transaction, what plans and cancels a CL's runs: a new
-// patchset's plan, and a planning run's queuing of its jobs.
-func lockCL(ctx context.Context, tx pgx.Tx, repo, cl int64) error {
-	h := fnv.New64a()
-	fmt.Fprintf(h, "ok-automation plan %d/%d", repo, cl)
-	_, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, int64(h.Sum64()))
-	return err
-}
-
-const planColumns = `id, repository_id, cl_number, patchset, phase, commit_id, workflows_commit, context, touched,
-	planned, jobs, skipped, affected, upstream, created_at, pre_commit`
-
-func scanPlan(row pgx.Row) (*Plan, error) {
-	var p Plan
-	var touched, jobs, skipped, affected, upstream []byte
-	err := row.Scan(&p.ID, &p.RepositoryID, &p.CLNumber, &p.Patchset, &p.Phase, &p.CommitID, &p.WorkflowsCommit,
-		&p.Context, &touched, &p.Planned, &jobs, &skipped, &affected, &upstream, &p.CreatedAt, &p.PreCommit)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, ErrNotFound
-	}
-	if err != nil {
-		return nil, err
-	}
-	for _, f := range []struct {
-		data []byte
-		into any
-		what string
-	}{{touched, &p.Touched, "touched paths"}, {jobs, &p.Jobs, "jobs"}, {skipped, &p.Skipped, "skipped jobs"}, {affected, &p.Affected, "affected targets"}, {upstream, &p.Upstream, "upstream targets"}} {
-		if err := json.Unmarshal(f.data, f.into); err != nil {
-			return nil, fmt.Errorf("plan %d's %s: %w", p.ID, f.what, err)
-		}
-	}
-	return &p, nil
-}
-
 // CreatePlan records a patchset's pre and queues its planning run, once: a patchset already
 // planned is left as it is (created is false). The pre runs of the CL's earlier patchsets that
 // have not finished are canceled: a new patchset supersedes them.
@@ -131,35 +93,31 @@ func (s *Store) CreatePlan(ctx context.Context, req PlanRequest) (plan *Plan, cr
 	case req.RequestedBy == "":
 		return nil, false, invalid("a run is requested by someone")
 	}
-	err = pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		if err := lockCL(ctx, tx, req.RepositoryID, req.CLNumber); err != nil {
+	err = s.b.Txn(ctx, func(tx Ops) error {
+		created = false
+		if err := tx.LockCL(ctx, req.RepositoryID, req.CLNumber); err != nil {
 			return err
 		}
-		plan, err = scanPlan(tx.QueryRow(ctx, `INSERT INTO plan (repository_id, cl_number, patchset, phase, commit_id,
-				workflows_commit, context)
-			VALUES ($1, $2, $3, $4, $5, $6, $7)
-			ON CONFLICT (repository_id, cl_number, patchset) WHERE phase = 1 DO NOTHING
-			RETURNING `+planColumns,
-			req.RepositoryID, req.CLNumber, req.Patchset, PhasePre, req.CommitID, req.WorkflowsCommit, req.Context))
-		if errors.Is(err, ErrNotFound) {
-			plan, err = scanPlan(tx.QueryRow(ctx, `SELECT `+planColumns+` FROM plan
-				WHERE repository_id = $1 AND cl_number = $2 AND patchset = $3 AND phase = $4`,
-				req.RepositoryID, req.CLNumber, req.Patchset, PhasePre))
+		var err error
+		plan, err = tx.PrePlan(ctx, req.RepositoryID, req.CLNumber, req.Patchset)
+		if err == nil || !errors.Is(err, ErrNotFound) {
 			return err
 		}
+		plan, err = tx.InsertPlan(ctx, NewPlan{RepositoryID: req.RepositoryID, CLNumber: req.CLNumber, Patchset: req.Patchset,
+			Phase: PhasePre, CommitID: req.CommitID, WorkflowsCommit: req.WorkflowsCommit, Context: req.Context})
 		if err != nil {
 			return err
 		}
 		created = true
-		if _, err := tx.Exec(ctx, `INSERT INTO run (repository_id, commit_id, kind, targets, args, phase,
-				cl_number, patchset, job, plan_id, why, requested_by, status, timeout_seconds)
-			VALUES ($1, $2, $3, '{}', '{}', $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
-			req.RepositoryID, req.CommitID, KindPlan, PhasePre, req.CLNumber, req.Patchset, planJob, plan.ID,
-			fmt.Sprintf("patchset %d was uploaded", req.Patchset), req.RequestedBy, StatusQueued,
-			int32(s.cfg.DefaultTimeout/time.Second)); err != nil {
+		if _, err := tx.InsertRun(ctx, NewRun{
+			RepositoryID: req.RepositoryID, CommitID: req.CommitID, Job: Job{Kind: KindPlan},
+			Origin: Origin{Phase: PhasePre, CLNumber: req.CLNumber, Patchset: req.Patchset, Job: planJob}, PlanID: plan.ID,
+			Why: fmt.Sprintf("patchset %d was uploaded", req.Patchset), RequestedBy: req.RequestedBy, Status: StatusQueued,
+			TimeoutSeconds: int32(s.cfg.DefaultTimeout / time.Second),
+		}); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(ctx, `SELECT pg_notify($1, '')`, chanQueue); err != nil {
+		if err := queued(ctx, tx); err != nil {
 			return err
 		}
 		return s.cancelPre(ctx, tx, req.RepositoryID, req.CLNumber, req.Patchset, fmt.Sprintf("patchset %d superseded it", req.Patchset))
@@ -170,8 +128,8 @@ func (s *Store) CreatePlan(ctx context.Context, req PlanRequest) (plan *Plan, cr
 // EndPre cancels every pre run of a CL that has not finished: the CL landed, or was abandoned,
 // and no pre of it can matter now.
 func (s *Store) EndPre(ctx context.Context, repo, cl int64, reason string) error {
-	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		if err := lockCL(ctx, tx, repo, cl); err != nil {
+	return s.b.Txn(ctx, func(tx Ops) error {
+		if err := tx.LockCL(ctx, repo, cl); err != nil {
 			return err
 		}
 		return s.cancelPre(ctx, tx, repo, cl, math.MaxInt32, reason)
@@ -184,80 +142,81 @@ func (s *Store) EndPre(ctx context.Context, repo, cl int64, reason string) error
 // heard the stop ends canceled; it is run again by hand.)
 func (s *Store) ResumePre(ctx context.Context, repo, cl int64, patchset int32, requestedBy string) (int, error) {
 	var n int
-	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		if err := lockCL(ctx, tx, repo, cl); err != nil {
+	err := s.b.Txn(ctx, func(tx Ops) error {
+		n = 0
+		if err := tx.LockCL(ctx, repo, cl); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(ctx, `UPDATE run SET stop_reason = NULL
-			WHERE repository_id = $1 AND cl_number = $2 AND patchset = $3 AND phase = $4 AND status = $5`,
-			repo, cl, patchset, PhasePre, StatusRunning); err != nil {
+		if err := tx.ClearPreStops(ctx, repo, cl, patchset); err != nil {
 			return err
 		}
-		tag, err := tx.Exec(ctx, `INSERT INTO run (repository_id, commit_id, kind, targets, args, phase, cl_number,
-				patchset, job, plan_id, why, requested_by, rerun_of, status, timeout_seconds)
-			SELECT repository_id, commit_id, kind, targets, args, phase, cl_number, patchset, job, plan_id, why,
-				$5, id, $6, timeout_seconds
-			FROM (SELECT DISTINCT ON (job) * FROM run
-				WHERE plan_id = (SELECT id FROM plan WHERE repository_id = $1 AND cl_number = $2 AND patchset = $3 AND phase = $4)
-				ORDER BY job, id DESC) latest
-			WHERE status = $7`, repo, cl, patchset, PhasePre, requestedBy, StatusQueued, StatusCanceled)
+		plan, err := tx.PrePlan(ctx, repo, cl, patchset)
+		if errors.Is(err, ErrNotFound) {
+			return nil
+		}
 		if err != nil {
 			return err
 		}
-		n = int(tag.RowsAffected())
-		if n > 0 {
-			_, err = tx.Exec(ctx, `SELECT pg_notify($1, '')`, chanQueue)
+		runs, err := tx.PlanRuns(ctx, []int64{plan.ID})
+		if err != nil {
+			return err
 		}
-		return err
+		latest := latestByJob(runs)
+		jobs := make([]string, 0, len(latest))
+		for j := range latest {
+			jobs = append(jobs, j)
+		}
+		sort.Strings(jobs)
+		for _, j := range jobs {
+			if r := latest[j]; r.Status == StatusCanceled {
+				if _, err := tx.InsertRun(ctx, rerunOf(r, requestedBy)); err != nil {
+					return err
+				}
+				n++
+			}
+		}
+		if n > 0 {
+			return queued(ctx, tx)
+		}
+		return nil
 	})
 	return n, err
 }
 
+// latestByJob is each job's latest run among runs, which are in ID order.
+func latestByJob(runs []*Run) map[string]*Run {
+	out := map[string]*Run{}
+	for _, r := range runs {
+		out[r.Origin.Job] = r
+	}
+	return out
+}
+
 // cancelPre cancels the pre runs of a CL's patchsets before below that have not finished: a
 // queued run ends at once, and a running one's worker is told to stop it.
-func (s *Store) cancelPre(ctx context.Context, tx pgx.Tx, repo, cl int64, below int32, reason string) error {
-	rows, err := tx.Query(ctx, `UPDATE run SET status = $5, reason = $6, finished_at = now(), log_stored = true
-		WHERE repository_id = $1 AND cl_number = $2 AND phase = $3 AND patchset < $4 AND status = $7
-		RETURNING id`, repo, cl, PhasePre, below, StatusCanceled, reason, StatusQueued)
+func (s *Store) cancelPre(ctx context.Context, tx Ops, repo, cl int64, below int32, reason string) error {
+	ended, err := tx.CancelQueuedPre(ctx, repo, cl, below, reason)
 	if err != nil {
 		return err
 	}
-	var ended []int64
-	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
-			rows.Close()
-			return err
-		}
-		ended = append(ended, id)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return err
-	}
 	for _, id := range ended {
-		if _, err := notify(ctx, tx, chanDone, id); err != nil {
+		if err := notify(ctx, tx, chanDone, id); err != nil {
 			return err
 		}
 	}
-	_, err = tx.Exec(ctx, `UPDATE run SET stop_reason = $5
-		WHERE repository_id = $1 AND cl_number = $2 AND phase = $3 AND patchset < $4 AND status = $6
-			AND stop_reason IS NULL`, repo, cl, PhasePre, below, reason, StatusRunning)
-	return err
+	return tx.StopRunningPre(ctx, repo, cl, below, reason)
 }
 
 // GetPlan returns a plan.
-func (s *Store) GetPlan(ctx context.Context, id int64) (*Plan, error) {
-	return scanPlan(s.pool.QueryRow(ctx, `SELECT `+planColumns+` FROM plan WHERE id = $1`, id))
-}
+func (s *Store) GetPlan(ctx context.Context, id int64) (*Plan, error) { return s.b.Plan(ctx, id) }
 
 // queuePlan records what a planning run found, within the transaction that records the run
 // passed: the plan's jobs, the workflow jobs it leaves to main, and the change's footprint.
 // A pre plan's jobs are queued at once — recorded canceled when a newer patchset has
 // superseded the plan, since they would test a patchset no one can submit. A post plan's wait
 // for the landing queue to release its attempt.
-func (s *Store) queuePlan(ctx context.Context, tx pgx.Tx, run *Run, result *PlanResult) error {
-	if err := lockCL(ctx, tx, run.RepositoryID, run.Origin.CLNumber); err != nil {
+func (s *Store) queuePlan(ctx context.Context, tx Ops, run *Run, result *PlanResult) error {
+	if err := tx.LockCL(ctx, run.RepositoryID, run.Origin.CLNumber); err != nil {
 		return err
 	}
 	seen := map[string]bool{planJob: true}
@@ -281,44 +240,26 @@ func (s *Store) queuePlan(ctx context.Context, tx pgx.Tx, run *Run, result *Plan
 			return invalid("%q is not a Bazel label", l)
 		}
 	}
-	var planned bool
-	if err := tx.QueryRow(ctx, `SELECT planned FROM plan WHERE id = $1 FOR UPDATE`, run.PlanID).Scan(&planned); err != nil {
+	plan, err := tx.LockPlan(ctx, run.PlanID)
+	if err != nil {
 		return err
 	}
-	if planned {
+	if plan.Planned {
 		return &ConflictError{Message: "the patchset is planned already"}
 	}
-	enc := func(v any) ([]byte, error) { return json.Marshal(v) }
-	jobs, err := enc(orEmptyJobs(result.Jobs))
-	if err != nil {
-		return err
-	}
-	skipped, err := enc(orEmptySkipped(result.Skipped))
-	if err != nil {
-		return err
-	}
-	affected, err := enc(orEmpty(result.Affected))
-	if err != nil {
-		return err
-	}
-	upstream, err := enc(orEmpty(result.Upstream))
-	if err != nil {
-		return err
-	}
-	if _, err := tx.Exec(ctx, `UPDATE plan SET planned = true, jobs = $2, skipped = $3, affected = $4, upstream = $5
-		WHERE id = $1`, run.PlanID, jobs, skipped, affected, upstream); err != nil {
+	if err := tx.SetPlanned(ctx, run.PlanID, PlanResult{
+		Jobs: orEmptyJobs(result.Jobs), Skipped: orEmptySkipped(result.Skipped),
+		Affected: orEmpty(result.Affected), Upstream: orEmpty(result.Upstream),
+	}); err != nil {
 		return err
 	}
 	if run.Origin.Phase == PhasePost {
 		// The landing queue decides when the attempt runs; a released attempt's plans are all
 		// planned, so this plan's is not released yet.
-		_, err := tx.Exec(ctx, `SELECT pg_notify($1, $2)`, chanSubmission, strconv.FormatInt(run.RepositoryID, 10))
-		return err
+		return notifyQueue(ctx, tx, run.RepositoryID)
 	}
-	var newer int32
-	if err := tx.QueryRow(ctx, `SELECT coalesce(max(patchset), 0) FROM plan
-		WHERE repository_id = $1 AND cl_number = $2 AND phase = $3`,
-		run.RepositoryID, run.Origin.CLNumber, PhasePre).Scan(&newer); err != nil {
+	newer, err := tx.MaxPrePatchset(ctx, run.RepositoryID, run.Origin.CLNumber)
+	if err != nil {
 		return err
 	}
 	status, reason := StatusQueued, ""
@@ -330,30 +271,26 @@ func (s *Store) queuePlan(ctx context.Context, tx pgx.Tx, run *Run, result *Plan
 
 // insertJobs queues a plan's jobs as runs on its commit — or records them ended, canceled for
 // reason, when status says so.
-func (s *Store) insertJobs(ctx context.Context, tx pgx.Tx, repo int64, commit []byte, origin Origin, planID int64,
+func (s *Store) insertJobs(ctx context.Context, tx Ops, repo int64, commit []byte, origin Origin, planID int64,
 	requestedBy string, jobs []PlannedJob, priority int16, status Status, reason string) error {
 	if len(jobs) == 0 {
 		return nil
 	}
-	var finished any
-	if status != StatusQueued {
-		finished = time.Now()
-	}
-	batch := &pgx.Batch{}
+	rs := make([]NewRun, 0, len(jobs))
 	for _, j := range jobs {
-		batch.Queue(`INSERT INTO run (repository_id, commit_id, kind, targets, args, phase, cl_number, patchset,
-				job, plan_id, why, requested_by, status, reason, timeout_seconds, finished_at, log_stored, priority)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)`,
-			repo, commit, j.Spec.Kind, orEmpty(j.Spec.Targets), orEmpty(j.Spec.Args),
-			origin.Phase, origin.CLNumber, origin.Patchset, j.Job, planID, j.Why, requestedBy, status, reason,
-			int32(s.cfg.DefaultTimeout/time.Second), finished, status != StatusQueued, priority)
+		o := origin
+		o.Job = j.Job
+		rs = append(rs, NewRun{
+			RepositoryID: repo, CommitID: commit, Job: j.Spec, Origin: o, PlanID: planID, Why: j.Why,
+			RequestedBy: requestedBy, Status: status, Reason: reason, TimeoutSeconds: int32(s.cfg.DefaultTimeout / time.Second),
+			Finished: status != StatusQueued, LogStored: status != StatusQueued, Priority: priority,
+		})
 	}
-	if err := tx.SendBatch(ctx, batch).Close(); err != nil {
+	if err := tx.InsertRuns(ctx, rs); err != nil {
 		return err
 	}
 	if status == StatusQueued {
-		_, err := tx.Exec(ctx, `SELECT pg_notify($1, '')`, chanQueue)
-		return err
+		return queued(ctx, tx)
 	}
 	return nil
 }
@@ -397,18 +334,25 @@ func (s *Store) GetPre(ctx context.Context, repo, cl int64, patchset int32) (*Pr
 		return nil, invalid("name the repository, CL, and patchset")
 	}
 	pre := &Pre{Verdict: VerdictNone}
-	err := pgx.BeginTxFunc(ctx, s.pool, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly}, func(tx pgx.Tx) error {
-		plan, err := scanPlan(tx.QueryRow(ctx, `SELECT `+planColumns+` FROM plan
-			WHERE repository_id = $1 AND cl_number = $2 AND patchset = $3 AND phase = $4`, repo, cl, patchset, PhasePre))
+	err := s.b.Snapshot(ctx, func(tx Ops) error {
+		*pre = Pre{Verdict: VerdictNone}
+		plan, err := tx.PrePlan(ctx, repo, cl, patchset)
 		if errors.Is(err, ErrNotFound) {
 			return nil
 		}
 		if err != nil {
 			return err
 		}
+		runs, err := tx.PlanRuns(ctx, []int64{plan.ID})
+		if err != nil {
+			return err
+		}
 		pre.Plan = plan
-		pre.PlanRun, pre.Jobs, err = planRuns(ctx, tx, plan.ID)
-		return err
+		pre.PlanRun, pre.Jobs = planRuns(runs)
+		if pre.PlanRun == nil {
+			return ErrNotFound
+		}
+		return nil
 	})
 	if err != nil {
 		return nil, err
@@ -419,37 +363,25 @@ func (s *Store) GetPre(ctx context.Context, repo, cl int64, patchset int32) (*Pr
 	return pre, nil
 }
 
-// planRuns returns a plan's latest planning run and the latest run of each of its jobs, in the
-// order the plan queued them.
-func planRuns(ctx context.Context, q querier, planID int64) (*Run, []*Run, error) {
-	planRun, err := scanRun(q.QueryRow(ctx, `SELECT `+runColumns+` FROM run
-		WHERE plan_id = $1 AND kind = $2 ORDER BY id DESC LIMIT 1`, planID, KindPlan))
-	if err != nil {
-		return nil, nil, err
-	}
-	rows, err := q.Query(ctx, `SELECT `+runColumns+` FROM (
-			SELECT DISTINCT ON (job) *, min(id) OVER (PARTITION BY job) AS first
-			FROM run WHERE plan_id = $1 AND kind <> $2 ORDER BY job, id DESC
-		) latest ORDER BY first`, planID, KindPlan)
-	if err != nil {
-		return nil, nil, err
-	}
-	defer rows.Close()
+// planRuns is, of a plan's runs in ID order, its latest planning run and the latest run of each
+// of its jobs, in the order the plan queued them.
+func planRuns(runs []*Run) (*Run, []*Run) {
+	var plan *Run
 	var jobs []*Run
-	for rows.Next() {
-		r, err := scanRun(rows)
-		if err != nil {
-			return nil, nil, err
+	at := map[string]int{}
+	for _, r := range runs {
+		if r.Job.Kind == KindPlan {
+			plan = r
+			continue
 		}
+		if i, ok := at[r.Origin.Job]; ok {
+			jobs[i] = r
+			continue
+		}
+		at[r.Origin.Job] = len(jobs)
 		jobs = append(jobs, r)
 	}
-	return planRun, jobs, rows.Err()
-}
-
-// querier is a pool or a transaction.
-type querier interface {
-	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
-	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	return plan, jobs
 }
 
 // verdict is a pre's verdict from its planning run and its jobs' latest runs: any that did not

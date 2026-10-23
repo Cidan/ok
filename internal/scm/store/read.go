@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/Cidan/ok/internal/blob"
 	"github.com/Cidan/ok/internal/scm/copies"
@@ -42,7 +43,7 @@ func chunkKey(repo int64, id encoding.ID) string {
 }
 
 // ReadObjects reads symlinks, trees, copy histories, and commits as canonical bodies,
-// from an in-memory cache before PostgreSQL. The empty tree is served virtually; the root
+// from an in-memory cache before the database. The empty tree is served virtually; the root
 // commit is virtual on the client and reported absent.
 func (s *Store) ReadObjects(ctx context.Context, repo int64, refs []ObjectRef) ([]ObjectResult, error) {
 	out := make([]ObjectResult, len(refs))
@@ -66,39 +67,20 @@ func (s *Store) ReadObjects(ctx context.Context, repo int64, refs []ObjectRef) (
 	}
 	found := map[ObjectRef][]byte{}
 	for kind, members := range misses {
-		var rows interface {
-			Next() bool
-			Scan(...any) error
-			Close()
-			Err() error
-		}
+		var bodies map[encoding.ID][]byte
 		var err error
 		if kind == encoding.KindCommit {
-			rows, err = s.pool.Query(ctx, `SELECT id, body FROM commit WHERE repository_id = $1 AND id = ANY($2)`, repo, ids(members))
+			bodies, err = s.b.CommitBodies(ctx, repo, members)
 		} else {
-			rows, err = s.pool.Query(ctx, `SELECT id, body FROM object WHERE repository_id = $1 AND id = ANY($2) AND kind = $3`, repo, ids(members), int16(kind))
+			bodies, err = s.b.ObjectBodies(ctx, repo, kind, members)
 		}
 		if err != nil {
 			return nil, err
 		}
-		for rows.Next() {
-			var idb, body []byte
-			if err := rows.Scan(&idb, &body); err != nil {
-				rows.Close()
-				return nil, err
-			}
-			id, err := toID(idb)
-			if err != nil {
-				rows.Close()
-				return nil, err
-			}
+		for id, body := range bodies {
 			r := ObjectRef{Kind: kind, ID: id}
 			found[r] = body
 			s.objects.put(objectKey(repo, r), body, len(body))
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
-			return nil, err
 		}
 	}
 	for i := range out {
@@ -696,46 +678,17 @@ func (s *Store) ReadManifests(ctx context.Context, repo int64, files []encoding.
 // every descendant of those — children before parents, ties broken by ID (jj's
 // get_related_copies contract).
 func (s *Store) GetRelatedCopies(ctx context.Context, repo int64, copyID encoding.ID) ([]EncodedObject, error) {
-	// Each step is a fenced per-row index probe, as in loadEdges.
-	rows, err := s.pool.Query(ctx, `WITH RECURSIVE
-		anc(id) AS (
-			SELECT $2::bytea
-			UNION
-			SELECT p.parent_id FROM anc, LATERAL (
-				SELECT cp.parent_id FROM copy_parent cp WHERE cp.repository_id = $1 AND cp.copy_id = anc.id OFFSET 0) p
-		),
-		rel(id) AS (
-			SELECT id FROM anc
-			UNION
-			SELECT c.copy_id FROM rel, LATERAL (
-				SELECT cp.copy_id FROM copy_parent cp WHERE cp.repository_id = $1 AND cp.parent_id = rel.id OFFSET 0) c
-		)
-		SELECT o.id, o.body FROM rel JOIN object o ON o.repository_id = $1 AND o.id = rel.id AND o.kind = $3`,
-		repo, copyID[:], int16(encoding.KindCopyHistory))
+	bodies, err := s.b.CopyRelatives(ctx, repo, copyID)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	bodies := map[encoding.ID][]byte{}
 	parents := map[encoding.ID][]encoding.ID{}
-	for rows.Next() {
-		var idb, body []byte
-		if err := rows.Scan(&idb, &body); err != nil {
-			return nil, err
-		}
-		id, err := toID(idb)
-		if err != nil {
-			return nil, err
-		}
+	for id, body := range bodies {
 		o, err := decodeStored(encoding.KindCopyHistory, id, body)
 		if err != nil {
 			return nil, err
 		}
-		bodies[id] = body
 		parents[id] = o.(*encoding.CopyHistory).Parents
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
 	}
 	if _, ok := bodies[copyID]; !ok {
 		return nil, notFound("copy history %s", copyID)
@@ -919,77 +872,37 @@ func (s *Store) loadGenerations(ctx context.Context, repo int64, members []encod
 	if len(members) == 0 {
 		return nil
 	}
-	rows, err := s.pool.Query(ctx, `SELECT id, generation FROM commit WHERE repository_id = $1 AND id = ANY($2)`, repo, ids(members))
+	got, err := s.b.CommitGenerations(ctx, repo, members)
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var b []byte
-		var g int64
-		if err := rows.Scan(&b, &g); err != nil {
-			return err
-		}
-		id, err := toID(b)
-		if err != nil {
-			return err
-		}
+	for id, g := range got {
 		gen[id] = g
 	}
-	return rows.Err()
+	return nil
 }
 
-// parentsOf is the parent edges of one commit, with each parent's generation. The
-// OFFSET 0 fence keeps it a subquery run per row — two primary-key probes — so a walk
-// that visits a window of a repository's history never becomes a join over every edge
-// in the repository.
-const parentsOf = `SELECT cp.parent_id, cp.ord, pc.generation
-	FROM commit_parent cp JOIN commit pc ON pc.repository_id = cp.repository_id AND pc.id = cp.parent_id
-	WHERE cp.repository_id = $1 AND cp.commit_id = walk.id OFFSET 0`
-
 // loadEdges loads the parent edges of from and of every ancestor down to generation
-// minGen in one query. The virtual root has no commit row, so it is never a parent here.
+// minGen in one read. The virtual root has no commit row, so it is never a parent here.
 func (s *Store) loadEdges(ctx context.Context, repo int64, from []encoding.ID, minGen int64, gen map[encoding.ID]int64, edges map[encoding.ID][]encoding.ID, loaded map[encoding.ID]bool) error {
-	rows, err := s.pool.Query(ctx, `WITH RECURSIVE walk(id) AS (
-			SELECT unnest($2::bytea[])
-			UNION
-			SELECT e.parent_id FROM walk, LATERAL (`+parentsOf+`) e WHERE e.generation >= $3
-		)
-		SELECT walk.id, e.parent_id, e.generation
-		FROM walk LEFT JOIN LATERAL (`+parentsOf+`) e ON true
-		ORDER BY walk.id, e.ord`, repo, ids(from), minGen)
+	ancestors, err := s.b.Ancestry(ctx, repo, from, minGen)
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var idb, parentb []byte
-		var pgen *int64
-		if err := rows.Scan(&idb, &parentb, &pgen); err != nil {
-			return err
+	for _, a := range ancestors {
+		loaded[a.ID] = true
+		for i, p := range a.Parents {
+			edges[a.ID] = append(edges[a.ID], p)
+			gen[p] = a.Generations[i]
 		}
-		id, err := toID(idb)
-		if err != nil {
-			return err
-		}
-		loaded[id] = true
-		if pgen == nil {
-			continue
-		}
-		parent, err := toID(parentb)
-		if err != nil {
-			return err
-		}
-		edges[id] = append(edges[id], parent)
-		gen[parent] = *pgen
 	}
-	return rows.Err()
+	return nil
 }
 
 // opLogCommits lists every commit the caller's operation log references: each view's
 // commits and each operation's commit_predecessors.
 func (s *Store) opLogCommits(ctx context.Context, repo int64, principal, workspace string) ([]encoding.ID, error) {
-	opLog, err := logOf(ctx, s.pool, repo, principal, workspace)
+	opLog, err := logOf(ctx, s.b, repo, principal, workspace)
 	if err != nil {
 		return nil, err
 	}
@@ -1001,50 +914,33 @@ func (s *Store) opLogCommits(ctx context.Context, repo int64, principal, workspa
 			out = append(out, id)
 		}
 	}
-	for _, t := range []struct {
-		kind  encoding.Kind
-		query string
-	}{
-		{encoding.KindView, `SELECT id, body FROM view WHERE op_log_id = $1`},
-		{encoding.KindOperation, `SELECT id, body FROM operation WHERE op_log_id = $1`},
-	} {
-		rows, err := s.pool.Query(ctx, t.query, opLog)
+	views, err := s.b.Views(ctx, opLog)
+	if err != nil {
+		return nil, err
+	}
+	for _, v := range views {
+		o, err := decodeStored(encoding.KindView, v.ID, v.Body)
 		if err != nil {
 			return nil, err
 		}
-		for rows.Next() {
-			var idb, body []byte
-			if err := rows.Scan(&idb, &body); err != nil {
-				rows.Close()
-				return nil, err
-			}
-			id, err := toID(idb)
-			if err != nil {
-				rows.Close()
-				return nil, err
-			}
-			o, err := decodeStored(t.kind, id, body)
-			if err != nil {
-				rows.Close()
-				return nil, err
-			}
-			switch o := o.(type) {
-			case *encoding.View:
-				for _, c := range viewCommits(o) {
-					add(c)
-				}
-			case *encoding.Operation:
-				for c, preds := range o.CommitPredecessors {
-					add(c)
-					for _, p := range preds {
-						add(p)
-					}
-				}
-			}
+		for _, c := range viewCommits(o.(*encoding.View)) {
+			add(c)
 		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
+	}
+	ops, err := s.b.Operations(ctx, opLog, time.Time{})
+	if err != nil {
+		return nil, err
+	}
+	for _, op := range ops {
+		o, err := decodeStored(encoding.KindOperation, op.ID, op.Body)
+		if err != nil {
 			return nil, err
+		}
+		for c, preds := range o.(*encoding.Operation).CommitPredecessors {
+			add(c)
+			for _, p := range preds {
+				add(p)
+			}
 		}
 	}
 	return out, nil

@@ -2,21 +2,23 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"strconv"
 	"sync"
 	"time"
 
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/Cidan/ok/internal/bus"
+	"github.com/Cidan/ok/internal/scm/scmfeed"
+	"github.com/Cidan/ok/internal/scm/store/backend"
 	scmpb "github.com/Cidan/ok/proto/ok/scm/v1"
 )
 
-// eventHub wakes event watchers when an event commits. One PostgreSQL connection per
-// replica LISTENs on eventChannel, which every event-writing transaction notifies at
-// commit; each notification closes the current channel and opens the next.
+// eventHub wakes the relay when an event commits. Each replica listens on eventChannel (the
+// backend's Listen), which every event-writing transaction notifies at commit; each
+// notification closes the current channel and opens the next.
 type eventHub struct {
 	start sync.Once
 	mu    sync.Mutex
@@ -70,116 +72,152 @@ func (s *Store) Close() {
 	}
 }
 
-// listen holds the LISTEN connection until the store closes, reconnecting after a
-// failure: on eventChannel, for event watchers, and on contentChannel, for the content
-// indexes. Every (re)connection signals and marks every index stale, so a watcher re-reads
-// anything committed while the connection was down, and an index refreshes.
+// listen listens until the store closes, reconnecting after a failure: on eventChannel, for
+// event watchers, and on contentChannel, for the content indexes. Every (re)connection signals
+// and marks every index stale, so a watcher re-reads anything committed while the connection
+// was down, and an index refreshes.
 func (s *Store) listen() {
 	ctx := s.events.ctx
-	for backoff := time.Second; ctx.Err() == nil; {
-		conn, err := pgx.ConnectConfig(ctx, s.pool.Config().ConnConfig.Copy())
-		if err == nil {
-			_, err = conn.Exec(ctx, `LISTEN `+eventChannel+`; LISTEN `+contentChannel)
-		}
-		if err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			slog.Warn("ok scm: event listener", slog.Any("err", err))
-			if conn != nil {
-				conn.Close(context.WithoutCancel(ctx))
-			}
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(backoff):
-			}
-			backoff = min(backoff*2, 30*time.Second)
-			continue
-		}
-		backoff = time.Second
+	ready := func() {
 		s.events.signal()
 		s.allIndexesChanged()
-		for {
-			var n *pgconn.Notification
-			if n, err = conn.WaitForNotification(ctx); err != nil {
-				break
+	}
+	deliver := func(channel, payload string) {
+		if channel == contentChannel {
+			if repo, err := strconv.ParseInt(payload, 10, 64); err == nil {
+				s.indexChanged(repo)
 			}
-			if n.Channel == contentChannel {
-				if repo, perr := strconv.ParseInt(n.Payload, 10, 64); perr == nil {
-					s.indexChanged(repo)
-				}
-				continue
-			}
-			s.events.signal()
+			return
 		}
-		conn.Close(context.WithoutCancel(ctx))
+		s.events.signal()
+	}
+	for backoff := time.Second; ctx.Err() == nil; {
+		start := time.Now()
+		err := s.b.Listen(ctx, []string{eventChannel, contentChannel}, ready, deliver)
 		if ctx.Err() != nil {
 			return
 		}
-		slog.Warn("ok scm: event listener lost its connection", slog.Any("err", err))
+		slog.Warn("ok scm: event listener", slog.Any("err", err))
+		if time.Since(start) > time.Minute {
+			backoff = time.Second
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+		}
+		backoff = min(backoff*2, 30*time.Second)
 	}
 }
-
-// eventRepoll is how often a caught-up watcher re-reads without a notification, in case
-// one was lost with the listening connection.
-const eventRepoll = 30 * time.Second
 
 // eventPage is how many events one read returns.
 const eventPage = 1000
 
-// WatchEvents streams every event after sequence number after, in sequence order, and
-// keeps streaming new ones as they commit until ctx ends or emit fails. Sequence order is
-// commit order, so a watcher never skips an event.
-func (s *Store) WatchEvents(ctx context.Context, after int64, emit func(*scmpb.Event) error) error {
+// decodeEvents decodes events as the log holds them. An event written before repositories had
+// logs of their own carries its place in its repository's log in its row alone.
+func decodeEvents(rows []backend.Event) ([]*scmpb.Event, error) {
+	evs := make([]*scmpb.Event, 0, len(rows))
+	for _, r := range rows {
+		ev := &scmpb.Event{}
+		if err := proto.Unmarshal(r.Body, ev); err != nil {
+			return nil, fmt.Errorf("event %d of repository %d: %w", r.RepositorySeq, r.Repository, err)
+		}
+		ev.RepositoryId, ev.RepositorySeq = r.Repository, r.RepositorySeq
+		evs = append(evs, ev)
+	}
+	return evs, nil
+}
+
+// ReadEvents returns up to limit of a repository's events after place after in its log, in order
+// (limit 0, or past eventPage: eventPage).
+func (s *Store) ReadEvents(ctx context.Context, repo, after int64, limit int) ([]*scmpb.Event, error) {
+	if after < 0 {
+		return nil, invalid("a place in a log is not negative")
+	}
+	if limit <= 0 || limit > eventPage {
+		limit = eventPage
+	}
+	if err := s.repositoryExists(ctx, s.b, repo); err != nil {
+		return nil, err
+	}
+	rows, err := s.b.RepositoryEvents(ctx, repo, after, limit)
+	if err != nil {
+		return nil, err
+	}
+	return decodeEvents(rows)
+}
+
+// LogHead is how far a repository's log reaches: the place of its last event.
+type LogHead struct {
+	Repository, Seq int64
+}
+
+// LogHeads lists, for up to limit repositories with IDs above after (limit 0, or past eventPage:
+// eventPage), by ID, the last place in each one's log — now, or (asOf > 0) as of the feed's
+// sequence number asOf, for a follower moving from the feed to the stream. A repository with no
+// event by then is left out.
+func (s *Store) LogHeads(ctx context.Context, asOf, after int64, limit int) ([]LogHead, error) {
+	if asOf < 0 || after < 0 {
+		return nil, invalid("a place in the feed, and a repository ID, are not negative")
+	}
+	if limit <= 0 || limit > eventPage {
+		limit = eventPage
+	}
+	rows, err := s.b.LogHeads(ctx, asOf, after, limit)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]LogHead, len(rows))
+	for i, r := range rows {
+		out[i] = LogHead{Repository: r[0], Seq: r[1]}
+	}
+	return out, nil
+}
+
+// EventTopic is the bus's stream the relay publishes the SCM's events on (scmfeed.Topic).
+const EventTopic = scmfeed.Topic
+
+// relayPage is how many events one relay round publishes.
+const relayPage = 500
+
+// Relay publishes to stream every event no relay has yet, until ctx ends: at least once each, as
+// they commit, any number of relays beside it (docs/hosted.md, "The per-repository log").
+func (s *Store) Relay(ctx context.Context, stream bus.Stream) error {
 	s.startListening()
 	for {
 		wake := s.events.wait()
-		n, err := s.readEvents(ctx, &after, emit)
-		if err != nil {
-			return err
+		n, err := s.relayOnce(ctx, stream)
+		if err != nil && ctx.Err() == nil {
+			slog.Warn("ok scm: relaying events", slog.Any("err", err))
 		}
-		if n == eventPage {
+		if n == relayPage && err == nil {
 			continue
 		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-wake:
-		case <-time.After(eventRepoll):
+		case <-time.After(relayPoll):
 		}
 	}
 }
 
-func (s *Store) readEvents(ctx context.Context, after *int64, emit func(*scmpb.Event) error) (int, error) {
-	rows, err := s.pool.Query(ctx, `SELECT seq, body FROM event WHERE seq > $1 ORDER BY seq LIMIT $2`, *after, eventPage)
-	if err != nil {
-		return 0, err
-	}
-	var evs []*scmpb.Event
-	for rows.Next() {
-		var seq int64
-		var body []byte
-		if err := rows.Scan(&seq, &body); err != nil {
-			rows.Close()
-			return 0, err
+// relayPoll is how often a caught-up relay looks for events without a notification.
+const relayPoll = time.Second
+
+// relayOnce publishes one page of pending events.
+func (s *Store) relayOnce(ctx context.Context, stream bus.Stream) (int, error) {
+	return s.b.RelayEvents(ctx, relayPage, func(rows []backend.Event) error {
+		evs, err := decodeEvents(rows)
+		if err != nil {
+			return err
 		}
-		ev := &scmpb.Event{}
-		if err := proto.Unmarshal(body, ev); err != nil {
-			rows.Close()
-			return 0, err
+		out := make([]bus.Event, len(evs))
+		for i, ev := range evs {
+			if out[i], err = scmfeed.Encode(ev); err != nil {
+				return err
+			}
 		}
-		evs = append(evs, ev)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return 0, err
-	}
-	for _, ev := range evs {
-		if err := emit(ev); err != nil {
-			return 0, err
-		}
-		*after = ev.Seq
-	}
-	return len(evs), nil
+		return stream.Publish(ctx, out...)
+	})
 }

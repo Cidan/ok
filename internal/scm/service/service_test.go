@@ -22,13 +22,14 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
-	"github.com/Cidan/ok/internal/blob"
 	"github.com/Cidan/ok/internal/identity"
 	"github.com/Cidan/ok/internal/scm/encoding"
 	"github.com/Cidan/ok/internal/scm/pack"
 	"github.com/Cidan/ok/internal/scm/store"
+	scmpostgres "github.com/Cidan/ok/internal/scm/store/postgres"
 	"github.com/Cidan/ok/internal/serve/authn"
 	"github.com/Cidan/ok/internal/testdb"
+	"github.com/Cidan/ok/internal/testdb/testobjects"
 	identitypb "github.com/Cidan/ok/proto/ok/identity/v1"
 	scmpb "github.com/Cidan/ok/proto/ok/scm/v1"
 	okpb "github.com/Cidan/ok/proto/ok/v1"
@@ -109,18 +110,12 @@ func testServer(t *testing.T) clients {
 		t.Fatal(err)
 	}
 	t.Cleanup(pool.Close)
-	s3 := testdb.S3(t)
-	blobs, err := blob.NewS3(blob.Config{
-		Endpoint:  s3.Endpoint,
-		Bucket:    testdb.Bucket(t),
-		AccessKey: s3.AccessKey,
-		SecretKey: s3.SecretKey,
-		Region:    s3.Region,
-	})
+	blobs := testobjects.Store(t)
+	b, err := scmpostgres.Open(ctx, pool)
 	if err != nil {
 		t.Fatal(err)
 	}
-	s, err := store.Open(ctx, pool, blobs, store.Config{Names: testNames, ObjectCacheBytes: 8 << 20, ChunkCacheBytes: 8 << 20})
+	s, err := store.New(b, blobs, store.Config{Names: testNames, ObjectCacheBytes: 8 << 20, ChunkCacheBytes: 8 << 20})
 	if err != nil {
 		t.Fatal(err)
 	}

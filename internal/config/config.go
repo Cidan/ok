@@ -36,6 +36,8 @@ type Config struct {
 	TLS *TLS `yaml:"tls"`
 	// Database is the PostgreSQL every role keeps its tables in, each under its own names.
 	Database Database `yaml:"database"`
+	// Bus is how the roles hear of what happened and hand out work.
+	Bus Bus `yaml:"bus"`
 	// Roles are the robots ok's roles run as, by role: what precedes .robot.<domain>.
 	Roles Roles `yaml:"roles"`
 	// Identity is the identity role's.
@@ -97,7 +99,7 @@ func (v EnvValue) Resolve() (string, error) {
 
 // Automation is ok automation's configuration.
 type Automation struct {
-	// Logs is the S3 bucket finished runs' logs are kept in.
+	// Logs is the object store finished runs' logs are kept in.
 	Logs Objects `yaml:"logs"`
 	// SpeculationDepth bounds how many earlier submissions the landing queue's attempt speculates
 	// on: 8 unless set.
@@ -131,7 +133,7 @@ type Worker struct {
 
 // SCM is the SCM role's configuration.
 type SCM struct {
-	// Objects is the S3 bucket file contents are kept in.
+	// Objects is the object store file contents are kept in.
 	Objects Objects `yaml:"objects"`
 	// EmailDomain is what a person's handle is an address at in the commits ok writes for them
 	// (landings, rollbacks), and what reviewers may be named with: <handle>@<email_domain>. It is
@@ -150,14 +152,35 @@ type SCMCache struct {
 	Diffs   int `yaml:"diffs"`
 }
 
-// Objects is an S3 bucket. Without the key files, credentials come from the environment: AWS's
-// variables, or the instance's or pod's role.
+// Objects is an object store: an S3-compatible bucket (type s3, the default), a Google Cloud Storage
+// bucket (gcs), or a directory (fs). Without its credential files, an S3 bucket's credentials come
+// from AWS's chain (its variables, its credentials file, the instance's or pod's role), and a GCS
+// bucket's from Google's application default chain (GOOGLE_APPLICATION_CREDENTIALS, the workload's
+// identity).
 type Objects struct {
-	Endpoint      string `yaml:"endpoint"` // https://s3.us-east-1.amazonaws.com, http://minio:9000
-	Bucket        string `yaml:"bucket"`
-	Region        string `yaml:"region"`
+	Type          string `yaml:"type"`     // s3, gcs, or fs
+	Endpoint      string `yaml:"endpoint"` // s3: https://s3.us-east-1.amazonaws.com, http://minio:9000; gcs: an emulator's
+	Bucket        string `yaml:"bucket"`   // s3, gcs
+	Region        string `yaml:"region"`   // s3
 	AccessKeyFile string `yaml:"access_key_file"`
 	SecretKeyFile string `yaml:"secret_key_file"`
+	// CredentialsFile is a GCS bucket's service-account JSON key.
+	CredentialsFile string `yaml:"credentials_file"`
+	// Dir is an fs store's directory.
+	Dir string `yaml:"dir"`
+}
+
+// Bus is how the roles hear of what happened — the stream — and hand out work — the queue
+// (docs/hosted.md, "Events and the bus"), each a backend of its own.
+type Bus struct {
+	Stream BusBackend `yaml:"stream"`
+	Queue  BusBackend `yaml:"queue"`
+}
+
+// BusBackend is one of the bus's backends: postgres, the default, keeps it in the installation's
+// database, in a schema of its own (bus).
+type BusBackend struct {
+	Type string `yaml:"type"`
 }
 
 // TLS is a certificate and key, as files.
@@ -428,6 +451,15 @@ func (c *Config) check() error {
 	if c.TLS != nil && (c.TLS.Cert == "" || c.TLS.Key == "") {
 		add("tls names a cert and a key")
 	}
+	for field, b := range map[string]*BusBackend{"bus.stream": &c.Bus.Stream, "bus.queue": &c.Bus.Queue} {
+		switch b.Type {
+		case "":
+			b.Type = "postgres"
+		case "postgres":
+		default:
+			add("%s.type: %q is not postgres", field, b.Type)
+		}
+	}
 	if c.Domain != "" && len(problems) == 0 {
 		names := c.Names()
 		for role, robot := range c.Roles.All() {
@@ -541,9 +573,29 @@ func Secret(path string) (string, error) {
 	return strings.TrimRight(string(data), "\r\n"), nil
 }
 
-// Open makes a client of the bucket, reading its key files; field names it in errors
-// (scm.objects). With ensure, the bucket is made if it does not exist: local development.
-func (o Objects) Open(ctx context.Context, field string, ensure bool) (*blob.S3, error) {
+// Open makes a client of the store, reading its key files; field names it in errors
+// (scm.objects). With ensure, an S3 bucket is made if it does not exist: local development.
+func (o Objects) Open(ctx context.Context, field string, ensure bool) (blob.Store, error) {
+	switch o.Type {
+	case "", "s3":
+		return o.openS3(ctx, field, ensure)
+	case "gcs":
+		g, err := blob.NewGCS(ctx, blob.GCSConfig{Bucket: o.Bucket, CredentialsFile: o.CredentialsFile, Endpoint: o.Endpoint})
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", field, err)
+		}
+		return g, nil
+	case "fs":
+		f, err := blob.NewFS(o.Dir)
+		if err != nil {
+			return nil, fmt.Errorf("%s.dir: %w", field, err)
+		}
+		return f, nil
+	}
+	return nil, fmt.Errorf("%s.type: %q is none of s3, gcs, and fs", field, o.Type)
+}
+
+func (o Objects) openS3(ctx context.Context, field string, ensure bool) (blob.Store, error) {
 	access, err := Secret(o.AccessKeyFile)
 	if err != nil {
 		return nil, fmt.Errorf("%s.access_key_file: %w", field, err)

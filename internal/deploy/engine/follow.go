@@ -2,26 +2,25 @@ package engine
 
 import (
 	"context"
-	"errors"
-	"fmt"
-	"io"
 	"log/slog"
 	"time"
 
+	"github.com/Cidan/ok/internal/bus"
+	"github.com/Cidan/ok/internal/bus/follow"
 	"github.com/Cidan/ok/internal/deploy/store"
-	"github.com/Cidan/ok/internal/lock"
+	"github.com/Cidan/ok/internal/scm/scmfeed"
 	scmpb "github.com/Cidan/ok/proto/ok/scm/v1"
 )
 
-// Follow applies the SCM's change feed to the store until ctx ends: each repository's
-// creation and renaming, and each move of its main. One replica follows at a time (the feed
-// lock, its follow ended if the lock is lost); an event is applied once, however often it is
-// read.
-func Follow(ctx context.Context, s *store.Store, events scmpb.EventsClient, log *slog.Logger) error {
+// Follow applies the SCM's events to the store until ctx ends, as the bus's stream brings them
+// and each repository's log fills in: each repository's creation and renaming, and each move of
+// its main. Every replica follows, sharing the repositories (the stream's group, deploy); an
+// event is applied once, however often it comes.
+func Follow(ctx context.Context, s *store.Store, stream bus.Stream, events scmpb.EventsClient, log *slog.Logger) error {
+	f := &follow.Follower{Stream: stream, Topic: scmfeed.Topic, Group: "deploy", Log: scmfeed.Log{Events: events}, Apply: applier{s}}
 	for {
-		err := s.LeadFeed(ctx, func(ctx context.Context) error { return follow(ctx, s, events) })
-		if !errors.Is(err, lock.ErrNotAcquired) && ctx.Err() == nil {
-			log.Warn("deploy: stopped following the change feed", "err", err)
+		if err := f.Run(ctx); ctx.Err() == nil {
+			log.Warn("deploy: stopped following the SCM's events", "err", err)
 		}
 		select {
 		case <-ctx.Done():
@@ -31,34 +30,20 @@ func Follow(ctx context.Context, s *store.Store, events scmpb.EventsClient, log 
 	}
 }
 
-func follow(ctx context.Context, s *store.Store, events scmpb.EventsClient) error {
-	cursor, err := s.Cursor(ctx)
+// applier is the store as a follow.Applier and follow.Legacy.
+type applier struct{ *store.Store }
+
+func (a applier) Apply(ctx context.Context, e bus.Event) error {
+	ev, err := scmfeed.Decode(e)
 	if err != nil {
 		return err
 	}
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	stream, err := events.Watch(ctx, &scmpb.WatchRequest{AfterSeq: cursor})
-	if err != nil {
-		return err
-	}
-	for {
-		ev, err := stream.Recv()
-		if errors.Is(err, io.EOF) {
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-		if err := s.Apply(ctx, FeedEvent(ev)); err != nil {
-			return fmt.Errorf("event %d: %w", ev.GetSeq(), err)
-		}
-	}
+	return a.Store.Apply(ctx, FeedEvent(ev))
 }
 
 // FeedEvent is what the store keeps of an event of the change feed.
 func FeedEvent(ev *scmpb.Event) store.FeedEvent {
-	out := store.FeedEvent{Seq: ev.GetSeq(), Repository: ev.GetRepositoryId()}
+	out := store.FeedEvent{Seq: ev.GetRepositorySeq(), Repository: ev.GetRepositoryId()}
 	switch k := ev.GetKind().(type) {
 	case *scmpb.Event_RepositoryCreated:
 		out.Name, out.Created = k.RepositoryCreated.GetName(), true

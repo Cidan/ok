@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/jackc/pgx/v5"
-
 	"github.com/Cidan/ok/internal/identity"
 )
 
@@ -30,25 +28,20 @@ type Applied struct {
 // Tree returns the applied tree's sets, ordered by name, and which commit's they are (a zero
 // Applied before any tree was applied).
 func (s *Store) Tree(ctx context.Context) ([]TreeSet, Applied, error) {
-	var a Applied
-	err := s.pool.QueryRow(ctx, `SELECT commit, sequence, applied_at FROM tree_state`).Scan(&a.Commit, &a.Sequence, &a.At)
-	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		return nil, a, err
-	}
-	rows, err := s.pool.Query(ctx, `SELECT name, kind, path, owner, members FROM tree_sets ORDER BY name`)
+	a, _, err := s.b.TreeState(ctx)
 	if err != nil {
 		return nil, a, err
 	}
-	defer rows.Close()
-	var out []TreeSet
-	for rows.Next() {
-		var full, kind string
-		var ts TreeSet
-		if err := rows.Scan(&full, &kind, &ts.Path, &ts.Owner, &ts.Members); err != nil {
-			return nil, a, err
-		}
+	stored, err := s.b.TreeSets(ctx)
+	if err != nil {
+		return nil, a, err
+	}
+	out := make([]TreeSet, 0, len(stored))
+	for _, st := range stored {
+		ts := TreeSet{Owner: st.Owner}
+		ts.Path, ts.Members = st.Path, st.Members
 		ts.Kind = identity.Group
-		if kind == "acl" {
+		if st.Kind == "acl" {
 			ts.Kind = identity.ACL
 		}
 		ts.Name = identity.Root
@@ -57,7 +50,7 @@ func (s *Store) Tree(ctx context.Context) ([]TreeSet, Applied, error) {
 		}
 		out = append(out, ts)
 	}
-	return out, a, rows.Err()
+	return out, a, nil
 }
 
 func lastSlash(p string) int {
@@ -74,67 +67,44 @@ func lastSlash(p string) int {
 // Every set the tree adds must take a name no one holds or held, and every set it drops has its
 // name retired.
 func (s *Store) ReplaceTree(ctx context.Context, prev Applied, commit string, sequence int64, tree *identity.Tree) error {
-	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		if err := lockNames(ctx, tx); err != nil {
+	return s.b.Txn(ctx, func(tx Ops) error {
+		if err := tx.LockNames(ctx); err != nil {
 			return err
 		}
-		var cur Applied
-		err := tx.QueryRow(ctx, `SELECT commit, sequence FROM tree_state`).Scan(&cur.Commit, &cur.Sequence)
+		cur, ok, err := tx.TreeState(ctx)
 		switch {
-		case errors.Is(err, pgx.ErrNoRows):
-			if prev != (Applied{}) {
-				return ErrStale
-			}
 		case err != nil:
 			return err
+		case !ok:
+			if prev.Commit != "" || prev.Sequence != 0 {
+				return ErrStale
+			}
 		case cur.Commit != prev.Commit || cur.Sequence != prev.Sequence || sequence < cur.Sequence:
 			return ErrStale
 		}
-		before := map[string]bool{}
-		rows, err := tx.Query(ctx, `SELECT name FROM tree_sets`)
+		stored, err := tx.TreeSets(ctx)
 		if err != nil {
 			return err
 		}
-		for rows.Next() {
-			var n string
-			if err := rows.Scan(&n); err != nil {
-				rows.Close()
-				return err
-			}
-			before[n] = true
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
-			return err
+		before := map[string]bool{}
+		for _, st := range stored {
+			before[st.Name] = true
 		}
 		names := tree.Names()
 		after := map[string]bool{}
+		var sets []StoredSet
 		for _, set := range tree.Sets() {
 			full := names.OfSet(set)
 			after[full] = true
-			if before[full] {
-				continue
-			}
-			free, err := nameFree(ctx, tx, full)
-			if err != nil {
-				return err
-			}
-			if !free {
-				return fmt.Errorf("%s: %w", full, ErrTaken)
-			}
-		}
-		for n := range before {
-			if !after[n] {
-				if err := retire(ctx, tx, n, "deleted from the tree at "+commit); err != nil {
+			if !before[full] {
+				held, err := tx.NameHeld(ctx, full)
+				if err != nil {
 					return err
 				}
+				if held {
+					return fmt.Errorf("%s: %w", full, ErrTaken)
+				}
 			}
-		}
-		if _, err := tx.Exec(ctx, `DELETE FROM tree_sets`); err != nil {
-			return err
-		}
-		for _, set := range tree.Sets() {
-			full := names.OfSet(set)
 			owner, _ := tree.Owner(full)
 			kind := "group"
 			if set.Kind == identity.ACL {
@@ -144,13 +114,18 @@ func (s *Store) ReplaceTree(ctx context.Context, prev Applied, commit string, se
 			if members == nil {
 				members = []string{}
 			}
-			if _, err := tx.Exec(ctx, `INSERT INTO tree_sets (name, kind, path, owner, members) VALUES ($1, $2, $3, $4, $5)`,
-				full, kind, set.Path, owner, members); err != nil {
-				return err
+			sets = append(sets, StoredSet{Name: full, Kind: kind, Path: set.Path, Owner: owner, Members: members})
+		}
+		for n := range before {
+			if !after[n] {
+				if err := tx.RetireName(ctx, n, "deleted from the tree at "+commit); err != nil {
+					return err
+				}
 			}
 		}
-		_, err = tx.Exec(ctx, `INSERT INTO tree_state (singleton, commit, sequence, applied_at) VALUES (true, $1, $2, now())
-			ON CONFLICT (singleton) DO UPDATE SET commit = $1, sequence = $2, applied_at = now()`, commit, sequence)
-		return err
+		if err := tx.ReplaceTreeSets(ctx, sets); err != nil {
+			return err
+		}
+		return tx.PutTreeState(ctx, commit, sequence)
 	})
 }

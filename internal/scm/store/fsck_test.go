@@ -56,7 +56,7 @@ func TestFsck(t *testing.T) {
 	}
 	exec := func(sql string, args ...any) {
 		t.Helper()
-		tag, err := s.pool.Exec(ctx, sql, args...)
+		tag, err := poolOf(s).Exec(ctx, sql, args...)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -73,7 +73,7 @@ func TestFsck(t *testing.T) {
 		t.Fatalf("fresh repository counts: %+v", r)
 	}
 	var packB []byte
-	if err := s.pool.QueryRow(ctx, `SELECT id FROM pack WHERE repository_id = $1`, repo).Scan(&packB); err != nil {
+	if err := poolOf(s).QueryRow(ctx, `SELECT id FROM pack WHERE repository_id = $1`, repo).Scan(&packB); err != nil {
 		t.Fatal(err)
 	}
 	packID := encoding.ID(packB)

@@ -9,11 +9,10 @@ import (
 	"sort"
 	"time"
 
-	"github.com/jackc/pgx/v5"
-
 	"github.com/Cidan/ok/internal/scm/contentindex"
 	"github.com/Cidan/ok/internal/scm/encoding"
 	"github.com/Cidan/ok/internal/scm/pack"
+	"github.com/Cidan/ok/internal/scm/store/backend"
 )
 
 // ChunkRef is one chunk of a staged file: its ID and length.
@@ -85,7 +84,7 @@ func isVirtual(r ObjectRef) bool {
 // views for the operation log of the caller's workspace. It touches every staged object and file
 // the server already holds, and reports the rest as missing (see Missing).
 func (s *Store) BeginPublish(ctx context.Context, repo int64, principal, workspace string, objects []ObjectRef, files []FileManifest) (*Publication, error) {
-	if err := s.repositoryExists(ctx, s.pool, repo); err != nil {
+	if err := s.repositoryExists(ctx, s.b, repo); err != nil {
 		return nil, err
 	}
 	p := &Publication{
@@ -158,7 +157,7 @@ func (s *Store) BeginPublish(ctx context.Context, repo int64, principal, workspa
 	for id := range manifests {
 		fileIDs = append(fileIDs, id)
 	}
-	if p.heldFiles, err = s.existing(ctx, s.pool, repo, tFile, 0, fileIDs); err != nil {
+	if p.heldFiles, err = s.existing(ctx, s.b, repo, tFile, 0, fileIDs); err != nil {
 		return nil, err
 	}
 
@@ -210,7 +209,7 @@ func (s *Store) BeginPublish(ctx context.Context, repo int64, principal, workspa
 	if err != nil {
 		return nil, err
 	}
-	present, err := s.existing(ctx, s.pool, repo, tChunk, 0, chunkIDs)
+	present, err := s.existing(ctx, s.b, repo, tChunk, 0, chunkIDs)
 	if err != nil {
 		return nil, err
 	}
@@ -244,7 +243,7 @@ func (s *Store) touchHeld(ctx context.Context, repo int64, roots []ref) ([]ref, 
 	var vanished []ref
 	for len(roots) > 0 {
 		var missing []ref
-		err := s.inTx(ctx, func(tx pgx.Tx) error {
+		err := s.inTx(ctx, func(tx *txn) error {
 			var err error
 			if missing, err = s.touch(ctx, tx, repo, roots); err != nil {
 				return err
@@ -295,10 +294,10 @@ func (s *Store) heldObjects(ctx context.Context, repo, opLog int64, staged map[O
 		var err error
 		switch kind {
 		case encoding.KindOperation, encoding.KindView:
-			present, err = existingInOpLog(ctx, s.pool, opLog, kind, members)
+			present, err = existingInOpLog(ctx, s.b, opLog, kind, members)
 		default:
 			rf := refOf(kind, encoding.ID{})
-			present, err = s.existing(ctx, s.pool, repo, rf.table, rf.kind, members)
+			present, err = s.existing(ctx, s.b, repo, rf.table, rf.kind, members)
 		}
 		if err != nil {
 			return nil, err
@@ -310,34 +309,19 @@ func (s *Store) heldObjects(ctx context.Context, repo, opLog int64, staged map[O
 	return held, nil
 }
 
-func existingInOpLog(ctx context.Context, q interface {
-	Query(context.Context, string, ...any) (pgx.Rows, error)
-}, opLog int64, kind encoding.Kind, members []encoding.ID) (map[encoding.ID]bool, error) {
+func existingInOpLog(ctx context.Context, q backend.Ops, opLog int64, kind encoding.Kind, members []encoding.ID) (map[encoding.ID]bool, error) {
 	out := map[encoding.ID]bool{}
 	if len(members) == 0 {
 		return out, nil
 	}
-	tableName := "operation"
-	if kind == encoding.KindView {
-		tableName = "view"
-	}
-	rows, err := q.Query(ctx, `SELECT id FROM `+tableName+` WHERE op_log_id = $1 AND id = ANY($2)`, opLog, ids(members))
+	bodies, err := q.OpBodies(ctx, opLog, kind, members)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var b []byte
-		if err := rows.Scan(&b); err != nil {
-			return nil, err
-		}
-		id, err := toID(b)
-		if err != nil {
-			return nil, err
-		}
+	for id := range bodies {
 		out[id] = true
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 // AddObject receives one missing object. Its body must decode canonically and hash to
@@ -572,11 +556,11 @@ func (p *Publication) Commit(ctx context.Context, heads *OpHeadsUpdate) ([]encod
 		p.s.beforeCommit()
 	}
 	var result []encoding.ID
-	err := p.s.inTx(ctx, func(tx pgx.Tx) error {
+	err := p.s.inTx(ctx, func(tx *txn) error {
 		// The log's row lock orders this publish against collection and against the
 		// caller's other publishes that move its operations.
 		if carriesOps {
-			if _, err := tx.Exec(ctx, `SELECT id FROM op_log WHERE id = $1 FOR UPDATE`, p.opLog); err != nil {
+			if err := tx.LockOpLog(ctx, p.opLog); err != nil {
 				return err
 			}
 		}
@@ -648,7 +632,7 @@ func (p *Publication) Commit(ctx context.Context, heads *OpHeadsUpdate) ([]encod
 			}
 		}
 		if p.opLog != 0 {
-			result, err = opHeads(ctx, tx, p.opLog)
+			result, err = tx.OpHeads(ctx, p.opLog)
 		}
 		return err
 	})
@@ -667,7 +651,7 @@ func packKey(repo int64, id encoding.ID) string {
 	return fmt.Sprintf("repos/%d/packs/%s", repo, id)
 }
 
-func (p *Publication) insertPack(ctx context.Context, tx pgx.Tx, packID encoding.ID, size int64) error {
+func (p *Publication) insertPack(ctx context.Context, tx *txn, packID encoding.ID, size int64) error {
 	lg, err := p.s.txIndex(ctx, tx, p.repo)
 	if err != nil {
 		return err
@@ -685,10 +669,8 @@ func (p *Publication) insertPack(ctx context.Context, tx pgx.Tx, packID encoding
 			fresh = append(fresh, id)
 		}
 	}
-	var num uint64
-	if err := tx.QueryRow(ctx, `INSERT INTO pack (repository_id, id, size) VALUES ($1, $2, $3)
-		ON CONFLICT (repository_id, id) DO UPDATE SET size = EXCLUDED.size RETURNING num`,
-		p.repo, packID[:], size).Scan(&num); err != nil {
+	num, err := tx.PutPack(ctx, p.repo, packID, size)
+	if err != nil {
 		return err
 	}
 	for _, id := range fresh {
@@ -719,7 +701,7 @@ func notInserted(want, inserted []encoding.ID, mk func(encoding.ID) ref) []ref {
 
 // insertFiles stores the new files and their chunk lists, and returns those it found
 // already stored.
-func (p *Publication) insertFiles(ctx context.Context, tx pgx.Tx, fileIDs []encoding.ID) ([]ref, error) {
+func (p *Publication) insertFiles(ctx context.Context, tx *txn, fileIDs []encoding.ID) ([]ref, error) {
 	if len(fileIDs) == 0 {
 		return nil, nil
 	}
@@ -758,7 +740,7 @@ func (p *Publication) sortedReceived(match func(encoding.Kind) bool) []ObjectRef
 
 // insertObjects stores the new trees, symlinks, and copy histories, and returns those it
 // found already stored.
-func (p *Publication) insertObjects(ctx context.Context, tx pgx.Tx) ([]ref, error) {
+func (p *Publication) insertObjects(ctx context.Context, tx *txn) ([]ref, error) {
 	refs := p.sortedReceived(func(k encoding.Kind) bool {
 		return k == encoding.KindSymlink || k == encoding.KindTree || k == encoding.KindCopyHistory
 	})
@@ -766,14 +748,12 @@ func (p *Publication) insertObjects(ctx context.Context, tx pgx.Tx) ([]ref, erro
 		return nil, nil
 	}
 	idCol := make([]encoding.ID, len(refs))
-	kinds := make([]int16, len(refs))
-	bodies := make([][]byte, len(refs))
+	objects := make([]backend.Object, len(refs))
 	for i, r := range refs {
-		idCol[i], kinds[i], bodies[i] = r.ID, int16(r.Kind), p.bodies[r]
+		idCol[i] = r.ID
+		objects[i] = backend.Object{ID: r.ID, Kind: r.Kind, Body: p.bodies[r]}
 	}
-	inserted, err := returningIDs(ctx, tx, `INSERT INTO object (repository_id, id, kind, body)
-		SELECT $1, u.id, u.kind, u.body FROM unnest($2::bytea[], $3::smallint[], $4::bytea[]) AS u(id, kind, body)
-		ORDER BY u.id ON CONFLICT DO NOTHING RETURNING id`, p.repo, ids(idCol), kinds, bodies)
+	inserted, err := tx.InsertObjects(ctx, p.repo, objects)
 	if err != nil {
 		return nil, err
 	}
@@ -795,15 +775,12 @@ func (p *Publication) insertObjects(ctx context.Context, tx pgx.Tx) ([]ref, erro
 	if len(copyCol) == 0 {
 		return found, nil
 	}
-	_, err = tx.Exec(ctx, `INSERT INTO copy_parent (repository_id, copy_id, parent_id)
-		SELECT $1, u.c, u.p FROM unnest($2::bytea[], $3::bytea[]) AS u(c, p) ON CONFLICT DO NOTHING`,
-		p.repo, ids(copyCol), ids(parentCol))
-	return found, err
+	return found, tx.InsertCopyParents(ctx, p.repo, copyCol, parentCol)
 }
 
 // insertCommits stores the new commits and their parent edges, and returns those it found
 // already stored.
-func (p *Publication) insertCommits(ctx context.Context, tx pgx.Tx) ([]ref, error) {
+func (p *Publication) insertCommits(ctx context.Context, tx *txn) ([]ref, error) {
 	refs := p.sortedReceived(func(k encoding.Kind) bool { return k == encoding.KindCommit })
 	if len(refs) == 0 {
 		return nil, nil
@@ -819,27 +796,12 @@ func (p *Publication) insertCommits(ctx context.Context, tx pgx.Tx) ([]ref, erro
 	}
 	gen := map[encoding.ID]int64{encoding.RootCommitID: 0}
 	if len(outside) > 0 {
-		rows, err := tx.Query(ctx, `SELECT id, generation FROM commit WHERE repository_id = $1 AND id = ANY($2)`, p.repo, ids(outside))
+		got, err := tx.CommitGenerations(ctx, p.repo, outside)
 		if err != nil {
 			return nil, err
 		}
-		for rows.Next() {
-			var b []byte
-			var g int64
-			if err := rows.Scan(&b, &g); err != nil {
-				rows.Close()
-				return nil, err
-			}
-			id, err := toID(b)
-			if err != nil {
-				rows.Close()
-				return nil, err
-			}
+		for id, g := range got {
 			gen[id] = g
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
-			return nil, err
 		}
 	}
 	var generation func(encoding.ID) int64
@@ -854,45 +816,34 @@ func (p *Publication) insertCommits(ctx context.Context, tx pgx.Tx) ([]ref, erro
 		gen[id] = g
 		return g
 	}
-	n := len(refs)
-	idCol := make([]encoding.ID, n)
-	changeIDs := make([][]byte, n)
-	bodies := make([][]byte, n)
-	gens := make([]int64, n)
-	conflicted := make([]bool, n)
-	committed := make([]time.Time, n)
+	idCol := make([]encoding.ID, len(refs))
+	commits := make([]backend.Commit, len(refs))
 	for i, r := range refs {
 		c := p.received[r].(*encoding.Commit)
-		idCol[i], changeIDs[i], bodies[i] = r.ID, append([]byte(nil), c.ChangeID[:]...), p.bodies[r]
-		gens[i], conflicted[i] = generation(r.ID), len(c.RootTree) > 1
-		committed[i] = time.UnixMilli(c.Committer.Time.Millis)
+		idCol[i] = r.ID
+		commits[i] = backend.Commit{
+			ID: r.ID, ChangeID: append([]byte(nil), c.ChangeID[:]...), Body: p.bodies[r],
+			Generation: generation(r.ID), Conflicted: len(c.RootTree) > 1, CommittedAt: time.UnixMilli(c.Committer.Time.Millis),
+		}
 	}
-	inserted, err := returningIDs(ctx, tx, `INSERT INTO commit (repository_id, id, change_id, body, generation, conflicted, committed_at, written_by)
-		SELECT $1, u.id, u.change, u.body, u.gen, u.conflicted, u.committed, $8
-		FROM unnest($2::bytea[], $3::bytea[], $4::bytea[], $5::bigint[], $6::bool[], $7::timestamptz[]) AS u(id, change, body, gen, conflicted, committed)
-		ORDER BY u.id ON CONFLICT DO NOTHING RETURNING id`,
-		p.repo, ids(idCol), changeIDs, bodies, gens, conflicted, committed, p.principal)
+	inserted, err := tx.InsertCommits(ctx, p.repo, commits, p.principal)
 	if err != nil {
 		return nil, err
 	}
 	found := notInserted(idCol, inserted, func(id encoding.ID) ref { return ref{table: tCommit, id: id} })
-	var commitCol, parentCol []encoding.ID
-	var ords []int16
+	var edges []backend.ParentEdge
 	for _, id := range inserted {
 		for i, parent := range p.received[ObjectRef{Kind: encoding.KindCommit, ID: id}].(*encoding.Commit).Parents {
-			commitCol, parentCol, ords = append(commitCol, id), append(parentCol, parent), append(ords, int16(i))
+			edges = append(edges, backend.ParentEdge{Commit: id, Ord: int16(i), Parent: parent})
 		}
 	}
-	_, err = tx.Exec(ctx, `INSERT INTO commit_parent (repository_id, commit_id, ord, parent_id)
-		SELECT $1, u.c, u.o, u.p FROM unnest($2::bytea[], $3::smallint[], $4::bytea[]) AS u(c, o, p)`,
-		p.repo, ids(commitCol), ords, ids(parentCol))
-	return found, err
+	return found, tx.InsertCommitParents(ctx, p.repo, edges)
 }
 
 // insertOperations stores the new views and operations in the caller's log, and touches
 // every staged one it already held: re-publishing an operation or view (undo and restore
 // produce identical ones) keeps it from collection.
-func (p *Publication) insertOperations(ctx context.Context, tx pgx.Tx) error {
+func (p *Publication) insertOperations(ctx context.Context, tx *txn) error {
 	for _, kind := range []encoding.Kind{encoding.KindView, encoding.KindOperation} {
 		refs := p.sortedReceived(func(k encoding.Kind) bool { return k == kind })
 		var heldIDs []encoding.ID
@@ -902,63 +853,30 @@ func (p *Publication) insertOperations(ctx context.Context, tx pgx.Tx) error {
 			}
 		}
 		sortIDs(heldIDs)
-		tableName := "view"
-		if kind == encoding.KindOperation {
-			tableName = "operation"
-		}
 		if len(refs) > 0 {
-			idCol := make([]encoding.ID, len(refs))
-			viewCol := make([]encoding.ID, len(refs))
-			bodies := make([][]byte, len(refs))
-			for i, r := range refs {
-				idCol[i], bodies[i] = r.ID, p.bodies[r]
-				if op, ok := p.received[r].(*encoding.Operation); ok {
-					viewCol[i] = op.ViewID
-				}
-			}
 			var err error
 			if kind == encoding.KindOperation {
-				_, err = tx.Exec(ctx, `INSERT INTO operation (op_log_id, id, view_id, body)
-					SELECT $1, u.id, u.view, u.body FROM unnest($2::bytea[], $3::bytea[], $4::bytea[]) AS u(id, view, body)
-					ORDER BY u.id ON CONFLICT (op_log_id, id) DO UPDATE SET touched_at = now()`,
-					p.opLog, ids(idCol), ids(viewCol), bodies)
+				ops := make([]backend.Operation, len(refs))
+				for i, r := range refs {
+					ops[i] = backend.Operation{ID: r.ID, View: p.received[r].(*encoding.Operation).ViewID, Body: p.bodies[r]}
+				}
+				err = tx.PutOperations(ctx, p.opLog, ops)
 			} else {
-				_, err = tx.Exec(ctx, `INSERT INTO view (op_log_id, id, body)
-					SELECT $1, u.id, u.body FROM unnest($2::bytea[], $3::bytea[]) AS u(id, body)
-					ORDER BY u.id ON CONFLICT (op_log_id, id) DO UPDATE SET touched_at = now()`,
-					p.opLog, ids(idCol), bodies)
+				views := make([]backend.Object, len(refs))
+				for i, r := range refs {
+					views[i] = backend.Object{ID: r.ID, Kind: kind, Body: p.bodies[r]}
+				}
+				err = tx.PutViews(ctx, p.opLog, views)
 			}
 			if err != nil {
 				return err
 			}
 		}
 		if len(heldIDs) > 0 {
-			if _, err := tx.Exec(ctx, `UPDATE `+tableName+` SET touched_at = now() WHERE op_log_id = $1 AND id = ANY($2)`,
-				p.opLog, ids(heldIDs)); err != nil {
+			if err := tx.TouchOps(ctx, p.opLog, kind, heldIDs); err != nil {
 				return err
 			}
 		}
 	}
 	return nil
-}
-
-func returningIDs(ctx context.Context, tx pgx.Tx, sql string, args ...any) ([]encoding.ID, error) {
-	rows, err := tx.Query(ctx, sql, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []encoding.ID
-	for rows.Next() {
-		var b []byte
-		if err := rows.Scan(&b); err != nil {
-			return nil, err
-		}
-		id, err := toID(b)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, id)
-	}
-	return out, rows.Err()
 }

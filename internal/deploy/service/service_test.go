@@ -20,6 +20,7 @@ import (
 	"github.com/Cidan/ok/internal/deploy/kubesim"
 	"github.com/Cidan/ok/internal/deploy/observe"
 	"github.com/Cidan/ok/internal/deploy/store"
+	"github.com/Cidan/ok/internal/deploy/store/postgres"
 	"github.com/Cidan/ok/internal/serve/authn"
 	"github.com/Cidan/ok/internal/testdb"
 	"github.com/Cidan/ok/internal/workflow"
@@ -58,7 +59,8 @@ func newService(t *testing.T, objs ...runtime.Object) (deploypb.DeploymentsClien
 		t.Fatal(err)
 	}
 	t.Cleanup(pool.Close)
-	st, err := store.Open(context.Background(), pool)
+	b, err := postgres.Open(context.Background(), pool)
+	st := store.New(b)
 	if err != nil {
 		t.Fatal(err)
 	}

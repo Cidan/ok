@@ -17,6 +17,9 @@ tls: {cert: /etc/ok/tls/tls.crt, key: /etc/ok/tls/tls.key}   # omit behind a TLS
 database:
   url_file: /etc/ok/secrets/database-url  # postgres://ok:…@db:5432/ok
   max_connections: 20                   # each role's pool
+bus:                                    # how the roles hear of events and hand out work
+  stream: {type: postgres}              # the default: in the database above, schema bus
+  queue: {type: postgres}
 roles:                                  # the robots ok's roles run as: <name>.robot.<domain>
   identity: identity.ok
   scm: scm.ok
@@ -67,6 +70,7 @@ scm:
     endpoint: https://s3.us-east-1.amazonaws.com
     bucket: example-ok-scm
     region: us-east-1                   # no key files: AWS's credential chain, or the pod's role
+    # or, on Google Cloud: {type: gcs, bucket: example-ok-scm}
   email_domain: example.com             # <handle>@example.com in the commits ok writes
   gc_hour: 9                            # each repository's daily garbage collection, from 09:00 UTC
 automation:
@@ -95,6 +99,7 @@ deploy:
 | `listen`, `metrics_listen` | Each role's serving and metrics addresses. Defaults `:8472` and `:8473`. |
 | `tls` | The certificate a role serves with, re-read as it is renewed. Without it, roles serve cleartext HTTP/2, for a TLS proxy or service mesh in front. |
 | `database` | The PostgreSQL every role keeps its tables in: `url_file` holds the URL, with its password. Each role keeps its tables in a PostgreSQL schema of its own (`identity`, `scm`, …) and makes it when it first starts, which needs the `CREATE` privilege on the database; without that, make the schemas beforehand and grant the role's user their use. |
+| `bus` | How the roles hear of what happened — `stream`, which carries the SCM's events to their followers — and hand out work — `queue` (`hosted.md`, "Events and the bus"). Each names its backend's `type`: `postgres`, the default and for now the only one, keeps it in the database above, in a schema of its own (`bus`). |
 | `roles` | The robot each of ok's roles runs as, by what precedes `.robot.<domain>`. ok identity makes them when it starts. A service that admits a role admits that robot. |
 
 ## One public address
@@ -148,7 +153,7 @@ it to ok identity once it lands. Other repositories' `acl:` owners are ok identi
 
 | Key | |
 |---|---|
-| `scm.objects` | The S3 bucket file contents are kept in, as packs: `endpoint` (whose scheme selects TLS), `bucket`, `region`, and `access_key_file` and `secret_key_file`, without which credentials come from AWS's chain — its environment variables, its credentials file, or the instance's or pod's role. Any S3-compatible store works: AWS, MinIO, Ceph, Cloudflare R2. |
+| `scm.objects` | The object store file contents are kept in, as packs, by its `type`. **`s3`** (the default): `endpoint` (whose scheme selects TLS), `bucket`, `region`, and `access_key_file` and `secret_key_file`, without which credentials come from AWS's chain — its environment variables, its credentials file, or the instance's or pod's role; any S3-compatible store works: AWS, MinIO, Ceph, Cloudflare R2. **`gcs`**: a Google Cloud Storage `bucket`, through GCS's own API, with `credentials_file` (a service account's JSON key), without which credentials come from Google's application default chain — `GOOGLE_APPLICATION_CREDENTIALS`, or the workload's own identity; `endpoint` points it at an emulator. **`fs`**: a directory, `dir`, for one machine. |
 | `scm.email_domain` | What a person's handle is an address at in the commits ok writes for them — landings and rollbacks — and what reviewers may be named by (`<handle>@<email_domain>`). Default: `domain`. |
 | `scm.gc_hour` | The hour (UTC) each repository's daily garbage collection is due from. Default 9. |
 | `scm.cache` | The SCM's in-memory caches, in bytes: `objects` (default 256 MiB), `chunks` (512 MiB), `diffs` (64 MiB). |
@@ -170,7 +175,7 @@ ok automation reads `database`, `roles`, `services` (identity and the SCM), `wor
 
 | Key | |
 |---|---|
-| `automation.logs` | The S3 bucket finished runs' logs are kept in, as `scm.objects` names one. |
+| `automation.logs` | The object store finished runs' logs are kept in, as `scm.objects` names one. |
 | `automation.speculation_depth` | How many earlier submissions the landing queue speculates a submission lands after, at most. Default 8. |
 
 Its tables are in the schema `automation`. What it does is [automation.md](automation.md).

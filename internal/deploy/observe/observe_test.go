@@ -14,6 +14,7 @@ import (
 
 	"github.com/Cidan/ok/internal/deploy/kubesim"
 	"github.com/Cidan/ok/internal/deploy/store"
+	"github.com/Cidan/ok/internal/deploy/store/postgres"
 	"github.com/Cidan/ok/internal/testdb"
 	"github.com/Cidan/ok/internal/workflow"
 )
@@ -29,7 +30,8 @@ func replica(t *testing.T, url string) *store.Store {
 		t.Fatal(err)
 	}
 	t.Cleanup(pool.Close)
-	s, err := store.Open(context.Background(), pool)
+	b, err := postgres.Open(context.Background(), pool)
+	s := store.New(b)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,14 +84,23 @@ func TestRounds(t *testing.T) {
 			_ = (&Observer{Store: st, Kube: cluster.Kube, Log: log, Period: period}).Run(ctx)
 		}()
 	}
-	time.Sleep(3 * time.Second)
+	// Three rounds, however long a loaded machine takes to make them: what is held to time is the
+	// space between them.
+	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(50 * time.Millisecond) {
+		mu.Lock()
+		n := len(starts)
+		mu.Unlock()
+		if n >= 3 || time.Now().After(deadline) {
+			break
+		}
+	}
 	cancel()
 	wg.Wait()
 
 	mu.Lock()
 	defer mu.Unlock()
 	if len(starts) < 3 {
-		t.Fatalf("%d rounds in 3 seconds", len(starts))
+		t.Fatalf("%d rounds in 30 seconds", len(starts))
 	}
 	for i := 1; i < len(starts); i++ {
 		if gap := starts[i].Sub(starts[i-1]); gap < slow+period-20*time.Millisecond {

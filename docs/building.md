@@ -43,6 +43,8 @@ Unit tests need nothing. Tests of the database, object storage, and the client a
 |---|---|
 | `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD` | A PostgreSQL server (tested with 18) and a role that may create databases. Each Go test makes a database of its own and drops it; the Rust suites' `ok scm` keeps its tables in a schema of its own, in `PGDATABASE` or `postgres`. |
 | `AWS_ENDPOINT_URL_S3`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION` | An S3-compatible server. Tests make the buckets they use. |
+| `OK_TEST_OBJECTS` | Where the tests that keep objects keep them: `s3` (the default), the server above; `gcs`, a GCS emulator each test process runs on its loopback, needing no server (`internal/testdb/testobjects`); or `fs`, a directory. The S3 store's own tests use S3 whatever it says. |
+| `OK_GCS_BINARY` | The GCS emulator the Rust suites start beside their SCM with `OK_TEST_OBJECTS=gcs` (`go build -o /tmp/ok-test-gcs ./internal/testdb/testobjects/gcsserver`; default: `ok-test-gcs` on the `PATH`). |
 | `OK_BINARY` | The `ok` binary the Rust suites run as their SCM (default: `ok` on the `PATH`). |
 | `OK_TEST_INTEGRATION` | Without the servers, those tests are skipped and say so; `require` fails them instead, as CI does. |
 | `OK_BAZEL` | Bazel (default: `bazel`, else `bazelisk`, on the `PATH`), for the tests that run it: the Bazel driver's, the deployer's, and ok automation's end-to-end suite, whose workers run real Bazel. They need bubblewrap (`bwrap`) too. Without them, those tests are skipped and say so. |
@@ -67,7 +69,13 @@ go build -o /tmp/ok ./cmd/ok && OK_BINARY=/tmp/ok cargo test --workspace
 cargo build -p ok-jj && OK_JJ=$PWD/target/debug/jj go test ./internal/control/e2e ./internal/automation/e2e ./internal/deploy/role
 ```
 
-(`docker run` takes the same arguments.)
+(`docker run` takes the same arguments.) CI runs the suites on S3 and again on GCS:
+
+```bash
+OK_TEST_OBJECTS=gcs go test ./...
+go build -o /tmp/ok-test-gcs ./internal/testdb/testobjects/gcsserver
+OK_TEST_OBJECTS=gcs OK_GCS_BINARY=/tmp/ok-test-gcs OK_BINARY=/tmp/ok cargo test --workspace
+```
 
 ok automation's suite builds small Bazel workspaces of Starlark rules alone, so Bazel downloads
 nothing for them beyond itself. The client's suites that mount virtual workspaces need `/dev/fuse` and unprivileged user

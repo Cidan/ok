@@ -60,7 +60,7 @@ func TestTreeSizes(t *testing.T) {
 		t.Fatalf("%v derived, want 2 (root and sub, once each)", served("derived")-derived)
 	}
 	var n int
-	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM tree_sizes WHERE repository_id = $1`, repo).Scan(&n); err != nil || n != 2 {
+	if err := poolOf(s).QueryRow(ctx, `SELECT count(*) FROM tree_sizes WHERE repository_id = $1`, repo).Scan(&n); err != nil || n != 2 {
 		t.Fatalf("%d kept (%v), want 2", n, err)
 	}
 

@@ -3,12 +3,10 @@ package store
 import (
 	"bytes"
 	"context"
-	"errors"
 	"time"
 
-	"github.com/jackc/pgx/v5"
-
 	"github.com/Cidan/ok/internal/scm/encoding"
+	"github.com/Cidan/ok/internal/scm/store/backend"
 )
 
 // Every operation log is one workspace's (docs/scm.md, "Decisions", 3): (repository,
@@ -16,28 +14,13 @@ import (
 // never made by a request naming it, so two clones can never come to share one; a request
 // naming no workspace, or one the caller does not have, is refused.
 
-// opLogID returns the operation log of the caller's workspace in repo, if it has one.
-func opLogID(ctx context.Context, q interface {
-	QueryRow(context.Context, string, ...any) pgx.Row
-}, repo int64, principal, workspace string) (int64, bool, error) {
-	var id int64
-	err := q.QueryRow(ctx, `SELECT id FROM op_log WHERE repository_id = $1 AND principal = $2 AND workspace = $3`,
-		repo, principal, workspace).Scan(&id)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return 0, false, nil
-	}
-	return id, err == nil, err
-}
-
 // logOf returns the operation log of the caller's workspace in repo: InvalidArgument for a
 // request naming no workspace, and NotFound for a workspace the caller does not have.
-func logOf(ctx context.Context, q interface {
-	QueryRow(context.Context, string, ...any) pgx.Row
-}, repo int64, principal, workspace string) (int64, error) {
+func logOf(ctx context.Context, q backend.Ops, repo int64, principal, workspace string) (int64, error) {
 	if workspace == "" {
 		return 0, unnamedWorkspace()
 	}
-	id, ok, err := opLogID(ctx, q, repo, principal, workspace)
+	id, ok, err := q.OpLogID(ctx, repo, principal, workspace)
 	if err == nil && !ok {
 		err = noWorkspace(workspace)
 	}
@@ -54,56 +37,20 @@ func noWorkspace(workspace string) error {
 
 // ensureOpLog returns the operation log of the caller's workspace in repo, making it, with the
 // root operation as its only head, when it does not exist.
-func ensureOpLog(ctx context.Context, tx pgx.Tx, repo int64, principal, workspace string) (int64, bool, error) {
-	var id int64
-	err := tx.QueryRow(ctx,
-		`INSERT INTO op_log (repository_id, principal, workspace) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING RETURNING id`,
-		repo, principal, workspace).Scan(&id)
-	switch {
-	case err == nil:
-		_, err = tx.Exec(ctx, `INSERT INTO op_head (op_log_id, op_id) VALUES ($1, $2)`, id, encoding.RootOperationID[:])
-		return id, true, err
-	case errors.Is(err, pgx.ErrNoRows):
-		// It exists; ON CONFLICT waited for the transaction making it to commit.
-		id, ok, err := opLogID(ctx, tx, repo, principal, workspace)
-		if err == nil && !ok {
-			err = errors.New("operation log vanished")
-		}
+func ensureOpLog(ctx context.Context, tx *txn, repo int64, principal, workspace string) (int64, bool, error) {
+	id, made, err := tx.InsertOpLog(ctx, repo, principal, workspace)
+	if err != nil || !made {
 		return id, false, err
-	default:
-		return 0, false, err
 	}
+	return id, true, tx.AddOpHead(ctx, id, encoding.RootOperationID)
 }
 
 // OpLog returns the operation log of the caller's workspace in repo (see logOf).
 func (s *Store) OpLog(ctx context.Context, repo int64, principal, workspace string) (int64, error) {
-	if err := s.repositoryExists(ctx, s.pool, repo); err != nil {
+	if err := s.repositoryExists(ctx, s.b, repo); err != nil {
 		return 0, err
 	}
-	return logOf(ctx, s.pool, repo, principal, workspace)
-}
-
-func opHeads(ctx context.Context, q interface {
-	Query(context.Context, string, ...any) (pgx.Rows, error)
-}, opLog int64) ([]encoding.ID, error) {
-	rows, err := q.Query(ctx, `SELECT op_id FROM op_head WHERE op_log_id = $1 ORDER BY op_id`, opLog)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []encoding.ID
-	for rows.Next() {
-		var b []byte
-		if err := rows.Scan(&b); err != nil {
-			return nil, err
-		}
-		id, err := toID(b)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, id)
-	}
-	return out, rows.Err()
+	return logOf(ctx, s.b, repo, principal, workspace)
 }
 
 // GetOpHeads returns the operation heads of the caller's workspace: never empty, the root
@@ -113,14 +60,14 @@ func (s *Store) GetOpHeads(ctx context.Context, repo int64, principal, workspace
 	if err != nil {
 		return nil, err
 	}
-	return opHeads(ctx, s.pool, opLog)
+	return s.b.OpHeads(ctx, opLog)
 }
 
 // updateOpHeads applies jj's update_op_heads: add newID, then remove each old ID other
 // than newID. Adding is idempotent and removing an ID that is not a head is a no-op, so
 // the heads are never empty.
-func updateOpHeads(ctx context.Context, tx pgx.Tx, opLog int64, old []encoding.ID, newID encoding.ID) error {
-	if _, err := tx.Exec(ctx, `INSERT INTO op_head (op_log_id, op_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`, opLog, newID[:]); err != nil {
+func updateOpHeads(ctx context.Context, tx *txn, opLog int64, old []encoding.ID, newID encoding.ID) error {
+	if err := tx.AddOpHead(ctx, opLog, newID); err != nil {
 		return err
 	}
 	var drop []encoding.ID
@@ -132,8 +79,7 @@ func updateOpHeads(ctx context.Context, tx pgx.Tx, opLog int64, old []encoding.I
 	if len(drop) == 0 {
 		return nil
 	}
-	_, err := tx.Exec(ctx, `DELETE FROM op_head WHERE op_log_id = $1 AND op_id = ANY($2)`, opLog, ids(drop))
-	return err
+	return tx.DeleteOpHeads(ctx, opLog, drop)
 }
 
 // Resolution is the outcome of resolving an operation ID prefix.
@@ -163,7 +109,7 @@ func (s *Store) ResolveOperationPrefix(ctx context.Context, repo int64, principa
 		}
 		return bytes.Equal(id[:n], lo)
 	}
-	opLog, err := logOf(ctx, s.pool, repo, principal, workspace)
+	opLog, err := logOf(ctx, s.b, repo, principal, workspace)
 	if err != nil {
 		return NoMatch, encoding.ID{}, err
 	}
@@ -182,33 +128,15 @@ func (s *Store) ResolveOperationPrefix(ctx context.Context, repo int64, principa
 		sum := int(hi[i]) + int(step)
 		hi[i], carry, step = byte(sum), sum > 0xff, 1
 	}
-	query := `SELECT id FROM operation WHERE op_log_id = $1 AND id >= $2 ORDER BY id LIMIT 2`
-	args := []any{opLog, lo}
+	var upper []byte
 	if !carry && len(hi) > 0 {
-		query = `SELECT id FROM operation WHERE op_log_id = $1 AND id >= $2 AND id < $3 ORDER BY id LIMIT 2`
-		args = append(args, hi)
+		upper = hi
 	}
-	rows, err := s.pool.Query(ctx, query, args...)
+	more, err := s.b.OperationIDsFrom(ctx, opLog, lo, upper, 2)
 	if err != nil {
 		return NoMatch, encoding.ID{}, err
 	}
-	for rows.Next() {
-		var b []byte
-		if err := rows.Scan(&b); err != nil {
-			rows.Close()
-			return NoMatch, encoding.ID{}, err
-		}
-		id, err := toID(b)
-		if err != nil {
-			rows.Close()
-			return NoMatch, encoding.ID{}, err
-		}
-		found = append(found, id)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return NoMatch, encoding.ID{}, err
-	}
+	found = append(found, more...)
 	switch len(found) {
 	case 0:
 		return NoMatch, encoding.ID{}, nil
@@ -226,44 +154,27 @@ func (s *Store) ReadOperations(ctx context.Context, repo int64, principal, works
 			return nil, invalid("ReadOperations reads operations and views, not a %s", r.Kind)
 		}
 	}
-	opLog, err := logOf(ctx, s.pool, repo, principal, workspace)
+	opLog, err := logOf(ctx, s.b, repo, principal, workspace)
 	if err != nil {
 		return nil, err
 	}
 	bodies := map[ObjectRef][]byte{}
-	for _, t := range []struct {
-		kind  encoding.Kind
-		table string
-	}{{encoding.KindOperation, "operation"}, {encoding.KindView, "view"}} {
+	for _, kind := range []encoding.Kind{encoding.KindOperation, encoding.KindView} {
 		var want []encoding.ID
 		for _, r := range refs {
-			if r.Kind == t.kind {
+			if r.Kind == kind {
 				want = append(want, r.ID)
 			}
 		}
 		if len(want) == 0 {
 			continue
 		}
-		rows, err := s.pool.Query(ctx, `SELECT id, body FROM `+t.table+` WHERE op_log_id = $1 AND id = ANY($2)`, opLog, ids(want))
+		got, err := s.b.OpBodies(ctx, opLog, kind, want)
 		if err != nil {
 			return nil, err
 		}
-		for rows.Next() {
-			var idb, body []byte
-			if err := rows.Scan(&idb, &body); err != nil {
-				rows.Close()
-				return nil, err
-			}
-			id, err := toID(idb)
-			if err != nil {
-				rows.Close()
-				return nil, err
-			}
-			bodies[ObjectRef{Kind: t.kind, ID: id}] = body
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
-			return nil, err
+		for id, body := range got {
+			bodies[ObjectRef{Kind: kind, ID: id}] = body
 		}
 	}
 	out := make([]ObjectResult, len(refs))
@@ -283,7 +194,7 @@ const prefetchOpsBatch = 500
 // is ignored. The log's operations are read with one query, as collection reads them: a log is
 // one person's, and collection keeps it to what its heads reach.
 func (s *Store) PrefetchOperations(ctx context.Context, repo int64, principal, workspace string, want, have []encoding.ID, limit int, emit func(EncodedObject) error) error {
-	opLog, err := logOf(ctx, s.pool, repo, principal, workspace)
+	opLog, err := logOf(ctx, s.b, repo, principal, workspace)
 	if err != nil {
 		return err
 	}
@@ -293,39 +204,19 @@ func (s *Store) PrefetchOperations(ctx context.Context, repo int64, principal, w
 		parents []encoding.ID
 	}
 	ops := map[encoding.ID]*op{}
-	rows, err := s.pool.Query(ctx, `SELECT id, view_id, body FROM operation WHERE op_log_id = $1`, opLog)
+	all, err := s.b.Operations(ctx, opLog, time.Time{})
 	if err != nil {
 		return err
 	}
-	for rows.Next() {
-		var idb, viewb, body []byte
-		if err := rows.Scan(&idb, &viewb, &body); err != nil {
-			rows.Close()
-			return err
-		}
-		id, err := toID(idb)
+	for _, row := range all {
+		o, err := decodeStored(encoding.KindOperation, row.ID, row.Body)
 		if err != nil {
-			rows.Close()
 			return err
 		}
-		view, err := toID(viewb)
-		if err != nil {
-			rows.Close()
-			return err
-		}
-		o, err := decodeStored(encoding.KindOperation, id, body)
-		if err != nil {
-			rows.Close()
-			return err
-		}
-		ops[id] = &op{body: body, view: view, parents: o.(*encoding.Operation).Parents}
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return err
+		ops[row.ID] = &op{body: row.Body, view: row.View, parents: o.(*encoding.Operation).Parents}
 	}
 	if len(want) == 0 {
-		if want, err = opHeads(ctx, s.pool, opLog); err != nil {
+		if want, err = s.b.OpHeads(ctx, opLog); err != nil {
 			return err
 		}
 	}
@@ -356,25 +247,8 @@ func (s *Store) PrefetchOperations(ctx context.Context, repo int64, principal, w
 		}
 		bodies := map[encoding.ID][]byte{}
 		if len(views) > 0 {
-			rows, err := s.pool.Query(ctx, `SELECT id, body FROM view WHERE op_log_id = $1 AND id = ANY($2)`, opLog, ids(views))
-			if err != nil {
-				return err
-			}
-			for rows.Next() {
-				var idb, body []byte
-				if err := rows.Scan(&idb, &body); err != nil {
-					rows.Close()
-					return err
-				}
-				id, err := toID(idb)
-				if err != nil {
-					rows.Close()
-					return err
-				}
-				bodies[id] = body
-			}
-			rows.Close()
-			if err := rows.Err(); err != nil {
+			var err error
+			if bodies, err = s.b.OpBodies(ctx, opLog, encoding.KindView, views); err != nil {
 				return err
 			}
 		}
@@ -420,7 +294,7 @@ func (s *Store) PrefetchOperations(ctx context.Context, repo int64, principal, w
 // before keepNewer (server time). A head published concurrently is therefore never
 // collected, whatever the caller passes.
 func (s *Store) CollectOperations(ctx context.Context, repo int64, principal, workspace string, heads []encoding.ID, keepNewer time.Time) error {
-	opLog, err := logOf(ctx, s.pool, repo, principal, workspace)
+	opLog, err := logOf(ctx, s.b, repo, principal, workspace)
 	if err != nil {
 		return err
 	}
@@ -440,46 +314,29 @@ type Collected struct {
 // holds the lock for the new operations, not the log's history.
 func (s *Store) collectLog(ctx context.Context, opLog int64, heads []encoding.ID, keepNewer time.Time, dryRun bool) (Collected, error) {
 	var out Collected
-	var old bool
-	if err := s.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM operation WHERE op_log_id = $1 AND touched_at < $2)
-		OR EXISTS (SELECT 1 FROM view WHERE op_log_id = $1 AND touched_at < $2)`, opLog, keepNewer).Scan(&old); err != nil || !old {
+	old, err := s.b.OlderThan(ctx, opLog, keepNewer)
+	if err != nil || !old {
 		return out, err
 	}
 
 	// The snapshot: every operation's parents, and which are old enough to collect.
 	parents := map[encoding.ID][]encoding.ID{}
 	stale := map[encoding.ID]bool{}
-	rows, err := s.pool.Query(ctx, `SELECT id, body, touched_at < $2 FROM operation WHERE op_log_id = $1`, opLog, keepNewer)
+	all, err := s.b.Operations(ctx, opLog, keepNewer)
 	if err != nil {
 		return out, err
 	}
-	for rows.Next() {
-		var idb, body []byte
-		var isOld bool
-		if err := rows.Scan(&idb, &body, &isOld); err != nil {
-			rows.Close()
-			return out, err
-		}
-		id, err := toID(idb)
+	for _, row := range all {
+		o, err := decodeStored(encoding.KindOperation, row.ID, row.Body)
 		if err != nil {
-			rows.Close()
 			return out, err
 		}
-		o, err := decodeStored(encoding.KindOperation, id, body)
-		if err != nil {
-			rows.Close()
-			return out, err
-		}
-		parents[id] = o.(*encoding.Operation).Parents
-		if isOld {
-			stale[id] = true
+		parents[row.ID] = o.(*encoding.Operation).Parents
+		if row.Old {
+			stale[row.ID] = true
 		}
 	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return out, err
-	}
-	current, err := opHeads(ctx, s.pool, opLog)
+	current, err := s.b.OpHeads(ctx, opLog)
 	if err != nil {
 		return out, err
 	}
@@ -506,12 +363,12 @@ func (s *Store) collectLog(ctx context.Context, opLog int64, heads []encoding.ID
 	}
 	reach(append(append([]encoding.ID(nil), heads...), current...))
 
-	err = s.inTx(ctx, func(tx pgx.Tx) error {
+	err = s.inTx(ctx, func(tx *txn) error {
 		out = Collected{}
-		if _, err := tx.Exec(ctx, `SELECT id FROM op_log WHERE id = $1 FOR UPDATE`, opLog); err != nil {
+		if err := tx.LockOpLog(ctx, opLog); err != nil {
 			return err
 		}
-		current, err := opHeads(ctx, tx, opLog)
+		current, err := tx.OpHeads(ctx, opLog)
 		if err != nil {
 			return err
 		}
@@ -530,34 +387,20 @@ func (s *Store) collectLog(ctx context.Context, opLog int64, heads []encoding.ID
 			if len(batch) == 0 {
 				break
 			}
-			rows, err := tx.Query(ctx, `SELECT id, body FROM operation WHERE op_log_id = $1 AND id = ANY($2)`, opLog, ids(batch))
+			got, err := tx.OpBodies(ctx, opLog, encoding.KindOperation, batch)
 			if err != nil {
 				return err
 			}
 			var next []encoding.ID
-			for rows.Next() {
-				var idb, body []byte
-				if err := rows.Scan(&idb, &body); err != nil {
-					rows.Close()
-					return err
-				}
-				id, err := toID(idb)
-				if err != nil {
-					rows.Close()
-					return err
-				}
+			for id, body := range got {
 				o, err := decodeStored(encoding.KindOperation, id, body)
 				if err != nil {
-					rows.Close()
 					return err
 				}
 				parents[id] = o.(*encoding.Operation).Parents
 				next = append(next, id)
 			}
-			rows.Close()
-			if err := rows.Err(); err != nil {
-				return err
-			}
+			sortIDs(next)
 			unknown = reach(next)
 		}
 		var doomed []encoding.ID
@@ -567,31 +410,9 @@ func (s *Store) collectLog(ctx context.Context, opLog int64, heads []encoding.ID
 			}
 		}
 		sortIDs(doomed)
-		// touched_at is checked again: re-publishing an operation keeps it.
-		if dryRun {
-			if err := tx.QueryRow(ctx, `SELECT count(*) FROM operation WHERE op_log_id = $1 AND id = ANY($2) AND touched_at < $3`,
-				opLog, ids(doomed), keepNewer).Scan(&out.Operations); err != nil {
-				return err
-			}
-			return tx.QueryRow(ctx, `SELECT count(*) FROM view v WHERE v.op_log_id = $1 AND v.touched_at < $2
-				AND NOT EXISTS (SELECT 1 FROM operation o WHERE o.op_log_id = v.op_log_id AND o.view_id = v.id
-				AND NOT (o.id = ANY($3) AND o.touched_at < $2))`, opLog, keepNewer, ids(doomed)).Scan(&out.Views)
-		}
-		tag, err := tx.Exec(ctx, `DELETE FROM operation WHERE op_log_id = $1 AND id = ANY($2) AND touched_at < $3`,
-			opLog, ids(doomed), keepNewer)
-		if err != nil {
-			return err
-		}
-		out.Operations = tag.RowsAffected()
-		tag, err = tx.Exec(ctx,
-			`DELETE FROM view v WHERE v.op_log_id = $1 AND v.touched_at < $2
-			   AND NOT EXISTS (SELECT 1 FROM operation o WHERE o.op_log_id = v.op_log_id AND o.view_id = v.id)`,
-			opLog, keepNewer)
-		if err != nil {
-			return err
-		}
-		out.Views = tag.RowsAffected()
-		return nil
+		// The last touch is checked again: re-publishing an operation keeps it.
+		out.Operations, out.Views, err = tx.CollectOps(ctx, opLog, doomed, keepNewer, dryRun)
+		return err
 	})
 	return out, err
 }

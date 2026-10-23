@@ -132,7 +132,7 @@ func TestCollectionNeverTakesACurrentHead(t *testing.T) {
 	}
 	// Views still used by a surviving operation stay; the abandoned ones' views go too.
 	var views int
-	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM view v JOIN op_log l ON l.id = v.op_log_id
+	if err := poolOf(s).QueryRow(ctx, `SELECT count(*) FROM view v JOIN op_log l ON l.id = v.op_log_id
 		WHERE l.repository_id = $1 AND NOT EXISTS (SELECT 1 FROM operation o WHERE o.op_log_id = v.op_log_id AND o.view_id = v.id)`, repo).Scan(&views); err != nil {
 		t.Fatal(err)
 	}

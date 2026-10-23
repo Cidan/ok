@@ -4,12 +4,15 @@ import (
 	"context"
 	"testing"
 
-	"github.com/Cidan/ok/internal/blob"
-	idstore "github.com/Cidan/ok/internal/id/store"
+	"github.com/jackc/pgx/v5"
+
+	idpostgres "github.com/Cidan/ok/internal/id/store/postgres"
 	"github.com/Cidan/ok/internal/identity"
 	"github.com/Cidan/ok/internal/pgdb"
 	scmstore "github.com/Cidan/ok/internal/scm/store"
+	scmpostgres "github.com/Cidan/ok/internal/scm/store/postgres"
 	"github.com/Cidan/ok/internal/testdb"
+	"github.com/Cidan/ok/internal/testdb/testobjects"
 )
 
 // Roles sharing one database keep their tables apart: identity's and the SCM's both have a locks
@@ -24,7 +27,7 @@ func TestRolesShareADatabase(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer idPool.Close()
-	if _, err := idstore.Open(ctx, idPool, names); err != nil {
+	if _, err := idpostgres.Open(ctx, idPool); err != nil {
 		t.Fatalf("identity: %v", err)
 	}
 	scmPool, err := pgdb.Open(ctx, url, "scm", 0)
@@ -32,12 +35,12 @@ func TestRolesShareADatabase(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer scmPool.Close()
-	s3 := testdb.S3(t)
-	blobs, err := blobOf(s3, testdb.Bucket(t))
+	blobs := testobjects.Store(t)
+	sb, err := scmpostgres.Open(ctx, scmPool)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("the SCM: %v", err)
 	}
-	st, err := scmstore.Open(ctx, scmPool, blobs, scmstore.Config{Names: names})
+	st, err := scmstore.New(sb, blobs, scmstore.Config{Names: names})
 	if err != nil {
 		t.Fatalf("the SCM: %v", err)
 	}
@@ -58,7 +61,7 @@ func TestRolesShareADatabase(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer again.Close()
-	if _, err := idstore.Open(ctx, again, names); err != nil {
+	if _, err := idpostgres.Open(ctx, again); err != nil {
 		t.Errorf("identity again: %v", err)
 	}
 	if _, err := pgdb.Open(ctx, url, "Bad; DROP", 0); err == nil {
@@ -66,6 +69,35 @@ func TestRolesShareADatabase(t *testing.T) {
 	}
 }
 
-func blobOf(s3 testdb.S3Server, bucket string) (*blob.S3, error) {
-	return blob.NewS3(blob.Config{Endpoint: s3.Endpoint, Bucket: bucket, AccessKey: s3.AccessKey, SecretKey: s3.SecretKey, Region: s3.Region})
+// A pool beside another reaches its database, its tables in a schema of its own, and leaves the
+// first as it was.
+func TestBeside(t *testing.T) {
+	ctx := context.Background()
+	pool, err := pgdb.Open(ctx, testdb.Postgres(t), "first", 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	beside, err := pgdb.Beside(ctx, pool, "second")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer beside.Close()
+	for want, p := range map[string]interface {
+		QueryRow(context.Context, string, ...any) pgx.Row
+	}{"first": pool, "second": beside} {
+		var schema, db string
+		if err := p.QueryRow(ctx, `SELECT current_schema(), current_database()`).Scan(&schema, &db); err != nil || schema != want {
+			t.Errorf("the %s pool's schema: %q, %v", want, schema, err)
+		}
+	}
+	var first, second string
+	pool.QueryRow(ctx, `SELECT current_database()`).Scan(&first)
+	beside.QueryRow(ctx, `SELECT current_database()`).Scan(&second)
+	if first == "" || first != second || beside.Config().MaxConns != 3 {
+		t.Errorf("databases %q and %q, the second's pool of %d", first, second, beside.Config().MaxConns)
+	}
+	if _, err := pgdb.Beside(ctx, pool, "Bad; DROP"); err == nil {
+		t.Error("a schema name that is no identifier was accepted")
+	}
 }

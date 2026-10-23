@@ -481,7 +481,9 @@ message RollbackRequest {
 }
 message RollbackResponse {
   ChangeList change_list = 1;  // the rollback CL, open for review
-  int64 event_seq = 2;
+  reserved 2;
+  reserved "event_seq";
+  int64 repository_seq = 3;  // its event's place in the repository's log
 }
 
 // Why a rollback is refused: the detail of its FailedPrecondition.
@@ -593,11 +595,13 @@ message TransitionRequest {
   string actor = 4;   // the human ok control authorized
   string reason = 5;  // abandon only
 }
-// The CL after a transition, and the sequence number of the event it wrote: a caller
-// following the change feed has seen the transition once it has seen that event.
+// The CL after a transition, and the event it wrote, by its place in the repository's log: a
+// caller following the SCM's events has seen the transition once it has seen that event.
 message TransitionResponse {
   ChangeList change_list = 1;
-  int64 event_seq = 2;
+  reserved 2;
+  reserved "event_seq";
+  int64 repository_seq = 3;
 }
 
 message PrepareCandidateRequest {
@@ -645,8 +649,11 @@ message LandResponse {
     bytes commit_id = 2;
   }
   repeated Landed landed = 1;
-  bytes head = 2;       // the new head (the would-be head on a dry run)
-  int64 event_seq = 3;  // the last event the landing wrote (0 on a dry run)
+  bytes head = 2;  // the new head (the would-be head on a dry run)
+  reserved 3;
+  reserved "event_seq";
+  int64 repository_seq =
+      4;  // the last event the landing wrote, by its place in the repository's log (0 on a dry run)
 }
 
 // Returned in the status details of a FAILED_PRECONDITION landing or candidate.
@@ -909,22 +916,54 @@ message ExportEntry {
 
 // ─── Events ───
 
+// Each repository's log of events, which the SCM's relay publishes on the bus's stream (topic
+// scm.events) and its followers read from here what the stream has not brought them.
 service Events {
-  // ok control, ok automation, and ok's deployer follow the feed.
+  // ok control, ok automation, and ok's deployer follow the SCM's events.
   option (ok.v1.callers) = CALLER_CONTROL;
   option (ok.v1.callers) = CALLER_AUTOMATION;
   option (ok.v1.callers) = CALLER_DEPLOY;
-  rpc Watch(WatchRequest) returns (stream Event);
+  // Read returns up to limit of a repository's events after a place in its log, in order: a
+  // follower of the bus's stream fills what the stream has not yet brought it from here.
+  rpc Read(ReadEventsRequest) returns (ReadEventsResponse);
+  // Heads lists how far each repository's log reaches, a page at a time by repository: now, or
+  // as of a place in the feed that numbered every repository's events together before. A follower
+  // of the stream catches up from them as it starts.
+  rpc Heads(HeadsRequest) returns (HeadsResponse);
 }
 
-message WatchRequest {
-  int64 after_seq = 1;
+message HeadsRequest {
+  int64 after_repository_id = 1;  // the page after this repository (0: from the first)
+  int32 limit = 2;                // 0: the most the SCM returns at once, 1,000
+  // A place in the old feed (0: now): what a follower of it applied through, for the events
+  // written while there was one.
+  int64 as_of_seq = 3;
+}
+message HeadsResponse {
+  message Head {
+    int64 repository_id = 1;
+    int64 repository_seq = 2;  // the place of the repository's last event in its log
+  }
+  repeated Head heads = 1;  // by repository; fewer than the limit at the end
 }
 
+message ReadEventsRequest {
+  int64 repository_id = 1;
+  int64 after_seq = 2;  // a place in the repository's log: an Event's repository_seq
+  int32 limit = 3;      // 0: the most the SCM returns at once, 1,000
+}
+message ReadEventsResponse {
+  repeated Event events = 1;
+}
+
+// An event: on the bus's stream (topic scm.events, keyed by its repository, numbered by its
+// repository_seq), and in Events.Read's answers.
 message Event {
-  int64 seq = 1;
+  reserved 1;  // its place in the old feed, across every repository
+  reserved "seq";
   int64 repository_id = 2;
   google.protobuf.Timestamp at = 3;
+  int64 repository_seq = 4;  // its place in its repository's log, from 1
   oneof kind {
     ChangeListUploaded uploaded = 10;
     ChangeListTransitioned transitioned = 11;

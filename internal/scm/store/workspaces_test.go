@@ -189,7 +189,7 @@ func TestCheckpointRetentionAndGC(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := s.pool.Exec(ctx, `UPDATE checkpoint SET created_at = $2 WHERE id = $1`, c.ID, at); err != nil {
+		if _, err := poolOf(s).Exec(ctx, `UPDATE checkpoint SET created_at = $2 WHERE id = $1`, c.ID, at); err != nil {
 			t.Fatal(err)
 		}
 		return c

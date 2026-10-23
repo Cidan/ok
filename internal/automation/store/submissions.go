@@ -7,10 +7,9 @@ import (
 	"fmt"
 	"slices"
 	"sort"
-	"strconv"
 	"time"
 
-	"github.com/jackc/pgx/v5"
+	"github.com/Cidan/ok/internal/work"
 )
 
 // SubmissionStatus is where a submission is.
@@ -133,33 +132,23 @@ func (s *Store) Submit(ctx context.Context, req SubmitRequest) (*Submission, err
 		numbers[i] = c.Number
 	}
 	var id int64
-	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+	err := s.b.Txn(ctx, func(tx Ops) error {
 		locked := append([]int64(nil), numbers...)
 		sort.Slice(locked, func(i, j int) bool { return locked[i] < locked[j] })
 		for _, n := range locked {
-			if err := lockCL(ctx, tx, req.RepositoryID, n); err != nil {
+			if err := tx.LockCL(ctx, req.RepositoryID, n); err != nil {
 				return err
 			}
 		}
-		var cl, other int64
-		err := tx.QueryRow(ctx, `SELECT sc.cl_number, s.id FROM submission_cl sc JOIN submission s ON s.id = sc.submission_id
-			WHERE sc.repository_id = $1 AND sc.cl_number = ANY($2) AND s.status = $3 ORDER BY s.id LIMIT 1`,
-			req.RepositoryID, numbers, SubmissionActive).Scan(&cl, &other)
-		if err == nil {
+		cl, other, ok, err := tx.ActiveSubmissionOf(ctx, req.RepositoryID, numbers)
+		if err != nil {
+			return err
+		}
+		if ok {
 			return &ConflictError{Message: fmt.Sprintf("CL %d is already submitting (submission %d)", cl, other)}
 		}
-		if !errors.Is(err, pgx.ErrNoRows) {
+		if id, err = tx.InsertSubmission(ctx, req.RepositoryID, req.SubmittedBy, req.CLs); err != nil {
 			return err
-		}
-		if err := tx.QueryRow(ctx, `INSERT INTO submission (repository_id, submitted_by, status) VALUES ($1, $2, $3)
-			RETURNING id`, req.RepositoryID, req.SubmittedBy, SubmissionActive).Scan(&id); err != nil {
-			return err
-		}
-		for i, c := range req.CLs {
-			if _, err := tx.Exec(ctx, `INSERT INTO submission_cl (submission_id, position, repository_id, cl_number, patchset)
-				VALUES ($1, $2, $3, $4, $5)`, id, i, req.RepositoryID, c.Number, c.Patchset); err != nil {
-				return err
-			}
 		}
 		return notifyQueue(ctx, tx, req.RepositoryID)
 	})
@@ -170,64 +159,41 @@ func (s *Store) Submit(ctx context.Context, req SubmitRequest) (*Submission, err
 }
 
 // notifyQueue wakes the landing queue for a repository, when tx commits.
-func notifyQueue(ctx context.Context, tx pgx.Tx, repo int64) error {
-	_, err := tx.Exec(ctx, `SELECT pg_notify($1, $2)`, chanSubmission, strconv.FormatInt(repo, 10))
-	return err
+func notifyQueue(ctx context.Context, tx Ops, repo int64) error {
+	if err := tx.MarkWork(ctx, QueueWork, repo); err != nil {
+		return err
+	}
+	return notify(ctx, tx, chanSubmission, repo)
 }
 
-const submissionColumns = `id, repository_id, submitted_by, status, reason, note, created_at, finished_at`
+// QueueWork is a repository's landing queue, as keyed work: marked whenever what the queue acts on
+// changes, and done by one replica at a time.
+const QueueWork = "queue"
 
-// loadSubmissions returns the submissions a query selects (by submissionColumns), with their
-// CLs, in the query's order.
-func loadSubmissions(ctx context.Context, q querier, sql string, args ...any) ([]*Submission, error) {
-	rows, err := q.Query(ctx, sql, args...)
-	if err != nil {
-		return nil, err
-	}
-	var out []*Submission
-	byID := map[int64]*Submission{}
-	for rows.Next() {
-		var sub Submission
-		var finished *time.Time
-		if err := rows.Scan(&sub.ID, &sub.RepositoryID, &sub.SubmittedBy, &sub.Status, &sub.Reason, &sub.Note,
-			&sub.CreatedAt, &finished); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		if finished != nil {
-			sub.FinishedAt = *finished
-		}
-		out = append(out, &sub)
-		byID[sub.ID] = &sub
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil || len(out) == 0 {
-		return out, err
-	}
-	ids := make([]int64, 0, len(out))
-	for _, sub := range out {
-		ids = append(ids, sub.ID)
-	}
-	rows, err = q.Query(ctx, `SELECT submission_id, cl_number, patchset, landed_commit FROM submission_cl
-		WHERE submission_id = ANY($1) ORDER BY submission_id, position`, ids)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var id int64
-		var c SubmittedCL
-		if err := rows.Scan(&id, &c.Number, &c.Patchset, &c.LandedCommit); err != nil {
-			return nil, err
-		}
-		byID[id].CLs = append(byID[id].CLs, c)
-	}
-	return out, rows.Err()
+// Work is automation's keyed work's store (internal/work).
+func (s *Store) Work() work.Store { return workStore{s.b} }
+
+type workStore struct{ b Backend }
+
+func (w workStore) Mark(ctx context.Context, kind string, key int64) error {
+	return w.b.MarkWork(ctx, kind, key)
+}
+func (w workStore) Take(ctx context.Context, kind string, key int64, holder string, ttl time.Duration) (bool, error) {
+	return w.b.TakeWork(ctx, kind, key, holder, ttl)
+}
+func (w workStore) Renew(ctx context.Context, kind string, key int64, holder string, ttl time.Duration) (bool, error) {
+	return w.b.RenewWork(ctx, kind, key, holder, ttl)
+}
+func (w workStore) Release(ctx context.Context, kind string, key int64, holder string) (bool, error) {
+	return w.b.ReleaseWork(ctx, kind, key, holder)
+}
+func (w workStore) Due(ctx context.Context, kind string, limit int) ([]int64, error) {
+	return w.b.DueWork(ctx, kind, limit)
 }
 
 // GetSubmission returns a submission.
 func (s *Store) GetSubmission(ctx context.Context, id int64) (*Submission, error) {
-	subs, err := loadSubmissions(ctx, s.pool, `SELECT `+submissionColumns+` FROM submission WHERE id = $1`, id)
+	subs, err := s.b.Submissions(ctx, []int64{id})
 	if err != nil {
 		return nil, err
 	}
@@ -239,7 +205,7 @@ func (s *Store) GetSubmission(ctx context.Context, id int64) (*Submission, error
 
 // GetSubmissions returns submissions by ID; an ID that names none is left out.
 func (s *Store) GetSubmissions(ctx context.Context, ids []int64) (map[int64]*Submission, error) {
-	subs, err := loadSubmissions(ctx, s.pool, `SELECT `+submissionColumns+` FROM submission WHERE id = ANY($1)`, ids)
+	subs, err := s.b.Submissions(ctx, ids)
 	if err != nil {
 		return nil, err
 	}
@@ -261,148 +227,67 @@ func (s *Store) ListSubmissions(ctx context.Context, repo, cl int64, limit int) 
 	case limit > 500:
 		limit = 500
 	}
-	return loadSubmissions(ctx, s.pool, `SELECT `+submissionColumns+` FROM submission WHERE id IN (
-			SELECT submission_id FROM submission_cl WHERE repository_id = $1 AND cl_number = $2)
-		ORDER BY id DESC LIMIT $3`, repo, cl, limit)
+	return s.b.SubmissionsOfCL(ctx, repo, cl, limit)
 }
 
 // Attempts returns a submission's attempts, oldest first, with their candidates, the own
 // candidates' post plans, and their runs.
 func (s *Store) Attempts(ctx context.Context, submission int64) ([]*Attempt, error) {
 	var out []*Attempt
-	err := pgx.BeginTxFunc(ctx, s.pool, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly}, func(tx pgx.Tx) error {
+	err := s.b.Snapshot(ctx, func(tx Ops) error {
 		var err error
-		out, err = loadAttempts(ctx, tx, `SELECT `+attemptColumns+` FROM attempt WHERE submission_id = $1 ORDER BY id`, submission)
-		return err
+		if out, err = tx.Attempts(ctx, []int64{submission}, 0); err != nil {
+			return err
+		}
+		return loadPlans(ctx, tx, out)
 	})
 	return out, err
 }
 
-const attemptColumns = `id, submission_id, base, base_seq, chain, status, released, prepare_error, reason, created_at, finished_at`
-
-// loadAttempts returns the attempts a query selects (by attemptColumns), in its order, with
-// their candidates, plans, and runs.
-func loadAttempts(ctx context.Context, q querier, sql string, args ...any) ([]*Attempt, error) {
-	rows, err := q.Query(ctx, sql, args...)
-	if err != nil {
-		return nil, err
-	}
-	var out []*Attempt
-	byID := map[int64]*Attempt{}
-	for rows.Next() {
-		var a Attempt
-		var finished *time.Time
-		if err := rows.Scan(&a.ID, &a.SubmissionID, &a.Base, &a.BaseSeq, &a.Chain, &a.Status, &a.Released,
-			&a.PrepareError, &a.Reason, &a.CreatedAt, &finished); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		if finished != nil {
-			a.FinishedAt = *finished
-		}
-		out = append(out, &a)
-		byID[a.ID] = &a
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil || len(out) == 0 {
-		return out, err
-	}
-	ids := make([]int64, 0, len(out))
-	for _, a := range out {
-		ids = append(ids, a.ID)
-	}
-	rows, err = q.Query(ctx, `SELECT attempt_id, submission_id, cl_number, patchset, commit_id, base, coalesce(plan_id, 0)
-		FROM attempt_candidate WHERE attempt_id = ANY($1) ORDER BY attempt_id, position`, ids)
-	if err != nil {
-		return nil, err
-	}
-	plans := map[int64]*AttemptCandidate{}
-	var planIDs []int64
-	for rows.Next() {
-		var id int64
-		var c AttemptCandidate
-		if err := rows.Scan(&id, &c.SubmissionID, &c.CLNumber, &c.Patchset, &c.Commit, &c.Base, &c.PlanID); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		byID[id].Candidates = append(byID[id].Candidates, &c)
-		if c.PlanID > 0 {
-			plans[c.PlanID] = &c
-			planIDs = append(planIDs, c.PlanID)
+// loadPlans gives attempts' own candidates their post plans, each plan's latest planning run,
+// and the latest run of each of its jobs, in the order its first run was queued.
+func loadPlans(ctx context.Context, tx Ops, attempts []*Attempt) error {
+	byPlan := map[int64]*AttemptCandidate{}
+	var ids []int64
+	for _, a := range attempts {
+		for _, c := range a.Candidates {
+			if c.PlanID > 0 {
+				byPlan[c.PlanID] = c
+				ids = append(ids, c.PlanID)
+			}
 		}
 	}
-	rows.Close()
-	if err := rows.Err(); err != nil || len(planIDs) == 0 {
-		return out, err
-	}
-	rows, err = q.Query(ctx, `SELECT `+planColumns+` FROM plan WHERE id = ANY($1)`, planIDs)
-	if err != nil {
-		return nil, err
-	}
-	for rows.Next() {
-		p, err := scanPlan(rows)
-		if err != nil {
-			rows.Close()
-			return nil, err
-		}
-		plans[p.ID].Plan = p
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	// Each plan's latest planning run, and the latest run of each job in the order its first
-	// run was queued.
-	rows, err = q.Query(ctx, `SELECT `+runColumns+` FROM run WHERE plan_id = ANY($1) ORDER BY id`, planIDs)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	latest := map[int64]map[string]int{} // plan -> job -> index in Jobs
-	for rows.Next() {
-		r, err := scanRun(rows)
-		if err != nil {
-			return nil, err
-		}
-		c := plans[r.PlanID]
-		if r.Job.Kind == KindPlan {
-			c.PlanRun = r
-			continue
-		}
-		if latest[r.PlanID] == nil {
-			latest[r.PlanID] = map[string]int{}
-		}
-		if i, ok := latest[r.PlanID][r.Origin.Job]; ok {
-			c.Jobs[i] = r
-			continue
-		}
-		latest[r.PlanID][r.Origin.Job] = len(c.Jobs)
-		c.Jobs = append(c.Jobs, r)
-	}
-	return out, rows.Err()
-}
-
-// cancelAttemptRuns cancels the runs of attempts that have not finished.
-func cancelAttemptRuns(ctx context.Context, tx pgx.Tx, attempts []int64, reason string) error {
-	if len(attempts) == 0 {
+	if len(ids) == 0 {
 		return nil
 	}
-	rows, err := tx.Query(ctx, `SELECT r.id FROM run r JOIN attempt_candidate ac ON ac.plan_id = r.plan_id
-		WHERE ac.attempt_id = ANY($1) AND r.status IN ($2, $3) ORDER BY r.id`, attempts, StatusQueued, StatusRunning)
+	plans, err := tx.Plans(ctx, ids)
 	if err != nil {
 		return err
 	}
-	var ids []int64
-	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
-			rows.Close()
-			return err
-		}
-		ids = append(ids, id)
+	for _, p := range plans {
+		byPlan[p.ID].Plan = p
 	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
+	runs, err := tx.PlanRuns(ctx, ids)
+	if err != nil {
+		return err
+	}
+	of := map[int64][]*Run{}
+	for _, r := range runs {
+		of[r.PlanID] = append(of[r.PlanID], r)
+	}
+	for id, c := range byPlan {
+		c.PlanRun, c.Jobs = planRuns(of[id])
+	}
+	return nil
+}
+
+// cancelAttemptRuns cancels the runs of attempts that have not finished.
+func cancelAttemptRuns(ctx context.Context, tx Ops, attempts []int64, reason string) error {
+	if len(attempts) == 0 {
+		return nil
+	}
+	ids, err := tx.UnfinishedRunsOfAttempts(ctx, attempts)
+	if err != nil {
 		return err
 	}
 	for _, id := range ids {
@@ -414,23 +299,9 @@ func cancelAttemptRuns(ctx context.Context, tx pgx.Tx, attempts []int64, reason 
 }
 
 // endAttempts ends a submission's active attempts with status, canceling their runs.
-func endAttempts(ctx context.Context, tx pgx.Tx, submission int64, status AttemptStatus, reason string) error {
-	rows, err := tx.Query(ctx, `UPDATE attempt SET status = $3, reason = $4, finished_at = now()
-		WHERE submission_id = $1 AND status = $2 RETURNING id`, submission, AttemptActive, status, reason)
+func endAttempts(ctx context.Context, tx Ops, submission int64, status AttemptStatus, reason string) error {
+	ids, err := tx.EndActiveAttempts(ctx, submission, status, reason)
 	if err != nil {
-		return err
-	}
-	var ids []int64
-	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
-			rows.Close()
-			return err
-		}
-		ids = append(ids, id)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
 		return err
 	}
 	return cancelAttemptRuns(ctx, tx, ids, reason)
@@ -438,14 +309,9 @@ func endAttempts(ctx context.Context, tx pgx.Tx, submission int64, status Attemp
 
 // finishSubmission ends an active submission with status and reason, and its attempts; it
 // reports whether the submission was active.
-func finishSubmission(ctx context.Context, tx pgx.Tx, id int64, status SubmissionStatus, reason string) (bool, error) {
-	var repo int64
-	err := tx.QueryRow(ctx, `UPDATE submission SET status = $3, reason = $4, note = '', finished_at = now()
-		WHERE id = $1 AND status = $2 RETURNING repository_id`, id, SubmissionActive, status, reason).Scan(&repo)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return false, nil
-	}
-	if err != nil {
+func finishSubmission(ctx context.Context, tx Ops, id int64, status SubmissionStatus, reason string) (bool, error) {
+	repo, ok, err := tx.FinishSubmission(ctx, id, status, reason)
+	if err != nil || !ok {
 		return false, err
 	}
 	attempt := AttemptDiscarded
@@ -464,7 +330,7 @@ func (s *Store) CancelSubmission(ctx context.Context, id int64, reason string) (
 	if reason == "" {
 		reason = "canceled"
 	}
-	if err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+	if err := s.b.Txn(ctx, func(tx Ops) error {
 		_, err := finishSubmission(ctx, tx, id, SubmissionCanceled, reason)
 		return err
 	}); err != nil {
@@ -477,25 +343,10 @@ func (s *Store) CancelSubmission(ctx context.Context, id int64, reason string) (
 // patchset, or every one when patchset is 0 — and returns how many.
 func (s *Store) CancelSubmissionsOf(ctx context.Context, repo, cl int64, patchset int32, reason string) (int, error) {
 	n := 0
-	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+	err := s.b.Txn(ctx, func(tx Ops) error {
 		n = 0
-		rows, err := tx.Query(ctx, `SELECT s.id FROM submission s JOIN submission_cl sc ON sc.submission_id = s.id
-			WHERE sc.repository_id = $1 AND sc.cl_number = $2 AND s.status = $3 AND ($4 = 0 OR sc.patchset < $4)
-			ORDER BY s.id`, repo, cl, SubmissionActive, patchset)
+		ids, err := tx.ActiveSubmissionsOfCL(ctx, repo, cl, patchset)
 		if err != nil {
-			return err
-		}
-		var ids []int64
-		for rows.Next() {
-			var id int64
-			if err := rows.Scan(&id); err != nil {
-				rows.Close()
-				return err
-			}
-			ids = append(ids, id)
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
 			return err
 		}
 		for _, id := range ids {
@@ -514,7 +365,7 @@ func (s *Store) CancelSubmissionsOf(ctx context.Context, repo, cl int64, patchse
 
 // FailSubmission fails an active submission: nothing of it lands.
 func (s *Store) FailSubmission(ctx context.Context, id int64, reason string) error {
-	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+	return s.b.Txn(ctx, func(tx Ops) error {
 		_, err := finishSubmission(ctx, tx, id, SubmissionFailed, reason)
 		return err
 	})
@@ -522,9 +373,7 @@ func (s *Store) FailSubmission(ctx context.Context, id int64, reason string) err
 
 // SetNote records what the queue is waiting for on an active submission.
 func (s *Store) SetNote(ctx context.Context, id int64, note string) error {
-	_, err := s.pool.Exec(ctx, `UPDATE submission SET note = $3 WHERE id = $1 AND status = $2 AND note <> $3`,
-		id, SubmissionActive, note)
-	return err
+	return s.b.SetNote(ctx, id, note)
 }
 
 // NewCandidate is a candidate of an attempt the queue prepared. An own candidate carries its
@@ -570,73 +419,65 @@ func (s *Store) CreateAttempt(ctx context.Context, na NewAttempt) (int64, error)
 		}
 	}
 	var id int64
-	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		var repo int64
-		var status SubmissionStatus
-		var submittedBy string
-		err := tx.QueryRow(ctx, `SELECT repository_id, status, submitted_by FROM submission WHERE id = $1 FOR UPDATE`,
-			na.SubmissionID).Scan(&repo, &status, &submittedBy)
-		if errors.Is(err, pgx.ErrNoRows) {
-			return ErrNotFound
-		}
+	err := s.b.Txn(ctx, func(tx Ops) error {
+		sub, err := tx.LockSubmission(ctx, na.SubmissionID)
 		if err != nil {
 			return err
 		}
-		if status != SubmissionActive {
+		if sub.Status != SubmissionActive {
 			return &ConflictError{Message: fmt.Sprintf("submission %d is no longer active", na.SubmissionID)}
 		}
-		var active int64
-		err = tx.QueryRow(ctx, `SELECT id FROM attempt WHERE submission_id = $1 AND status = $2 ORDER BY id LIMIT 1`,
-			na.SubmissionID, AttemptActive).Scan(&active)
-		if err == nil {
-			return &ConflictError{Message: fmt.Sprintf("submission %d already has an active attempt, %d", na.SubmissionID, active)}
-		}
-		if !errors.Is(err, pgx.ErrNoRows) {
+		active, ok, err := tx.ActiveAttempt(ctx, na.SubmissionID)
+		if err != nil {
 			return err
+		}
+		if ok {
+			return &ConflictError{Message: fmt.Sprintf("submission %d already has an active attempt, %d", na.SubmissionID, active)}
 		}
 		chain := na.Chain
 		if chain == nil {
 			chain = []int64{}
 		}
-		if err := tx.QueryRow(ctx, `INSERT INTO attempt (submission_id, base, base_seq, chain, status, prepare_error)
-			VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`, na.SubmissionID, na.Base, na.BaseSeq, chain, AttemptActive,
-			na.PrepareError).Scan(&id); err != nil {
+		if id, err = tx.InsertAttempt(ctx, NewAttemptRow{SubmissionID: na.SubmissionID, Base: na.Base, BaseSeq: na.BaseSeq,
+			Chain: chain, PrepareError: na.PrepareError}); err != nil {
 			return err
 		}
-		queued := false
+		repo := sub.RepositoryID
+		anyQueued := false
 		for i, c := range na.Candidates {
-			var planID *int64
+			var planID int64
 			if c.Own {
-				var p int64
-				touched, err := json.Marshal(orEmpty(c.Touched))
+				// The planning run compares the candidate with the commit the patchset's pre ran on.
+				var preCommit []byte
+				pre, err := tx.PrePlan(ctx, repo, c.CLNumber, c.Patchset)
+				switch {
+				case err == nil:
+					preCommit = pre.CommitID
+				case !errors.Is(err, ErrNotFound):
+					return err
+				}
+				p, err := tx.InsertPlan(ctx, NewPlan{RepositoryID: repo, CLNumber: c.CLNumber, Patchset: c.Patchset, Phase: PhasePost,
+					CommitID: c.Commit, WorkflowsCommit: c.WorkflowsCommit, Context: c.Context, Touched: orEmpty(c.Touched), PreCommit: preCommit})
 				if err != nil {
 					return err
 				}
-				// The planning run compares the candidate with the commit the patchset's pre ran on.
-				if err := tx.QueryRow(ctx, `INSERT INTO plan (repository_id, cl_number, patchset, phase, commit_id,
-						workflows_commit, context, touched, pre_commit) VALUES ($1, $2, $3, $4, $5, $6, $7, $8,
-						(SELECT commit_id FROM plan WHERE repository_id = $1 AND cl_number = $2 AND patchset = $3 AND phase = $9))
-					RETURNING id`,
-					repo, c.CLNumber, c.Patchset, PhasePost, c.Commit, c.WorkflowsCommit, c.Context, touched, PhasePre).Scan(&p); err != nil {
+				if _, err := tx.InsertRun(ctx, NewRun{
+					RepositoryID: repo, CommitID: c.Commit, Job: Job{Kind: KindPlan},
+					Origin: Origin{Phase: PhasePost, CLNumber: c.CLNumber, Patchset: c.Patchset, Job: planJob}, PlanID: p.ID,
+					Why: na.Why, RequestedBy: sub.SubmittedBy, Status: StatusQueued,
+					TimeoutSeconds: int32(s.cfg.DefaultTimeout / time.Second), Priority: postPriority,
+				}); err != nil {
 					return err
 				}
-				if _, err := tx.Exec(ctx, `INSERT INTO run (repository_id, commit_id, kind, targets, args, phase,
-						cl_number, patchset, job, plan_id, why, requested_by, status, timeout_seconds, priority)
-					VALUES ($1, $2, $3, '{}', '{}', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
-					repo, c.Commit, KindPlan, PhasePost, c.CLNumber, c.Patchset, planJob, p, na.Why, submittedBy,
-					StatusQueued, int32(s.cfg.DefaultTimeout/time.Second), postPriority); err != nil {
-					return err
-				}
-				planID, queued = &p, true
+				planID, anyQueued = p.ID, true
 			}
-			if _, err := tx.Exec(ctx, `INSERT INTO attempt_candidate (attempt_id, position, repository_id, submission_id,
-					cl_number, patchset, commit_id, base, plan_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-				id, i, repo, c.SubmissionID, c.CLNumber, c.Patchset, c.Commit, c.Base, planID); err != nil {
+			if err := tx.InsertCandidate(ctx, id, i, repo, AttemptCandidate{SubmissionID: c.SubmissionID, CLNumber: c.CLNumber,
+				Patchset: c.Patchset, Commit: c.Commit, Base: c.Base, PlanID: planID}); err != nil {
 				return err
 			}
 		}
-		if queued {
-			if _, err := tx.Exec(ctx, `SELECT pg_notify($1, '')`, chanQueue); err != nil {
+		if anyQueued {
+			if err := queued(ctx, tx); err != nil {
 				return err
 			}
 		}
@@ -650,45 +491,31 @@ func (s *Store) CreateAttempt(ctx context.Context, na NewAttempt) (int64, error)
 // which passed there, is recorded passed at once instead, carrying that pass.
 func (s *Store) ReleaseAttempt(ctx context.Context, id int64) error {
 	var carried []int64
-	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+	err := s.b.Txn(ctx, func(tx Ops) error {
 		carried = nil
-		var status AttemptStatus
-		var released bool
-		var submission int64
-		err := tx.QueryRow(ctx, `SELECT status, released, submission_id FROM attempt WHERE id = $1 FOR UPDATE`, id).
-			Scan(&status, &released, &submission)
-		if errors.Is(err, pgx.ErrNoRows) {
-			return ErrNotFound
-		}
+		a, err := tx.LockAttempt(ctx, id)
 		if err != nil {
 			return err
 		}
-		if status != AttemptActive || released {
+		if a.Status != AttemptActive || a.Released {
 			return &ConflictError{Message: fmt.Sprintf("attempt %d is not waiting to run", id)}
 		}
-		var submittedBy string
-		var repo int64
-		if err := tx.QueryRow(ctx, `SELECT submitted_by, repository_id FROM submission WHERE id = $1`, submission).
-			Scan(&submittedBy, &repo); err != nil {
-			return err
-		}
-		rows, err := tx.Query(ctx, `SELECT `+planColumns+` FROM plan WHERE id IN (
-				SELECT plan_id FROM attempt_candidate WHERE attempt_id = $1 AND plan_id IS NOT NULL)
-			ORDER BY id`, id)
+		subs, err := tx.Submissions(ctx, []int64{a.SubmissionID})
 		if err != nil {
 			return err
 		}
-		var plans []*Plan
-		for rows.Next() {
-			p, err := scanPlan(rows)
-			if err != nil {
-				rows.Close()
-				return err
-			}
-			plans = append(plans, p)
+		if len(subs) == 0 {
+			return ErrNotFound
 		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
+		sub := subs[0]
+		var ids []int64
+		for _, c := range a.Candidates {
+			if c.PlanID > 0 {
+				ids = append(ids, c.PlanID)
+			}
+		}
+		plans, err := tx.Plans(ctx, ids)
+		if err != nil {
 			return err
 		}
 		for _, p := range plans {
@@ -697,16 +524,16 @@ func (s *Store) ReleaseAttempt(ctx context.Context, id int64) error {
 			}
 		}
 		for _, p := range plans {
-			c, err := s.releasePlan(ctx, tx, repo, p, submittedBy)
+			c, err := s.releasePlan(ctx, tx, sub.RepositoryID, p, sub.SubmittedBy)
 			if err != nil {
 				return err
 			}
 			carried = append(carried, c...)
 		}
-		if _, err := tx.Exec(ctx, `UPDATE attempt SET released = true WHERE id = $1`, id); err != nil {
+		if err := tx.SetReleased(ctx, id); err != nil {
 			return err
 		}
-		return notifyQueue(ctx, tx, repo)
+		return notifyQueue(ctx, tx, sub.RepositoryID)
 	})
 	if err != nil {
 		return err
@@ -723,39 +550,41 @@ func (s *Store) ReleaseAttempt(ctx context.Context, id int64) error {
 // releasePlan queues a post plan's jobs on its candidate, but records each job that is unchanged
 // since pre and passed there as passed at once, carrying that pass (docs/automation.md,
 // "post"). It returns the runs it carried.
-func (s *Store) releasePlan(ctx context.Context, tx pgx.Tx, repo int64, p *Plan, requestedBy string) ([]int64, error) {
+func (s *Store) releasePlan(ctx context.Context, tx Ops, repo int64, p *Plan, requestedBy string) ([]int64, error) {
 	origin := Origin{Phase: PhasePost, CLNumber: p.CLNumber, Patchset: p.Patchset}
 	passes, err := prePasses(ctx, tx, repo, p.CLNumber, p.Patchset)
 	if err != nil {
 		return nil, err
 	}
-	var queued []PlannedJob
+	var toQueue []PlannedJob
 	var carried []int64
 	for _, j := range p.Jobs {
 		from := passes.of(j)
 		if !j.UnchangedSincePre || from == nil {
-			queued = append(queued, j)
+			toQueue = append(toQueue, j)
 			continue
 		}
 		note := fmt.Sprintf("ok: not run: it passed in pre as run %d, on patchset %d's commit %.10x, and nothing it reads differs on this candidate\n",
 			from.ID, p.Patchset, from.CommitID)
-		var run int64
-		if err := tx.QueryRow(ctx, `INSERT INTO run (repository_id, commit_id, kind, targets, args, phase, cl_number, patchset,
-				job, plan_id, why, requested_by, status, timeout_seconds, priority, started_at, finished_at, carried_from, log_size)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, now(), now(), $16, $17) RETURNING id`,
-			repo, p.CommitID, j.Spec.Kind, orEmpty(j.Spec.Targets), orEmpty(j.Spec.Args), origin.Phase, origin.CLNumber, origin.Patchset,
-			j.Job, p.ID, j.Why, requestedBy, StatusPassed, int32(s.cfg.DefaultTimeout/time.Second), postPriority, from.ID, len(note)).Scan(&run); err != nil {
+		o := origin
+		o.Job = j.Job
+		run, err := tx.InsertRun(ctx, NewRun{
+			RepositoryID: repo, CommitID: p.CommitID, Job: j.Spec, Origin: o, PlanID: p.ID, Why: j.Why, RequestedBy: requestedBy,
+			Status: StatusPassed, TimeoutSeconds: int32(s.cfg.DefaultTimeout / time.Second), Priority: postPriority,
+			Started: true, Finished: true, CarriedFrom: from.ID,
+		})
+		if err != nil {
 			return nil, err
 		}
-		if _, err := tx.Exec(ctx, `INSERT INTO log_chunk (run_id, at, data) VALUES ($1, 0, $2)`, run, []byte(note)); err != nil {
+		if err := tx.AppendLogChunk(ctx, run.ID, 0, []byte(note)); err != nil {
 			return nil, err
 		}
-		if _, err := notify(ctx, tx, chanDone, run); err != nil {
+		if err := notify(ctx, tx, chanDone, run.ID); err != nil {
 			return nil, err
 		}
-		carried = append(carried, run)
+		carried = append(carried, run.ID)
 	}
-	return carried, s.insertJobs(ctx, tx, repo, p.CommitID, origin, p.ID, requestedBy, queued, postPriority, StatusQueued, "")
+	return carried, s.insertJobs(ctx, tx, repo, p.CommitID, origin, p.ID, requestedBy, toQueue, postPriority, StatusQueued, "")
 }
 
 // passes are the jobs of a patchset's pre whose latest run passed.
@@ -765,27 +594,28 @@ type passes struct {
 }
 
 // prePasses returns the passes of a patchset's pre.
-func prePasses(ctx context.Context, tx pgx.Tx, repo, cl int64, patchset int32) (*passes, error) {
-	rows, err := tx.Query(ctx, `SELECT `+runColumns+` FROM (
-			SELECT DISTINCT ON (job) * FROM run
-			WHERE plan_id = (SELECT id FROM plan WHERE repository_id = $1 AND cl_number = $2 AND patchset = $3 AND phase = $4)
-				AND kind <> $5
-			ORDER BY job, id DESC
-		) latest WHERE status = $6 ORDER BY id`, repo, cl, patchset, PhasePre, KindPlan, StatusPassed)
+func prePasses(ctx context.Context, tx Ops, repo, cl int64, patchset int32) (*passes, error) {
+	out := &passes{byJob: map[string]*Run{}}
+	plan, err := tx.PrePlan(ctx, repo, cl, patchset)
+	if errors.Is(err, ErrNotFound) {
+		return out, nil
+	}
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	out := &passes{byJob: map[string]*Run{}}
-	for rows.Next() {
-		r, err := scanRun(rows)
-		if err != nil {
-			return nil, err
-		}
-		out.byJob[r.Origin.Job] = r
-		out.all = append(out.all, r)
+	runs, err := tx.PlanRuns(ctx, []int64{plan.ID})
+	if err != nil {
+		return nil, err
 	}
-	return out, rows.Err()
+	_, jobs := planRuns(runs)
+	for _, r := range jobs {
+		if r.Status == StatusPassed {
+			out.byJob[r.Origin.Job] = r
+			out.all = append(out.all, r)
+		}
+	}
+	sort.Slice(out.all, func(i, j int) bool { return out.all[i].ID < out.all[j].ID })
+	return out, nil
 }
 
 // of returns the pre pass a post job carries: the same job's — a built-in job's in post is the
@@ -812,10 +642,9 @@ func sameJob(a, b Job) bool {
 
 // DiscardAttempt ends an active attempt that no longer holds for main, canceling its runs.
 func (s *Store) DiscardAttempt(ctx context.Context, id int64, reason string) error {
-	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		tag, err := tx.Exec(ctx, `UPDATE attempt SET status = $3, reason = $4, finished_at = now()
-			WHERE id = $1 AND status = $2`, id, AttemptActive, AttemptDiscarded, reason)
-		if err != nil || tag.RowsAffected() == 0 {
+	return s.b.Txn(ctx, func(tx Ops) error {
+		moved, err := tx.SetAttemptStatus(ctx, id, AttemptActive, AttemptDiscarded, reason)
+		if err != nil || !moved {
 			return err
 		}
 		return cancelAttemptRuns(ctx, tx, []int64{id}, reason)
@@ -831,42 +660,40 @@ type LandedCL struct {
 // RecordLanding records that a submission landed on an attempt: the commit each CL landed as,
 // and — at fromSeq, main's place before the landing, when it is known — main's history.
 func (s *Store) RecordLanding(ctx context.Context, submission, attempt int64, landed []LandedCL, fromSeq int64) error {
-	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		var repo int64
-		err := tx.QueryRow(ctx, `UPDATE submission SET status = $3, reason = '', note = '', finished_at = now()
-			WHERE id = $1 AND status = $2 RETURNING repository_id`, submission, SubmissionActive, SubmissionLanded).Scan(&repo)
-		if errors.Is(err, pgx.ErrNoRows) {
-			return &ConflictError{Message: fmt.Sprintf("submission %d is no longer active", submission)}
-		}
+	return s.b.Txn(ctx, func(tx Ops) error {
+		repo, ok, err := tx.FinishSubmission(ctx, submission, SubmissionLanded, "")
 		if err != nil {
 			return err
 		}
-		if _, err := tx.Exec(ctx, `UPDATE attempt SET status = $3, finished_at = now() WHERE id = $1 AND submission_id = $2`,
-			attempt, submission, AttemptLanded); err != nil {
+		if !ok {
+			return &ConflictError{Message: fmt.Sprintf("submission %d is no longer active", submission)}
+		}
+		a, err := tx.LockAttempt(ctx, attempt)
+		switch {
+		case err == nil && a.SubmissionID == submission:
+			if _, err := tx.SetAttemptStatus(ctx, attempt, 0, AttemptLanded, a.Reason); err != nil {
+				return err
+			}
+		case err != nil && !errors.Is(err, ErrNotFound):
 			return err
 		}
 		if err := endAttempts(ctx, tx, submission, AttemptDiscarded, "another attempt landed"); err != nil {
 			return err
 		}
 		for i, l := range landed {
-			if _, err := tx.Exec(ctx, `UPDATE submission_cl SET landed_commit = $3 WHERE submission_id = $1 AND cl_number = $2`,
-				submission, l.CLNumber, l.Commit); err != nil {
+			if err := tx.SetLandedCommit(ctx, submission, l.CLNumber, l.Commit); err != nil {
 				return err
 			}
-			if _, err := tx.Exec(ctx, `INSERT INTO landed_change (repository_id, commit_id, cl_number) VALUES ($1, $2, $3)
-				ON CONFLICT DO NOTHING`, repo, l.Commit, l.CLNumber); err != nil {
+			if err := tx.InsertLandedChange(ctx, repo, l.Commit, l.CLNumber); err != nil {
 				return err
 			}
 			if fromSeq > 0 {
-				if _, err := tx.Exec(ctx, `INSERT INTO main_commit (repository_id, seq, commit_id, submission_id)
-					VALUES ($1, $2, $3, $4) ON CONFLICT (repository_id, seq) DO UPDATE SET submission_id = EXCLUDED.submission_id`,
-					repo, fromSeq+int64(i)+1, l.Commit, submission); err != nil {
+				if err := tx.PutMainCommit(ctx, repo, fromSeq+int64(i)+1, l.Commit, submission); err != nil {
 					return err
 				}
 				continue
 			}
-			if _, err := tx.Exec(ctx, `UPDATE main_commit SET submission_id = $3 WHERE repository_id = $1 AND commit_id = $2`,
-				repo, l.Commit, submission); err != nil {
+			if err := tx.SetMainCommitSubmission(ctx, repo, l.Commit, submission); err != nil {
 				return err
 			}
 		}
@@ -876,9 +703,8 @@ func (s *Store) RecordLanding(ctx context.Context, submission, attempt int64, la
 
 // RecordMainCommit records a commit main moved to, at its place in main's history.
 func (s *Store) RecordMainCommit(ctx context.Context, repo, seq int64, commit []byte) error {
-	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx, `INSERT INTO main_commit (repository_id, seq, commit_id) VALUES ($1, $2, $3)
-			ON CONFLICT DO NOTHING`, repo, seq, commit); err != nil {
+	return s.b.Txn(ctx, func(tx Ops) error {
+		if err := tx.InsertMainCommit(ctx, repo, seq, commit); err != nil {
 			return err
 		}
 		return notifyQueue(ctx, tx, repo)
@@ -887,63 +713,25 @@ func (s *Store) RecordMainCommit(ctx context.Context, repo, seq int64, commit []
 
 // RecordLandedChange records the CL a landed commit is.
 func (s *Store) RecordLandedChange(ctx context.Context, repo int64, commit []byte, cl int64) error {
-	_, err := s.pool.Exec(ctx, `INSERT INTO landed_change (repository_id, commit_id, cl_number) VALUES ($1, $2, $3)
-		ON CONFLICT DO NOTHING`, repo, commit, cl)
-	return err
+	return s.b.InsertLandedChange(ctx, repo, commit, cl)
 }
 
 // ReusableCandidate returns a candidate an active attempt already prepared from a CL's
 // patchset on base, if there is one.
 func (s *Store) ReusableCandidate(ctx context.Context, repo int64, base []byte, cl int64, patchset int32) ([]byte, bool, error) {
-	var commit []byte
-	err := s.pool.QueryRow(ctx, `SELECT ac.commit_id FROM attempt_candidate ac JOIN attempt a ON a.id = ac.attempt_id
-		WHERE ac.repository_id = $1 AND ac.base = $2 AND ac.cl_number = $3 AND ac.patchset = $4 AND a.status = $5
-		ORDER BY a.id DESC LIMIT 1`, repo, base, cl, patchset, AttemptActive).Scan(&commit)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, false, nil
-	}
-	return commit, err == nil, err
+	return s.b.ReusableCandidate(ctx, repo, base, cl, patchset)
 }
 
 // CandidatesInUse returns the candidates a repository's active attempts hold, by commit ID.
 func (s *Store) CandidatesInUse(ctx context.Context, repo int64) (map[string]bool, error) {
-	rows, err := s.pool.Query(ctx, `SELECT ac.commit_id FROM attempt_candidate ac JOIN attempt a ON a.id = ac.attempt_id
-		WHERE ac.repository_id = $1 AND a.status = $2`, repo, AttemptActive)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := map[string]bool{}
-	for rows.Next() {
-		var c []byte
-		if err := rows.Scan(&c); err != nil {
-			return nil, err
-		}
-		out[string(c)] = true
-	}
-	return out, rows.Err()
+	return s.b.CandidatesInUse(ctx, repo)
 }
 
 // QueueRepositories returns the repositories the landing queue has work in: those with active
 // submissions, and those where a submission finished within recent, whose candidates it
 // cleans up.
 func (s *Store) QueueRepositories(ctx context.Context, recent time.Duration) ([]int64, error) {
-	rows, err := s.pool.Query(ctx, `SELECT DISTINCT repository_id FROM submission
-		WHERE status = $1 OR finished_at > now() - make_interval(secs => $2) ORDER BY repository_id`,
-		SubmissionActive, recent.Seconds())
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []int64
-	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		out = append(out, id)
-	}
-	return out, rows.Err()
+	return s.b.QueueRepositories(ctx, recent)
 }
 
 // MainCommit is one commit main moved to: its place in main's history, the CL it is (0 when
@@ -980,11 +768,10 @@ type QueueState struct {
 // QueueState reads a repository's landing queue, consistently. from bounds main's history from
 // below when no active attempt names an earlier base.
 func (s *Store) QueueState(ctx context.Context, repo, from int64) (*QueueState, error) {
-	st := &QueueState{Others: map[int64]*Submission{}, Landings: map[int64]*Attempt{}, LandedCLs: map[int64][]byte{}}
-	err := pgx.BeginTxFunc(ctx, s.pool, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly}, func(tx pgx.Tx) error {
+	st := &QueueState{}
+	err := s.b.Snapshot(ctx, func(tx Ops) error {
 		*st = QueueState{Others: map[int64]*Submission{}, Landings: map[int64]*Attempt{}, LandedCLs: map[int64][]byte{}}
-		subs, err := loadSubmissions(ctx, tx, `SELECT `+submissionColumns+` FROM submission
-			WHERE repository_id = $1 AND status = $2 ORDER BY id`, repo, SubmissionActive)
+		subs, err := tx.ActiveSubmissions(ctx, repo)
 		if err != nil {
 			return err
 		}
@@ -999,8 +786,11 @@ func (s *Store) QueueState(ctx context.Context, repo, from int64) (*QueueState, 
 				cls = append(cls, c.Number)
 			}
 		}
-		attempts, err := loadAttempts(ctx, tx, `SELECT `+attemptColumns+` FROM attempt WHERE submission_id = ANY($1) ORDER BY id`, ids)
+		attempts, err := tx.Attempts(ctx, ids, 0)
 		if err != nil {
+			return err
+		}
+		if err := loadPlans(ctx, tx, attempts); err != nil {
 			return err
 		}
 		st.From = from
@@ -1014,26 +804,13 @@ func (s *Store) QueueState(ctx context.Context, repo, from int64) (*QueueState, 
 				}
 			}
 		}
-		rows, err := tx.Query(ctx, `SELECT mc.seq, mc.commit_id, coalesce(lc.cl_number, 0), coalesce(mc.submission_id, 0)
-			FROM main_commit mc LEFT JOIN landed_change lc ON lc.repository_id = mc.repository_id AND lc.commit_id = mc.commit_id
-			WHERE mc.repository_id = $1 AND mc.seq > $2 ORDER BY mc.seq`, repo, st.From)
-		if err != nil {
+		if st.Main, err = tx.MainCommitsAfter(ctx, repo, st.From); err != nil {
 			return err
 		}
-		for rows.Next() {
-			var m MainCommit
-			if err := rows.Scan(&m.Seq, &m.Commit, &m.CLNumber, &m.SubmissionID); err != nil {
-				rows.Close()
-				return err
-			}
-			st.Main = append(st.Main, m)
+		for _, m := range st.Main {
 			if m.SubmissionID > 0 {
 				named[m.SubmissionID] = true
 			}
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
-			return err
 		}
 		var others []int64
 		for id := range named {
@@ -1041,38 +818,34 @@ func (s *Store) QueueState(ctx context.Context, repo, from int64) (*QueueState, 
 				others = append(others, id)
 			}
 		}
+		slices.Sort(others)
 		if len(others) > 0 {
-			subs, err := loadSubmissions(ctx, tx, `SELECT `+submissionColumns+` FROM submission WHERE id = ANY($1)`, others)
+			subs, err := tx.Submissions(ctx, others)
 			if err != nil {
 				return err
 			}
 			for _, sub := range subs {
 				st.Others[sub.ID] = sub
 			}
-			landings, err := loadAttempts(ctx, tx, `SELECT `+attemptColumns+` FROM attempt
-				WHERE submission_id = ANY($1) AND status = $2 ORDER BY id`, others, AttemptLanded)
+			landings, err := tx.Attempts(ctx, others, AttemptLanded)
 			if err != nil {
+				return err
+			}
+			if err := loadPlans(ctx, tx, landings); err != nil {
 				return err
 			}
 			for _, a := range landings {
 				st.Landings[a.SubmissionID] = a
 			}
 		}
-		rows, err = tx.Query(ctx, `SELECT cl_number, commit_id FROM landed_change WHERE repository_id = $1 AND cl_number = ANY($2)`,
-			repo, cls)
-		if err != nil {
-			return err
-		}
-		defer rows.Close()
-		for rows.Next() {
-			var cl int64
-			var commit []byte
-			if err := rows.Scan(&cl, &commit); err != nil {
+		if len(cls) > 0 {
+			landedCLs, err := tx.LandedCLs(ctx, repo, cls)
+			if err != nil {
 				return err
 			}
-			st.LandedCLs[cl] = commit
+			st.LandedCLs = landedCLs
 		}
-		return rows.Err()
+		return nil
 	})
 	return st, err
 }

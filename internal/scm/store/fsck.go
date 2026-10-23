@@ -4,13 +4,13 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
-
-	"github.com/jackc/pgx/v5"
 
 	"github.com/Cidan/ok/internal/scm/contentindex"
 	"github.com/Cidan/ok/internal/scm/encoding"
 	"github.com/Cidan/ok/internal/scm/pack"
+	"github.com/Cidan/ok/internal/scm/store/backend"
 )
 
 // FsckReport is what Fsck found in one repository.
@@ -38,7 +38,7 @@ func (r *FsckReport) problem(format string, args ...any) {
 // indexes against the bodies they index. With repair, it rebuilds the index's entries for
 // chunks files use that it lacks, from the packs that hold them (packs are self-describing).
 func (s *Store) Fsck(ctx context.Context, repo int64, repair bool) (*FsckReport, error) {
-	if err := s.repositoryExists(ctx, s.pool, repo); err != nil {
+	if err := s.repositoryExists(ctx, s.b, repo); err != nil {
 		return nil, err
 	}
 	r := &FsckReport{}
@@ -67,50 +67,24 @@ type packRow struct {
 }
 
 func (s *Store) fsckPacks(ctx context.Context, repo int64, repair bool, r *FsckReport) error {
-	rows, err := s.pool.Query(ctx, `SELECT id, num, size FROM pack WHERE repository_id = $1 AND retired_at IS NULL ORDER BY id`, repo)
+	live, err := s.b.LivePacks(ctx, repo)
 	if err != nil {
 		return err
 	}
-	var packs []packRow
-	for rows.Next() {
-		var b []byte
-		var pr packRow
-		if err := rows.Scan(&b, &pr.num, &pr.size); err != nil {
-			rows.Close()
-			return err
-		}
-		if pr.id, err = toID(b); err != nil {
-			rows.Close()
-			return err
-		}
-		packs = append(packs, pr)
+	packs := make([]packRow, len(live))
+	for i, p := range live {
+		packs[i] = packRow{id: p.ID, num: p.Num, size: p.Size}
 	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	// Retired packs are known too: repacking deletes them from S3 an hour after retiring.
+	sort.Slice(packs, func(i, j int) bool { return string(packs[i].id[:]) < string(packs[j].id[:]) })
+	// Retired packs are known too: repacking deletes them from object storage an hour after
+	// retiring.
 	known := map[string]bool{}
-	rs, err := s.pool.Query(ctx, `SELECT id FROM pack WHERE repository_id = $1 AND retired_at IS NOT NULL`, repo)
+	retired, err := s.b.RetiredPackIDs(ctx, repo)
 	if err != nil {
 		return err
 	}
-	for rs.Next() {
-		var b []byte
-		if err := rs.Scan(&b); err != nil {
-			rs.Close()
-			return err
-		}
-		id, err := toID(b)
-		if err != nil {
-			rs.Close()
-			return err
-		}
+	for _, id := range retired {
 		known[packKey(repo, id)] = true
-	}
-	rs.Close()
-	if err := rs.Err(); err != nil {
-		return err
 	}
 	for _, pr := range packs {
 		known[packKey(repo, pr.id)] = true
@@ -192,7 +166,7 @@ func (s *Store) fsckPack(ctx context.Context, repo int64, pr packRow, repair boo
 	}
 	rowless := map[encoding.ID]bool{}
 	if len(orphaned) > 0 {
-		present, err := s.existing(ctx, s.pool, repo, tChunk, 0, orphaned)
+		present, err := s.existing(ctx, s.b, repo, tChunk, 0, orphaned)
 		if err != nil {
 			return err
 		}
@@ -224,7 +198,7 @@ func (s *Store) fsckPack(ctx context.Context, repo int64, pr packRow, repair boo
 		}
 		rec := byID[id]
 		inserted := false
-		err := s.inTx(ctx, func(tx pgx.Tx) error {
+		err := s.inTx(ctx, func(tx *txn) error {
 			lg, err := s.txIndex(ctx, tx, repo)
 			if err != nil {
 				return err
@@ -328,66 +302,33 @@ func verifyBody(kind encoding.Kind, id encoding.ID, body []byte) (encoding.Objec
 }
 
 func (s *Store) fsckObjects(ctx context.Context, repo int64, r *FsckReport) error {
-	rows, err := s.pool.Query(ctx, `SELECT id, kind, body FROM object WHERE repository_id = $1 ORDER BY id`, repo)
+	objects, err := s.b.AllObjects(ctx, repo)
 	if err != nil {
 		return err
 	}
 	copyParents := map[encoding.ID][]encoding.ID{}
-	for rows.Next() {
-		var b, body []byte
-		var kind int16
-		if err := rows.Scan(&b, &kind, &body); err != nil {
-			rows.Close()
-			return err
-		}
-		id, err := toID(b)
-		if err != nil {
-			rows.Close()
-			return err
-		}
+	for _, row := range objects {
 		r.Objects++
-		o, err := verifyBody(encoding.Kind(kind), id, body)
+		o, err := verifyBody(row.Kind, row.ID, row.Body)
 		if err != nil {
-			r.problem("%s %s: %v", encoding.Kind(kind), id, err)
+			r.problem("%s %s: %v", row.Kind, row.ID, err)
 			continue
 		}
 		if c, ok := o.(*encoding.CopyHistory); ok {
-			copyParents[id] = c.Parents
+			copyParents[row.ID] = c.Parents
 		}
 	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return err
-	}
 	indexed := map[encoding.ID]map[encoding.ID]bool{}
-	cr, err := s.pool.Query(ctx, `SELECT copy_id, parent_id FROM copy_parent WHERE repository_id = $1`, repo)
+	edges, err := s.b.AllCopyParents(ctx, repo)
 	if err != nil {
 		return err
 	}
-	for cr.Next() {
-		var cb, pb []byte
-		if err := cr.Scan(&cb, &pb); err != nil {
-			cr.Close()
-			return err
-		}
-		c, err := toID(cb)
-		if err != nil {
-			cr.Close()
-			return err
-		}
-		p, err := toID(pb)
-		if err != nil {
-			cr.Close()
-			return err
-		}
+	for _, e := range edges {
+		c, p := e[0], e[1]
 		if indexed[c] == nil {
 			indexed[c] = map[encoding.ID]bool{}
 		}
 		indexed[c][p] = true
-	}
-	cr.Close()
-	if err := cr.Err(); err != nil {
-		return err
 	}
 	for c, parents := range copyParents {
 		want := map[encoding.ID]bool{}
@@ -414,7 +355,7 @@ func sameSet(a, b map[encoding.ID]bool) bool {
 }
 
 func (s *Store) fsckCommits(ctx context.Context, repo int64, r *FsckReport) error {
-	rows, err := s.pool.Query(ctx, `SELECT id, body, generation FROM commit WHERE repository_id = $1`, repo)
+	stored, err := s.b.AllCommits(ctx, repo)
 	if err != nil {
 		return err
 	}
@@ -423,56 +364,22 @@ func (s *Store) fsckCommits(ctx context.Context, repo int64, r *FsckReport) erro
 		gen     int64
 	}
 	commits := map[encoding.ID]info{}
-	for rows.Next() {
-		var b, body []byte
-		var gen int64
-		if err := rows.Scan(&b, &body, &gen); err != nil {
-			rows.Close()
-			return err
-		}
-		id, err := toID(b)
-		if err != nil {
-			rows.Close()
-			return err
-		}
+	for _, row := range stored {
 		r.Commits++
-		o, err := verifyBody(encoding.KindCommit, id, body)
+		o, err := verifyBody(encoding.KindCommit, row.ID, row.Body)
 		if err != nil {
-			r.problem("commit %s: %v", id, err)
+			r.problem("commit %s: %v", row.ID, err)
 			continue
 		}
-		commits[id] = info{parents: o.(*encoding.Commit).Parents, gen: gen}
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return err
+		commits[row.ID] = info{parents: o.(*encoding.Commit).Parents, gen: row.Generation}
 	}
 	indexed := map[encoding.ID][]encoding.ID{}
-	pr, err := s.pool.Query(ctx, `SELECT commit_id, parent_id FROM commit_parent WHERE repository_id = $1 ORDER BY commit_id, ord`, repo)
+	edges, err := s.b.AllCommitParents(ctx, repo)
 	if err != nil {
 		return err
 	}
-	for pr.Next() {
-		var cb, pb []byte
-		if err := pr.Scan(&cb, &pb); err != nil {
-			pr.Close()
-			return err
-		}
-		c, err := toID(cb)
-		if err != nil {
-			pr.Close()
-			return err
-		}
-		p, err := toID(pb)
-		if err != nil {
-			pr.Close()
-			return err
-		}
-		indexed[c] = append(indexed[c], p)
-	}
-	pr.Close()
-	if err := pr.Err(); err != nil {
-		return err
+	for _, e := range edges {
+		indexed[e[0]] = append(indexed[e[0]], e[1])
 	}
 	for id, c := range commits {
 		if fmt.Sprint(indexed[id]) != fmt.Sprint(c.parents) {
@@ -501,35 +408,21 @@ func (s *Store) fsckCommits(ctx context.Context, repo int64, r *FsckReport) erro
 func (s *Store) fsckOperations(ctx context.Context, repo int64, r *FsckReport) error {
 	for _, t := range []struct {
 		kind  encoding.Kind
-		query string
+		read  func(backend.Ops, context.Context, int64) ([]backend.Object, error)
 		count *int
 	}{
-		{encoding.KindOperation, `SELECT o.id, o.body FROM operation o JOIN op_log l ON l.id = o.op_log_id WHERE l.repository_id = $1`, &r.Operations},
-		{encoding.KindView, `SELECT v.id, v.body FROM view v JOIN op_log l ON l.id = v.op_log_id WHERE l.repository_id = $1`, &r.Views},
+		{encoding.KindOperation, backend.Ops.RepositoryOperations, &r.Operations},
+		{encoding.KindView, backend.Ops.RepositoryViews, &r.Views},
 	} {
-		rows, err := s.pool.Query(ctx, t.query, repo)
+		rows, err := t.read(s.b, ctx, repo)
 		if err != nil {
 			return err
 		}
-		for rows.Next() {
-			var b, body []byte
-			if err := rows.Scan(&b, &body); err != nil {
-				rows.Close()
-				return err
-			}
-			id, err := toID(b)
-			if err != nil {
-				rows.Close()
-				return err
-			}
+		for _, row := range rows {
 			*t.count++
-			if _, err := verifyBody(t.kind, id, body); err != nil {
-				r.problem("%s %s: %v", t.kind, id, err)
+			if _, err := verifyBody(t.kind, row.ID, row.Body); err != nil {
+				r.problem("%s %s: %v", t.kind, row.ID, err)
 			}
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
-			return err
 		}
 	}
 	return nil

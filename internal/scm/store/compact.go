@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"sort"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/klauspost/compress/zstd"
 
 	"github.com/Cidan/ok/internal/scm/contentindex"
@@ -107,24 +106,14 @@ func (s *Store) compact(ctx context.Context, repo int64, opts GCOptions, r *GCRe
 		}
 		return true
 	})
-	rows, err := s.pool.Query(ctx, `SELECT id, num, size, dictionary_id FROM pack
-		WHERE repository_id = $1 AND retired_at IS NULL ORDER BY created_at, id`, repo)
+	live, err := s.b.LivePacks(ctx, repo)
 	if err != nil {
 		return err
 	}
 	var packs []compactPack
-	for rows.Next() {
-		var b []byte
-		var p compactPack
-		var considered *int64
-		if err := rows.Scan(&b, &p.num, &p.size, &considered); err != nil {
-			rows.Close()
-			return err
-		}
-		if p.id, err = toID(b); err != nil {
-			rows.Close()
-			return err
-		}
+	for _, row := range live {
+		p := compactPack{id: row.ID, num: row.Num, size: row.Size}
+		considered := row.Dictionary
 		if st := stats[p.num]; st != nil {
 			p.chunks, p.live = st.chunks, st.live
 			// Small chunks are counted only while the newest dictionary has not considered it.
@@ -133,10 +122,6 @@ func (s *Store) compact(ctx context.Context, repo int64, opts GCOptions, r *GCRe
 			}
 		}
 		packs = append(packs, p)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return err
 	}
 	var empty, sparse, small, recompress, considered []compactPack
 	for _, p := range packs {
@@ -160,8 +145,7 @@ func (s *Store) compact(ctx context.Context, repo int64, opts GCOptions, r *GCRe
 		for i, p := range considered {
 			marked[i] = p.id
 		}
-		if _, err := s.pool.Exec(ctx, `UPDATE pack SET dictionary_id = $3 WHERE repository_id = $1 AND id = ANY($2)`,
-			repo, ids(marked), dictRow); err != nil {
+		if err := s.b.SetPacksDictionary(ctx, repo, marked, dictRow); err != nil {
 			return err
 		}
 	}
@@ -420,10 +404,10 @@ func (s *Store) writeCompacted(ctx context.Context, repo int64, dir string, n in
 	}
 
 	li := s.live(repo)
-	err = s.inTx(ctx, func(tx pgx.Tx) error {
+	err = s.inTx(ctx, func(tx *txn) error {
 		// No transaction changes the index while this one moves chunks in it, and the index
 		// read after the lock holds every change before.
-		if _, err := tx.Exec(ctx, `SELECT generation FROM content_index WHERE repository_id = $1 FOR UPDATE`, repo); err != nil {
+		if _, err := tx.LockContentIndex(ctx, repo); err != nil {
 			return err
 		}
 		if err := s.refreshIndex(ctx, repo, li); err != nil {
@@ -434,9 +418,8 @@ func (s *Store) writeCompacted(ctx context.Context, repo int64, dir string, n in
 		if enc != nil {
 			considered = &dictRow
 		}
-		var num uint64
-		if err := tx.QueryRow(ctx, `INSERT INTO pack (repository_id, id, size, dictionary_id) VALUES ($1, $2, $3, $4) RETURNING num`,
-			repo, packID[:], size, considered).Scan(&num); err != nil {
+		num, err := tx.InsertPack(ctx, repo, packID, size, considered)
+		if err != nil {
 			return err
 		}
 		var live int64
@@ -460,8 +443,7 @@ func (s *Store) writeCompacted(ctx context.Context, repo int64, dir string, n in
 		}
 		if live == 0 {
 			// Every chunk it copied moved or went meanwhile: it holds nothing live.
-			_, err := tx.Exec(ctx, `UPDATE pack SET retired_at = now() WHERE repository_id = $1 AND id = $2`, repo, packID[:])
-			return err
+			return tx.RetirePack(ctx, repo, packID)
 		}
 		return nil
 	})
@@ -485,40 +467,18 @@ func (s *Store) retireDrained(ctx context.Context, repo int64, packIDs []encodin
 		}
 		return true
 	})
-	rows, err := s.pool.Query(ctx, `SELECT id, num FROM pack WHERE repository_id = $1 AND id = ANY($2) AND retired_at IS NULL`, repo, ids(packIDs))
+	nums, err := s.b.LivePackNumbers(ctx, repo, packIDs)
 	if err != nil {
 		return 0, 0, err
 	}
 	var drained []encoding.ID
-	for rows.Next() {
-		var b []byte
-		var num uint64
-		if err := rows.Scan(&b, &num); err != nil {
-			rows.Close()
-			return 0, 0, err
-		}
-		id, err := toID(b)
-		if err != nil {
-			rows.Close()
-			return 0, 0, err
-		}
-		if !used[num] {
+	for _, id := range packIDs {
+		if num, ok := nums[id]; ok && !used[num] {
 			drained = append(drained, id)
 		}
 	}
-	rows.Close()
-	if err := rows.Err(); err != nil || len(drained) == 0 {
-		return 0, 0, err
+	if len(drained) == 0 {
+		return 0, 0, nil
 	}
-	stmt := `WITH r AS (
-			UPDATE pack SET retired_at = now()
-			WHERE repository_id = $1 AND id = ANY($2) AND retired_at IS NULL RETURNING size
-		) SELECT count(*), coalesce(sum(size), 0)::bigint FROM r`
-	if dryRun {
-		stmt = `SELECT count(*), coalesce(sum(size), 0)::bigint FROM pack WHERE repository_id = $1 AND id = ANY($2) AND retired_at IS NULL`
-	}
-	var n int
-	var bytes int64
-	err = s.pool.QueryRow(ctx, stmt, repo, ids(drained)).Scan(&n, &bytes)
-	return n, bytes, err
+	return s.b.RetirePacks(ctx, repo, drained, dryRun)
 }

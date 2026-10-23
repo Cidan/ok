@@ -27,6 +27,7 @@ import (
 	"github.com/Cidan/ok/internal/deploy/plan"
 	"github.com/Cidan/ok/internal/deploy/roll"
 	"github.com/Cidan/ok/internal/deploy/store"
+	"github.com/Cidan/ok/internal/deploy/store/postgres"
 	"github.com/Cidan/ok/internal/testdb"
 	"github.com/Cidan/ok/internal/workflow"
 	automationpb "github.com/Cidan/ok/proto/ok/automation/v1"
@@ -264,7 +265,8 @@ func newEnv(t *testing.T, objs ...runtime.Object) *env {
 		t.Fatal(err)
 	}
 	t.Cleanup(pool.Close)
-	st, err := store.Open(context.Background(), pool)
+	b, err := postgres.Open(context.Background(), pool)
+	st := store.New(b)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -876,9 +878,9 @@ func TestUnchanged(t *testing.T) {
 	if d := e.byName("api"); d.Status != store.Succeeded || d.Reason != "the workload already runs these images" {
 		t.Errorf("api %s: %s", d.Status, d.Reason)
 	}
-	var notes []string
-	if err := e.store.Pool().QueryRow(context.Background(), `SELECT notes FROM plan`).Scan(&notes); err != nil || len(notes) != 1 || !strings.Contains(notes[0], "x/.ok/workflow/bad.yaml") {
-		t.Errorf("the plan's notes %v (%v)", notes, err)
+	plans, err := e.store.Plans(context.Background(), 0)
+	if err != nil || len(plans) != 1 || len(plans[0].Notes) != 1 || !strings.Contains(plans[0].Notes[0], "x/.ok/workflow/bad.yaml") {
+		t.Errorf("the plans %+v (%v)", plans, err)
 	}
 }
 
@@ -906,25 +908,19 @@ func TestImported(t *testing.T) {
 	if len(e.build.affected) != 0 || len(e.build.applied) != 0 || len(e.runs.runs) != 0 {
 		t.Errorf("the deployer ran something: affected %v, applied %v, %d runs", e.build.affected, e.build.applied, len(e.runs.runs))
 	}
-	rows, err := e.store.Pool().Query(context.Background(), `SELECT head_seq, notes FROM plan ORDER BY head_seq`)
+	plans, err := e.store.Plans(context.Background(), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer rows.Close()
 	var seqs []int64
-	for rows.Next() {
-		var seq int64
-		var notes []string
-		if err := rows.Scan(&seq, &notes); err != nil {
-			t.Fatal(err)
-		}
-		seqs = append(seqs, seq)
-		if len(notes) != 1 || notes[0] != "the repository is imported: ok deploys nothing from it" {
-			t.Errorf("the plan at %d: notes %v", seq, notes)
+	for _, p := range plans {
+		seqs = append(seqs, p.HeadSeq)
+		if len(p.Notes) != 1 || p.Notes[0] != "the repository is imported: ok deploys nothing from it" {
+			t.Errorf("the plan at %d: notes %v", p.HeadSeq, p.Notes)
 		}
 	}
-	if err := rows.Err(); err != nil || !slices.Equal(seqs, []int64{1, 2}) {
-		t.Errorf("plans at %v (%v), want each head planned", seqs, err)
+	if !slices.Equal(seqs, []int64{1, 2}) {
+		t.Errorf("plans at %v, want each head planned", seqs)
 	}
 }
 

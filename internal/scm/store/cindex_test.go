@@ -8,8 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5"
-
 	"github.com/Cidan/ok/internal/scm/contentindex"
 	"github.com/Cidan/ok/internal/scm/encoding"
 	"github.com/Cidan/ok/internal/scm/pack"
@@ -18,7 +16,7 @@ import (
 func logRows(t *testing.T, s *Store, repo int64) int {
 	t.Helper()
 	var n int
-	if err := s.pool.QueryRow(context.Background(), `SELECT count(*) FROM content_log WHERE repository_id = $1`, repo).Scan(&n); err != nil {
+	if err := poolOf(s).QueryRow(context.Background(), `SELECT count(*) FROM content_log WHERE repository_id = $1`, repo).Scan(&n); err != nil {
 		t.Fatal(err)
 	}
 	return n
@@ -52,14 +50,14 @@ func TestContentIndexRebuild(t *testing.T) {
 	}
 	pinned := b.commit(b.tree(fileEntry("again", b.file([]byte("again\n")))), "more", commit)
 	mustPublish(t, e.s, e.repo, alice, b, nil)
-	if err := e.s.inTx(ctx, func(tx pgx.Tx) error { return e.s.pin(ctx, tx, e.repo, []ref{{table: tCommit, id: pinned}}) }); err != nil {
+	if err := e.s.inTx(ctx, func(tx *txn) error { return e.s.pin(ctx, tx, e.repo, []ref{{table: tCommit, id: pinned}}) }); err != nil {
 		t.Fatal(err)
 	}
 	if logRows(t, e.s, e.repo) == 0 {
 		t.Fatal("nothing logged after the rebuild")
 	}
 	var blocks int
-	if err := e.s.pool.QueryRow(ctx, `SELECT count(*) FROM index_block WHERE repository_id = $1 AND generation <> 2`, e.repo).Scan(&blocks); err != nil || blocks != 0 {
+	if err := poolOf(e.s).QueryRow(ctx, `SELECT count(*) FROM index_block WHERE repository_id = $1 AND generation <> 2`, e.repo).Scan(&blocks); err != nil || blocks != 0 {
 		t.Fatalf("%d blocks of the old generation remain (%v)", blocks, err)
 	}
 	clean(t, e.s, e.repo)
@@ -82,7 +80,7 @@ func TestFsckFindsAWrongContentIndex(t *testing.T) {
 	ce, _ := indexOf(t, e.s, e.repo).Get(chunk)
 	wrong := ce.Loc
 	wrong.Offset += 5
-	if err := e.s.inTx(ctx, func(tx pgx.Tx) error {
+	if err := e.s.inTx(ctx, func(tx *txn) error {
 		e.s.logIndex(tx, e.repo, contentindex.Update{Op: contentindex.Move, ID: chunk, Entry: contentindex.Entry{Kind: encoding.KindChunk, Loc: wrong}})
 		return nil
 	}); err != nil {
@@ -152,7 +150,7 @@ func TestSweepKeepsWhatTheIndexSaysIsFresh(t *testing.T) {
 	age(t, e.s, e.repo, 20)
 	chunk := pack.ChunkID(contents)
 	today := contentindex.DayOf(time.Now())
-	if err := e.s.inTx(ctx, func(tx pgx.Tx) error {
+	if err := e.s.inTx(ctx, func(tx *txn) error {
 		e.s.logIndex(tx, e.repo,
 			contentindex.Update{Op: contentindex.Touch, ID: f, Entry: contentindex.Entry{Kind: encoding.KindFile, Day: today}},
 			contentindex.Update{Op: contentindex.Touch, ID: chunk, Entry: contentindex.Entry{Kind: encoding.KindChunk, Day: today}})

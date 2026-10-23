@@ -16,7 +16,6 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"github.com/Cidan/ok/internal/control/db"
 	pages "github.com/Cidan/ok/internal/control/pages"
 	"github.com/Cidan/ok/internal/control/render"
 	"github.com/Cidan/ok/internal/control/review"
@@ -565,7 +564,7 @@ func (s *Server) commits(w http.ResponseWriter, r *http.Request) {
 	for i, c := range resp.GetCommits() {
 		ids[i] = c.GetId()
 	}
-	landed, err := db.LandedBy(ctx, s.db.Q(), repo.GetId(), ids)
+	landed, err := s.db.LandedBy(ctx, repo.GetId(), ids)
 	if err != nil {
 		fail(w, r, err)
 		return
@@ -638,7 +637,7 @@ func (s *Server) commit(w http.ResponseWriter, r *http.Request) {
 		}
 		v.Parents = append(v.Parents, pages.ParentRef{ShortSHA: scm.Short(parent), Href: commitHref(repo.GetName(), parent)})
 	}
-	landed, err := db.LandedBy(ctx, s.db.Q(), repo.GetId(), [][]byte{id})
+	landed, err := s.db.LandedBy(ctx, repo.GetId(), [][]byte{id})
 	if err != nil {
 		fail(w, r, err)
 		return

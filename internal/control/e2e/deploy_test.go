@@ -160,11 +160,11 @@ func itoa(n int64) string { return strconv.FormatInt(n, 10) }
 
 // dbChangeList reads a CL's projection in ok control's database.
 func dbChangeList(e *env, repo string, n int64) (db.ChangeList, bool, error) {
-	var id int64
-	if err := e.db.Q().QueryRow(context.Background(), `SELECT id FROM repository WHERE name = $1`, repo).Scan(&id); err != nil {
+	r, ok, err := e.db.RepositoryByName(context.Background(), repo)
+	if err != nil || !ok {
 		return db.ChangeList{}, false, err
 	}
-	return db.GetChangeList(context.Background(), e.db.Q(), id, n)
+	return e.db.GetChangeList(context.Background(), r.ID, n)
 }
 
 // TestDeployments shows a merged CL's deployments, and lets the CL's author retry and halt one,

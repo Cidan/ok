@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"strings"
 	"time"
-
-	"github.com/jackc/pgx/v5"
 )
 
 // Lease assigns a queued run to a worker — the highest priority's oldest, so post, which main
@@ -21,15 +19,9 @@ func (s *Store) Lease(ctx context.Context, worker string, wait time.Duration) (*
 		// Waiting for a notification starts before the claim, so a run queued between an
 		// empty claim and the wait still wakes it.
 		woken := s.notify.watch(chanQueue, "")
-		run, err := scanRun(s.pool.QueryRow(ctx, `UPDATE run
-			SET status = $2, worker = $3, lease_expires = now() + make_interval(secs => $4), started_at = now()
-			WHERE id = (SELECT id FROM run WHERE status = $1 ORDER BY priority DESC, id LIMIT 1 FOR UPDATE SKIP LOCKED)
-			RETURNING `+runColumns, StatusQueued, StatusRunning, worker, s.leaseTTL().Seconds()))
-		switch {
-		case err == nil:
-			return run, nil
-		case err != ErrNotFound:
-			return nil, err
+		run, err := s.b.ClaimRun(ctx, worker, s.leaseTTL())
+		if err != nil || run != nil {
+			return run, err
 		}
 		left := time.Until(deadline)
 		if left <= 0 {
@@ -54,59 +46,53 @@ const (
 // Heartbeat renews a worker's lease on a run, and says whether the worker must stop it, and
 // why: it was canceled, it ran past its timeout, or the lease is no longer the worker's.
 func (s *Store) Heartbeat(ctx context.Context, id int64, worker string) (stop Stop, reason string, err error) {
-	var stopReason *string
-	var overdue bool
-	var timeout int32
-	err = s.pool.QueryRow(ctx, `UPDATE run SET lease_expires = now() + make_interval(secs => $3)
-		WHERE id = $1 AND status = $4 AND worker = $2
-		RETURNING stop_reason, now() > started_at + make_interval(secs => timeout_seconds), timeout_seconds`,
-		id, worker, s.leaseTTL().Seconds(), StatusRunning).Scan(&stopReason, &overdue, &timeout)
+	l, ok, err := s.b.RenewLease(ctx, id, worker, s.leaseTTL())
 	switch {
-	case err == pgx.ErrNoRows:
-		return StopLeaseLost, ErrLeaseLost.Error(), nil
 	case err != nil:
 		return StopNone, "", err
-	case stopReason != nil:
-		return StopCanceled, *stopReason, nil
-	case overdue:
-		return StopTimedOut, fmt.Sprintf("it ran past its timeout of %s", time.Duration(timeout)*time.Second), nil
+	case !ok:
+		return StopLeaseLost, ErrLeaseLost.Error(), nil
+	case l.Stopping:
+		return StopCanceled, l.StopReason, nil
+	case l.Overdue:
+		return StopTimedOut, fmt.Sprintf("it ran past its timeout of %s", time.Duration(l.TimeoutSeconds)*time.Second), nil
 	}
 	return StopNone, "", nil
+}
+
+// leased reads a run, held, if it is running and worker's lease; ErrLeaseLost otherwise.
+func leased(ctx context.Context, tx Ops, id int64, worker string) (*Run, error) {
+	run, err := tx.LockRun(ctx, id)
+	if errors.Is(err, ErrNotFound) || err == nil && (run.Status != StatusRunning || run.Worker != worker) {
+		return nil, ErrLeaseLost
+	}
+	return run, err
 }
 
 // Release gives a leased run back to the queue, its log cleared, without spending an
 // attempt: its worker is shutting down. A run canceled meanwhile ends canceled instead.
 func (s *Store) Release(ctx context.Context, id int64, worker, reason string) error {
-	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		var stopReason *string
-		err := tx.QueryRow(ctx, `SELECT stop_reason FROM run WHERE id = $1 AND status = $2 AND worker = $3 FOR UPDATE`,
-			id, StatusRunning, worker).Scan(&stopReason)
-		if err == pgx.ErrNoRows {
-			return ErrLeaseLost
+	return s.b.Txn(ctx, func(tx Ops) error {
+		if _, err := leased(ctx, tx, id, worker); err != nil {
+			return err
 		}
+		stopping, stopReason, err := tx.StopRequest(ctx, id)
 		if err != nil {
 			return err
 		}
-		if stopReason != nil {
-			if _, err := tx.Exec(ctx, `UPDATE run SET status = $2, reason = stop_reason, finished_at = now(),
-					lease_expires = NULL, stop_reason = NULL WHERE id = $1`, id, StatusCanceled); err != nil {
+		if stopping {
+			if err := tx.FinishRun(ctx, id, StatusCanceled, 0, stopReason); err != nil {
 				return err
 			}
-			_, err = notify(ctx, tx, chanDone, id)
-			return err
+			return notify(ctx, tx, chanDone, id)
 		}
 		if reason == "" {
 			reason = "released by its worker"
 		}
-		if _, err := tx.Exec(ctx, `UPDATE run SET status = $2, reason = $3, worker = NULL, lease_expires = NULL,
-				started_at = NULL, log_size = 0 WHERE id = $1`, id, StatusQueued, reason); err != nil {
+		if err := tx.RequeueRun(ctx, id, reason, false); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(ctx, `DELETE FROM log_chunk WHERE run_id = $1`, id); err != nil {
-			return err
-		}
-		_, err = tx.Exec(ctx, `SELECT pg_notify($1, '')`, chanQueue)
-		return err
+		return queued(ctx, tx)
 	})
 }
 
@@ -116,12 +102,8 @@ func (s *Store) Finish(ctx context.Context, id int64, worker string, status Stat
 	if !status.Finished() {
 		return invalid("a run finishes passed, failed, canceled, or in error")
 	}
-	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		run, err := scanRun(tx.QueryRow(ctx, `SELECT `+runColumns+` FROM run
-			WHERE id = $1 AND status = $3 AND worker = $2 FOR UPDATE`, id, worker, StatusRunning))
-		if errors.Is(err, ErrNotFound) {
-			return ErrLeaseLost
-		}
+	err := s.b.Txn(ctx, func(tx Ops) error {
+		run, err := leased(ctx, tx, id, worker)
 		if err != nil {
 			return err
 		}
@@ -135,18 +117,17 @@ func (s *Store) Finish(ctx context.Context, id int64, worker string, status Stat
 		case len(pushed) > 0 && (run.Job.Kind != KindPush || status != StatusPassed):
 			return invalid("only a push run that passed carries what it pushed")
 		}
-		for i, p := range pushed {
+		for _, p := range pushed {
 			if p.Target != run.Job.Targets[0] || p.Registry == "" || p.Repository == "" || !validDigest(p.Digest) {
 				return invalid("a pushed image names the run's oci_push, where it went, and a sha256 digest")
 			}
-			if _, err := tx.Exec(ctx, `INSERT INTO pushed_image (run_id, position, target, registry, repository, digest, tags)
-				VALUES ($1, $2, $3, $4, $5, $6, $7)`, id, i, p.Target, p.Registry, p.Repository, p.Digest, orEmpty(p.Tags)); err != nil {
+		}
+		if len(pushed) > 0 {
+			if err := tx.InsertPushed(ctx, id, pushed); err != nil {
 				return err
 			}
 		}
-		if _, err := tx.Exec(ctx, `UPDATE run SET status = $2, exit_code = $3, reason = $4, finished_at = now(),
-				lease_expires = NULL, stop_reason = NULL WHERE id = $1`,
-			id, status, exitCode, reason); err != nil {
+		if err := tx.FinishRun(ctx, id, status, exitCode, reason); err != nil {
 			return err
 		}
 		if plan != nil {
@@ -154,8 +135,13 @@ func (s *Store) Finish(ctx context.Context, id int64, worker string, status Stat
 				return err
 			}
 		}
-		_, err = notify(ctx, tx, chanDone, id)
-		return err
+		if run.Origin.Phase == PhasePost {
+			// A post run's end is its repository's landing queue's to act on.
+			if err := notifyQueue(ctx, tx, run.RepositoryID); err != nil {
+				return err
+			}
+		}
+		return notify(ctx, tx, chanDone, id)
 	})
 	if err != nil {
 		return err
@@ -181,53 +167,32 @@ func validDigest(d string) bool {
 // sweepLeases acts on the leases that lapsed: a canceled run ends canceled; any other is
 // queued again, once, with its log cleared, and then ends in error.
 func (s *Store) sweepLeases(ctx context.Context) error {
-	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		rows, err := tx.Query(ctx, `UPDATE run SET
-				status = CASE WHEN stop_reason IS NOT NULL THEN $2::smallint
-					WHEN attempt < $3 THEN $4::smallint ELSE $5::smallint END,
-				reason = CASE WHEN stop_reason IS NOT NULL THEN stop_reason
-					WHEN attempt < $3 THEN 'its worker ' || worker || ' was lost; it runs again'
-					ELSE 'its worker ' || worker || ' was lost, on its last attempt' END,
-				attempt = CASE WHEN stop_reason IS NULL AND attempt < $3 THEN attempt + 1 ELSE attempt END,
-				finished_at = CASE WHEN stop_reason IS NULL AND attempt < $3 THEN NULL ELSE now() END,
-				started_at = CASE WHEN stop_reason IS NULL AND attempt < $3 THEN NULL ELSE started_at END,
-				worker = CASE WHEN stop_reason IS NULL AND attempt < $3 THEN NULL ELSE worker END,
-				log_size = CASE WHEN stop_reason IS NULL AND attempt < $3 THEN 0 ELSE log_size END,
-				lease_expires = NULL, stop_reason = NULL
-			WHERE status = $1 AND lease_expires < now()
-			RETURNING id, status`, StatusRunning, StatusCanceled, s.cfg.Attempts, StatusQueued, StatusError)
+	return s.b.Txn(ctx, func(tx Ops) error {
+		lapsed, err := tx.LapsedRuns(ctx)
 		if err != nil {
 			return err
 		}
-		type swept struct {
-			id     int64
-			status Status
-		}
-		var all []swept
-		for rows.Next() {
-			var w swept
-			if err := rows.Scan(&w.id, &w.status); err != nil {
-				rows.Close()
-				return err
-			}
-			all = append(all, w)
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
-			return err
-		}
-		for _, w := range all {
-			if w.status == StatusQueued {
-				// The lost attempt's log goes; the next attempt writes its own from the start.
-				if _, err := tx.Exec(ctx, `DELETE FROM log_chunk WHERE run_id = $1`, w.id); err != nil {
+		for _, l := range lapsed {
+			switch {
+			case l.Stopping:
+				if err := tx.FinishRun(ctx, l.ID, StatusCanceled, 0, l.StopReason); err != nil {
 					return err
 				}
-				if _, err := tx.Exec(ctx, `SELECT pg_notify($1, '')`, chanQueue); err != nil {
+			case l.Attempt < s.cfg.Attempts:
+				// The lost attempt's log goes; the next attempt writes its own from the start.
+				if err := tx.RequeueRun(ctx, l.ID, "its worker "+l.Worker+" was lost; it runs again", true); err != nil {
+					return err
+				}
+				if err := queued(ctx, tx); err != nil {
 					return err
 				}
 				continue
+			default:
+				if err := tx.FinishRun(ctx, l.ID, StatusError, 0, "its worker "+l.Worker+" was lost, on its last attempt"); err != nil {
+					return err
+				}
 			}
-			if _, err := notify(ctx, tx, chanDone, w.id); err != nil {
+			if err := notify(ctx, tx, chanDone, l.ID); err != nil {
 				return err
 			}
 		}

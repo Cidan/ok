@@ -203,14 +203,14 @@ func (a *API) clOut(t *target) *controlpb.CL {
 // review; a closed CL's is its reviewers and threads alone.
 func (a *API) reviewOut(ctx context.Context, t *target) (*controlpb.Review, *review.Evaluation, error) {
 	rv := &controlpb.Review{Approved: t.cl.Approved}
-	reviewers, err := db.Reviewers(ctx, a.db.Q(), t.repo.GetId(), t.cl.Number)
+	reviewers, err := a.db.Reviewers(ctx, t.repo.GetId(), t.cl.Number)
 	if err != nil {
 		return nil, nil, err
 	}
 	for _, r := range reviewers {
 		rv.Reviewers = append(rv.Reviewers, people.Handle(r.Principal))
 	}
-	comments, err := db.Comments(ctx, a.db.Q(), t.repo.GetId(), t.cl.Number)
+	comments, err := a.db.Comments(ctx, t.repo.GetId(), t.cl.Number)
 	if err != nil {
 		return nil, nil, err
 	}

@@ -9,7 +9,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	builddict "github.com/klauspost/compress/dict"
 	"github.com/klauspost/compress/zstd"
 
@@ -73,14 +72,12 @@ func (d *dictionaries) Decoder(id uint32) (*zstd.Decoder, error) {
 	if id < dictionaryIDBase {
 		return nil, fmt.Errorf("dictionary %d: no dictionary has that ID", id)
 	}
-	var body []byte
-	err := d.s.pool.QueryRow(context.Background(),
-		`SELECT body FROM dictionary WHERE id = $1 AND length(body) > 0`, int64(id-dictionaryIDBase)).Scan(&body)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, notFound("dictionary %d", id)
-	}
+	body, ok, err := d.s.b.DictionaryBody(context.Background(), int64(id-dictionaryIDBase))
 	if err != nil {
 		return nil, err
+	}
+	if !ok {
+		return nil, notFound("dictionary %d", id)
 	}
 	dec, err = zstd.NewReader(nil, zstd.WithDecoderDicts(body), zstd.WithDecoderConcurrency(0))
 	if err != nil {
@@ -103,11 +100,9 @@ func (s *Store) Dictionary(ctx context.Context, repo int64, id uint32) ([]byte, 
 	if id < dictionaryIDBase {
 		return nil, notFound("dictionary %d", id)
 	}
-	var body []byte
-	err := s.pool.QueryRow(ctx, `SELECT body FROM dictionary WHERE repository_id = $1 AND id = $2 AND length(body) > 0`,
-		repo, int64(id-dictionaryIDBase)).Scan(&body)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, notFound("dictionary %d", id)
+	body, ok, err := s.b.RepositoryDictionary(ctx, repo, int64(id-dictionaryIDBase))
+	if err == nil && !ok {
+		err = notFound("dictionary %d", id)
 	}
 	return body, err
 }
@@ -115,13 +110,8 @@ func (s *Store) Dictionary(ctx context.Context, repo int64, id uint32) ([]byte, 
 // newestDictionary is a repository's newest dictionary and when it was trained; a body of nil
 // when it has none.
 func (s *Store) newestDictionary(ctx context.Context, repo int64) (id uint32, body []byte, at time.Time, err error) {
-	var row int64
-	err = s.pool.QueryRow(ctx, `SELECT id, body, created_at FROM dictionary
-		WHERE repository_id = $1 AND length(body) > 0 ORDER BY id DESC LIMIT 1`, repo).Scan(&row, &body, &at)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return 0, nil, time.Time{}, nil
-	}
-	if err != nil {
+	row, body, at, ok, err := s.b.NewestDictionary(ctx, repo)
+	if err != nil || !ok {
 		return 0, nil, time.Time{}, err
 	}
 	return uint32(row + dictionaryIDBase), body, at, nil
@@ -193,9 +183,8 @@ func (s *Store) trainDictionary(ctx context.Context, repo int64, now time.Time) 
 	if len(samples) < least {
 		return 0, 0, nil
 	}
-	var row int64
-	if err := s.pool.QueryRow(ctx, `INSERT INTO dictionary (repository_id, body, samples) VALUES ($1, '', $2) RETURNING id`,
-		repo, len(samples)).Scan(&row); err != nil {
+	row, err := s.b.InsertDictionary(ctx, repo, len(samples))
+	if err != nil {
 		return 0, 0, err
 	}
 	id := uint32(row + dictionaryIDBase)
@@ -207,10 +196,10 @@ func (s *Store) trainDictionary(ctx context.Context, repo int64, now time.Time) 
 		ZstdLevel:      zstd.SpeedBestCompression,
 	})
 	if err == nil {
-		_, err = s.pool.Exec(ctx, `UPDATE dictionary SET body = $2 WHERE id = $1`, row, dict)
+		err = s.b.SetDictionaryBody(ctx, row, dict)
 	}
 	if err != nil {
-		if _, derr := s.pool.Exec(context.WithoutCancel(ctx), `DELETE FROM dictionary WHERE id = $1`, row); derr != nil {
+		if derr := s.b.DeleteDictionary(context.WithoutCancel(ctx), row); derr != nil {
 			return 0, 0, errors.Join(err, derr)
 		}
 		return 0, 0, fmt.Errorf("training dictionary %d: %w", id, err)

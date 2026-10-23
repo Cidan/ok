@@ -20,9 +20,10 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/Cidan/ok/internal/automation/store"
-	"github.com/Cidan/ok/internal/blob"
+	autopostgres "github.com/Cidan/ok/internal/automation/store/postgres"
 	"github.com/Cidan/ok/internal/serve/authn"
 	"github.com/Cidan/ok/internal/testdb"
+	"github.com/Cidan/ok/internal/testdb/testobjects"
 	automationpb "github.com/Cidan/ok/proto/ok/automation/v1"
 	okpb "github.com/Cidan/ok/proto/ok/v1"
 )
@@ -60,15 +61,12 @@ func newClients(t *testing.T) clients {
 		t.Fatal(err)
 	}
 	t.Cleanup(pool.Close)
-	s3 := testdb.S3(t)
-	blobs, err := blob.NewS3(blob.Config{Endpoint: s3.Endpoint, Bucket: testdb.Bucket(t), AccessKey: s3.AccessKey, SecretKey: s3.SecretKey, Region: s3.Region})
+	blobs := testobjects.Store(t)
+	b, err := autopostgres.Open(ctx, pool)
 	if err != nil {
 		t.Fatal(err)
 	}
-	st, err := store.Open(ctx, pool, blobs, store.DefaultConfig)
-	if err != nil {
-		t.Fatal(err)
-	}
+	st := store.New(b, blobs, store.DefaultConfig)
 	go st.Listen(ctx)
 	svc := New(st, 10*time.Second)
 	srv := grpc.NewServer(

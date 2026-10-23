@@ -24,6 +24,7 @@ import (
 	"github.com/Cidan/ok/internal/id/ca"
 	"github.com/Cidan/ok/internal/id/role"
 	idstore "github.com/Cidan/ok/internal/id/store"
+	idpostgres "github.com/Cidan/ok/internal/id/store/postgres"
 	"github.com/Cidan/ok/internal/pgdb"
 	"github.com/Cidan/ok/internal/serve"
 	identitypb "github.com/Cidan/ok/proto/ok/identity/v1"
@@ -141,10 +142,11 @@ func identityCertify(args []string, stdout io.Writer) error {
 		return err
 	}
 	defer pool.Close()
-	st, err := idstore.Open(ctx, pool, names)
+	b, err := idpostgres.Open(ctx, pool)
 	if err != nil {
 		return fmt.Errorf("the identity store: %w", err)
 	}
+	st := idstore.New(b, names)
 	authority, err := ca.Load(cfg.Identity.CADir)
 	if err != nil {
 		return fmt.Errorf("identity.ca_dir: %w (make one with: ok identity ca init)", err)

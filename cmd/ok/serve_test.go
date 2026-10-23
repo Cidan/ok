@@ -16,6 +16,7 @@ import (
 	"github.com/Cidan/ok/internal/id/ca"
 	"github.com/Cidan/ok/internal/id/signin/oidctest"
 	"github.com/Cidan/ok/internal/testdb"
+	"github.com/Cidan/ok/internal/testdb/testobjects"
 )
 
 // ok serve runs identity, the SCM, automation, and control in one process on one port, each role
@@ -35,7 +36,6 @@ func TestServe(t *testing.T) {
 		os.WriteFile(p, []byte(value+"\n"), 0o600)
 		return p
 	}
-	s3 := testdb.S3(t)
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -43,10 +43,7 @@ func TestServe(t *testing.T) {
 	addr := lis.Addr().String()
 	lis.Close()
 	base := "http://" + addr
-	bucket := func(field string) string {
-		return field + `: {endpoint: ` + s3.Endpoint + `, bucket: ` + testdb.Bucket(t) + `, region: ` + s3.Region +
-			`, access_key_file: ` + secret(field+"-access", s3.AccessKey) + `, secret_key_file: ` + secret(field+"-secret", s3.SecretKey) + `}`
-	}
+	bucket := func(field string) string { return field + `: ` + testobjects.New(t).YAML(secret) }
 	config := filepath.Join(dir, "ok.yaml")
 	os.WriteFile(config, []byte(`
 domain: example.com

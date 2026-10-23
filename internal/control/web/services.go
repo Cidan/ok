@@ -16,7 +16,6 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"github.com/Cidan/ok/internal/control/db"
 	pages "github.com/Cidan/ok/internal/control/pages"
 	"github.com/Cidan/ok/internal/control/pages/servicegroup"
 	"github.com/Cidan/ok/internal/control/review"
@@ -269,7 +268,7 @@ func (s *Server) landedCLs(ctx context.Context, svs []*deploypb.Service) (map[in
 	}
 	out := map[int64]map[string]int64{}
 	for repo, cs := range commits {
-		m, err := db.LandedBy(ctx, s.db.Q(), repo, cs)
+		m, err := s.db.LandedBy(ctx, repo, cs)
 		if err != nil {
 			return nil, err
 		}

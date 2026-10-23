@@ -10,8 +10,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/jackc/pgx/v5"
-
 	"github.com/Cidan/ok/internal/scm/contentindex"
 	"github.com/Cidan/ok/internal/scm/encoding"
 	"github.com/Cidan/ok/internal/scm/pack"
@@ -212,7 +210,7 @@ func TestReadFilesAfterRepack(t *testing.T) {
 	mustPublish(t, s, repo, "alice", b, nil)
 
 	var oldPack []byte
-	if err := s.pool.QueryRow(ctx, `SELECT id FROM pack WHERE repository_id = $1`, repo).Scan(&oldPack); err != nil {
+	if err := poolOf(s).QueryRow(ctx, `SELECT id FROM pack WHERE repository_id = $1`, repo).Scan(&oldPack); err != nil {
 		t.Fatal(err)
 	}
 	repack := func() {
@@ -240,10 +238,9 @@ func TestReadFilesAfterRepack(t *testing.T) {
 			t.Fatal(err)
 		}
 		// As compaction moves chunks.
-		if err := s.inTx(ctx, func(tx pgx.Tx) error {
-			var num uint64
-			if err := tx.QueryRow(ctx, `INSERT INTO pack (repository_id, id, size) VALUES ($1, $2, $3) RETURNING num`,
-				repo, id[:], size).Scan(&num); err != nil {
+		if err := s.inTx(ctx, func(tx *txn) error {
+			num, err := tx.InsertPack(ctx, repo, id, size, nil)
+			if err != nil {
 				return err
 			}
 			for cid, loc := range locs {

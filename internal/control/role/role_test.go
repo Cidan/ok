@@ -18,7 +18,6 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
-	"github.com/Cidan/ok/internal/blob"
 	"github.com/Cidan/ok/internal/config"
 	"github.com/Cidan/ok/internal/control/role"
 	"github.com/Cidan/ok/internal/dial"
@@ -32,6 +31,7 @@ import (
 	"github.com/Cidan/ok/internal/serve/authn"
 	"github.com/Cidan/ok/internal/serve/node"
 	"github.com/Cidan/ok/internal/testdb"
+	"github.com/Cidan/ok/internal/testdb/testobjects"
 	controlpb "github.com/Cidan/ok/proto/ok/control/v1"
 	scmpb "github.com/Cidan/ok/proto/ok/scm/v1"
 )
@@ -133,11 +133,7 @@ identity:
 
 	// The SCM.
 	scmCred := as("scm")
-	s3 := testdb.S3(t)
-	blobs, err := blob.NewS3(blob.Config{Endpoint: s3.Endpoint, Bucket: testdb.Bucket(t), AccessKey: s3.AccessKey, SecretKey: s3.SecretKey, Region: s3.Region})
-	if err != nil {
-		t.Fatal(err)
-	}
+	blobs := testobjects.Store(t)
 	scm, err := scmrole.Build(ctx, cfg, scmrole.Options{Pool: open(scmrole.Schema), Blobs: blobs, Identity: conn(idAddr, scmCred)})
 	if err != nil {
 		t.Fatal(err)

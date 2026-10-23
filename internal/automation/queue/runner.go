@@ -15,7 +15,7 @@ import (
 
 	"github.com/Cidan/ok/internal/automation/changes"
 	"github.com/Cidan/ok/internal/automation/store"
-	"github.com/Cidan/ok/internal/lock"
+	"github.com/Cidan/ok/internal/work"
 	"github.com/Cidan/ok/internal/workflow"
 	scmpb "github.com/Cidan/ok/proto/ok/scm/v1"
 )
@@ -42,8 +42,9 @@ type Config struct {
 // DefaultConfig is the service's.
 var DefaultConfig = Config{Depth: DefaultDepth, Idle: 10 * time.Second, Grace: 5 * time.Minute}
 
-// Runner runs the landing queue: one replica at a time (the store's queue lock) reads each
-// repository's queue, asks Decide what to do, and does it through the SCM and the store.
+// Runner runs the landing queue: each repository's queue is keyed work (internal/work), done by
+// one replica at a time and by every replica between them, which reads the queue, asks Decide
+// what to do, and does it through the SCM and the store.
 type Runner struct {
 	store *store.Store
 	scm   SCM
@@ -56,50 +57,34 @@ func New(s *store.Store, scm SCM, cfg Config, log *slog.Logger) *Runner {
 	return &Runner{store: s, scm: scm, cfg: cfg, log: log}
 }
 
-// Run runs the queue until ctx ends: it waits to lead, then passes over every repository's
-// queue whenever something it acts on changes, and at least every Idle — until it stops
-// leading, its lock lost, which ends the pass under way.
+// Run runs the queue until ctx ends: each repository's whenever something it acts on changes,
+// and every repository with work in the queue at least every Idle.
 func (r *Runner) Run(ctx context.Context) error {
-	for {
-		err := r.store.LeadQueue(ctx, r.lead)
-		if err != nil && !errors.Is(err, lock.ErrNotAcquired) && ctx.Err() == nil {
-			r.log.Warn("queue: leading", "err", err)
-		}
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-time.After(2 * time.Second):
-		}
-	}
+	return (&work.Runner{
+		Kind:  store.QueueWork,
+		Store: r.store.Work(),
+		Do:    r.repository,
+		Watch: r.store.WatchQueue,
+		Sweep: r.sweep,
+		Idle:  r.cfg.Idle,
+		Log:   r.log,
+	}).Run(ctx)
 }
 
-// lead passes over the queue as its leader, until ctx ends.
-func (r *Runner) lead(ctx context.Context) error {
-	for ctx.Err() == nil {
-		wait := r.store.WatchQueue()
-		if err := r.Pass(ctx); err != nil && ctx.Err() == nil {
-			r.log.Warn("queue: pass", "err", err)
-		}
-		if err := wait(ctx, r.cfg.Idle); err != nil {
-			break
-		}
-	}
-	return nil
-}
-
-// Pass acts once on every repository the queue has work in.
-func (r *Runner) Pass(ctx context.Context) error {
+// sweep marks the queue of every repository it has work in, to act on what no change announces:
+// what time decides.
+func (r *Runner) sweep(ctx context.Context) error {
 	repos, err := r.store.QueueRepositories(ctx, time.Hour)
 	if err != nil {
 		return err
 	}
-	var errs []error
+	w := r.store.Work()
 	for _, repo := range repos {
-		if err := r.repository(ctx, repo); err != nil {
-			errs = append(errs, fmt.Errorf("repository %d: %w", repo, err))
+		if err := w.Mark(ctx, store.QueueWork, repo); err != nil {
+			return err
 		}
 	}
-	return errors.Join(errs...)
+	return nil
 }
 
 // maxSteps bounds one pass over a repository: each step lands at most one submission.

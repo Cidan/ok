@@ -17,9 +17,12 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/Cidan/ok/internal/bus"
+	"github.com/Cidan/ok/internal/bus/busconfig"
 	"github.com/Cidan/ok/internal/config"
 	"github.com/Cidan/ok/internal/control/api"
 	"github.com/Cidan/ok/internal/control/db"
+	"github.com/Cidan/ok/internal/control/db/postgres"
 	"github.com/Cidan/ok/internal/control/feed"
 	"github.com/Cidan/ok/internal/control/pages"
 	"github.com/Cidan/ok/internal/control/people"
@@ -45,7 +48,7 @@ const Schema = "control"
 type Role struct {
 	Root     node.Node
 	Resolver *authn.Resolver
-	DB       *db.DB
+	DB       db.Store
 	Review   *review.Service
 	closers  []func()
 }
@@ -61,8 +64,10 @@ func (r *Role) Close() {
 type Options struct {
 	// Dev accepts development principals: a role on loopback, for local development and tests.
 	Dev bool
-	// Pool, when set, is the database instead of the configuration's: tests.
-	Pool *pgxpool.Pool
+	// Pool and Stream, when set, are the database and the bus's stream instead of the
+	// configuration's: tests.
+	Pool   *pgxpool.Pool
+	Stream bus.Stream
 	// The other roles, when set, dialed as ok control: tests. Unset, each is dialed at its
 	// services address.
 	Identity, SCM, Automation, Deploy grpc.ClientConnInterface
@@ -121,9 +126,18 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (*Role, error)
 		}
 		r.closers = append(r.closers, pool.Close)
 	}
-	d, err := db.Open(ctx, pool)
+	d, err := postgres.Open(ctx, pool)
 	if err != nil {
 		return nil, fmt.Errorf("ok control's database: %w", err)
+	}
+	stream := opts.Stream
+	if stream == nil {
+		bb, err := busconfig.Open(ctx, cfg.Bus, pool)
+		if err != nil {
+			return nil, err
+		}
+		r.closers = append(r.closers, bb.Close)
+		stream = bb.Stream
 	}
 	r.DB = d
 
@@ -205,7 +219,7 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (*Role, error)
 		cl.SetPoll(opts.Poll)
 	}
 	cls := &changeLists{api: cl}
-	follow := &follower{f: feed.New(d, sc, r.Review)}
+	follow := &follower{f: feed.New(d, stream, sc, r.Review)}
 	r.Root = &assembly{deps: []node.Node{site, cls, follow, roots}}
 	ok = true
 	return r, nil

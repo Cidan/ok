@@ -34,7 +34,6 @@ type Syncer struct {
 	source   directory.Source
 	name     string // the source's kind: static, google, entra, ldap, scim
 	interval time.Duration
-	locks    *lock.Lock
 	poke     chan struct{}
 	failing  atomic.Bool
 }
@@ -43,7 +42,7 @@ var _ node.Application = (*Syncer)(nil)
 
 // New is a syncer of source (of kind name) into st, every interval.
 func New(st *store.Store, source directory.Source, name string, interval time.Duration) *Syncer {
-	return &Syncer{store: st, source: source, name: name, interval: interval, locks: lock.New(st.Pool()), poke: make(chan struct{}, 1)}
+	return &Syncer{store: st, source: source, name: name, interval: interval, poke: make(chan struct{}, 1)}
 }
 
 func (s *Syncer) Name() string                 { return "ok/identity/sync" }
@@ -66,7 +65,7 @@ func (s *Syncer) Changed() {
 func (s *Syncer) Sync(ctx context.Context) (*directory.Plan, error) {
 	var plan *directory.Plan
 	start := time.Now()
-	err := s.locks.LockFn(ctx, "identity", "sync", lockWait, func(ctx context.Context) error {
+	err := s.store.LockSync(ctx, lockWait, func(ctx context.Context) error {
 		opts, err := s.store.SyncOptions(ctx)
 		if err != nil {
 			return err

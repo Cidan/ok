@@ -2,12 +2,8 @@ package store
 
 import (
 	"context"
-	"errors"
 	"strconv"
 	"time"
-
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // Notification channels: a run was queued; a run's log grew (payload: its ID); a run
@@ -20,10 +16,13 @@ const (
 	chanSubmission = "ok_automation_submission"
 )
 
-// notify sends a notification about a run, delivered when tx commits.
-func notify(ctx context.Context, tx pgx.Tx, channel string, id int64) (pgconn.CommandTag, error) {
-	return tx.Exec(ctx, `SELECT pg_notify($1, $2)`, channel, strconv.FormatInt(id, 10))
+// notify sends a notification about a run or a repository, delivered when tx commits.
+func notify(ctx context.Context, tx Ops, channel string, id int64) error {
+	return tx.Notify(ctx, channel, strconv.FormatInt(id, 10))
 }
+
+// queued wakes the workers waiting for a run, when tx commits.
+func queued(ctx context.Context, tx Ops) error { return tx.Notify(ctx, chanQueue, "") }
 
 // StartRequest is a job to run on a commit.
 type StartRequest struct {
@@ -70,20 +69,16 @@ func (s *Store) Start(ctx context.Context, req StartRequest) (*Run, error) {
 		return nil, invalid("a timeout is between a second and %s", s.cfg.MaxTimeout)
 	}
 	var run *Run
-	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+	err := s.b.Txn(ctx, func(tx Ops) error {
 		var err error
-		run, err = scanRun(tx.QueryRow(ctx, `INSERT INTO run (repository_id, commit_id, kind, targets, args,
-				phase, cl_number, patchset, job, requested_by, status, timeout_seconds, priority)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-			RETURNING `+runColumns,
-			req.RepositoryID, req.CommitID, req.Job.Kind, orEmpty(req.Job.Targets), orEmpty(req.Job.Args),
-			req.Origin.Phase, nullable(req.Origin.CLNumber), nullable(req.Origin.Patchset),
-			req.Origin.Job, req.RequestedBy, StatusQueued, int32(timeout/time.Second), priority))
+		run, err = tx.InsertRun(ctx, NewRun{
+			RepositoryID: req.RepositoryID, CommitID: req.CommitID, Job: req.Job, Origin: req.Origin,
+			RequestedBy: req.RequestedBy, Status: StatusQueued, TimeoutSeconds: int32(timeout / time.Second), Priority: priority,
+		})
 		if err != nil {
 			return err
 		}
-		_, err = tx.Exec(ctx, `SELECT pg_notify($1, '')`, chanQueue)
-		return err
+		return queued(ctx, tx)
 	})
 	return run, err
 }
@@ -94,15 +89,12 @@ func (s *Store) Cancel(ctx context.Context, id int64, reason string) (*Run, erro
 	if reason == "" {
 		reason = "canceled"
 	}
-	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		var phase Phase
-		if err := tx.QueryRow(ctx, `SELECT phase FROM run WHERE id = $1`, id).Scan(&phase); err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				return ErrNotFound
-			}
+	err := s.b.Txn(ctx, func(tx Ops) error {
+		r, err := tx.Run(ctx, id)
+		if err != nil {
 			return err
 		}
-		if phase == PhasePost {
+		if r.Origin.Phase == PhasePost {
 			return &ConflictError{Message: "a post run is its submission's: cancel the submission"}
 		}
 		return cancelRun(ctx, tx, id, reason)
@@ -114,20 +106,25 @@ func (s *Store) Cancel(ctx context.Context, id int64, reason string) (*Run, erro
 }
 
 // cancelRun ends a queued run canceled, or asks a running run's worker to stop it.
-func cancelRun(ctx context.Context, tx pgx.Tx, id int64, reason string) error {
+func cancelRun(ctx context.Context, tx Ops, id int64, reason string) error {
 	// A queued run has no log: it is stored, empty, as it ends.
-	tag, err := tx.Exec(ctx, `UPDATE run SET status = $2, reason = $3, finished_at = now(), log_stored = true
-		WHERE id = $1 AND status = $4`, id, StatusCanceled, reason, StatusQueued)
+	ended, err := tx.CancelQueuedRun(ctx, id, reason)
 	if err != nil {
 		return err
 	}
-	if tag.RowsAffected() == 1 {
-		_, err = notify(ctx, tx, chanDone, id)
-		return err
+	if ended {
+		return notify(ctx, tx, chanDone, id)
 	}
-	_, err = tx.Exec(ctx, `UPDATE run SET stop_reason = $2 WHERE id = $1 AND status = $3 AND stop_reason IS NULL`,
-		id, reason, StatusRunning)
-	return err
+	return tx.RequestStop(ctx, id, reason)
+}
+
+// rerunOf is a new run of prev's job on its commit, requested by by: a rerun of it.
+func rerunOf(prev *Run, by string) NewRun {
+	return NewRun{
+		RepositoryID: prev.RepositoryID, CommitID: prev.CommitID, Job: prev.Job, Origin: prev.Origin,
+		PlanID: prev.PlanID, Why: prev.Why, RequestedBy: by, RerunOf: prev.ID, Status: StatusQueued,
+		TimeoutSeconds: prev.TimeoutSeconds,
+	}
 }
 
 // Rerun queues a finished run's job on its commit again, as a new run.
@@ -136,8 +133,8 @@ func (s *Store) Rerun(ctx context.Context, id int64, requestedBy string) (*Run, 
 		return nil, invalid("a run is requested by someone")
 	}
 	var run *Run
-	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		prev, err := scanRun(tx.QueryRow(ctx, `SELECT `+runColumns+` FROM run WHERE id = $1`, id))
+	err := s.b.Txn(ctx, func(tx Ops) error {
+		prev, err := tx.Run(ctx, id)
 		if err != nil {
 			return err
 		}
@@ -151,69 +148,30 @@ func (s *Store) Rerun(ctx context.Context, id int64, requestedBy string) (*Run, 
 			return &ConflictError{Message: "a push is its deployment's: retry the deployment"}
 		}
 		if prev.Job.Kind == KindPlan {
-			var planned bool
-			if err := tx.QueryRow(ctx, `SELECT planned FROM plan WHERE id = $1 FOR UPDATE`, prev.PlanID).Scan(&planned); err != nil {
+			plan, err := tx.LockPlan(ctx, prev.PlanID)
+			if err != nil {
 				return err
 			}
-			if planned {
+			if plan.Planned {
 				return &ConflictError{Message: "the patchset is planned: run its jobs again instead"}
 			}
 		}
-		run, err = scanRun(tx.QueryRow(ctx, `INSERT INTO run (repository_id, commit_id, kind, targets, args,
-				phase, cl_number, patchset, job, plan_id, why, requested_by, rerun_of, status, timeout_seconds)
-			SELECT repository_id, commit_id, kind, targets, args, phase, cl_number, patchset, job, plan_id, why,
-				$2, id, $3, timeout_seconds
-			FROM run WHERE id = $1
-			RETURNING `+runColumns, id, requestedBy, StatusQueued))
-		if err != nil {
+		if run, err = tx.InsertRun(ctx, rerunOf(prev, requestedBy)); err != nil {
 			return err
 		}
-		_, err = tx.Exec(ctx, `SELECT pg_notify($1, '')`, chanQueue)
-		return err
+		return queued(ctx, tx)
 	})
 	return run, err
 }
 
 // MainCommits returns each repository's newest n commits on main, as automation has seen main
-// move (main_commit), newest first.
+// move, newest first.
 func (s *Store) MainCommits(ctx context.Context, n int) (map[int64][][]byte, error) {
-	rows, err := s.pool.Query(ctx, `SELECT repository_id, commit_id FROM (
-			SELECT repository_id, commit_id, row_number() OVER (PARTITION BY repository_id ORDER BY seq DESC) AS r
-			FROM main_commit) m
-		WHERE r <= $1 ORDER BY repository_id, r`, n)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := map[int64][][]byte{}
-	for rows.Next() {
-		var repo int64
-		var commit []byte
-		if err := rows.Scan(&repo, &commit); err != nil {
-			return nil, err
-		}
-		out[repo] = append(out[repo], commit)
-	}
-	return out, rows.Err()
+	return s.b.MainCommits(ctx, n)
 }
 
 // RunCommits returns the commits of every run queued or running, or finished since since, by
 // repository.
 func (s *Store) RunCommits(ctx context.Context, since time.Time) (map[int64][][]byte, error) {
-	rows, err := s.pool.Query(ctx, `SELECT DISTINCT repository_id, commit_id FROM run
-		WHERE status IN ($1, $2) OR finished_at >= $3`, StatusQueued, StatusRunning, since)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := map[int64][][]byte{}
-	for rows.Next() {
-		var repo int64
-		var commit []byte
-		if err := rows.Scan(&repo, &commit); err != nil {
-			return nil, err
-		}
-		out[repo] = append(out[repo], commit)
-	}
-	return out, rows.Err()
+	return s.b.RunCommits(ctx, since)
 }

@@ -31,6 +31,7 @@ import (
 	"github.com/Cidan/ok/internal/id/service"
 	"github.com/Cidan/ok/internal/id/signin"
 	"github.com/Cidan/ok/internal/id/store"
+	idpostgres "github.com/Cidan/ok/internal/id/store/postgres"
 	"github.com/Cidan/ok/internal/id/syncer"
 	"github.com/Cidan/ok/internal/id/web"
 	"github.com/Cidan/ok/internal/idclient"
@@ -95,7 +96,8 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (*Role, error)
 			pool.Close()
 		}
 	}()
-	st, err := store.Open(ctx, pool, names)
+	b, err := idpostgres.Open(ctx, pool)
+	st := store.New(b, names)
 	if err != nil {
 		return nil, fmt.Errorf("the identity store: %w", err)
 	}

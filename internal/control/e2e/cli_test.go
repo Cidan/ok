@@ -137,10 +137,11 @@ func TestCommandLineLifecycle(t *testing.T) {
 	w := &steered{e: e}
 	go w.run(ctx)
 	e.post(alice, "/repositories/new", url.Values{"name": {"svc"}})
-	var repoID int64
-	if err := e.db.Q().QueryRow(ctx, `SELECT id FROM repository WHERE name = 'svc'`).Scan(&repoID); err != nil {
-		t.Fatal(err)
+	svc, ok, err := e.db.RepositoryByName(ctx, "svc")
+	if err != nil || !ok {
+		t.Fatalf("the svc repository: %v %v", ok, err)
 	}
+	repoID := svc.ID
 	a, b, c := e.person(alice), e.person(bob), e.person(carol)
 	a.jj("", "clone", "svc")
 

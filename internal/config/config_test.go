@@ -34,7 +34,8 @@ func TestDefaultsAndRefusals(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Listen != ":8472" || c.MetricsListen != ":8473" || c.Installation != "ok" || c.Identity.SystemOfRecord.Interval != 10*time.Minute {
+	if c.Listen != ":8472" || c.MetricsListen != ":8473" || c.Installation != "ok" || c.Identity.SystemOfRecord.Interval != 10*time.Minute ||
+		c.Bus.Stream.Type != "postgres" || c.Bus.Queue.Type != "postgres" {
 		t.Errorf("defaults: %+v", c)
 	}
 	for name, bad := range map[string]string{
@@ -47,6 +48,7 @@ func TestDefaultsAndRefusals(t *testing.T) {
 		"a bad admin":       "domain: example.com\npublic_url: https://ok.example.com\nidentity: {bootstrap_admins: [Ada Lovelace]}\n",
 		"oidc ids twice":    "domain: example.com\npublic_url: https://ok.example.com\nidentity: {sign_in: {oidc: [{id: g}, {id: g}]}}\n",
 		"no audience":       "domain: example.com\npublic_url: https://ok.example.com\nidentity: {federation: [{issuer: https://x}]}\n",
+		"an unknown stream": "domain: example.com\npublic_url: https://ok.example.com\nbus: {stream: {type: carrier-pigeon}}\n",
 	} {
 		if _, err := Parse([]byte(bad)); err == nil {
 			t.Errorf("%s: accepted", name)

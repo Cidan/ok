@@ -32,7 +32,7 @@ import (
 
 // Server serves ok control's pages.
 type Server struct {
-	db          *db.DB
+	db          db.Store
 	scm         *scm.Client
 	runs        automationpb.RunsClient
 	deploys     deploypb.DeploymentsClient
@@ -43,7 +43,7 @@ type Server struct {
 
 // New builds the site over ok control's database, the SCM, ok automation's runs, the
 // deployer's deployments, and review.
-func New(d *db.DB, c *scm.Client, runs automationpb.RunsClient, deploys deploypb.DeploymentsClient, r *review.Service, dir *people.Directory) *Server {
+func New(d db.Store, c *scm.Client, runs automationpb.RunsClient, deploys deploypb.DeploymentsClient, r *review.Service, dir *people.Directory) *Server {
 	return &Server{db: d, scm: c, runs: runs, deploys: deploys, review: r, people: dir, changeCache: newChangeCache()}
 }
 

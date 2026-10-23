@@ -383,8 +383,12 @@ automation (`internal/automation/queue`):
   just before a crash, after a grace period — and a CL main has though the queue lost the record
   of landing it is adopted when its attempt had passed.
 
-One replica runs the queue at a time (its lock, `internal/lock`), woken by any submission, plan, run, or
-commit on main, and at least every ten seconds. A submission has one active attempt at a time:
+Each repository's queue is keyed work (`internal/work`; hosted.md, "Work without leaders"): a row
+marked whenever a submission, a post plan, a post run, or a commit on main changes what it acts on,
+done by one replica at a time — whichever takes it first — and by every replica between them, the
+queue's repositories shared among them. Every replica looks for marked work as each mark's
+notification arrives, and at least every ten seconds, when it also marks every repository with
+work in the queue, for what time decides. A submission has one active attempt at a time:
 the store refuses another while one is active, so its post never runs twice. Each submission
 says what it waits for (its note: testing on top of which CLs, waiting for which to land).
 

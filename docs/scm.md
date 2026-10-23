@@ -9,7 +9,7 @@ ok is built of roles on one runtime, and a client; three matter here:
 
 - **The SCM** (`internal/scm`) is the source of truth for code. It is a Go gRPC service
   that implements jj's storage interfaces server-side: content-addressed objects (file contents in
-  packfiles on S3, every other object in PostgreSQL), one operation log per workspace — each
+  packfiles in object storage, every other object in PostgreSQL), one operation log per workspace — each
   workspace isolated from every other — each repository's `main`, and the ChangeList lifecycle —
   identity, author, status, patchsets, stacks, and landing.
 - **ok control** is the web UI and the review process: reviewers,
@@ -49,7 +49,7 @@ one line of history, `main`, which only submit moves; everything else is a Chang
 4. **BLAKE3-256 over a canonical encoding** defined here, implemented in Go (server) and Rust
    (client) against shared golden vectors. Objects travel over the wire as their canonical bytes,
    and both ends verify every hash they receive.
-5. **Storage split.** File contents live in packfiles on S3, FastCDC-chunked above 128 KiB. Every
+5. **Storage split.** File contents live in packfiles in object storage, FastCDC-chunked above 128 KiB. Every
    other object and all state live in PostgreSQL.
 6. **CLs only.** Uploading creates and updates CLs; `main` moves only by submit. Only a CL's
    author uploads its patchsets.
@@ -474,11 +474,11 @@ the serving runtime's single port, split along who may call them (*Authorization
 - **`Landing`** for ok automation's landing queue: candidates and landing;
 - **`LandingChecks`** for dry runs of a landing (ok control's Submit button);
 - **`Browse`** for code reads by ok control and automation;
-- **`Events`** for the change feed;
+- **`Events`** for each repository's log of events;
 - **`Workspaces`** for okfs's attachment leases and checkpoints (`docs/okfs.md`).
 
-Replicas are stateless: all coordination is in PostgreSQL, and file contents are in a private S3
-bucket the installation names (`scm.objects`). The SCM brings its tables to its schema when it
+Replicas are stateless: all coordination is in PostgreSQL, and file contents are in a private
+object store the installation names (`scm.objects`: an S3 or GCS bucket, or a directory). The SCM brings its tables to its schema when it
 starts (*Schema*). `ok scm fsck [-repair] REPOSITORY` verifies one repository against its
 invariants.
 
@@ -493,7 +493,7 @@ invariants.
 3. The client sends the missing object bodies and chunks, then `commit`, optionally carrying an
    operation-heads update (`old_ids`, `new_id`).
 4. The server verifies everything ("What the server verifies"). It then:
-   - writes the new chunks as one pack to S3;
+   - writes the new chunks as one pack to the object store;
    - runs one PostgreSQL transaction that:
      - locks the caller's `op_log` row whenever the publish carries operations, views, or a heads
        update;
@@ -518,7 +518,7 @@ only there: a workspace's views name only its own working copy, and its operatio
   manifest (its size and chunks) with one query per 1,000 files, then the chunks a window at a time
   — up to 16 MiB of them, located with one query — each window's packs read together before its
   frames go out, in request order. Chunks whose data lie within 128 KiB of each other in a pack are
-  read with one S3 range GET, up to 4 MiB, the bytes between them discarded; packs keep a
+  read with one range GET, up to 4 MiB, the bytes between them discarded; packs keep a
   directory's files together (compaction orders chunks by path), so a directory is usually one
   read. Up to eight range GETs run at once per call. Every chunk is verified against its ID as it
   arrives and kept in an in-memory cache as its pack stores it, compressed; a read whose pack was
@@ -661,7 +661,7 @@ footer     u64 offset of the index, magic "OKSCMEND"
 Chunks are stored with zstd (level 3) unless compression doesn't shrink them; compaction later
 compresses small ones with the repository's dictionary (*Dictionaries*), which the frame names.
 The records and index make a pack self-describing, so `ok scm fsck` can verify every pack
-against the content index (hashes, locations, lengths) and rebuild its chunk entries from S3; a
+against the content index (hashes, locations, lengths) and rebuild its chunk entries from the object store; a
 chunk compressed with a dictionary is verified with it.
 
 ### The content index
@@ -859,20 +859,38 @@ asked (`docs/automation.md`, "Rollbacks"). It creates a CL that rolls back a lan
 ### Events
 
 Every SCM transaction that changes a repository or a CL writes its events in the same
-transaction. Each event takes the next sequence number from a single counter row, whose lock is
-held until commit, so sequence order is commit order and a reader never skips an event. The
-counter is always the last lock a transaction takes, just before commit, so it never joins a
-deadlock and holds the global order for as short a time as possible. The same transaction
-notifies the PostgreSQL channel `the SCM's database_events`, delivered at commit; each replica holds one
-connection listening on it, which wakes the replica's watchers, and a caught-up watcher also
-re-reads every 30 seconds in case a notification was lost with that connection.
-`Events.Watch(after)` streams from a cursor; events are never pruned, so a new consumer replays
-the whole feed. ok control consumes it to keep its repository and CL projections current (for
-the finder and the change log), to assign reviewers passed with an upload, to re-evaluate
-approval when a patchset arrives, to re-derive every active CL's approval when a landing edits
-OWNERS, and (later) to start automation. `Transition` and `Land` return the sequence number of
-the last event they wrote, so ok control can wait until its feed has applied its own action
-before it renders the page that follows.
+transaction, in the repository's log: each takes the next place in that log from the
+repository's own counter row (`repository_seq`), whose lock is held until commit, so the log's
+order is commit order and two repositories' writes never wait on each other (hosted.md, "The
+per-repository log"). The counter is the last lock a transaction takes, just before commit, so it
+never joins a deadlock and holds the order for as short a time as possible. Events are never
+pruned. The same transaction marks the events pending, and the relay — every replica runs one —
+publishes them on the bus's stream (topic `scm.events`, keyed by repository, numbered by
+`repository_seq`) and forgets them: each takes pending events with `FOR UPDATE SKIP LOCKED`, so
+relays beside it take others, and deletes them in the transaction that took them once they are
+published, so one that dies first leaves them for the next. The transaction also notifies the
+PostgreSQL channel `ok_scm_events`, delivered at commit; each replica holds one connection
+listening on it, which wakes its relay, and the relay also looks every second in case a
+notification was lost with that connection. `Events.Read(repository, after)` reads a
+repository's log from a place in it, a page at a time: what a follower of the stream fills a gap
+with.
+
+ok control, ok automation, and ok's deployer follow the stream, every replica of each a
+member of the role's group, which shares the repositories among them (`internal/bus/follow`;
+hosted.md, "Consumers"). Each keeps a cursor per repository — the place in its log of the last
+event applied — and applies an event once: one at or before the cursor is a duplicate, and one
+after a gap waits for `Events.Read` to fill it. As it starts, a follower makes its group, so
+what is published from then reaches it, then catches up every repository whose log went past its
+cursor (`Events.Heads`) — events published before the group was, or while the follower was away
+longer than the stream keeps them. A follower of the feed that numbered every repository's
+events together before (`Events.Watch`, now gone) leaves it once, seeding each repository's
+cursor from where the feed had reached: each event it numbered keeps its number (`event.seq`),
+and `Events.Heads` answers as of one. ok control follows to keep its repository and CL projections current (for the finder and
+the change log), to assign reviewers passed with an upload, to re-evaluate approval when a
+patchset arrives, and to re-derive every active CL's approval when a landing edits OWNERS.
+`Transition`, `Rollback`, and `Land` return the last event they wrote, by its place in its
+repository's log, so ok control can wait until its follower has applied its own action before it
+renders the page that follows.
 
 ## Submit: path-level landing
 
@@ -936,7 +954,7 @@ runs one PostgreSQL transaction:
      - committer set to the actor's signature at landing time;
      - no signature.
 3. **Write and publish**, unless this is a dry run. It writes L's new trees and commit (a splice
-   creates no file contents, so landing never touches S3). It then advances `main` from H to the
+   creates no file contents, so landing never touches the object store). It then advances `main` from H to the
    last L, appends to `head_log` (one row per L), marks each CL submitted with its landed commit
    and submitter, indexes each L's changed leaf paths for `Log`, drops the landed CLs' pending
    candidates, pins everything, and emits a `landed` event per CL and a `head_moved` event per L.
@@ -1073,15 +1091,15 @@ repositories themselves are never deleted (see "Decisions").
   by the path on `main` of a file that holds them, then their offset in it, for read locality;
   chunks no file on `main` holds follow, by ID. One pass reads at most 1 GiB of source packs in a
   repository; the rest waits for the next.
-  1. The new pack is written to S3.
+  1. The new pack is written to the object store.
   2. One transaction moves its chunks to it in the content index — each only if the index still
      has it where compaction read it. Once every new pack is written, the source packs left with
      no chunk are retired.
-  3. Retired packs are deleted from S3 an hour later, then their rows. A read that located a
+  3. Retired packs are deleted from the object store an hour later, then their rows. A read that located a
      chunk in a pack before it moved still reads it, and one that finds the pack gone locates
      the chunk again.
 
-  Packs in S3 with no `pack` row (a publish or compaction that failed after uploading) are
+  Packs in the object store with no `pack` row (a publish or compaction that failed after uploading) are
   deleted after a day.
 - **Every pack is unique.** A pack begins with 16 random bytes (see "Storage"), so no two packs
   share an ID or a key even when they hold the same chunks. Nothing ever writes a deleted pack's
@@ -1118,7 +1136,7 @@ the protocol has no way to (see "Decisions"). "Other people can't write to your 
 | `Review` | ok control | for a person it authorized (`actor`): `CreateRepository` (who becomes its creator), `Transition`, and `Rollback` |
 | `Landing` | ok automation | `PrepareCandidate`, `DiscardCandidate`, `ListCandidates`, and `Land`, for the submissions ok control hands it (the landing queue): `main` moves only once post passes |
 | `LandingChecks` | ok control, ok automation | `DryRunLand`: ok control's Submit button checks a landing, changing nothing |
-| `Events` | ok control, ok automation, ok's deployer | `Watch`, the change feed |
+| `Events` | ok control, ok automation, ok's deployer | `Read`, a repository's log; `Heads`, how far each reaches |
 
 ## Protocol
 
@@ -1166,9 +1184,10 @@ newer than the binary is refused. The tables:
 - **ChangeLists:** `changelist`, `patchset`, and `candidate`, and `changelist_counter`, each
   repository's next CL number in a row of its own (see "Upload" for why it is not the
   repository row).
-- **Events:** `event`, ordered by `event_counter`, whose row lock serializes event sequence
-  numbers in commit order. Its one row is made by the first event (a declaration holds no
-  data), as a repository's `changelist_counter` row is by its first CL.
+- **Events:** `event`, keyed by repository and `repository_seq`, the place in its log its
+  `repository_event_counter` row's lock serializes in commit order; `event_pending`, the events the
+  relay has yet to publish. A repository's counter row is made by its first event (a declaration
+  holds no data), as its `changelist_counter` row is by its first CL.
 
 Two planner decisions are part of the schema:
 

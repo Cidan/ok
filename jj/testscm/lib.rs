@@ -1,14 +1,18 @@
 //! An ok SCM for the jj client's end-to-end tests (docs/building.md, "Tests").
 //!
-//! [`endpoint`] starts one `ok scm serve -dev` per test process, over the PostgreSQL and S3 the
-//! environment names as PostgreSQL's and AWS's tools name them (PGHOST, PGUSER, …;
-//! AWS_ENDPOINT_URL_S3, …), serving plaintext on a loopback port. The SCM makes its own schema in
-//! the database, and its bucket, [`BUCKET`], if it does not exist. The `ok` binary is `$OK_BINARY`, else `ok` on
-//! the PATH. With no ok identity behind it, a development SCM trusts the principal a caller names
+//! [`endpoint`] starts one `ok scm serve -dev` per test process, over the PostgreSQL the
+//! environment names as PostgreSQL's tools name it (PGHOST, PGUSER, …), serving plaintext on a
+//! loopback port, and the object store `OK_TEST_OBJECTS` names (as ok's Go tests take it,
+//! internal/testdb/testobjects): `s3` (the default), the S3 server AWS's tools name
+//! (AWS_ENDPOINT_URL_S3, …); `gcs`, a GCS emulator this process starts on its loopback
+//! (`$OK_GCS_BINARY`, else `ok-test-gcs` on the PATH); or `fs`, a directory. The SCM makes its own
+//! schema in the database, and its S3 bucket, [`BUCKET`], if it does not exist. The `ok` binary is
+//! `$OK_BINARY`, else `ok` on the PATH. With no ok identity behind it, a development SCM trusts the principal a caller names
 //! in its `ok-dev-principal` metadata, which the jj client sends for a loopback SCM (a clone's
 //! recorded principal), and which the clients here send for any principal a test acts as —
 //! [`CONTROL`] included. Tests share the server and isolate by repository: each creates its own.
 
+use std::io::BufRead as _;
 use std::io::Read as _;
 use std::net::TcpListener;
 use std::net::TcpStream;
@@ -50,6 +54,31 @@ struct Server {
 
 static SERVER: OnceLock<Server> = OnceLock::new();
 static IDENTITY: OnceLock<Server> = OnceLock::new();
+static GCS: OnceLock<Emulator> = OnceLock::new();
+
+/// The object store the test SCM keeps its packs in.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Objects {
+    S3,
+    Gcs,
+    Fs,
+}
+
+/// The object store `OK_TEST_OBJECTS` names: S3 unless it says `gcs` or `fs`.
+fn objects() -> Objects {
+    match std::env::var("OK_TEST_OBJECTS").as_deref() {
+        Err(_) | Ok("") | Ok("s3") => Objects::S3,
+        Ok("gcs") => Objects::Gcs,
+        Ok("fs") => Objects::Fs,
+        Ok(other) => panic!("OK_TEST_OBJECTS={other:?} is none of s3, gcs, and fs"),
+    }
+}
+
+/// The GCS emulator, its address `127.0.0.1:<port>`, with [`BUCKET`] made.
+struct Emulator {
+    addr: String,
+    _child: Child,
+}
 
 /// The people the test identity knows, from its static system of record: ada.human.example.com.
 pub const IDENTITY_PEOPLE: &str = "people:\n  - {id: \"1\", email: ada@example.com, name: Ada}\n";
@@ -66,16 +95,18 @@ fn var(name: &str) -> String {
 /// returns when it is false: the test is skipped, and says so — unless `OK_TEST_INTEGRATION` is
 /// `require`, as CI sets it, when a missing server fails the test instead.
 pub fn available() -> bool {
-    let missing: Vec<&str> = [
-        "PGHOST",
-        "PGUSER",
-        "AWS_ENDPOINT_URL_S3",
-        "AWS_ACCESS_KEY_ID",
-        "AWS_SECRET_ACCESS_KEY",
-    ]
-    .into_iter()
-    .filter(|v| std::env::var(v).map_or(true, |x| x.is_empty()))
-    .collect();
+    let mut needed = vec!["PGHOST", "PGUSER"];
+    if objects() == Objects::S3 {
+        needed.extend([
+            "AWS_ENDPOINT_URL_S3",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+        ]);
+    }
+    let missing: Vec<&str> = needed
+        .into_iter()
+        .filter(|v| std::env::var(v).map_or(true, |x| x.is_empty()))
+        .collect();
     if missing.is_empty() {
         return true;
     }
@@ -97,14 +128,43 @@ pub fn endpoint() -> &'static str {
     &SERVER.get_or_init(start).endpoint
 }
 
-/// The ok binary.
+/// The ok binary, finding the GCS emulator, when the SCM keeps its packs there, as a GCS client
+/// finds any emulator: by STORAGE_EMULATOR_HOST.
 fn ok() -> Command {
     let bin = std::env::var("OK_BINARY").unwrap_or_else(|_| "ok".to_owned());
     let mut cmd = Command::new(bin);
     cmd.env_clear()
         .env("PATH", var("PATH"))
         .env("HOME", var("HOME"));
+    if objects() == Objects::Gcs {
+        cmd.env("STORAGE_EMULATOR_HOST", &GCS.get_or_init(start_gcs).addr);
+    }
     cmd
+}
+
+/// Starts the GCS emulator on a loopback port, with [`BUCKET`]; it prints the address it listens
+/// at, and runs until the test process ends.
+fn start_gcs() -> Emulator {
+    let bin = std::env::var("OK_GCS_BINARY").unwrap_or_else(|_| "ok-test-gcs".to_owned());
+    let mut cmd = Command::new(bin);
+    cmd.env_clear()
+        .env("PATH", var("PATH"))
+        .env("HOME", var("HOME"))
+        .args(["-listen", "127.0.0.1:0", "-bucket", BUCKET])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped());
+    let mut child = spawn_for_process(cmd)
+        .expect("start the GCS emulator (is ok-test-gcs on the PATH, or OK_GCS_BINARY set?)");
+    let mut addr = String::new();
+    std::io::BufReader::new(child.stdout.take().expect("the GCS emulator's output"))
+        .read_line(&mut addr)
+        .expect("read the GCS emulator's address");
+    let addr = addr.trim().to_owned();
+    assert!(!addr.is_empty(), "the GCS emulator printed no address");
+    Emulator {
+        addr,
+        _child: child,
+    }
 }
 
 /// The database URL the environment's PGHOST, PGPORT, PGUSER, PGPASSWORD, and PGDATABASE name
@@ -144,15 +204,31 @@ fn write_config(port: u16) -> PathBuf {
         p.display().to_string()
     };
     let db = secret("database-url", &database_url());
-    let access = secret("access-key", &var("AWS_ACCESS_KEY_ID"));
-    let secret_key = secret("secret-key", &var("AWS_SECRET_ACCESS_KEY"));
+    let objects = match objects() {
+        Objects::S3 => {
+            let access = secret("access-key", &var("AWS_ACCESS_KEY_ID"));
+            let secret_key = secret("secret-key", &var("AWS_SECRET_ACCESS_KEY"));
+            format!(
+                "{{endpoint: {:?}, bucket: {BUCKET}, region: {:?}, access_key_file: {access:?}, secret_key_file: {secret_key:?}}}",
+                var("AWS_ENDPOINT_URL_S3"),
+                std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".to_owned()),
+            )
+        }
+        Objects::Gcs => format!(
+            "{{type: gcs, endpoint: \"http://{}/storage/v1/\", bucket: {BUCKET}}}",
+            GCS.get_or_init(start_gcs).addr
+        ),
+        Objects::Fs => {
+            let packs = dir.join("objects");
+            std::fs::create_dir_all(&packs).expect("make the test SCM's object directory");
+            format!("{{type: fs, dir: {:?}}}", packs.display().to_string())
+        }
+    };
     let config = format!(
         "domain: example.com\npublic_url: http://127.0.0.1:{port}\nlisten: 127.0.0.1:{port}\nmetrics_listen: 127.0.0.1:0\n\
          roles: {{control: control.ok, automation: automation.ok}}\n\
          database: {{url_file: {db:?}}}\n\
-         scm:\n  objects: {{endpoint: {:?}, bucket: {BUCKET}, region: {:?}, access_key_file: {access:?}, secret_key_file: {secret_key:?}}}\n",
-        var("AWS_ENDPOINT_URL_S3"),
-        std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".to_owned()),
+         scm:\n  objects: {objects}\n"
     );
     let path = dir.join("ok.yaml");
     std::fs::write(&path, config).expect("write the test SCM's configuration");

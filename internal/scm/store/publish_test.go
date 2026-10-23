@@ -11,8 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5"
-
 	"github.com/Cidan/ok/internal/scm/contentindex"
 	"github.com/Cidan/ok/internal/scm/encoding"
 	"github.com/Cidan/ok/internal/scm/pack"
@@ -106,7 +104,7 @@ func TestPublishRoundTrip(t *testing.T) {
 	}
 
 	var gen int64
-	if err := s.pool.QueryRow(ctx, `SELECT generation FROM commit WHERE repository_id = $1 AND id = $2`, repo.ID, c2[:]).Scan(&gen); err != nil || gen != 2 {
+	if err := poolOf(s).QueryRow(ctx, `SELECT generation FROM commit WHERE repository_id = $1 AND id = $2`, repo.ID, c2[:]).Scan(&gen); err != nil || gen != 2 {
 		t.Fatalf("c2 generation = %d, %v", gen, err)
 	}
 	report, err := s.Fsck(ctx, repo.ID, false)
@@ -315,13 +313,13 @@ func TestConcurrentPublishers(t *testing.T) {
 		t.Error(err)
 	}
 	var commits, heads int
-	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM commit WHERE repository_id = $1`, repo.ID).Scan(&commits); err != nil {
+	if err := poolOf(s).QueryRow(ctx, `SELECT count(*) FROM commit WHERE repository_id = $1`, repo.ID).Scan(&commits); err != nil {
 		t.Fatal(err)
 	}
 	if commits != writers+1 {
 		t.Errorf("%d commits stored, want %d", commits, writers+1)
 	}
-	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM op_head h JOIN op_log l ON l.id = h.op_log_id
+	if err := poolOf(s).QueryRow(ctx, `SELECT count(*) FROM op_head h JOIN op_log l ON l.id = h.op_log_id
 		WHERE l.repository_id = $1 AND l.principal IN ('p0', 'p1', 'p2')`, repo.ID).Scan(&heads); err != nil {
 		t.Fatal(err)
 	}
@@ -350,15 +348,15 @@ func TestDeadlockRetry(t *testing.T) {
 	locked.Add(2)
 	var once [2]sync.Once
 	lockPair := func(side int, first, second int64) error {
-		return s.inTx(ctx, func(tx pgx.Tx) error {
-			if _, err := tx.Exec(ctx, `SELECT id FROM repository WHERE id = $1 FOR UPDATE`, first); err != nil {
+		return s.inTx(ctx, func(tx *txn) error {
+			if _, _, err := tx.LockRepositoryName(ctx, first); err != nil {
 				return err
 			}
 			once[side].Do(func() {
 				locked.Done()
 				locked.Wait() // both hold their first lock before either asks for its second
 			})
-			_, err := tx.Exec(ctx, `SELECT id FROM repository WHERE id = $1 FOR UPDATE`, second)
+			_, _, err := tx.LockRepositoryName(ctx, second)
 			return err
 		})
 	}
@@ -379,14 +377,14 @@ func touchedToday(t *testing.T, s *Store, repo int64, tableName string, id encod
 	t.Helper()
 	if tableName == "file" || tableName == "chunk" {
 		var day time.Time
-		if err := s.pool.QueryRow(context.Background(), `SELECT current_date`).Scan(&day); err != nil {
+		if err := poolOf(s).QueryRow(context.Background(), `SELECT current_date`).Scan(&day); err != nil {
 			t.Fatal(err)
 		}
 		e, ok := indexOf(t, s, repo).Get(id)
 		return ok && e.Day == contentindex.DayOf(day)
 	}
 	var today bool
-	if err := s.pool.QueryRow(context.Background(),
+	if err := poolOf(s).QueryRow(context.Background(),
 		`SELECT touched_at = current_date FROM `+tableName+` WHERE repository_id = $1 AND id = $2`, repo, id[:]).Scan(&today); err != nil {
 		t.Fatal(err)
 	}
@@ -414,7 +412,7 @@ func TestTouchIsTransitiveAndStopsAtPinned(t *testing.T) {
 			})
 			return
 		}
-		if _, err := s.pool.Exec(ctx, `UPDATE `+tableName+` SET touched_at = current_date - 20 WHERE repository_id = $1 AND id = $2`, repo.ID, id[:]); err != nil {
+		if _, err := poolOf(s).Exec(ctx, `UPDATE `+tableName+` SET touched_at = current_date - 20 WHERE repository_id = $1 AND id = $2`, repo.ID, id[:]); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -424,7 +422,7 @@ func TestTouchIsTransitiveAndStopsAtPinned(t *testing.T) {
 	}{{"object", outer}, {"object", inner}, {"object", pinnedTree}, {"file", f}, {"file", pinnedFile}} {
 		age(x.table, x.id)
 	}
-	if _, err := s.pool.Exec(ctx, `UPDATE object SET pinned = true WHERE repository_id = $1 AND id = $2`, repo.ID, pinnedTree[:]); err != nil {
+	if _, err := poolOf(s).Exec(ctx, `UPDATE object SET pinned = true WHERE repository_id = $1 AND id = $2`, repo.ID, pinnedTree[:]); err != nil {
 		t.Fatal(err)
 	}
 	// A new commit referencing the outer tree touches it and everything unpinned beneath.

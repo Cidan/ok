@@ -6,8 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
-
-	"github.com/jackc/pgx/v5"
 )
 
 // logKey is a finished run's log object in the bucket.
@@ -27,24 +25,20 @@ func (s *Store) AppendLog(ctx context.Context, id int64, worker string, offset i
 		return 0, invalid("a log offset is not negative")
 	}
 	var size int64
-	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		var status Status
-		var holder *string
-		if err := tx.QueryRow(ctx, `SELECT status, worker, log_size FROM run WHERE id = $1 FOR UPDATE`, id).
-			Scan(&status, &holder, &size); err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				return ErrNotFound
-			}
+	err := s.b.Txn(ctx, func(tx Ops) error {
+		run, err := tx.LockRun(ctx, id)
+		if err != nil {
 			return err
 		}
-		if status != StatusRunning || holder == nil || *holder != worker {
+		size = run.LogSize
+		if run.Status != StatusRunning || run.Worker != worker {
 			return ErrLeaseLost
 		}
 		if offset > size {
 			return invalid("the log is %d bytes; a write at %d leaves a gap", size, offset)
 		}
 		// Only what extends the log is new.
-		data = data[min(int64(len(data)), size-offset):]
+		data := data[min(int64(len(data)), size-offset):]
 		if len(data) == 0 {
 			return nil
 		}
@@ -57,23 +51,13 @@ func (s *Store) AppendLog(ctx context.Context, id int64, worker string, offset i
 		if room := s.cfg.MaxLog - int64(len(note)) - size; int64(len(data)) > room {
 			data = append(append([]byte{}, data[:room]...), note...)
 		}
-		if _, err := tx.Exec(ctx, `INSERT INTO log_chunk (run_id, at, data) VALUES ($1, $2, $3)`, id, size, data); err != nil {
+		if err := tx.AppendLogChunk(ctx, id, size, data); err != nil {
 			return err
 		}
 		size += int64(len(data))
-		if _, err := tx.Exec(ctx, `UPDATE run SET log_size = $2 WHERE id = $1`, id, size); err != nil {
-			return err
-		}
-		_, err := notify(ctx, tx, chanLog, id)
-		return err
+		return notify(ctx, tx, chanLog, id)
 	})
 	return size, err
-}
-
-// logChunk is a part of a log: its bytes at its offset.
-type logChunk struct {
-	at   int64
-	data []byte
 }
 
 // ReadLog emits a run's log from offset: what there is, then — with follow — what is
@@ -97,15 +81,15 @@ func (s *Store) ReadLog(ctx context.Context, id, offset int64, follow bool, emit
 		if run.LogStored {
 			return s.readStored(ctx, run, offset, emit)
 		}
-		chunks, err := s.chunksFrom(ctx, id, offset)
+		chunks, err := s.b.LogChunks(ctx, id, offset)
 		if err != nil {
 			return err
 		}
 		for _, c := range chunks {
-			if c.at > offset {
+			if c.At > offset {
 				break // the chunks moved to the bucket as they were read: read again
 			}
-			data := c.data[offset-c.at:]
+			data := c.Data[offset-c.At:]
 			offset += int64(len(data))
 			if err := emit(offset-int64(len(data)), data, run.Status.Finished() && offset == run.LogSize); err != nil {
 				return err
@@ -127,25 +111,6 @@ func (s *Store) ReadLog(ctx context.Context, id, offset int64, follow bool, emit
 			return err
 		}
 	}
-}
-
-// chunksFrom returns the log's chunks that reach past offset, in order.
-func (s *Store) chunksFrom(ctx context.Context, id, offset int64) ([]logChunk, error) {
-	rows, err := s.pool.Query(ctx, `SELECT at, data FROM log_chunk
-		WHERE run_id = $1 AND at + length(data) > $2 ORDER BY at`, id, offset)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []logChunk
-	for rows.Next() {
-		var c logChunk
-		if err := rows.Scan(&c.at, &c.data); err != nil {
-			return nil, err
-		}
-		out = append(out, c)
-	}
-	return out, rows.Err()
 }
 
 // readChunk is how much of a stored log one emit carries.
@@ -182,16 +147,16 @@ func (s *Store) storeLog(ctx context.Context, id int64) error {
 		return nil
 	}
 	if run.LogSize > 0 {
-		chunks, err := s.chunksFrom(ctx, id, 0)
+		chunks, err := s.b.LogChunks(ctx, id, 0)
 		if err != nil {
 			return err
 		}
 		var log bytes.Buffer
 		for _, c := range chunks {
-			if c.at != int64(log.Len()) {
-				return fmt.Errorf("the log of run %d is missing bytes %d to %d", id, log.Len(), c.at)
+			if c.At != int64(log.Len()) {
+				return fmt.Errorf("the log of run %d is missing bytes %d to %d", id, log.Len(), c.At)
 			}
-			log.Write(c.data)
+			log.Write(c.Data)
 		}
 		if int64(log.Len()) != run.LogSize {
 			return fmt.Errorf("the log of run %d has %d of its %d bytes", id, log.Len(), run.LogSize)
@@ -200,22 +165,12 @@ func (s *Store) storeLog(ctx context.Context, id int64) error {
 			return fmt.Errorf("store the log of run %d: %w", id, err)
 		}
 	}
-	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx, `UPDATE run SET log_stored = true WHERE id = $1`, id); err != nil {
-			return err
-		}
-		_, err := tx.Exec(ctx, `DELETE FROM log_chunk WHERE run_id = $1`, id)
-		return err
-	})
+	return s.b.MarkLogStored(ctx, id)
 }
 
 // sweepLogs moves the logs of finished runs a failed move left in the database.
 func (s *Store) sweepLogs(ctx context.Context) error {
-	rows, err := s.pool.Query(ctx, `SELECT id FROM run WHERE status >= $1 AND NOT log_stored ORDER BY id LIMIT 100`, StatusPassed)
-	if err != nil {
-		return err
-	}
-	ids, err := pgx.CollectRows(rows, pgx.RowTo[int64])
+	ids, err := s.b.UnstoredLogs(ctx, 100)
 	if err != nil {
 		return err
 	}

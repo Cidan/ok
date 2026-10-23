@@ -243,11 +243,11 @@ func (s *Review) Transition(ctx context.Context, req *scmpb.TransitionRequest) (
 	if kind < store.RequestReview || kind > store.Restore {
 		return nil, status.Errorf(codes.InvalidArgument, "transition %d", req.GetKind())
 	}
-	c, seq, err := s.c.store.Transition(ctx, req.GetRepositoryId(), req.GetNumber(), kind, req.GetActor(), req.GetReason())
+	c, ev, err := s.c.store.Transition(ctx, req.GetRepositoryId(), req.GetNumber(), kind, req.GetActor(), req.GetReason())
 	if err != nil {
 		return nil, toStatus(err)
 	}
-	return &scmpb.TransitionResponse{ChangeList: changeListOut(c), EventSeq: seq}, nil
+	return &scmpb.TransitionResponse{ChangeList: changeListOut(c), RepositorySeq: ev.GetRepositorySeq()}, nil
 }
 
 func (s *Review) Rollback(ctx context.Context, req *scmpb.RollbackRequest) (*scmpb.RollbackResponse, error) {
@@ -264,7 +264,7 @@ func (s *Review) Rollback(ctx context.Context, req *scmpb.RollbackRequest) (*scm
 	if err != nil {
 		return nil, toStatus(err)
 	}
-	return &scmpb.RollbackResponse{ChangeList: changeListOut(*r.ChangeList), EventSeq: r.Seq}, nil
+	return &scmpb.RollbackResponse{ChangeList: changeListOut(*r.ChangeList), RepositorySeq: r.Event.GetRepositorySeq()}, nil
 }
 
 func (s *Landing) PrepareCandidate(ctx context.Context, req *scmpb.PrepareCandidateRequest) (*scmpb.Candidate, error) {
@@ -359,11 +359,11 @@ func (s *core) land(ctx context.Context, req *scmpb.LandRequest) (*scmpb.LandRes
 			items[i].Candidate = &id
 		}
 	}
-	landed, head, seq, err := s.store.Land(ctx, req.GetRepositoryId(), items, expected, req.GetActor(), req.GetDryRun())
+	landed, head, last, err := s.store.Land(ctx, req.GetRepositoryId(), items, expected, req.GetActor(), req.GetDryRun())
 	if err != nil {
 		return nil, toStatus(err)
 	}
-	out := &scmpb.LandResponse{Head: head[:], EventSeq: seq}
+	out := &scmpb.LandResponse{Head: head[:], RepositorySeq: last.GetRepositorySeq()}
 	for _, l := range landed {
 		out.Landed = append(out.Landed, &scmpb.LandResponse_Landed{Number: l.Number, CommitId: l.Commit[:]})
 	}
@@ -383,13 +383,34 @@ type Events struct {
 	c *core
 }
 
-func (s *Events) Watch(req *scmpb.WatchRequest, stream grpc.ServerStreamingServer[scmpb.Event]) error {
-	ctx := stream.Context()
+func (s *Events) Heads(ctx context.Context, req *scmpb.HeadsRequest) (*scmpb.HeadsResponse, error) {
 	if _, err := caller(ctx); err != nil {
-		return err
+		return nil, err
 	}
-	if req.GetAfterSeq() < 0 {
-		return status.Error(codes.InvalidArgument, "after_seq is negative")
+	if req.GetLimit() < 0 {
+		return nil, status.Error(codes.InvalidArgument, "limit is negative")
 	}
-	return toStatus(s.c.store.WatchEvents(ctx, req.GetAfterSeq(), stream.Send))
+	heads, err := s.c.store.LogHeads(ctx, req.GetAsOfSeq(), req.GetAfterRepositoryId(), int(req.GetLimit()))
+	if err != nil {
+		return nil, toStatus(err)
+	}
+	out := &scmpb.HeadsResponse{Heads: make([]*scmpb.HeadsResponse_Head, len(heads))}
+	for i, h := range heads {
+		out.Heads[i] = &scmpb.HeadsResponse_Head{RepositoryId: h.Repository, RepositorySeq: h.Seq}
+	}
+	return out, nil
+}
+
+func (s *Events) Read(ctx context.Context, req *scmpb.ReadEventsRequest) (*scmpb.ReadEventsResponse, error) {
+	if _, err := caller(ctx); err != nil {
+		return nil, err
+	}
+	if req.GetLimit() < 0 {
+		return nil, status.Error(codes.InvalidArgument, "limit is negative")
+	}
+	evs, err := s.c.store.ReadEvents(ctx, req.GetRepositoryId(), req.GetAfterSeq(), int(req.GetLimit()))
+	if err != nil {
+		return nil, toStatus(err)
+	}
+	return &scmpb.ReadEventsResponse{Events: evs}, nil
 }

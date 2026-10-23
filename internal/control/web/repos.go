@@ -7,7 +7,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/Cidan/ok/internal/control/db"
 	pages "github.com/Cidan/ok/internal/control/pages"
 	"github.com/Cidan/ok/internal/control/people"
 	"github.com/Cidan/ok/internal/control/review"
@@ -28,7 +27,7 @@ func rowsURL(keyword string) string {
 // repoPage is one page of the finder: the principal's favorites first, then the most
 // recently updated, and whether another page follows.
 func (s *Server) repoPage(r *http.Request, keyword string, page int) ([]pages.RepoItem, bool, error) {
-	rs, err := db.ListRepositories(r.Context(), s.db.Q(), principal(r), keyword, (page-1)*repoPageSize, repoPageSize+1)
+	rs, err := s.db.ListRepositories(r.Context(), principal(r), keyword, (page-1)*repoPageSize, repoPageSize+1)
 	if err != nil {
 		return nil, false, err
 	}
@@ -125,7 +124,7 @@ func (s *Server) star(on bool) http.HandlerFunc {
 			fail(w, r, err)
 			return
 		}
-		if err := db.SetFavorite(r.Context(), s.db.Q(), principal(r), repo.GetId(), on); err != nil {
+		if err := s.db.SetFavorite(r.Context(), principal(r), repo.GetId(), on); err != nil {
 			fail(w, r, err)
 			return
 		}

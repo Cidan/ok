@@ -6,18 +6,17 @@
 // each commit main moves to, and the CL it is — and cancels a submission whose CL gets a new
 // patchset, is abandoned, or returns to draft.
 //
-// One replica follows the feed at a time (an advisory lock). An event's plan is recorded once
-// however often it is seen, and the cursor never moves back, so replaying the feed from any
-// point plans nothing twice.
+// Every replica follows the SCM's events, as the bus's stream brings them and each repository's
+// log fills in, sharing the repositories (the stream's group, automation; internal/bus/follow).
+// An event's plan is recorded once however often it is seen, and each repository's cursor never
+// moves back, so applying an event again plans nothing twice.
 package feed
 
 import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"time"
 
@@ -25,7 +24,9 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/Cidan/ok/internal/automation/store"
-	"github.com/Cidan/ok/internal/lock"
+	"github.com/Cidan/ok/internal/bus"
+	"github.com/Cidan/ok/internal/bus/follow"
+	"github.com/Cidan/ok/internal/scm/scmfeed"
 	"github.com/Cidan/ok/internal/workflow"
 	scmpb "github.com/Cidan/ok/proto/ok/scm/v1"
 )
@@ -40,22 +41,22 @@ type SCM struct {
 
 // Follower plans the patchsets the SCM's change feed announces.
 type Follower struct {
-	store *store.Store
-	scm   SCM
-	log   *slog.Logger
+	store  *store.Store
+	stream bus.Stream
+	scm    SCM
+	log    *slog.Logger
 }
 
-// New builds a follower.
-func New(s *store.Store, scm SCM, log *slog.Logger) *Follower {
-	return &Follower{store: s, scm: scm, log: log}
+// New builds a follower of the SCM's events on stream.
+func New(s *store.Store, stream bus.Stream, scm SCM, log *slog.Logger) *Follower {
+	return &Follower{store: s, stream: stream, scm: scm, log: log}
 }
 
-// Run follows the feed until ctx ends: it waits to be the leader, then applies events as they
-// come — until the stream breaks or the leader's lock is lost — reconnecting after a failure.
+// Run follows the SCM's events until ctx ends, starting again after a failure.
 func (f *Follower) Run(ctx context.Context) error {
+	fl := &follow.Follower{Stream: f.stream, Topic: scmfeed.Topic, Group: "automation", Log: scmfeed.Log{Events: f.scm.Events}, Apply: applier{f}}
 	for {
-		err := f.store.LeadFeed(ctx, f.follow)
-		if !errors.Is(err, lock.ErrNotAcquired) && ctx.Err() == nil {
+		if err := fl.Run(ctx); ctx.Err() == nil {
 			f.log.Warn("feed: stopped following", "err", err)
 		}
 		select {
@@ -66,35 +67,34 @@ func (f *Follower) Run(ctx context.Context) error {
 	}
 }
 
-// follow applies the feed from the cursor until the stream breaks, an event cannot be applied
-// yet, or ctx ends.
-func (f *Follower) follow(ctx context.Context) error {
-	cursor, err := f.store.Cursor(ctx)
-	if err != nil {
-		return err
-	}
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	stream, err := f.scm.Events.Watch(ctx, &scmpb.WatchRequest{AfterSeq: cursor})
-	if err != nil {
-		return err
-	}
-	for {
-		ev, err := stream.Recv()
-		if errors.Is(err, io.EOF) {
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-		if err := f.Apply(ctx, ev); err != nil {
-			return fmt.Errorf("event %d: %w", ev.GetSeq(), err)
-		}
-		if err := f.store.SetCursor(ctx, ev.GetSeq()); err != nil {
-			return err
-		}
-	}
+// applier is the follower as a follow.Applier and follow.Legacy: an event applied, then its
+// repository's cursor moved past it.
+type applier struct{ *Follower }
+
+func (a applier) Cursor(ctx context.Context, repo int64) (int64, error) {
+	return a.store.Cursor(ctx, repo)
 }
+
+func (a applier) Apply(ctx context.Context, e bus.Event) error {
+	cursor, err := a.store.Cursor(ctx, e.Key)
+	if err != nil || e.Seq <= cursor {
+		return err
+	}
+	ev, err := scmfeed.Decode(e)
+	if err != nil {
+		return err
+	}
+	if err := a.Follower.Apply(ctx, ev); err != nil {
+		return fmt.Errorf("event %d of repository %d: %w", e.Seq, e.Key, err)
+	}
+	return a.store.SetCursor(ctx, e.Key, e.Seq)
+}
+
+func (a applier) LegacyCursor(ctx context.Context) (int64, error) { return a.store.LegacyCursor(ctx) }
+func (a applier) Seed(ctx context.Context, repo, seq int64) error {
+	return a.store.Seed(ctx, repo, seq)
+}
+func (a applier) LeaveLegacy(ctx context.Context) error { return a.store.LeaveLegacy(ctx) }
 
 // Apply acts on one event. An error is one worth retrying: the event is applied again later.
 func (f *Follower) Apply(ctx context.Context, ev *scmpb.Event) error {
@@ -147,7 +147,7 @@ func (f *Follower) Apply(ctx context.Context, ev *scmpb.Event) error {
 		switch st.Code() {
 		case codes.NotFound, codes.InvalidArgument, codes.FailedPrecondition, codes.PermissionDenied:
 			// The SCM refuses it for what it is, and always will: plan nothing, and move on.
-			f.log.Warn("feed: not planned", "seq", ev.GetSeq(), "repository", repo, "err", err)
+			f.log.Warn("feed: not planned", "repository", repo, "seq", ev.GetRepositorySeq(), "err", err)
 			return nil
 		}
 	}

@@ -20,6 +20,8 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 
 	"github.com/Cidan/ok/internal/buildsys/bazel"
+	"github.com/Cidan/ok/internal/bus"
+	"github.com/Cidan/ok/internal/bus/busconfig"
 	"github.com/Cidan/ok/internal/checkout"
 	"github.com/Cidan/ok/internal/config"
 	"github.com/Cidan/ok/internal/credential"
@@ -28,6 +30,7 @@ import (
 	"github.com/Cidan/ok/internal/deploy/roll"
 	"github.com/Cidan/ok/internal/deploy/service"
 	"github.com/Cidan/ok/internal/deploy/store"
+	"github.com/Cidan/ok/internal/deploy/store/postgres"
 	"github.com/Cidan/ok/internal/dial"
 	"github.com/Cidan/ok/internal/idclient"
 	"github.com/Cidan/ok/internal/pgdb"
@@ -76,9 +79,10 @@ type Options struct {
 	// run, for the Bazel Build.
 	Bazel string
 	Env   []string
-	// Pool, Kube, Identity, SCM, and Automation, when set, are the database, the cluster, and the
-	// roles, dialed as the deployer already: tests.
+	// Pool, Stream, Kube, Identity, SCM, and Automation, when set, are the database, the bus's
+	// stream, the cluster, and the roles, dialed as the deployer already: tests.
 	Pool                      *pgxpool.Pool
+	Stream                    bus.Stream
 	Kube                      kubernetes.Interface
 	Identity, SCM, Automation grpc.ClientConnInterface
 	// Timing and Interval, when set, are the watch's and the engine's: tests.
@@ -118,11 +122,21 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (*Role, error)
 		}
 		r.closers = append(r.closers, pool.Close)
 	}
-	st, err := store.Open(ctx, pool)
+	b, err := postgres.Open(ctx, pool)
 	if err != nil {
 		return nil, fmt.Errorf("the deployer's store: %w", err)
 	}
+	st := store.New(b)
 	r.Store = st
+	stream := opts.Stream
+	if stream == nil {
+		bb, err := busconfig.Open(ctx, cfg.Bus, pool)
+		if err != nil {
+			return nil, err
+		}
+		r.closers = append(r.closers, bb.Close)
+		stream = bb.Stream
+	}
 	kube := opts.Kube
 	if kube == nil {
 		var rc *rest.Config
@@ -218,7 +232,7 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (*Role, error)
 	events := scmpb.NewEventsClient(scmConn)
 	r.Root = &assembly{deps: []node.Node{
 		&services{svc: service.New(st)},
-		&app{name: "ok/deploy/feed", run: func(ctx context.Context) error { return engine.Follow(ctx, st, events, slog.Default()) }},
+		&app{name: "ok/deploy/feed", run: func(ctx context.Context) error { return engine.Follow(ctx, st, stream, events, slog.Default()) }},
 		&app{name: "ok/deploy/observer", run: (&observe.Observer{Store: st, Kube: kube, Labels: labels, Log: slog.Default()}).Run},
 		&app{name: "ok/deploy/engine", run: func(ctx context.Context) error {
 			defer r.Engine.Wait()

@@ -422,6 +422,15 @@ func TestServeMetrics(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
+	// Serve serves before it marks itself ready: ok_ready is 1 once /readyz says so.
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+		if code, _ := getStatus(t, "http://"+addr+"/readyz"); code == http.StatusOK {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("Serve never said it was ready")
+		}
+	}
 
 	code, body := getStatus(t, "http://"+metricsLis.Addr().String()+"/metrics")
 	if code != http.StatusOK {

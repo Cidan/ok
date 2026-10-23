@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
@@ -67,14 +68,36 @@ func Bucket(t testing.TB) string {
 	if err := c.MakeBucket(ctx, name, minio.MakeBucketOptions{Region: s.Region}); err != nil {
 		t.Fatalf("testdb: creating bucket %s: %v", name, err)
 	}
-	t.Cleanup(func() {
+	t.Cleanup(func() { emptyAndDelete(t, ctx, c, name, nil) })
+	return name
+}
+
+// emptyFor is how long emptyAndDelete empties a bucket that writes still land in.
+const emptyFor = 30 * time.Second
+
+// emptyAndDelete empties a bucket and deletes it. A write its client gave up on — a role's, stopped
+// mid-write as its test ended — the server may still finish once the bucket is listed, as
+// versitygw does: while the bucket is not empty, it is emptied again, for up to emptyFor. between,
+// when set, runs after each emptying, before the deletion: tests.
+func emptyAndDelete(t testing.TB, ctx context.Context, c *minio.Client, name string, between func()) {
+	t.Helper()
+	deadline := time.Now().Add(emptyFor)
+	for {
 		objects := c.ListObjects(ctx, name, minio.ListObjectsOptions{Recursive: true, WithVersions: true})
 		for err := range c.RemoveObjects(ctx, name, objects, minio.RemoveObjectsOptions{}) {
 			t.Errorf("testdb: emptying bucket %s: %s: %v", name, err.ObjectName, err.Err)
 		}
-		if err := c.RemoveBucket(ctx, name); err != nil {
-			t.Errorf("testdb: deleting bucket %s: %v", name, err)
+		if between != nil {
+			between()
 		}
-	})
-	return name
+		err := c.RemoveBucket(ctx, name)
+		if err == nil {
+			return
+		}
+		if minio.ToErrorResponse(err).Code != "BucketNotEmpty" || time.Now().After(deadline) {
+			t.Errorf("testdb: deleting bucket %s: %v", name, err)
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }

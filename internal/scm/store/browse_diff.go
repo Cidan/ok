@@ -609,7 +609,7 @@ func (s *Store) Annotate(ctx context.Context, repo int64, commit encoding.ID, p 
 	// Off main: each commit's own changes to the path, back along first parents.
 	at := commit
 	for {
-		on, err := onMain(ctx, s.pool, repo, at)
+		on, err := onMain(ctx, s.b, repo, at)
 		if err != nil {
 			return nil, err
 		}
@@ -637,30 +637,12 @@ func (s *Store) Annotate(ctx context.Context, repo int64, commit encoding.ID, p 
 	}
 	// On main: the commits that changed the path, newest first.
 	if at != encoding.RootCommitID && left() {
-		var gen int64
-		if err := s.pool.QueryRow(ctx, `SELECT generation FROM commit WHERE repository_id = $1 AND id = $2`, repo, at[:]).Scan(&gen); err != nil {
-			return nil, err
-		}
-		rows, err := s.pool.Query(ctx, `SELECT commit_id FROM commit_path WHERE repository_id = $1 AND path = $2 AND generation <= $3 ORDER BY generation DESC`, repo, p, gen)
+		gen, err := generation(ctx, s.b, repo, at)
 		if err != nil {
 			return nil, err
 		}
-		var touching []encoding.ID
-		for rows.Next() {
-			var b []byte
-			if err := rows.Scan(&b); err != nil {
-				rows.Close()
-				return nil, err
-			}
-			id, err := toID(b)
-			if err != nil {
-				rows.Close()
-				return nil, err
-			}
-			touching = append(touching, id)
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
+		touching, err := s.b.PathHistory(ctx, repo, p, gen)
+		if err != nil {
 			return nil, err
 		}
 		for _, m := range touching {

@@ -6,6 +6,7 @@ package pgdb
 import (
 	"context"
 	"fmt"
+	"maps"
 	"regexp"
 
 	"github.com/jackc/pgx/v5"
@@ -19,15 +20,30 @@ var schemaName = regexp.MustCompile(`^[a-z][a-z0-9_]{0,62}$`)
 // CREATE privilege on the database, once; an installation that grants none makes the schemas
 // beforehand.
 func Open(ctx context.Context, url, schema string, maxConns int32) (*pgxpool.Pool, error) {
-	if !schemaName.MatchString(schema) {
-		return nil, fmt.Errorf("pgdb: %q is not a schema name", schema)
-	}
 	cfg, err := pgxpool.ParseConfig(url)
 	if err != nil {
 		return nil, fmt.Errorf("the database URL: %w", err)
 	}
 	if maxConns > 0 {
 		cfg.MaxConns = maxConns
+	}
+	return open(ctx, cfg, schema)
+}
+
+// Beside connects to the database pool reaches, as pool does, its tables in schema instead: what
+// several roles share, beside each role's own (the bus).
+func Beside(ctx context.Context, pool *pgxpool.Pool, schema string) (*pgxpool.Pool, error) {
+	cfg := pool.Config()
+	cfg.ConnConfig.RuntimeParams = maps.Clone(cfg.ConnConfig.RuntimeParams)
+	return open(ctx, cfg, schema)
+}
+
+func open(ctx context.Context, cfg *pgxpool.Config, schema string) (*pgxpool.Pool, error) {
+	if !schemaName.MatchString(schema) {
+		return nil, fmt.Errorf("pgdb: %q is not a schema name", schema)
+	}
+	if cfg.ConnConfig.RuntimeParams == nil {
+		cfg.ConnConfig.RuntimeParams = map[string]string{}
 	}
 	cfg.ConnConfig.RuntimeParams["search_path"] = schema
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)

@@ -5,9 +5,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/jackc/pgx/v5"
-
 	"github.com/Cidan/ok/internal/scm/encoding"
+	"github.com/Cidan/ok/internal/scm/store/backend"
 )
 
 // treeStore reads trees and writes new ones. Landing and candidates write through a
@@ -100,7 +99,7 @@ func (p *pendingTrees) writeTree(t *encoding.Tree) (encoding.ID, error) {
 
 // insert stores the pending trees, keeping only what is reachable from roots (a landing
 // that tried several splices wrote trees it no longer needs).
-func (p *pendingTrees) insert(ctx context.Context, tx pgx.Tx, roots []encoding.ID) error {
+func (p *pendingTrees) insert(ctx context.Context, tx *txn, roots []encoding.ID) error {
 	keep := map[encoding.ID]bool{}
 	var mark func(id encoding.ID)
 	mark = func(id encoding.ID) {
@@ -128,14 +127,11 @@ func (p *pendingTrees) insert(ctx context.Context, tx pgx.Tx, roots []encoding.I
 		return nil
 	}
 	sortIDs(idCol)
-	kinds := make([]int16, len(idCol))
-	bodies := make([][]byte, len(idCol))
+	objects := make([]backend.Object, len(idCol))
 	for i, id := range idCol {
-		kinds[i], bodies[i] = int16(encoding.KindTree), p.body[id]
+		objects[i] = backend.Object{ID: id, Kind: encoding.KindTree, Body: p.body[id]}
 	}
-	_, err := tx.Exec(ctx, `INSERT INTO object (repository_id, id, kind, body)
-		SELECT $1, u.id, u.kind, u.body FROM unnest($2::bytea[], $3::smallint[], $4::bytea[]) AS u(id, kind, body)
-		ORDER BY u.id ON CONFLICT DO NOTHING`, p.repo, ids(idCol), kinds, bodies)
+	_, err := tx.InsertObjects(ctx, p.repo, objects)
 	return err
 }
 

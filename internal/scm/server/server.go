@@ -1,7 +1,7 @@
 // Package server is the SCM role's nodes: the service node serves the Repositories, Store,
 // ChangeLists, Review, Landing, LandingChecks, Browse, Events, and Workspaces services over the
 // storage core; the GC node runs garbage collection (docs/scm.md, "Garbage collection and
-// compaction").
+// compaction"); the relay node publishes the SCM's events on the bus's stream.
 package server
 
 import (
@@ -12,6 +12,7 @@ import (
 
 	"google.golang.org/grpc"
 
+	"github.com/Cidan/ok/internal/bus"
 	"github.com/Cidan/ok/internal/lock"
 	"github.com/Cidan/ok/internal/scm/service"
 	"github.com/Cidan/ok/internal/scm/store"
@@ -121,4 +122,28 @@ func (n *GC) round(ctx context.Context, s *store.Store) {
 		}
 		slog.Info("gc: pass", "report", report.String())
 	}
+}
+
+// Relay is the relay's node, a node.Application: every replica runs one, each publishing pending
+// events beside the others (store.Relay).
+type Relay struct {
+	svc    *Service
+	stream bus.Stream
+}
+
+var _ node.Application = (*Relay)(nil)
+
+// NewRelay publishes the service's store's events on stream.
+func NewRelay(svc *Service, stream bus.Stream) *Relay { return &Relay{svc: svc, stream: stream} }
+
+func (*Relay) Name() string                 { return "ok/scm/relay" }
+func (n *Relay) Dependencies() []node.Node  { return []node.Node{n.svc} }
+func (*Relay) Setup(context.Context) error  { return nil }
+func (*Relay) Healthy(context.Context) bool { return true }
+
+func (n *Relay) Start(ctx context.Context) error {
+	if err := n.svc.store.Relay(ctx, n.stream); ctx.Err() == nil {
+		return err
+	}
+	return nil
 }

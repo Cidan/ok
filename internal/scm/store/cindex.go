@@ -2,7 +2,6 @@ package store
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -10,10 +9,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/jackc/pgx/v5"
-
 	"github.com/Cidan/ok/internal/scm/contentindex"
 	"github.com/Cidan/ok/internal/scm/encoding"
+	"github.com/Cidan/ok/internal/scm/store/backend"
 )
 
 // The content index (docs/scm.md, "The content index") is ok scm's only record of
@@ -22,8 +20,8 @@ import (
 // index's row lock (txIndex); and every garbage collection pass folds the log into the next
 // generation's blocks (RebuildContentIndex).
 
-// contentChannel is the PostgreSQL channel each logging transaction notifies, with the
-// repository's ID, as it commits.
+// contentChannel is the channel each logging transaction notifies, with the repository's ID,
+// as it commits.
 const contentChannel = "ok_scm_content"
 
 // txLog is what one transaction changed in a repository's content index, and the index it
@@ -40,12 +38,11 @@ type txLog struct {
 	puts    map[encoding.ID]contentindex.Entry
 }
 
-func (s *Store) txLogOf(tx pgx.Tx, repo int64) *txLog {
-	v, _ := s.txLogs.Load(tx)
-	lg, _ := v.(*txLog)
+func (s *Store) txLogOf(tx *txn, repo int64) *txLog {
+	lg := tx.log
 	if lg == nil {
 		lg = &txLog{repo: repo, touched: map[encoding.ID]bool{}, pinned: map[encoding.ID]bool{}, puts: map[encoding.ID]contentindex.Entry{}}
-		s.txLogs.Store(tx, lg)
+		tx.log = lg
 	}
 	if lg.repo != repo {
 		panic(fmt.Sprintf("store: one transaction changes content of repositories %d and %d", lg.repo, repo))
@@ -54,7 +51,7 @@ func (s *Store) txLogOf(tx pgx.Tx, repo int64) *txLog {
 }
 
 // logIndex records, for the transaction tx, changes to repo's content index.
-func (s *Store) logIndex(tx pgx.Tx, repo int64, updates ...contentindex.Update) {
+func (s *Store) logIndex(tx *txn, repo int64, updates ...contentindex.Update) {
 	if len(updates) == 0 {
 		return
 	}
@@ -78,17 +75,17 @@ func (s *Store) logIndex(tx pgx.Tx, repo int64, updates ...contentindex.Update) 
 // transaction holds the index's row lock in share mode, so no sweep or compaction changes it
 // before the transaction commits — what it finds stays — while other writers, whose puts,
 // touches, and pins commute with its own, run beside it. It returns the database's day too.
-func (s *Store) txIndex(ctx context.Context, tx pgx.Tx, repo int64) (*txLog, error) {
+func (s *Store) txIndex(ctx context.Context, tx *txn, repo int64) (*txLog, error) {
 	lg := s.txLogOf(tx, repo)
 	if lg.index != nil {
 		return lg, nil
 	}
-	var today time.Time
-	if err := tx.QueryRow(ctx, `SELECT current_date FROM content_index WHERE repository_id = $1 FOR SHARE`, repo).Scan(&today); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, fmt.Errorf("repository %d has no content index", repo)
-		}
+	today, ok, err := tx.ShareContentIndex(ctx, repo)
+	if err != nil {
 		return nil, err
+	}
+	if !ok {
+		return nil, fmt.Errorf("repository %d has no content index", repo)
 	}
 	li := s.live(repo)
 	if err := s.refreshIndex(ctx, repo, li); err != nil {
@@ -114,21 +111,18 @@ type loggedRow struct {
 }
 
 // flushIndexLog writes tx's logged changes, if any, as one content_log row, and notifies.
-func (s *Store) flushIndexLog(ctx context.Context, tx pgx.Tx) (*loggedRow, error) {
-	v, ok := s.txLogs.LoadAndDelete(tx)
-	if !ok {
-		return nil, nil
-	}
-	lg := v.(*txLog)
-	if len(lg.updates) == 0 {
+func (s *Store) flushIndexLog(ctx context.Context, tx *txn) (*loggedRow, error) {
+	lg := tx.log
+	tx.log = nil
+	if lg == nil || len(lg.updates) == 0 {
 		return nil, nil
 	}
 	row := &loggedRow{repo: lg.repo, body: contentindex.EncodeLog(lg.updates)}
-	if err := tx.QueryRow(ctx, `INSERT INTO content_log (repository_id, body) VALUES ($1, $2) RETURNING id`,
-		lg.repo, row.body).Scan(&row.id); err != nil {
+	var err error
+	if row.id, err = tx.InsertContentLog(ctx, lg.repo, row.body); err != nil {
 		return nil, err
 	}
-	if _, err := tx.Exec(ctx, `SELECT pg_notify($1, $2)`, contentChannel, strconv.FormatInt(lg.repo, 10)); err != nil {
+	if err := tx.Notify(ctx, contentChannel, strconv.FormatInt(lg.repo, 10)); err != nil {
 		return nil, err
 	}
 	return row, nil
@@ -147,7 +141,7 @@ func pinUpdate(kind encoding.Kind, id encoding.ID) contentindex.Update {
 // LoadContentIndex reads a repository's whole content index: its generation's blocks and every
 // log row. found is false while the repository has none (its backfill has not run).
 func (s *Store) LoadContentIndex(ctx context.Context, repo int64) (x *contentindex.Index, found bool, err error) {
-	err = s.inReadTx(ctx, func(tx pgx.Tx) error {
+	err = s.b.Snapshot(ctx, func(tx backend.Ops) error {
 		x, found, err = s.loadContentIndex(ctx, tx, repo)
 		return err
 	})
@@ -155,35 +149,22 @@ func (s *Store) LoadContentIndex(ctx context.Context, repo int64) (x *contentind
 }
 
 // loadContentIndex is LoadContentIndex in tx.
-func (s *Store) loadContentIndex(ctx context.Context, tx pgx.Tx, repo int64) (x *contentindex.Index, found bool, err error) {
+func (s *Store) loadContentIndex(ctx context.Context, tx backend.Ops, repo int64) (x *contentindex.Index, found bool, err error) {
 	err = func() error {
-		var gen int64
-		if err := tx.QueryRow(ctx, `SELECT generation FROM content_index WHERE repository_id = $1`, repo).Scan(&gen); err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				return nil
-			}
+		gen, ok, err := tx.ContentIndexGeneration(ctx, repo)
+		if err != nil || !ok {
 			return err
 		}
 		found = true
 		x = contentindex.New(gen)
-		rows, err := tx.Query(ctx, `SELECT body FROM index_block WHERE repository_id = $1 AND generation = $2`, repo, gen)
+		blocks, err := tx.IndexBlocks(ctx, repo, gen)
 		if err != nil {
 			return err
 		}
-		for rows.Next() {
-			var body []byte
-			if err := rows.Scan(&body); err != nil {
-				rows.Close()
-				return err
-			}
+		for _, body := range blocks {
 			if err := x.ApplyBlock(body); err != nil {
-				rows.Close()
 				return fmt.Errorf("repository %d's content index: %w", repo, err)
 			}
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
-			return err
 		}
 		return s.applyLogs(ctx, tx, repo, x)
 	}()
@@ -191,52 +172,33 @@ func (s *Store) loadContentIndex(ctx context.Context, tx pgx.Tx, repo int64) (x 
 }
 
 // applyLogs applies every log row of repo that x lacks.
-func (s *Store) applyLogs(ctx context.Context, q interface {
-	Query(context.Context, string, ...any) (pgx.Rows, error)
-}, repo int64, x *contentindex.Index) error {
-	rows, err := q.Query(ctx, `SELECT id FROM content_log WHERE repository_id = $1`, repo)
+func (s *Store) applyLogs(ctx context.Context, q backend.Ops, repo int64, x *contentindex.Index) error {
+	all, err := q.ContentLogIDs(ctx, repo)
 	if err != nil {
 		return err
 	}
 	var want []int64
-	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
-			rows.Close()
-			return err
-		}
+	for _, id := range all {
 		if !x.HasLog(id) {
 			want = append(want, id)
 		}
 	}
-	rows.Close()
-	if err := rows.Err(); err != nil || len(want) == 0 {
-		return err
+	if len(want) == 0 {
+		return nil
 	}
 	// In ID order: a later row never needs an earlier one, but applying them as written keeps
 	// a touch from preceding its entry's body more often than it must.
 	sort.Slice(want, func(i, j int) bool { return want[i] < want[j] })
-	body, err := q.Query(ctx, `SELECT id, body FROM content_log WHERE repository_id = $1 AND id = ANY($2) ORDER BY id`, repo, want)
+	logs, err := q.ContentLogs(ctx, repo, want)
 	if err != nil {
 		return err
 	}
-	defer body.Close()
-	for body.Next() {
-		var id int64
-		var b []byte
-		if err := body.Scan(&id, &b); err != nil {
-			return err
-		}
-		if err := x.ApplyLog(id, b); err != nil {
-			return fmt.Errorf("repository %d's content log row %d: %w", repo, id, err)
+	for _, l := range logs {
+		if err := x.ApplyLog(l.ID, l.Body); err != nil {
+			return fmt.Errorf("repository %d's content log row %d: %w", repo, l.ID, err)
 		}
 	}
-	return body.Err()
-}
-
-// inReadTx runs fn in a read-only transaction that sees one snapshot throughout.
-func (s *Store) inReadTx(ctx context.Context, fn func(pgx.Tx) error) error {
-	return pgx.BeginTxFunc(ctx, s.pool, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly}, fn)
+	return nil
 }
 
 // RebuildContentIndex writes a repository's content index as a new generation in place of the
@@ -250,13 +212,15 @@ func (s *Store) RebuildContentIndex(ctx context.Context, repo int64) (gen int64,
 		generation int64
 		logs       []int64
 	}
-	err = s.inReadTx(ctx, func(tx pgx.Tx) error {
-		if err := tx.QueryRow(ctx, `SELECT generation FROM content_index WHERE repository_id = $1`, repo).Scan(&snap.generation); err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				return fmt.Errorf("repository %d has no content index", repo)
-			}
+	err = s.b.Snapshot(ctx, func(tx backend.Ops) error {
+		gen, ok, err := tx.ContentIndexGeneration(ctx, repo)
+		if err != nil {
 			return err
 		}
+		if !ok {
+			return fmt.Errorf("repository %d has no content index", repo)
+		}
+		snap.generation = gen
 		x, _, err := s.loadContentIndex(ctx, tx, repo)
 		if err != nil {
 			return err
@@ -266,32 +230,28 @@ func (s *Store) RebuildContentIndex(ctx context.Context, repo int64) (gen int64,
 				snap.entries = append(snap.entries, k)
 			}
 		}
-		logs, err := tx.Query(ctx, `SELECT id FROM content_log WHERE repository_id = $1`, repo)
-		if err != nil {
-			return err
-		}
-		snap.logs, err = pgx.CollectRows(logs, pgx.RowTo[int64])
+		snap.logs, err = tx.ContentLogIDs(ctx, repo)
 		return err
 	})
 	if err != nil {
 		return 0, 0, err
 	}
-	err = s.inTx(ctx, func(tx pgx.Tx) error {
+	err = s.inTx(ctx, func(tx *txn) error {
 		gen = 0
-		var current int64
-		if err := tx.QueryRow(ctx, `SELECT generation FROM content_index WHERE repository_id = $1 FOR UPDATE`, repo).Scan(&current); err != nil {
+		current, err := tx.LockContentIndex(ctx, repo)
+		if err != nil {
 			return err
 		}
 		if current != snap.generation {
 			return nil
 		}
-		if _, err := tx.Exec(ctx, `UPDATE content_index SET generation = $2 WHERE repository_id = $1`, repo, current+1); err != nil {
+		if err := tx.SetContentIndexGeneration(ctx, repo, current+1); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(ctx, `DELETE FROM index_block WHERE repository_id = $1 AND generation = $2`, repo, current); err != nil {
+		if err := tx.DeleteIndexBlocks(ctx, repo, current); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(ctx, `DELETE FROM content_log WHERE repository_id = $1 AND id = ANY($2)`, repo, snap.logs); err != nil {
+		if err := tx.DeleteContentLogs(ctx, repo, snap.logs); err != nil {
 			return err
 		}
 		gen = snap.generation + 1
@@ -305,19 +265,17 @@ func (s *Store) RebuildContentIndex(ctx context.Context, repo int64) (gen int64,
 }
 
 // writeBlocks writes entries, in ID order, as a generation's blocks.
-func writeBlocks(ctx context.Context, tx pgx.Tx, repo, gen int64, entries []contentindex.Keyed) error {
+func writeBlocks(ctx context.Context, tx backend.Ops, repo, gen int64, entries []contentindex.Keyed) error {
 	blocks := contentindex.Blocks(entries)
-	firsts := make([][]byte, len(blocks))
+	firsts := make([]encoding.ID, len(blocks))
 	bodies := make([][]byte, len(blocks))
 	for i, b := range blocks {
-		firsts[i] = b[0].ID[:]
+		firsts[i] = b[0].ID
 		bodies[i] = contentindex.EncodeBlock(b)
 	}
 	for start := 0; start < len(blocks); start += 500 {
 		end := min(start+500, len(blocks))
-		if _, err := tx.Exec(ctx, `INSERT INTO index_block (repository_id, generation, first_id, body)
-			SELECT $1, $2, u.f, u.b FROM unnest($3::bytea[], $4::bytea[]) AS u(f, b)`,
-			repo, gen, firsts[start:end], bodies[start:end]); err != nil {
+		if err := tx.InsertIndexBlocks(ctx, repo, gen, firsts[start:end], bodies[start:end]); err != nil {
 			return err
 		}
 	}
@@ -394,13 +352,13 @@ func (s *Store) refreshIndex(ctx context.Context, repo int64, li *liveIndex) err
 	defer li.mu.Unlock()
 	// Cleared first, so an announcement during the refresh marks it again.
 	li.stale.Store(false)
-	err := s.inReadTx(ctx, func(tx pgx.Tx) error {
-		var gen int64
-		if err := tx.QueryRow(ctx, `SELECT generation FROM content_index WHERE repository_id = $1`, repo).Scan(&gen); err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				return fmt.Errorf("repository %d has no content index yet", repo)
-			}
+	err := s.b.Snapshot(ctx, func(tx backend.Ops) error {
+		gen, ok, err := tx.ContentIndexGeneration(ctx, repo)
+		if err != nil {
 			return err
+		}
+		if !ok {
+			return fmt.Errorf("repository %d has no content index yet", repo)
 		}
 		if x := li.x.Load(); x != nil && x.Generation() == gen {
 			return s.applyLogs(ctx, tx, repo, x)
@@ -409,7 +367,7 @@ func (s *Store) refreshIndex(ctx context.Context, repo int64, li *liveIndex) err
 		if err != nil {
 			return err
 		}
-		packs, err := packNumbers(ctx, tx, repo)
+		packs, err := tx.PackNumbers(ctx, repo)
 		if err != nil {
 			return err
 		}
@@ -423,32 +381,6 @@ func (s *Store) refreshIndex(ctx context.Context, repo int64, li *liveIndex) err
 	return err
 }
 
-// packNumbers maps a repository's pack numbers to their IDs, retired packs included: a reader
-// may still be reading one.
-func packNumbers(ctx context.Context, q interface {
-	Query(context.Context, string, ...any) (pgx.Rows, error)
-}, repo int64) (map[uint64]encoding.ID, error) {
-	rows, err := q.Query(ctx, `SELECT num, id FROM pack WHERE repository_id = $1`, repo)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := map[uint64]encoding.ID{}
-	for rows.Next() {
-		var num uint64
-		var b []byte
-		if err := rows.Scan(&num, &b); err != nil {
-			return nil, err
-		}
-		id, err := toID(b)
-		if err != nil {
-			return nil, err
-		}
-		out[num] = id
-	}
-	return out, rows.Err()
-}
-
 // packID is the ID of a pack the index names by number, reading the pack table again for one
 // it does not know (compaction wrote it since).
 func (s *Store) packID(ctx context.Context, repo int64, li *liveIndex, num uint64) (encoding.ID, error) {
@@ -457,7 +389,7 @@ func (s *Store) packID(ctx context.Context, repo int64, li *liveIndex, num uint6
 			return id, nil
 		}
 	}
-	m, err := packNumbers(ctx, s.pool, repo)
+	m, err := s.b.PackNumbers(ctx, repo)
 	if err != nil {
 		return encoding.ID{}, err
 	}
