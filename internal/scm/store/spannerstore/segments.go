@@ -19,27 +19,31 @@ const segmentColumns = `scope, owner_id, network_id, kind, id, level, records, s
 func (x queries) segments(ctx context.Context, sql string, params map[string]any) ([]backend.Segment, error) {
 	var out []backend.Segment
 	err := x.rows(ctx, sql, params, func() { out = nil }, func(row *spanner.Row) error {
-		var s backend.Segment
-		var idb []byte
-		var scope, net, kind, level int64
-		var bound spanner.NullInt64
-		if err := row.Columns(&scope, &s.Scope.ID, &net, &kind, &idb, &level, &s.Records, &s.Size, &s.CreatedAt, &s.Age,
-			&s.Inherited, &bound); err != nil {
-			return err
-		}
-		s.Scope.Network, s.Net, s.Kind, s.Level = scope == 1, backend.Network(net), segment.Kind(kind), int16(level)
-		s.Bound = backend.NoBound
-		if bound.Valid {
-			s.Bound = bound.Int64
-		}
-		var err error
-		if s.ID, err = toID(idb); err != nil {
-			return err
-		}
+		s, err := segmentOf(row)
 		out = append(out, s)
-		return nil
+		return err
 	})
 	return out, err
+}
+
+// segmentOf is a row of segmentColumns.
+func segmentOf(row *spanner.Row) (backend.Segment, error) {
+	var s backend.Segment
+	var idb []byte
+	var scope, net, kind, level int64
+	var bound spanner.NullInt64
+	if err := row.Columns(&scope, &s.Scope.ID, &net, &kind, &idb, &level, &s.Records, &s.Size, &s.CreatedAt, &s.Age,
+		&s.Inherited, &bound); err != nil {
+		return s, err
+	}
+	s.Scope.Network, s.Net, s.Kind, s.Level = scope == 1, backend.Network(net), segment.Kind(kind), int16(level)
+	s.Bound = backend.NoBound
+	if bound.Valid {
+		s.Bound = bound.Int64
+	}
+	var err error
+	s.ID, err = toID(idb)
+	return s, err
 }
 
 // boundOf is a segment's bound as its column holds it: NULL when it is read whole.
@@ -50,8 +54,28 @@ func boundOf(s backend.Segment) spanner.NullInt64 {
 func (x queries) Segments(ctx context.Context, sc backend.Scope, kind segment.Kind) ([]backend.Segment, error) {
 	p := scopeParams(sc)
 	p["kind"] = int64(kind)
-	return x.segments(ctx, `SELECT `+segmentColumns+` FROM segment
-		WHERE scope = @scope AND owner_id = @owner AND kind = @kind AND retired_at IS NULL ORDER BY age DESC`, p)
+	return x.segments(ctx, liveSegments, p)
+}
+
+// liveSegments are a repository's or network's live segments of a kind, newest first.
+const liveSegments = `SELECT ` + segmentColumns + ` FROM segment
+	WHERE scope = @scope AND owner_id = @owner AND kind = @kind AND retired_at IS NULL ORDER BY age DESC`
+
+// SegmentsUnlocked are Segments, read unlocked: in the operation's snapshot, or a read-only
+// transaction of its own.
+func (x queries) SegmentsUnlocked(ctx context.Context, sc backend.Scope, kind segment.Kind) ([]backend.Segment, error) {
+	p := scopeParams(sc)
+	p["kind"] = int64(kind)
+	var out []backend.Segment
+	err := x.unlocked(func(r spannerdata.Reader) error {
+		out = nil
+		return spannerdata.Each(ctx, r, liveSegments, p, func(row *spanner.Row) error {
+			s, err := segmentOf(row)
+			out = append(out, s)
+			return err
+		})
+	})
+	return out, err
 }
 
 // segmentParams are a segment's columns as parameters.

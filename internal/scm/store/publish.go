@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"sort"
 	"time"
 
@@ -168,8 +169,30 @@ func (s *Store) BeginPublish(ctx context.Context, repo int64, principal, workspa
 		return nil, err
 	}
 
-	// Touch what is held now, so a sweep between this exchange and the commit cannot
-	// take it. Anything that vanished meanwhile is requested like any missing object.
+	// Touch what is held now — the objects, the files, and the chunks of the files it lacks —
+	// so a sweep between this exchange and the commit cannot take it: in one transaction, a
+	// second only for the chunks of a held file that vanished meanwhile. Anything that vanished
+	// is requested like anything missing; a touch that reaches a missing chunk is rolled back
+	// and run again without it.
+	chunksOf := func(files []encoding.ID) []encoding.ID {
+		var out []encoding.ID
+		for _, id := range files {
+			for _, c := range manifests[id].Chunks {
+				out = append(out, c.ID)
+			}
+		}
+		return out
+	}
+	var lacking []encoding.ID
+	for id := range manifests {
+		if !p.heldFiles[id] {
+			lacking = append(lacking, id)
+		}
+	}
+	present, err := s.existing(ctx, s.ops(ctx), repo, tChunk, 0, chunksOf(lacking))
+	if err != nil {
+		return nil, err
+	}
 	var roots []ref
 	for r := range p.held {
 		if rf := refOf(r.Kind, r.ID); rf.table != tOperation && rf.table != tView {
@@ -179,15 +202,45 @@ func (s *Store) BeginPublish(ctx context.Context, repo int64, principal, workspa
 	for id := range p.heldFiles {
 		roots = append(roots, ref{table: tFile, id: id})
 	}
+	for id := range present {
+		roots = append(roots, ref{table: tChunk, id: id})
+	}
 	vanished, err := s.touchHeld(ctx, repo, roots)
 	if err != nil {
 		return nil, err
 	}
+	var gone []encoding.ID
 	for _, v := range vanished {
-		if v.table == tFile {
+		switch v.table {
+		case tFile:
 			delete(p.heldFiles, v.id)
-		} else {
+			gone = append(gone, v.id)
+		case tChunk:
+			delete(present, v.id)
+		default:
 			delete(p.held, v.objectRef())
+		}
+	}
+	if len(gone) > 0 {
+		more, err := s.existing(ctx, s.ops(ctx), repo, tChunk, 0, chunksOf(gone))
+		if err != nil {
+			return nil, err
+		}
+		var chunkRoots []ref
+		for id := range more {
+			if !present[id] {
+				chunkRoots = append(chunkRoots, ref{table: tChunk, id: id})
+			}
+		}
+		absent, err := s.touchHeld(ctx, repo, chunkRoots)
+		if err != nil {
+			return nil, err
+		}
+		for _, a := range absent {
+			delete(more, a.id)
+		}
+		for id := range more {
+			present[id] = true
 		}
 	}
 
@@ -197,40 +250,16 @@ func (s *Store) BeginPublish(ctx context.Context, repo int64, principal, workspa
 			p.missingObjects = append(p.missingObjects, r)
 		}
 	}
-	var chunkIDs []encoding.ID
 	for id, f := range manifests {
 		if p.heldFiles[id] {
 			continue
 		}
 		p.files[id] = f
 		for _, c := range f.Chunks {
-			chunkIDs = append(chunkIDs, c.ID)
-		}
-	}
-	// Chunks the server holds are touched too, for the same reason; the rest are wanted. Those its
-	// index has are touched — what a sweep took meanwhile is wanted too — and no more: a touch that
-	// reaches a missing chunk is rolled back and run again without it.
-	present, err := s.existing(ctx, s.ops(ctx), repo, tChunk, 0, chunkIDs)
-	if err != nil {
-		return nil, err
-	}
-	var chunkRoots []ref
-	for _, id := range chunkIDs {
-		if present[id] {
-			chunkRoots = append(chunkRoots, ref{table: tChunk, id: id})
-		}
-	}
-	absent, err := s.touchHeld(ctx, repo, chunkRoots)
-	if err != nil {
-		return nil, err
-	}
-	for _, a := range absent {
-		delete(present, a.id)
-	}
-	for _, id := range chunkIDs {
-		if !present[id] && !p.wantChunks[id] {
-			p.wantChunks[id] = true
-			p.missingChunks = append(p.missingChunks, id)
+			if !present[c.ID] && !p.wantChunks[c.ID] {
+				p.wantChunks[c.ID] = true
+				p.missingChunks = append(p.missingChunks, c.ID)
+			}
 		}
 	}
 	sort.Slice(p.missingObjects, func(i, j int) bool {
@@ -284,6 +313,26 @@ func (s *Store) touchHeld(ctx context.Context, repo int64, roots []ref) ([]ref, 
 		roots = kept
 	}
 	return vanished, nil
+}
+
+// forward reports whether an update of the operation heads moves them forward: the new head is
+// an operation of this exchange whose parents are every old head (jj's next operation, or a merge
+// of concurrent ones). One it cannot tell is taken as not.
+func (p *Publication) forward(heads *OpHeadsUpdate) bool {
+	o, ok := p.received[ObjectRef{Kind: encoding.KindOperation, ID: heads.New}]
+	if !ok {
+		return false
+	}
+	op, ok := o.(*encoding.Operation)
+	if !ok {
+		return false
+	}
+	for _, old := range heads.Old {
+		if old != heads.New && !slices.Contains(op.Parents, old) {
+			return false
+		}
+	}
+	return true
 }
 
 // Missing is what the client must send: the staged objects the server lacks, and the
@@ -695,6 +744,13 @@ func (p *Publication) Commit(ctx context.Context, heads *OpHeadsUpdate) ([]encod
 		if heads != nil {
 			if err := updateOpHeads(ctx, tx, p.opLog, heads.Old, heads.New); err != nil {
 				return err
+			}
+			// Heads that moved other than forward — jj op abandon — leave operations nothing
+			// reaches: the log is collected again (settle.go).
+			if !p.forward(heads) {
+				if err := tx.DivergeOpLog(ctx, p.opLog); err != nil {
+					return err
+				}
 			}
 		}
 		if p.opLog != 0 {

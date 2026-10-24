@@ -487,7 +487,7 @@ func (s *Store) CreateAttempt(ctx context.Context, na NewAttempt) (int64, error)
 					return err
 				}
 				p, err := tx.InsertPlan(ctx, NewPlan{RepositoryID: repo, CLNumber: c.CLNumber, Patchset: c.Patchset, Phase: PhasePost,
-					CommitID: c.Commit, WorkflowsCommit: c.WorkflowsCommit, Context: c.Context, Touched: orEmpty(c.Touched), PreCommit: preCommit})
+					CommitID: c.Commit, WorkflowsCommit: c.WorkflowsCommit, Context: c.Context, Touched: orEmpty(BoundPaths(c.Touched)), PreCommit: preCommit})
 				if err != nil {
 					return err
 				}

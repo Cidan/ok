@@ -375,7 +375,11 @@ automation (`internal/automation/queue`):
   too — and whether any is (an imported repository's). An imported repository's change, which
   affects no target, has its paths alone. Two
   changes that do not conflict keep their results whatever order they land in. Two that touch a
-  common path (or one a path under the other's) cannot both land: the SCM refuses the second.
+  common path (or one a path under the other's) cannot both land: the SCM refuses the second. A footprint is kept bounded, never missing anything: past 64 KiB, its paths become their
+  directories a level at a time, each standing for everything under it (`/` for everything), and
+  its targets become every target (`//...`) — so an import, a vendored tree, or a long stack
+  conflicts with more and lands more alone, as a change that large does anyway. A submission whose
+  attempt the store cannot record fails, saying why, rather than holding its repository's queue.
 - **Grouping.** Every submission's first attempt is on main alone; its footprint — the
   submission's **reference**, re-read whenever it is tested on main alone again — is what the
   queue groups it by. A submission's chain is every earlier active submission it conflicts with,

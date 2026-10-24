@@ -347,7 +347,8 @@ is stacked on it, or contending for jj's locks.
   can be undone).
 - **Retention.** Every checkpoint for 7 days; then the last of each hour for 30 days; then the
   last of each day for a year; a workspace's latest is always kept. ok scm's garbage collection
-  thins them and treats every kept checkpoint's tree as a root.
+  thins them; a checkpoint kept past its first week has its trees pinned, and the rest's trees are
+  roots of its mark.
 - **Real checkouts** take no checkpoints: the daemon does not serve them, and their changes reach
   ok at each jj command's snapshot, as today. A real workspace can be attached elsewhere as a
   virtual one, from its working-copy commit.

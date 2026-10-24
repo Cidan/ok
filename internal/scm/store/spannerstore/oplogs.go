@@ -376,3 +376,53 @@ func (x queries) RepositoryViews(ctx context.Context, repo int64) ([]backend.OpR
 	return x.opRecords(ctx, encoding.KindView, `SELECT v.op_log_id, v.id, CAST(NULL AS BYTES), v.body, v.touched_at
 		FROM view v JOIN op_log l ON l.op_log_id = v.op_log_id WHERE l.repository_id = @repo`, map[string]any{"repo": repo})
 }
+
+func (x queries) OpContentPinned(ctx context.Context, repo int64) (bool, error) {
+	var pinned bool
+	_, err := x.one(ctx, `SELECT op_content_pinned FROM repository WHERE repository_id = @repo`, map[string]any{"repo": repo}, &pinned)
+	return pinned, err
+}
+
+func (x queries) SetOpContentPinned(ctx context.Context, repo int64) error {
+	_, err := x.exec(ctx, `UPDATE repository SET op_content_pinned = TRUE WHERE repository_id = @repo`, map[string]any{"repo": repo})
+	return err
+}
+
+func (x queries) TailOps(ctx context.Context, repo int64, kind encoding.Kind, after backend.OpKey, limit int) ([]backend.OpRecord, error) {
+	view, table := "o.view_id", "operation"
+	if kind == encoding.KindView {
+		view, table = "CAST(NULL AS BYTES)", "view"
+	}
+	return x.opRecords(ctx, kind, `SELECT o.op_log_id, o.id, `+view+`, o.body, o.touched_at
+		FROM `+table+` o JOIN op_log l ON l.op_log_id = o.op_log_id
+		WHERE l.repository_id = @repo AND (o.op_log_id > @log OR (o.op_log_id = @log AND o.id > @id))
+		ORDER BY o.op_log_id, o.id LIMIT @limit`,
+		map[string]any{"repo": repo, "log": after.Log, "id": after.ID[:], "limit": int64(limit)})
+}
+
+func (x queries) DivergeOpLog(ctx context.Context, opLog int64) error {
+	_, err := x.exec(ctx, `UPDATE op_log SET diverged_at = `+now+` WHERE op_log_id = @log`, map[string]any{"log": opLog})
+	return err
+}
+
+func (x queries) OpLogsToCollect(ctx context.Context, repo int64) ([]backend.OpLogDivergence, error) {
+	var out []backend.OpLogDivergence
+	err := x.rows(ctx, `SELECT op_log_id, diverged_at FROM op_log
+		WHERE repository_id = @repo AND workspace != '' AND diverged_at IS NOT NULL
+		  AND (collected_through IS NULL OR collected_through < diverged_at) ORDER BY op_log_id`,
+		map[string]any{"repo": repo}, func() { out = nil }, func(row *spanner.Row) error {
+			var d backend.OpLogDivergence
+			if err := row.Columns(&d.OpLog, &d.DivergedAt); err != nil {
+				return err
+			}
+			out = append(out, d)
+			return nil
+		})
+	return out, err
+}
+
+func (x queries) SetOpLogCollected(ctx context.Context, opLog int64, through time.Time) error {
+	_, err := x.exec(ctx, `UPDATE op_log SET collected_through = GREATEST(IFNULL(collected_through, @through), @through) WHERE op_log_id = @log`,
+		map[string]any{"log": opLog, "through": through})
+	return err
+}

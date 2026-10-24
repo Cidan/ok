@@ -12,6 +12,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -85,6 +86,9 @@ type Config struct {
 	ChunkCacheBytes int
 	// DiffCacheBytes bounds the cache of file pairs' diffs (DiffFiles).
 	DiffCacheBytes int
+	// PathCommitCacheBytes bounds the cache of the newest commits of main that changed paths, which
+	// a tree's listing with its entries' last commits reads (lastPathCommits).
+	PathCommitCacheBytes int
 	// SegmentCacheBytes bounds the cache of segments' decoded blocks; their readers' fences and
 	// filters take up to a quarter of it again.
 	SegmentCacheBytes int
@@ -111,15 +115,16 @@ type Config struct {
 
 // Default cache sizes, for a Config that leaves them zero.
 const (
-	DefaultObjectCacheBytes  = 256 << 20
-	DefaultChunkCacheBytes   = 512 << 20
-	DefaultDiffCacheBytes    = 64 << 20
-	DefaultSegmentCacheBytes = 256 << 20
-	DefaultSegmentBatch      = 1 << 12
-	DefaultSegmentMin        = 1 << 12
-	DefaultDeleteBatch       = 10_000
-	DefaultLandingPaths      = 20_000
-	DefaultFoldBatch         = 500
+	DefaultObjectCacheBytes     = 256 << 20
+	DefaultChunkCacheBytes      = 512 << 20
+	DefaultDiffCacheBytes       = 64 << 20
+	DefaultPathCommitCacheBytes = 32 << 20
+	DefaultSegmentCacheBytes    = 256 << 20
+	DefaultSegmentBatch         = 1 << 12
+	DefaultSegmentMin           = 1 << 12
+	DefaultDeleteBatch          = 10_000
+	DefaultLandingPaths         = 20_000
+	DefaultFoldBatch            = 500
 )
 
 // readLimits bound how files are read (read.go, browse_diff.go).
@@ -174,6 +179,8 @@ type Store struct {
 	objects *cache[[]byte]
 	chunks  *cache[storedChunk]
 	diffs   *cache[FileDiff]
+	// newestOfPaths are answers lastPathCommits read: main's history fixes each for good.
+	newestOfPaths *cache[pathCommit]
 	// codeIndexes are the code search indexes this replica holds (codesearch.go).
 	codeIndexes *cache[*codeIndex]
 	dicts       *dictionaries
@@ -194,6 +201,12 @@ type Store struct {
 	deletes, landingPaths, foldBlocks int
 	// txAttempts counts transaction attempts (a test observes deadlock retries).
 	txAttempts func()
+	// indexReads counts the content index refreshes that read the database (a test observes
+	// refreshes coalescing).
+	indexReads func()
+	// settleUnpinned moves settled operations into segments without pinning what they reach, as
+	// compaction did before (a test makes a repository of then).
+	settleUnpinned bool
 	// afterLocate runs between reading chunk locations and fetching them (a test
 	// repacks there to exercise the retired-pack re-read).
 	afterLocate func()
@@ -231,6 +244,9 @@ func New(b backend.Backend, blobs blob.Store, cfg Config) (*Store, error) {
 	if cfg.DiffCacheBytes == 0 {
 		cfg.DiffCacheBytes = DefaultDiffCacheBytes
 	}
+	if cfg.PathCommitCacheBytes == 0 {
+		cfg.PathCommitCacheBytes = DefaultPathCommitCacheBytes
+	}
 	if cfg.CodeIndexCacheBytes == 0 {
 		cfg.CodeIndexCacheBytes = DefaultCodeIndexCacheBytes
 	}
@@ -253,21 +269,22 @@ func New(b backend.Backend, blobs blob.Store, cfg Config) (*Store, error) {
 		cfg.FoldBatch = DefaultFoldBatch
 	}
 	s := &Store{
-		b:            b,
-		names:        cfg.Names,
-		email:        cfg.EmailDomain,
-		signals:      cfg.Signals,
-		namer:        cfg.Principals,
-		blobs:        blobs,
-		objects:      newCache[[]byte]("objects", cfg.ObjectCacheBytes),
-		chunks:       newCache[storedChunk]("chunks", cfg.ChunkCacheBytes),
-		diffs:        newCache[FileDiff]("diffs", cfg.DiffCacheBytes),
-		codeIndexes:  newCache[*codeIndex]("code_indexes", cfg.CodeIndexCacheBytes),
-		reads:        defaultReadLimits,
-		holder:       work.NewHolder(),
-		deletes:      cfg.DeleteBatch,
-		landingPaths: cfg.LandingPaths,
-		foldBlocks:   cfg.FoldBatch,
+		b:             b,
+		names:         cfg.Names,
+		email:         cfg.EmailDomain,
+		signals:       cfg.Signals,
+		namer:         cfg.Principals,
+		blobs:         blobs,
+		objects:       newCache[[]byte]("objects", cfg.ObjectCacheBytes),
+		chunks:        newCache[storedChunk]("chunks", cfg.ChunkCacheBytes),
+		diffs:         newCache[FileDiff]("diffs", cfg.DiffCacheBytes),
+		newestOfPaths: newCache[pathCommit]("path_commits", cfg.PathCommitCacheBytes),
+		codeIndexes:   newCache[*codeIndex]("code_indexes", cfg.CodeIndexCacheBytes),
+		reads:         defaultReadLimits,
+		holder:        work.NewHolder(),
+		deletes:       cfg.DeleteBatch,
+		landingPaths:  cfg.LandingPaths,
+		foldBlocks:    cfg.FoldBatch,
 		segs: segmentState{
 			readers: newCache[*segment.Reader]("segment_readers", cfg.SegmentCacheBytes/4),
 			blocks:  newCache[*segment.Block]("segment_blocks", cfg.SegmentCacheBytes),
@@ -297,12 +314,33 @@ type txn struct {
 	logs    []*txLog    // the content indexes it changes: a repository's and its network's at most
 	done    atomic.Bool // the transaction has ended
 	pending bus.Pending // the signals to send once it commits
+	marks   []workMark  // the keyed work to mark once it commits (markAfter)
+}
+
+// workMark is keyed work of a kind and key.
+type workMark struct {
+	kind string
+	key  int64
 }
 
 // Notify records a signal to send once the transaction commits.
 func (t *txn) Notify(_ context.Context, channel, payload string) error {
 	t.pending.Add(channel, payload)
 	return nil
+}
+
+// markAfter marks keyed work once the transaction commits, not in it: marked in it, the work's row
+// is held by every transaction marking it until each commits — a repository's every upload and
+// landing marks its compaction (pin) — and the work's own claims of it, writing the row, wait on
+// them all (on Spanner, abort them). A mark lost to a replica stopping between the commit and the
+// mark is work done later: compaction's next mark, or the repository's daily pass, which compacts.
+func (t *txn) markAfter(kind string, key int64) {
+	for _, m := range t.marks {
+		if m.kind == kind && m.key == key {
+			return
+		}
+	}
+	t.marks = append(t.marks, workMark{kind, key})
 }
 
 // txKey is the context key a transaction's context holds it under.
@@ -334,6 +372,18 @@ func (s *Store) snapshot(ctx context.Context, fn func(backend.Ops) error) error 
 	return s.b.Snapshot(ctx, fn)
 }
 
+// inSnapshot runs fn as inTx runs it, over a read-only snapshot instead: for what reads as a
+// transaction does — through the store's helpers that take one — and writes nothing, a landing's
+// dry run. It takes no locks, so it holds no writer back: in a Spanner read-write transaction a read
+// locks what it reads, and a check of every submittable CL would hold main's head from its landing.
+func (s *Store) inSnapshot(ctx context.Context, fn func(context.Context, *txn) error) error {
+	return s.b.Snapshot(ctx, func(ops backend.Ops) error {
+		tx := &txn{Ops: ops}
+		defer tx.done.Store(true)
+		return fn(context.WithValue(ctx, txKey{}, tx), tx)
+	})
+}
+
 // retryable reports a transaction the database aborted to break a deadlock or a conflict, or
 // one that lost a race the store detects itself (errRace); running it again is safe.
 func (s *Store) retryable(err error) bool {
@@ -346,12 +396,12 @@ func (s *Store) retryable(err error) bool {
 // reads through the transaction (ops).
 func (s *Store) inTx(ctx context.Context, fn func(context.Context, *txn) error) error {
 	return data.Retry(ctx, s.retryable, func() error {
-		if s.txAttempts != nil {
-			s.txAttempts()
-		}
 		var logged []backend.Scope
 		var committed *txn
 		err := s.b.Txn(ctx, func(ops backend.Ops) error {
+			if s.txAttempts != nil {
+				s.txAttempts()
+			}
 			tx := &txn{Ops: ops}
 			committed = tx
 			defer tx.done.Store(true)
@@ -371,6 +421,11 @@ func (s *Store) inTx(ctx context.Context, fn func(context.Context, *txn) error) 
 				s.indexChanged(sc)
 			}
 			committed.pending.Send(ctx, s.signals)
+			for _, m := range committed.marks {
+				if err := s.Work().Mark(context.WithoutCancel(ctx), m.kind, m.key); err != nil {
+					slog.Warn("scm: marking work", slog.String("kind", m.kind), slog.Int64("key", m.key), slog.Any("err", err))
+				}
+			}
 		}
 		return err
 	})

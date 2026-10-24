@@ -85,7 +85,7 @@ automation:
 	args := []string{"-address", addr, "-insecure", "-dev-person", "load.human.example.com", "-dev-worker", "worker.ok.robot.example.com",
 		// ~14 CLs offered over the run: one at least, all but certainly (the offers are random).
 		"-repositories", "5", "-speed", "400", "-cls-per-day", "40", "-duration", "15s", "-drain", "60s", "-run-time", "200ms", "-workers", "4",
-		"-publish-bytes", "200000", "-report", reportPath}
+		"-publish-bytes", "200000", "-seed-files", "2000", "-seed-file-bytes", "200", "-report", reportPath}
 	var runErr error
 	for i := 0; i < 50; i++ { // the system of record's first sync makes the load's person
 		out.Reset()

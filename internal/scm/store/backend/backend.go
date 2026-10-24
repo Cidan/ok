@@ -23,11 +23,12 @@ var ErrDuplicate = errors.New("backend: duplicate")
 // Backend is the SCM's database.
 type Backend interface {
 	Ops
-	// Txn runs fn in one read-write transaction, once: the store runs it again when Retryable
-	// says so. Notifications fn sends are delivered when it commits.
+	// Txn runs fn in a read-write transaction — on Spanner, again when Spanner aborts it, as the
+	// aborted one reset, which keeps its priority — and the store runs it again when Retryable
+	// says so. fn may run more than once. Notifications fn sends are delivered when it commits.
 	Txn(ctx context.Context, fn func(tx Ops) error) error
-	// Retryable reports a transaction the database aborted to break a deadlock or a conflict,
-	// which running again may commit.
+	// Retryable reports a transaction the database aborted to break a deadlock or a conflict, or
+	// one that refused what a transaction begun anew may not, which running again may commit.
 	Retryable(err error) bool
 	// Snapshot runs fn in one read-only transaction that sees the database as of one moment.
 	Snapshot(ctx context.Context, fn func(tx Ops) error) error
@@ -210,8 +211,9 @@ type Ops interface {
 	// InsertPack records a pack compaction wrote, with the dictionary it considered (nil: none),
 	// and returns its number.
 	InsertPack(ctx context.Context, net Network, id encoding.ID, size int64, dictionary *int64) (uint64, error)
-	// PackNumbers are a network's packs' IDs, retired ones too, by number.
-	PackNumbers(ctx context.Context, net Network) (map[uint64]encoding.ID, error)
+	// NumberedPacks are the IDs of a network's packs of numbers nums, retired ones too: a number is
+	// one pack's for good. Read without locking them (a reader of a chunk index names many).
+	NumberedPacks(ctx context.Context, net Network, nums []uint64) (map[uint64]encoding.ID, error)
 	// LivePacks are a network's packs not retired, oldest first.
 	LivePacks(ctx context.Context, net Network) ([]Pack, error)
 	// RetiredPackIDs are a network's retired packs' IDs.
@@ -259,10 +261,12 @@ type Ops interface {
 	// CommitGenerations are the generations of the commits among ids, by ID.
 	CommitGenerations(ctx context.Context, repo int64, ids []encoding.ID) (map[encoding.ID]int64, error)
 	// WalkObjects applies walk to the objects of kind among ids it applies to — unpinned and
-	// older than today for a touch, unpinned for a refresh or a pin — and returns their bodies.
-	WalkObjects(ctx context.Context, repo int64, kind encoding.Kind, ids []encoding.ID, walk Walk) (map[encoding.ID][]byte, error)
+	// older than today for a touch, unpinned for a refresh or a pin — and returns their bodies,
+	// and the ids it found held that it does not apply to, committed before the transaction:
+	// pinned, or touched today for a touch (none, when it does not tell them).
+	WalkObjects(ctx context.Context, repo int64, kind encoding.Kind, ids []encoding.ID, walk Walk) (map[encoding.ID][]byte, map[encoding.ID]bool, error)
 	// WalkCommits is WalkObjects for commits.
-	WalkCommits(ctx context.Context, repo int64, ids []encoding.ID, walk Walk) (map[encoding.ID][]byte, error)
+	WalkCommits(ctx context.Context, repo int64, ids []encoding.ID, walk Walk) (map[encoding.ID][]byte, map[encoding.ID]bool, error)
 	// StaleObjectIDs and StaleCommitIDs are the unpinned objects or commits not touched since
 	// cutoff, by ID.
 	StaleObjectIDs(ctx context.Context, repo int64, cutoff time.Time) ([]encoding.ID, error)
@@ -299,6 +303,12 @@ type Ops interface {
 
 	// Segments are a scope's live segments of kind, newest first by age.
 	Segments(ctx context.Context, scope Scope, kind segment.Kind) ([]Segment, error)
+	// SegmentsUnlocked are the same, read without locking them: in a Spanner read-write
+	// transaction a read locks what it scans, so every reader of a repository's segments would
+	// wait on compaction's writes to its manifest, and compaction on every reader. For reading what
+	// segments hold, which a merge or a fold retiring them does not change: a retired segment stays
+	// readable for its grace. On PostgreSQL, Segments, which locks nothing.
+	SegmentsUnlocked(ctx context.Context, scope Scope, kind segment.Kind) ([]Segment, error)
 	// InsertSegments records written segments live.
 	InsertSegments(ctx context.Context, segs []Segment) error
 	// RetireSegments retires a scope's live segments of kind among ids, those it inherited aside,
@@ -442,6 +452,24 @@ type Ops interface {
 	// DeleteOrphanWorkspaces its workspaces with no operation log — or, dry, counts them.
 	DeleteOrphanOpLogs(ctx context.Context, repo int64, dry bool) (int64, error)
 	DeleteOrphanWorkspaces(ctx context.Context, repo int64, dry bool) (int64, error)
+	// OpContentPinned reports whether what a repository's settled operations and views reach is
+	// pinned (docs/scm.md, "Garbage collection and compaction"): true of a repository made since
+	// compaction pins it as it moves them, and of one a pass pinned the rest of; SetOpContentPinned
+	// records it.
+	OpContentPinned(ctx context.Context, repo int64) (bool, error)
+	SetOpContentPinned(ctx context.Context, repo int64) error
+	// TailOps are up to limit of the operations or views (kind) the tail holds of a repository's
+	// operation logs, after the key after (zero: from the first), in key order: the roots
+	// garbage collection's mark reads a page at a time.
+	TailOps(ctx context.Context, repo int64, kind encoding.Kind, after OpKey, limit int) ([]OpRecord, error)
+	// DivergeOpLog records that an operation log's heads moved other than forward, now
+	// (diverged_at): only such a move leaves operations nothing reaches. OpLogsToCollect are a
+	// repository's logs that diverged after what a collection covered (collected_through), with
+	// when; SetOpLogCollected records a collection that took everything a divergence at through
+	// left unreached.
+	DivergeOpLog(ctx context.Context, opLog int64) error
+	OpLogsToCollect(ctx context.Context, repo int64) ([]OpLogDivergence, error)
+	SetOpLogCollected(ctx context.Context, opLog int64, through time.Time) error
 	// RepositoryOperations and RepositoryViews are every operation and view the tail holds of a
 	// repository's operation logs.
 	RepositoryOperations(ctx context.Context, repo int64) ([]OpRecord, error)
@@ -580,6 +608,11 @@ type Ops interface {
 	// every, except each workspace's latest that is not a fork: before daily, every one; before
 	// hourly, all but the last of each day; otherwise all but the last of each hour (UTC).
 	ThinCheckpoints(ctx context.Context, repo int64, every, hourly, daily time.Time, dry bool) (int64, error)
-	// CheckpointTrees are the trees of a repository's checkpoints, once each.
+	// CheckpointTrees are the trees of a repository's checkpoints whose trees are not pinned, once
+	// each: garbage collection's roots.
 	CheckpointTrees(ctx context.Context, repo int64) ([]encoding.ID, error)
+	// CheckpointsToPin are up to limit of a repository's checkpoints made before before whose trees
+	// are not pinned, with their trees; SetCheckpointsPinned records theirs pinned.
+	CheckpointsToPin(ctx context.Context, repo int64, before time.Time, limit int) ([]CheckpointTreeIDs, error)
+	SetCheckpointsPinned(ctx context.Context, repo int64, ids []int64) error
 }

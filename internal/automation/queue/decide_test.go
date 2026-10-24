@@ -42,6 +42,17 @@ func TestConflict(t *testing.T) {
 		// affects nothing, conflicts with the change that makes the repository a Bazel workspace.
 		"imported beside the settings": {fp("README.md"), fp("//a:a", ".ok/repository.yaml"), true, false},
 		"two changes to the settings":  {fp(".ok/repository.yaml"), fp(".ok/repository.yaml"), true, true},
+		// A large change's footprint, kept coarse (store.BoundPaths, store.BoundTargets): a
+		// subtree touches anything under it; every target meets anything with targets.
+		"a subtree and a file in it":        {fp("vendor/x/"), fp("vendor/x/y/z.go"), false, true},
+		"a subtree and a package in it":     {fp("vendor/x/"), fp("//vendor/x/y:z", "app/a.go"), true, false},
+		"a subtree in a package":            {fp("lib/deep/"), fp("//lib:lib", "app/a.go"), true, false},
+		"a subtree and a file beside it":    {fp("vendor/x/"), fp("vendor/y.go"), false, false},
+		"a file where a subtree is":         {fp("docs"), fp("docs/api/"), false, true},
+		"everything":                        {fp("/"), fp("README.md"), true, true},
+		"every target and a change's":       {fp("//...", "a/a.go"), fp("//b:b", "b/b.go"), true, false},
+		"every target and a file's change":  {fp("//...", "a/a.go"), fp("README.md"), true, false},
+		"every target reached, and nothing": {fp("^//...", "a/a.go"), fp("README.md"), true, false},
 	} {
 		if got := Conflict(tc.a, tc.b); got != tc.conflict {
 			t.Errorf("%s: Conflict %v, want %v", name, got, tc.conflict)

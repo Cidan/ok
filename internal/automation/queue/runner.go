@@ -277,6 +277,17 @@ func (r *Runner) act(ctx context.Context, rep *scmpb.Repository, st *store.Queue
 		// came: the next pass sees it.
 		return nil
 	}
+	var invalid *store.InvalidError
+	if a.Kind == Create && errors.As(err, &invalid) {
+		// The store refuses what it cannot hold, and always will: the submission fails, saying
+		// why, rather than holding its repository's queue up on every pass.
+		reason := "its attempt could not be recorded: " + invalid.Message
+		r.log.Warn("queue: failed a submission", "repository", rep.GetName(), "submission", a.Submission, "reason", reason)
+		if ferr := r.store.FailSubmission(ctx, a.Submission, reason); ferr != nil && !errors.As(ferr, &conflict) {
+			return fmt.Errorf("submission %d: %w", a.Submission, ferr)
+		}
+		return nil
+	}
 	if err != nil {
 		return fmt.Errorf("submission %d: %w", a.Submission, err)
 	}

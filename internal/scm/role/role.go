@@ -134,7 +134,7 @@ func open(ctx context.Context, cfg *config.Config, opts Options) (*store.Store, 
 	st, err := store.New(b, blobs, store.Config{
 		Names: cfg.Names(), EmailDomain: cfg.SCM.EmailDomain,
 		ObjectCacheBytes: cfg.SCM.Cache.Objects, ChunkCacheBytes: cfg.SCM.Cache.Chunks, DiffCacheBytes: cfg.SCM.Cache.Diffs,
-		CodeIndexCacheBytes: cfg.SCM.Cache.CodeIndexes,
+		PathCommitCacheBytes: cfg.SCM.Cache.PathCommits, CodeIndexCacheBytes: cfg.SCM.Cache.CodeIndexes,
 	})
 	if err != nil {
 		done()

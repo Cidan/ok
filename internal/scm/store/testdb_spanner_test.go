@@ -171,6 +171,11 @@ func (d spannerDB) networks(t testing.TB, net int64) int {
 	return d.count(t, "network", `network_id = @net`, map[string]any{"net": net})
 }
 
+func (d spannerDB) unpinOpContent(t testing.TB, repo int64) {
+	t.Helper()
+	d.exec(t, `UPDATE repository SET op_content_pinned = FALSE WHERE repository_id = @repo`, map[string]any{"repo": repo})
+}
+
 func (d spannerDB) setHead(t testing.TB, repo int64, head encoding.ID) {
 	t.Helper()
 	d.exec(t, `UPDATE repository SET head = @head WHERE repository_id = @repo`, map[string]any{"repo": repo, "head": head[:]})

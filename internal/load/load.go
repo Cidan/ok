@@ -74,7 +74,15 @@ type Config struct {
 	Read    bool
 	// WorkerPrefix tells this run's workers from others' — another pod's of the same run.
 	WorkerPrefix string
-	Log          *slog.Logger
+	// SeedFiles, when set, has each repository seeded with a tree of that many files shaped as a
+	// monorepo's, each of SeedFileBytes; checkpoints, publishes, and CLs change files of it, and
+	// publishes carry jj's operations and views (monorepo.go). SeedLands: this pod lands the
+	// seeds, which others wait for.
+	SeedFiles, SeedFileBytes int
+	SeedLands                bool
+	// Pod and Pods: this pod of the run's, whose share of the seed's files its CLs change.
+	Pod, Pods int
+	Log       *slog.Logger
 }
 
 // run is a run under way.
@@ -92,6 +100,9 @@ type run struct {
 		stuck             []string
 	}
 	runs struct{ plans, jobs, released atomic.Int64 }
+	// mono and trees: a run with SeedFiles' seed, and the trees it read and wrote.
+	mono  *seeded
+	trees *trees
 }
 
 // repoState is what a run keeps of a repository.
@@ -112,6 +123,13 @@ type workspace struct {
 	mu        sync.Mutex
 	lease     *scmpb.Lease
 	lastCheck int64
+	// With a seed: main's head when it began, its working copy's tree, the files it works on, its
+	// working-copy commit, and its operation log's heads.
+	base    []byte
+	tree    encoding.ID
+	paths   []string
+	wc      encoding.ID
+	opHeads [][]byte
 }
 
 // operations a run measures.
@@ -160,6 +178,19 @@ func Run(ctx context.Context, cfg Config) (*Report, error) {
 			defer workers.Done()
 			r.worker(wctx, fmt.Sprintf("load-%s-%d", cfg.WorkerPrefix, i), cfg.WorkerClients[i%len(cfg.WorkerClients)])
 		}()
+	}
+	if cfg.SeedFiles > 0 {
+		r.trees = newTrees()
+		r.mono = newSeeded(cfg.SeedFiles, cfg.Pod, cfg.Pods)
+		seeded := time.Now()
+		for _, rs := range r.repos {
+			if err := r.seedRepo(ctx, rs); err != nil {
+				stopWorkers()
+				workers.Wait()
+				return nil, fmt.Errorf("load: seeding: %w", err)
+			}
+		}
+		cfg.Log.Info("load: seeded", "repositories", len(r.repos), "files", cfg.SeedFiles, "took", time.Since(seeded).Round(time.Millisecond))
 	}
 	offerCtx, stopOffering := context.WithTimeout(ctx, cfg.Duration)
 	defer stopOffering()
@@ -290,6 +321,15 @@ func name() string {
 // publish sends a commit of fresh files on a repository's main, as a person's jj publishes a
 // transaction.
 func (r *run) publish(ctx context.Context) error {
+	if r.mono != nil {
+		ws := r.workspaces[mrand.IntN(len(r.workspaces))]
+		ws.mu.Lock()
+		defer ws.mu.Unlock()
+		if err := r.begin(ctx, ws); err != nil {
+			return err
+		}
+		return r.publishTransaction(ctx, ws)
+	}
 	p, rs := r.pick()
 	head, err := r.mainHead(ctx, p, rs)
 	if err != nil {
@@ -322,28 +362,26 @@ func (r *run) checkpoint(ctx context.Context) error {
 	}
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
-	if ws.lease == nil {
-		// A workspace, as jj clone makes one, then attached, as okfs attaches it.
-		if _, err := p.Workspaces.CreateWorkspace(ctx, &scmpb.CreateWorkspaceRequest{RepositoryId: rs.ID, Workspace: ws.name}); err != nil &&
-			status.Code(err) != codes.AlreadyExists {
-			return err
-		}
-		got, err := p.Workspaces.Attach(ctx, &scmpb.AttachRequest{RepositoryId: rs.ID, Workspace: ws.name, Machine: "load", Takeover: true})
-		if err != nil {
-			return err
-		}
-		if !got.GetGranted() {
-			return status.Errorf(codes.Aborted, "the workspace is %s's", got.GetHolder())
-		}
-		ws.lease, ws.lastCheck = got.GetLease(), got.GetLatest().GetId()
+	if err := r.begin(ctx, ws); err != nil {
+		return err
 	}
 	b := scmtest.Builder()
-	tree := r.files(b, "ws", r.cfg.CheckpointBytes)
+	var tree encoding.ID
+	base := head
+	if r.mono != nil {
+		var err error
+		if tree, err = r.editWorkspace(ctx, ws, b, 1, r.cfg.CheckpointBytes); err != nil {
+			return err
+		}
+		base = ws.base
+	} else {
+		tree = r.files(b, "ws", r.cfg.CheckpointBytes)
+	}
 	if _, _, err := b.Publish(ctx, p.Store, rs.ID, nil); err != nil {
 		return err
 	}
 	cp, err := p.Workspaces.RecordCheckpoint(ctx, &scmpb.RecordCheckpointRequest{Lease: ws.lease, ParentId: ws.lastCheck, TreeIds: [][]byte{tree[:]},
-		BaseCommitId: head})
+		BaseCommitId: base})
 	if err != nil {
 		if status.Code(err) == codes.FailedPrecondition || status.Code(err) == codes.PermissionDenied {
 			ws.lease = nil // lapsed: attach again next time
@@ -351,6 +389,9 @@ func (r *run) checkpoint(ctx context.Context) error {
 		return err
 	}
 	ws.lastCheck = cp.GetId()
+	if r.mono != nil {
+		ws.tree = tree
+	}
 	return nil
 }
 
@@ -363,7 +404,23 @@ func (r *run) cl(ctx context.Context) error {
 		return err
 	}
 	b := scmtest.Builder()
-	c := commit(b, r.files(b, "cl-"+name(), r.cfg.CLBytes), "a load CL", head)
+	var tree encoding.ID
+	if r.mono != nil {
+		root, err := r.trees.rootOf(ctx, p, rs.ID, head)
+		if err != nil {
+			return err
+		}
+		changes := map[string]encoding.ID{}
+		for _, path := range r.mono.forCL() {
+			changes[path] = fresh(b, r.cfg.CLBytes/clFiles)
+		}
+		if tree, err = r.trees.edit(ctx, p, rs.ID, b, root, changes); err != nil {
+			return err
+		}
+	} else {
+		tree = r.files(b, "cl-"+name(), r.cfg.CLBytes)
+	}
+	c := commit(b, tree, "a load CL", head)
 	step := func(name string, do func() error) error {
 		t0 := time.Now()
 		err := do()
@@ -513,21 +570,42 @@ func (r *run) do(ctx context.Context, c Clients, worker string, run *automationp
 		return
 	}
 	r.runs.jobs.Add(1)
+	// The job reads its commit's files while its run's time passes, its lease kept by heartbeats
+	// throughout, as a worker's checkout and build are: a large tree's read may outlast a lease.
+	read := make(chan struct{})
 	if r.cfg.Read {
-		t0 := time.Now()
-		err := r.read(ctx, c, run)
-		r.stats["worker.read"].offer()
-		r.stats["worker.read"].done(time.Since(t0), err)
+		go func() {
+			defer close(read)
+			t0 := time.Now()
+			err := r.read(ctx, c, run)
+			r.stats["worker.read"].offer()
+			r.stats["worker.read"].done(time.Since(t0), err)
+		}()
+	} else {
+		close(read)
 	}
 	end := time.Now().Add(r.cfg.RunTime)
-	for time.Now().Before(end) {
+	for read != nil || time.Now().Before(end) {
+		wait := heartbeat
+		if read == nil {
+			wait = min(heartbeat, time.Until(end))
+		}
 		select {
 		case <-ctx.Done():
+			if read != nil {
+				<-read
+			}
 			if _, err := c.Work.Release(context.WithoutCancel(ctx), &automationpb.ReleaseRequest{RunId: run.GetId(), Worker: worker}); err == nil {
 				r.runs.released.Add(1)
 			}
 			return
-		case <-time.After(min(heartbeat, time.Until(end))):
+		case <-read:
+			read = nil // read: the run's time decides now
+			continue
+		case <-time.After(wait):
+		}
+		if read == nil && !time.Now().Before(end) {
+			break
 		}
 		hb, err := c.Work.Heartbeat(ctx, &automationpb.HeartbeatRequest{RunId: run.GetId(), Worker: worker})
 		if err == nil && hb.GetStop() != automationpb.HeartbeatResponse_STOP_UNSPECIFIED {

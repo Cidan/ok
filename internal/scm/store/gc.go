@@ -53,8 +53,10 @@ type GCReport struct {
 	// whole: the operation logs of no workspace, and the workspaces with no log of their own
 	// (their leases and checkpoints).
 	OpLogsDeleted, WorkspacesDeleted int64
-	// Checkpoints retention no longer keeps (docs/okfs.md, "Checkpoints").
+	// Checkpoints retention no longer keeps (docs/okfs.md, "Checkpoints"), and those it keeps past
+	// their first week whose trees the pass pinned (settle.go).
 	CheckpointsDeleted int64
+	CheckpointsPinned  int
 	// Marked counts the unpinned, stale objects still reachable, which the sweep keeps.
 	Marked int
 	// Rows swept, by table, and the stored bytes of the chunks whose locations went with them.
@@ -123,6 +125,16 @@ func (s *Store) GC(ctx context.Context, repo int64, now time.Time, opts GCOption
 		return r, err
 	}
 	r.CheckpointsDeleted = thinned
+	if !opts.DryRun {
+		// What the mark need not walk again (settle.go): settled operations' content, once, and
+		// the trees of checkpoints kept past their first week.
+		if err := s.pinSettledOps(ctx, repo); err != nil {
+			return r, fmt.Errorf("pinning what settled operations reach: %w", err)
+		}
+		if r.CheckpointsPinned, err = s.pinKeptCheckpoints(ctx, repo, now.Add(-CheckpointsAll)); err != nil {
+			return r, fmt.Errorf("pinning kept checkpoints' trees: %w", err)
+		}
+	}
 	cutoff := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC).AddDate(0, 0, -sweepGraceDays)
 	if err := s.markAndSweep(ctx, repo, cutoff, opts, r); err != nil {
 		return r, fmt.Errorf("mark and sweep: %w", err)
@@ -194,17 +206,26 @@ func (s *Store) collectRepository(ctx context.Context, repo int64, keepNewer tim
 		}
 		*n = got
 	}
-	logs, err := s.ops(ctx).WorkspaceOpLogs(ctx, repo)
+	// Only a log whose heads moved other than forward — jj op abandon — holds operations nothing
+	// reaches, so only a log that did so since a collection covered it is walked (settle.go).
+	logs, err := s.ops(ctx).OpLogsToCollect(ctx, repo)
 	if err != nil {
 		return err
 	}
 	for _, log := range logs {
-		c, err := s.collectLog(ctx, repo, log, nil, keepNewer, opts.DryRun)
+		c, err := s.collectLog(ctx, repo, log.OpLog, nil, keepNewer, opts.DryRun)
 		if err != nil {
-			return fmt.Errorf("operation log %d: %w", log, err)
+			return fmt.Errorf("operation log %d: %w", log.OpLog, err)
 		}
 		r.OperationsDeleted += c.Operations
 		r.ViewsDeleted += c.Views
+		// What the divergence left unreached was touched by then: once that is past the window, this
+		// collection took all of it, and the log is not walked again until it diverges again.
+		if !opts.DryRun && log.DivergedAt.Before(keepNewer) {
+			if err := s.ops(ctx).SetOpLogCollected(ctx, log.OpLog, log.DivergedAt); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }
@@ -519,88 +540,100 @@ func (s *Store) staleInIndex(ctx context.Context, tx *txn, repo int64, t table, 
 // mark returns the unpinned objects not touched since cutoff that are reachable from the
 // roots: every commit a view or operation of the repository's operation logs references
 // (a view's heads, working-copy commits, and ref targets; an operation's commit
-// predecessors), every pending candidate, and every checkpoint's tree. The walk stops at pinned objects, which are
+// predecessors) — the tail's alone once what settled ones reach is pinned (settle.go) — every
+// pending candidate, and the trees of the checkpoints not pinned. The walk stops at pinned objects, which are
 // never swept and whose subgraphs are pinned, and at objects touched since cutoff, whose
 // subgraphs were touched no earlier (a touch recurses into what it references).
 func (s *Store) mark(ctx context.Context, repo int64, cutoff time.Time) (map[ref]bool, error) {
-	roots := map[encoding.ID]bool{}
-	for _, q := range []struct {
-		kind encoding.Kind
-	}{
-		{encoding.KindView},
-		{encoding.KindOperation},
-	} {
-		rows, err := s.repositoryOps(ctx, repo, q.kind)
-		if err != nil {
-			return nil, err
-		}
-		for _, row := range rows {
-			o, err := decodeStored(q.kind, row.ID, row.Body)
+	marked := map[ref]bool{}
+	var frontier []ref
+	// markCommits marks roots' stale, unpinned ancestry, in one recursive query per batch of
+	// roots, and puts their trees on the frontier.
+	markCommits := func(rootIDs []encoding.ID) error {
+		sortIDs(rootIDs)
+		for start := 0; start < len(rootIDs); start += gcBatch {
+			batch := rootIDs[start:min(start+gcBatch, len(rootIDs))]
+			reached, err := s.ops(ctx).StaleAncestry(ctx, repo, batch, cutoff)
 			if err != nil {
-				return nil, err
+				return err
 			}
-			switch o := o.(type) {
-			case *encoding.View:
-				for _, c := range viewCommits(o) {
-					roots[c] = true
+			ids := make([]encoding.ID, 0, len(reached))
+			for id := range reached {
+				ids = append(ids, id)
+			}
+			sortIDs(ids)
+			for _, id := range ids {
+				r := ref{table: tCommit, id: id}
+				if marked[r] {
+					continue
 				}
-			case *encoding.Operation:
-				for c, preds := range o.CommitPredecessors {
-					roots[c] = true
-					for _, p := range preds {
-						roots[p] = true
+				marked[r] = true
+				o, err := decodeStored(encoding.KindCommit, id, reached[id])
+				if err != nil {
+					return err
+				}
+				for _, t := range o.(*encoding.Commit).RootTree {
+					if t != encoding.EmptyTreeID {
+						frontier = append(frontier, ref{table: tObject, id: t})
 					}
 				}
 			}
+		}
+		return nil
+	}
+	commitsOf := func(rs []ref) []encoding.ID {
+		out := make([]encoding.ID, len(rs))
+		for i, r := range rs {
+			out[i] = r.id
+		}
+		return out
+	}
+
+	// The commits the operation logs name: the tail's operations and views a page at a time, once
+	// what the segments' reach is pinned (settle.go); every one's before.
+	settled, err := s.ops(ctx).OpContentPinned(ctx, repo)
+	if err != nil {
+		return nil, err
+	}
+	if settled {
+		if err := s.eachTailOpRoots(ctx, repo, func(roots []ref) error { return markCommits(commitsOf(roots)) }); err != nil {
+			return nil, err
+		}
+	} else {
+		var recs []backend.OpRecord
+		for _, kind := range []encoding.Kind{encoding.KindView, encoding.KindOperation} {
+			rows, err := s.repositoryOps(ctx, repo, kind)
+			if err != nil {
+				return nil, err
+			}
+			for _, row := range rows {
+				recs = append(recs, backend.OpRecord{OpKey: backend.OpKey{Kind: kind, ID: row.ID}, Body: row.Body})
+			}
+		}
+		roots, err := opRoots(recs)
+		if err != nil {
+			return nil, err
+		}
+		if err := markCommits(commitsOf(roots)); err != nil {
+			return nil, err
 		}
 	}
 	cands, err := s.ops(ctx).Candidates(ctx, repo)
 	if err != nil {
 		return nil, err
 	}
+	var candidates []encoding.ID
 	for _, c := range cands {
-		roots[c.Commit] = true
+		if c.Commit != encoding.RootCommitID {
+			candidates = append(candidates, c.Commit)
+		}
 	}
-	delete(roots, encoding.RootCommitID)
-
-	marked := map[ref]bool{}
-	// Commits: their stale, unpinned ancestry from the roots, in one recursive query per
-	// batch of roots.
-	rootIDs := make([]encoding.ID, 0, len(roots))
-	for id := range roots {
-		rootIDs = append(rootIDs, id)
-	}
-	sortIDs(rootIDs)
-	var frontier []ref
-	for start := 0; start < len(rootIDs); start += gcBatch {
-		batch := rootIDs[start:min(start+gcBatch, len(rootIDs))]
-		reached, err := s.ops(ctx).StaleAncestry(ctx, repo, batch, cutoff)
-		if err != nil {
-			return nil, err
-		}
-		ids := make([]encoding.ID, 0, len(reached))
-		for id := range reached {
-			ids = append(ids, id)
-		}
-		sortIDs(ids)
-		for _, id := range ids {
-			r := ref{table: tCommit, id: id}
-			if marked[r] {
-				continue
-			}
-			marked[r] = true
-			o, err := decodeStored(encoding.KindCommit, id, reached[id])
-			if err != nil {
-				return nil, err
-			}
-			for _, t := range o.(*encoding.Commit).RootTree {
-				if t != encoding.EmptyTreeID {
-					frontier = append(frontier, ref{table: tObject, id: t})
-				}
-			}
-		}
+	if err := markCommits(candidates); err != nil {
+		return nil, err
 	}
 
+	// The trees of the checkpoints not pinned: those within their first week, and any older a pass
+	// has yet to pin (pinKeptCheckpoints).
 	checkpointTrees, err := s.checkpointTrees(ctx, repo)
 	if err != nil {
 		return nil, err

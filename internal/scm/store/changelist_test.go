@@ -10,8 +10,10 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/Cidan/ok/internal/scm/encoding"
+	"github.com/Cidan/ok/internal/scm/store/backend"
 )
 
 const (
@@ -479,6 +481,112 @@ func TestTransitions(t *testing.T) {
 	e.mustLand(LandItem{Number: n, Patchset: 1})
 	refuse(Abandon)
 	refuse(ReturnToDraft)
+}
+
+// An upload onto main where main is a CL's patchset — landed as itself, by fast-forward — stacks
+// on no CL, and does not lock that CL: every upload onto main would wait on every other while main
+// stands there. It commits while another transaction holds the landed CL's row.
+func TestUploadOntoMainLocksNoLandedCL(t *testing.T) {
+	ctx := context.Background()
+	e := newCLEnv(t)
+	c1 := e.commit(alice, newChange(), encoding.RootCommitID, "one", map[string]string{"a": "1"})
+	n1 := e.open(c1)
+	if landed := e.mustLand(LandItem{Number: n1, Patchset: 1}); landed[0].Commit != c1 {
+		t.Fatalf("CL %d did not land as itself: %s", n1, landed[0].Commit)
+	}
+	held, release := make(chan struct{}), make(chan struct{})
+	holder := make(chan error, 1)
+	go func() {
+		holder <- e.s.inTx(ctx, func(ctx context.Context, tx *txn) error {
+			if _, err := e.s.lockChangeLists(ctx, tx, e.repo, []int64{n1}); err != nil {
+				return err
+			}
+			select {
+			case <-held:
+			default:
+				close(held)
+			}
+			<-release
+			return nil
+		})
+	}()
+	<-held
+	c2 := e.commit(bob, newChange(), c1, "two", map[string]string{"b": "2"})
+	uploaded := make(chan error, 1)
+	go func() {
+		res, err := e.upload(bob, Ready, nil, c2)
+		if err == nil && (len(res) != 1 || res[0].Outcome != Created) {
+			err = fmt.Errorf("the upload: %+v", res)
+		}
+		uploaded <- err
+	}()
+	select {
+	case err := <-uploaded:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		close(release)
+		t.Fatal("an upload onto main waited on the CL main's head landed from")
+	}
+	close(release)
+	if err := <-holder; err != nil {
+		t.Fatal(err)
+	}
+}
+
+// What an upload pins is compaction's, marked once the upload commits rather than in it: an upload's
+// transaction commits while compaction's claim holds the work's row, and compaction, done, finds
+// the work marked again.
+func TestPinMarksCompactionAfterCommit(t *testing.T) {
+	ctx := context.Background()
+	e := newCLEnv(t)
+	// The work is not marked before compaction takes it: on Spanner a mark of work already
+	// marked writes nothing, and may commit before the claim, which then covers the upload's pins
+	// itself; one of work unmarked is written, after the claim.
+	held, release := make(chan struct{}), make(chan struct{})
+	holder := make(chan error, 1)
+	go func() {
+		holder <- e.s.b.Txn(ctx, func(tx backend.Ops) error {
+			if ok, err := tx.TakeWork(ctx, SegmentWork, e.repo, "compaction", time.Minute); err != nil || !ok {
+				return errors.Join(err, fmt.Errorf("took the work: %v", ok))
+			}
+			select {
+			case <-held:
+			default:
+				close(held)
+			}
+			<-release
+			return nil
+		})
+	}()
+	<-held
+	c := e.commit(alice, newChange(), encoding.RootCommitID, "one", map[string]string{"a": "1"})
+	uploaded := make(chan error, 1)
+	go func() {
+		_, err := e.upload(alice, Ready, nil, c)
+		uploaded <- err
+	}()
+	// The upload commits while compaction holds the work: its mark, after, waits for the claim.
+	db := dbOf(e.s)
+	for deadline := time.Now().Add(10 * time.Second); db.count(t, "changelist", "repository_id = @repo", map[string]any{"repo": e.repo}) == 0; {
+		if time.Now().After(deadline) {
+			close(release)
+			t.Fatal("an upload's transaction waited on compaction's claim of its work")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	close(release)
+	if err := <-holder; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-uploaded; err != nil {
+		t.Fatal(err)
+	}
+	// Marked once compaction took it: compaction keeps it, to run again.
+	if again, err := e.s.Work().Release(ctx, SegmentWork, e.repo, "compaction"); err != nil || !again {
+		t.Fatalf("releasing compaction: again %v, %v; the upload's pins were not marked", again, err)
+	}
 }
 
 func TestLandFastForwardAndSplice(t *testing.T) {

@@ -43,7 +43,7 @@ func (x queries) InsertRepository(ctx context.Context, id int64, net backend.Net
 		return backend.Repository{}, err
 	}
 	r, err := scanRepository(x.q.QueryRow(ctx,
-		`INSERT INTO repository (id, network_id, head, created_by) VALUES ($1, $2, $3, $4) RETURNING `+repositoryColumns,
+		`INSERT INTO repository (id, network_id, head, created_by, op_content_pinned) VALUES ($1, $2, $3, $4, true) RETURNING `+repositoryColumns,
 		id, net, head[:], createdBy))
 	if unique(err) {
 		return r, errors.Join(backend.ErrDuplicate, err)
@@ -53,8 +53,8 @@ func (x queries) InsertRepository(ctx context.Context, id int64, net backend.Net
 
 func (x queries) InsertFork(ctx context.Context, id int64, parent backend.Repository, createdBy string) (backend.Repository, error) {
 	r, err := scanRepository(x.q.QueryRow(ctx,
-		`INSERT INTO repository (id, network_id, parent_id, parent_seq, head, head_seq, created_by)
-		VALUES ($1, $2, $3, $5, $4, $5, $6) RETURNING `+repositoryColumns,
+		`INSERT INTO repository (id, network_id, parent_id, parent_seq, head, head_seq, created_by, op_content_pinned)
+		VALUES ($1, $2, $3, $5, $4, $5, $6, true) RETURNING `+repositoryColumns,
 		id, parent.Network, parent.ID, parent.Head[:], parent.HeadSeq, createdBy))
 	if unique(err) {
 		return r, errors.Join(backend.ErrDuplicate, err)
@@ -580,8 +580,12 @@ func (x queries) InsertPack(ctx context.Context, net backend.Network, id encodin
 	return num, err
 }
 
-func (x queries) PackNumbers(ctx context.Context, net backend.Network) (map[uint64]encoding.ID, error) {
-	rows, err := x.q.Query(ctx, `SELECT num, id FROM pack WHERE network_id = $1`, net)
+func (x queries) NumberedPacks(ctx context.Context, net backend.Network, nums []uint64) (map[uint64]encoding.ID, error) {
+	n := make([]int64, len(nums))
+	for i, v := range nums {
+		n[i] = int64(v)
+	}
+	rows, err := x.q.Query(ctx, `SELECT num, id FROM pack WHERE network_id = $1 AND num = ANY($2)`, net, n)
 	if err != nil {
 		return nil, err
 	}

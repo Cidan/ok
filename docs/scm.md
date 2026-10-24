@@ -619,8 +619,9 @@ A workspace is made by `CreateWorkspace`, with its operation log; okfs's virtual
   otherwise — kept, never refused.
 
 Garbage collection thins checkpoints (every one for 7 days, then the last of each hour for 30,
-then the last of each day for a year; a workspace's latest always) and treats every kept
-checkpoint's tree as a root.
+then the last of each day for a year; a workspace's latest always). A checkpoint kept past its
+first week has its trees pinned — kept for good, in segments, out of the database's rows — and the
+trees of the rest are roots of the mark (*Garbage collection and compaction*).
 
 ### Browse
 
@@ -829,9 +830,19 @@ record of them:
   segment. A repository's index is marked stale when this
   replica commits a change to it or another's commit is announced, and the next read refreshes
   it first, from one snapshot: the log rows committed after its place, or the whole of a new
-  generation — what it reads is what is new, however long the tail. A file
+  generation — what it reads is what is new, however long the tail. Readers that find it stale
+  together share one refresh: one that began after a reader asked serves it, so a busy
+  repository's every write staling every replica's index costs each replica a refresh at a time,
+  not one a write (`ok_scm_index_refresh_wait_seconds`, `ok_scm_index_refresh_seconds`). Files'
+  manifests and sizes, which a file's ID fixes, and a publish's first look at what the repository
+  holds — which its touch, under the index's lock, checks again — read the replica's index as it
+  is, refreshing only for what it lacks; chunks' locations, which compaction moves, a transaction,
+  and garbage collection read it refreshed. A file
   or chunk it lacks is looked for again after a refresh — it may have committed since — and is
-  absent after that; a read whose pack was retired refreshes before it locates its chunks again.
+  absent after that; a read whose pack was retired refreshes before it locates its chunks again. A
+  network's chunk index names packs by number, which a replica resolves as it needs them — just
+  those numbers, and keeps them: a number is one pack's for good, and a network writes a pack a
+  publish.
 - **Checking it.** `ok scm fsck` verifies every pack of the repository's network against the chunk
   index's locations in it, every file the repository holds against its ID, and that the repository
   holds every chunk of its files; with `-repair`, it rebuilds the location of a chunk a file uses
@@ -1204,6 +1215,14 @@ repositories themselves are never deleted (see "Decisions").
   is kept, with its view and `commit_predecessors`. That is jj's own semantics, where any past
   state can be restored, and it matches CitC's snapshot history. A user sheds history with
   `jj op abandon` followed by `jj util gc`.
+  - **Settled content is pinned** (`settle.go`). An operation or view untouched for 15 days (the
+    collection window and a day) is settled: compaction moves it into a segment, and first pins
+    what it reaches — a view's heads, bookmarks, tags, and working copies, an operation's commits
+    and their predecessors — so that content leaves the database's rows with it, and no pass walks
+    it again. What an operation abandoned within the window reached is still collected; what one
+    abandoned after it settled reached stays, as pinned objects do. A repository's settled
+    operations from before compaction pinned their content are pinned by its next pass, once
+    (`op_content_pinned`).
   - **`CollectOperations(heads, keep_newer)`** deletes operations and views that are unreachable
     from both the given heads and every current `op_head` row, and whose `touched_at` (server
     time) is older than `keep_newer`. A head another machine published concurrently is therefore
@@ -1220,8 +1239,13 @@ repositories themselves are never deleted (see "Decisions").
     operations, views, and heads, and with them the commits only they kept. So is a workspace
     okfs recorded then, with no log of its own, which no clone can use: with its lease and
     checkpoints.
-  - The server runs it daily for every operation log with a 14-day cutoff, matching the
-    default of `jj util gc`.
+  - The server runs it daily with a 14-day cutoff, matching the default of `jj util gc`, for the
+    operation logs that need it: only heads that moved other than forward — the new head not an
+    operation whose parents are every old head, as `jj op abandon` makes — leave operations nothing
+    reaches. Such a log (`diverged_at`) is collected each day until a collection past the window
+    after its divergence has taken everything it left (`collected_through`); a log whose heads
+    only moved forward is never walked. A log from before these were recorded is collected so,
+    once.
 - **Freshness is transitive and quantized.** `touched_at` holds a day (the database's
   `current_date`, UTC), not an instant.
   - **The walk.** Touching an unpinned object sets its `touched_at` to today — a file's or a
@@ -1247,9 +1271,13 @@ repositories themselves are never deleted (see "Decisions").
   than 15 days old (14 days, plus one day for the quantization), listed from partial indexes
   over unpinned rows, and the content index's unpinned files and chunks as old; a repository
   with none skips the mark.
-  - **Roots:** every commit referenced by a view or an operation of any of the repository's
-    operation logs (a view's heads, working-copy commits, and ref targets; an operation's
-    `commit_predecessors`), and every pending candidate.
+  - **Roots:** every commit referenced by a view or an operation the tail holds of the
+    repository's operation logs (a view's heads, working-copy commits, and ref targets; an
+    operation's `commit_predecessors`), read a page at a time — a settled one's, in a segment, is
+    pinned — every pending candidate, and the trees of the checkpoints not pinned. A checkpoint
+    kept past its first week (*Workspaces*) has its trees pinned by the next pass, which records
+    it (`trees_pinned`): the mark walks only the recent ones. Before a repository's settled
+    content is pinned, every operation and view is a root.
   - **Mark:** traverse the unpinned objects reachable from the roots, stopping at pinned ones and
     at ones touched within the cutoff (their subgraphs are no staler, so hold no candidate).
     Commits are walked in one recursive query over `commit_parent`; trees, files, and chunks
@@ -1258,9 +1286,9 @@ repositories themselves are never deleted (see "Decisions").
     files, then chunks, so a row a reader finds rarely points at one already gone — in batches.
     Each `DELETE` re-checks `pinned` and `touched_at` under the row's lock; files and chunks are
     dropped from the content index under its lock, re-checked there.
-  - Reading every retained view and operation is proportional to the repositories' retained
-    history, like jj's own `jj util gc`; the object walk is proportional to the stale, unpinned
-    objects still reachable.
+  - A pass is proportional to what was written within the windows — the tail's operations and
+    views, the last week's checkpoints, the logs that diverged — not to the repository's history;
+    the object walk, to the stale, unpinned objects still reachable.
 - **Why no reachable object is ever swept.** An object reachable when the mark ran is marked. One
   that became reachable afterwards got there through a publish, an upload, a landing, or a
   candidate:

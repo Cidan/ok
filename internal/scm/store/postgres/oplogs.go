@@ -309,3 +309,52 @@ func (x queries) RepositoryViews(ctx context.Context, repo int64) ([]backend.OpR
 	return opRecords(x.q.Query(ctx, `SELECT v.op_log_id, $2::smallint, v.id, NULL::bytea, v.body, v.touched_at
 		FROM view v JOIN op_log l ON l.id = v.op_log_id WHERE l.repository_id = $1`, repo, int16(encoding.KindView)))
 }
+
+func (x queries) OpContentPinned(ctx context.Context, repo int64) (bool, error) {
+	var pinned bool
+	err := x.q.QueryRow(ctx, `SELECT op_content_pinned FROM repository WHERE id = $1`, repo).Scan(&pinned)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	return pinned, err
+}
+
+func (x queries) SetOpContentPinned(ctx context.Context, repo int64) error {
+	_, err := x.q.Exec(ctx, `UPDATE repository SET op_content_pinned = true WHERE id = $1`, repo)
+	return err
+}
+
+func (x queries) TailOps(ctx context.Context, repo int64, kind encoding.Kind, after backend.OpKey, limit int) ([]backend.OpRecord, error) {
+	view := "o.view_id"
+	table := "operation"
+	if kind == encoding.KindView {
+		view, table = "NULL::bytea", "view"
+	}
+	return opRecords(x.q.Query(ctx, `SELECT o.op_log_id, $2::smallint, o.id, `+view+`, o.body, o.touched_at
+		FROM `+table+` o JOIN op_log l ON l.id = o.op_log_id
+		WHERE l.repository_id = $1 AND (o.op_log_id, o.id) > ($3, $4::bytea)
+		ORDER BY o.op_log_id, o.id LIMIT $5`, repo, int16(kind), after.Log, after.ID[:], limit))
+}
+
+func (x queries) DivergeOpLog(ctx context.Context, opLog int64) error {
+	_, err := x.q.Exec(ctx, `UPDATE op_log SET diverged_at = now() WHERE id = $1`, opLog)
+	return err
+}
+
+func (x queries) OpLogsToCollect(ctx context.Context, repo int64) ([]backend.OpLogDivergence, error) {
+	rows, err := x.q.Query(ctx, `SELECT id, diverged_at FROM op_log
+		WHERE repository_id = $1 AND workspace <> '' AND diverged_at IS NOT NULL
+		  AND (collected_through IS NULL OR collected_through < diverged_at) ORDER BY id`, repo)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, func(r pgx.CollectableRow) (backend.OpLogDivergence, error) {
+		var d backend.OpLogDivergence
+		return d, r.Scan(&d.OpLog, &d.DivergedAt)
+	})
+}
+
+func (x queries) SetOpLogCollected(ctx context.Context, opLog int64, through time.Time) error {
+	_, err := x.q.Exec(ctx, `UPDATE op_log SET collected_through = greatest(coalesce(collected_through, $2), $2) WHERE id = $1`, opLog, through)
+	return err
+}

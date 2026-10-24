@@ -121,12 +121,15 @@ func walkSet(walk backend.Walk) string {
 	return ` SET pinned = true WHERE repository_id = $1 AND id = ANY($2) AND NOT pinned`
 }
 
-func (x queries) WalkObjects(ctx context.Context, repo int64, kind encoding.Kind, members []encoding.ID, walk backend.Walk) (map[encoding.ID][]byte, error) {
-	return bodies(x.q.Query(ctx, `UPDATE object`+walkSet(walk)+` AND kind = $3 RETURNING id, body`, repo, ids(members), int16(kind)))
+// WalkObjects and WalkCommits tell no held rows apart: an UPDATE locks only the rows it writes.
+func (x queries) WalkObjects(ctx context.Context, repo int64, kind encoding.Kind, members []encoding.ID, walk backend.Walk) (map[encoding.ID][]byte, map[encoding.ID]bool, error) {
+	b, err := bodies(x.q.Query(ctx, `UPDATE object`+walkSet(walk)+` AND kind = $3 RETURNING id, body`, repo, ids(members), int16(kind)))
+	return b, nil, err
 }
 
-func (x queries) WalkCommits(ctx context.Context, repo int64, members []encoding.ID, walk backend.Walk) (map[encoding.ID][]byte, error) {
-	return bodies(x.q.Query(ctx, `UPDATE commit`+walkSet(walk)+` RETURNING id, body`, repo, ids(members)))
+func (x queries) WalkCommits(ctx context.Context, repo int64, members []encoding.ID, walk backend.Walk) (map[encoding.ID][]byte, map[encoding.ID]bool, error) {
+	b, err := bodies(x.q.Query(ctx, `UPDATE commit`+walkSet(walk)+` RETURNING id, body`, repo, ids(members)))
+	return b, nil, err
 }
 
 func (x queries) StaleObjectIDs(ctx context.Context, repo int64, cutoff time.Time) ([]encoding.ID, error) {

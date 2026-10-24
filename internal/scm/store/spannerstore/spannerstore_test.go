@@ -79,7 +79,7 @@ func TestManyRows(t *testing.T) {
 			return n, tx.InsertCommitPaths(ctx, repo, 1, idOf("commit", 0), paths)
 		}},
 		{"pinning", func(tx backend.Ops) (int, error) {
-			pinned, err := tx.WalkObjects(ctx, repo, encoding.KindTree, trees, backend.PinWalk)
+			pinned, _, err := tx.WalkObjects(ctx, repo, encoding.KindTree, trees, backend.PinWalk)
 			return len(pinned), err
 		}},
 	} {
@@ -247,5 +247,51 @@ func TestStagedContentLog(t *testing.T) {
 	}
 	if got, _ := since(nil); len(got) != 0 {
 		t.Errorf("after the fold's deletion, %q read", got)
+	}
+}
+
+// A replica reserves a network's pack numbers a block at a time, once however many publishes find
+// its block spent together: each waits for the one reservation, rather than reserving a block of
+// its own on the one counter row, so the counter holds one block's end, and every pack a number of
+// its own.
+func TestPackNumbersReservedOnce(t *testing.T) {
+	ctx := context.Background()
+	admin, client := spannertest.Database(t, spannerstore.Migrations)
+	b, err := spannerstore.Open(ctx, admin, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	net := backend.Network(9)
+	if _, err := b.InsertRepository(ctx, 10, net, encoding.RootCommitID, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	const packs = 200
+	nums := make([]uint64, packs)
+	errs := make(chan error, packs)
+	for i := range packs {
+		go func() {
+			errs <- txn(ctx, b, func(o backend.Ops) error {
+				var err error
+				nums[i], err = o.InsertPack(ctx, net, idOf("pack", i), 100, nil)
+				return err
+			})
+		}()
+	}
+	for range packs {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	var last int64
+	if err := client.Single().Query(ctx, spanner.Statement{SQL: `SELECT last FROM counter WHERE name = 'pack' AND scope_id = @net`,
+		Params: map[string]any{"net": int64(net)}}).Do(func(r *spanner.Row) error { return r.Columns(&last) }); err != nil {
+		t.Fatal(err)
+	}
+	if last != 1024 {
+		t.Errorf("%d packs at once reserved through %d: more than one block", packs, last)
+	}
+	slices.Sort(nums)
+	if nums = slices.Compact(nums); len(nums) != packs {
+		t.Errorf("%d packs share numbers", packs-len(nums))
 	}
 }

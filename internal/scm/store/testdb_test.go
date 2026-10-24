@@ -59,6 +59,9 @@ type testDB interface {
 	networks(t testing.TB, net int64) int
 	// setHead moves a repository's main with no landing.
 	setHead(t testing.TB, repo int64, head encoding.ID)
+	// unpinOpContent marks a repository's settled operations' content not pinned, as before
+	// compaction pinned it (settle.go).
+	unpinOpContent(t testing.TB, repo int64)
 	// plantSharedLog makes an operation log of a principal's of no workspace, as each workspace had
 	// none of its own once, with the root operation its head, and returns its ID; plantWorkspace a
 	// workspace of theirs with no log, with a checkpoint when withCheckpoint.
@@ -93,6 +96,11 @@ func newTestDB(t *testing.T, conns int32) testDB {
 		}
 		cfg.MaxConns = conns
 		testdb.NoNestedConns(t, cfg)
+		// As pgdb's pools are: ok's days are UTC's, whatever the test server's time zone.
+		if cfg.ConnConfig.RuntimeParams == nil {
+			cfg.ConnConfig.RuntimeParams = map[string]string{}
+		}
+		cfg.ConnConfig.RuntimeParams["timezone"] = "UTC"
 		pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
 		if err != nil {
 			t.Fatal(err)
@@ -232,6 +240,11 @@ func (d pgDB) packs(t testing.TB, net int64) (live, retired int) {
 func (d pgDB) networks(t testing.TB, net int64) int {
 	t.Helper()
 	return d.count(t, "network", `id = @net`, map[string]any{"net": net})
+}
+
+func (d pgDB) unpinOpContent(t testing.TB, repo int64) {
+	t.Helper()
+	d.exec(t, `UPDATE repository SET op_content_pinned = false WHERE id = @repo`, map[string]any{"repo": repo})
 }
 
 func (d pgDB) setHead(t testing.TB, repo int64, head encoding.ID) {

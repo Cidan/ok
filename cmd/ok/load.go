@@ -52,6 +52,8 @@ func loadRun(args []string, stdout io.Writer) error {
 	publishBytes := flags.Int("publish-bytes", load.PublishBytes, "bytes a publish sends: by default, an account's ingest a day over its publishes")
 	checkpointBytes := flags.Int("checkpoint-bytes", load.CheckpointFile, "bytes a checkpoint's changed file holds")
 	clBytes := flags.Int("cl-bytes", 64<<10, "bytes a CL's change holds")
+	seedFiles := flags.Int("seed-files", load.SeedFiles, "files in each repository's seeded tree, shaped as a monorepo's: checkpoints, publishes, and CLs change them, and publishes carry jj's operations (0: none, each write a directory of its own)")
+	seedFileBytes := flags.Int("seed-file-bytes", load.SeedFileBytes, "bytes each seeded file holds")
 	workers := flags.Int("workers", 16, "synthetic workers")
 	runTime := flags.Duration("run-time", 10*time.Second, "how long a synthetic job takes")
 	read := flags.Bool("read", true, "synthetic jobs read their commit's files through the SCM")
@@ -186,7 +188,8 @@ func loadRun(args []string, stdout io.Writer) error {
 		"browses/s", rates.Browses)
 	rep, err := load.Run(ctx, load.Config{People: who, WorkerClients: workerClients, WorkerPrefix: strconv.Itoa(*pod),
 		Repos: rs, Shape: shape, Duration: *duration, Drain: *drain, MaxInFlight: *inFlight, PublishBytes: *publishBytes, CheckpointBytes: *checkpointBytes, CLBytes: *clBytes,
-		Workers: *workers, RunTime: *runTime, Read: *read, Log: slog.Default()})
+		Workers: *workers, RunTime: *runTime, Read: *read, SeedFiles: *seedFiles, SeedFileBytes: *seedFileBytes, SeedLands: *pod == 0,
+		Pod: *pod, Pods: *pods, Log: slog.Default()})
 	if err != nil {
 		return err
 	}

@@ -241,9 +241,64 @@ func (s *Store) pathCommits(ctx context.Context, repo int64, paths []string, fro
 	return out[:min(limit, len(out))], nil
 }
 
+// pathCommit is the newest commit of main at or below a generation that changed a path, or none.
+type pathCommit struct {
+	commit encoding.ID
+	found  bool
+}
+
 // lastPathCommits are, for each of paths, the newest commit of main at or below generation gen that
-// changed it (absent: none), by its index in paths.
+// changed it (absent: none), by its index in paths. gen is a commit's of main: main's history up to
+// it never changes, so each answer is kept in the replica's cache, which a repository's listings
+// at the same commit of main — its people's browsing at main's head — read again and again. Within
+// a transaction, which may itself be landing gen, nothing is kept.
 func (s *Store) lastPathCommits(ctx context.Context, repo, gen int64, paths []string) (map[int]encoding.ID, error) {
+	keep := !inTxContext(ctx)
+	out := make(map[int]encoding.ID, len(paths))
+	var ask []string
+	var at []int
+	for i, p := range paths {
+		if keep {
+			if c, ok := s.newestOfPaths.get(pathCommitKey(repo, gen, p)); ok {
+				if c.found {
+					out[i] = c.commit
+				}
+				continue
+			}
+		}
+		ask, at = append(ask, p), append(at, i)
+	}
+	if len(ask) == 0 {
+		return out, nil
+	}
+	got, err := s.readLastPathCommits(ctx, repo, gen, ask)
+	if err != nil {
+		return nil, err
+	}
+	for j, p := range ask {
+		c, found := got[j]
+		if found {
+			out[at[j]] = c
+		}
+		if keep {
+			key := pathCommitKey(repo, gen, p)
+			s.newestOfPaths.put(key, pathCommit{commit: c, found: found}, len(key)+encoding.IDLen+16)
+		}
+	}
+	return out, nil
+}
+
+// pathCommitKey is a path's key in newestOfPaths at a generation of a repository's main.
+func pathCommitKey(repo, gen int64, path string) string {
+	var b [16]byte
+	binary.BigEndian.PutUint64(b[:8], uint64(repo))
+	binary.BigEndian.PutUint64(b[8:], uint64(gen))
+	return string(b[:]) + path
+}
+
+// readLastPathCommits is lastPathCommits read: the tail, the segments, and what is landed but not
+// yet in either.
+func (s *Store) readLastPathCommits(ctx context.Context, repo, gen int64, paths []string) (map[int]encoding.ID, error) {
 	pending, err := s.pendingPaths(ctx, repo)
 	if err != nil {
 		return nil, err

@@ -463,12 +463,27 @@ type plannedCL struct {
 
 func (s *Store) applyUpload(ctx context.Context, tx *txn, repo int64, principal string, staged []*uploadCommit, readiness Readiness, assign []string, reviewerRejection *UploadRejection) ([]UploadResult, error) {
 	// Find and lock every CL the upload can touch — those of its changes, and those whose
-	// patchsets are its commits' parents — in number order.
+	// patchsets are its commits' parents — in number order. A parent on main, which stays on main,
+	// stacks on no CL (rule 2): the CL it is a patchset of, if it landed as itself, is not read —
+	// locked, it would be every upload's onto main while main stands there.
+	staging := map[encoding.ID]bool{}
+	for _, u := range staged {
+		staging[u.id] = true
+	}
 	changeKeys := make([][]byte, len(staged))
 	parentKeys := make([][]byte, 0, len(staged))
 	for i, u := range staged {
 		changeKeys[i] = u.c.ChangeID[:]
-		parentKeys = append(parentKeys, u.parent[:])
+		if staging[u.parent] {
+			continue
+		}
+		main, err := s.onMain(ctx, tx, repo, u.parent)
+		if err != nil {
+			return nil, err
+		}
+		if !main {
+			parentKeys = append(parentKeys, u.parent[:])
+		}
 	}
 	numbers, err := tx.UploadChangeLists(ctx, repo, changeKeys, parentKeys)
 	if err != nil {

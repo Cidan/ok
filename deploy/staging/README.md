@@ -122,7 +122,7 @@ ok load cost -report report.json -measured measured.json -prices ../load/gcp-us-
 #     Secret Manager's secrets, which nothing else deletes; and the root key's versions, as its ring
 #     cannot be.
 kubectl delete namespace ok dex nats
-for s in $(gcloud secrets list --project <project> --format='value(name)' | grep /ok-); do gcloud secrets delete ${s##*/} --project <project> --quiet; done
+for s in $(gcloud secrets list --project <project> --format='value(name.basename())' | grep '^ok-'); do gcloud secrets delete $s --project <project> --quiet; done
 terraform destroy -var project=<project> -var nodes_per_zone=2 -var spanner_processing_units=3000 -var secrets_root=$root
 gcloud kms keys versions destroy 1 --key staging --keyring ok-test --location us-central1 --project <project>
 ```

@@ -48,6 +48,11 @@ func boundOf(s backend.Segment) *int64 {
 	return &s.Bound
 }
 
+// SegmentsUnlocked are Segments: read committed locks nothing.
+func (x queries) SegmentsUnlocked(ctx context.Context, sc backend.Scope, kind segment.Kind) ([]backend.Segment, error) {
+	return x.Segments(ctx, sc, kind)
+}
+
 func (x queries) Segments(ctx context.Context, sc backend.Scope, kind segment.Kind) ([]backend.Segment, error) {
 	scope, owner := scopeOf(sc)
 	return segments(x.q.Query(ctx, `SELECT `+segmentColumns+` FROM segment

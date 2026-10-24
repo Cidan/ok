@@ -181,8 +181,10 @@ type chunkLoc struct {
 	loc  pack.Location
 }
 
-// chunkLocations locates a repository's chunks through its network's chunk index; one it lacks is
-// absent. Every caller names chunks of files the repository holds, so none is another's.
+// chunkLocations locates a repository's chunks through its network's chunk index, refreshed when
+// stale (contentEntries): a chunk compaction moved is read where it is now — in its new pack, with
+// its dictionary — not from the pack it left; one it lacks is absent. Every caller names chunks of
+// files the repository holds, so none is another's.
 func (s *Store) chunkLocations(ctx context.Context, repo int64, members []encoding.ID) (map[encoding.ID]chunkLoc, error) {
 	out := map[encoding.ID]chunkLoc{}
 	if len(members) == 0 {
@@ -196,11 +198,16 @@ func (s *Store) chunkLocations(ctx context.Context, repo int64, members []encodi
 	if err != nil {
 		return nil, err
 	}
+	nums := make([]uint64, 0, len(entries))
+	for _, e := range entries {
+		nums = append(nums, e.Loc.Pack)
+	}
+	packs, err := s.packIDs(ctx, net, li, nums)
+	if err != nil {
+		return nil, err
+	}
 	for id, e := range entries {
-		pid, err := s.packID(ctx, net, li, e.Loc.Pack)
-		if err != nil {
-			return nil, err
-		}
+		pid := packs[e.Loc.Pack]
 		out[id] = chunkLoc{id: id, pack: pid, loc: pack.Location{
 			Offset: e.Loc.Offset, Codec: pack.Codec(e.Loc.Codec), RawLength: e.Loc.Raw, StoredLength: e.Loc.Stored}}
 	}
@@ -435,9 +442,10 @@ type manifest struct {
 // verifies, at once.
 const manifestBatch = 1000
 
-// manifests reads files' manifests from the content index; an absent file has no entry.
+// manifests reads files' manifests from the content index; an absent file has no entry. A file's
+// manifest never changes, so the index is read as the replica holds it (knownEntries).
 func (s *Store) manifests(ctx context.Context, repo int64, files []encoding.ID) (map[encoding.ID]*manifest, error) {
-	_, entries, err := s.contentEntries(ctx, repoScope(repo), encoding.KindFile, files)
+	_, entries, err := s.knownEntries(ctx, repoScope(repo), encoding.KindFile, files)
 	if err != nil {
 		return nil, err
 	}

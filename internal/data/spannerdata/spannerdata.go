@@ -104,14 +104,19 @@ func micros(d time.Duration) int64 { return d.Microseconds() }
 
 // MarkWork marks key's work of kind dirty, due now.
 func MarkWork(ctx context.Context, tx *spanner.ReadWriteTransaction, kind string, key int64) error {
-	_, ok, err := readWork(ctx, tx, kind, key)
+	w, ok, err := readWork(ctx, tx, kind, key)
 	if err != nil {
 		return err
 	}
 	p := map[string]any{"kind": kind, "key": key}
-	if ok {
+	switch {
+	case ok && w.dirty && w.dueNow:
+		// Marked due now already: written again, the row would be every marker's to wait on — a
+		// repository's every upload marks its compaction. The read's lock holds the mark until
+		// this transaction commits: the work cannot take it off meanwhile.
+	case ok:
 		_, err = update(ctx, tx, `UPDATE work SET dirty = TRUE, due_at = NULL WHERE kind = @kind AND key = @key`, p)
-	} else {
+	default:
 		_, err = update(ctx, tx, `INSERT INTO work (kind, key, dirty) VALUES (@kind, @key, TRUE)`, p)
 	}
 	return err

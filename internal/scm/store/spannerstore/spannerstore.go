@@ -55,36 +55,58 @@ func Open(ctx context.Context, admin *database.DatabaseAdminClient, client *span
 	return &Backend{queries{c: client, stageBytes: defaultStageLogBytes, packNums: &numberBlocks{}}}, nil
 }
 
-// Txn runs fn in one read-write transaction, once: a statement-based one, which the client does
-// not run again when Spanner aborts it — the store does (Retryable). Its operations may be called
-// from several goroutines at once: they take turns, as Spanner runs a transaction's statements in
-// order.
-func (b *Backend) Txn(ctx context.Context, fn func(backend.Ops) error) (err error) {
-	stx, err := spanner.NewReadWriteStmtBasedTransaction(ctx, b.c)
-	if err != nil {
+// Txn runs fn in a read-write transaction: a statement-based one, run again when Spanner aborts
+// it — up to data.Attempts times, as the store runs PostgreSQL's — as the aborted one reset
+// (ResetForRetry), which keeps its place in Spanner's wound-wait: begun anew, a long transaction
+// a stream of shorter ones keeps aborting is younger at every attempt, and never commits (a
+// repository's uploads beside its publishes). Its operations may be called from several
+// goroutines at once: they take turns, as Spanner runs a transaction's statements in order.
+func (b *Backend) Txn(ctx context.Context, fn func(backend.Ops) error) error {
+	var stx *spanner.ReadWriteStmtBasedTransaction
+	aborted := func(err error) bool { return spanner.ErrCode(err) == codes.Aborted }
+	return data.Retry(ctx, aborted, func() (err error) {
+		if stx != nil {
+			next, rerr := stx.ResetForRetry(ctx)
+			if rerr != nil {
+				// An abort the transaction did not see — a nested transaction's: it is rolled
+				// back, and the next begun anew.
+				stx.Rollback(context.WithoutCancel(ctx))
+				next = nil
+			}
+			stx = next
+		}
+		if stx == nil {
+			if stx, err = spanner.NewReadWriteStmtBasedTransaction(ctx, b.c); err != nil {
+				return err
+			}
+		}
+		// Measured here, in Txn's own closure, so the site is the code that called Txn
+		// (spannertxn's wrappers).
+		t := &txn{tx: &stx.ReadWriteTransaction}
+		done := spannertxn.Begun(t.tx)
+		defer func() { done(err) }()
+		// What ctx's lease guards is written only while its holder holds it (data.Fence).
+		err = spannerdata.CheckFence(ctx, t.tx)
+		if err == nil {
+			err = fn(queries{c: b.c, tx: t, stageBytes: b.stageBytes, packNums: b.packNums})
+		}
+		t.mu.Lock()
+		defer t.mu.Unlock()
+		if err != nil {
+			if spanner.ErrCode(err) != codes.Aborted {
+				stx.Rollback(context.WithoutCancel(ctx))
+			}
+			return err
+		}
+		_, err = stx.Commit(ctx)
 		return err
-	}
-	t := &txn{tx: &stx.ReadWriteTransaction}
-	done := spannertxn.Begun(t.tx)
-	defer func() { done(err) }()
-	// What ctx's lease guards is written only while its holder holds it (data.Fence).
-	err = spannerdata.CheckFence(ctx, t.tx)
-	if err == nil {
-		err = fn(queries{c: b.c, tx: t, stageBytes: b.stageBytes, packNums: b.packNums})
-	}
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if err != nil {
-		stx.Rollback(context.WithoutCancel(ctx))
-		return err
-	}
-	_, err = stx.Commit(ctx)
-	return err
+	})
 }
 
-// Retryable reports a transaction Spanner aborted, as it does to one of two that meet.
+// Retryable reports a transaction refused a pack number another pack holds, which a transaction
+// begun anew numbers from a block reserved anew. One Spanner aborted Txn runs again itself.
 func (b *Backend) Retryable(err error) bool {
-	return spanner.ErrCode(err) == codes.Aborted || errors.Is(err, errPackNumberTaken)
+	return errors.Is(err, errPackNumberTaken)
 }
 
 // Snapshot runs fn in a read-only transaction: every read in it at one moment.
@@ -618,6 +640,20 @@ func scanID(row *spanner.Row) (encoding.ID, error) {
 		return encoding.ID{}, err
 	}
 	return toID(b)
+}
+
+// unlockedIDSet is idSet, read unlocked (unlocked).
+func (x queries) unlockedIDSet(ctx context.Context, sql string, params map[string]any, arrays ...string) (map[encoding.ID]bool, error) {
+	out := map[encoding.ID]bool{}
+	err := x.unlocked(func(r spannerdata.Reader) error {
+		clear(out)
+		return eachIn(ctx, r, sql, params, arrays, func(row *spanner.Row) error {
+			id, err := scanID(row)
+			out[id] = true
+			return err
+		})
+	})
+	return out, err
 }
 
 // idSet reads rows of one ID each, as a set.

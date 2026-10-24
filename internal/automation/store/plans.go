@@ -250,7 +250,7 @@ func (s *Store) queuePlan(ctx context.Context, tx Ops, run *Run, result *PlanRes
 	}
 	if err := tx.SetPlanned(ctx, run.PlanID, PlanResult{
 		Jobs: orEmptyJobs(result.Jobs), Skipped: orEmptySkipped(result.Skipped),
-		Affected: orEmpty(result.Affected), Upstream: orEmpty(result.Upstream),
+		Affected: orEmpty(BoundTargets(result.Affected)), Upstream: orEmpty(BoundTargets(result.Upstream)),
 	}); err != nil {
 		return err
 	}

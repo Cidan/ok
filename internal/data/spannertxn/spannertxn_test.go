@@ -22,6 +22,20 @@ func publish() string { return store{}.inTx() }
 
 func land() string { return store{}.Txn() }
 
+// Retry stands for data.Retry, and backend's Txn for a backend's, which begins its transaction —
+// each attempt's — in the closure it retries.
+func Retry(attempt func() string) string { return attempt() }
+
+type backend struct{}
+
+func (backend) Txn() string { return Retry(func() string { return begin() }) }
+
+type retrying struct{}
+
+func (retrying) inTx() string { return Retry(func() string { return backend{}.Txn() }) }
+
+func commit() string { return retrying{}.inTx() }
+
 // A transaction is named for the code that began it, past ok's transaction wrappers and the
 // closures within them.
 func TestCallSite(t *testing.T) {
@@ -30,6 +44,7 @@ func TestCallSite(t *testing.T) {
 	}{
 		{publish(), "data/spannertxn_test.publish"},
 		{land(), "data/spannertxn_test.land"},
+		{commit(), "data/spannertxn_test.commit"},
 	} {
 		if c.got != c.want {
 			t.Errorf("site %q, want %q", c.got, c.want)

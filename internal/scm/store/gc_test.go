@@ -728,18 +728,29 @@ func TestCompactionReclaimsBytes(t *testing.T) {
 			t.Fatalf("file %s reads back wrong after compaction", f)
 		}
 	}
-	// The new pack holds the files' chunks in the order of their paths on main.
-	x, locs := indexOf(t, e.s, e.repo), locationsOf(t, e.s, e.repo)
+	// The new pack holds the files' chunks in the order of their paths on main. The files are
+	// pinned — the settled operation reaches them — so their entries may be in index segments.
 	type placed struct {
 		path string
 		off  int64
 	}
 	var files []placed
 	for f, p := range mainPath {
-		fe, _ := x.Get(f)
+		_, fes, err := e.s.contentEntries(ctx, repoScope(e.repo), encoding.KindFile, []encoding.ID{f})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var chunks []encoding.ID
+		for _, c := range fes[f].Chunks {
+			chunks = append(chunks, c.ID)
+		}
+		_, ces, err := e.s.contentEntries(ctx, backend.NetworkScope(netOf(t, e.s, e.repo)), encoding.KindChunk, chunks)
+		if err != nil {
+			t.Fatal(err)
+		}
 		first := int64(-1)
-		for _, c := range fe.Chunks {
-			if ce, ok := locs.Get(c.ID); ok && (first < 0 || ce.Loc.Offset < first) {
+		for _, c := range chunks {
+			if ce, ok := ces[c]; ok && (first < 0 || ce.Loc.Offset < first) {
 				first = ce.Loc.Offset
 			}
 		}

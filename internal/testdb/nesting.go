@@ -103,6 +103,11 @@ func Pool(t testing.TB) *pgxpool.Pool {
 		t.Fatal(err)
 	}
 	NoNestedConns(t, cfg)
+	// As pgdb's pools are, whatever the test server's time zone: ok's days are UTC's.
+	if cfg.ConnConfig.RuntimeParams == nil {
+		cfg.ConnConfig.RuntimeParams = map[string]string{}
+	}
+	cfg.ConnConfig.RuntimeParams["timezone"] = "UTC"
 	p, err := pgxpool.NewWithConfig(context.Background(), cfg)
 	if err != nil {
 		t.Fatal(err)

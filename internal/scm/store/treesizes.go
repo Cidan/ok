@@ -196,9 +196,10 @@ func (s *Store) deriveTreeSizes(ctx context.Context, repo int64, trees []encodin
 	return out, nil
 }
 
-// fileSizes reads files' sizes from the content index; an absent file has none.
+// fileSizes reads files' sizes from the content index; an absent file has none. A file's size never
+// changes, so the index is read as the replica holds it (knownEntries).
 func (s *Store) fileSizes(ctx context.Context, repo int64, files []encoding.ID) (map[encoding.ID]uint64, error) {
-	_, entries, err := s.contentEntries(ctx, repoScope(repo), encoding.KindFile, files)
+	_, entries, err := s.knownEntries(ctx, repoScope(repo), encoding.KindFile, files)
 	if err != nil {
 		return nil, err
 	}

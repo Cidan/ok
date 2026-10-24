@@ -53,6 +53,9 @@ func open(ctx context.Context, cfg *pgxpool.Config, schema string) (*pgxpool.Poo
 		cfg.ConnConfig.RuntimeParams = map[string]string{}
 	}
 	cfg.ConnConfig.RuntimeParams["search_path"] = schema
+	// ok's days — a touch's, a quota's — are the database's current_date, and every role takes
+	// them for UTC's: the session's time zone says so, whatever the server's is.
+	cfg.ConnConfig.RuntimeParams["timezone"] = "UTC"
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, err

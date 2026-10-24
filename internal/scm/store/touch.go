@@ -52,8 +52,9 @@ func (s *Store) pin(ctx context.Context, tx *txn, repo int64, roots []ref) error
 	if len(missing) > 0 {
 		return fmt.Errorf("%w: pinning reached %d missing objects, first %s", errMissing, len(missing), missing[0].objectRef())
 	}
-	// What it pinned is compaction's to move into segments.
-	return tx.MarkWork(ctx, SegmentWork, repo)
+	// What it pinned is compaction's to move into segments, marked once the transaction commits.
+	tx.markAfter(SegmentWork, repo)
+	return nil
 }
 
 // refresh makes every unpinned object reachable from roots fresh today, recursing through
@@ -105,13 +106,13 @@ func (s *Store) walk(ctx context.Context, tx *txn, repo int64, roots []ref, mode
 		for _, g := range keys {
 			members := groups[g]
 			sortIDs(members)
-			children, err := s.walkGroup(ctx, tx, repo, g.table, g.kind, members, mode)
+			children, held, err := s.walkGroup(ctx, tx, repo, g.table, g.kind, members, mode)
 			if err != nil {
 				return nil, err
 			}
 			var stale []encoding.ID
 			for _, id := range members {
-				if _, updated := children[id]; !updated {
+				if _, updated := children[id]; !updated && !held[id] {
 					stale = append(stale, id)
 				}
 			}
@@ -141,36 +142,39 @@ func (s *Store) walk(ctx context.Context, tx *txn, repo int64, roots []ref, mode
 
 // walkGroup updates the rows among ids that mode applies to — unpinned and stale for a
 // touch, unpinned for a refresh or a pin — and returns, for each row it updated, the
-// references the walk continues into. Files and chunks are updated in the content index.
-func (s *Store) walkGroup(ctx context.Context, tx *txn, repo int64, t table, kind encoding.Kind, members []encoding.ID, mode walkMode) (map[encoding.ID][]ref, error) {
+// references the walk continues into, and the rows it found held that mode does not apply to
+// (backend.Ops.WalkObjects; none for files and chunks, updated in the content index).
+func (s *Store) walkGroup(ctx context.Context, tx *txn, repo int64, t table, kind encoding.Kind, members []encoding.ID, mode walkMode) (map[encoding.ID][]ref, map[encoding.ID]bool, error) {
 	if t == tFile || t == tChunk {
-		return s.walkContent(ctx, tx, repo, t, members, mode)
+		out, err := s.walkContent(ctx, tx, repo, t, members, mode)
+		return out, nil, err
 	}
 	var updated map[encoding.ID][]byte
+	var held map[encoding.ID]bool
 	var err error
 	switch t {
 	case tObject:
-		updated, err = tx.WalkObjects(ctx, repo, kind, members, mode)
+		updated, held, err = tx.WalkObjects(ctx, repo, kind, members, mode)
 	case tCommit:
-		updated, err = tx.WalkCommits(ctx, repo, members, mode)
+		updated, held, err = tx.WalkCommits(ctx, repo, members, mode)
 		kind = encoding.KindCommit
 	default:
-		return nil, fmt.Errorf("touch: %v is not a repository object table", t)
+		return nil, nil, fmt.Errorf("touch: %v is not a repository object table", t)
 	}
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	out := make(map[encoding.ID][]ref, len(updated))
 	for id, body := range updated {
 		o, err := decodeStored(kind, id, body)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		rs := refSet{}
 		gcRefs(rs, o)
 		out[id] = rs.sorted()
 	}
-	return out, nil
+	return out, held, nil
 }
 
 // walkContent is walkGroup for files and chunks, in the transaction's content index: a file
@@ -268,7 +272,9 @@ func (s *Store) existing(ctx context.Context, q backend.Ops, repo int64, t table
 			}
 			return out, nil
 		}
-		_, entries, err := s.contentEntries(ctx, repoScope(repo), kind, members)
+		// A first look, outside a transaction: what it finds held, the caller's touch checks again
+		// under the index's lock (touchHeld).
+		_, entries, err := s.knownEntries(ctx, repoScope(repo), kind, members)
 		if err != nil {
 			return nil, err
 		}

@@ -1,7 +1,9 @@
 package spannerstore
 
 import (
+	"bytes"
 	"context"
+	"slices"
 	"time"
 
 	"cloud.google.com/go/spanner"
@@ -143,24 +145,76 @@ func (x queries) CommitGenerations(ctx context.Context, repo int64, members []en
 }
 
 // walkSet is what a walk sets of a row, and which rows it applies to. Today is UTC's.
+// walkSet is a walk's write, and walkWhere the rows it writes among @ids.
 func walkSet(walk backend.Walk) string {
-	switch walk {
-	case backend.TouchWalk:
-		return ` SET touched_at = CURRENT_DATE('UTC') WHERE repository_id = @repo AND id IN UNNEST(@ids) AND NOT pinned
-			AND touched_at < CURRENT_DATE('UTC')`
-	case backend.RefreshWalk:
-		return ` SET touched_at = CURRENT_DATE('UTC') WHERE repository_id = @repo AND id IN UNNEST(@ids) AND NOT pinned`
+	if walk == backend.PinWalk {
+		return ` SET pinned = TRUE`
 	}
-	return ` SET pinned = TRUE WHERE repository_id = @repo AND id IN UNNEST(@ids) AND NOT pinned`
+	return ` SET touched_at = CURRENT_DATE('UTC')`
 }
 
-func (x queries) WalkObjects(ctx context.Context, repo int64, kind encoding.Kind, members []encoding.ID, walk backend.Walk) (map[encoding.ID][]byte, error) {
-	return x.returningBodies(ctx, `UPDATE object`+walkSet(walk)+` AND kind = @kind THEN RETURN id, body`,
-		map[string]any{"repo": repo, "ids": ids(members), "kind": int64(kind)}, "ids")
+func walkWhere(walk backend.Walk) string {
+	if walk == backend.TouchWalk {
+		return ` WHERE repository_id = @repo AND id IN UNNEST(@ids) AND NOT pinned AND touched_at < CURRENT_DATE('UTC')`
+	}
+	return ` WHERE repository_id = @repo AND id IN UNNEST(@ids) AND NOT pinned`
 }
 
-func (x queries) WalkCommits(ctx context.Context, repo int64, members []encoding.ID, walk backend.Walk) (map[encoding.ID][]byte, error) {
-	return x.returningBodies(ctx, `UPDATE commit`+walkSet(walk)+` THEN RETURN id, body`, map[string]any{"repo": repo, "ids": ids(members)}, "ids")
+// WalkObjects and WalkCommits first read the members unlocked, and pass over those committed
+// rows the walk does not write — pinned, which is permanent, or touched today by a touch, which no
+// sweep takes — returning them held; the rest, the transaction's own rows among them, which only
+// it sees, it writes under their locks, checking again. A read-write transaction's statement
+// locks every row it reads, and a walk reads many it does not write — pinned trees every change
+// shares, which compaction deletes as it moves them into segments — so that every walk and every
+// compaction would hold one another.
+func (x queries) WalkObjects(ctx context.Context, repo int64, kind encoding.Kind, members []encoding.ID, walk backend.Walk) (map[encoding.ID][]byte, map[encoding.ID]bool, error) {
+	p := map[string]any{"repo": repo, "ids": ids(members), "kind": int64(kind)}
+	held, err := x.unlockedIDSet(ctx, `SELECT id FROM object WHERE repository_id = @repo AND id IN UNNEST(@ids) AND kind = @kind`+walkPasses(walk), p, "ids")
+	if err != nil {
+		return nil, nil, err
+	}
+	rest := without(members, held)
+	if len(rest) == 0 {
+		return map[encoding.ID][]byte{}, held, nil
+	}
+	p["ids"] = ids(rest)
+	b, err := x.returningBodies(ctx, `UPDATE object`+walkSet(walk)+walkWhere(walk)+` AND kind = @kind THEN RETURN id, body`, p, "ids")
+	return b, held, err
+}
+
+func (x queries) WalkCommits(ctx context.Context, repo int64, members []encoding.ID, walk backend.Walk) (map[encoding.ID][]byte, map[encoding.ID]bool, error) {
+	p := map[string]any{"repo": repo, "ids": ids(members)}
+	held, err := x.unlockedIDSet(ctx, `SELECT id FROM commit WHERE repository_id = @repo AND id IN UNNEST(@ids)`+walkPasses(walk), p, "ids")
+	if err != nil {
+		return nil, nil, err
+	}
+	rest := without(members, held)
+	if len(rest) == 0 {
+		return map[encoding.ID][]byte{}, held, nil
+	}
+	p["ids"] = ids(rest)
+	b, err := x.returningBodies(ctx, `UPDATE commit`+walkSet(walk)+walkWhere(walk)+` THEN RETURN id, body`, p, "ids")
+	return b, held, err
+}
+
+// walkPasses is the condition on a row a walk does not write: pinned, or touched today by a touch.
+func walkPasses(walk backend.Walk) string {
+	if walk == backend.TouchWalk {
+		return ` AND (pinned OR touched_at >= CURRENT_DATE('UTC'))`
+	}
+	return ` AND pinned`
+}
+
+// without is members not in set, in order.
+func without(members []encoding.ID, set map[encoding.ID]bool) []encoding.ID {
+	out := make([]encoding.ID, 0, len(members))
+	for _, id := range members {
+		if !set[id] {
+			out = append(out, id)
+		}
+	}
+	slices.SortFunc(out, func(a, b encoding.ID) int { return bytes.Compare(a[:], b[:]) })
+	return out
 }
 
 func (x queries) StaleObjectIDs(ctx context.Context, repo int64, cutoff time.Time) ([]encoding.ID, error) {
@@ -518,28 +572,30 @@ func (x queries) PathCommits(ctx context.Context, repo int64, paths []string, fr
 		map[string]any{"repo": repo, "paths": paths, "from": from, "to": to, "limit": int64(limit)})
 }
 
-// LastPathCommits reads, for each path, its newest row at or below gen: main has one commit at a
-// generation, so the newest generation names one commit.
+// LastPathCommits reads, for each path, its newest row at or below gen — one seek a path, both
+// columns at once: main has one commit at a generation, so the newest generation names one commit.
 func (x queries) LastPathCommits(ctx context.Context, repo, gen int64, paths []string) (map[int]backend.GenCommit, error) {
 	out := map[int]backend.GenCommit{}
-	const newest = `FROM commit_path cp WHERE cp.repository_id = @repo AND cp.path = u AND cp.generation <= @gen ORDER BY cp.generation DESC LIMIT 1`
-	err := x.rows(ctx, `SELECT i, (SELECT cp.commit_id `+newest+`), (SELECT cp.generation `+newest+`)
+	err := x.rows(ctx, `SELECT i, ARRAY(SELECT AS STRUCT cp.commit_id, cp.generation FROM commit_path cp
+			WHERE cp.repository_id = @repo AND cp.path = u AND cp.generation <= @gen ORDER BY cp.generation DESC LIMIT 1)
 		FROM UNNEST(@paths) AS u WITH OFFSET i`, map[string]any{"repo": repo, "gen": gen, "paths": paths}, func() { clear(out) },
 		func(row *spanner.Row) error {
 			var i int64
-			var b []byte
-			var g spanner.NullInt64
-			if err := row.Columns(&i, &b, &g); err != nil {
+			var newest []*struct {
+				CommitID   []byte `spanner:"commit_id"`
+				Generation int64  `spanner:"generation"`
+			}
+			if err := row.Columns(&i, &newest); err != nil {
 				return err
 			}
-			if b == nil {
+			if len(newest) == 0 {
 				return nil
 			}
-			id, err := toID(b)
+			id, err := toID(newest[0].CommitID)
 			if err != nil {
 				return err
 			}
-			out[int(i)] = backend.GenCommit{Commit: id, Generation: g.Int64}
+			out[int(i)] = backend.GenCommit{Commit: id, Generation: newest[0].Generation}
 			return nil
 		})
 	return out, err

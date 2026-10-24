@@ -59,8 +59,9 @@ func (x queries) InsertRepository(ctx context.Context, id int64, net backend.Net
 			VALUES (@net, `+now+`, @id)`, p); err != nil {
 			return err
 		}
-		if _, err := spannerdata.Update(ctx, tx, `INSERT INTO repository (repository_id, network_id, head, head_seq, created_at, created_by)
-			VALUES (@id, @net, @head, 0, `+now+`, @by)`, p); err != nil {
+		if _, err := spannerdata.Update(ctx, tx, `INSERT INTO repository (repository_id, network_id, head, head_seq, created_at, created_by,
+				op_content_pinned)
+			VALUES (@id, @net, @head, 0, `+now+`, @by, TRUE)`, p); err != nil {
 			return err
 		}
 		var err error
@@ -77,8 +78,8 @@ func (x queries) InsertFork(ctx context.Context, id int64, parent backend.Reposi
 	var r backend.Repository
 	err := x.write(ctx, func(tx *spanner.ReadWriteTransaction) error {
 		if _, err := spannerdata.Update(ctx, tx, `INSERT INTO repository (repository_id, network_id, parent_id, parent_seq, head, head_seq,
-				created_at, created_by)
-			VALUES (@id, @net, @parent, @seq, @head, @seq, `+now+`, @by)`,
+				created_at, created_by, op_content_pinned)
+			VALUES (@id, @net, @parent, @seq, @head, @seq, `+now+`, @by, TRUE)`,
 			map[string]any{"id": id, "net": int64(parent.Network), "parent": parent.ID, "seq": parent.HeadSeq, "head": parent.Head[:],
 				"by": createdBy}); err != nil {
 			return err
@@ -794,6 +795,16 @@ type numberBlocks struct {
 	mu sync.Mutex
 	// next and end bound each network's block: next is the number it gives next, end past its last.
 	next, end map[backend.Network]int64
+	// reserving is a network's reservation under way: those that find its block spent meanwhile
+	// wait for it, rather than each reserving a block of its own — every publish of that moment
+	// contending on the one counter row, nearly all aborted and tried again.
+	reserving map[backend.Network]*reservation
+}
+
+// reservation is a block of pack numbers being reserved: done is closed once it is, or failed.
+type reservation struct {
+	done chan struct{}
+	err  error
 }
 
 // packNum is a network's next pack number: from this replica's block, reserving another when it
@@ -802,25 +813,42 @@ type numberBlocks struct {
 // before the network moved away and back would give.
 func (x queries) packNum(ctx context.Context, net backend.Network) (int64, error) {
 	b := x.packNums
-	b.mu.Lock()
-	if b.next[net] < b.end[net] {
-		n := b.next[net]
-		b.next[net]++
+	for {
+		b.mu.Lock()
+		if b.next[net] < b.end[net] {
+			n := b.next[net]
+			b.next[net]++
+			b.mu.Unlock()
+			return n, nil
+		}
+		if r := b.reserving[net]; r != nil {
+			b.mu.Unlock()
+			select {
+			case <-r.done:
+			case <-ctx.Done():
+				return 0, ctx.Err()
+			}
+			continue // its block, or — had it failed — a reservation of this one's own
+		}
+		if b.next == nil {
+			b.next, b.end, b.reserving = map[backend.Network]int64{}, map[backend.Network]int64{}, map[backend.Network]*reservation{}
+		}
+		r := &reservation{done: make(chan struct{})}
+		b.reserving[net] = r
 		b.mu.Unlock()
-		return n, nil
+		last, err := x.next(ctx, packCounter, int64(net), packBlock)
+		b.mu.Lock()
+		delete(b.reserving, net)
+		if err == nil {
+			b.next[net], b.end[net] = last-packBlock+1, last+1
+		}
+		r.err = err
+		close(r.done)
+		b.mu.Unlock()
+		if err != nil {
+			return 0, err
+		}
 	}
-	b.mu.Unlock()
-	last, err := x.next(ctx, packCounter, int64(net), packBlock)
-	if err != nil {
-		return 0, err
-	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.next == nil {
-		b.next, b.end = map[backend.Network]int64{}, map[backend.Network]int64{}
-	}
-	b.next[net], b.end[net] = last-packBlock+2, last+1
-	return last - packBlock + 1, nil
 }
 
 // errPackNumberTaken is a pack row refused for a number another pack holds: the transaction runs
@@ -842,22 +870,29 @@ func (x queries) numberTaken(net backend.Network, err error) error {
 	return fmt.Errorf("%w: %w", errPackNumberTaken, err)
 }
 
-func (x queries) PackNumbers(ctx context.Context, net backend.Network) (map[uint64]encoding.ID, error) {
+func (x queries) NumberedPacks(ctx context.Context, net backend.Network, nums []uint64) (map[uint64]encoding.ID, error) {
 	out := map[uint64]encoding.ID{}
-	err := x.rows(ctx, `SELECT num, id FROM pack WHERE network_id = @net`, map[string]any{"net": int64(net)}, func() { clear(out) },
-		func(row *spanner.Row) error {
-			var num int64
-			var b []byte
-			if err := row.Columns(&num, &b); err != nil {
-				return err
-			}
-			id, err := toID(b)
-			if err != nil {
-				return err
-			}
-			out[uint64(num)] = id
-			return nil
-		})
+	n := make([]int64, len(nums))
+	for i, v := range nums {
+		n[i] = int64(v)
+	}
+	err := x.unlocked(func(r spannerdata.Reader) error {
+		clear(out)
+		return spannerdata.Each(ctx, r, `SELECT num, id FROM pack@{FORCE_INDEX=pack_num} WHERE network_id = @net AND num IN UNNEST(@nums)`,
+			map[string]any{"net": int64(net), "nums": n}, func(row *spanner.Row) error {
+				var num int64
+				var b []byte
+				if err := row.Columns(&num, &b); err != nil {
+					return err
+				}
+				id, err := toID(b)
+				if err != nil {
+					return err
+				}
+				out[uint64(num)] = id
+				return nil
+			})
+	})
 	return out, err
 }
 

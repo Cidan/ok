@@ -14,6 +14,7 @@ import (
 	"github.com/Cidan/ok/internal/scm/encoding"
 	"github.com/Cidan/ok/internal/scm/segment"
 	"github.com/Cidan/ok/internal/scm/store/backend"
+	"github.com/Cidan/ok/internal/serve/metrics"
 	"github.com/Cidan/ok/internal/work"
 )
 
@@ -109,8 +110,10 @@ func (s *Store) txIndex(ctx context.Context, tx *txn, sc backend.Scope) (*txLog,
 	if !ok {
 		return nil, fmt.Errorf("%s has no content index", sc.Name())
 	}
+	// What was committed before the transaction held the index's row is what it must see: no fold
+	// commits meanwhile, so a refresh begun since serves it, whoever's it is.
 	li := s.live(sc)
-	if err := s.refreshIndex(ctx, sc, li); err != nil {
+	if err := s.refreshIndexSince(ctx, sc, li, time.Now()); err != nil {
 		return nil, err
 	}
 	lg.index, lg.today = li.x.Load(), dayOf(today)
@@ -474,10 +477,17 @@ type liveIndex struct {
 	place      backend.LogPlace
 	tail       int
 	foldMarked bool
-	packs      atomic.Pointer[map[uint64]encoding.ID] // a network's pack numbers to IDs
+	// packs are a network's pack numbers' IDs this replica has read (packIDs): a number is one
+	// pack's for good, so they are kept across generations.
+	packMu sync.Mutex
+	packs  map[uint64]encoding.ID
 	// stale is set when another replica's commit was announced, or this one committed: the next
 	// read refreshes first.
 	stale atomic.Bool
+	// readFrom is when the last refresh that succeeded began reading — once it held mu, before its
+	// view's first read — so it holds what was committed before then: a refresh asked for since a
+	// moment it began after is done already. Under mu.
+	readFrom time.Time
 }
 
 // liveIndexes are the content indexes this replica holds, by scope.
@@ -523,10 +533,12 @@ func (s *Store) allIndexesChanged() {
 func (s *Store) contentIndex(ctx context.Context, sc backend.Scope) (*liveIndex, *contentindex.Index, error) {
 	s.startListening()
 	li := s.live(sc)
+	seen := time.Now()
 	if x := li.x.Load(); x != nil && !li.stale.Load() {
 		return li, x, nil
 	}
-	if err := s.refreshIndex(ctx, sc, li); err != nil {
+	// Stale when seen: a refresh begun since serves this read.
+	if err := s.refreshIndexSince(ctx, sc, li, seen); err != nil {
 		return nil, nil, err
 	}
 	return li, li.x.Load(), nil
@@ -541,10 +553,35 @@ func (s *Store) contentIndex(ctx context.Context, sc backend.Scope) (*liveIndex,
 // mutex while it waited for a connection, beside transactions that held every connection while
 // they waited for the mutex, would wait forever.
 func (s *Store) refreshIndex(ctx context.Context, sc backend.Scope, li *liveIndex) error {
+	return s.refreshIndexSince(ctx, sc, li, time.Now())
+}
+
+// refreshIndexSince is refreshIndex for a caller that needs what was committed before need: a
+// refresh that began since — another caller's, which this one waited for on the mutex — serves
+// it, so callers that find the index stale together read the database once, not one after
+// another (a repository's publishes, each staling every replica's index, would otherwise queue on
+// its mutex a read each).
+func (s *Store) refreshIndexSince(ctx context.Context, sc backend.Scope, li *liveIndex, need time.Time) error {
 	markFold := false
+	asked := time.Now()
+	result := "served" // by another's refresh
 	err := s.snapshot(ctx, func(tx backend.Ops) error {
 		li.mu.Lock()
-		defer li.mu.Unlock()
+		began := time.Now()
+		indexWaits.Observe(began.Sub(asked).Seconds())
+		defer func() {
+			li.mu.Unlock()
+			if result != "served" {
+				indexHolds.With(result).Since(began)
+			}
+		}()
+		if li.x.Load() != nil && !li.readFrom.Before(need) {
+			return nil
+		}
+		result = "applied"
+		if s.indexReads != nil {
+			s.indexReads()
+		}
 		// Cleared first, so an announcement during the refresh marks it again.
 		li.stale.Store(false)
 		gen, _, ok, err := tx.ContentIndexGeneration(ctx, sc)
@@ -561,26 +598,22 @@ func (s *Store) refreshIndex(ctx context.Context, sc backend.Scope, li *liveInde
 				li.x.Store(nil)
 				return err
 			}
-			li.place, li.tail = place, li.tail+rows
+			li.place, li.tail, li.readFrom = place, li.tail+rows, began
 			markFold = s.foldDue(li, x)
 			return nil
 		}
+		result = "loaded"
 		x, place, rows, _, err := s.loadContentIndex(ctx, tx, sc)
 		if err != nil {
 			return err
 		}
 		li.place, li.tail, li.foldMarked = place, rows, false
 		markFold = s.foldDue(li, x)
-		if sc.Network {
-			packs, err := tx.PackNumbers(ctx, backend.Network(sc.ID))
-			if err != nil {
-				return err
-			}
-			li.packs.Store(&packs)
-		}
 		li.x.Store(x)
+		li.readFrom = began
 		return nil
 	})
+	indexRefreshes.With(result).Inc()
 	if err != nil {
 		li.stale.Store(true)
 		return err
@@ -597,6 +630,15 @@ func (s *Store) refreshIndex(ctx context.Context, sc backend.Scope, li *liveInde
 	}
 	return nil
 }
+
+var (
+	indexRefreshes = metrics.NewCounter("ok_scm_index_refreshes_total",
+		"Refreshes of a replica's content indexes, by what each did: applied the log since its place, loaded a new generation whole, or was served by another's begun since it was asked for.", "result")
+	indexWaits = metrics.NewHistogram("ok_scm_index_refresh_wait_seconds",
+		"How long a refresh of a content index waited for the index's mutex: its turn behind the refresh under way.", metrics.Seconds)
+	indexHolds = metrics.NewHistogram("ok_scm_index_refresh_seconds",
+		"How long a refresh held a content index's mutex, by what it did: applied the log, or loaded a generation.", metrics.Seconds, "result")
+)
 
 // A content index's tail is folded once it is as long as an eighth of the index's entries, and
 // foldTailMin rows at least: a fold rewrites the index at most eight times for what was written to
@@ -644,33 +686,87 @@ func (s *Store) FoldDue(ctx context.Context, kind string, id int64) error {
 	return err
 }
 
-// packID is the ID of a pack a network's chunk index names by number, reading the pack table
-// again for one it does not know (compaction wrote it since).
+// packID is the ID of a pack a network's chunk index names by number (packIDs).
 func (s *Store) packID(ctx context.Context, net backend.Network, li *liveIndex, num uint64) (encoding.ID, error) {
-	if m := li.packs.Load(); m != nil {
-		if id, ok := (*m)[num]; ok {
-			return id, nil
-		}
-	}
-	m, err := s.ops(ctx).PackNumbers(ctx, net)
+	ids, err := s.packIDs(ctx, net, li, []uint64{num})
 	if err != nil {
 		return encoding.ID{}, err
 	}
-	li.packs.Store(&m)
-	id, ok := m[num]
-	if !ok {
-		return encoding.ID{}, fmt.Errorf("network %d's chunk index names pack %d, which it lacks", net, num)
+	return ids[num], nil
+}
+
+// packIDs are the IDs of the packs a network's chunk index names by numbers: those this replica
+// read before, and the rest read now, just those — a network writes a pack a publish, so it holds
+// millions.
+func (s *Store) packIDs(ctx context.Context, net backend.Network, li *liveIndex, nums []uint64) (map[uint64]encoding.ID, error) {
+	out := make(map[uint64]encoding.ID, len(nums))
+	var ask []uint64
+	li.packMu.Lock()
+	for _, n := range nums {
+		if id, ok := li.packs[n]; ok {
+			out[n] = id
+		} else {
+			ask = append(ask, n)
+		}
 	}
-	return id, nil
+	li.packMu.Unlock()
+	if len(ask) == 0 {
+		return out, nil
+	}
+	slices.Sort(ask)
+	ask = slices.Compact(ask)
+	got, err := s.ops(ctx).NumberedPacks(ctx, net, ask)
+	if err != nil {
+		return nil, err
+	}
+	li.packMu.Lock()
+	if li.packs == nil {
+		li.packs = map[uint64]encoding.ID{}
+	}
+	for n, id := range got {
+		li.packs[n] = id
+		out[n] = id
+	}
+	li.packMu.Unlock()
+	for _, n := range ask {
+		if _, ok := got[n]; !ok {
+			return nil, fmt.Errorf("network %d's chunk index names pack %d, which it lacks", net, n)
+		}
+	}
+	return out, nil
 }
 
 // contentEntries returns the entries of the files or chunks among ids the index holds, of
 // kind. One missing is looked for again after a refresh — it may have been committed since —
 // and absent after that.
 func (s *Store) contentEntries(ctx context.Context, sc backend.Scope, kind encoding.Kind, ids []encoding.ID) (*liveIndex, map[encoding.ID]contentindex.Entry, error) {
-	li, x, err := s.contentIndex(ctx, sc)
-	if err != nil {
-		return nil, nil, err
+	return s.entries(ctx, sc, kind, ids, false)
+}
+
+// knownEntries is contentEntries for a caller an entry the index dropped or moved since does no
+// harm: the replica's live index is read as it is, and refreshed only for what it lacks. So are a
+// publish's first looks at what the repository holds, which its touch checks again under the
+// index's lock (touchHeld), and files' manifests and sizes, which a file's ID fixes — not chunks'
+// locations, which compaction moves. A replica of a busy repository hears of a write every few
+// milliseconds: refreshing for each, every such caller would wait its turn on the index's mutex.
+func (s *Store) knownEntries(ctx context.Context, sc backend.Scope, kind encoding.Kind, ids []encoding.ID) (*liveIndex, map[encoding.ID]contentindex.Entry, error) {
+	return s.entries(ctx, sc, kind, ids, true)
+}
+
+// entries is contentEntries, or — asIs — knownEntries.
+func (s *Store) entries(ctx context.Context, sc backend.Scope, kind encoding.Kind, ids []encoding.ID, asIs bool) (*liveIndex, map[encoding.ID]contentindex.Entry, error) {
+	var li *liveIndex
+	var x *contentindex.Index
+	if asIs {
+		s.startListening()
+		li = s.live(sc)
+		x = li.x.Load()
+	}
+	if x == nil {
+		var err error
+		if li, x, err = s.contentIndex(ctx, sc); err != nil {
+			return nil, nil, err
+		}
 	}
 	out := make(map[encoding.ID]contentindex.Entry, len(ids))
 	// lookup finds what out lacks: in the tail, then the index segments.

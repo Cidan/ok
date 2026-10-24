@@ -207,3 +207,51 @@ func (s *Store) logRows(ctx context.Context, sc backend.Scope) (rows int, folded
 	})
 	return rows, folded, found, err
 }
+
+// Readers that find an index stale together read the database once between them, not a read each
+// one after another — a repository's publishes stale every replica's index at once — and each holds
+// what was committed before it asked; a reader that asks after a refresh began reads again.
+func TestRefreshesCoalesce(t *testing.T) {
+	s := testStore(t)
+	sc := repoScope(newRepo(t, s).ID)
+	other := reopen(t, s)
+	li := refreshed(t, other, sc)
+	var reads atomic.Int64
+	other.indexReads = func() {
+		reads.Add(1)
+		time.Sleep(20 * time.Millisecond) // a read that takes a while, as Spanner's does
+	}
+	defer func() { other.indexReads = nil }()
+	const readers = 64
+	for round := range 3 {
+		id := chunkID(uint64(100 + round))
+		logAs(t, s, sc, false, putChunk(id))
+		li.stale.Store(true)
+		reads.Store(0)
+		var wg sync.WaitGroup
+		for range readers {
+			wg.Go(func() {
+				_, x, err := other.contentIndex(context.Background(), sc)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				if _, ok := x.Get(id); !ok {
+					t.Errorf("round %d: a reader's index lacks what was committed before it asked", round)
+				}
+			})
+		}
+		wg.Wait()
+		if n := reads.Load(); n == 0 || n > 3 {
+			t.Errorf("round %d: %d readers of a stale index read it %d times", round, readers, n)
+		}
+	}
+	// One that asks after the last refresh began reads again, though the index is not stale.
+	reads.Store(0)
+	if err := other.refreshIndex(context.Background(), sc, li); err != nil {
+		t.Fatal(err)
+	}
+	if reads.Load() != 1 {
+		t.Errorf("a refresh asked for after the last read %d times", reads.Load())
+	}
+}

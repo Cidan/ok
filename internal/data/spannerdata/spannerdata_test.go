@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -139,6 +140,69 @@ func TestWork(t *testing.T) {
 	}
 	if got := due(); len(got) != 0 {
 		t.Errorf("due once 3 was released, marked for later: %v", got)
+	}
+}
+
+// A mark of work marked already writes nothing, so transactions marking the same work — a
+// repository's every upload marks its compaction — do not wait on one another: one commits while
+// another that marked it first is still open. The open one's read still holds the mark: taking the
+// work, which clears it, waits until that one commits.
+func TestMarksDoNotWaitOnEachOther(t *testing.T) {
+	ctx := context.Background()
+	c := client(t)
+	w := spannerdata.Work(c)
+	if err := w.Mark(ctx, "m", 1); err != nil {
+		t.Fatal(err)
+	}
+	marked, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	done := func() { once.Do(func() { close(release) }) }
+	defer done()
+	first := make(chan error, 1)
+	go func() {
+		var signal sync.Once
+		_, err := c.ReadWriteTransaction(ctx, func(ctx context.Context, tx *spanner.ReadWriteTransaction) error {
+			if err := spannerdata.MarkWork(ctx, tx, "m", 1); err != nil {
+				return err
+			}
+			signal.Do(func() { close(marked) })
+			<-release
+			return nil
+		})
+		first <- err
+	}()
+	<-marked
+	second := make(chan error, 1)
+	go func() {
+		_, err := c.ReadWriteTransaction(ctx, func(ctx context.Context, tx *spanner.ReadWriteTransaction) error {
+			return spannerdata.MarkWork(ctx, tx, "m", 1)
+		})
+		second <- err
+	}()
+	select {
+	case err := <-second:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("a mark waited on another open transaction's mark of the same work")
+	}
+	taken := make(chan error, 1)
+	go func() {
+		_, err := w.Take(ctx, "m", 1, "a", time.Minute)
+		taken <- err
+	}()
+	select {
+	case err := <-taken:
+		t.Fatalf("the work was taken while a transaction that marked it was open (%v)", err)
+	case <-time.After(2 * time.Second):
+	}
+	done()
+	if err := <-first; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-taken; err != nil {
+		t.Fatal(err)
 	}
 }
 

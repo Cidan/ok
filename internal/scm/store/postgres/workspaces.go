@@ -363,5 +363,33 @@ func (x queries) ThinCheckpoints(ctx context.Context, repo int64, every, hourly,
 }
 
 func (x queries) CheckpointTrees(ctx context.Context, repo int64) ([]encoding.ID, error) {
-	return idList(x.q.Query(ctx, `SELECT DISTINCT t FROM checkpoint, unnest(tree_ids) AS t WHERE repository_id = $1`, repo))
+	return idList(x.q.Query(ctx, `SELECT DISTINCT t FROM checkpoint, unnest(tree_ids) AS t WHERE repository_id = $1 AND NOT trees_pinned`, repo))
+}
+
+func (x queries) CheckpointsToPin(ctx context.Context, repo int64, before time.Time, limit int) ([]backend.CheckpointTreeIDs, error) {
+	rows, err := x.q.Query(ctx, `SELECT id, tree_ids FROM checkpoint
+		WHERE repository_id = $1 AND NOT trees_pinned AND created_at < $2 ORDER BY created_at, id LIMIT $3`, repo, before, limit)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, func(r pgx.CollectableRow) (backend.CheckpointTreeIDs, error) {
+		var c backend.CheckpointTreeIDs
+		var trees [][]byte
+		if err := r.Scan(&c.ID, &trees); err != nil {
+			return c, err
+		}
+		for _, b := range trees {
+			id, err := toID(b)
+			if err != nil {
+				return c, err
+			}
+			c.Trees = append(c.Trees, id)
+		}
+		return c, nil
+	})
+}
+
+func (x queries) SetCheckpointsPinned(ctx context.Context, repo int64, ids []int64) error {
+	_, err := x.q.Exec(ctx, `UPDATE checkpoint SET trees_pinned = true WHERE repository_id = $1 AND id = ANY($2)`, repo, ids)
+	return err
 }

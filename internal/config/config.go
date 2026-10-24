@@ -425,6 +425,9 @@ type SCMCache struct {
 	Objects int `yaml:"objects"`
 	Chunks  int `yaml:"chunks"`
 	Diffs   int `yaml:"diffs"`
+	// PathCommits are the newest commits of main that changed paths, which tree listings with their
+	// entries' last commits read.
+	PathCommits int `yaml:"path_commits"`
 	// CodeIndexes are the code search indexes a replica holds (docs/hosted.md, "ok control at
 	// scale, as built").
 	CodeIndexes int `yaml:"code_indexes"`

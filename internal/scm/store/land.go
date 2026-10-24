@@ -243,7 +243,12 @@ func (s *Store) Land(ctx context.Context, repo int64, items []LandItem, expected
 	var landed []Landed
 	var newHead encoding.ID
 	var last *scmpb.Event
-	err := s.inTx(ctx, func(ctx context.Context, tx *txn) error {
+	// A dry run writes nothing: read from a snapshot, it locks nothing a landing waits on.
+	run := s.inTx
+	if dryRun {
+		run = s.inSnapshot
+	}
+	err := run(ctx, func(ctx context.Context, tx *txn) error {
 		landed, newHead, last = nil, encoding.ID{}, nil
 		head, headSeq, ok, err := tx.Head(ctx, repo, !dryRun)
 		if err != nil {

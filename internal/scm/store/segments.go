@@ -200,10 +200,11 @@ func (s *Store) allSegmentsChanged() {
 }
 
 // manifest is a repository's live segments of kind, newest first: within a transaction, read
-// through it; otherwise the replica's, read again if stale or fresh is set.
+// through it, unlocked (backend.Ops.SegmentsUnlocked) — what the segments hold is all a reader
+// reads; otherwise the replica's, read again if stale or fresh is set.
 func (s *Store) manifest(ctx context.Context, sc backend.Scope, kind segment.Kind, fresh bool) ([]backend.Segment, error) {
 	if inTxContext(ctx) {
-		return s.ops(ctx).Segments(ctx, sc, kind)
+		return s.ops(ctx).SegmentsUnlocked(ctx, sc, kind)
 	}
 	s.startListening()
 	m := s.liveManifest(sc, kind)
@@ -631,6 +632,13 @@ func (s *Store) compactTail(ctx context.Context, repo int64, min int, r *Segment
 	if total == 0 || total < min {
 		r.More = false
 		return nil
+	}
+	// What the settled operations and views reach is pinned before they move (settle.go): from a
+	// segment, the mark reads them no more.
+	if !s.settleUnpinned {
+		if err := s.pinOpContent(ctx, repo, ops); err != nil {
+			return fmt.Errorf("pinning what settled operations reach: %w", err)
+		}
 	}
 	var objRecs, sizeRecs, edgeRecs, graphRecs, bodyRecs, pathRecs, eventRecs, opRecs, clRecs, logRecs []segment.Record
 	var c backend.Compacted

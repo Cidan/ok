@@ -361,3 +361,15 @@ type Checkpoint struct {
 	Fork       bool
 	CreatedAt  time.Time
 }
+
+// OpLogDivergence is an operation log and when its heads last moved other than forward.
+type OpLogDivergence struct {
+	OpLog      int64
+	DivergedAt time.Time
+}
+
+// CheckpointTreeIDs is a checkpoint and its trees.
+type CheckpointTreeIDs struct {
+	ID    int64
+	Trees []encoding.ID
+}
