@@ -82,6 +82,14 @@ func mainLogPrefix(k []byte) []byte {
 
 // settledRecords are a landed CL's records in segChangeLists, and its move's in segMainLog.
 func settledRecords(sc backend.SettledChangeList) (cls, log []segment.Record, err error) {
+	// Landed, so numbered, as is everything it was stacked on (sequence.go).
+	provisional := sc.Number <= 0 || sc.Parent < 0
+	for _, p := range sc.Patchsets {
+		provisional = provisional || p.Parent < 0
+	}
+	if provisional {
+		return nil, nil, fmt.Errorf("CL %d of ID %d is not numbered, nor is what it was stacked on", sc.Number, sc.ID)
+	}
 	n := be(sc.Number)
 	if bytes.IndexByte([]byte(sc.Author), 0) >= 0 {
 		return nil, nil, fmt.Errorf("CL %d's author holds a NUL: %q", sc.Number, sc.Author)
@@ -177,12 +185,13 @@ func (r *recReader) id() encoding.ID {
 func (r *recReader) time() time.Time { return time.UnixMicro(r.int()) }
 
 // recordVersion begins every record of these kinds.
-const recordVersion = 1
+const recordVersion = 2
 
 // encodeSettled is a landed CL's record: its row, its patchsets, and its landing.
 func encodeSettled(sc backend.SettledChangeList) []byte {
 	w := recWriter{recordVersion}
 	c := sc.ChangeList
+	w.uint(uint64(c.ID))
 	w.bytes(c.ChangeID)
 	w.str(c.Author)
 	w.uint(uint64(c.Status))
@@ -226,6 +235,7 @@ func decodeSettled(number int64, b []byte) (backend.SettledChangeList, error) {
 	r := &recReader{b: b[1:]}
 	c := &sc.ChangeList
 	c.Number = number
+	c.ID = int64(r.uint())
 	c.ChangeID = r.bytes()
 	c.Author = r.str()
 	c.Status = int16(r.uint())
@@ -250,7 +260,7 @@ func decodeSettled(number int64, b []byte) (backend.SettledChangeList, error) {
 		if r.bad {
 			break
 		}
-		p := backend.Patchset{CL: number, Number: int32(r.uint()), Commit: r.id(), Base: r.id(), Parent: int64(r.uint())}
+		p := backend.Patchset{CL: c.ID, Number: int32(r.uint()), Commit: r.id(), Base: r.id(), Parent: int64(r.uint())}
 		p.UploadedBy = r.str()
 		p.UploadedAt = r.time()
 		sc.Patchsets = append(sc.Patchsets, p)

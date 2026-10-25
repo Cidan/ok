@@ -100,11 +100,22 @@ func readWork(ctx context.Context, tx *spanner.ReadWriteTransaction, kind string
 	return w, ok, err
 }
 
+// readMark reads, in tx, what a mark decides by — whether key's work is marked, and due now — and
+// those cells alone: not its holder's or lease's, which a renewal writes, so marks never hold its
+// holder's renewals back. A take and a release write the mark's cells, so a mark is ordered against
+// them still.
+func readMark(ctx context.Context, tx *spanner.ReadWriteTransaction, kind string, key int64) (workRow, bool, error) {
+	var w workRow
+	ok, err := one(ctx, tx, spanner.Statement{SQL: `SELECT dirty, due_at IS NULL OR due_at <= CURRENT_TIMESTAMP()
+		FROM work WHERE kind = @kind AND key = @key`, Params: map[string]any{"kind": kind, "key": key}}, &w.dirty, &w.dueNow)
+	return w, ok, err
+}
+
 func micros(d time.Duration) int64 { return d.Microseconds() }
 
 // MarkWork marks key's work of kind dirty, due now.
 func MarkWork(ctx context.Context, tx *spanner.ReadWriteTransaction, kind string, key int64) error {
-	w, ok, err := readWork(ctx, tx, kind, key)
+	w, ok, err := readMark(ctx, tx, kind, key)
 	if err != nil {
 		return err
 	}
@@ -124,7 +135,7 @@ func MarkWork(ctx context.Context, tx *spanner.ReadWriteTransaction, kind string
 
 // MarkWorkAt marks key's work of kind dirty, due at at — or sooner, if it is marked so already.
 func MarkWorkAt(ctx context.Context, tx *spanner.ReadWriteTransaction, kind string, key int64, at time.Time) error {
-	w, ok, err := readWork(ctx, tx, kind, key)
+	w, ok, err := readMark(ctx, tx, kind, key)
 	if err != nil {
 		return err
 	}
@@ -184,6 +195,13 @@ func RenewWork(ctx context.Context, tx *spanner.ReadWriteTransaction, kind strin
 	return n > 0, err
 }
 
+// LetWork ends holder's lease on key's work and leaves its mark as it is, as pgdata.LetWork does.
+func LetWork(ctx context.Context, tx *spanner.ReadWriteTransaction, kind string, key int64, holder string) error {
+	_, err := update(ctx, tx, `UPDATE work SET holder = NULL, lease_until = NULL WHERE kind = @kind AND key = @key AND holder = @holder`,
+		map[string]any{"kind": kind, "key": key, "holder": holder})
+	return err
+}
+
 // ReleaseWork ends holder's lease on key's work — unless the work was marked meanwhile, due now,
 // when it clears the mark and keeps the lease, reporting again — as pgdata.ReleaseWork does.
 func ReleaseWork(ctx context.Context, tx *spanner.ReadWriteTransaction, kind string, key int64, holder string) (again bool, err error) {
@@ -220,12 +238,15 @@ func DueWork(ctx context.Context, r Reader, kind string, limit int) ([]int64, er
 	return out, err
 }
 
-// CheckWorkFence fails tx with data.ErrFenced unless f's work is still leased to f's holder,
-// reading its row so a takeover waits for or is aborted by tx.
+// CheckWorkFence fails tx with data.ErrFenced unless f's work is held by f's holder, reading that
+// cell alone, so a takeover, which writes it, waits for tx or aborts it. It reads no other: Spanner
+// locks cells, and a renewal writes lease_until, which a fenced transaction reading it would keep
+// from its holder's own renewals — every one of a compaction's batches, each renewal waiting on all
+// of them. A lease lapsed and not taken over still fences: no one else writes.
 func CheckWorkFence(ctx context.Context, tx *spanner.ReadWriteTransaction, f data.Fence) error {
 	var held bool
-	ok, err := one(ctx, tx, spanner.Statement{SQL: `SELECT holder = @holder AND lease_until >= CURRENT_TIMESTAMP() FROM work
-		WHERE kind = @kind AND key = @key`, Params: map[string]any{"kind": f.Kind, "key": f.Key, "holder": f.Holder}}, &held)
+	ok, err := one(ctx, tx, spanner.Statement{SQL: `SELECT holder = @holder FROM work WHERE kind = @kind AND key = @key`,
+		Params: map[string]any{"kind": f.Kind, "key": f.Key, "holder": f.Holder}}, &held)
 	if err != nil {
 		return err
 	}
@@ -284,6 +305,12 @@ func (w workStore) Release(ctx context.Context, kind string, key int64, holder s
 		return err
 	})
 	return again, err
+}
+
+func (w workStore) Let(ctx context.Context, kind string, key int64, holder string) error {
+	return w.txn(ctx, func(ctx context.Context, tx *spanner.ReadWriteTransaction) error {
+		return LetWork(ctx, tx, kind, key, holder)
+	})
 }
 
 func (w workStore) Due(ctx context.Context, kind string, limit int) ([]int64, error) {

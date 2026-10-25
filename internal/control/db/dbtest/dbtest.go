@@ -89,6 +89,15 @@ func testChangeListProjection(t *testing.T, s db.Store) {
 	if wrote, err := s.UpsertChangeList(ctx, fresh); err != nil || !wrote {
 		t.Fatalf("a fresh upsert: %v %v", wrote, err)
 	}
+	// The state it holds, recorded again, writes nothing; a change at the same moment writes.
+	if wrote, err := s.UpsertChangeList(ctx, fresh); err != nil || wrote {
+		t.Fatalf("an upsert of the state held: %v %v", wrote, err)
+	}
+	same := fresh
+	same.Description = "change e\n\nedited at the same moment"
+	if wrote, err := s.UpsertChangeList(ctx, same); err != nil || !wrote {
+		t.Fatalf("a change at the same moment: %v %v", wrote, err)
+	}
 	got, ok, err := s.GetChangeList(ctx, 1, 4)
 	if err != nil || !ok || got.CurrentPatchset != 2 || got.Status != db.StatusOpen || !got.Approved || got.Title() != "change e" {
 		t.Fatalf("CL 4: %+v %v %v", got, ok, err)

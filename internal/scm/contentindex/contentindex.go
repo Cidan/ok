@@ -1,11 +1,13 @@
 // Package contentindex is the model of ok scm's content index (docs/scm.md, "The
 // content index"): for each of a repository's files, its size and its chunks, and for each
-// chunk, where it is stored — with what garbage collection needs of both, whether it is
-// pinned and the last day anything wrote or referenced it. PostgreSQL holds it compactly,
-// as blocks of a few hundred entries in ID order (written whole by a merge) and a log of
-// what each transaction changed since; each replica keeps a repository's whole index in
-// memory. This package is the entries, their encodings, and applying them; the store reads
-// and writes them.
+// chunk and each tree a publish stored in a pack, where it is stored — with what garbage
+// collection needs of all three, whether it is pinned and the last day anything wrote or
+// referenced it. The index is a log of what each
+// transaction changed, which the database holds, and runs: sorted files in the object store,
+// each record an entry as a fold found it, a newer run's record superseding an older's. A
+// replica holds the log since the last fold (Log) and reads the runs through. This package is
+// the entries, their encodings, and applying an entry's updates to its newest record
+// (Resolve); the store reads and writes them.
 //
 // Puts, touches, and pins commute: an entry's body is kept once known — two copies of one
 // chunk are both valid locations — pinning only sets, and a touch keeps the latest day. A
@@ -16,7 +18,6 @@
 package contentindex
 
 import (
-	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -36,8 +37,8 @@ func DayOf(t time.Time) Day {
 // Time is the day's first instant, UTC.
 func (d Day) Time() time.Time { return time.Unix(int64(d)*86400, 0).UTC() }
 
-// Location is where a chunk is stored: its pack (by the pack's number), its record's offset,
-// and how the record stores it.
+// Location is where a chunk or a tree is stored: its pack (by the pack's number), its record's
+// offset, and how the record stores it.
 type Location struct {
 	Pack   uint64
 	Offset int64
@@ -52,18 +53,22 @@ type FileChunk struct {
 	Length uint32
 }
 
-// Entry is what the index holds of one file or chunk. Body is whether its contents are
-// known — a chunk's location, a file's size and chunks — rather than only a pin or a touch
-// that arrived before them.
+// Entry is what the index holds of one file, chunk, or tree. Body is whether its contents are
+// known — a chunk's or a tree's location (in a network's index; a repository's holds none), a
+// file's size and chunks — rather than only a pin or a touch that arrived before them.
 type Entry struct {
 	Kind   encoding.Kind
 	Body   bool
 	Pinned bool
 	Day    Day
-	Loc    Location    // a chunk's
+	Loc    Location    // a chunk's or a tree's (Located)
 	Size   uint64      // a file's
 	Chunks []FileChunk // a file's, in order
 }
+
+// Located reports whether entries of kind have a location: chunks, and trees, which a publish
+// stores in its pack beside its chunks.
+func Located(k encoding.Kind) bool { return k == encoding.KindChunk || k == encoding.KindTree }
 
 // combine folds b into a: the body a has (or b's), pinned if either is, the later day.
 func combine(a, b Entry) Entry {
@@ -98,9 +103,8 @@ const (
 	Touch Op = 2
 	// Pin records that it became pinned.
 	Pin Op = 3
-	// Move records a chunk's new location: compaction rewrote it. Of a chunk the index lacks —
-	// pinned, its entry in a segment, or dropped — the index keeps only the location (Moved), for a
-	// reader to apply to the segment's entry; a dropped chunk, in no segment, stays absent.
+	// Move records a chunk's or a tree's new location: compaction rewrote it. It moves what the
+	// index holds, and nothing of what it lacks.
 	Move Op = 4
 	// Drop records that it is gone: a sweep deleted it.
 	Drop Op = 5
@@ -127,8 +131,7 @@ func (u Update) entry() Entry {
 }
 
 const (
-	logVersion   = 1
-	blockVersion = 1
+	logVersion = 1
 
 	flagPinned = 1 << 0
 	flagBody   = 1 << 1
@@ -136,7 +139,7 @@ const (
 
 var errMalformed = errors.New("contentindex: malformed")
 
-func validKind(k encoding.Kind) bool { return k == encoding.KindFile || k == encoding.KindChunk }
+func validKind(k encoding.Kind) bool { return k == encoding.KindFile || Located(k) }
 
 // appendEntry encodes an entry's kind, flags, day, and body.
 func appendEntry(b []byte, e Entry) []byte {
@@ -152,7 +155,7 @@ func appendEntry(b []byte, e Entry) []byte {
 	if !e.Body {
 		return b
 	}
-	if e.Kind == encoding.KindChunk {
+	if Located(e.Kind) {
 		b = binary.AppendUvarint(b, e.Loc.Pack)
 		b = binary.AppendUvarint(b, uint64(e.Loc.Offset))
 		b = binary.AppendUvarint(b, uint64(e.Loc.Stored))
@@ -240,7 +243,7 @@ func (r *reader) entry() Entry {
 	if !e.Body || r.err != nil {
 		return e
 	}
-	if e.Kind == encoding.KindChunk {
+	if Located(e.Kind) {
 		e.Loc.Pack = r.uvarint()
 		off := r.uvarint()
 		if off > 1<<62 {
@@ -356,10 +359,10 @@ func DecodeLog(b []byte) ([]Update, error) {
 			u.Entry.Kind = encoding.Kind(r.byte())
 		case Move:
 			e := r.entry()
-			if e.Kind != encoding.KindChunk || !e.Body {
+			if !Located(e.Kind) || !e.Body {
 				r.fail()
 			}
-			u.Entry = Entry{Kind: encoding.KindChunk, Loc: e.Loc}
+			u.Entry = Entry{Kind: e.Kind, Loc: e.Loc}
 		default:
 			r.fail()
 		}
@@ -377,7 +380,8 @@ func DecodeLog(b []byte) ([]Update, error) {
 	return out, nil
 }
 
-// EncodeEntry encodes an entry alone: a segment's value.
+// EncodeEntry encodes an entry alone: a run's record. A bodiless one is a tombstone: the entry
+// is gone, whatever an older run holds of it.
 func EncodeEntry(e Entry) []byte { return appendEntry(nil, e) }
 
 // DecodeEntry decodes EncodeEntry's encoding.
@@ -395,45 +399,3 @@ type Keyed struct {
 	ID    encoding.ID
 	Entry Entry
 }
-
-// EncodeBlock encodes entries, in ID order, as one block's body.
-func EncodeBlock(entries []Keyed) []byte {
-	b := []byte{blockVersion}
-	b = binary.AppendUvarint(b, uint64(len(entries)))
-	for _, k := range entries {
-		b = append(b, k.ID[:]...)
-		b = appendEntry(b, k.Entry)
-	}
-	return b
-}
-
-// DecodeBlock decodes a block's body, checking its entries are in ID order.
-func DecodeBlock(b []byte) ([]Keyed, error) {
-	r := &reader{b: b}
-	if r.byte() != blockVersion {
-		return nil, fmt.Errorf("%w: block version", errMalformed)
-	}
-	n := r.uvarint()
-	if r.err != nil || n > uint64(len(r.b))/35 {
-		return nil, fmt.Errorf("%w block", errMalformed)
-	}
-	out := make([]Keyed, 0, n)
-	for i := range n {
-		k := Keyed{ID: r.id()}
-		k.Entry = r.entry()
-		if r.err != nil {
-			return nil, fmt.Errorf("%w block", errMalformed)
-		}
-		if i > 0 && bytes.Compare(out[i-1].ID[:], k.ID[:]) >= 0 {
-			return nil, fmt.Errorf("%w block: entries out of order", errMalformed)
-		}
-		out = append(out, k)
-	}
-	if len(r.b) != 0 {
-		return nil, fmt.Errorf("%w block: %d bytes after its entries", errMalformed, len(r.b))
-	}
-	return out, nil
-}
-
-// BlockEntries is how many entries a merge writes to a block: about 20 KB of small files'.
-const BlockEntries = 256

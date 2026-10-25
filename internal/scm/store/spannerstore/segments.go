@@ -14,7 +14,7 @@ import (
 
 // ─── Segments ───
 
-const segmentColumns = `scope, owner_id, network_id, kind, id, level, records, size, created_at, age, inherited, bound`
+const segmentColumns = `scope, owner_id, network_id, kind, id, level, records, size, created_at, age, inherited, bound, day`
 
 func (x queries) segments(ctx context.Context, sql string, params map[string]any) ([]backend.Segment, error) {
 	var out []backend.Segment
@@ -31,11 +31,12 @@ func segmentOf(row *spanner.Row) (backend.Segment, error) {
 	var s backend.Segment
 	var idb []byte
 	var scope, net, kind, level int64
-	var bound spanner.NullInt64
+	var bound, day spanner.NullInt64
 	if err := row.Columns(&scope, &s.Scope.ID, &net, &kind, &idb, &level, &s.Records, &s.Size, &s.CreatedAt, &s.Age,
-		&s.Inherited, &bound); err != nil {
+		&s.Inherited, &bound, &day); err != nil {
 		return s, err
 	}
+	s.Day = day.Int64
 	s.Scope.Network, s.Net, s.Kind, s.Level = scope == 1, backend.Network(net), segment.Kind(kind), int16(level)
 	s.Bound = backend.NoBound
 	if bound.Valid {
@@ -82,11 +83,12 @@ func (x queries) SegmentsUnlocked(ctx context.Context, sc backend.Scope, kind se
 func segmentParams(s backend.Segment) map[string]any {
 	scope, owner := scopeOf(s.Scope)
 	return map[string]any{"scope": scope, "owner": owner, "net": int64(s.Net), "kind": int64(s.Kind), "id": s.ID[:], "level": int64(s.Level),
-		"records": s.Records, "size": s.Size, "age": s.Age, "inherited": s.Inherited, "bound": boundOf(s)}
+		"records": s.Records, "size": s.Size, "age": s.Age, "inherited": s.Inherited, "bound": boundOf(s),
+		"day": spanner.NullInt64{Int64: s.Day, Valid: s.Day != 0}}
 }
 
-const insertSegment = `INSERT INTO segment (scope, owner_id, network_id, kind, id, level, records, size, created_at, age, inherited, bound)
-	VALUES (@scope, @owner, @net, @kind, @id, @level, @records, @size, ` + now + `, @age, @inherited, @bound)`
+const insertSegment = `INSERT INTO segment (scope, owner_id, network_id, kind, id, level, records, size, created_at, age, inherited, bound, day)
+	VALUES (@scope, @owner, @net, @kind, @id, @level, @records, @size, ` + now + `, @age, @inherited, @bound, @day)`
 
 // InsertSegments records segments live, one written from the tail (Age 0) under its network's
 // counter's next age.
@@ -202,11 +204,11 @@ func (x queries) PinnedPaths(ctx context.Context, repo int64, limit int) ([]back
 	return out, err
 }
 
-func (x queries) SettledEvents(ctx context.Context, repo int64, limit int) ([]backend.Event, error) {
+func (x queries) SettledEvents(ctx context.Context, repo int64, before time.Time, limit int) ([]backend.Event, error) {
 	return x.events(ctx, `SELECT e.repository_id, e.repository_seq, e.body FROM event e
-		WHERE e.repository_id = @repo AND NOT EXISTS (SELECT 1 FROM event_pending p
+		WHERE e.repository_id = @repo AND e.event_at < @before AND NOT EXISTS (SELECT 1 FROM event_pending p
 			WHERE p.repository_id = e.repository_id AND p.repository_seq = e.repository_seq)
-		ORDER BY e.repository_seq LIMIT @limit`, map[string]any{"repo": repo, "limit": int64(limit)})
+		ORDER BY e.repository_seq LIMIT @limit`, map[string]any{"repo": repo, "before": before, "limit": int64(limit)})
 }
 
 func (x queries) PinnedCommits(ctx context.Context, repo int64, limit int) ([]backend.PinnedCommit, error) {
@@ -330,8 +332,9 @@ func (x queries) DeleteCompacted(ctx context.Context, repo int64, c backend.Comp
 	if len(c.ChangeLists) > 0 {
 		// Their patchsets go first: deleted with them (patchset's foreign key), they would count in the
 		// CLs' statement.
-		add(`DELETE FROM patchset WHERE repository_id = @repo AND cl_number IN UNNEST(@numbers)
-			AND cl_number IN (SELECT number FROM changelist WHERE repository_id = @repo AND status = @settled)`, "numbers", c.ChangeLists)
+		add(`DELETE FROM patchset WHERE repository_id = @repo
+			AND cl_id IN (SELECT id FROM changelist WHERE repository_id = @repo AND number IN UNNEST(@numbers) AND status = @settled)`,
+			"numbers", c.ChangeLists)
 		stmts[len(stmts)-1].p["settled"] = int64(settledStatus)
 		add(`DELETE FROM changelist WHERE repository_id = @repo AND number IN UNNEST(@numbers) AND status = @settled`, "numbers", c.ChangeLists)
 		stmts[len(stmts)-1].p["settled"] = int64(settledStatus)

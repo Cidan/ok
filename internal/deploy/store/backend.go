@@ -171,7 +171,7 @@ type Ops interface {
 
 	// ─── Keyed work ───
 
-	// MarkWork, MarkWorkAt, TakeWork, RenewWork, ReleaseWork, and DueWork are the deployer's keyed
+	// MarkWork, MarkWorkAt, TakeWork, RenewWork, ReleaseWork, LetWork, and DueWork are the deployer's keyed
 	// work's (internal/work; pgdata's work operations, on PostgreSQL).
 	MarkWork(ctx context.Context, kind string, key int64) error
 	MarkWorkAt(ctx context.Context, kind string, key int64, at time.Time) error
@@ -180,6 +180,7 @@ type Ops interface {
 	TakeWork(ctx context.Context, kind string, key int64, holder string, ttl time.Duration) (bool, error)
 	RenewWork(ctx context.Context, kind string, key int64, holder string, ttl time.Duration) (bool, error)
 	ReleaseWork(ctx context.Context, kind string, key int64, holder string) (bool, error)
+	LetWork(ctx context.Context, kind string, key int64, holder string) error
 	DueWork(ctx context.Context, kind string, limit int) ([]int64, error)
 }
 

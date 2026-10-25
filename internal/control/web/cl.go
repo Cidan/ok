@@ -363,7 +363,7 @@ func (s *Server) buildCL(r *http.Request, t *clTarget) (*pages.CLView, error) {
 	if viewed != cl.CurrentPatchset {
 		current = s.preChecks(ctx, repo, cl, cl.CurrentPatchset, me)
 	}
-	if sub := subs.latest(); sub.GetStatus() == automationpb.Submission_STATUS_ACTIVE {
+	if sub := subs.latest(); sub.GetStatus() == automationpb.Submission_STATUS_ACTIVE && !landedFirst(cl, sub) {
 		v.Submitting = true
 		if s.review.CanSubmit(ctx, repo, cl, me) {
 			v.CancelSubmitHref = link + "/cancel-submit"

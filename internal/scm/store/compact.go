@@ -47,8 +47,10 @@ func (p compactPack) dead() int64 {
 	return p.size - p.live - pack.Overhead(p.chunks)
 }
 
+// compactChunk is a record compaction copies: a chunk's, or a tree's (kind).
 type compactChunk struct {
 	id     encoding.ID
+	kind   encoding.Kind
 	pack   encoding.ID
 	loc    pack.Location
 	hinted bool        // a file holds it:
@@ -58,14 +60,15 @@ type compactChunk struct {
 }
 
 // compact rewrites a repository's packs (docs/scm.md, "Garbage collection and
-// compaction"), from the content index: packs no chunk points at are retired outright; packs more than half
-// dead, the small packs when there are two or more, and — once the repository has a
-// dictionary — packs holding small chunks not yet compressed with it are rewritten into packs
-// of up to maxPackBytes holding only their live chunks, ordered by the path of a file that
-// holds them on main, for read locality. Chunks are copied as stored, but for small ones the
-// dictionary shrinks, which are re-encoded with it. Each new pack is written to S3, then one
-// transaction moves its chunks to it, in the index and in their rows; the source packs left
-// with no chunk are retired once every new pack is written. Readers that located a chunk in a retired pack still read it: a
+// compaction"), from the content index: packs no chunk or tree points at are retired outright;
+// packs more than half dead, the small packs when there are two or more, and — once the
+// repository has a dictionary — packs holding small chunks not yet compressed with it are
+// rewritten into packs of up to maxPackBytes holding only their live chunks and trees, the
+// chunks ordered by the path of a file that holds them on main, for read locality, the trees
+// after them. Records are copied as stored, but for small chunks the dictionary shrinks, which
+// are re-encoded with it. Each new pack is written to S3, then one transaction moves its records
+// to it, in the index; the source packs left with nothing live are retired once every new pack
+// is written. Readers that located a chunk in a retired pack still read it: a
 // retired pack stays in S3 for RetiredPackGrace.
 func (s *Store) compact(ctx context.Context, repo int64, opts GCOptions, r *GCReport) error {
 	net, netScope, err := s.networkOf(ctx, repo)
@@ -95,7 +98,7 @@ func (s *Store) compact(ctx context.Context, repo int64, opts GCOptions, r *GCRe
 	}
 	stats := map[uint64]*packStats{}
 	err = v.each(ctx, func(_ encoding.ID, e contentindex.Entry) bool {
-		if e.Kind != encoding.KindChunk {
+		if !contentindex.Located(e.Kind) {
 			return true
 		}
 		st := stats[e.Loc.Pack]
@@ -105,7 +108,8 @@ func (s *Store) compact(ctx context.Context, repo int64, opts GCOptions, r *GCRe
 		}
 		st.chunks++
 		st.live += int64(e.Loc.Stored)
-		if e.Loc.Raw <= DictionaryChunkMax && pack.Codec(e.Loc.Codec) != pack.ZstdDict {
+		// The dictionary is a file's: a tree is copied as stored.
+		if e.Kind == encoding.KindChunk && e.Loc.Raw <= DictionaryChunkMax && pack.Codec(e.Loc.Codec) != pack.ZstdDict {
 			st.small++
 		}
 		return true
@@ -306,9 +310,9 @@ func (s *Store) compactChunks(ctx context.Context, repo int64, v *contentView, s
 	var onMainFiles []onMain
 	at := map[encoding.ID]int{}
 	err = v.each(ctx, func(id encoding.ID, e contentindex.Entry) bool {
-		if pid, ok := byNum[e.Loc.Pack]; ok && e.Kind == encoding.KindChunk {
+		if pid, ok := byNum[e.Loc.Pack]; ok && contentindex.Located(e.Kind) {
 			at[id] = len(out)
-			out = append(out, compactChunk{id: id, pack: pid, loc: pack.Location{
+			out = append(out, compactChunk{id: id, kind: e.Kind, pack: pid, loc: pack.Location{
 				Offset: e.Loc.Offset, Codec: pack.Codec(e.Loc.Codec), RawLength: e.Loc.Raw, StoredLength: e.Loc.Stored}})
 		}
 		return true
@@ -394,10 +398,10 @@ func (s *Store) writeCompacted(ctx context.Context, net backend.Network, dir str
 	for i, c := range chunks {
 		stored := make([]byte, c.loc.StoredLength)
 		if _, err := sources[c.pack].ReadAt(stored, c.loc.DataOffset()); err != nil {
-			return 0, fmt.Errorf("pack %s: chunk %s: %w", c.pack, c.id, err)
+			return 0, fmt.Errorf("pack %s: %s %s: %w", c.pack, c.kind, c.id, err)
 		}
 		codec := c.loc.Codec
-		if enc != nil && codec != pack.ZstdDict && c.loc.RawLength <= DictionaryChunkMax {
+		if enc != nil && c.kind == encoding.KindChunk && codec != pack.ZstdDict && c.loc.RawLength <= DictionaryChunkMax {
 			raw, err := pack.Decode(s.dicts.of(net), c.id, codec, c.loc.RawLength, stored)
 			if err != nil {
 				return 0, fmt.Errorf("pack %s: %w", c.pack, err)
@@ -411,9 +415,9 @@ func (s *Store) writeCompacted(ctx context.Context, net backend.Network, dir str
 				dictionaryChunks.With("not_smaller").Inc()
 			}
 		}
-		loc, err := pw.AddStored(s.dicts.of(net), c.id, codec, c.loc.RawLength, stored)
+		loc, err := pw.AddStored(s.dicts.of(net), c.kind, c.id, codec, c.loc.RawLength, stored)
 		if err != nil {
-			return 0, fmt.Errorf("pack %s: chunk %s: %w", c.pack, c.id, err)
+			return 0, fmt.Errorf("pack %s: %s %s: %w", c.pack, c.kind, c.id, err)
 		}
 		locs[i] = loc
 	}
@@ -432,7 +436,7 @@ func (s *Store) writeCompacted(ctx context.Context, net backend.Network, dir str
 	err = s.inTx(ctx, func(ctx context.Context, tx *txn) error {
 		// No transaction changes the index while this one moves chunks in it, and the index
 		// read after the lock holds every change before.
-		if _, err := tx.LockContentIndex(ctx, backend.NetworkScope(net)); err != nil {
+		if _, _, err := tx.LockContentIndex(ctx, backend.NetworkScope(net)); err != nil {
 			return err
 		}
 		lg, err := s.txIndex(ctx, tx, backend.NetworkScope(net))
@@ -447,9 +451,16 @@ func (s *Store) writeCompacted(ctx context.Context, net backend.Network, dir str
 		if err != nil {
 			return err
 		}
+		ids := make([]encoding.ID, len(chunks))
+		for i, c := range chunks {
+			ids[i] = c.id
+		}
+		if err := lg.load(ctx, ids); err != nil {
+			return err
+		}
 		var live int64
 		for i, c := range chunks {
-			e, ok, err := lg.has(ctx, encoding.KindChunk, c.id)
+			e, ok, err := lg.has(ctx, c.kind, c.id)
 			if err != nil {
 				return err
 			}
@@ -464,7 +475,7 @@ func (s *Store) writeCompacted(ctx context.Context, net backend.Network, dir str
 			}
 			loc := locs[i]
 			s.logIndex(tx, backend.NetworkScope(net), contentindex.Update{Op: contentindex.Move, ID: c.id, Entry: contentindex.Entry{
-				Kind: encoding.KindChunk,
+				Kind: c.kind,
 				Loc:  contentindex.Location{Pack: num, Offset: loc.Offset, Stored: loc.StoredLength, Raw: loc.RawLength, Codec: uint8(loc.Codec)},
 			}})
 			live += int64(loc.StoredLength)
@@ -481,7 +492,7 @@ func (s *Store) writeCompacted(ctx context.Context, net backend.Network, dir str
 	return size, nil
 }
 
-// retireDrained retires the packs among ids that no chunk in the content index is in, and
+// retireDrained retires the packs among ids that no chunk or tree in the content index is in, and
 // returns how many and their total size.
 func (s *Store) retireDrained(ctx context.Context, net backend.Network, packIDs []encoding.ID, dryRun bool) (int, int64, error) {
 	v, err := s.contentView(ctx, backend.NetworkScope(net))
@@ -490,7 +501,7 @@ func (s *Store) retireDrained(ctx context.Context, net backend.Network, packIDs 
 	}
 	used := map[uint64]bool{}
 	err = v.each(ctx, func(_ encoding.ID, e contentindex.Entry) bool {
-		if e.Kind == encoding.KindChunk {
+		if contentindex.Located(e.Kind) {
 			used[e.Loc.Pack] = true
 		}
 		return true

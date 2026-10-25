@@ -126,6 +126,9 @@ func collectCLs(rows pgx.Rows, err error) ([]db.ChangeList, error) {
 }
 
 func (x queries) UpsertChangeList(ctx context.Context, c db.ChangeList) (bool, error) {
+	if cur, ok, err := x.GetChangeList(ctx, c.Repo, c.Number); err != nil || ok && cur.Holds(c) {
+		return false, err
+	}
 	var parent *int64
 	if c.ParentNumber != 0 {
 		parent = &c.ParentNumber

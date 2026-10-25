@@ -466,3 +466,37 @@ func TestBatchStopsWhereALandingInteracts(t *testing.T) {
 	check(t, "the batch", Batch(s, 8), "land 1/2")
 	check(t, "deciding after 1 lands", Decide(s.AfterLanding(1, 2)), "discard 2/3", "create 2 []")
 }
+
+// A step that lands does the rest of what its reading said beside the landing — a new submission's
+// attempt prepared, a planned one released — not after landings stop coming; the landing's own
+// submissions do nothing else, and an adoption waits for the next step.
+func TestLandingStepDoesTheRestBesideIt(t *testing.T) {
+	s := Snapshot{HeadSeq: 4, Submissions: []Submission{
+		sub(1, []int64{11}, attempt(1, 4, nil, Passed, libFP)),
+		sub(2, []int64{12}, attempt(2, 4, nil, Planned, docsFP)),
+		sub(3, []int64{13}),
+	}}
+	acts := Decide(s)
+	check(t, "deciding", acts, "land 1/1", "release 2/2", "create 3 []")
+	batch, rest := LandingStep(s, acts, 8)
+	check(t, "the landing", batch, "land 1/1")
+	check(t, "beside it", rest, "release 2/2", "create 3 []")
+	if n := notes(rest); n[2] == "" || n[3] == "" || n[1] != "" {
+		t.Errorf("notes beside the landing: %v; want 2's and 3's, not the landing's", n)
+	}
+
+	// Two land in one batch: neither does anything else.
+	s.Submissions[1].Attempts[0].State = Passed
+	acts = Decide(s)
+	batch, rest = LandingStep(s, acts, 8)
+	check(t, "the batch of two", batch, "land 1/1", "land 2/2")
+	check(t, "beside it, the new one", rest, "create 3 []")
+
+	// An adoption is not done beside a landing.
+	adopting := Snapshot{HeadSeq: 5, Submissions: []Submission{
+		sub(1, []int64{11}, attempt(1, 4, nil, Passed, libFP)),
+		{ID: 4, CLs: []int64{14}, Landed: []int64{14}, Attempts: []Attempt{attempt(4, 4, nil, Passed, docsFP)}},
+	}}
+	_, rest = LandingStep(adopting, Decide(adopting), 8)
+	check(t, "an adoption waits", rest)
+}

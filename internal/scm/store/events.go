@@ -66,6 +66,7 @@ func (s *Store) startListening() {
 
 // Close stops the store's listening connection, if it started, and waits for it to end.
 func (s *Store) Close() {
+	s.marksMade()
 	s.events.stop()
 	s.events.mu.Lock()
 	listening := s.events.listening
@@ -228,9 +229,16 @@ const EventTopic = scmfeed.Topic
 const relayPage = 500
 
 // Relay publishes to stream every event no relay has yet, until ctx ends: at least once each, as
-// they commit, any number of relays beside it (docs/hosted.md, "The per-repository log").
+// they commit, any number of relays beside it (docs/hosted.md, "The per-repository log"). Beside
+// it, it runs the sequencing passes that writers stopped before running leave (sweep).
 func (s *Store) Relay(ctx context.Context, stream bus.Stream) error {
 	s.startListening()
+	swept := make(chan struct{})
+	go func() {
+		defer close(swept)
+		s.sweep(ctx)
+	}()
+	defer func() { <-swept }()
 	for {
 		wake := s.events.wait()
 		n, err := s.relayOnce(ctx, stream)

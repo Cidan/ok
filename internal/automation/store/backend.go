@@ -23,6 +23,12 @@ type Backend interface {
 	Snapshot(ctx context.Context, fn func(tx Ops) error) error
 	// Moves are its rows about repositories, for a move between cells.
 	Moves() move.Rows
+	// FencedWritesBesideEachOther reports whether transactions that rest on one keyed-work lease
+	// and mark its work row may run beside each other. On Spanner they may: the fence reads the
+	// holder's cell, which a mark does not write. On PostgreSQL they may not: the fence holds the
+	// work row in share mode, which a mark of it then upgrades, so beside each other they deadlock
+	// on it and hold off the lease's renewal.
+	FencedWritesBesideEachOther() bool
 }
 
 // Ops are the database's operations. Outside a transaction each is its own; inside Txn they are
@@ -234,13 +240,14 @@ type Ops interface {
 	ReusableCandidate(ctx context.Context, repo int64, base []byte, cl int64, patchset int32) ([]byte, bool, error)
 	// CandidatesInUse are the candidates a repository's active attempts hold, by commit ID.
 	CandidatesInUse(ctx context.Context, repo int64) (map[string]bool, error)
-	// MarkWork, TakeWork, RenewWork, ReleaseWork, and DueWork are automation's keyed work's
+	// MarkWork, TakeWork, RenewWork, ReleaseWork, LetWork, and DueWork are automation's keyed work's
 	// (internal/work's Store).
 	MarkWork(ctx context.Context, kind string, key int64) error
 	MarkWorkAt(ctx context.Context, kind string, key int64, at time.Time) error
 	TakeWork(ctx context.Context, kind string, key int64, holder string, ttl time.Duration) (bool, error)
 	RenewWork(ctx context.Context, kind string, key int64, holder string, ttl time.Duration) (bool, error)
 	ReleaseWork(ctx context.Context, kind string, key int64, holder string) (bool, error)
+	LetWork(ctx context.Context, kind string, key int64, holder string) error
 	DueWork(ctx context.Context, kind string, limit int) ([]int64, error)
 
 	// SetLandedCommit records the commit a submission's CL landed as.

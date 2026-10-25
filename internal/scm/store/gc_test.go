@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"sync"
 	"testing"
@@ -13,6 +14,7 @@ import (
 	"github.com/Cidan/ok/internal/scm/contentindex"
 	"github.com/Cidan/ok/internal/scm/encoding"
 	"github.com/Cidan/ok/internal/scm/pack"
+	"github.com/Cidan/ok/internal/scm/segment"
 	"github.com/Cidan/ok/internal/scm/store/backend"
 )
 
@@ -35,56 +37,83 @@ func ageIndex(t *testing.T, s *Store, repo int64, days int) {
 	})
 }
 
-// rewriteIndex writes a repository's content index as a new generation, each entry as f
-// changes it, as a test that changes the index by hand needs.
+// rewriteIndex rewrites a repository's content index, each entry as f changes it, as a test that
+// changes the index by hand needs: it folds the log, then writes every entry into one run of its
+// kind — the unpinned one of the latest day it holds, as a fold of entries last changed then would —
+// in place of every run the index had, as a new generation, which every replica reads anew. The
+// index's swept-to day moves back to the run's, if it is past it, as a history that folded the run
+// then would have left it: no pass swept past a day whose run is still there.
 func rewriteIndex(t *testing.T, s *Store, repo int64, f func(encoding.ID, *contentindex.Entry)) {
 	t.Helper()
 	ctx := context.Background()
-	var x *contentindex.Index
-	var place backend.LogPlace
-	if err := s.snapshot(ctx, func(tx backend.Ops) error {
-		var err error
-		x, place, _, _, err = s.loadContentIndex(ctx, tx, repoScope(repo))
-		return err
-	}); err != nil {
+	sc := repoScope(repo)
+	if _, _, _, err := s.foldIndex(ctx, sc); err != nil {
 		t.Fatal(err)
 	}
-	var entries []contentindex.Keyed
-	for _, k := range x.Sorted() {
-		if !k.Entry.Body {
+	var pinned, unpinned []segment.Record
+	var day contentindex.Day
+	for _, k := range indexOf(t, s, repo).Sorted() {
+		f(k.ID, &k.Entry)
+		rec := segment.Record{Key: bytes.Clone(k.ID[:]), Value: contentindex.EncodeEntry(k.Entry)}
+		if k.Entry.Pinned {
+			pinned = append(pinned, rec)
+		} else {
+			unpinned = append(unpinned, rec)
+			day = max(day, k.Entry.Day)
+		}
+	}
+	var runs []backend.Segment
+	for _, w := range []struct {
+		kind segment.Kind
+		recs []segment.Record
+	}{{segIndex, pinned}, {segIndexUnpinned, unpinned}} {
+		if len(w.recs) == 0 {
 			continue
 		}
-		f(k.ID, &k.Entry)
-		entries = append(entries, k)
-	}
-	gen, _, ok, err := s.ops(ctx).ContentIndexGeneration(ctx, repoScope(repo))
-	if err != nil || !ok {
-		t.Fatalf("the content index's generation: %v, %v", ok, err)
-	}
-	// The next generation's blocks a bounded transaction at a time, as a fold writes them — a
-	// repository's whole index is more than one Spanner transaction holds — none read until the
-	// last makes it the generation.
-	if err := s.writeBlocksBatched(ctx, repoScope(repo), gen+1, entries); err != nil {
-		t.Fatal(err)
+		sg, ok, err := s.writeSegment(ctx, sc, w.kind, 0, segment.Records(w.recs))
+		if err != nil || !ok {
+			t.Fatalf("writing a run: %v, %v", ok, err)
+		}
+		if w.kind == segIndexUnpinned {
+			sg.Day = int64(day)
+		}
+		runs = append(runs, sg)
 	}
 	if err := s.inTx(ctx, func(ctx context.Context, tx *txn) error {
-		if current, err := tx.LockContentIndex(ctx, repoScope(repo)); err != nil || current != gen {
-			return fmt.Errorf("the content index's generation is %d (%v), not %d", current, err, gen)
-		}
-		if err := tx.DeleteIndexBlocks(ctx, repoScope(repo), gen); err != nil {
+		if _, _, err := tx.LockContentIndex(ctx, sc); err != nil {
 			return err
 		}
-
-		return tx.SetContentIndexGeneration(ctx, repoScope(repo), gen+1, place)
+		st, _, err := tx.ContentIndexGeneration(ctx, sc)
+		if err != nil {
+			return err
+		}
+		for _, kind := range []segment.Kind{segIndex, segIndexUnpinned} {
+			old, err := tx.SegmentsUnlocked(ctx, sc, kind)
+			if err != nil {
+				return err
+			}
+			ids := make([]encoding.ID, len(old))
+			for i, sg := range old {
+				ids[i] = sg.ID
+			}
+			if _, err := tx.RetireSegments(ctx, sc, kind, ids); err != nil {
+				return err
+			}
+		}
+		if err := tx.InsertSegments(ctx, runs); err != nil {
+			return err
+		}
+		if len(unpinned) > 0 && st.SweptBefore > int64(day) {
+			if err := tx.SetContentIndexSwept(ctx, sc, int64(day)); err != nil {
+				return err
+			}
+		}
+		return tx.SetContentIndexGeneration(ctx, sc, st.Generation+1, st.Folded)
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.deleteTail(ctx, func(ctx context.Context, tx *txn, limit int) (int64, error) {
-		return tx.DeleteFoldedContentLogs(ctx, repoScope(repo), place, limit)
-	}); err != nil {
-		t.Fatal(err)
-	}
-	s.indexChanged(repoScope(repo))
+	s.segmentsChanged(sc)
+	s.indexChanged(sc)
 }
 
 // netOf is a repository's network.
@@ -97,43 +126,63 @@ func netOf(t *testing.T, s *Store, repo int64) backend.Network {
 	return net
 }
 
-// locationsOf reads a repository's network's chunk index afresh.
-func locationsOf(t *testing.T, s *Store, repo int64) *contentindex.Index {
+// wholeIndex is a content index read whole: every entry it holds, by ID.
+type wholeIndex map[encoding.ID]contentindex.Entry
+
+// Get is an entry the index holds.
+func (w wholeIndex) Get(id encoding.ID) (contentindex.Entry, bool) {
+	e, ok := w[id]
+	return e, ok
+}
+
+// Sorted is every entry, in ID order.
+func (w wholeIndex) Sorted() []contentindex.Keyed {
+	out := make([]contentindex.Keyed, 0, len(w))
+	for id, e := range w {
+		out = append(out, contentindex.Keyed{ID: id, Entry: e})
+	}
+	slices.SortFunc(out, func(a, b contentindex.Keyed) int { return bytes.Compare(a.ID[:], b.ID[:]) })
+	return out
+}
+
+// readWhole reads a content index whole, its log and runs read afresh.
+func readWhole(t *testing.T, s *Store, sc backend.Scope) wholeIndex {
 	t.Helper()
-	sc := backend.NetworkScope(netOf(t, s, repo))
-	var x *contentindex.Index
-	if err := s.snapshot(context.Background(), func(tx backend.Ops) error {
-		var found bool
-		var err error
-		x, _, _, found, err = s.loadContentIndex(context.Background(), tx, sc)
-		if err == nil && !found {
-			err = fmt.Errorf("%s has no chunk index", sc.Name())
-		}
-		return err
+	ctx := context.Background()
+	v, err := s.contentView(ctx, sc)
+	if err != nil {
+		t.Fatalf("%s: %v", sc.Name(), err)
+	}
+	out := wholeIndex{}
+	if err := v.each(ctx, func(id encoding.ID, e contentindex.Entry) bool {
+		out[id] = e
+		return true
 	}); err != nil {
 		t.Fatal(err)
 	}
-	return x
+	return out
+}
+
+// locationsOf reads a repository's network's chunk index afresh.
+func locationsOf(t *testing.T, s *Store, repo int64) wholeIndex {
+	t.Helper()
+	return readWhole(t, s, backend.NetworkScope(netOf(t, s, repo)))
 }
 
 // indexOf reads a repository's content index afresh.
-func indexOf(t *testing.T, s *Store, repo int64) *contentindex.Index {
+func indexOf(t *testing.T, s *Store, repo int64) wholeIndex {
 	t.Helper()
-	x, found, err := s.LoadContentIndex(context.Background(), repo)
-	if err != nil || !found {
-		t.Fatalf("repository %d's content index: %v %v", repo, found, err)
-	}
-	return x
+	return readWhole(t, s, repoScope(repo))
 }
 
-// dropFromIndex drops a file or chunk from a repository's content index, as a sweep does — a
-// chunk's location from its network's chunk index too.
+// dropFromIndex drops a file, chunk, or tree from a repository's content index, as a sweep does — a
+// chunk's or a tree's location from its network's chunk index too.
 func dropFromIndex(t *testing.T, s *Store, repo int64, kind encoding.Kind, id encoding.ID) {
 	t.Helper()
 	net := backend.NetworkScope(netOf(t, s, repo))
 	if err := s.inTx(context.Background(), func(ctx context.Context, tx *txn) error {
 		s.logIndex(tx, repoScope(repo), contentindex.Update{Op: contentindex.Drop, ID: id, Entry: contentindex.Entry{Kind: kind}})
-		if kind == encoding.KindChunk {
+		if contentindex.Located(kind) {
 			s.logIndex(tx, net, contentindex.Update{Op: contentindex.Drop, ID: id, Entry: contentindex.Entry{Kind: kind}})
 		}
 		return nil
@@ -161,6 +210,16 @@ func has(t *testing.T, s *Store, repo int64, tbl string, id encoding.ID) bool {
 	if dbOf(s).count(t, tbl, `repository_id = @repo AND id = @id`, map[string]any{"repo": repo, "id": id[:]}) > 0 {
 		return true
 	}
+	if tbl == "object" {
+		// A tree a publish stored is the content index's.
+		_, entries, err := s.contentEntries(context.Background(), repoScope(repo), encoding.KindTree, []encoding.ID{id})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := entries[id]; ok {
+			return true
+		}
+	}
 	// Pinned, it may have moved into a segment.
 	kind := segObjects
 	if tbl == "commit" {
@@ -171,6 +230,17 @@ func has(t *testing.T, s *Store, repo int64, tbl string, id encoding.ID) bool {
 		t.Fatal(err)
 	}
 	return len(got) > 0
+}
+
+// objectState is an object's last day touched and whether it is pinned: a tree a publish stored
+// from the content index, read afresh; anything else from its row.
+func objectState(t *testing.T, s *Store, repo int64, id encoding.ID) (touched time.Time, pinned bool) {
+	t.Helper()
+	if e, ok := indexOf(t, s, repo).Get(id); ok && e.Kind == encoding.KindTree {
+		return e.Day.Time(), e.Pinned
+	}
+	dbOf(s).scan(t, `SELECT pinned FROM object WHERE repository_id = @repo AND id = @id`, map[string]any{"repo": repo, "id": id[:]}, &pinned)
+	return dbOf(s).touched(t, "object", repo, id), pinned
 }
 
 // dropChunk deletes a chunk as a sweep does — its pack's live bytes too — whatever its
@@ -311,8 +381,13 @@ func TestGCSweepsWhatNothingReaches(t *testing.T) {
 			t.Errorf("chunk %s of the unreachable file survived", c)
 		}
 	}
-	if keptSizes(goneTree) || !keptSizes(keepTree) {
-		t.Errorf("tree sizes kept: swept tree %v, kept tree %v; want false, true", keptSizes(goneTree), keptSizes(keepTree))
+	// Both are trees publishes stored, unpinned: a replica keeps their records in memory alone, never
+	// a row a swept tree's would outlive. The kept tree's is served still.
+	if keptSizes(goneTree) || keptSizes(keepTree) {
+		t.Errorf("tree sizes kept as rows: swept tree %v, kept tree %v; want neither", keptSizes(goneTree), keptSizes(keepTree))
+	}
+	if sizes, err := reopen(t, e.s).TreeSizes(ctx, e.repo, []encoding.ID{keepTree, goneTree}); err != nil || len(sizes) != 1 || sizes[keepTree] == nil {
+		t.Errorf("trees' sizes after the sweep: %d records, %v; want the kept tree's alone", len(sizes), err)
 	}
 	if r.Marked == 0 {
 		t.Error("the mark kept nothing, though the kept commit is stale and unpinned")
@@ -336,7 +411,8 @@ func TestGCKeepsWhatIsFresh(t *testing.T) {
 	ctx := context.Background()
 	e := newCLEnv(t)
 	g := newBuilder(t)
-	gone := g.commit(g.tree(fileEntry("f", g.file([]byte("fresh")))), "unreachable, but fresh", encoding.RootCommitID)
+	f := g.file([]byte("fresh"))
+	gone := g.commit(g.tree(fileEntry("f", f)), "unreachable, but fresh", encoding.RootCommitID)
 	mustPublish(t, e.s, e.repo, alice, g, nil)
 	for _, days := range []int{0, 14, 15} {
 		age(t, e.s, e.repo, days)
@@ -344,12 +420,12 @@ func TestGCKeepsWhatIsFresh(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if r.CommitsSwept != 0 || !has(t, e.s, e.repo, "commit", gone) {
-			t.Fatalf("an unreachable commit %d days old was swept: %s", days, r)
+		if r.CommitsSwept != 0 || r.FilesSwept != 0 || !has(t, e.s, e.repo, "commit", gone) || !has(t, e.s, e.repo, "file", f) {
+			t.Fatalf("an unreachable commit and its file %d days old were swept: %s", days, r)
 		}
 	}
 	age(t, e.s, e.repo, 16)
-	if r, err := e.s.GC(ctx, e.repo, time.Now(), GCOptions{}); err != nil || r.CommitsSwept != 1 {
+	if r, err := e.s.GC(ctx, e.repo, time.Now(), GCOptions{}); err != nil || r.CommitsSwept != 1 || r.FilesSwept != 1 || has(t, e.s, e.repo, "file", f) {
 		t.Fatalf("16 days old: %s, %v", r, err)
 	}
 }
@@ -485,7 +561,7 @@ func TestExchangeNeverFreshensOverAMissingObject(t *testing.T) {
 	if len(objs) != 1 || objs[0] != (ObjectRef{Kind: encoding.KindTree, ID: tree}) || len(chunks) != 1 || chunks[0] != lost {
 		t.Fatalf("missing %v, chunks %v", objs, chunks)
 	}
-	if !dbOf(e.s).touched(t, "object", e.repo, tree).Before(dbOf(e.s).today(t)) {
+	if touched, _ := objectState(t, e.s, e.repo, tree); !touched.Before(dbOf(e.s).today(t)) {
 		t.Fatal("the tree over the missing chunk was freshened")
 	}
 	mustPublish(t, e.s, e.repo, alice, g, nil)
@@ -629,16 +705,18 @@ func TestSpliceReusingGarbageKeepsIt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if dbOf(e.s).touched(t, "object", e.repo, spliced).Before(dbOf(e.s).today(t)) {
+	if touched, _ := objectState(t, e.s, e.repo, spliced); touched.Before(dbOf(e.s).today(t)) {
 		t.Fatal("the candidate's reused tree was not refreshed")
 	}
-	var pinned bool
 	if r, err := e.s.GC(ctx, e.repo, time.Now(), GCOptions{}); err != nil || r.ObjectsSwept != 0 {
 		t.Fatalf("GC beside a candidate: %s, %v", r, err)
 	}
 	landedAs := e.mustLand(LandItem{Number: ny, Patchset: 1, Candidate: &cand.Commit})
-	if dbOf(e.s).scan(t, `SELECT pinned FROM object WHERE repository_id = @repo AND id = @id`, map[string]any{"repo": e.repo, "id": spliced[:]}, &pinned); !pinned {
+	if _, pinned := objectState(t, e.s, e.repo, spliced); !pinned {
 		t.Fatal("the landing did not pin its reused tree")
+	}
+	if n := dbOf(e.s).count(t, "object", `repository_id = @repo AND id = @id`, map[string]any{"repo": e.repo, "id": spliced[:]}); n != 0 {
+		t.Fatal("the landing stored again, as a row, a tree the content index held")
 	}
 	if landedAs[0].Commit != cand.Commit {
 		t.Fatalf("landed as %s, the candidate was %s", landedAs[0].Commit, cand.Commit)
@@ -955,6 +1033,72 @@ func TestCompactionSettles(t *testing.T) {
 		if err != nil || again.PacksWritten != 0 || again.PacksRetired != 0 {
 			t.Fatalf("a settled repository compacted again: %s, %v", again, err)
 		}
+	}
+	clean(t, e.s, e.repo)
+}
+
+// Garbage collection lists stale content from the unpinned index's runs of its window's days alone —
+// from the day the last complete pass swept to through its cutoff's — sweeps what the mark does not
+// reach, touches what it does, folds, retires the runs of the days before its cutoff, and records
+// the index swept to it: the next pass reads nothing it read.
+func TestGCReadsItsWindowAndRetiresTheDaysBefore(t *testing.T) {
+	ctx := context.Background()
+	e := newCLEnv(t)
+	sc := repoScope(e.repo)
+
+	b := newBuilder(t)
+	keepFile := b.file([]byte("kept, reachable\n"))
+	keep := b.commit(b.tree(fileEntry("keep", keepFile)), "kept", encoding.RootCommitID)
+	mustPublish(t, e.s, e.repo, alice, b, &OpHeadsUpdate{Old: []encoding.ID{encoding.RootOperationID},
+		New: b.operation(b.view(keep), "snapshot", encoding.RootOperationID)})
+	g := newBuilder(t)
+	goneFile := g.file([]byte("gone, reached by nothing\n"))
+	g.commit(g.tree(fileEntry("gone", goneFile)), "garbage", encoding.RootCommitID)
+	mustPublish(t, e.s, e.repo, alice, g, nil)
+	age(t, e.s, e.repo, 20)
+
+	// Today's run: written after the aging, outside the window.
+	n := newBuilder(t)
+	n.commit(n.tree(fileEntry("new", n.file([]byte("new today\n")))), "today's", encoding.RootCommitID)
+	mustPublish(t, e.s, e.repo, alice, n, nil)
+	if _, _, _, err := e.s.RebuildContentIndex(ctx, e.repo); err != nil {
+		t.Fatal(err)
+	}
+	today := contentindex.DayOf(dbOf(e.s).today(t))
+	cutoff := today - sweepGraceDays
+
+	var scanned []backend.Segment
+	e.s.scanningRun = func(sg backend.Segment) { scanned = append(scanned, sg) }
+	r, err := e.s.GC(ctx, e.repo, time.Now(), GCOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(scanned) != 1 || contentindex.Day(scanned[0].Day) != today-20 {
+		t.Fatalf("the pass scanned runs %+v, want the one of 20 days ago", scanned)
+	}
+	if r.FilesSwept != 1 || r.ContentKept < 2 || r.IndexRunsRetired < 1 || has(t, e.s, e.repo, "file", goneFile) {
+		t.Fatalf("the pass: %s; want the unreached file swept, the reached file and its chunk touched, the old run retired", r)
+	}
+	if e, ok := indexOf(t, e.s, e.repo).Get(keepFile); !ok || e.Day != today {
+		t.Fatalf("the reached file: %+v %v; want it touched today", e, ok)
+	}
+	st, _, err := e.s.ops(ctx).ContentIndexGeneration(ctx, sc)
+	if err != nil || contentindex.Day(st.SweptBefore) != cutoff {
+		t.Fatalf("swept to day %d (%v), want the cutoff's, %d", st.SweptBefore, err, cutoff)
+	}
+	for _, sg := range runsOf(t, e.s, sc, segIndexUnpinned) {
+		if contentindex.Day(sg.Day) < cutoff {
+			t.Fatalf("a run of day %d, before the cutoff's, %d, is live", sg.Day, cutoff)
+		}
+	}
+	if got := readAll(t, reopen(t, e.s), e.repo, keepFile); string(got) != "kept, reachable\n" {
+		t.Fatalf("the reached file reads %q", got)
+	}
+
+	scanned = nil
+	again, err := e.s.GC(ctx, e.repo, time.Now(), GCOptions{})
+	if err != nil || again.FilesSwept+again.ChunksSwept != 0 || again.ContentKept != 0 || again.IndexRunsRetired != 0 || len(scanned) != 0 {
+		t.Fatalf("a second pass: %s, %v, scanning %+v; want nothing to read or do", again, err, scanned)
 	}
 	clean(t, e.s, e.repo)
 }

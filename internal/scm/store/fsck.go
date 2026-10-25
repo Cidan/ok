@@ -17,9 +17,11 @@ import (
 // FsckReport is what Fsck found in one repository.
 type FsckReport struct {
 	Packs, Chunks, Files, Objects, Commits, Operations, Views int
-	// IndexEntries are the content index's files and chunks.
+	// PackedTrees are the trees in packs the network's chunk index locates.
+	PackedTrees int
+	// IndexEntries are the content index's files, chunks, and trees.
 	IndexEntries int
-	// DeadBytes are pack bytes no chunk row points at (reclaimed by compaction).
+	// DeadBytes are pack bytes no location points at (reclaimed by compaction).
 	DeadBytes int64
 	// OrphanPacks are S3 keys with no pack row (a failed publish's upload).
 	OrphanPacks []string
@@ -34,10 +36,11 @@ func (r *FsckReport) problem(format string, args ...any) {
 }
 
 // Fsck verifies one repository against its own invariants: every pack against its bytes
-// and the content index's chunks in it, every file's chunks against its ID, every object,
-// commit, operation, and view against its ID and canonical encoding, and the parent and copy
-// indexes against the bodies they index. With repair, it rebuilds the index's entries for
-// chunks files use that it lacks, from the packs that hold them (packs are self-describing).
+// and the content index's chunks and trees in it, every file's chunks against its ID, every
+// object, packed tree, commit, operation, and view against its ID and canonical encoding, and the
+// parent and copy indexes against the bodies they index. With repair, it rebuilds the network's
+// locations of chunks files use, and of trees the repository holds, that it lacks, from the packs
+// that hold them (packs are self-describing).
 func (s *Store) Fsck(ctx context.Context, repo int64, repair bool) (*FsckReport, error) {
 	if err := s.repositoryExists(ctx, s.ops(ctx), repo); err != nil {
 		return nil, err
@@ -117,17 +120,19 @@ func (s *Store) fsckPacks(ctx context.Context, repo int64, repair bool, r *FsckR
 		return err
 	}
 	for _, view := range []*contentView{v, locs} {
-		for _, k := range view.x.Sorted() {
-			if !k.Entry.Body {
-				r.problem("content index: %s %s has only a touch or a pin", k.Entry.Kind, k.ID)
-				r.IndexEntries++
-			}
+		touched, err := s.touchedOnly(ctx, view)
+		if err != nil {
+			return err
+		}
+		for _, k := range touched {
+			r.problem("content index: %s %s has only a touch or a pin", k.Entry.Kind, k.ID)
+			r.IndexEntries++
 		}
 	}
 	byPack := map[uint64][]contentindex.Keyed{}
 	packOf := map[encoding.ID]uint64{}
 	err = locs.each(ctx, func(id encoding.ID, e contentindex.Entry) bool {
-		if e.Kind == encoding.KindChunk {
+		if contentindex.Located(e.Kind) {
 			byPack[e.Loc.Pack] = append(byPack[e.Loc.Pack], contentindex.Keyed{ID: id, Entry: e})
 			packOf[id] = e.Loc.Pack
 		}
@@ -137,16 +142,16 @@ func (s *Store) fsckPacks(ctx context.Context, repo int64, repair bool, r *FsckR
 		return err
 	}
 	var files []fsckFile
-	var unlocated []encoding.ID
+	var unlocated []contentindex.Keyed
 	heldChunks := map[encoding.ID]bool{}
 	err = v.each(ctx, func(id encoding.ID, e contentindex.Entry) bool {
 		r.IndexEntries++
+		if _, ok := packOf[id]; contentindex.Located(e.Kind) && !ok {
+			unlocated = append(unlocated, contentindex.Keyed{ID: id, Entry: contentindex.Entry{Kind: e.Kind}})
+		}
 		switch e.Kind {
 		case encoding.KindChunk:
 			heldChunks[id] = true
-			if _, ok := packOf[id]; !ok {
-				unlocated = append(unlocated, id)
-			}
 		case encoding.KindFile:
 			files = append(files, fsckFile{id: id, size: e.Size, chunks: e.Chunks})
 		}
@@ -217,10 +222,10 @@ func (s *Store) fsckPacks(ctx context.Context, repo int64, repair bool, r *FsckR
 	if err := s.fsckUnheld(ctx, repo, unheld, repair, r); err != nil {
 		return err
 	}
-	// A chunk the repository holds that no live pack has a record of is gone.
-	for _, id := range unlocated {
-		if !recorded[id] {
-			r.problem("chunk %s: held, but in none of its network's live packs", id)
+	// A chunk or tree the repository holds that no live pack has a record of is gone.
+	for _, k := range unlocated {
+		if !recorded[k.ID] {
+			r.problem("%s %s: held, but in none of its network's live packs", k.Entry.Kind, k.ID)
 		}
 	}
 	for _, f := range afterRepair {
@@ -238,8 +243,9 @@ func (s *Store) fsckPacks(ctx context.Context, repo int64, repair bool, r *FsckR
 	return nil
 }
 
-// fsckPack verifies a pack against the content index's chunks in it (here), and the files whose
-// first chunk it holds, and returns its records no entry points at.
+// fsckPack verifies a pack against the content index's chunks and trees in it (here) — a tree's body
+// decoding canonically — and the files whose first chunk it holds, and returns its records no entry
+// points at.
 func (s *Store) fsckPack(ctx context.Context, repo int64, net backend.Network, here []contentindex.Keyed, files []fsckFile, pr packRow, r *FsckReport) ([]orphan, error) {
 	f, err := os.CreateTemp("", "ok scm-fsck-*")
 	if err != nil {
@@ -269,14 +275,32 @@ func (s *Store) fsckPack(ctx context.Context, repo int64, net backend.Network, h
 	for _, k := range here {
 		id, e := k.ID, k.Entry
 		pointed[id] = true
-		r.Chunks++
+		if e.Kind == encoding.KindTree {
+			r.PackedTrees++
+		} else {
+			r.Chunks++
+		}
 		rec, ok := byID[id]
 		want := pack.Location{Offset: e.Loc.Offset, Codec: pack.Codec(e.Loc.Codec), RawLength: e.Loc.Raw, StoredLength: e.Loc.Stored}
 		switch {
 		case !ok:
-			r.problem("chunk %s: the index has it in pack %s, which does not hold it", id, pr.id)
+			r.problem("%s %s: the index has it in pack %s, which does not hold it", e.Kind, id, pr.id)
 		case rec.Location != want:
-			r.problem("chunk %s: the index's %+v disagrees with pack %s record %+v", id, want, pr.id, rec.Location)
+			r.problem("%s %s: the index's %+v disagrees with pack %s record %+v", e.Kind, id, want, pr.id, rec.Location)
+		case rec.Kind != e.Kind:
+			r.problem("%s %s: pack %s's record of it is a %s's", e.Kind, id, pr.id, rec.Kind)
+		case e.Kind == encoding.KindTree:
+			stored := make([]byte, rec.StoredLength)
+			if _, err := f.ReadAt(stored, rec.DataOffset()); err != nil {
+				return nil, err
+			}
+			raw, err := pack.Decompress(s.dicts.of(net), id, rec.Codec, rec.RawLength, stored)
+			if err == nil {
+				_, err = verifyBody(encoding.KindTree, id, raw)
+			}
+			if err != nil {
+				r.problem("tree %s in pack %s: %v", id, pr.id, err)
+			}
 		}
 	}
 	// A chunk the index has here is read from the local copy, whose records Verify hashed.
@@ -390,26 +414,35 @@ func (s *Store) fsckUnheld(ctx context.Context, repo int64, ids []encoding.ID, r
 }
 
 // fsckOrphans classifies packs' records no location in the network's chunk index points at: dead
-// bytes, unless a file the repository holds uses the chunk and the network has no location of
-// it, which repair rebuilds from the record — with the repository's entry of the chunk, if that is
-// missing too. One scan of the repository's index finds the files that use them. It returns the
-// chunks the records are of.
+// bytes, unless the network has no location of the record's chunk or tree and the repository needs
+// it — a file it holds uses the chunk, or it holds the tree — which repair rebuilds from the record,
+// with the repository's entry of a chunk, if that is missing too. One scan of the repository's
+// index finds what it needs. It returns the chunks and trees the records are of.
 func (s *Store) fsckOrphans(ctx context.Context, repo int64, netScope backend.Scope, v *contentView, orphans []orphan, repair bool, r *FsckReport) (map[encoding.ID]bool, error) {
 	recorded := make(map[encoding.ID]bool, len(orphans))
 	if len(orphans) == 0 {
 		return recorded, nil
 	}
-	ids := make([]encoding.ID, len(orphans))
-	for i, o := range orphans {
-		ids[i] = o.pack.ID
+	byKind := map[encoding.Kind][]encoding.ID{}
+	for _, o := range orphans {
+		byKind[o.pack.Kind] = append(byKind[o.pack.Kind], o.pack.ID)
 		recorded[o.pack.ID] = true
 	}
-	_, located, err := s.contentEntries(ctx, netScope, encoding.KindChunk, ids)
-	if err != nil {
-		return nil, err
+	located := map[encoding.ID]bool{}
+	for kind, ids := range byKind {
+		_, locs, err := s.contentEntries(ctx, netScope, kind, ids)
+		if err != nil {
+			return nil, err
+		}
+		for id := range locs {
+			located[id] = true
+		}
 	}
 	used := map[encoding.ID]bool{}
-	err = v.each(ctx, func(_ encoding.ID, e contentindex.Entry) bool {
+	err := v.each(ctx, func(id encoding.ID, e contentindex.Entry) bool {
+		if e.Kind == encoding.KindTree && recorded[id] {
+			used[id] = true
+		}
 		for _, c := range e.Chunks {
 			if recorded[c.ID] {
 				used[c.ID] = true
@@ -422,13 +455,13 @@ func (s *Store) fsckOrphans(ctx context.Context, repo int64, netScope backend.Sc
 	}
 	rebuilt := map[encoding.ID]bool{}
 	for _, o := range orphans {
-		id, rec, pr := o.pack.ID, o.pack, o.pr
-		if _, ok := located[id]; ok || !used[id] || rebuilt[id] {
+		id, rec, pr, kind := o.pack.ID, o.pack, o.pr, o.pack.Kind
+		if located[id] || !used[id] || rebuilt[id] {
 			r.DeadBytes += int64(rec.StoredLength) + pack.RecordHeaderLen
 			continue
 		}
 		if !repair {
-			r.problem("chunk %s: used by a file but not in the index (pack %s holds it)", id, pr.id)
+			r.problem("%s %s: the repository needs it, but the network has no location of it (pack %s holds it)", kind, id, pr.id)
 			continue
 		}
 		inserted := false
@@ -442,19 +475,19 @@ func (s *Store) fsckOrphans(ctx context.Context, repo int64, netScope backend.Sc
 			if err != nil {
 				return err
 			}
-			if _, ok, err := locs.has(ctx, encoding.KindChunk, id); err != nil || ok {
+			if _, ok, err := locs.has(ctx, kind, id); err != nil || ok {
 				return err
 			}
 			inserted = true
 			s.logIndex(tx, netScope, contentindex.Update{Op: contentindex.Put, ID: id, Entry: contentindex.Entry{
-				Kind: encoding.KindChunk, Day: locs.today,
+				Kind: kind, Day: locs.today,
 				Loc: contentindex.Location{Pack: pr.num, Offset: rec.Offset, Stored: rec.StoredLength, Raw: rec.RawLength, Codec: uint8(rec.Codec)},
 			}})
-			if _, ok, err := held.has(ctx, encoding.KindChunk, id); err != nil {
+			if _, ok, err := held.has(ctx, kind, id); err != nil {
 				return err
 			} else if !ok {
 				s.logIndex(tx, repoScope(repo), contentindex.Update{Op: contentindex.Put, ID: id, Entry: contentindex.Entry{
-					Kind: encoding.KindChunk, Day: held.today,
+					Kind: kind, Day: held.today,
 				}})
 			}
 			return nil
@@ -468,8 +501,12 @@ func (s *Store) fsckOrphans(ctx context.Context, repo int64, netScope backend.Sc
 			continue
 		}
 		rebuilt[id] = true
-		r.Chunks++
-		r.Repaired = append(r.Repaired, fmt.Sprintf("rebuilt chunk %s from pack %s", id, pr.id))
+		if kind == encoding.KindTree {
+			r.PackedTrees++
+		} else {
+			r.Chunks++
+		}
+		r.Repaired = append(r.Repaired, fmt.Sprintf("rebuilt %s %s from pack %s", kind, id, pr.id))
 	}
 	return recorded, nil
 }
@@ -698,8 +735,8 @@ func (s *Store) fsckOperations(ctx context.Context, repo int64, r *FsckReport) e
 // String renders the report for the fsck command.
 func (r *FsckReport) String() string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "%d packs, %d chunks, %d files, %d objects, %d commits, %d operations, %d views\n",
-		r.Packs, r.Chunks, r.Files, r.Objects, r.Commits, r.Operations, r.Views)
+	fmt.Fprintf(&b, "%d packs, %d chunks, %d packed trees, %d files, %d objects, %d commits, %d operations, %d views\n",
+		r.Packs, r.Chunks, r.PackedTrees, r.Files, r.Objects, r.Commits, r.Operations, r.Views)
 	fmt.Fprintf(&b, "%d dead pack bytes, %d orphan packs\n", r.DeadBytes, len(r.OrphanPacks))
 	fmt.Fprintf(&b, "%d content index entries\n", r.IndexEntries)
 	for _, o := range r.OrphanPacks {

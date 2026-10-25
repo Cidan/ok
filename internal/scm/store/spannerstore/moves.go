@@ -19,7 +19,7 @@ import (
 // staged content log's batches, whose rows an export reads only once committed.
 var moveTables = []string{
 	"network", "repository", "head_log", "object", "tree_sizes", "commit", "commit_parent", "copy_parent", "commit_path", "path_index",
-	"pack", "content_index", "index_block", "content_log", "dictionary", "dictionary_grant", "op_log", "operation", "view", "op_head",
+	"pack", "content_index", "content_log", "dictionary", "dictionary_grant", "op_log", "operation", "view", "op_head",
 	"op_tombstone", "changelist", "patchset", "candidate", "changelist_counter", "event", "event_pending", "repository_event_counter",
 	"gc_pass", "workspace", "checkpoint", "segment", "chunk_release",
 }
@@ -33,10 +33,13 @@ var moveRenames = spannerdata.Renames{
 }
 
 // moveSkip are the columns Spanner alone has, which a move does not carry: a staged log row's
-// batch (an export reads only committed ones), a pending event's relay lease, and a content index's
-// log's commit times and fold's place: the SCM exports the log itself, in the order it applies
-// (Store.exportContentLog), and the generation it carries folded none of it.
-var moveSkip = map[string]bool{"batch_id": true, "holder": true, "lease_until": true, "logged_at": true, "folded_through": true}
+// batch (an export reads only committed ones), a pending event's relay lease, a content index's
+// log's commit times and fold's place — the SCM exports the log itself, in the order it applies
+// (Store.exportContentLog), and the generation it carries folded none of it — and the tie of the
+// transaction that wrote an event, which only its writer asks of it, at once, and a log row's shard,
+// which only orders its writers.
+var moveSkip = map[string]bool{"batch_id": true, "holder": true, "lease_until": true, "logged_at": true, "folded_through": true,
+	"txn": true, "shard": true}
 
 // moveWhere is the condition a table's rows about a network (@net) and its repositories (@repos)
 // meet, by Spanner's names.
@@ -50,7 +53,7 @@ func moveWhere(table string) string {
 		return "op_log_id IN (SELECT op_log_id FROM op_log WHERE repository_id IN UNNEST(@repos))"
 	case "pack", "chunk_release", "dictionary", "segment":
 		return "network_id = @net"
-	case "content_index", "index_block":
+	case "content_index":
 		return "((scope = 1 AND owner_id = @net) OR (scope = 0 AND owner_id IN UNNEST(@repos)))"
 	case "content_log":
 		return `((scope = 1 AND owner_id = @net) OR (scope = 0 AND owner_id IN UNNEST(@repos)))
@@ -175,7 +178,8 @@ func (b *Backend) FinishImport(ctx context.Context, m backend.Moving) error {
 	return nil
 }
 
-// DropNetworkRows deletes a network's rows, children first, then its counters and staged batches.
+// DropNetworkRows deletes a network's rows, children first, then its counters, staged batches, and
+// pending sequences (none, once its freeze sequenced it, but for a writer's that failed).
 func (b *Backend) DropNetworkRows(ctx context.Context, m backend.Moving, limit int) (int64, error) {
 	tables, order, err := b.catalog(ctx)
 	if err != nil {
@@ -201,6 +205,7 @@ func (b *Backend) DropNetworkRows(ctx context.Context, m backend.Moving, limit i
 	_, err = spannertxn.ReadWrite(ctx, b.c, func(ctx context.Context, tx *spanner.ReadWriteTransaction) error {
 		for _, t := range []tableRows{
 			{"content_log_batch", `(scope = 1 AND owner_id = @net) OR (scope = 0 AND owner_id IN UNNEST(@repos))`},
+			{"sequence_pending", `repository_id IN UNNEST(@repos)`},
 			{"counter", `(name = @repoLogs AND scope_id IN UNNEST(@repos))
 				OR ((name = @netLogs OR name = @packs OR name = @ages OR name = @dictionaries) AND scope_id = @net)`},
 		} {

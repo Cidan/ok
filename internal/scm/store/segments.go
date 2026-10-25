@@ -49,10 +49,9 @@ const (
 	// segEvents holds a repository's events the relay has published, by place in its log
 	// (big-endian): each one's body.
 	segEvents segment.Kind = 7
-	// segIndex holds the content index's pinned entries, by file or chunk ID: each entry
-	// (contentindex.EncodeEntry) as it was when its segment was written. A newer segment's record
-	// supersedes an older's, and the tail's moves (contentindex.Index.Moved) both: repacking moves
-	// a pinned chunk (cindexsegments.go).
+	// segIndex holds a repository's content index's pinned entries, and a network's chunk index's
+	// every entry and tombstone, by file or chunk ID: each (contentindex.EncodeEntry) as the fold
+	// that wrote it found it. A newer segment's record supersedes an older's (cindexsegments.go).
 	segIndex segment.Kind = 8
 	// segOps holds operation logs' settled operations and views: an operation log's ID (big-endian),
 	// the kind, and the ID; each a live record or a tombstone collection wrote (opsegments.go).
@@ -64,9 +63,15 @@ const (
 	// segMainLog holds main's moves by place, and the place of each commit main moved to
 	// (clsegments.go).
 	segMainLog segment.Kind = 11
+	// segIndexUnpinned holds a repository's content index's unpinned entries and their tombstones,
+	// as segIndex does its pinned ones: its unpinned index, whose runs each carry the day their fold
+	// committed, merge within a day, and retire once garbage collection swept past their day
+	// (cindexsegments.go). A fork does not take them.
+	segIndexUnpinned segment.Kind = 12
 )
 
-// segmentKinds are every kind of segment, in the order compaction writes them.
+// segmentKinds are every kind of segment compaction writes and merges by level, in the order it
+// writes them: the unpinned index, which folds write and merge by day, aside.
 var segmentKinds = []segment.Kind{segObjects, segTreeSizes, segCopyEdges, segCommitGraph, segCommitBodies, segPaths, segEvents, segIndex, segOps,
 	segChangeLists, segMainLog}
 
@@ -203,8 +208,22 @@ func (s *Store) allSegmentsChanged() {
 // through it, unlocked (backend.Ops.SegmentsUnlocked) — what the segments hold is all a reader
 // reads; otherwise the replica's, read again if stale or fresh is set.
 func (s *Store) manifest(ctx context.Context, sc backend.Scope, kind segment.Kind, fresh bool) ([]backend.Segment, error) {
-	if inTxContext(ctx) {
-		return s.ops(ctx).SegmentsUnlocked(ctx, sc, kind)
+	if tx, ok := ctx.Value(txKey{}).(*txn); ok && !tx.done.Load() {
+		// Read unlocked, once a transaction — but again, fresh, for a key the first missed — so all
+		// its lookups see one manifest, from when it first needed it.
+		k := manifestKey{sc, kind}
+		if segs, ok := tx.manifests[k]; ok && !fresh {
+			return segs, nil
+		}
+		segs, err := s.ops(ctx).SegmentsUnlocked(ctx, sc, kind)
+		if err != nil {
+			return nil, err
+		}
+		if tx.manifests == nil {
+			tx.manifests = map[manifestKey][]backend.Segment{}
+		}
+		tx.manifests[k] = segs
+		return segs, nil
 	}
 	s.startListening()
 	m := s.liveManifest(sc, kind)
@@ -521,9 +540,10 @@ func (s *Store) writeSegment(ctx context.Context, sc backend.Scope, kind segment
 // SegmentReport is what one compaction of a repository's tail did.
 type SegmentReport struct {
 	// Moved counts the tail's records moved into segments, by kind: objects, trees' sizes records,
-	// copies' edges, commits, rows of main's path history, events, the content index's pinned
-	// entries and moves, operation logs' operations, views, and tombstones, and landed CLs (each
-	// with its patchsets and its move of main).
+	// copies' edges, commits, rows of main's path history, events, the records a fold of the
+	// content index wrote to its pinned runs and of its network's chunk index to its, operation
+	// logs' operations, views, and tombstones, and landed CLs (each with its patchsets and its move
+	// of main).
 	Objects, TreeSizes, CopyEdges, Commits, Paths, Events, Index, Ops, ChangeLists int
 	// Written and Merged count the segments written from the tail, and merged into others.
 	Written, Merged int
@@ -532,9 +552,12 @@ type SegmentReport struct {
 }
 
 // CompactSegments moves the tail's pinned rows of a repository into segments, if at least min of
-// them wait — up to a batch of each kind — and folds its content index, if at least min of its
-// entries and moves would move (RebuildContentIndex); then it merges the repository's segments
-// where a level holds mergeAt of a kind. The rows it moves are deleted from the tail in the
+// them wait — up to a batch of each kind — and folds its content index and its network's chunk
+// index, each if its log changed foldLogEntries entries, as a fold come due would — or, compacting
+// fully (min 1, for a fork, which takes what is pinned from the runs), any (foldIndex); then it
+// merges the repository's segments where a level holds mergeAt of a kind. A fold is a generation
+// every replica loads again: compaction, which every pin asks for, folding at its own minimum
+// folded every ten seconds at a monorepo's peak. The rows it moves are deleted from the tail in the
 // transaction that records their segments, each only if still pinned, which nothing undoes; a
 // reader that misses a row it moved finds it in the segment, its manifest read anew.
 func (s *Store) CompactSegments(ctx context.Context, repo int64, min int) (*SegmentReport, error) {
@@ -556,7 +579,7 @@ func (s *Store) CompactSegments(ctx context.Context, repo int64, min int) (*Segm
 		if err := s.refreshIndex(ctx, sc, li); err != nil {
 			return nil, err
 		}
-		if n := foldable(li.x.Load()); n > 0 && n >= min {
+		if n := foldable(li.view.Load()); n > 0 && (n >= foldLogEntries || min <= 1) {
 			_, _, folded, err := s.foldIndex(ctx, sc)
 			if err != nil {
 				return nil, fmt.Errorf("folding %s's content index: %w", sc.Name(), err)
@@ -575,6 +598,12 @@ func (s *Store) CompactSegments(ctx context.Context, repo int64, min int) (*Segm
 
 // networkKinds are the kinds of segment a network holds: its chunk index's folds.
 var networkKinds = []segment.Kind{segIndex}
+
+// eventsSettle is how long an event stays in the tail after it is written, published or not: a
+// writer reads its events' places back by its transaction (sequence.go), which only the tail
+// records, once its pass has run — another replica's pass may have placed them, and the relay
+// published them, before it reads.
+var eventsSettle = 10 * time.Minute
 
 // compactTail moves the tail's pinned rows into segments, if at least min of them wait.
 func (s *Store) compactTail(ctx context.Context, repo int64, min int, r *SegmentReport) error {
@@ -598,7 +627,7 @@ func (s *Store) compactTail(ctx context.Context, repo int64, min int, r *Segment
 	if err != nil {
 		return err
 	}
-	events, err := s.ops(ctx).SettledEvents(ctx, repo, s.segs.batch)
+	events, err := s.ops(ctx).SettledEvents(ctx, repo, time.Now().Add(-eventsSettle), s.segs.batch)
 	if err != nil {
 		return err
 	}

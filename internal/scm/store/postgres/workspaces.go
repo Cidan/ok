@@ -140,6 +140,10 @@ func (x queries) ReleaseWork(ctx context.Context, kind string, key int64, holder
 	return pgdata.ReleaseWork(ctx, x.q, kind, key, holder)
 }
 
+func (x queries) LetWork(ctx context.Context, kind string, key int64, holder string) error {
+	return pgdata.LetWork(ctx, x.q, kind, key, holder)
+}
+
 func (x queries) DueWork(ctx context.Context, kind string, limit int) ([]int64, error) {
 	return pgdata.DueWork(ctx, x.q, kind, limit)
 }

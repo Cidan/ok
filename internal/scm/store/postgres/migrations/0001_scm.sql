@@ -187,8 +187,11 @@ CREATE TABLE op_head (                                -- the root op (32 zero by
 -- ChangeLists (docs/scm.md, "ChangeLists in the SCM"): each CL, its patchsets, the
 -- candidates prepared for post-submit automation, and the change feed.
 
+-- A CL is keyed by its ID, 63 random bits; its number is the name everything outside the SCM knows
+-- it by, taken from changelist_counter in the transaction that makes it.
 CREATE TABLE changelist (
     repository_id    bigint      NOT NULL REFERENCES repository ON DELETE CASCADE,
+    id               bigint      NOT NULL,
     number           bigint      NOT NULL,
     change_id        bytea       NOT NULL,
     author           text        NOT NULL,
@@ -207,25 +210,28 @@ CREATE TABLE changelist (
     rolls_back       bigint[]    NOT NULL DEFAULT '{}',
     rollback_paths   text[]      NOT NULL DEFAULT '{}',
     rollback_left    text[]      NOT NULL DEFAULT '{}',
-    PRIMARY KEY (repository_id, number),
+    PRIMARY KEY (repository_id, id),
+    UNIQUE (repository_id, number),
     UNIQUE (repository_id, change_id)
 );
 CREATE INDEX changelist_status ON changelist (repository_id, status, number);
 CREATE INDEX changelist_author ON changelist (repository_id, author, number);
+CREATE INDEX changelist_parent ON changelist (repository_id, parent_number) WHERE parent_number IS NOT NULL;
 
 CREATE TABLE patchset (
     repository_id  bigint      NOT NULL,
-    cl_number      bigint      NOT NULL,
+    cl_id          bigint      NOT NULL,
     number         int         NOT NULL,
     commit_id      bytea       NOT NULL,
     base_commit_id bytea       NOT NULL,
     parent_number  bigint,                            -- the CL it was stacked on when uploaded
     uploaded_by    text        NOT NULL,
     uploaded_at    timestamptz NOT NULL DEFAULT now(),
-    PRIMARY KEY (repository_id, cl_number, number),
-    FOREIGN KEY (repository_id, cl_number) REFERENCES changelist ON DELETE CASCADE
+    PRIMARY KEY (repository_id, cl_id, number),
+    FOREIGN KEY (repository_id, cl_id) REFERENCES changelist ON DELETE CASCADE
 );
 CREATE INDEX patchset_commit ON patchset (repository_id, commit_id);
+CREATE INDEX patchset_parent ON patchset (repository_id, parent_number) WHERE parent_number IS NOT NULL;
 
 CREATE TABLE candidate (
     repository_id bigint      NOT NULL REFERENCES repository ON DELETE CASCADE,

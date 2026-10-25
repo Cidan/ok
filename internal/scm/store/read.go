@@ -37,10 +37,11 @@ func objectKey(repo int64, r ObjectRef) string {
 	return string(append(b, r.ID[:]...))
 }
 
-// chunkKey is a chunk's key in the chunk cache: its network's, as its bytes are.
-func chunkKey(net backend.Network, id encoding.ID) string {
+// chunkKey is a pack record's key in the chunk cache — a chunk's, or a tree's (kind) — its
+// network's, as its bytes are.
+func chunkKey(net backend.Network, kind encoding.Kind, id encoding.ID) string {
 	b := binary.LittleEndian.AppendUint64(nil, uint64(net))
-	b = append(b, byte(encoding.KindChunk))
+	b = append(b, byte(kind))
 	return string(append(b, id[:]...))
 }
 
@@ -95,6 +96,22 @@ func (s *Store) ReadObjects(ctx context.Context, repo int64, refs []ObjectRef) (
 				return nil, err
 			}
 			for id, body := range moved {
+				bodies[id] = body
+			}
+		}
+		if kind == encoding.KindTree && len(bodies) < len(members) {
+			// A tree a publish stored is in its pack, which the content index locates.
+			var rest []encoding.ID
+			for _, id := range members {
+				if _, ok := bodies[id]; !ok {
+					rest = append(rest, id)
+				}
+			}
+			packed, err := s.heldTreeBodies(ctx, repo, rest)
+			if err != nil {
+				return nil, err
+			}
+			for id, body := range packed {
 				bodies[id] = body
 			}
 		}
@@ -175,17 +192,19 @@ func (s *Store) readCommit(ctx context.Context, repo int64, id encoding.ID) (*en
 	return o.(*encoding.Commit), nil
 }
 
+// chunkLoc is a pack record's location: a chunk's, or a tree's (kind).
 type chunkLoc struct {
 	id   encoding.ID
+	kind encoding.Kind
 	pack encoding.ID
 	loc  pack.Location
 }
 
-// chunkLocations locates a repository's chunks through its network's chunk index, refreshed when
-// stale (contentEntries): a chunk compaction moved is read where it is now — in its new pack, with
-// its dictionary — not from the pack it left; one it lacks is absent. Every caller names chunks of
-// files the repository holds, so none is another's.
-func (s *Store) chunkLocations(ctx context.Context, repo int64, members []encoding.ID) (map[encoding.ID]chunkLoc, error) {
+// recordLocations locates a repository's chunks or trees (kind) through its network's chunk index,
+// refreshed when stale (contentEntries): a record compaction moved is read where it is now — in its
+// new pack, with its dictionary — not from the pack it left; one it lacks is absent. Every caller
+// names chunks of files the repository holds, or trees it holds, so none is another's.
+func (s *Store) recordLocations(ctx context.Context, repo int64, kind encoding.Kind, members []encoding.ID) (map[encoding.ID]chunkLoc, error) {
 	out := map[encoding.ID]chunkLoc{}
 	if len(members) == 0 {
 		return out, nil
@@ -194,7 +213,7 @@ func (s *Store) chunkLocations(ctx context.Context, repo int64, members []encodi
 	if err != nil {
 		return nil, err
 	}
-	li, entries, err := s.contentEntries(ctx, sc, encoding.KindChunk, members)
+	li, entries, err := s.contentEntries(ctx, sc, kind, members)
 	if err != nil {
 		return nil, err
 	}
@@ -208,7 +227,7 @@ func (s *Store) chunkLocations(ctx context.Context, repo int64, members []encodi
 	}
 	for id, e := range entries {
 		pid := packs[e.Loc.Pack]
-		out[id] = chunkLoc{id: id, pack: pid, loc: pack.Location{
+		out[id] = chunkLoc{id: id, kind: kind, pack: pid, loc: pack.Location{
 			Offset: e.Loc.Offset, Codec: pack.Codec(e.Loc.Codec), RawLength: e.Loc.Raw, StoredLength: e.Loc.Stored}}
 	}
 	return out, nil
@@ -242,10 +261,29 @@ func (s *Store) chunkBytes(ctx context.Context, repo int64, members []encoding.I
 	return out, nil
 }
 
-// storedChunks returns chunks as their packs store them, from the chunk cache before S3. The
-// cache holds chunks compressed, as stored, each verified against its ID when it was fetched.
-// A read whose pack was retired by repacking re-reads the chunk locations once.
+// storedChunks returns chunks as their packs store them (storedRecords).
 func (s *Store) storedChunks(ctx context.Context, repo int64, members []encoding.ID) (map[encoding.ID]storedChunk, error) {
+	return s.storedRecords(ctx, repo, encoding.KindChunk, members)
+}
+
+// heldTreeBodies reads, of the trees among members, those the repository's content index holds — a
+// publish stored them in its pack — as their canonical bodies. One it does not hold is absent.
+func (s *Store) heldTreeBodies(ctx context.Context, repo int64, members []encoding.ID) (map[encoding.ID][]byte, error) {
+	_, held, err := s.contentEntries(ctx, repoScope(repo), encoding.KindTree, members)
+	if err != nil || len(held) == 0 {
+		return nil, err
+	}
+	ids := make([]encoding.ID, 0, len(held))
+	for id := range held {
+		ids = append(ids, id)
+	}
+	return s.treeBodies(ctx, repo, ids)
+}
+
+// storedRecords returns chunks or trees (kind) as their packs store them, from the chunk cache
+// before S3. The cache holds records compressed, as stored, each verified against its ID when it
+// was fetched. A read whose pack was retired by repacking re-reads the locations once.
+func (s *Store) storedRecords(ctx context.Context, repo int64, kind encoding.Kind, members []encoding.ID) (map[encoding.ID]storedChunk, error) {
 	net, sc, err := s.networkOf(ctx, repo)
 	if err != nil {
 		return nil, err
@@ -256,7 +294,7 @@ func (s *Store) storedChunks(ctx context.Context, repo int64, members []encoding
 		if _, done := out[id]; done {
 			continue
 		}
-		if c, ok := s.chunks.get(chunkKey(net, id)); ok {
+		if c, ok := s.chunks.get(chunkKey(net, kind, id)); ok {
 			out[id] = c
 			continue
 		}
@@ -270,13 +308,13 @@ func (s *Store) storedChunks(ctx context.Context, repo int64, members []encoding
 				return nil, err
 			}
 		}
-		locs, err := s.chunkLocations(ctx, repo, misses)
+		locs, err := s.recordLocations(ctx, repo, kind, misses)
 		if err != nil {
 			return nil, err
 		}
 		for _, id := range misses {
 			if _, ok := locs[id]; !ok {
-				return nil, notFound("chunk %s", id)
+				return nil, notFound("%s %s", kind, id)
 			}
 		}
 		if s.afterLocate != nil {
@@ -287,7 +325,7 @@ func (s *Store) storedChunks(ctx context.Context, repo int64, members []encoding
 			return nil, err
 		}
 		if len(retry) > 0 && attempt > 0 {
-			return nil, fmt.Errorf("chunks %v: packs missing from storage", retry)
+			return nil, fmt.Errorf("%ss %v: packs missing from storage", kind, retry)
 		}
 		misses = retry
 	}
@@ -415,13 +453,13 @@ func (s *Store) fetchSpan(ctx context.Context, net backend.Network, sp span) (ma
 	for _, l := range sp.locs {
 		at := l.loc.DataOffset() - first.DataOffset()
 		data := b[at : at+int64(l.loc.StoredLength)]
-		if _, err := pack.Decode(s.dicts.of(net), l.id, l.loc.Codec, l.loc.RawLength, data); err != nil {
+		if _, err := pack.DecodeObject(s.dicts.of(net), l.kind, l.id, l.loc.Codec, l.loc.RawLength, data); err != nil {
 			return nil, nil, err
 		}
 		// A copy: the span's other bytes, and the gaps between its chunks, are not kept.
 		c := storedChunk{codec: l.loc.Codec, raw: l.loc.RawLength, data: bytes.Clone(data)}
 		got[l.id] = c
-		s.chunks.put(chunkKey(net, l.id), c, len(c.data))
+		s.chunks.put(chunkKey(net, l.kind, l.id), c, len(c.data))
 	}
 	return got, nil, nil
 }

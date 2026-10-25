@@ -87,6 +87,15 @@ func ReleaseWork(ctx context.Context, q Querier, kind string, key int64, holder 
 	return again, err
 }
 
+// LetWork ends holder's lease on key's work and leaves its mark as it is: work a claim
+// (work.Claim) held while it was marked is done by whoever takes it next. Nothing happens if the
+// lease is another's.
+func LetWork(ctx context.Context, q Querier, kind string, key int64, holder string) error {
+	_, err := q.Exec(ctx, `UPDATE work SET holder = NULL, lease_until = NULL WHERE kind = $1 AND key = $2 AND holder = $3`,
+		kind, key, holder)
+	return err
+}
+
 // DueWork are up to limit keys of kind's work that is marked, due, and held by no one, or whose
 // holder's lease lapsed, by key.
 func DueWork(ctx context.Context, q interface {
@@ -137,6 +146,10 @@ func (w workStore) Renew(ctx context.Context, kind string, key int64, holder str
 
 func (w workStore) Release(ctx context.Context, kind string, key int64, holder string) (bool, error) {
 	return ReleaseWork(ctx, w.pool, kind, key, holder)
+}
+
+func (w workStore) Let(ctx context.Context, kind string, key int64, holder string) error {
+	return LetWork(ctx, w.pool, kind, key, holder)
 }
 
 func (w workStore) Due(ctx context.Context, kind string, limit int) ([]int64, error) {

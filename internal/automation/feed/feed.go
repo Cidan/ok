@@ -31,6 +31,7 @@ import (
 	"github.com/Cidan/ok/internal/bus"
 	"github.com/Cidan/ok/internal/bus/follow"
 	"github.com/Cidan/ok/internal/scm/scmfeed"
+	"github.com/Cidan/ok/internal/serve/metrics"
 	"github.com/Cidan/ok/internal/work"
 	"github.com/Cidan/ok/internal/workflow"
 	scmpb "github.com/Cidan/ok/proto/ok/scm/v1"
@@ -112,8 +113,16 @@ func (a applier) Apply(ctx context.Context, e bus.Event) error {
 	if err := a.Follower.Apply(held, ev); err != nil {
 		return fmt.Errorf("event %d of repository %d: %w", e.Seq, e.Key, err)
 	}
-	return a.store.SetCursor(held, e.Key, e.Seq)
+	if err := a.store.SetCursor(held, e.Key, e.Seq); err != nil {
+		return err
+	}
+	feedLag.With(scmfeed.Kind(ev)).Observe(time.Since(ev.GetAt().AsTime()).Seconds())
+	return nil
 }
+
+var feedLag = metrics.NewHistogram("ok_automation_feed_lag_seconds",
+	"How long after the SCM wrote an event ok automation applied it, by the event's kind: an upload's pre is planned once its event is.",
+	metrics.Seconds, "kind")
 
 // Apply acts on one event. An error is one worth retrying: the event is applied again later.
 func (f *Follower) Apply(ctx context.Context, ev *scmpb.Event) error {

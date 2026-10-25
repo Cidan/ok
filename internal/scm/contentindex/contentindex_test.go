@@ -26,7 +26,7 @@ func fileEntry(day Day, chunks ...FileChunk) Entry {
 	return Entry{Kind: encoding.KindFile, Body: true, Day: day, Size: size, Chunks: chunks}
 }
 
-// Logs and blocks round-trip.
+// Logs round-trip.
 func TestEncodings(t *testing.T) {
 	updates := []Update{
 		{Op: Put, ID: id(1), Entry: chunkEntry(7, 1<<33, 20000)},
@@ -44,20 +44,6 @@ func TestEncodings(t *testing.T) {
 	for i := range got {
 		if got[i].Op != updates[i].Op || got[i].ID != updates[i].ID || !got[i].entry().Equal(updates[i].entry()) {
 			t.Errorf("update %d: %+v, want %+v", i, got[i], updates[i])
-		}
-	}
-	block := []Keyed{
-		{ID: id(1), Entry: chunkEntry(7, 99, 20000)},
-		{ID: id(2), Entry: fileEntry(20001, FileChunk{id(1), 2100})},
-		{ID: id(9), Entry: Entry{Kind: encoding.KindChunk, Pinned: true, Day: 3}},
-	}
-	back, err := DecodeBlock(EncodeBlock(block))
-	if err != nil {
-		t.Fatal(err)
-	}
-	for i := range block {
-		if back[i].ID != block[i].ID || !back[i].Entry.Equal(block[i].Entry) {
-			t.Errorf("entry %d: %+v, want %+v", i, back[i], block[i])
 		}
 	}
 }
@@ -104,7 +90,7 @@ func TestEncodeLogs(t *testing.T) {
 }
 
 // Anything malformed is refused, never half read: truncations, trailing bytes, unknown kinds
-// and ops, a file whose chunks do not add up, a block out of order.
+// and ops, a file whose chunks do not add up.
 func TestMalformed(t *testing.T) {
 	log := EncodeLog([]Update{{Op: Put, ID: id(2), Entry: fileEntry(1, FileChunk{id(1), 10})}})
 	for n := range log {
@@ -119,97 +105,171 @@ func TestMalformed(t *testing.T) {
 	if _, err := DecodeLog(bad); err == nil {
 		t.Fatal("a file whose chunks do not add up to its size decoded")
 	}
-	kind := EncodeLog([]Update{{Op: Pin, ID: id(1), Entry: Entry{Kind: encoding.KindTree}}})
+	kind := EncodeLog([]Update{{Op: Pin, ID: id(1), Entry: Entry{Kind: encoding.KindSymlink}}})
 	if _, err := DecodeLog(kind); err == nil {
-		t.Fatal("a tree's update decoded")
+		t.Fatal("a symlink's update decoded")
+	}
+	tree := Entry{Kind: encoding.KindTree, Body: true, Day: 4, Loc: Location{Pack: 3, Offset: 9, Stored: 40, Raw: 70}}
+	if got, err := DecodeEntry(EncodeEntry(tree)); err != nil || !got.Equal(tree) {
+		t.Fatalf("a tree's entry, located: %+v, %v", got, err)
 	}
 	op := EncodeLog([]Update{{Op: Pin, ID: id(1), Entry: Entry{Kind: encoding.KindChunk}}})
 	op[2] = 9
 	if _, err := DecodeLog(op); err == nil {
 		t.Fatal("an unknown op decoded")
 	}
-	block := EncodeBlock([]Keyed{{ID: id(2), Entry: chunkEntry(1, 0, 1)}, {ID: id(1), Entry: chunkEntry(1, 0, 1)}})
-	if _, err := DecodeBlock(block); err == nil {
-		t.Fatal("a block out of order decoded")
-	}
 }
 
-// A move replaces a chunk's location and keeps the rest; a drop removes an entry, and a put
-// after it stores it anew; both round-trip.
-func TestMoveAndDrop(t *testing.T) {
-	x := New(1)
-	steps := [][]Update{
-		{{Op: Put, ID: id(1), Entry: chunkEntry(3, 10, 100)}, {Op: Pin, ID: id(1), Entry: Entry{Kind: encoding.KindChunk}}},
-		{{Op: Move, ID: id(1), Entry: Entry{Kind: encoding.KindChunk, Loc: Location{Pack: 9, Offset: 77, Stored: 50, Raw: 2100, Codec: 2}}}},
-		{{Op: Put, ID: id(2), Entry: chunkEntry(3, 20, 100)}, {Op: Drop, ID: id(2), Entry: Entry{Kind: encoding.KindChunk}}},
-		{{Op: Put, ID: id(2), Entry: chunkEntry(5, 30, 101)}},
-	}
-	for _, us := range steps {
-		got, err := DecodeLog(EncodeLog(us))
-		if err != nil {
-			t.Fatal(err)
+// A move replaces a chunk's location and keeps the rest, and is nothing to a chunk the index lacks;
+// a drop removes an entry, whatever its record held, and a put after it stores it anew; a tombstone
+// is no record.
+func TestResolve(t *testing.T) {
+	moved := Location{Pack: 9, Offset: 77, Stored: 50, Raw: 2100, Codec: 2}
+	pinned := chunkEntry(3, 10, 100)
+	pinned.Pinned = true
+	ck := Entry{Kind: encoding.KindChunk}
+	for _, tc := range []struct {
+		name  string
+		base  *Entry
+		ups   []Update
+		want  Entry
+		holds bool
+	}{
+		{"a record alone", &pinned, nil, pinned, true},
+		{"a move of a held chunk", &pinned, []Update{{Op: Move, ID: id(1), Entry: Entry{Kind: encoding.KindChunk, Loc: moved}}},
+			Entry{Kind: encoding.KindChunk, Body: true, Pinned: true, Day: 100, Loc: moved}, true},
+		{"a move of a chunk the index lacks", nil, []Update{{Op: Move, ID: id(1), Entry: Entry{Kind: encoding.KindChunk, Loc: moved}}},
+			Entry{}, false},
+		{"a drop of a pinned record", &pinned, []Update{{Op: Drop, ID: id(1), Entry: ck}}, Entry{}, false},
+		{"a put after a drop starts anew", &pinned, []Update{{Op: Drop, ID: id(1), Entry: ck}, {Op: Put, ID: id(1), Entry: chunkEntry(5, 30, 101)}},
+			chunkEntry(5, 30, 101), true},
+		{"a move after a drop", &pinned, []Update{{Op: Drop, ID: id(1), Entry: ck}, {Op: Move, ID: id(1), Entry: Entry{Kind: encoding.KindChunk, Loc: moved}}},
+			Entry{}, false},
+		{"a touch keeps the later day", &pinned, []Update{{Op: Touch, ID: id(1), Entry: Entry{Kind: encoding.KindChunk, Day: 99}},
+			{Op: Touch, ID: id(1), Entry: Entry{Kind: encoding.KindChunk, Day: 120}}},
+			Entry{Kind: encoding.KindChunk, Body: true, Pinned: true, Day: 120, Loc: pinned.Loc}, true},
+		{"a put of a held entry keeps its body", &pinned, []Update{{Op: Put, ID: id(1), Entry: chunkEntry(8, 0, 130)}},
+			Entry{Kind: encoding.KindChunk, Body: true, Pinned: true, Day: 130, Loc: pinned.Loc}, true},
+		{"a tombstone is no record", &Entry{Kind: encoding.KindChunk}, []Update{{Op: Touch, ID: id(1), Entry: Entry{Kind: encoding.KindChunk, Day: 5}}},
+			Entry{}, false},
+		{"a pin before its body", nil, []Update{{Op: Pin, ID: id(1), Entry: ck}, {Op: Put, ID: id(1), Entry: chunkEntry(4, 0, 150)}},
+			Entry{Kind: encoding.KindChunk, Body: true, Pinned: true, Day: 150, Loc: chunkEntry(4, 0, 150).Loc}, true},
+	} {
+		var base Entry
+		if tc.base != nil {
+			base = *tc.base
 		}
-		if err := x.ApplyLog(EncodeLog(got)); err != nil {
-			t.Fatal(err)
+		got, holds := Resolve(base, tc.base != nil, tc.ups)
+		if holds != tc.holds || (holds && !got.Equal(tc.want)) {
+			t.Errorf("%s: %+v %v, want %+v %v", tc.name, got, holds, tc.want, tc.holds)
 		}
-	}
-	if e, ok := x.Get(id(1)); !ok || !e.Pinned || e.Day != 100 || e.Loc != (Location{Pack: 9, Offset: 77, Stored: 50, Raw: 2100, Codec: 2}) {
-		t.Fatalf("moved chunk: %+v %v", e, ok)
-	}
-	if e, ok := x.Get(id(2)); !ok || e.Loc.Pack != 5 || e.Day != 101 {
-		t.Fatalf("a chunk dropped and stored anew: %+v %v", e, ok)
-	}
-	// A move of a chunk the index lacks — its entry in a segment — creates no entry, and is kept as
-	// its location alone, the last logged; a drop clears it.
-	for _, pack := range []uint64{9, 11} {
-		if err := x.ApplyLog(EncodeLog([]Update{{Op: Move, ID: id(7), Entry: Entry{Kind: encoding.KindChunk, Loc: Location{Pack: pack}}}})); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if _, ok := x.Lookup(id(7)); ok {
-		t.Fatal("a move created a chunk")
-	}
-	if l, ok := x.Moved(id(7)); !ok || l.Pack != 11 {
-		t.Fatalf("the moved location of a chunk the index lacks: %+v, %v", l, ok)
-	}
-	if ids := x.MovedIDs(); len(ids) != 1 || ids[0] != id(7) {
-		t.Fatalf("moved IDs: %v", ids)
-	}
-	if _, ok := x.Moved(id(1)); ok {
-		t.Fatal("a move of a chunk the index holds was kept apart from its entry")
-	}
-	if err := x.ApplyLog(EncodeLog([]Update{{Op: Drop, ID: id(7), Entry: Entry{Kind: encoding.KindChunk}}})); err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := x.Moved(id(7)); ok {
-		t.Fatal("a dropped chunk's move outlived the drop")
-	}
-	// A drop is remembered — hiding what a segment holds of it — until its entry is put again; a
-	// touch or a pin after it puts no body, and is no reason to forget it.
-	if !x.Dropped(id(7)) || x.Dropped(id(2)) {
-		t.Fatalf("dropped: chunk 7 %v, chunk 2 (stored anew) %v", x.Dropped(id(7)), x.Dropped(id(2)))
-	}
-	if err := x.ApplyLog(EncodeLog([]Update{{Op: Touch, ID: id(7), Entry: Entry{Kind: encoding.KindChunk, Day: 120}}})); err != nil {
-		t.Fatal(err)
-	}
-	if ds := x.DroppedIDs(); len(ds) != 1 || ds[0].ID != id(7) || ds[0].Entry.Kind != encoding.KindChunk {
-		t.Fatalf("dropped IDs after a touch: %v", ds)
-	}
-	if err := x.ApplyLog(EncodeLog([]Update{{Op: Move, ID: id(7), Entry: Entry{Kind: encoding.KindChunk, Loc: Location{Pack: 12}}}})); err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := x.Moved(id(7)); ok {
-		t.Fatal("a move of a dropped chunk was kept")
-	}
-	if err := x.ApplyLog(EncodeLog([]Update{{Op: Put, ID: id(7), Entry: chunkEntry(6, 0, 121)}})); err != nil {
-		t.Fatal(err)
-	}
-	if x.Dropped(id(7)) {
-		t.Fatal("a chunk stored anew is still dropped")
 	}
 	bad := EncodeLog([]Update{{Op: Move, ID: id(1), Entry: Entry{Kind: encoding.KindFile}}})
 	if _, err := DecodeLog(bad); err == nil {
 		t.Fatal("a file's move decoded")
+	}
+	treeMove := []Update{{Op: Move, ID: id(1), Entry: Entry{Kind: encoding.KindTree, Loc: Location{Pack: 7, Offset: 3}}}}
+	if got, err := DecodeLog(EncodeLog(treeMove)); err != nil || got[0].Entry.Kind != encoding.KindTree || got[0].Entry.Loc.Pack != 7 {
+		t.Fatalf("a tree's move: %+v, %v", got, err)
+	}
+}
+
+// A log keeps each entry's updates in the order its rows applied, and an entry's updates read before
+// more rows apply stay as they were read.
+func TestLog(t *testing.T) {
+	l := NewLog(4)
+	rows := [][]Update{
+		{{Op: Put, ID: id(2), Entry: chunkEntry(1, 0, 10)}, {Op: Touch, ID: id(1), Entry: Entry{Kind: encoding.KindFile, Day: 11}}},
+		{{Op: Pin, ID: id(2), Entry: Entry{Kind: encoding.KindChunk}}},
+	}
+	if err := l.Apply(EncodeLog(rows[0])); err != nil {
+		t.Fatal(err)
+	}
+	before := l.Updates(id(2))
+	if err := l.Apply(EncodeLog(rows[1])); err != nil {
+		t.Fatal(err)
+	}
+	if len(before) != 1 || before[0].Op != Put {
+		t.Fatalf("updates read before the second row: %+v", before)
+	}
+	if ups := l.Updates(id(2)); len(ups) != 2 || ups[0].Op != Put || ups[1].Op != Pin {
+		t.Fatalf("chunk 2's updates: %+v", ups)
+	}
+	if ids := l.IDs(); len(ids) != 2 || ids[0] != id(1) || ids[1] != id(2) || l.Len() != 2 || l.Generation() != 4 {
+		t.Fatalf("IDs %v, Len %d, generation %d", ids, l.Len(), l.Generation())
+	}
+	if ups := l.Updates(id(9)); len(ups) != 0 {
+		t.Fatalf("an entry the log did not change: %+v", ups)
+	}
+}
+
+// Folding is resolving: a history folded at any points — each fold writing what Resolve gives, a
+// record for what the index holds and a tombstone for what it dropped — then resolved over the
+// last fold's records, gives what resolving the whole history at once does. The histories are a
+// writer's: puts of what the index lacks, or of what it holds; touches, pins, and moves of what it
+// holds; drops.
+func TestFoldingIsResolving(t *testing.T) {
+	rnd := rand.New(rand.NewPCG(1, 2))
+	const ids = 6
+	for trial := range 2000 {
+		var history []Update
+		held := map[byte]bool{}
+		for range 1 + rnd.IntN(30) {
+			n := byte(rnd.IntN(ids))
+			kind := encoding.KindChunk
+			u := Update{ID: id(n)}
+			switch op := rnd.IntN(6); {
+			case op == 0 || !held[n]:
+				u.Op, u.Entry = Put, chunkEntry(uint64(rnd.IntN(4)), int64(rnd.IntN(100)), Day(100+rnd.IntN(10)))
+				held[n] = true
+			case op == 1:
+				u.Op, u.Entry = Touch, Entry{Kind: kind, Day: Day(100 + rnd.IntN(20))}
+			case op == 2:
+				u.Op, u.Entry = Pin, Entry{Kind: kind}
+			case op == 3:
+				u.Op, u.Entry = Move, Entry{Kind: kind, Loc: Location{Pack: uint64(10 + rnd.IntN(4))}}
+			default:
+				u.Op, u.Entry = Drop, Entry{Kind: kind}
+				held[n] = false
+			}
+			history = append(history, u)
+		}
+		// Folds after random updates.
+		records := map[encoding.ID]Entry{}
+		start := 0
+		for start < len(history) {
+			end := start + 1 + rnd.IntN(len(history)-start)
+			byID := map[encoding.ID][]Update{}
+			for _, u := range history[start:end] {
+				byID[u.ID] = append(byID[u.ID], u)
+			}
+			for k, ups := range byID {
+				base, found := records[k]
+				e, holds := Resolve(base, found, ups)
+				switch {
+				case holds:
+					records[k] = e
+				case found:
+					records[k] = Entry{Kind: base.Kind} // a tombstone
+				}
+			}
+			start = end
+		}
+		for n := range byte(ids) {
+			k := id(n)
+			var all []Update
+			for _, u := range history {
+				if u.ID == k {
+					all = append(all, u)
+				}
+			}
+			want, wantHolds := Resolve(Entry{}, false, all)
+			rec, found := records[k]
+			got, holds := Resolve(rec, found, nil)
+			if holds != wantHolds || (holds && !got.Equal(want)) {
+				t.Fatalf("trial %d, entry %d: folded %+v %v, at once %+v %v\nhistory %+v", trial, n, got, holds, want, wantHolds, all)
+			}
+		}
 	}
 }
 
@@ -226,73 +286,36 @@ func TestEntryEncoding(t *testing.T) {
 	}
 }
 
-// Puts, touches, and pins give the same index in any order, applied any number of times; a pin
-// or touch that arrives before its entry's body waits for it.
+// Puts, touches, and pins of an entry give the same entry in any order, any number of times; a pin
+// or touch that arrives before its entry's body waits for it, and one alone gives none.
 func TestOrderDoesNotMatter(t *testing.T) {
-	type piece struct {
-		log   int64
-		body  []byte
-		block bool
+	base := fileEntry(100, FileChunk{id(1), 2100})
+	ups := []Update{
+		{Op: Touch, ID: id(2), Entry: Entry{Kind: encoding.KindFile, Day: 140}},
+		{Op: Pin, ID: id(2), Entry: Entry{Kind: encoding.KindFile}},
+		{Op: Put, ID: id(2), Entry: fileEntry(150, FileChunk{id(3), 2100})},
+		{Op: Touch, ID: id(2), Entry: Entry{Kind: encoding.KindFile, Day: 120}},
 	}
-	pieces := []piece{
-		{block: true, body: EncodeBlock([]Keyed{{ID: id(1), Entry: chunkEntry(3, 10, 100)}, {ID: id(2), Entry: fileEntry(100, FileChunk{id(1), 2100})}})},
-		{log: 1, body: EncodeLog([]Update{{Op: Touch, ID: id(2), Entry: Entry{Kind: encoding.KindFile, Day: 140}}})},
-		{log: 2, body: EncodeLog([]Update{{Op: Pin, ID: id(1), Entry: Entry{Kind: encoding.KindChunk}}, {Op: Pin, ID: id(6), Entry: Entry{Kind: encoding.KindChunk}}})},
-		{log: 3, body: EncodeLog([]Update{{Op: Put, ID: id(6), Entry: chunkEntry(4, 0, 150)}, {Op: Touch, ID: id(2), Entry: Entry{Kind: encoding.KindFile, Day: 120}}})},
-		{log: 4, body: EncodeLog([]Update{{Op: Touch, ID: id(8), Entry: Entry{Kind: encoding.KindFile, Day: 150}}})},
+	want, ok := Resolve(base, true, ups)
+	if !ok || !want.Pinned || want.Day != 150 || want.Chunks[0].ID != id(1) {
+		t.Fatalf("resolved: %+v %v", want, ok)
 	}
-	var want []Keyed
-	for trial := range 50 {
-		x := New(1)
-		order := rand.Perm(len(pieces))
+	for range 50 {
+		order := rand.Perm(len(ups))
 		order = append(order, order[:2]...)
-		for _, i := range order {
-			p := pieces[i]
-			var err error
-			if p.block {
-				err = x.ApplyBlock(p.body)
-			} else {
-				err = x.ApplyLog(p.body)
-			}
-			if err != nil {
-				t.Fatal(err)
-			}
+		shuffled := make([]Update, len(order))
+		for i, j := range order {
+			shuffled[i] = ups[j]
 		}
-		got := x.Sorted()
-		if trial == 0 {
-			want = got
-			continue
-		}
-		if len(got) != len(want) {
-			t.Fatalf("order %v: %d entries, want %d", order, len(got), len(want))
-		}
-		for i := range got {
-			if got[i].ID != want[i].ID || !got[i].Entry.Equal(want[i].Entry) {
-				t.Fatalf("order %v: %+v, want %+v", order, got[i], want[i])
-			}
+		if got, ok := Resolve(base, true, shuffled); !ok || !got.Equal(want) {
+			t.Fatalf("order %v: %+v, want %+v", order, got, want)
 		}
 	}
-	x := New(1)
-	for _, p := range pieces {
-		if p.block {
-			_ = x.ApplyBlock(p.body)
-		} else {
-			_ = x.ApplyLog(p.body)
-		}
-	}
-	if e, ok := x.Get(id(2)); !ok || e.Day != 140 || e.Size != 2100 {
-		t.Fatalf("file: %+v %v", e, ok)
-	}
-	if e, ok := x.Get(id(6)); !ok || !e.Pinned || e.Loc.Pack != 4 {
+	early := []Update{{Op: Pin, ID: id(6), Entry: Entry{Kind: encoding.KindChunk}}, {Op: Put, ID: id(6), Entry: chunkEntry(4, 0, 150)}}
+	if e, ok := Resolve(Entry{}, false, early); !ok || !e.Pinned || e.Loc.Pack != 4 {
 		t.Fatalf("a chunk pinned before its body arrived: %+v %v", e, ok)
 	}
-	if _, ok := x.Get(id(8)); ok {
+	if _, ok := Resolve(Entry{}, false, ups[:1]); ok {
 		t.Fatal("a touch alone gave a file a body")
-	}
-	if e, ok := x.Lookup(id(8)); !ok || e.Day != 150 {
-		t.Fatalf("the touch was not kept: %+v %v", e, ok)
-	}
-	if first := id(1); !bytes.Equal(want[0].ID[:], first[:]) {
-		t.Fatal("not in ID order")
 	}
 }

@@ -18,7 +18,7 @@ import (
 // deletions' records, and the locks, which stay with the cell.
 var moveTables = []string{
 	"network", "repository", "head_log", "object", "tree_sizes", "commit", "commit_parent", "copy_parent", "commit_path", "path_index",
-	"pack", "content_index", "index_block", "content_log", "dictionary", "dictionary_grant", "op_log", "operation", "view", "op_head",
+	"pack", "content_index", "content_log", "dictionary", "dictionary_grant", "op_log", "operation", "view", "op_head",
 	"op_tombstone", "changelist", "patchset", "candidate", "changelist_counter", "event", "event_pending", "repository_event_counter",
 	"gc_pass", "workspace", "checkpoint", "segment", "chunk_release",
 }
@@ -35,7 +35,7 @@ func moveWhere(table string) string {
 		return "op_log_id IN (SELECT id FROM op_log WHERE repository_id = ANY(@repos))"
 	case "pack", "chunk_release", "dictionary", "segment":
 		return "network_id = @net"
-	case "content_index", "index_block", "content_log":
+	case "content_index", "content_log":
 		return "((scope = 1 AND owner_id = @net) OR (scope = 0 AND owner_id = ANY(@repos)))"
 	}
 	return "repository_id = ANY(@repos)"

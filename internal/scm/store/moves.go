@@ -123,14 +123,14 @@ func (s *Store) exportContentLog(ctx context.Context, sc move.Scope, after *okpb
 			if after != nil && (scope < from[0] || scope == from[0] && owner < from[1]) {
 				continue
 			}
-			_, folded, ok, err := tx.ContentIndexGeneration(ctx, c)
+			st, ok, err := tx.ContentIndexGeneration(ctx, c)
 			if err != nil {
 				return err
 			}
 			if !ok {
 				continue
 			}
-			logs, _, err := tx.ContentLogSince(ctx, c, folded)
+			logs, _, err := tx.ContentLogSince(ctx, c, st.Folded)
 			if err != nil {
 				return err
 			}
@@ -232,8 +232,19 @@ func (m mover) Drop(ctx context.Context, sc move.Scope) error {
 	}
 }
 
+// Freeze stops the network's writes, then sequences what its repositories' writers left pending:
+// every writer's transaction read the network's gate, so none commits after the freeze, and the
+// export that follows carries no pending row (sequence.go).
 func (m mover) Freeze(ctx context.Context, sc move.Scope) error {
-	return m.s.b.SetNetworkMove(ctx, backend.Network(sc.Network), backend.MoveFrozen, "")
+	if err := m.s.b.SetNetworkMove(ctx, backend.Network(sc.Network), backend.MoveFrozen, ""); err != nil {
+		return err
+	}
+	for _, r := range sc.Repositories {
+		if err := m.s.sequence(sequencing(), r, time.Now()); err != nil {
+			return fmt.Errorf("sequencing repository %d: %w", r, err)
+		}
+	}
+	return nil
 }
 
 func (m mover) Thaw(ctx context.Context, sc move.Scope) error {

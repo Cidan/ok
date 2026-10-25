@@ -61,9 +61,10 @@ func (s *Store) FinishDeletions(ctx context.Context, limit int) (int, error) {
 	return len(pending), nil
 }
 
-// finishDeletion releases every chunk a deleted repository held, a batch at a time — again, after
-// a crash: a release is recorded once — retires its segment references and deletes its content
-// index, then deletes its network if it was the last of it, or collects the network's releases.
+// finishDeletion releases every chunk and tree a deleted repository's content index held, a batch at
+// a time — again, after a crash: a release is recorded once — retires its segment references and
+// deletes its content index, then deletes its network if it was the last of it, or collects the
+// network's releases.
 func (s *Store) finishDeletion(ctx context.Context, d backend.Deletion) error {
 	if err := s.dropCodeIndex(ctx, d.Repo); err != nil {
 		return err
@@ -76,7 +77,7 @@ func (s *Store) finishDeletion(ctx context.Context, d backend.Deletion) error {
 		v, err := s.contentView(ctx, repoScope(d.Repo))
 		if err != nil {
 			// Another replica finished it first: its content index is gone.
-			if _, _, ok, gerr := s.ops(ctx).ContentIndexGeneration(ctx, repoScope(d.Repo)); gerr == nil && !ok {
+			if _, ok, gerr := s.ops(ctx).ContentIndexGeneration(ctx, repoScope(d.Repo)); gerr == nil && !ok {
 				return nil
 			}
 			return err
@@ -91,7 +92,7 @@ func (s *Store) finishDeletion(ctx context.Context, d backend.Deletion) error {
 			return rerr == nil
 		}
 		if err := v.each(ctx, func(id encoding.ID, e contentindex.Entry) bool {
-			if e.Kind == encoding.KindChunk {
+			if contentindex.Located(e.Kind) {
 				batch = append(batch, id)
 			}
 			return len(batch) < gcBatch || flush()

@@ -97,6 +97,15 @@ func (s *store) Release(_ context.Context, _ string, key int64, holder string) (
 	return false, nil
 }
 
+func (s *store) Let(_ context.Context, _ string, key int64, holder string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if r := s.rows[key]; r != nil && r.holder == holder {
+		r.holder = ""
+	}
+	return nil
+}
+
 func (s *store) Due(_ context.Context, _ string, limit int) ([]int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -324,6 +333,31 @@ func TestClaim(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("a lost lease never ended the claim")
+	}
+}
+
+// A claim's release lets the lease go and leaves a mark made while it was held: the work is due,
+// and another takes it at once — a claimer does its work once, and its lease kept for the mark would
+// go unused until it lapsed.
+func TestClaimLeavesAMark(t *testing.T) {
+	ctx := context.Background()
+	s := newStore()
+	_, release, ok, err := work.Claim(ctx, s, "compact", 7, "a", time.Hour)
+	if err != nil || !ok {
+		t.Fatalf("claiming: %v, %v", ok, err)
+	}
+	if err := s.Mark(ctx, "compact", 7); err != nil {
+		t.Fatal(err)
+	}
+	release()
+	due, err := s.Due(ctx, "compact", 10)
+	if err != nil || !slices.Contains(due, 7) {
+		t.Fatalf("after the release, due %v (%v): the mark made meanwhile was lost", due, err)
+	}
+	if _, release, ok, err := work.Claim(ctx, s, "compact", 7, "b", time.Hour); err != nil || !ok {
+		t.Fatalf("another claiming it after the release: %v, %v", ok, err)
+	} else {
+		release()
 	}
 }
 

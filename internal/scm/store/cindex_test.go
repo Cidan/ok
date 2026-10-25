@@ -13,6 +13,7 @@ import (
 	"github.com/Cidan/ok/internal/scm/contentindex"
 	"github.com/Cidan/ok/internal/scm/encoding"
 	"github.com/Cidan/ok/internal/scm/pack"
+	"github.com/Cidan/ok/internal/scm/segment"
 	"github.com/Cidan/ok/internal/scm/store/backend"
 	"github.com/Cidan/ok/internal/work"
 )
@@ -22,8 +23,20 @@ func logRows(t *testing.T, s *Store, repo int64) int {
 	return dbOf(s).count(t, "content_log", `scope = 0 AND owner_id = @repo`, map[string]any{"repo": repo})
 }
 
-// A rebuild folds the log into the next generation's blocks, and what is logged after it applies
-// over them.
+// runsOf are a content index's live runs of a kind.
+func runsOf(t *testing.T, s *Store, sc backend.Scope, kind segment.Kind) []backend.Segment {
+	t.Helper()
+	segs, err := s.b.Segments(context.Background(), sc, kind)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return segs
+}
+
+// A fold writes what the log changed into runs — unpinned entries into the unpinned index, pinned
+// ones into the pinned runs forks take — every entry whole, and deletes the rows it folded; what
+// is logged after it applies over the runs, and a replica's memory of the index after a fold is the
+// log since alone.
 func TestContentIndexRebuild(t *testing.T) {
 	ctx := context.Background()
 	e := newCLEnv(t)
@@ -35,44 +48,56 @@ func TestContentIndexRebuild(t *testing.T) {
 		t.Fatal("a publish logged nothing")
 	}
 	before := indexOf(t, e.s, e.repo).Sorted()
-	gen, entries, folded, err := e.s.RebuildContentIndex(ctx, e.repo)
-	if err != nil || gen != 2 || entries != len(before) || folded != 0 {
-		t.Fatalf("rebuild: generation %d of %d entries (%d before), %v", gen, entries, len(before), err)
+	gen, unpinned, pinned, err := e.s.RebuildContentIndex(ctx, e.repo)
+	if err != nil || gen != 2 || unpinned != len(before) || pinned != 0 {
+		t.Fatalf("rebuild: generation %d, %d unpinned and %d pinned records (%d entries before), %v", gen, unpinned, pinned, len(before), err)
 	}
 	if n := logRows(t, e.s, e.repo); n != 0 {
 		t.Fatalf("%d log rows the rebuild folded in remain", n)
 	}
-	after := indexOf(t, e.s, e.repo).Sorted()
+	runs := runsOf(t, e.s, repoScope(e.repo), segIndexUnpinned)
+	if len(runs) != 1 || runs[0].Records != int64(len(before)) || runs[0].Day == 0 {
+		t.Fatalf("the unpinned index's runs: %+v", runs)
+	}
+	li := e.s.live(repoScope(e.repo))
+	if err := e.s.refreshIndex(ctx, repoScope(e.repo), li); err != nil {
+		t.Fatal(err)
+	}
+	if n := li.view.Load().log.Len(); n != 0 {
+		t.Fatalf("after the fold, this replica's log of the index holds %d entries", n)
+	}
+	after := indexOf(t, reopen(t, e.s), e.repo).Sorted()
+	if len(after) != len(before) {
+		t.Fatalf("%d entries after the fold, %d before", len(after), len(before))
+	}
 	for i := range before {
 		if before[i].ID != after[i].ID || !before[i].Entry.Equal(after[i].Entry) {
 			t.Fatalf("entry %s changed in the rebuild: %+v, then %+v", before[i].ID, before[i].Entry, after[i].Entry)
 		}
 	}
-	pinned := b.commit(b.tree(fileEntry("again", b.file([]byte("again\n")))), "more", commit)
+	pinnedCommit := b.commit(b.tree(fileEntry("again", b.file([]byte("again\n")))), "more", commit)
 	mustPublish(t, e.s, e.repo, alice, b, nil)
 	if err := e.s.inTx(ctx, func(ctx context.Context, tx *txn) error {
-		return e.s.pin(ctx, tx, e.repo, []ref{{table: tCommit, id: pinned}})
+		return e.s.pin(ctx, tx, e.repo, []ref{{table: tCommit, id: pinnedCommit}})
 	}); err != nil {
 		t.Fatal(err)
 	}
 	if logRows(t, e.s, e.repo) == 0 {
 		t.Fatal("nothing logged after the rebuild")
 	}
-	if blocks := dbOf(e.s).count(t, "index_block", `scope = 0 AND owner_id = @repo AND generation <> 2`, map[string]any{"repo": e.repo}); blocks != 0 {
-		t.Fatalf("%d blocks of the old generation remain", blocks)
-	}
 	clean(t, e.s, e.repo)
-	if _, _, _, err := reopen(t, e.s).RebuildContentIndex(ctx, e.repo); err != nil {
-		t.Fatal(err)
+	if g, _, pinned, err := reopen(t, e.s).RebuildContentIndex(ctx, e.repo); err != nil || g != 3 || pinned == 0 {
+		t.Fatalf("the second rebuild: generation %d, %d pinned records, %v", g, pinned, err)
+	}
+	if runs := runsOf(t, e.s, repoScope(e.repo), segIndex); len(runs) == 0 {
+		t.Fatal("no pinned run after a fold of pinned entries")
 	}
 	clean(t, e.s, e.repo)
 }
 
-// A fold writes its next generation a few blocks a transaction (Config.FoldBatch) before the one
-// that makes it the generation, after deleting what a fold that stopped short left, then deletes
-// the generation it replaced a few rows a transaction; a fold that finds another running changes
-// nothing.
-func TestFoldInBatches(t *testing.T) {
+// A fold that finds another running changes nothing; one with nothing to fold, too. A fold of many
+// entries writes them all to one run, read back whole by a replica with nothing cached.
+func TestFoldWritesARun(t *testing.T) {
 	ctx := context.Background()
 	e := newCLEnv(t)
 	b := newBuilder(t)
@@ -81,13 +106,6 @@ func TestFoldInBatches(t *testing.T) {
 	}
 	mustPublish(t, e.s, e.repo, alice, b, nil)
 	before := indexOf(t, e.s, e.repo).Sorted()
-	gen, _, ok, err := e.s.ops(ctx).ContentIndexGeneration(ctx, repoScope(e.repo))
-	if err != nil || !ok {
-		t.Fatal(ok, err)
-	}
-	blocksOf := func(where string) int {
-		return dbOf(e.s).count(t, "index_block", `scope = 0 AND owner_id = @repo AND `+where, map[string]any{"repo": e.repo, "gen": gen})
-	}
 
 	// Another fold holds the index: this one changes nothing.
 	_, release, ok, err := work.Claim(ctx, e.s.Work(), FoldWork, e.repo, "another replica", time.Minute)
@@ -99,28 +117,12 @@ func TestFoldInBatches(t *testing.T) {
 	}
 	release()
 
-	// What a fold that stopped short left: a block of the next generation.
-	stray := contentindex.Keyed{ID: encoding.ID{0xee}, Entry: before[0].Entry}
-	if err := e.s.inTx(ctx, func(ctx context.Context, tx *txn) error {
-		return writeBlocks(ctx, tx, repoScope(e.repo), gen+1, []contentindex.Keyed{stray})
-	}); err != nil {
-		t.Fatal(err)
+	g, unpinned, _, err := e.s.RebuildContentIndex(ctx, e.repo)
+	if err != nil || g != 2 || unpinned != len(before) {
+		t.Fatalf("the fold: generation %d, %d unpinned records (%d entries before), %v", g, unpinned, len(before), err)
 	}
-	small := mustOpen(t, dbOf(e.s), e.s.blobs, Config{FoldBatch: 2, DeleteBatch: 3, Signals: e.s.signals})
-	txns := 0
-	small.txAttempts = func() { txns++ }
-	folded, entries, _, err := small.RebuildContentIndex(ctx, e.repo)
-	if err != nil || folded != gen+1 || entries != len(before) {
-		t.Fatalf("the fold: generation %d of %d entries (%d before), %v", folded, entries, len(before), err)
-	}
-	if want := (len(before)+2*contentindex.BlockEntries-1)/(2*contentindex.BlockEntries) + 2; txns < want {
-		t.Errorf("the fold took %d transactions, want at least %d: two blocks to one", txns, want)
-	}
-	if n := blocksOf(`generation <> @gen + 1`); n != 0 {
-		t.Errorf("%d blocks of other generations remain", n)
-	}
-	if n, want := blocksOf(`generation = @gen + 1`), (len(before)+contentindex.BlockEntries-1)/contentindex.BlockEntries; n != want {
-		t.Errorf("%d blocks of the new generation, want %d", n, want)
+	if g, _, _, err := e.s.RebuildContentIndex(ctx, e.repo); err != nil || g != 0 {
+		t.Fatalf("a fold with nothing to fold: generation %d, %v", g, err)
 	}
 	after := indexOf(t, reopen(t, e.s), e.repo).Sorted()
 	if len(after) != len(before) {

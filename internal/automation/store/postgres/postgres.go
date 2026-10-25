@@ -82,6 +82,10 @@ func moveWhere(table string) string {
 // Moves are the backend's rows about repositories, for a move.
 func (b *Backend) Moves() move.Rows { return b.moves }
 
+// FencedWritesBesideEachOther is false: a work fence holds its row FOR SHARE, which a mark of the
+// row in the same transaction upgrades (pgdata.CheckWorkFence).
+func (b *Backend) FencedWritesBesideEachOther() bool { return false }
+
 func (x queries) RunningRuns(ctx context.Context, repos []int64) ([]int64, error) {
 	rows, err := x.q.Query(ctx, `SELECT id FROM run WHERE repository_id = ANY($1) AND status = $2 ORDER BY id`, repos, store.StatusRunning)
 	if err != nil {
@@ -444,6 +448,10 @@ func (x queries) RenewWork(ctx context.Context, kind string, key int64, holder s
 
 func (x queries) ReleaseWork(ctx context.Context, kind string, key int64, holder string) (bool, error) {
 	return pgdata.ReleaseWork(ctx, x.q, kind, key, holder)
+}
+
+func (x queries) LetWork(ctx context.Context, kind string, key int64, holder string) error {
+	return pgdata.LetWork(ctx, x.q, kind, key, holder)
 }
 
 func (x queries) DueWork(ctx context.Context, kind string, limit int) ([]int64, error) {

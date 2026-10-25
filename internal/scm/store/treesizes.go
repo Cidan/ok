@@ -13,11 +13,11 @@ import (
 // which a virtual workspace needs to answer a stat without reading any file. A record depends on
 // its tree and the files and symlinks the tree names — never on the subtrees — so any tree, in
 // any commit, at any depth, derives on its own: there is no backfill and no walk of history. It is
-// derived the first time it is read and kept in tree_sizes, which its tree's deletion cascades to.
-//
-// The records are kept where trees are, so they move with them when trees leave PostgreSQL for
-// packs (docs/scm.md, "Sequencing"): a record is self-describing and versioned
-// for that.
+// derived the first time it is read and kept in tree_sizes, which its tree's deletion cascades to —
+// unless its tree is one a publish stored, in the content index, unpinned: a workspace's, whose
+// record a replica keeps in memory alone. Compaction moves a kept record to segments once its tree
+// has no row in the object table, which then means pinned; a published tree's record is kept once
+// the tree is pinned, which nothing undoes.
 
 // treeSizesServed is how each record was served.
 var treeSizesServed = metrics.NewCounter("ok_scm_tree_sizes_total",
@@ -182,6 +182,20 @@ func (s *Store) deriveTreeSizes(ctx context.Context, repo int64, trees []encodin
 		out[id] = b
 		keepIDs = append(keepIDs, id)
 		keepBodies = append(keepBodies, b)
+	}
+	if len(keepIDs) > 0 {
+		// Not a published tree that is unpinned: its record would outlive it.
+		_, held, err := s.contentEntries(ctx, repoScope(repo), encoding.KindTree, keepIDs)
+		if err != nil {
+			return nil, err
+		}
+		ids, bodies := keepIDs[:0], keepBodies[:0]
+		for i, id := range keepIDs {
+			if e, ok := held[id]; !ok || e.Pinned {
+				ids, bodies = append(ids, id), append(bodies, keepBodies[i])
+			}
+		}
+		keepIDs, keepBodies = ids, bodies
 	}
 	if len(keepIDs) > 0 {
 		// Keeping is what spares the next reader the derivation; a record not kept — its tree

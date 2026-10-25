@@ -30,6 +30,11 @@ type Backend interface {
 	// Retryable reports a transaction the database aborted to break a deadlock or a conflict, or
 	// one that refused what a transaction begun anew may not, which running again may commit.
 	Retryable(err error) bool
+	// SequencesAfterCommit reports whether a repository's CL numbers and places in its log are
+	// given after the transaction that makes them commits, by its sequencing pass, rather than
+	// taken from its counters in it (docs/scm.md, "Sequencing"): Spanner aborts the transactions
+	// that would wait on those rows, and a long one, retried, meets the next.
+	SequencesAfterCommit() bool
 	// Snapshot runs fn in one read-only transaction that sees the database as of one moment.
 	Snapshot(ctx context.Context, fn func(tx Ops) error) error
 	// Ping reports whether the database answers.
@@ -152,13 +157,39 @@ type Ops interface {
 	ReserveRepositoryEvents(ctx context.Context, repo int64, n int) (int64, error)
 	// InsertEvents records a repository's events, encoded, at their places in its log, each for
 	// the relay to publish.
-	InsertEvents(ctx context.Context, repo int64, at time.Time, seqs []int64, bodies [][]byte) error
+	InsertEvents(ctx context.Context, repo int64, evs []LogEvent) error
 	// RepositoryEvents are up to limit of a repository's events after place after in its log, in
 	// order.
 	RepositoryEvents(ctx context.Context, repo, after int64, limit int) ([]Event, error)
 	// LogHeads are, for up to limit repositories with IDs above after, by ID, the last place in
 	// each one's log; a repository with no event is left out.
 	LogHeads(ctx context.Context, after int64, limit int) ([][2]int64, error)
+
+	// ─── Sequencing (Backend.SequencesAfterCommit) ───
+
+	// Pend records what a transaction leaves its repository's sequencing pass, keyed by its commit
+	// timestamp, which the database sets as it commits.
+	Pend(ctx context.Context, rows []Pending) error
+	// PendingRows are up to limit of a repository's pending rows, in commit order, read without a
+	// lock as of now: every row committed before is among them, or after them.
+	PendingRows(ctx context.Context, repo int64, limit int) ([]Pending, error)
+	// PendingHeld are which of a repository's pending rows are pending still, each held until the
+	// transaction ends.
+	PendingHeld(ctx context.Context, repo int64, keys []PendingKey) (map[PendingKey]bool, error)
+	// DeletePending deletes a repository's pending rows.
+	DeletePending(ctx context.Context, repo int64, keys []PendingKey) error
+	// NumberChangeLists gives a repository's CLs of ids the numbers, from their provisional ones,
+	// and the CLs and patchsets stacked on them theirs.
+	NumberChangeLists(ctx context.Context, repo int64, ids, numbers []int64) error
+	// ChangeListNumbers are the numbers of a repository's CLs of ids, by ID: provisional where the
+	// pass has not numbered them.
+	ChangeListNumbers(ctx context.Context, repo int64, ids []int64) (map[int64]int64, error)
+	// TransactionEvents are the places in a repository's log of the events the transaction of tie
+	// txn wrote, in order.
+	TransactionEvents(ctx context.Context, repo, txn int64) ([]int64, error)
+	// PendingRepositories are up to limit of the repositories with a row pending that committed
+	// before before, by ID.
+	PendingRepositories(ctx context.Context, before time.Time, limit int) ([]int64, error)
 
 	// ─── The content index ───
 
@@ -168,27 +199,19 @@ type Ops interface {
 	// InsertContentIndex records a content index at generation gen.
 	InsertContentIndex(ctx context.Context, scope Scope, gen int64) error
 	// ShareContentIndex holds a content index in share mode — writers that commute with each other
-	// run beside it; a sweep or a compaction does not — and returns today. ok is false when there is
-	// no such content index.
-	ShareContentIndex(ctx context.Context, scope Scope) (today time.Time, ok bool, err error)
-	// LockContentIndex holds a content index alone and returns its generation.
-	LockContentIndex(ctx context.Context, scope Scope) (gen int64, err error)
-	// ContentIndexGeneration is a content index's generation, and where in its log the fold that
-	// made it read to (nil: nowhere — the generation folded no log); ok is false when it has none.
-	ContentIndexGeneration(ctx context.Context, scope Scope) (gen int64, folded LogPlace, ok bool, err error)
+	// run beside it; a sweep, a compaction, or a fold does not — and returns today and its
+	// generation, which no fold moves while it is held. ok is false when there is no such content
+	// index.
+	ShareContentIndex(ctx context.Context, scope Scope) (today time.Time, gen int64, ok bool, err error)
+	// LockContentIndex holds a content index alone and returns its generation, and today.
+	LockContentIndex(ctx context.Context, scope Scope) (gen int64, today time.Time, err error)
+	// ContentIndexGeneration is a content index's row; ok is false when it has none.
+	ContentIndexGeneration(ctx context.Context, scope Scope) (state IndexState, ok bool, err error)
 	// SetContentIndexGeneration moves a content index to generation gen, which folded its log to
 	// folded.
 	SetContentIndexGeneration(ctx context.Context, scope Scope, gen int64, folded LogPlace) error
-	// IndexBlocks are a generation's blocks' bodies.
-	IndexBlocks(ctx context.Context, scope Scope, gen int64) ([][]byte, error)
-	// InsertIndexBlocks records a generation's blocks, each by its first entry's ID.
-	InsertIndexBlocks(ctx context.Context, scope Scope, gen int64, firsts []encoding.ID, bodies [][]byte) error
-	// DeleteIndexBlocks deletes a generation's blocks.
-	DeleteIndexBlocks(ctx context.Context, scope Scope, gen int64) error
-	// DeleteOtherIndexBlocks deletes up to limit of an index's blocks of every generation but keep,
-	// and returns how many: a fold's, a transaction at a time, of what a fold that stopped short
-	// left and of the generation it replaced.
-	DeleteOtherIndexBlocks(ctx context.Context, scope Scope, keep int64, limit int) (int64, error)
+	// SetContentIndexSwept records the day a content index's garbage collection swept to.
+	SetContentIndexSwept(ctx context.Context, scope Scope, before int64) error
 	// ContentLogSince are a content index's log rows the snapshot sees — the operation's, which
 	// must be one (Snapshot) — that a reader at since has not (nil: every one), in the order they
 	// apply, and the snapshot's place in the log. A reader goes on from that place: nothing
@@ -258,6 +281,11 @@ type Ops interface {
 	ObjectBodies(ctx context.Context, repo int64, kind encoding.Kind, ids []encoding.ID) (map[encoding.ID][]byte, error)
 	// CommitBodies are the bodies of the commits among ids, by ID.
 	CommitBodies(ctx context.Context, repo int64, ids []encoding.ID) (map[encoding.ID][]byte, error)
+	// UnpinnedObjects are, of the objects of kind among ids, the bodies of those unpinned, and
+	// which are pinned: one in neither has no row — pinned, in a segment, or not held.
+	UnpinnedObjects(ctx context.Context, repo int64, kind encoding.Kind, ids []encoding.ID) (unpinned map[encoding.ID][]byte, pinned map[encoding.ID]bool, err error)
+	// UnpinnedCommits is UnpinnedObjects for commits.
+	UnpinnedCommits(ctx context.Context, repo int64, ids []encoding.ID) (unpinned map[encoding.ID][]byte, pinned map[encoding.ID]bool, err error)
 	// CommitGenerations are the generations of the commits among ids, by ID.
 	CommitGenerations(ctx context.Context, repo int64, ids []encoding.ID) (map[encoding.ID]int64, error)
 	// WalkObjects applies walk to the objects of kind among ids it applies to — unpinned and
@@ -331,19 +359,23 @@ type Ops interface {
 
 	// ─── Chunk releases ───
 
-	// ReleaseChunks records that a repository no longer holds chunks, for its network's collection.
+	// Releases are of what a pack holds, chunks and trees, by ID: an ID is one kind's.
+
+	// ReleaseChunks records that a repository no longer holds chunks or trees, for its network's
+	// collection.
 	ReleaseChunks(ctx context.Context, net Network, ids []encoding.ID) error
-	// ReleasedChunks are up to limit of a network's released chunks, by ID.
+	// ReleasedChunks are up to limit of a network's released chunks and trees, by ID.
 	ReleasedChunks(ctx context.Context, net Network, limit int) ([]encoding.ID, error)
-	// DeleteReleases deletes a network's releases of chunks among ids.
+	// DeleteReleases deletes a network's releases among ids.
 	DeleteReleases(ctx context.Context, net Network, ids []encoding.ID) error
 	// DeleteSegment deletes a retired segment's row.
 	DeleteSegment(ctx context.Context, scope Scope, kind segment.Kind, id encoding.ID) error
 	// PinnedPaths are up to limit of the tail's rows of main's path history — every one is main's,
 	// so pinned — by path, generation, and commit.
 	PinnedPaths(ctx context.Context, repo int64, limit int) ([]PathRow, error)
-	// SettledEvents are up to limit of the tail's events the relay has published, by place.
-	SettledEvents(ctx context.Context, repo int64, limit int) ([]Event, error)
+	// SettledEvents are up to limit of the tail's events the relay has published, written before
+	// before, by place.
+	SettledEvents(ctx context.Context, repo int64, before time.Time, limit int) ([]Event, error)
 	// SettledChangeLists are up to limit of the tail's landed CLs, by number, each with its
 	// patchsets and its landing: nothing changes a CL once it has landed.
 	SettledChangeLists(ctx context.Context, repo int64, limit int) ([]SettledChangeList, error)
@@ -484,26 +516,27 @@ type Ops interface {
 	ListChangeLists(ctx context.Context, repo, before int64, statuses []int16, author string, parent int64, limit int) ([]ChangeList, error)
 	// ChangeListsOfChanges are a repository's CLs of change IDs, by number.
 	ChangeListsOfChanges(ctx context.Context, repo int64, changes [][]byte) ([]ChangeList, error)
-	// Patchsets are the patchsets of a repository's CLs, by CL and number.
+	// Patchsets are the patchsets of a repository's CLs of IDs cls, by CL and number.
 	Patchsets(ctx context.Context, repo int64, cls []int64) ([]Patchset, error)
 	// ChangeListStatus is a CL's status; ok is false when there is no CL.
 	ChangeListStatus(ctx context.Context, repo, number int64) (int16, bool, error)
-	// SetChangeListStatus moves a CL to status, with the status an abandoned one returns to.
-	SetChangeListStatus(ctx context.Context, repo, number int64, status int16, abandonedFrom *int16) error
-	// SetLanded records a CL submitted, landed as commit by by.
-	SetLanded(ctx context.Context, repo, number int64, status int16, commit encoding.ID, by string) error
+	// SetChangeListStatus moves the CL of ID id to status, with the status an abandoned one returns
+	// to.
+	SetChangeListStatus(ctx context.Context, repo, id int64, status int16, abandonedFrom *int16) error
+	// SetLanded records the CL of ID id submitted, landed as commit by by.
+	SetLanded(ctx context.Context, repo, id int64, status int16, commit encoding.ID, by string) error
 	// UploadChangeLists are the CLs of changes, and those whose patchsets are among commits.
 	UploadChangeLists(ctx context.Context, repo int64, changes, commits [][]byte) ([]int64, error)
 	// NextChangeListNumbers takes a repository's next n CL numbers and returns the last.
 	NextChangeListNumbers(ctx context.Context, repo int64, n int64) (int64, error)
-	// InsertChangeList records a CL; ErrDuplicate for one of its number or change ID.
+	// InsertChangeList records a CL; ErrDuplicate for one of its ID, number, or change ID.
 	InsertChangeList(ctx context.Context, repo int64, c ChangeList) error
-	// UpdateChangeList records a CL's new current patchset.
-	UpdateChangeList(ctx context.Context, repo, number int64, patchset int32, description string, parent *int64, status int16) error
+	// UpdateChangeList records the new current patchset of the CL of ID id.
+	UpdateChangeList(ctx context.Context, repo, id int64, patchset int32, description string, parent *int64, status int16) error
 	// InsertPatchset records a patchset.
 	InsertPatchset(ctx context.Context, repo int64, p Patchset) error
 	// RollingBack is a draft or open CL rolling back any of numbers, the lowest; ok is false when
-	// none.
+	// none. It may read as of now, outside the transaction: its caller holds the repository's head.
 	RollingBack(ctx context.Context, repo int64, numbers []int64, statuses []int16) (int64, bool, error)
 	// StackedOn are the tail's CLs with a patchset uploaded stacked on one of parents, as (parent,
 	// CL) pairs.
@@ -560,13 +593,14 @@ type Ops interface {
 
 	// ─── Keyed work ───
 
-	// MarkWork, TakeWork, RenewWork, ReleaseWork, and DueWork are the SCM's keyed work's
+	// MarkWork, TakeWork, RenewWork, ReleaseWork, LetWork, and DueWork are the SCM's keyed work's
 	// (internal/work's Store).
 	MarkWork(ctx context.Context, kind string, key int64) error
 	MarkWorkAt(ctx context.Context, kind string, key int64, at time.Time) error
 	TakeWork(ctx context.Context, kind string, key int64, holder string, ttl time.Duration) (bool, error)
 	RenewWork(ctx context.Context, kind string, key int64, holder string, ttl time.Duration) (bool, error)
 	ReleaseWork(ctx context.Context, kind string, key int64, holder string) (bool, error)
+	LetWork(ctx context.Context, kind string, key int64, holder string) error
 	DueWork(ctx context.Context, kind string, limit int) ([]int64, error)
 	// InsertGCPass records a pass, once.
 	InsertGCPass(ctx context.Context, p GCPass) error

@@ -165,17 +165,14 @@ func (x queries) DeleteRepositoryTail(ctx context.Context, id int64, limit int) 
 
 func (x queries) DeleteContentIndexTail(ctx context.Context, sc backend.Scope, limit int) (int64, error) {
 	scope, owner := scopeOf(sc)
-	return x.deleteTail(ctx, []tableRows{{"index_block", "scope = $1 AND owner_id = $2"}, {"content_log", "scope = $1 AND owner_id = $2"}},
-		limit, scope, owner)
+	return x.deleteTail(ctx, []tableRows{{"content_log", "scope = $1 AND owner_id = $2"}}, limit, scope, owner)
 }
 
 func (x queries) DeleteNetworkTail(ctx context.Context, net backend.Network, limit int) (int64, error) {
 	const unfinished = `(SELECT repository_id FROM repository_deletion WHERE network_id = $1)`
 	return x.deleteTail(ctx, []tableRows{
-		{"index_block", "scope = 0 AND owner_id IN " + unfinished},
 		{"content_log", "scope = 0 AND owner_id IN " + unfinished},
 		{"segment", "network_id = $1"},
-		{"index_block", "scope = 1 AND owner_id = $1"},
 		{"content_log", "scope = 1 AND owner_id = $1"},
 		{"pack", "network_id = $1"},
 		{"chunk_release", "network_id = $1"},
@@ -203,7 +200,6 @@ func (x queries) PendingDeletions(ctx context.Context, limit int) ([]backend.Del
 func (x queries) FinishDeletion(ctx context.Context, id int64) error {
 	for _, sql := range []string{
 		`UPDATE segment SET retired_at = now() WHERE scope = 0 AND owner_id = $1 AND retired_at IS NULL`,
-		`DELETE FROM index_block WHERE scope = 0 AND owner_id = $1`,
 		`DELETE FROM content_log WHERE scope = 0 AND owner_id = $1`,
 		`DELETE FROM content_index WHERE scope = 0 AND owner_id = $1`,
 		`DELETE FROM repository_deletion WHERE repository_id = $1`,
@@ -218,11 +214,9 @@ func (x queries) FinishDeletion(ctx context.Context, id int64) error {
 func (x queries) DeleteNetwork(ctx context.Context, net backend.Network) error {
 	for _, sql := range []string{
 		// The content indexes of its repositories whose deletions are not finished.
-		`DELETE FROM index_block WHERE scope = 0 AND owner_id IN (SELECT repository_id FROM repository_deletion WHERE network_id = $1)`,
 		`DELETE FROM content_log WHERE scope = 0 AND owner_id IN (SELECT repository_id FROM repository_deletion WHERE network_id = $1)`,
 		`DELETE FROM content_index WHERE scope = 0 AND owner_id IN (SELECT repository_id FROM repository_deletion WHERE network_id = $1)`,
 		`DELETE FROM segment WHERE network_id = $1`,
-		`DELETE FROM index_block WHERE scope = 1 AND owner_id = $1`,
 		`DELETE FROM content_log WHERE scope = 1 AND owner_id = $1`,
 		`DELETE FROM content_index WHERE scope = 1 AND owner_id = $1`,
 		// Its keyed work: its chunk index's folds'.
@@ -324,12 +318,16 @@ func (x queries) ReserveRepositoryEvents(ctx context.Context, repo int64, n int)
 	return last, err
 }
 
-func (x queries) InsertEvents(ctx context.Context, repo int64, at time.Time, seqs []int64, bodies [][]byte) error {
+func (x queries) InsertEvents(ctx context.Context, repo int64, evs []backend.LogEvent) error {
+	seqs, ats, bodies := make([]int64, len(evs)), make([]time.Time, len(evs)), make([][]byte, len(evs))
+	for i, e := range evs {
+		seqs[i], ats[i], bodies[i] = e.Seq, e.At, e.Body
+	}
 	_, err := x.q.Exec(ctx, `WITH pending AS (
-			INSERT INTO event_pending (repository_id, repository_seq) SELECT $1, s FROM unnest($3::bigint[]) AS s)
+			INSERT INTO event_pending (repository_id, repository_seq) SELECT $1, s FROM unnest($2::bigint[]) AS s)
 		INSERT INTO event (repository_id, repository_seq, at, body)
-		SELECT $1, u.seq, $2, u.body FROM unnest($3::bigint[], $4::bytea[]) AS u(seq, body)`,
-		repo, at, seqs, bodies)
+		SELECT $1, u.seq, u.at, u.body FROM unnest($2::bigint[], $3::timestamptz[], $4::bytea[]) AS u(seq, at, body)`,
+		repo, seqs, ats, bodies)
 	return err
 }
 
@@ -380,54 +378,64 @@ func (x queries) InsertContentIndex(ctx context.Context, sc backend.Scope, gen i
 
 // ShareContentIndex holds the index's row in share mode and takes the stamp the transaction's log
 // rows of it carry: the index's sequence, as it stands while the row is held so.
-func (x queries) ShareContentIndex(ctx context.Context, sc backend.Scope) (time.Time, bool, error) {
+func (x queries) ShareContentIndex(ctx context.Context, sc backend.Scope) (time.Time, int64, bool, error) {
 	scope, owner := scopeOf(sc)
 	var today time.Time
-	var seq int64
-	err := x.q.QueryRow(ctx, `SELECT current_date, log_seq FROM content_index WHERE scope = $1 AND owner_id = $2 FOR SHARE`, scope, owner).
-		Scan(&today, &seq)
+	var seq, gen int64
+	err := x.q.QueryRow(ctx, `SELECT current_date, log_seq, generation FROM content_index WHERE scope = $1 AND owner_id = $2 FOR SHARE`,
+		scope, owner).Scan(&today, &seq, &gen)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return time.Time{}, false, nil
+		return time.Time{}, 0, false, nil
 	}
 	if err == nil {
 		x.stamp(sc, seq)
 	}
-	return today, err == nil, err
+	return today, gen, err == nil, err
 }
 
 // LockContentIndex holds the index's row alone: its log rows are stamped past every writer's
 // before it, and the sequence moved past them, for every writer after.
-func (x queries) LockContentIndex(ctx context.Context, sc backend.Scope) (int64, error) {
+func (x queries) LockContentIndex(ctx context.Context, sc backend.Scope) (int64, time.Time, error) {
 	scope, owner := scopeOf(sc)
 	var gen, seq int64
+	var today time.Time
 	err := x.q.QueryRow(ctx, `UPDATE content_index SET log_seq = log_seq + 2 WHERE scope = $1 AND owner_id = $2
-		RETURNING generation, log_seq - 1`, scope, owner).Scan(&gen, &seq)
+		RETURNING generation, log_seq - 1, current_date`, scope, owner).Scan(&gen, &seq, &today)
 	if err == nil {
 		x.stamp(sc, seq)
 	}
-	return gen, err
+	return gen, today, err
 }
 
-func (x queries) ContentIndexGeneration(ctx context.Context, sc backend.Scope) (int64, backend.LogPlace, bool, error) {
+func (x queries) ContentIndexGeneration(ctx context.Context, sc backend.Scope) (backend.IndexState, bool, error) {
 	scope, owner := scopeOf(sc)
-	var gen int64
+	var st backend.IndexState
 	var folded *string
-	err := x.q.QueryRow(ctx, `SELECT generation, folded_through::text FROM content_index WHERE scope = $1 AND owner_id = $2`, scope, owner).
-		Scan(&gen, &folded)
+	var swept *int64
+	err := x.q.QueryRow(ctx, `SELECT generation, folded_through::text, swept_before FROM content_index
+		WHERE scope = $1 AND owner_id = $2`, scope, owner).Scan(&st.Generation, &folded, &swept)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return 0, nil, false, nil
+		return st, false, nil
 	}
-	var place backend.LogPlace
 	if folded != nil {
-		place = backend.LogPlace(*folded)
+		st.Folded = backend.LogPlace(*folded)
 	}
-	return gen, place, err == nil, err
+	if swept != nil {
+		st.SweptBefore = *swept
+	}
+	return st, err == nil, err
 }
 
 func (x queries) SetContentIndexGeneration(ctx context.Context, sc backend.Scope, gen int64, folded backend.LogPlace) error {
 	scope, owner := scopeOf(sc)
 	_, err := x.q.Exec(ctx, `UPDATE content_index SET generation = $3, folded_through = $4::text::pg_snapshot WHERE scope = $1 AND owner_id = $2`,
 		scope, owner, gen, snapshotText(folded))
+	return err
+}
+
+func (x queries) SetContentIndexSwept(ctx context.Context, sc backend.Scope, before int64) error {
+	scope, owner := scopeOf(sc)
+	_, err := x.q.Exec(ctx, `UPDATE content_index SET swept_before = $3 WHERE scope = $1 AND owner_id = $2`, scope, owner, before)
 	return err
 }
 
@@ -438,36 +446,6 @@ func snapshotText(p backend.LogPlace) *string {
 	}
 	s := string(p)
 	return &s
-}
-
-func (x queries) IndexBlocks(ctx context.Context, sc backend.Scope, gen int64) ([][]byte, error) {
-	scope, owner := scopeOf(sc)
-	rows, err := x.q.Query(ctx, `SELECT body FROM index_block WHERE scope = $1 AND owner_id = $2 AND generation = $3`, scope, owner, gen)
-	if err != nil {
-		return nil, err
-	}
-	return pgx.CollectRows(rows, pgx.RowTo[[]byte])
-}
-
-func (x queries) InsertIndexBlocks(ctx context.Context, sc backend.Scope, gen int64, firsts []encoding.ID, bodies [][]byte) error {
-	scope, owner := scopeOf(sc)
-	_, err := x.q.Exec(ctx, `INSERT INTO index_block (scope, owner_id, generation, first_id, body)
-		SELECT $1, $2, $3, u.f, u.b FROM unnest($4::bytea[], $5::bytea[]) AS u(f, b)`,
-		scope, owner, gen, ids(firsts), bodies)
-	return err
-}
-
-func (x queries) DeleteIndexBlocks(ctx context.Context, sc backend.Scope, gen int64) error {
-	scope, owner := scopeOf(sc)
-	_, err := x.q.Exec(ctx, `DELETE FROM index_block WHERE scope = $1 AND owner_id = $2 AND generation = $3`, scope, owner, gen)
-	return err
-}
-
-func (x queries) DeleteOtherIndexBlocks(ctx context.Context, sc backend.Scope, keep int64, limit int) (int64, error) {
-	scope, owner := scopeOf(sc)
-	tag, err := x.q.Exec(ctx, `DELETE FROM index_block WHERE ctid = ANY(ARRAY(SELECT ctid FROM index_block
-		WHERE scope = $1 AND owner_id = $2 AND generation <> $3 LIMIT $4))`, scope, owner, keep, limit)
-	return tag.RowsAffected(), err
 }
 
 // ContentLogSince reads the rows a snapshot sees that since's did not, by their transactions' IDs,

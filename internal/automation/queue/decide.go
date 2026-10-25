@@ -94,6 +94,16 @@ const (
 	Note                    // say what a submission waits for
 )
 
+var kindNames = map[Kind]string{Create: "create", Release: "release", Discard: "discard", Land: "land", Adopt: "adopt",
+	Fail: "fail", Cancel: "cancel", Note: "note"}
+
+func (k Kind) String() string {
+	if n, ok := kindNames[k]; ok {
+		return n
+	}
+	return fmt.Sprintf("kind(%d)", int(k))
+}
+
 // Action is one thing the queue does.
 type Action struct {
 	Kind       Kind
@@ -159,6 +169,23 @@ func Batch(s Snapshot, max int) []Action {
 		s = s.AfterLanding(acts[0].Submission, acts[0].Attempt)
 	}
 	return out
+}
+
+// LandingStep is what a step that lands does, of what Decide said on s (acts, a landing first): the
+// batch it lands (Batch), and the rest, done beside the landing — every other submission's actions
+// but an adoption, which waits for the next step. The batch's own submissions do nothing else.
+func LandingStep(s Snapshot, acts []Action, max int) (batch, rest []Action) {
+	batch = Batch(s, max)
+	landing := map[int64]bool{}
+	for _, a := range batch {
+		landing[a.Submission] = true
+	}
+	for _, a := range acts {
+		if a.Kind != Land && a.Kind != Adopt && !landing[a.Submission] {
+			rest = append(rest, a)
+		}
+	}
+	return batch, rest
 }
 
 // Decide says what a repository's landing queue does next: landings (and adoptions) first, in

@@ -114,6 +114,9 @@ type Segment struct {
 	Records   int64
 	Size      int64
 	CreatedAt time.Time
+	// Day is the day, since 1970-01-01, the fold that wrote it committed: a repository's unpinned
+	// index's runs' (0: none).
+	Day int64
 	// Age orders a kind's segments, newest first: InsertSegments gives one written from the tail
 	// (Age 0) the next; a merged one carries the newest of its inputs'.
 	Age int64
@@ -253,8 +256,12 @@ type Operation struct {
 	Old  bool
 }
 
-// ChangeList is a CL's row, with its patchsets when a read asks for them.
+// ChangeList is a CL's row, with its patchsets when a read asks for them. A CL its backend numbers
+// after commit (Backend.SequencesAfterCommit) is numbered -ID until its repository's sequencing
+// pass numbers it, and a CL stacked on one so has its parent's provisional number: each is unique,
+// as numbers are, but never shown outside the SCM (Provisional).
 type ChangeList struct {
+	ID              int64
 	Number          int64
 	ChangeID        []byte
 	Author          string
@@ -272,7 +279,11 @@ type ChangeList struct {
 	RollbackLeft    []string
 }
 
-// Patchset is a patchset's row.
+// Provisional reports whether a CL's row is not yet numbered: it, or the CL it is stacked on.
+func (c ChangeList) Provisional() bool { return c.Number < 0 || c.Parent < 0 }
+
+// Patchset is a patchset's row. CL is its CL's ID; Parent, the number of the CL it was uploaded
+// stacked on (provisional, as a ChangeList's may be).
 type Patchset struct {
 	CL         int64
 	Number     int32
@@ -311,6 +322,43 @@ type Candidate struct {
 	Patchset   int32
 	PreparedBy string
 	PreparedAt time.Time
+}
+
+// IndexState is a content index's row: its generation; where in its log the fold that made it read
+// to (nil: nowhere — the generation folded no log); and the day, since 1970-01-01, its last complete
+// garbage collection swept to — the day its unpinned index's runs start from (0: none yet).
+type IndexState struct {
+	Generation  int64
+	Folded      LogPlace
+	SweptBefore int64
+}
+
+// Pending is what a transaction wrote for its repository's sequencing pass to order once it commits
+// (Backend.SequencesAfterCommit): a CL to number (ChangeList, its ID), or an event to place in the
+// log (Body, its new CLs by provisional number; At, when it was written). Key orders them: the
+// transaction's commit timestamp, its tie, and the place in it.
+type Pending struct {
+	Repository int64
+	Key        PendingKey
+	ChangeList int64
+	At         time.Time
+	Body       []byte
+}
+
+// PendingKey is a pending row's place in commit order. CommittedAt is set by the database at commit.
+type PendingKey struct {
+	CommittedAt time.Time
+	Txn, Place  int64
+}
+
+// LogEvent is an event at its place in its repository's log, as InsertEvents records it: when it
+// was written, and the tie of the transaction that wrote it (0: none, where the transaction placed
+// it itself).
+type LogEvent struct {
+	Seq  int64
+	At   time.Time
+	Txn  int64
+	Body []byte
 }
 
 // GCPass is one garbage-collection pass's record.

@@ -197,6 +197,7 @@ type Store struct {
 	blobs  blob.Store
 	cfg    Config
 	notify *notifier
+	leases *leaseLines
 }
 
 // New builds a store over a backend and the logs' bucket. Run Listen for prompt wake-ups;
@@ -205,7 +206,7 @@ func New(b Backend, blobs blob.Store, cfg Config) *Store {
 	if cfg.Signals == nil {
 		cfg.Signals = bus.NewLocal()
 	}
-	return &Store{b: b, blobs: blobs, cfg: cfg, notify: newNotifier()}
+	return &Store{b: b, blobs: blobs, cfg: cfg, notify: newNotifier(), leases: newLeaseLines()}
 }
 
 // txOps are a transaction's operations as the store hands them on: the backend's, and the signals

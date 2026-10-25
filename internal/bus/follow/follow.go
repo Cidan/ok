@@ -40,6 +40,16 @@ type Applier interface {
 	Apply(ctx context.Context, e bus.Event) error
 }
 
+// BatchApplier is an Applier that applies a run of a key's events at once: the follower hands it
+// each page of the key's log it reads, from the event after its cursor, and applies an event the
+// stream brings through its key's log, its page with it. ApplyBatch applies the events after the
+// key's cursor and moves the cursor past the last, skipping those at or before it, as Apply does
+// one; it may answer ErrBusy.
+type BatchApplier interface {
+	Applier
+	ApplyBatch(ctx context.Context, evs []bus.Event) error
+}
+
 // ErrBusy is an Applier's answer when another of the group's members is applying the key's events
 // now: catching up leaves the key to it, and an event the stream brings waits for it a while
 // (Follower.BusyWait), then is refused, to come again later.
@@ -94,9 +104,12 @@ func (f *Follower) deliver(ctx context.Context, e bus.Event) error {
 		busyWait = 5 * time.Second
 	}
 	deadline := time.Now().Add(busyWait)
+	_, batches := f.Apply.(BatchApplier)
 	for wait := 10 * time.Millisecond; ; wait = min(2*wait, 500*time.Millisecond) {
-		err := f.through(ctx, e.Key, e.Seq-1)
-		if err == nil {
+		var err error
+		if batches {
+			err = f.through(ctx, e.Key, e.Seq)
+		} else if err = f.through(ctx, e.Key, e.Seq-1); err == nil {
 			err = f.Apply.Apply(ctx, e)
 		}
 		if !errors.Is(err, ErrBusy) || time.Now().Add(wait).After(deadline) {
@@ -139,13 +152,15 @@ func (f *Follower) catchUp(ctx context.Context) error {
 	})
 }
 
-// through applies key's events from its cursor through seq, in order.
+// through applies key's events from its cursor through seq, in order: a page of its log at a time
+// to a BatchApplier, the whole page though it goes past seq.
 func (f *Follower) through(ctx context.Context, key, seq int64) error {
 	cursors, err := f.Apply.Cursors(ctx, []int64{key})
 	if err != nil {
 		return err
 	}
 	at := cursors[key]
+	batch, batches := f.Apply.(BatchApplier)
 	for at < seq {
 		evs, err := f.Log.Read(ctx, key, at)
 		if err != nil {
@@ -153,6 +168,18 @@ func (f *Follower) through(ctx context.Context, key, seq int64) error {
 		}
 		if len(evs) == 0 {
 			return fmt.Errorf("follow: key %d's log ends at %d, before %d", key, at, seq)
+		}
+		if batches {
+			for i, e := range evs {
+				if e.Seq != at+int64(i)+1 {
+					return fmt.Errorf("follow: key %d's log has %d after %d", key, e.Seq, at+int64(i))
+				}
+			}
+			if err := batch.ApplyBatch(ctx, evs); err != nil {
+				return err
+			}
+			at = evs[len(evs)-1].Seq
+			continue
 		}
 		for _, e := range evs {
 			if e.Seq > seq {

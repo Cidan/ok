@@ -79,40 +79,41 @@ func appendEvent(ctx context.Context, tx *txn, repositoryID int64, ev *scmpb.Eve
 // eventChannel is the notification channel an event's commit signals, with its repository.
 const eventChannel = "ok_scm_events"
 
-// appendEvents records evs with the next places in their repository's log, in order, for the
-// relay to publish, and wakes the relays when the transaction commits. The repository's counter's
-// lock is held until commit, so its log's order is commit order. Call it last, just before
-// commit: the counter is the transaction's last lock, held briefly and never in a deadlock.
+// appendEvents records evs at the next places in their repository's log, in order, for the relay
+// to publish: in commit order. On a backend that sequences after commit they are left pending for
+// the repository's pass, which places them once the transaction commits (sequence.go), and their
+// places are filled in then. Otherwise they are placed now, from the repository's counter, whose
+// lock is held until commit, so the log's order is commit order; call it last, just before commit:
+// the counter is the transaction's last lock, held briefly and never in a deadlock.
 func appendEvents(ctx context.Context, tx *txn, repositoryID int64, evs []*scmpb.Event) error {
 	if len(evs) == 0 {
 		return nil
+	}
+	// Main moved: its code is indexed again (codesearch.go), marked once the transaction commits.
+	for _, ev := range evs {
+		if ev.GetHeadMoved() != nil {
+			tx.markAfter(CodeSearchWork, repositoryID)
+			break
+		}
+	}
+	at := time.Now()
+	if tx.after {
+		return pendEvents(ctx, tx, repositoryID, at, evs)
 	}
 	last, err := tx.ReserveRepositoryEvents(ctx, repositoryID, len(evs))
 	if err != nil {
 		return err
 	}
-	// Main moved: its code is indexed again (codesearch.go).
-	for _, ev := range evs {
-		if ev.GetHeadMoved() != nil {
-			if err := tx.MarkWork(ctx, CodeSearchWork, repositoryID); err != nil {
-				return err
-			}
-			break
-		}
-	}
-	at := time.Now()
-	seqs := make([]int64, len(evs))
-	bodies := make([][]byte, len(evs))
+	out := make([]backend.LogEvent, len(evs))
 	for i, ev := range evs {
-		seqs[i] = last - int64(len(evs)) + 1 + int64(i)
-		ev.RepositoryId, ev.RepositorySeq, ev.At = repositoryID, seqs[i], timestamppb.New(at)
+		ev.RepositoryId, ev.RepositorySeq, ev.At = repositoryID, last-int64(len(evs))+1+int64(i), timestamppb.New(at)
 		body, err := proto.Marshal(ev)
 		if err != nil {
 			return err
 		}
-		bodies[i] = body
+		out[i] = backend.LogEvent{Seq: ev.RepositorySeq, At: at, Body: body}
 	}
-	if err := tx.InsertEvents(ctx, repositoryID, at, seqs, bodies); err != nil {
+	if err := tx.InsertEvents(ctx, repositoryID, out); err != nil {
 		return err
 	}
 	return tx.Notify(ctx, eventChannel, fmt.Sprint(repositoryID))

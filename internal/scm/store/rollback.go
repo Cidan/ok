@@ -69,6 +69,9 @@ func (s *Store) Rollback(ctx context.Context, repo, number int64, actor, reason 
 	case reason == "":
 		return nil, invalid("a rollback says why")
 	}
+	if err := checkNumber(number); err != nil {
+		return nil, err
+	}
 	author, err := s.personOf(ctx, actor)
 	if err != nil {
 		return nil, err
@@ -170,21 +173,22 @@ func (s *Store) Rollback(ctx context.Context, repo, number int64, actor, reason 
 			return err
 		}
 
-		// The CL's number comes from the repository's counter, the last lock before the event
-		// counter, as an upload's does.
-		cl, err := tx.NextChangeListNumbers(ctx, repo, 1)
+		// The CL's number, as an upload's: from the repository's counter, the last lock before the
+		// event counter, or provisional, for its pass.
+		made, given, err := s.newChangeLists(ctx, tx, repo, 1)
 		if err != nil {
 			return err
 		}
+		clID, cl := made[0], given[0]
 		if left == nil {
 			left = []string{}
 		}
-		if err := tx.InsertChangeList(ctx, repo, backend.ChangeList{Number: cl, ChangeID: change[:], Author: actor,
+		if err := tx.InsertChangeList(ctx, repo, backend.ChangeList{ID: clID, Number: cl, ChangeID: change[:], Author: actor,
 			Status: int16(StatusOpen), CurrentPatchset: 1, Description: commit.Description,
 			RollsBack: numbers, RollbackPaths: paths, RollbackLeft: left}); err != nil {
 			return err
 		}
-		if err := tx.InsertPatchset(ctx, repo, backend.Patchset{CL: cl, Number: 1, Commit: id, Base: head, UploadedBy: actor}); err != nil {
+		if err := tx.InsertPatchset(ctx, repo, backend.Patchset{CL: clID, Number: 1, Commit: id, Base: head, UploadedBy: actor}); err != nil {
 			return err
 		}
 		var assign []string
@@ -211,7 +215,16 @@ func (s *Store) Rollback(ctx context.Context, repo, number int64, actor, reason 
 		out = &RollbackResult{ChangeList: created[cl], Event: ev}
 		return nil
 	})
-	return out, err
+	if err != nil || !s.b.SequencesAfterCommit() {
+		return out, err
+	}
+	// Numbered by its pass, which numbered its event too.
+	c, err := s.GetChangeList(ctx, repo, out.Event.GetUploaded().GetNumber())
+	if err != nil {
+		return nil, err
+	}
+	out.ChangeList = &c
+	return out, nil
 }
 
 // rollbackStack is what rolling back CL number rolls back, in the order it landed: the CL, and

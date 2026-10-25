@@ -527,8 +527,9 @@ subtree found to hold no value is remembered by its ID.
 
 - **Every object except file contents** is read from the tail in PostgreSQL, then — trees,
   symlinks, copy histories, and trees' sizes records the tail lacks — from the repository's
-  segments (*Segments*), behind an in-memory cache of decoded objects. Objects are immutable, so
-  the cache is never invalidated.
+  segments (*Segments*), then — a tree a publish stored — from its pack, located as a chunk is
+  (*Storage*), behind an in-memory cache of decoded objects. Objects are immutable, so the cache
+  is never invalidated.
 - **File contents** are read many files at a time, never one by one: every requested file's
   manifest (its size and chunks) with one query per 1,000 files, then the chunks a window at a time
   — up to 16 MiB of them, located with one query — each window's packs read together before its
@@ -584,10 +585,12 @@ half of a cold build's requests in a virtual workspace).
   derivation would chain down a tree (a directory's total size is left out for this reason).
 - **Derived when first read, then kept.** `TreeSizes` serves a record from memory, then the
   `tree_sizes` table, and derives the rest, keeping them; concurrent derivations write the same
-  record, and a tree's deletion cascades to it. Trees no client reads virtually never get one.
-- **Kept where trees are.** A record is keyed by its tree's ID and stored beside the trees, so
-  it moves with them when trees leave PostgreSQL for packs (`this document`,
-  "Sequencing"); its bytes are self-describing — kind byte `0x20`, a version, then LEB128
+  record, and a tree's deletion cascades to it. Trees no client reads virtually never get one. A
+  tree a publish stored, while it is unpinned — a workspace's — has its record kept in each
+  replica's memory alone: compaction moves a kept record into segments once its tree has no row,
+  and a record that outlived its tree there would be kept for good. Pinned, it is kept, as pinning
+  is permanent.
+- **Self-describing.** A record is keyed by its tree's ID; its bytes are self-describing — kind byte `0x20`, a version, then LEB128
   varints, about two bytes an entry where a tree spends about 75 — and held to one encoding by
   golden vectors both languages pass (`internal/scm/encoding/testdata/tree_sizes.json`).
 - **On the wire.** `Store.ReadTreeSizes` answers up to 100,000 trees in one call, and
@@ -658,7 +661,9 @@ monorepo's 13,000 directories is a dozen queries, not one per directory.
 Packs live at `nets/<network id>/packs/<pack id hex>` in the `ok scm` bucket. A pack holds chunks
 of one fork network — a repository and its forks (hosted.md, "Fork networks, as built"), one
 repository's alone until it is forked — whose chunk index says where each chunk is (*The content
-index*). The pack ID is the BLAKE3 of the pack's bytes, and the nonce makes every pack written unique (version 1 packs, written before
+index*), and the trees the publish that wrote it stored, after its chunks: a publish writes no row
+of `object` for a tree, so a workspace's trees cost the database nothing but their content index
+entries. A landing's splice writes the trees it makes as rows, unless a publish stored them. The pack ID is the BLAKE3 of the pack's bytes, and the nonce makes every pack written unique (version 1 packs, written before
 it, have none and are read the same way).
 
 ```
@@ -666,20 +671,23 @@ magic      "OKSCMPAK"                        8 bytes
 version    u32 = 2
 nonce      16 random bytes
 records    repeated:
-  chunk id       32 bytes
+  id             32 bytes: a chunk's, or a tree's
   codec          u8     0 = stored, 1 = zstd, 2 = zstd with a dictionary
   raw length     u32
   stored length  u32
   data           stored-length bytes
-index      u64 count, then (chunk id, u64 offset of its record), sorted by chunk id
+index      u64 count, then (id, u64 offset of its record), sorted by id
 footer     u64 offset of the index, magic "OKSCMEND"
 ```
 
 Chunks are stored with zstd (level 3) unless compression doesn't shrink them; compaction later
 compresses small ones with the network's dictionary (*Dictionaries*), which the frame names.
 The records and index make a pack self-describing, so `ok scm fsck` can verify every pack
-against the content index (hashes, locations, lengths) and rebuild its chunk entries from the object store; a
-chunk compressed with a dictionary is verified with it.
+against the content index (hashes, locations, lengths) and rebuild its locations from the object
+store; a chunk compressed with a dictionary is verified with it. A record carries no kind: an ID
+hashes its kind's byte with the bytes, so a record is a chunk's or a tree's as its bytes hash to its
+ID, which fsck checks against what the content index says it is, and a reader decodes a record only
+as the kind it asks for. A tree's record is its canonical body, compressed as a chunk is.
 
 ### Segments
 
@@ -697,8 +705,13 @@ history goes through the graph's segments in memory and through the tail with on
 each time it enters it, so a deep walk over compacted history costs no query once cached. Main's
 path history moves (a path, a NUL, the generation, and the commit, read by path: a segment's Bloom
 filter holds its paths too, so `Log` by path, `ReadTree`'s last commits, and `Annotate` skip the
-segments that never saw a path), and so do events once the relay has published them (by place in
-the log; a read whose page the tail holds without a gap reads no segment). Operation logs'
+segments that never saw a path), and so do events once the relay has published them and ten
+minutes have passed since they were written (by place in the log; a read whose page the tail holds
+without a gap reads no segment): on Spanner a writer reads its events' places back by its
+transaction once its pass has run, which only the tail records, and another replica's pass may have
+placed them, and the relay published them, before it reads. Landed CLs move as they land; a read of
+CLs reads their rows and their patchsets in one snapshot, so it finds a CL compaction moves meanwhile
+whole, in the tail or in a segment. Operation logs'
 operations and views move once settled, touched 15 days before: collection, finding one only a
 segment holds unreachable, records a tombstone of it, which hides it from every read and moves into
 a segment in turn; re-publishing one only a segment holds puts its row back in the tail, which
@@ -734,21 +747,26 @@ oldest level the tombstones with what they bury.
 ### The content index
 
 What the SCM knows of files and chunks is held in two **content indexes**
-(`internal/scm/internal/contentindex`), compactly in PostgreSQL rather than as rows per file and
-chunk, on one machinery and in one set of tables, each index by its scope; they are ok scm's only
-record of them:
+(`internal/scm/internal/contentindex`), each a log of what transactions changed, in the database,
+and **runs** — sorted files in the bucket, the segments a fold writes — rather than rows per file
+and chunk, on one machinery and in one set of tables, each index by its scope; they are ok scm's
+only record of them:
 
-- **A repository's** holds the files and chunks it holds — each file's size and chunks, each
-  chunk's presence — and for both whether it is pinned and the last day anything wrote or
-  referenced it. It is what the repository may read: a file it lacks is not found through it,
-  whatever its network holds.
-- **Its network's chunk index** holds where each chunk is: its pack, offset, lengths, and codec,
-  pinned when a repository pins the chunk, so a pinned chunk's location folds into the network's
-  segments as its entry folds into the repository's. A read finds a file in the repository's index
-  and its chunks' bytes through the network's; repacking moves chunks in the network's alone.
-- **Which writes which.** A publish records the files and chunks the repository lacks in its
-  index, and the location of each chunk its network lacks one of in the network's — a chunk the
-  network stores already keeps its location, and the new copy is dead bytes compaction reclaims.
+- **A repository's** holds the files, chunks, and trees publishes stored it holds — each file's
+  size and chunks, each chunk's and tree's presence — and for all three whether it is pinned and
+  the last day anything wrote or referenced it. It is what the repository may read: a file it
+  lacks is not found through it, whatever its network holds. The walks — touch, refresh, pin —
+  and garbage collection's mark go through its trees as through rows, reading each tree's body
+  from its pack.
+- **Its network's chunk index** holds where each chunk and tree is: its pack, offset, lengths, and
+  codec, pinned when a repository pins it, so a pinned location folds into the network's runs as
+  its entry folds into the repository's. A read finds a file or tree in the repository's index and
+  its bytes through the network's; repacking moves chunks and trees in the network's alone.
+- **Which writes which.** A publish records the files, chunks, and trees the repository lacks in
+  its index, and the location of each chunk and tree its network lacks one of in the network's —
+  one the network stores already keeps its location, and the new copy is dead bytes compaction
+  reclaims. A sweep in a network of more than one repository releases a chunk or tree rather than
+  drop its location, and the network's collection drops it once no repository holds it.
   The touch and refresh walks touch the repository's; the pin walk pins in both. A sweep drops a
   chunk from the repository's, and in a network of one its location too, in one transaction; in a
   network of more, it releases the chunk (`chunk_release`), and each collection pass drops the
@@ -759,9 +777,21 @@ record of them:
   at once, and the next fold writes a tombstone of it into the newest segment. A transaction
   that writes both takes the repository's lock before the network's.
 
-- **Blocks.** `index_block` holds the index of one generation (`content_index.generation`) as
-  blocks of up to 256 entries in ID order — a small file costs about 120 bytes, its file entry
-  and its chunk's. Each pack is named by its number (`pack.num`), not its 32-byte ID.
+- **Runs.** A fold writes what the log changed since the fold before into runs, every entry whole
+  as it now is — its updates applied, in order, to its newest record — or a tombstone of one it
+  dropped that a run holds; a small file costs about 120 bytes, its file entry and its chunk's.
+  A newer run's record supersedes an older's, so a lookup stops at the newest it finds, through
+  the runs' Bloom filters; runs merge only with their neighbours in age, so no merge puts an older
+  record above a newer one. A repository's index is two kinds of run: pinned (`segIndex`, *Segments*),
+  which forks inherit, and its **unpinned index** (`segIndexUnpinned`), its unpinned entries and
+  their tombstones, which they do not — a fork holds what its parent pinned, not its parent's
+  workspaces. Pinned is permanent there, so a lookup takes the pinned kind's record when it has
+  one, and the unpinned kind's newest otherwise. Each unpinned run carries the day its fold
+  committed (`segment.day`), and merges within its **day group**, the runs one day's folds wrote: a
+  group's two newest while the older holds at most four times the newer's records, and a group
+  whose day has ended into one run. A network's chunk index is one kind, `segIndex`: pinned and
+  unpinned locations, moves, and tombstones, merged by level as segments are. Each pack is named by
+  its number (`pack.num`), not its 32-byte ID.
 - **The log.** Every transaction that changes a file or chunk — a publish storing one, a walk
   touching or pinning one, a sweep dropping one, compaction moving one — writes what it changed
   as `content_log` rows in the same commit — one for each index it changed, or as many as keep
@@ -773,7 +803,10 @@ record of them:
   keeps its **place** in the log, and reads only what committed after it. On Spanner a row carries
   its transaction's commit timestamp (`logged_at`, a staged row its batch marker's), and a
   place is a read's timestamp: what committed by then the read saw, and whatever commits later
-  commits after it. On PostgreSQL a row carries its transaction's ID (`xid`), a place is a
+  commits after it. The index a reader from a place reads through, by commit timestamp, carries a
+  shard before the timestamp, which each row takes at random, and a reader reads every shard: a
+  writer holds its index entry at its pending commit timestamp until it commits, and with no shard
+  every writer of the index held the same one. On PostgreSQL a row carries its transaction's ID (`xid`), a place is a
   snapshot, and a reader reads the rows its snapshot sees that its place's did not; a row's
   `stamp` orders it — a writer holding the index in share mode stamps the index's sequence
   (`content_index.log_seq`), and one holding it alone stamps the next and moves the sequence past
@@ -781,8 +814,9 @@ record of them:
   logging transaction would write.
 - **Writing it.** A transaction that relies on what the index holds — a publish deciding what
   is already stored, the touch, refresh, and pin walks — takes the index's row lock in share mode
-  (`content_index ... FOR SHARE`) and reads the index after it, once — through its own
-  connection, the lock holding the generation and its blocks as they are, and log rows only ever
+  (`content_index ... FOR SHARE`; on Spanner, which locks cells, a read of its `generation`, the
+  cell a lock reads `FOR UPDATE` and a fold writes) and reads the index after it, once — through its own
+  connection, the lock holding the generation and its runs as they are, and log rows only ever
   added; its own puts, touches, and pins count for the rest of it. Everything the store reads
   within a transaction it reads through the transaction (a read that asked the pool for a second
   connection while holding one could, with every connection held so, wait forever), and keeps out
@@ -791,47 +825,57 @@ record of them:
   dropped, and a sweep never drops what a writer touched, pinned, or relied on first; writers run
   beside each other, their changes commuting. Two publishes storing one new chunk at once both
   log it, and the index keeps the copy logged first: the other is dead bytes compaction reclaims.
-- **Folds.** Each garbage collection pass ends by folding the index, and so does compaction into
-  segments once 4,096 entries would move, and so does a tail grown to an eighth of the index's
-  entries — 2,000 rows at least: a replica that finds it so marks its fold due (`fold-due`,
-  `fold-network-due` keyed work), and one replica's folds node runs it. So a fold rewrites the
-  index at most eight times for what was written to it, and the tail a replica loads stays a
-  fraction of the index. The blocks and the log rows one snapshot sees become the next generation,
-  whose blocks hold the unpinned entries; the pinned ones go to an index segment (*Segments*), the
-  newest, with the moves logged of chunks already in segments — their entries there, at their new
-  locations; entries with only a touch or a pin are dropped. The generation records the snapshot's
-  place (`content_index.folded_through`): it holds every row committed by then, and a reader of it
-  reads only the rows after. A fold holds its index's claim (`fold`, `fold-network` keyed work) for
-  its length, so two never overlap: it writes the next generation's blocks first, 500 to a
-  transaction — deleting first any other generation's, which a fold that stopped short left — none
-  read until one short transaction, under the index's lock alone, makes it the generation and
-  records the segment; then it deletes the generation it replaced and the log rows it folded, a
-  bounded transaction at a time (a reader of the old one reads in a snapshot from before), and the
-  staged rows of transactions that never committed, an hour old. Nothing in the transaction that
-  makes the generation reads the log, so writers beside it, logging all the while, do not abort it.
-  A fold that finds another running changes nothing. A new repository starts with an empty index.
-  A move carries each index's generation and the log rows its fold did not read, which the SCM
-  exports itself in the order they apply, numbered 1, 2, … in it: a row's order is otherwise the
-  database's that wrote it (commit timestamps, stamps), which a move does not carry, and so
-  numbered, the destination's database reads that order from the rows alone. Freezing a network
-  is one write, however long its logs.
-- **Compaction works from it.** Which chunks each pack holds, how many of its bytes are live,
-  and which packs are drained come from the network's chunk index; a chunk moves only if the index still has it
-  where compaction read it. Chunks are ordered by the path on `main` of a file that holds them
-  (the path hint a publish sends goes unused).
-- **Reading it.** Each replica holds a repository's tail — its generation's blocks and the log
-  since — in memory, loaded the first time it reads the repository: what is unpinned, and what was
-  pinned since the last fold. A file or chunk the tail lacks is looked for in the index segments,
-  newest first, through their Bloom filters, a chunk there taking the location of the last move the
-  tail logged of it (repacking moves pinned chunks: the tail keeps the move of a chunk it lacks as
-  its location alone). A transaction under the index's lock reads the index segments' manifest
-  through itself, once: only a fold, which takes the lock exclusively, adds to it. Scans of the
-  whole index — compaction's, fsck's, dictionary training's — read the tail, then every index
-  segment. A repository's index is marked stale when this
-  replica commits a change to it or another's commit is announced, and the next read refreshes
-  it first, from one snapshot: the log rows committed after its place, or the whole of a new
-  generation — what it reads is what is new, however long the tail. Readers that find it stale
-  together share one refresh: one that began after a reader asked serves it, so a busy
+- **Folds.** Each garbage collection pass ends by folding the index, and so does compacting a
+  repository fully (a fork's, which takes what is pinned from the runs); otherwise a log folds once
+  it changed 65,536 entries — compaction then folds it, or a replica that finds it so marks its
+  fold due (`fold-due`, `fold-network-due` keyed work) and one replica's folds node runs it. A fold is
+  a generation every replica loads again, its manifest and its log: compaction, which every pin asks
+  for, once folded at 4,096, every ten seconds at a monorepo's peak. A fold
+  reads, in one snapshot, the generation's place, the log since, and the runs, and writes a run of
+  each kind of what the log changed; one short transaction, under the index's lock alone, records
+  the runs and makes the next generation, which records the snapshot's place
+  (`content_index.folded_through`): it holds every row committed by then, and a reader of it reads
+  only the rows after, over its runs. Then it deletes the log rows it folded, a bounded transaction
+  at a time, and the staged rows of transactions that never committed, an hour old, and merges the
+  unpinned index. A fold holds its index's claim (`fold`, `fold-network` keyed work) for its length,
+  so two never overlap; one that finds another running changes nothing. Nothing in the transaction
+  that makes the generation reads the log, so writers beside it, logging all the while, do not
+  abort it. Runs that change otherwise than by a fold, a merge, or garbage collection's retirement —
+  a fork's sync, which takes its parent's pinned runs — make a new generation too. A new repository
+  starts with an empty index. A move carries each index's generation, its runs, and the log rows
+  its fold did not read, which the SCM exports itself in the order they apply, numbered 1, 2, … in
+  it: a row's order is otherwise the database's that wrote it (commit timestamps, stamps), which a
+  move does not carry, and so numbered, the destination's database reads that order from the rows
+  alone. Freezing a network is one write, however long its logs.
+- **Garbage collection reads a day of it.** A run's day is the day its fold committed, so a record
+  is in a run of its day or later. The index keeps the day its last complete pass swept to
+  (`content_index.swept_before`). A pass lists as candidates the unpinned entries last changed
+  before its cutoff's day that the unpinned index's runs of days from that day through the cutoff's
+  hold — normally a day's — and the log, each resolved as the index now holds it. The mark keeps
+  what it reaches, which the pass touches: live for the window again. It ends by folding, waiting
+  for a fold under way, so every candidate's outcome — a tombstone, a touch — is in a run of today;
+  then no run of a day before the cutoff holds what a lookup needs, and one transaction retires
+  them and records the index swept to the cutoff. A record folded late, its run's day after its
+  own, is a candidate in the pass whose window reaches that day.
+- **Compaction works from it.** Which chunks and trees each pack holds, how many of its bytes are
+  live, and which packs are drained come from the network's chunk index; a record moves only if the
+  index still has it where compaction read it. Chunks are ordered by the path on `main` of a file
+  that holds them (the path hint a publish sends goes unused), and trees follow them, copied as
+  stored: the dictionary is files'.
+- **Reading it.** Each replica holds a content index's log since its generation's fold in memory,
+  each entry's updates in order, with the runs its manifest named when it read the generation; a
+  lookup applies an entry's updates to its newest record in the runs. A merge or a retirement
+  since changes no lookup's answer, so a replica reads the runs again only for a new generation, or
+  when a run it names is gone from the bucket. A transaction looks up what it decides by in one
+  batch, through the view it read once it held the index's lock. Scans of the whole index —
+  compaction's, fsck's, dictionary training's, a deletion's — merge every run with the log, the
+  pinned kind's records first. A repository's index is marked stale when this replica commits a
+  change to it or another's commit is announced, and the next read refreshes it first, from one
+  snapshot: the log rows committed after its place, or a new generation's runs and log — what it
+  reads is what is new. The log's rows are read in one statement, a seek into each of its 16 shards
+  from the place (on Spanner an apply join over the shards: `shard IN UNNEST(...)` read each shard
+  from its start). A transaction holding the index in share mode knows its generation from the
+  share, which no fold moves while held, and reads the log alone. Readers that find it stale together share one refresh: one that began after a reader asked serves it, so a busy
   repository's every write staling every replica's index costs each replica a refresh at a time,
   not one a write (`ok_scm_index_refresh_wait_seconds`, `ok_scm_index_refresh_seconds`). Files'
   manifests and sizes, which a file's ID fixes, and a publish's first look at what the repository
@@ -935,7 +979,7 @@ parent's size.
 
 | SCM (the write path) | ok control (review) |
 |---|---|
-| CL identity: repository, number, change ID | reviewers |
+| CL identity: repository, ID, number, change ID | reviewers |
 | the author (the principal who first uploaded the change) | LGTM and Approval grants |
 | status (`draft`, `open`, `submitted`, `abandoned`) and the transitions between them | comments, threads, resolution, and porting across patchsets |
 | patchsets: commit, base, uploader | the `approved` projection and the live approval evaluation (OWNERS read through `Browse` at the head it then lands against) |
@@ -1009,11 +1053,15 @@ transaction does all of the following:
 
 Every patchset write takes the CL's row lock, so an upload, a transition, and a landing on the
 same CL are strictly ordered. An upload locks every CL it can touch — its changes' and its
-parents' — in number order; a new CL's number comes from the repository's own counter row
-(`changelist_counter`), taken after those, just before the event counter. A landing locks the
-repository row first and CL rows after, so an upload never takes the repository row, and the
-two never wait on each other in a cycle. Two uploads creating the same change's CL at once are
-decided by the change ID's uniqueness: the loser runs again and finds the CL.
+parents' — in number order. A new CL gets a random ID, which keys it and its patchsets inside the
+SCM, and a number, by which everything outside knows it — monotonic in the order the uploads that
+make CLs commit, with no gap (see "Sequencing"). On PostgreSQL the number comes from the
+repository's own counter row (`changelist_counter`), taken after those locks, just before the
+event counter; on Spanner the repository's sequencing pass gives it just after the upload commits,
+and the upload answers with it. A landing locks the repository row first and CL rows after, so
+an upload never takes the repository row, and the two never wait on each other in a cycle. Two
+uploads creating the same change's CL at once are decided by the change ID's uniqueness: the
+loser runs again and finds the CL.
 
 ### Lifecycle
 
@@ -1059,20 +1107,20 @@ asked (`docs/automation.md`, "Rollbacks"). It creates a CL that rolls back a lan
 ### Events
 
 Every SCM transaction that changes a repository or a CL writes its events in the same
-transaction, in the repository's log: each takes the next place in that log from the
-repository's own counter row (`repository_seq`), whose lock is held until commit, so the log's
-order is commit order and two repositories' writes never wait on each other (hosted.md, "The
-per-repository log"). The counter is the last lock a transaction takes, just before commit, so it
-never joins a deadlock and holds the order for as short a time as possible. Events are never
-pruned. The same transaction marks the events pending, and the relay — every replica runs one —
-publishes them on the bus's stream (topic `scm.events`, keyed by repository, numbered by
-`repository_seq`) and forgets them: each takes pending events with `FOR UPDATE SKIP LOCKED`, so
-relays beside it take others, and deletes them in the transaction that took them once they are
-published, so one that dies first leaves them for the next. Once the transaction commits, the
-store signals `ok_scm_events` on the bus (docs/hosted.md, "Signals"), which every replica listens
-on and which wakes its relay; the relay also looks every second in case a signal was lost. `Events.Read(repository, after)` reads a
-repository's log from a place in it, a page at a time: what a follower of the stream fills a gap
-with.
+transaction, for the repository's log, where each has its place, `repository_seq`: the log runs
+1, 2, 3, … with no gap, in the order the transactions commit, and two repositories' writes never
+wait on each other (hosted.md, "The per-repository log"; "Sequencing" below says how each backend
+places them). Events are never pruned. A placed event is pending until the relay — every replica
+runs one — publishes it on the bus's stream (topic `scm.events`, keyed by repository, numbered by
+`repository_seq`) and forgets it. On PostgreSQL each relay takes pending events with `FOR UPDATE
+SKIP LOCKED`, so relays beside it take others, and deletes them in the transaction that took them
+once they are published, so one that dies first leaves them for the next. On Spanner a relay reads
+pending events without a lock, takes those no relay holds for a lease in a transaction that reads
+them by key, publishes them, and deletes them by key: its scan holds nothing every placement
+writes. Once events are placed, the store signals `ok_scm_events` on the bus (docs/hosted.md,
+"Signals"), which every replica listens on and which wakes its relay; the relay also looks every
+second in case a signal was lost. `Events.Read(repository, after)` reads a repository's log from a
+place in it, a page at a time: what a follower of the stream fills a gap with.
 
 ok control, ok automation, and ok's deployer follow the stream, every replica of each a
 member of the role's group, which shares the repositories among them (`internal/bus/follow`;
@@ -1087,6 +1135,39 @@ patchset arrives, and to re-derive every active CL's approval when a landing edi
 `Transition`, `Rollback`, and `Land` return the last event they wrote, by its place in its
 repository's log, so ok control can wait until its follower has applied its own action before it
 renders the page that follows.
+
+### Sequencing
+
+A repository's CL numbers and its log's places are each given once, in the order its
+transactions commit: two orders every request of a repository shares. Where they are given is
+the backend's.
+
+- **On PostgreSQL**, in the transaction, from the repository's counters (`changelist_counter`,
+  `repository_event_counter`), the last locks it takes: a row lock is waited for, never aborted,
+  and the statements after it take microseconds, so writers queue on the counters briefly, and
+  the counter's order is commit order.
+- **On Spanner**, after the transaction commits. Spanner aborts the younger of two transactions
+  that meet on a row and holds every lock to commit, so a row every request of a repository writes
+  served one request at a time, aborting the rest: at a working day's peak, half of a monorepo's
+  uploads. So a transaction leaves what it makes pending (`sequence_pending`), keyed by its commit
+  timestamp, a random tie of its own, and its place in it: each CL it makes, numbered meanwhile
+  by its ID negated — unique as numbers are, so it keys the CL and names it as a parent until
+  then — and each event, its CLs named so. Just after it commits, the writer runs the
+  repository's **sequencing pass**, a transaction of a few statements: it reads the pending rows
+  without a lock, in commit order, takes those still pending by key, gives the CLs the next
+  numbers and the events the next places — the CLs and patchsets stacked on a new CL, and the
+  events naming one, theirs too — and deletes them. A strong read sees every row committed before
+  it, and one committed after carries a later timestamp, so each pass gives after every earlier
+  one, whichever replica ran it. A replica runs one pass at a time per repository, each serving
+  every writer that committed before it began, so under load one pass sequences many writes.
+- **A request answers once its pass has run**, with its CLs' numbers and its events' places,
+  however many replicas' passes ran meanwhile: a writer finds its events by its tie
+  (`event.txn`). A provisional number is never shown outside the SCM: a read that meets one runs
+  the repository's pass first and reads again, and the API refuses a number below 1.
+- **Nothing is left unsequenced.** A writer that stops between its commit and its pass leaves its
+  rows; every replica sweeps every five seconds for rows pending longer, and runs their
+  repositories' passes. A move's freeze runs the passes of the network's repositories, so its
+  export carries nothing pending.
 
 ## Submit: path-level landing
 
@@ -1207,10 +1288,12 @@ repositories themselves are never deleted (see "Decisions").
 - **Pinning.** Everything reachable from `main` or from any CL patchset (of any status: comments
   anchor to old patchsets, and an abandoned CL can be restored) is permanent. Upload and landing
   set `pinned` on each newly reachable commit, tree, file, symlink, copy history, and chunk,
-  stopping at objects already pinned, so the cost is proportional to what is new. A pin walk
-  that finds an object missing fails the transaction instead of pinning a dangling graph; a
-  landing whose splice wrote an object it found already stored, which a sweep then took, runs
-  again and stores it anew.
+  stopping at objects already pinned, so the cost is proportional to what is new. An upload finds
+  what it will pin before its transaction, from one snapshot — a commit's graph is immutable, and
+  pinned is permanent — and its transaction pins that a kind at a time, a statement or two each,
+  rather than a level of the graph at a time. A pin that finds an object missing fails the
+  transaction instead of pinning a dangling graph; a landing whose splice wrote an object it found
+  already stored, which a sweep then took, runs again and stores it anew.
 - **Operation-log retention follows jj.** Every operation reachable from an operation log's heads
   is kept, with its view and `commit_predecessors`. That is jj's own semantics, where any past
   state can be restored, and it matches CitC's snapshot history. A user sheds history with
@@ -1414,17 +1497,18 @@ binary is refused. The tables:
 
 - **`repository`** (name, creator, `head` and `head_seq` for main) and **`head_log`**, every move
   of main, one row per landed commit.
-- **Content, per repository:** `object` (trees, symlinks, and copy histories as canonical
-  bodies), `commit` (body, change ID, generation, conflict flag) with its `commit_parent` edges,
+- **Content, per repository:** `object` (symlinks, copy histories, and the trees landings make,
+  as canonical bodies — a publish's trees are in its pack, *Storage*), `commit` (body, change ID, generation, conflict flag) with its `commit_parent` edges,
   `copy_parent` (the reverse index `GetRelatedCopies` walks), `commit_path` (the paths each
   commit on main changed, and the directories above them, for `Log` and `ReadTree`), `path_index`
   (landings whose paths are yet to be written, *Landing*), and
-  `tree_sizes` (each tree's sizes record once read, *Tree sizes*; a sweep takes it with its tree).
+  `tree_sizes` (each tree's sizes record once read, but a workspace's, *Tree sizes*; a sweep takes
+  it with its tree).
   Objects, sizes records, copy edges, and commits pinned since compaction last ran are the tail of
   what `segment` records (*Segments*).
 - **File contents:** `pack` (an S3 pack's size, retirement, the dictionary compaction considered
   it with, and its number), `dictionary` (each repository's zstd dictionaries, *Dictionaries*),
-  and the content index — `content_index`, `index_block`, and `content_log` (*The content
+  and the content index — `content_index`, `content_log`, and its runs in `segment` (*The content
   index*) — which holds each file's and chunk's pinning and freshness too. Objects and commits
   carry GC's `pinned` and `touched_at`.
 - **Operation logs:** `op_log`, one per workspace — (repository, principal, workspace) — holding

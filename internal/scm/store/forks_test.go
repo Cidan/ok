@@ -148,10 +148,19 @@ func TestForkNetwork(t *testing.T) {
 		switch tbl {
 		case "segment", "content_index", "repository_event_counter", "event", "event_pending", "workspace", "op_log", "dictionary_grant",
 			// The network's, which the fork shares.
-			"pack", "index_block", "content_log", "dictionary", "chunk_release":
+			"pack", "content_log", "dictionary", "chunk_release":
 		default:
 			t.Errorf("forking wrote %d bytes of %s", n, tbl)
 		}
+	}
+
+	// The parent's unpinned index — what it holds of its workspaces — is its own: the fork takes none
+	// of its runs.
+	if len(runsOf(t, p.s, repoScope(p.repo), segIndexUnpinned)) == 0 {
+		t.Fatal("the parent's unpinned entries were folded into no run")
+	}
+	if runs := runsOf(t, p.s, repoScope(f.repo), segIndexUnpinned); len(runs) != 0 {
+		t.Fatalf("the fork took its parent's unpinned runs: %+v", runs)
 	}
 
 	// The fork reads its parent's main as of the fork, on a replica with nothing cached.
@@ -322,8 +331,9 @@ func TestForkNewUpstream(t *testing.T) {
 	}
 }
 
-// A chunk two repositories of a network hold goes once neither does: the first's sweep releases it
-// and its location stays; the second's sweep releases it too, and the network's collection drops it.
+// A chunk or a tree two repositories of a network hold goes once neither does: the first's sweep
+// releases it and its location stays; the second's sweep releases it too, and the network's
+// collection drops it.
 func TestForkReleasesChunks(t *testing.T) {
 	ctx := context.Background()
 	p := newCLEnv(t)
@@ -331,23 +341,32 @@ func TestForkReleasesChunks(t *testing.T) {
 	fr := newFork(t, p.s, p.repo)
 	shared := bytesOf(40_000, 5)
 	chunks := chunkIDs(shared)
+	var tree encoding.ID
 	for _, repo := range []int64{p.repo, fr.ID} {
 		b := newBuilder(t)
-		b.commit(b.tree(fileEntry("shared", b.file(shared))), "unreachable", encoding.RootCommitID)
+		tree = b.tree(fileEntry("shared", b.file(shared)))
+		b.commit(tree, "unreachable", encoding.RootCommitID)
 		mustPublish(t, p.s, repo, alice, b, nil)
 		age(t, p.s, repo, 20)
 	}
 	r, err := p.s.GC(ctx, p.repo, time.Now(), GCOptions{})
-	if err != nil || r.ChunksReleased != int64(len(chunks)) || r.LocationsDropped != 0 {
-		t.Fatalf("the parent's sweep: %s, %v; want its chunks released, their locations kept", r, err)
+	if err != nil || r.ChunksReleased != int64(len(chunks)) || r.TreesReleased != 1 || r.LocationsDropped != 0 {
+		t.Fatalf("the parent's sweep: %s, %v; want its chunks and tree released, their locations kept", r, err)
+	}
+	if res, err := reopen(t, p.s).ReadObjects(ctx, fr.ID, []ObjectRef{{Kind: encoding.KindTree, ID: tree}}); err != nil || !res[0].Found {
+		t.Fatalf("the fork lost the tree its parent swept: %v", err)
 	}
 	if got := readAll(t, reopen(t, p.s), fr.ID, fileID(t, string(shared))); string(got) != string(shared) {
 		t.Fatal("the fork lost the chunks its parent swept")
 	}
-	if r, err = p.s.GC(ctx, fr.ID, time.Now(), GCOptions{}); err != nil || r.ChunksReleased != int64(len(chunks)) || r.LocationsDropped != int64(len(chunks)) {
-		t.Fatalf("the fork's sweep: %s, %v; want its chunks released and their locations dropped", r, err)
+	if r, err = p.s.GC(ctx, fr.ID, time.Now(), GCOptions{}); err != nil || r.ChunksReleased != int64(len(chunks)) || r.TreesReleased != 1 ||
+		r.LocationsDropped != int64(len(chunks))+1 {
+		t.Fatalf("the fork's sweep: %s, %v; want its chunks and tree released and their locations dropped", r, err)
 	}
 	locs := locationsView(t, p.s, p.repo)
+	if _, ok := locs[tree]; ok {
+		t.Error("the tree still has a location once no repository holds it")
+	}
 	for _, c := range chunks {
 		if _, ok := locs[c]; ok {
 			t.Errorf("chunk %s still has a location once no repository holds it", c)
@@ -434,7 +453,7 @@ func TestForkDictionaries(t *testing.T) {
 	clean(t, p.s, fr.ID)
 }
 
-// locationsView is a repository's network's chunk index, whole: each chunk's location.
+// locationsView is a repository's network's chunk index, whole: each chunk's and tree's location.
 func locationsView(t *testing.T, s *Store, repo int64) map[encoding.ID]contentindex.Location {
 	t.Helper()
 	ctx := context.Background()
@@ -444,7 +463,7 @@ func locationsView(t *testing.T, s *Store, repo int64) map[encoding.ID]contentin
 	}
 	out := map[encoding.ID]contentindex.Location{}
 	if err := v.each(ctx, func(id encoding.ID, e contentindex.Entry) bool {
-		if e.Kind == encoding.KindChunk {
+		if contentindex.Located(e.Kind) {
 			out[id] = e.Loc
 		}
 		return true

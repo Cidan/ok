@@ -98,7 +98,9 @@ func (p *pendingTrees) writeTree(t *encoding.Tree) (encoding.ID, error) {
 }
 
 // insert stores the pending trees, keeping only what is reachable from roots (a landing
-// that tried several splices wrote trees it no longer needs).
+// that tried several splices wrote trees it no longer needs), and of them only those the
+// repository's content index does not hold: a tree a publish stored is kept there, where the
+// landing's pin or the candidate's refresh finds it.
 func (p *pendingTrees) insert(ctx context.Context, tx *txn, roots []encoding.ID) error {
 	keep := map[encoding.ID]bool{}
 	var mark func(id encoding.ID)
@@ -127,11 +129,20 @@ func (p *pendingTrees) insert(ctx context.Context, tx *txn, roots []encoding.ID)
 		return nil
 	}
 	sortIDs(idCol)
-	objects := make([]backend.Object, len(idCol))
-	for i, id := range idCol {
-		objects[i] = backend.Object{ID: id, Kind: encoding.KindTree, Body: p.body[id]}
+	held, err := p.s.indexHolds(ctx, tx, p.repo, encoding.KindTree, idCol)
+	if err != nil {
+		return err
 	}
-	_, err := tx.InsertObjects(ctx, p.repo, objects)
+	objects := make([]backend.Object, 0, len(idCol))
+	for _, id := range idCol {
+		if !held[id] {
+			objects = append(objects, backend.Object{ID: id, Kind: encoding.KindTree, Body: p.body[id]})
+		}
+	}
+	if len(objects) == 0 {
+		return nil
+	}
+	_, err = tx.InsertObjects(ctx, p.repo, objects)
 	return err
 }
 

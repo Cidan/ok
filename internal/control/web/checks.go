@@ -130,6 +130,12 @@ func (s *Server) preChecks(ctx context.Context, repo *scmpb.Repository, cl db.Ch
 	return c
 }
 
+// landedFirst reports a CL the SCM landed whose latest submission automation has yet to record so:
+// the landing queue lands it, then records it, and the SCM's feed can bring the landing here first.
+func landedFirst(cl db.ChangeList, sub *automationpb.Submission) bool {
+	return cl.Status == db.StatusSubmitted && sub.GetStatus() == automationpb.Submission_STATUS_ACTIVE
+}
+
 // post is the CL's post, from its latest submission: where it stands, and its runs on the attempt
 // that counts — the one testing, else the one it landed or failed on, else the newest.
 func (s *Server) post(ctx context.Context, repo *scmpb.Repository, cl db.ChangeList, subs submissions) pages.CLPost {
@@ -143,15 +149,19 @@ func (s *Server) post(ctx context.Context, repo *scmpb.Repository, cl db.ChangeL
 	}
 	p := pages.CLPost{Submitted: true, SubmittedBy: people.Handle(ctx, sub.GetSubmittedById())}
 	p.Age, p.AgeTitle = age(sub.GetCreatedAt().AsTime())
-	switch sub.GetStatus() {
-	case automationpb.Submission_STATUS_ACTIVE:
+	switch {
+	case landedFirst(cl, sub):
+		// The SCM landed it, and its feed brought that here before automation recorded its
+		// submission landed: the CL's own status counts.
+		p.Status, p.StatusKind = "Landed", "passed"
+	case sub.GetStatus() == automationpb.Submission_STATUS_ACTIVE:
 		p.Status, p.StatusKind, p.Detail = "Submitting", "running", upperFirst(sub.GetNote())
 		if p.Detail == "" {
 			p.Detail = "Waiting for the landing queue"
 		}
-	case automationpb.Submission_STATUS_LANDED:
+	case sub.GetStatus() == automationpb.Submission_STATUS_LANDED:
 		p.Status, p.StatusKind = "Landed", "passed"
-	case automationpb.Submission_STATUS_FAILED:
+	case sub.GetStatus() == automationpb.Submission_STATUS_FAILED:
 		p.Status, p.StatusKind, p.Detail = "Failed", "failed", upperFirst(sub.GetReason())
 	default:
 		p.Status, p.StatusKind, p.Detail = "Canceled", "canceled", upperFirst(people.Reason(ctx, sub.GetReason(), sub.GetCanceledById()))

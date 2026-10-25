@@ -60,10 +60,12 @@ type Patchset struct {
 // ChangeList is a CL as the SCM owns it (docs/scm.md, "Who owns what").
 type ChangeList struct {
 	Repository int64
-	Number     int64
-	ChangeID   encoding.ChangeID
-	Author     string
-	Status     Status
+	// ID keys the CL inside the SCM; Number names it everywhere else (sequence.go).
+	ID       int64
+	Number   int64
+	ChangeID encoding.ChangeID
+	Author   string
+	Status   Status
 	// AbandonedFrom is the status an abandoned CL returns to when restored; 0 otherwise.
 	AbandonedFrom Status
 	// ParentNumber is the CL this one is stacked on; 0 when it is not stacked.
@@ -105,7 +107,7 @@ func changeListOf(repo int64, r backend.ChangeList, pss []backend.Patchset) (*Ch
 		return nil, fmt.Errorf("CL %d: stored change ID of %d bytes", r.Number, len(r.ChangeID))
 	}
 	c := &ChangeList{
-		Repository: repo, Number: r.Number, ChangeID: encoding.ChangeID(r.ChangeID), Author: r.Author,
+		Repository: repo, ID: r.ID, Number: r.Number, ChangeID: encoding.ChangeID(r.ChangeID), Author: r.Author,
 		Status: Status(r.Status), AbandonedFrom: Status(r.AbandonedFrom), ParentNumber: r.Parent,
 		CurrentPatchset: r.CurrentPatchset, LandedCommit: r.Landed, SubmittedBy: r.SubmittedBy,
 		Description: r.Description, CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,
@@ -127,15 +129,18 @@ func changeListOf(repo int64, r backend.ChangeList, pss []backend.Patchset) (*Ch
 
 // loadChangeLists makes CLs of the tail's rows, all of one repository's, with their patchsets, in
 // the rows' order.
-func loadChangeLists(ctx context.Context, q backend.Ops, repo int64, rows []backend.ChangeList) ([]*ChangeList, error) {
+func (s *Store) loadChangeLists(ctx context.Context, q backend.Ops, repo int64, rows []backend.ChangeList) ([]*ChangeList, error) {
 	if len(rows) == 0 {
 		return nil, nil
 	}
-	numbers := make([]int64, len(rows))
-	for i, r := range rows {
-		numbers[i] = r.Number
+	if s.afterChangeListRows != nil {
+		s.afterChangeListRows()
 	}
-	pss, err := q.Patchsets(ctx, repo, numbers)
+	ids := make([]int64, len(rows))
+	for i, r := range rows {
+		ids[i] = r.ID
+	}
+	pss, err := q.Patchsets(ctx, repo, ids)
 	if err != nil {
 		return nil, err
 	}
@@ -145,7 +150,7 @@ func loadChangeLists(ctx context.Context, q backend.Ops, repo int64, rows []back
 	}
 	out := make([]*ChangeList, 0, len(rows))
 	for _, r := range rows {
-		c, err := changeListOf(repo, r, byCL[r.Number])
+		c, err := changeListOf(repo, r, byCL[r.ID])
 		if err != nil {
 			return nil, err
 		}
@@ -178,7 +183,7 @@ func (s *Store) readChangeLists(ctx context.Context, q backend.Ops, repo int64, 
 	if err != nil {
 		return nil, err
 	}
-	cls, err := loadChangeLists(ctx, q, repo, rows)
+	cls, err := s.loadChangeLists(ctx, q, repo, rows)
 	if err != nil {
 		return nil, err
 	}
@@ -226,9 +231,62 @@ func (s *Store) clStatus(ctx context.Context, q backend.Ops, repo, number int64)
 	return 0, notFound("CL %d", number)
 }
 
+// checkNumber refuses a CL number no CL is named by outside the SCM.
+func checkNumber(number int64) error {
+	if number <= 0 {
+		return invalid("CL %d: CL numbers start at 1", number)
+	}
+	return nil
+}
+
+// sequencedRead runs read, which reads CLs of repo, over one snapshot of the database
+// (inSnapshot) — a CL's row and its patchsets read together, so a landed CL compaction moves into
+// segments meanwhile is read whole from one or the other, never its row without its patchsets — and
+// again once their pass has run, if any it read was provisional (ensureSequenced): every read
+// outside the SCM's transactions shows numbers alone. Within a transaction, it reads through it.
+func (s *Store) sequencedRead(ctx context.Context, repo int64, read func(ctx context.Context, q backend.Ops) ([]backend.ChangeList, error)) error {
+	for {
+		var rows []backend.ChangeList
+		var err error
+		if inTxContext(ctx) {
+			rows, err = read(ctx, s.ops(ctx))
+		} else {
+			err = s.inSnapshot(ctx, func(ctx context.Context, tx *txn) error {
+				var err error
+				rows, err = read(ctx, tx)
+				return err
+			})
+		}
+		if err != nil {
+			return err
+		}
+		again, err := s.ensureSequenced(ctx, repo, rows)
+		if err != nil || !again {
+			return err
+		}
+	}
+}
+
+// changeListRows are the rows of cls, for ensureSequenced.
+func changeListRows(cls map[int64]*ChangeList) []backend.ChangeList {
+	out := make([]backend.ChangeList, 0, len(cls))
+	for _, c := range cls {
+		out = append(out, backend.ChangeList{Number: c.Number, Parent: c.ParentNumber})
+	}
+	return out
+}
+
 // GetChangeList returns one CL.
 func (s *Store) GetChangeList(ctx context.Context, repo, number int64) (ChangeList, error) {
-	cls, err := s.readChangeLists(ctx, s.ops(ctx), repo, []int64{number}, false)
+	if err := checkNumber(number); err != nil {
+		return ChangeList{}, err
+	}
+	var cls map[int64]*ChangeList
+	err := s.sequencedRead(ctx, repo, func(ctx context.Context, q backend.Ops) ([]backend.ChangeList, error) {
+		var err error
+		cls, err = s.readChangeLists(ctx, q, repo, []int64{number}, false)
+		return changeListRows(cls), err
+	})
 	if err != nil {
 		return ChangeList{}, err
 	}
@@ -256,11 +314,19 @@ func (s *Store) ListChangeLists(ctx context.Context, repo int64, statuses []Stat
 	for i, st := range statuses {
 		sts[i] = int16(st)
 	}
-	rows, err := s.ops(ctx).ListChangeLists(ctx, repo, before, sts, author, parent, pageSize+1)
-	if err != nil {
-		return nil, 0, err
+	if parent < 0 || before < 0 {
+		return nil, 0, invalid("CL numbers start at 1")
 	}
-	cls, err := loadChangeLists(ctx, s.ops(ctx), repo, rows)
+	var rows []backend.ChangeList
+	var cls []*ChangeList
+	err := s.sequencedRead(ctx, repo, func(ctx context.Context, q backend.Ops) ([]backend.ChangeList, error) {
+		var err error
+		if rows, err = q.ListChangeLists(ctx, repo, before, sts, author, parent, pageSize+1); err != nil {
+			return nil, err
+		}
+		cls, err = s.loadChangeLists(ctx, q, repo, rows)
+		return rows, err
+	})
 	if err != nil {
 		return nil, 0, err
 	}
@@ -311,11 +377,15 @@ func (s *Store) LookupChanges(ctx context.Context, repo int64, changeIDs []encod
 	for i := range changeIDs {
 		keys[i] = changeIDs[i][:]
 	}
-	rows, err := s.ops(ctx).ChangeListsOfChanges(ctx, repo, keys)
-	if err != nil {
-		return nil, err
-	}
-	cls, err := loadChangeLists(ctx, s.ops(ctx), repo, rows)
+	var cls []*ChangeList
+	err := s.sequencedRead(ctx, repo, func(ctx context.Context, q backend.Ops) ([]backend.ChangeList, error) {
+		rows, err := q.ChangeListsOfChanges(ctx, repo, keys)
+		if err != nil {
+			return nil, err
+		}
+		cls, err = s.loadChangeLists(ctx, q, repo, rows)
+		return rows, err
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -368,6 +438,9 @@ func (s *Store) Transition(ctx context.Context, repo, number int64, kind Transit
 	if kind != Abandon && reason != "" {
 		return ChangeList{}, nil, invalid("only abandon takes a reason")
 	}
+	if err := checkNumber(number); err != nil {
+		return ChangeList{}, nil, err
+	}
 	var out ChangeList
 	var ev *scmpb.Event
 	err := s.inTx(ctx, func(ctx context.Context, tx *txn) error {
@@ -413,7 +486,7 @@ func (s *Store) Transition(ctx context.Context, repo, number int64, kind Transit
 			f := int16(from)
 			abandonedFrom = &f
 		}
-		if err := tx.SetChangeListStatus(ctx, repo, number, int16(to), abandonedFrom); err != nil {
+		if err := tx.SetChangeListStatus(ctx, repo, c.ID, int16(to), abandonedFrom); err != nil {
 			return err
 		}
 		cls, err = s.lockChangeLists(ctx, tx, repo, []int64{number})

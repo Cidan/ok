@@ -1,16 +1,17 @@
 // Package pack is the SCM's pack file format (docs/scm.md, "Storage"): the S3
-// object that holds one repository's file-content chunks. Integers are little-endian.
+// object that holds one repository's file-content chunks, and the trees the publish that wrote it
+// stored beside them. Integers are little-endian.
 //
 //	magic      "OKSCMPAK"                        8 bytes
 //	version    u32 = 2
 //	nonce      16 random bytes
 //	records    repeated:
-//	  chunk id       32 bytes
+//	  id             32 bytes: a chunk's, or a tree's
 //	  codec          u8     0 = stored, 1 = zstd, 2 = zstd with the repository's dictionary
 //	  raw length     u32
 //	  stored length  u32
 //	  data           stored-length bytes
-//	index      u64 count, then (chunk id, u64 offset of its record), sorted by chunk id
+//	index      u64 count, then (id, u64 offset of its record), sorted by id
 //	footer     u64 offset of the index, magic "OKSCMEND"
 //
 // A pack's ID is the BLAKE3-256 of all of its bytes. The nonce makes every pack written
@@ -18,7 +19,9 @@
 // once garbage collection deletes a pack, nothing can write that key again. Version 1
 // packs, written before the nonce, have no nonce and are read the same way. The records and
 // index make a pack self-describing, so fsck can verify it against PostgreSQL and rebuild
-// chunk rows from it. A chunk stored with a dictionary names it in its zstd frame's header
+// chunk rows from it. A record holds a chunk's bytes, or a tree's canonical body — its ID that
+// body's under the tree's kind (encoding.IDOf) — which the content index says it is: a record
+// carries no kind, and is checked against the ID of the kind its reader asks for (DecodeObject). A chunk stored with a dictionary names it in its zstd frame's header
 // (RFC 8878 §3.1.1.1.3), and decoding it needs the dictionary: a Dicts.
 package pack
 
@@ -90,10 +93,28 @@ type Location struct {
 // DataOffset is the offset of the record's stored bytes.
 func (l Location) DataOffset() int64 { return l.Offset + RecordHeaderLen }
 
-// Record is one chunk's record, as read back from a pack.
+// Record is one record, as read back from a pack: a chunk's, or a tree's.
 type Record struct {
 	ID encoding.ID
+	// Kind is what the record holds: what its bytes hash to its ID as — a chunk, or a tree (Verify).
+	// A record read without its bytes has none.
+	Kind encoding.Kind
 	Location
+}
+
+// Kinds are what a pack's records hold.
+var Kinds = []encoding.Kind{encoding.KindChunk, encoding.KindTree}
+
+// KindOf is the kind, among Kinds, raw's ID is id as; false for none.
+func KindOf(id encoding.ID, raw []byte) (encoding.Kind, bool) {
+	for _, k := range Kinds {
+		h := encoding.NewHasher(k)
+		h.Write(raw)
+		if h.Sum() == id {
+			return k, true
+		}
+	}
+	return 0, false
 }
 
 // Error reports a pack that is not well formed.
@@ -178,18 +199,18 @@ func (pw *Writer) Add(id encoding.ID, raw []byte) (Location, error) {
 	return pw.add(id, codec, uint32(len(raw)), stored)
 }
 
-// AddStored appends a chunk's record as another pack stored it — its codec, raw length, and
-// stored bytes — without re-encoding them, as compaction copies chunks; or as compaction
-// re-encoded it, with a dictionary. The stored bytes must decode to the chunk (d decodes a
-// dictionary's).
-func (pw *Writer) AddStored(d Dicts, id encoding.ID, codec Codec, rawLength uint32, stored []byte) (Location, error) {
+// AddStored appends a chunk's or a tree's (kind) record as another pack stored it — its codec, raw
+// length, and stored bytes — without re-encoding them, as compaction copies records; or as
+// compaction re-encoded it, with a dictionary. The stored bytes must decode to the record's (d
+// decodes a dictionary's).
+func (pw *Writer) AddStored(d Dicts, kind encoding.Kind, id encoding.ID, codec Codec, rawLength uint32, stored []byte) (Location, error) {
 	if pw.err != nil {
 		return Location{}, pw.err
 	}
 	if pw.seen[id] {
-		return Location{}, fmt.Errorf("pack: chunk %s added twice", id)
+		return Location{}, fmt.Errorf("pack: %s %s added twice", kind, id)
 	}
-	if _, err := Decode(d, id, codec, rawLength, stored); err != nil {
+	if _, err := DecodeObject(d, kind, id, codec, rawLength, stored); err != nil {
 		return Location{}, err
 	}
 	return pw.add(id, codec, rawLength, stored)
@@ -254,6 +275,21 @@ func Decode(d Dicts, id encoding.ID, codec Codec, rawLength uint32, stored []byt
 	}
 	if got := ChunkID(raw); got != id {
 		return nil, malformed("chunk %s: bytes hash to %s", id, got)
+	}
+	return raw, nil
+}
+
+// DecodeObject is Decode for a record of an object of kind — a chunk, or a tree — checked against
+// the ID of the kind: BLAKE3 of the kind's byte and the record's raw bytes.
+func DecodeObject(d Dicts, kind encoding.Kind, id encoding.ID, codec Codec, rawLength uint32, stored []byte) ([]byte, error) {
+	raw, err := Decompress(d, id, codec, rawLength, stored)
+	if err != nil {
+		return nil, err
+	}
+	h := encoding.NewHasher(kind)
+	h.Write(raw)
+	if got := h.Sum(); got != id {
+		return nil, malformed("%s %s: bytes hash to %s", kind, id, got)
 	}
 	return raw, nil
 }
@@ -378,8 +414,8 @@ func ReadRecord(r io.ReaderAt, offset int64) (Record, error) {
 
 // Verify checks a whole pack: its bytes hash to wantID, its records tile the space
 // between the header and the index exactly, every record agrees with the index, and
-// every chunk decodes (d, a dictionary's) to bytes that hash to its ID. It returns the records
-// in pack order.
+// every record decodes (d, a dictionary's) to bytes that hash to its ID as one of Kinds. It returns
+// the records in pack order, each with its kind.
 func Verify(r io.ReaderAt, size int64, wantID encoding.ID, d Dicts) ([]Record, error) {
 	h := blake3.New()
 	if _, err := io.Copy(h, io.NewSectionReader(r, 0, size)); err != nil {
@@ -420,9 +456,15 @@ func Verify(r io.ReaderAt, size int64, wantID encoding.ID, d Dicts) ([]Record, e
 		if _, err := r.ReadAt(stored, rec.DataOffset()); err != nil {
 			return nil, err
 		}
-		if _, err := Decode(d, rec.ID, rec.Codec, rec.RawLength, stored); err != nil {
+		raw, err := Decompress(d, rec.ID, rec.Codec, rec.RawLength, stored)
+		if err != nil {
 			return nil, err
 		}
+		kind, ok := KindOf(rec.ID, raw)
+		if !ok {
+			return nil, malformed("record %s: its bytes hash to neither a chunk's ID nor a tree's", rec.ID)
+		}
+		rec.Kind = kind
 		records = append(records, rec)
 		off = end
 	}

@@ -208,6 +208,9 @@ func (w workStore) Renew(ctx context.Context, kind string, key int64, holder str
 func (w workStore) Release(ctx context.Context, kind string, key int64, holder string) (bool, error) {
 	return w.b.ReleaseWork(ctx, kind, key, holder)
 }
+func (w workStore) Let(ctx context.Context, kind string, key int64, holder string) error {
+	return w.b.LetWork(ctx, kind, key, holder)
+}
 func (w workStore) Due(ctx context.Context, kind string, limit int) ([]int64, error) {
 	return w.b.DueWork(ctx, kind, limit)
 }

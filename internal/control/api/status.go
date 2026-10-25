@@ -50,14 +50,24 @@ type target struct {
 
 // load reads the CL a request names, fresh from the SCM.
 func (a *API) load(ctx context.Context, ref *controlpb.CLRef) (*target, error) {
+	return a.loadIn(ctx, ref, nil)
+}
+
+// loadIn is load within a watch (bc not nil): its repository, once found by name, by ID.
+func (a *API) loadIn(ctx context.Context, ref *controlpb.CLRef, bc *blockedCache) (*target, error) {
 	if ref.GetRepository() == "" || ref.GetNumber() < 1 {
 		return nil, invalid("name a CL: its repository and number")
 	}
-	repo, err := a.scm.Repositories.GetRepository(ctx, &scmpb.GetRepositoryRequest{
-		Key: &scmpb.GetRepositoryRequest_Name{Name: ref.GetRepository()},
-	})
+	key := &scmpb.GetRepositoryRequest{Key: &scmpb.GetRepositoryRequest_Name{Name: ref.GetRepository()}}
+	if bc != nil && bc.repo != 0 {
+		key = &scmpb.GetRepositoryRequest{Key: &scmpb.GetRepositoryRequest_Id{Id: bc.repo}}
+	}
+	repo, err := a.scm.Repositories.GetRepository(ctx, key)
 	if err != nil {
 		return nil, err
+	}
+	if bc != nil {
+		bc.repo = repo.GetId()
 	}
 	// ok control reads every repository; the person asking, what Authorize lets them: one they
 	// cannot see is none.
@@ -83,7 +93,7 @@ const readAttempts = 3
 func (a *API) statusOf(ctx context.Context, ref *controlpb.CLRef, bc *blockedCache) (*controlpb.CLStatus, error) {
 	var st *controlpb.CLStatus
 	for attempt := 0; attempt < readAttempts; attempt++ {
-		t, err := a.load(ctx, ref)
+		t, err := a.loadIn(ctx, ref, bc)
 		if err != nil {
 			return nil, err
 		}
@@ -114,10 +124,13 @@ func settled(st *controlpb.CLStatus, headBefore, headAfter []byte) bool {
 	return st.GetPost().GetStatus() != controlpb.Post_STATUS_LANDED || st.GetCl().GetStatus() == controlpb.CL_STATUS_SUBMITTED
 }
 
-// blockedCache remembers what keeps a CL from submitting, per patchset and main's head: the dry
-// run behind it is the SCM's work, and a watch asks every few seconds.
+// blockedCache remembers, across a watch's reads, what keeps a CL from submitting, per patchset and
+// main's head — the dry run behind it is the SCM's work, and a watch asks every few seconds — and
+// the repository it found by name, read by ID from then on: the name is the directory's to resolve,
+// every read again otherwise.
 type blockedCache struct {
 	key, reason string
+	repo        int64
 }
 
 // status reads where t stands. bc, when not nil, carries the submit gates' answer across a

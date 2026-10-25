@@ -21,10 +21,13 @@ func segments(rows pgx.Rows, err error) ([]backend.Segment, error) {
 		var s backend.Segment
 		var idb []byte
 		var scope, kind int16
-		var bound *int64
+		var bound, day *int64
 		if err := r.Scan(&scope, &s.Scope.ID, &s.Net, &kind, &idb, &s.Level, &s.Records, &s.Size, &s.CreatedAt, &s.Age,
-			&s.Inherited, &bound); err != nil {
+			&s.Inherited, &bound, &day); err != nil {
 			return s, err
+		}
+		if day != nil {
+			s.Day = *day
 		}
 		s.Scope.Network = scope == 1
 		s.Kind = segment.Kind(kind)
@@ -38,7 +41,15 @@ func segments(rows pgx.Rows, err error) ([]backend.Segment, error) {
 	})
 }
 
-const segmentColumns = `scope, owner_id, network_id, kind, id, level, records, size, created_at, age, inherited, bound`
+const segmentColumns = `scope, owner_id, network_id, kind, id, level, records, size, created_at, age, inherited, bound, day`
+
+// dayOf is a segment's day as its column holds it: null for none.
+func dayOf(s backend.Segment) *int64 {
+	if s.Day == 0 {
+		return nil
+	}
+	return &s.Day
+}
 
 // boundOf is a segment's bound as its column holds it: null when it is read whole.
 func boundOf(s backend.Segment) *int64 {
@@ -62,9 +73,9 @@ func (x queries) Segments(ctx context.Context, sc backend.Scope, kind segment.Ki
 func (x queries) InsertSegments(ctx context.Context, segs []backend.Segment) error {
 	for _, s := range segs {
 		scope, owner := scopeOf(s.Scope)
-		if _, err := x.q.Exec(ctx, `INSERT INTO segment (scope, owner_id, network_id, kind, id, level, records, size, age, inherited, bound)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CASE WHEN $9::bigint = 0 THEN nextval('segment_age') ELSE $9 END, $10, $11)`,
-			scope, owner, s.Net, int16(s.Kind), s.ID[:], s.Level, s.Records, s.Size, s.Age, s.Inherited, boundOf(s)); err != nil {
+		if _, err := x.q.Exec(ctx, `INSERT INTO segment (scope, owner_id, network_id, kind, id, level, records, size, age, inherited, bound, day)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CASE WHEN $9::bigint = 0 THEN nextval('segment_age') ELSE $9 END, $10, $11, $12)`,
+			scope, owner, s.Net, int16(s.Kind), s.ID[:], s.Level, s.Records, s.Size, s.Age, s.Inherited, boundOf(s), dayOf(s)); err != nil {
 			return err
 		}
 	}
@@ -145,11 +156,11 @@ func (x queries) PinnedPaths(ctx context.Context, repo int64, limit int) ([]back
 	})
 }
 
-func (x queries) SettledEvents(ctx context.Context, repo int64, limit int) ([]backend.Event, error) {
+func (x queries) SettledEvents(ctx context.Context, repo int64, before time.Time, limit int) ([]backend.Event, error) {
 	return events(x.q.Query(ctx, `SELECT e.repository_id, e.repository_seq, e.body FROM event e
-		WHERE e.repository_id = $1 AND NOT EXISTS (SELECT 1 FROM event_pending p
+		WHERE e.repository_id = $1 AND e.at < $3 AND NOT EXISTS (SELECT 1 FROM event_pending p
 			WHERE p.repository_id = e.repository_id AND p.repository_seq = e.repository_seq)
-		ORDER BY e.repository_seq LIMIT $2`, repo, limit))
+		ORDER BY e.repository_seq LIMIT $2`, repo, limit, before))
 }
 
 func (x queries) PinnedCommits(ctx context.Context, repo int64, limit int) ([]backend.PinnedCommit, error) {

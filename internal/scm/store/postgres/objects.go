@@ -88,6 +88,42 @@ func (x queries) CommitBodies(ctx context.Context, repo int64, members []encodin
 	return bodies(x.q.Query(ctx, `SELECT id, body FROM commit WHERE repository_id = $1 AND id = ANY($2)`, repo, ids(members)))
 }
 
+func (x queries) UnpinnedObjects(ctx context.Context, repo int64, kind encoding.Kind, members []encoding.ID) (map[encoding.ID][]byte, map[encoding.ID]bool, error) {
+	return pinStates(x.q.Query(ctx, `SELECT id, pinned, CASE WHEN pinned THEN NULL ELSE body END FROM object
+		WHERE repository_id = $1 AND id = ANY($2) AND kind = $3`, repo, ids(members), int16(kind)))
+}
+
+func (x queries) UnpinnedCommits(ctx context.Context, repo int64, members []encoding.ID) (map[encoding.ID][]byte, map[encoding.ID]bool, error) {
+	return pinStates(x.q.Query(ctx, `SELECT id, pinned, CASE WHEN pinned THEN NULL ELSE body END FROM commit
+		WHERE repository_id = $1 AND id = ANY($2)`, repo, ids(members)))
+}
+
+// pinStates reads rows of an ID, whether it is pinned, and the body of one unpinned.
+func pinStates(rows pgx.Rows, err error) (map[encoding.ID][]byte, map[encoding.ID]bool, error) {
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+	unpinned, pinned := map[encoding.ID][]byte{}, map[encoding.ID]bool{}
+	for rows.Next() {
+		var b, body []byte
+		var p bool
+		if err := rows.Scan(&b, &p, &body); err != nil {
+			return nil, nil, err
+		}
+		id, err := toID(b)
+		if err != nil {
+			return nil, nil, err
+		}
+		if p {
+			pinned[id] = true
+		} else {
+			unpinned[id] = body
+		}
+	}
+	return unpinned, pinned, rows.Err()
+}
+
 func (x queries) CommitGenerations(ctx context.Context, repo int64, members []encoding.ID) (map[encoding.ID]int64, error) {
 	rows, err := x.q.Query(ctx, `SELECT id, generation FROM commit WHERE repository_id = $1 AND id = ANY($2)`, repo, ids(members))
 	if err != nil {

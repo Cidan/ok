@@ -10,6 +10,7 @@ import (
 
 	"github.com/Cidan/ok/internal/scm/encoding"
 	"github.com/Cidan/ok/internal/scm/segment"
+	"github.com/Cidan/ok/internal/scm/store/backend"
 )
 
 // pinned is content a test pinned by uploading it: a commit whose tree holds a file with a copy
@@ -83,16 +84,17 @@ func TestSegmentCompaction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r.Objects != 5 || r.TreeSizes != 1 || r.CopyEdges != 1 || r.Commits != 1 || r.Index != 6 || r.Written != 7 || r.More {
-		t.Fatalf("compaction: %+v; want 5 objects, the root's sizes, 1 copy edge, 1 commit, 2 files and 2 chunks and their "+
-			"network's 2 locations, 7 segments", r)
+	if r.Objects != 3 || r.TreeSizes != 1 || r.CopyEdges != 1 || r.Commits != 1 || r.Index != 12 || r.Written != 7 || r.More {
+		t.Fatalf("compaction: %+v; want 3 objects (the trees a publish stores are the content index's), the root's sizes, "+
+			"1 copy edge, 1 commit, 2 pinned files, 2 chunks, and 2 trees, their network's 6 locations — the unpinned chunk's "+
+			"and tree's too: a network's fold writes every location — 7 segments", r)
 	}
 	left, err := e.s.ops(ctx).PinnedObjects(ctx, e.repo, 100)
 	if err != nil || len(left) != 0 {
 		t.Fatalf("pinned rows left in the tail: %d, %v", len(left), err)
 	}
-	if present, _ := e.s.ops(ctx).ExistingObjects(ctx, e.repo, encoding.KindTree, []encoding.ID{loose}); !present[loose] {
-		t.Fatal("an unpinned tree left the tail")
+	if ent, ok := indexOf(t, e.s, e.repo).Get(loose); !ok || ent.Pinned {
+		t.Fatal("the unpinned tree is not the content index's, unpinned")
 	}
 
 	for name, s := range map[string]*Store{"this replica": e.s, "a replica with nothing cached": reopen(t, e.s)} {
@@ -261,17 +263,29 @@ func TestSegmentMoveSeenByAnotherReplica(t *testing.T) {
 }
 
 // A sweep takes a swept tree's sizes record and a swept copy's edges with it, as the rows' foreign
-// keys once did.
+// keys once did. The tree is a row, as a landing's splice makes one.
 func TestSweepTakesSizesAndEdges(t *testing.T) {
 	ctx := context.Background()
 	e := newCLEnv(t)
 	b := newBuilder(t)
 	parent := b.add(&encoding.CopyHistory{CurrentPath: "p"})
 	cp := b.add(&encoding.CopyHistory{CurrentPath: "c", Parents: []encoding.ID{parent}})
-	tree := b.tree(fileEntry("f", b.file([]byte("f\n"))))
+	f := b.file([]byte("f\n"))
 	mustPublish(t, e.s, e.repo, alice, b, nil)
+	tb := newBuilder(t)
+	tree := tb.tree(fileEntry("f", f))
+	if err := e.s.inTx(ctx, func(ctx context.Context, tx *txn) error {
+		_, err := tx.InsertObjects(ctx, e.repo, []backend.Object{{ID: tree, Kind: encoding.KindTree,
+			Body: tb.body(ObjectRef{Kind: encoding.KindTree, ID: tree})}})
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := e.s.TreeSizes(ctx, e.repo, []encoding.ID{tree}); err != nil {
 		t.Fatal(err)
+	}
+	if kept, err := e.s.ops(ctx).TreeSizes(ctx, e.repo, []encoding.ID{tree}); err != nil || len(kept) != 1 {
+		t.Fatalf("the tree's sizes record, kept: %d, %v", len(kept), err)
 	}
 	later := time.Now().Add(30 * 24 * time.Hour)
 	for _, id := range []encoding.ID{tree, cp, parent} {

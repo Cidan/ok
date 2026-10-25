@@ -19,8 +19,9 @@ func decodeSizes(t *testing.T, b []byte) []uint64 {
 }
 
 // A tree's sizes are its entries', in its order: files' lengths, symlinks' targets', 0 for a
-// subtree. They are derived the first time, kept, and served from memory and then PostgreSQL;
-// a tree the repository does not hold is left out, and the empty tree has none.
+// subtree. They are derived the first time and served from memory; a tree a publish stored, while
+// unpinned, has its record in memory alone, and once pinned has it kept, for every replica. A tree
+// the repository does not hold is left out, and the empty tree has none.
 func TestTreeSizes(t *testing.T) {
 	s := testStore(t)
 	ctx := context.Background()
@@ -59,8 +60,11 @@ func TestTreeSizes(t *testing.T) {
 	if served("derived")-derived != 2 {
 		t.Fatalf("%v derived, want 2 (root and sub, once each)", served("derived")-derived)
 	}
-	if n := dbOf(s).count(t, "tree_sizes", `repository_id = @repo`, map[string]any{"repo": repo}); n != 2 {
-		t.Fatalf("%d kept, want 2", n)
+	keptRows := func() int {
+		return dbOf(s).count(t, "tree_sizes", `repository_id = @repo`, map[string]any{"repo": repo})
+	}
+	if n := keptRows(); n != 0 {
+		t.Fatalf("%d kept of a workspace's unpinned trees, want none", n)
 	}
 
 	// Again: from memory.
@@ -70,7 +74,20 @@ func TestTreeSizes(t *testing.T) {
 	if served("memory")-memory != 1 {
 		t.Fatal("the second read was not from memory")
 	}
-	// A replica that never derived them reads them kept.
+
+	// Pinned, they are kept, and a replica that never derived them reads them kept.
+	if err := s.inTx(ctx, func(ctx context.Context, tx *txn) error {
+		return s.pin(ctx, tx, repo, []ref{{table: tObject, kind: encoding.KindTree, id: root}})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reopen(t, s).TreeSizes(ctx, repo, []encoding.ID{root, sub}); err != nil {
+		t.Fatal(err)
+	}
+	if n := keptRows(); n != 2 {
+		t.Fatalf("%d kept of the pinned trees, want 2", n)
+	}
+	kept = served("kept")
 	other := reopen(t, s)
 	again, err := other.TreeSizes(ctx, repo, []encoding.ID{root, sub})
 	if err != nil {

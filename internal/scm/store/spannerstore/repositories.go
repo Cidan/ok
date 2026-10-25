@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"slices"
 	"sync"
 	"time"
@@ -112,6 +113,7 @@ func (x queries) SetParentSeq(ctx context.Context, id, seq int64) error {
 var repositoryTail = []tableRows{
 	{"tree_sizes", "repository_id = @id"},
 	{"copy_parent", "repository_id = @id"},
+	{"sequence_pending", "repository_id = @id"},
 	{"event_pending", "repository_id = @id"},
 	{"event", "repository_id = @id"},
 	{"candidate", "repository_id = @id"},
@@ -187,8 +189,8 @@ func (x queries) DeleteContentIndexTail(ctx context.Context, sc backend.Scope, l
 	var n int64
 	err := x.write(ctx, func(tx *spanner.ReadWriteTransaction) error {
 		var err error
-		n, err = deleteTail(ctx, tx, []tableRows{{"index_block", `scope = @scope AND owner_id = @owner`},
-			{"content_log", `scope = @scope AND owner_id = @owner`}, {"content_log_batch", `scope = @scope AND owner_id = @owner`}},
+		n, err = deleteTail(ctx, tx, []tableRows{{"content_log", `scope = @scope AND owner_id = @owner`},
+			{"content_log_batch", `scope = @scope AND owner_id = @owner`}},
 			scopeParams(sc), limit)
 		return err
 	})
@@ -200,11 +202,9 @@ const unfinished = `(SELECT repository_id FROM repository_deletion WHERE network
 
 // networkTail are a network's rows DeleteNetworkTail deletes, by @net.
 var networkTail = []tableRows{
-	{"index_block", `scope = 0 AND owner_id IN ` + unfinished},
 	{"content_log", `scope = 0 AND owner_id IN ` + unfinished},
 	{"content_log_batch", `scope = 0 AND owner_id IN ` + unfinished},
 	{"segment", `network_id = @net`},
-	{"index_block", `scope = 1 AND owner_id = @net`},
 	{"content_log", `scope = 1 AND owner_id = @net`},
 	{"content_log_batch", `scope = 1 AND owner_id = @net`},
 	{"pack", `network_id = @net`},
@@ -244,7 +244,7 @@ func (x queries) FinishDeletion(ctx context.Context, id int64) error {
 		if _, err := spannerdata.Update(ctx, tx, `UPDATE segment SET retired_at = `+now+` WHERE scope = 0 AND owner_id = @id AND retired_at IS NULL`, p); err != nil {
 			return err
 		}
-		for _, t := range []string{"index_block", "content_log", "content_log_batch"} {
+		for _, t := range []string{"content_log", "content_log_batch"} {
 			if _, err := deleteAll(ctx, tx, t, `scope = 0 AND owner_id = @id`, p); err != nil {
 				return err
 			}
@@ -363,21 +363,25 @@ func (x queries) SetHead(ctx context.Context, id int64, head encoding.ID, seq in
 
 // bump adds n to a repository's counter in table, made at n if it has none, in tx, and returns
 // it: the counter's row is held until the transaction ends.
+// bump moves a repository's counter in table n on, returning its last: one statement, but for the
+// counter's first, which makes its row.
 func bump(ctx context.Context, tx *spanner.ReadWriteTransaction, table string, repo, n int64) (int64, error) {
 	var last int64
-	p := map[string]any{"repo": repo}
-	ok, err := spannerdata.First(ctx, tx, `SELECT last FROM `+table+` WHERE repository_id = @repo`, p, &last)
-	if err != nil {
+	p := map[string]any{"repo": repo, "n": n}
+	found := false
+	spannertxn.Counted(tx)
+	if err := tx.Query(ctx, spanner.Statement{SQL: `UPDATE ` + table + ` SET last = last + @n WHERE repository_id = @repo THEN RETURN last`,
+		Params: p}).Do(func(row *spanner.Row) error {
+		found = true
+		return row.Columns(&last)
+	}); err != nil {
 		return 0, err
 	}
-	last += n
-	p["last"] = last
-	sql := `INSERT INTO ` + table + ` (repository_id, last) VALUES (@repo, @last)`
-	if ok {
-		sql = `UPDATE ` + table + ` SET last = @last WHERE repository_id = @repo`
+	if found {
+		return last, nil
 	}
-	_, err = spannerdata.Update(ctx, tx, sql, p)
-	return last, err
+	_, err := spannerdata.Update(ctx, tx, `INSERT INTO `+table+` (repository_id, last) VALUES (@repo, @n)`, p)
+	return n, err
 }
 
 func (x queries) ReserveRepositoryEvents(ctx context.Context, repo int64, n int) (int64, error) {
@@ -390,20 +394,21 @@ func (x queries) ReserveRepositoryEvents(ctx context.Context, repo int64, n int)
 	return last, err
 }
 
-func (x queries) InsertEvents(ctx context.Context, repo int64, at time.Time, seqs []int64, bodies [][]byte) error {
-	if len(seqs) == 0 {
+// InsertEvents writes the events and their pending marks as mutations: their places, from the
+// counter the transaction holds, are theirs alone.
+func (x queries) InsertEvents(ctx context.Context, repo int64, evs []backend.LogEvent) error {
+	if len(evs) == 0 {
 		return nil
 	}
-	return x.write(ctx, func(tx *spanner.ReadWriteTransaction) error {
-		p := map[string]any{"repo": repo, "at": micros(at), "seqs": seqs, "bodies": bodies}
-		if _, err := updateIn(ctx, tx, `INSERT INTO event_pending (repository_id, repository_seq)
-			SELECT @repo, s FROM UNNEST(@seqs) AS s`, p, []string{"seqs"}, nil); err != nil {
-			return err
-		}
-		_, err := updateIn(ctx, tx, `INSERT INTO event (repository_id, repository_seq, event_at, body)
-			SELECT @repo, s, @at, @bodies[OFFSET(i)] FROM UNNEST(@seqs) AS s WITH OFFSET i`, p, []string{"seqs", "bodies"}, bodySize(bodies))
-		return err
-	})
+	muts := make([]*spanner.Mutation, 0, 2*len(evs))
+	for _, e := range evs {
+		txn := spanner.NullInt64{Int64: e.Txn, Valid: e.Txn != 0}
+		muts = append(muts,
+			spanner.Insert("event", []string{"repository_id", "repository_seq", "event_at", "txn", "body"},
+				[]any{repo, e.Seq, micros(e.At), txn, e.Body}),
+			spanner.Insert("event_pending", []string{"repository_id", "repository_seq"}, []any{repo, e.Seq}))
+	}
+	return x.write(ctx, func(tx *spanner.ReadWriteTransaction) error { return tx.BufferWrite(muts) })
 }
 
 func (x queries) events(ctx context.Context, sql string, params map[string]any) ([]backend.Event, error) {
@@ -462,25 +467,32 @@ func (x queries) InsertContentIndex(ctx context.Context, sc backend.Scope, gen i
 	return err
 }
 
-// ShareContentIndex reads the content index's row in the operation's transaction, which holds it
-// in share mode until it ends, as every read in a Spanner read-write transaction does: writers
-// that read it run beside each other, and one that locks it (LockContentIndex) waits for them.
-func (x queries) ShareContentIndex(ctx context.Context, sc backend.Scope) (time.Time, bool, error) {
+// ShareContentIndex reads the content index's generation in the operation's transaction, which
+// holds that cell in share mode until it ends, as every read in a Spanner read-write transaction
+// does: writers that read it run beside each other, and one that locks it (LockContentIndex, which
+// reads it FOR UPDATE) waits for them. It must be that cell: Spanner locks cells, and a read of the
+// row that read no cell a lock takes held nothing — a fold committed beside the transactions that
+// relied on the index.
+func (x queries) ShareContentIndex(ctx context.Context, sc backend.Scope) (time.Time, int64, bool, error) {
 	var today civil.Date
-	ok, err := x.one(ctx, `SELECT CURRENT_DATE('UTC') FROM content_index WHERE scope = @scope AND owner_id = @owner`, scopeParams(sc), &today)
+	var gen int64
+	ok, err := x.one(ctx, `SELECT CURRENT_DATE('UTC'), generation FROM content_index WHERE scope = @scope AND owner_id = @owner`,
+		scopeParams(sc), &today, &gen)
 	if err != nil || !ok {
-		return time.Time{}, false, err
+		return time.Time{}, 0, false, err
 	}
-	return day(today), true, nil
+	return day(today), gen, true, nil
 }
 
-func (x queries) LockContentIndex(ctx context.Context, sc backend.Scope) (int64, error) {
+func (x queries) LockContentIndex(ctx context.Context, sc backend.Scope) (int64, time.Time, error) {
 	var gen int64
-	ok, err := x.lockOne(ctx, `SELECT generation FROM content_index WHERE scope = @scope AND owner_id = @owner FOR UPDATE`, scopeParams(sc), &gen)
+	var today civil.Date
+	ok, err := x.lockOne(ctx, `SELECT generation, CURRENT_DATE('UTC') FROM content_index WHERE scope = @scope AND owner_id = @owner FOR UPDATE`,
+		scopeParams(sc), &gen, &today)
 	if err == nil && !ok {
 		err = fmt.Errorf("%s has no content index: %w", sc.Name(), errNoRow)
 	}
-	return gen, err
+	return gen, day(today), err
 }
 
 // logPlace is a read timestamp as a place in a content index's log.
@@ -500,22 +512,23 @@ func placeTime(p backend.LogPlace) (t time.Time, ok bool, err error) {
 	return t, true, nil
 }
 
-// ContentIndexGeneration, IndexBlocks, and ContentLogSince read unlocked.
-func (x queries) ContentIndexGeneration(ctx context.Context, sc backend.Scope) (int64, backend.LogPlace, bool, error) {
-	var gen int64
+// ContentIndexGeneration and ContentLogSince read unlocked.
+func (x queries) ContentIndexGeneration(ctx context.Context, sc backend.Scope) (backend.IndexState, bool, error) {
+	var st backend.IndexState
 	var folded spanner.NullTime
+	var swept spanner.NullInt64
 	var ok bool
 	err := x.unlocked(func(r spannerdata.Reader) error {
 		var err error
-		ok, err = spannerdata.First(ctx, r, `SELECT generation, folded_through FROM content_index WHERE scope = @scope AND owner_id = @owner`,
-			scopeParams(sc), &gen, &folded)
+		ok, err = spannerdata.First(ctx, r, `SELECT generation, folded_through, swept_before FROM content_index
+			WHERE scope = @scope AND owner_id = @owner`, scopeParams(sc), &st.Generation, &folded, &swept)
 		return err
 	})
-	var place backend.LogPlace
 	if folded.Valid {
-		place = logPlace(folded.Time)
+		st.Folded = logPlace(folded.Time)
 	}
-	return gen, place, ok, err
+	st.SweptBefore = swept.Int64
+	return st, ok, err
 }
 
 func (x queries) SetContentIndexGeneration(ctx context.Context, sc backend.Scope, gen int64, folded backend.LogPlace) error {
@@ -529,55 +542,11 @@ func (x queries) SetContentIndexGeneration(ctx context.Context, sc backend.Scope
 	return err
 }
 
-func (x queries) IndexBlocks(ctx context.Context, sc backend.Scope, gen int64) ([][]byte, error) {
+func (x queries) SetContentIndexSwept(ctx context.Context, sc backend.Scope, before int64) error {
 	p := scopeParams(sc)
-	p["gen"] = gen
-	var out [][]byte
-	err := x.unlocked(func(r spannerdata.Reader) error {
-		return spannerdata.Each(ctx, r, `SELECT body FROM index_block WHERE scope = @scope AND owner_id = @owner AND generation = @gen
-			ORDER BY first_id`, p, func(row *spanner.Row) error {
-			var b []byte
-			if err := row.Columns(&b); err != nil {
-				return err
-			}
-			out = append(out, b)
-			return nil
-		})
-	})
-	return out, err
-}
-
-func (x queries) InsertIndexBlocks(ctx context.Context, sc backend.Scope, gen int64, firsts []encoding.ID, bodies [][]byte) error {
-	if len(firsts) == 0 {
-		return nil
-	}
-	p := scopeParams(sc)
-	p["gen"], p["firsts"], p["bodies"] = gen, ids(firsts), bodies
-	_, err := x.execIn(ctx, `INSERT INTO index_block (scope, owner_id, generation, first_id, body)
-		SELECT @scope, @owner, @gen, f, @bodies[OFFSET(i)] FROM UNNEST(@firsts) AS f WITH OFFSET i`, p, []string{"firsts", "bodies"},
-		bodySize(bodies))
+	p["before"] = before
+	_, err := x.exec(ctx, `UPDATE content_index SET swept_before = @before WHERE scope = @scope AND owner_id = @owner`, p)
 	return err
-}
-
-func (x queries) DeleteOtherIndexBlocks(ctx context.Context, sc backend.Scope, keep int64, limit int) (int64, error) {
-	p := scopeParams(sc)
-	p["keep"] = keep
-	var n int64
-	err := x.write(ctx, func(tx *spanner.ReadWriteTransaction) error {
-		var err error
-		n, err = deleteUpTo(ctx, tx, "index_block", `scope = @scope AND owner_id = @owner AND generation != @keep`, p, int64(limit))
-		return err
-	})
-	return n, err
-}
-
-func (x queries) DeleteIndexBlocks(ctx context.Context, sc backend.Scope, gen int64) error {
-	p := scopeParams(sc)
-	p["gen"] = gen
-	return x.write(ctx, func(tx *spanner.ReadWriteTransaction) error {
-		_, err := deleteAll(ctx, tx, "index_block", `scope = @scope AND owner_id = @owner AND generation = @gen`, p)
-		return err
-	})
 }
 
 // ContentLogSince reads, unlocked — in the snapshot, or in a read-only transaction of its own,
@@ -604,27 +573,32 @@ func (x queries) ContentLogSince(ctx context.Context, sc backend.Scope, since ba
 		JOIN content_log@{FORCE_INDEX=content_log_batched} l ON l.scope = b.scope AND l.owner_id = b.owner_id AND l.batch_id = b.batch_id
 		WHERE b.scope = @scope AND b.owner_id = @owner`
 	if have {
-		p["after"] = after
-		direct = `SELECT logged_at, id, body FROM content_log@{FORCE_INDEX=content_log_logged}
-			WHERE scope = @scope AND owner_id = @owner AND batch_id IS NULL AND logged_at > @after`
-		staged += ` AND b.logged_at > @after`
+		// A seek per shard, from after: `shard IN UNNEST(@shards)` read every shard's rows from the
+		// index's start — 18,856 rows scanned for 100 returned, on Omni, against 200 this way.
+		p["after"], p["shards"] = after, logShardList
+		direct = `SELECT l.logged_at, l.id, l.body FROM UNNEST(@shards) AS s
+			JOIN@{JOIN_METHOD=APPLY_JOIN} content_log@{FORCE_INDEX=content_log_logged} l
+				ON l.scope = @scope AND l.owner_id = @owner AND l.shard = s AND l.logged_at > @after
+			WHERE l.batch_id IS NULL`
+		staged = `SELECT b.logged_at, l.id, l.body FROM content_log_batch@{FORCE_INDEX=content_log_batch_logged} b
+			JOIN content_log@{FORCE_INDEX=content_log_batched} l ON l.scope = b.scope AND l.owner_id = b.owner_id AND l.batch_id = b.batch_id
+			WHERE b.scope = @scope AND b.owner_id = @owner AND b.logged_at > @after`
 	}
 	var read time.Time
 	if err := x.unlocked(func(r spannerdata.Reader) error {
 		rows = nil
-		for _, sql := range []string{direct, staged} {
-			if err := spannerdata.Each(ctx, r, sql, p, func(row *spanner.Row) error {
-				var at spanner.NullTime
-				var l logRow
-				if err := row.Columns(&at, &l.id, &l.body); err != nil {
-					return err
-				}
-				l.at = at.Time
-				rows = append(rows, l)
-				return nil
-			}); err != nil {
+		// One statement, one round trip: every replica reads this each time a write stales its view.
+		if err := spannerdata.Each(ctx, r, direct+" UNION ALL "+staged, p, func(row *spanner.Row) error {
+			var at spanner.NullTime
+			var l logRow
+			if err := row.Columns(&at, &l.id, &l.body); err != nil {
 				return err
 			}
+			l.at = at.Time
+			rows = append(rows, l)
+			return nil
+		}); err != nil {
+			return err
 		}
 		var err error
 		read, err = r.(*spanner.ReadOnlyTransaction).Timestamp()
@@ -645,8 +619,21 @@ func (x queries) ContentLogSince(ctx context.Context, sc backend.Scope, since ba
 	return out, logPlace(read), nil
 }
 
-const insertContentLog = `INSERT INTO content_log (scope, owner_id, id, created_at, body, batch_id, logged_at)
-	VALUES (@scope, @owner, @id, ` + now + `, @body, @batch, PENDING_COMMIT_TIMESTAMP())`
+const insertContentLog = `INSERT INTO content_log (scope, owner_id, id, created_at, body, batch_id, logged_at, shard)
+	VALUES (@scope, @owner, @id, ` + now + `, @body, @batch, PENDING_COMMIT_TIMESTAMP(), @shard)`
+
+// logShards is how many shards the content log's commit-timestamp index has (migration 0010): a
+// writer's rows take one at random, so writers hold that many pending-timestamp keys between them.
+const logShards = 16
+
+// logShardList is every shard, for a reader of the log.
+var logShardList = func() []int64 {
+	out := make([]int64, logShards)
+	for i := range out {
+		out[i] = int64(i)
+	}
+	return out
+}()
 
 // logID numbers a transaction's next content log row: from a random base, in order, so its rows
 // apply in theirs; a write outside a transaction takes a number of its own.
@@ -672,7 +659,8 @@ func (x queries) logID() int64 {
 // table a transaction wrote a pending commit timestamp to.
 func (x queries) InsertContentLog(ctx context.Context, sc backend.Scope, body []byte) error {
 	scope, owner := scopeOf(sc)
-	p := map[string]any{"scope": scope, "owner": owner, "id": x.logID(), "body": body, "batch": spanner.NullInt64{}}
+	p := map[string]any{"scope": scope, "owner": owner, "id": x.logID(), "body": body, "batch": spanner.NullInt64{},
+		"shard": rand.Int64N(logShards)}
 	if x.tx == nil {
 		_, err := x.exec(ctx, insertContentLog, p)
 		return err

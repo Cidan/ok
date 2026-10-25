@@ -330,3 +330,83 @@ func TestBusyWhileWaiting(t *testing.T) {
 	}
 	a.once(t, map[int64]int64{1: 2})
 }
+
+// batcher is an applier that applies a page at a time: it records each page, and counts the events
+// handed it one alone, through Apply.
+type batcher struct {
+	*applier
+	batches [][]int64
+	alone   int
+}
+
+func (b *batcher) Apply(ctx context.Context, e bus.Event) error {
+	b.mu.Lock()
+	b.alone++
+	b.mu.Unlock()
+	return b.applier.Apply(ctx, e)
+}
+
+func (b *batcher) ApplyBatch(ctx context.Context, evs []bus.Event) error {
+	b.mu.Lock()
+	if b.busy[evs[0].Key] {
+		b.mu.Unlock()
+		return follow.ErrBusy
+	}
+	var seqs []int64
+	for _, e := range evs {
+		seqs = append(seqs, e.Seq)
+	}
+	b.batches = append(b.batches, seqs)
+	b.mu.Unlock()
+	for _, e := range evs {
+		if err := b.applier.Apply(ctx, e); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// A batch applier is handed each page of a key's log the follower reads, from the event after its
+// cursor — what the stream brings applied through the log, its page with it — so every event is
+// applied once, in order, a page at a time, and none alone through Apply.
+func TestBatches(t *testing.T) {
+	l := &log{keys: map[int64]int64{1: 6, 2: 3}}
+	b := &batcher{applier: &applier{cursors: map[int64]int64{1: 1}}}
+	s := &stream{deliver: []bus.Event{ev(1, 6), ev(1, 3), ev(2, 3), ev(2, 1)}, delivered: make(chan struct{})}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- (&follow.Follower{Stream: s, Topic: "t", Group: "g", Log: l, Apply: b, BusyWait: 50 * time.Millisecond}).Run(ctx)
+	}()
+	deadline := time.After(10 * time.Second)
+	for b.at(1) < 6 || b.at(2) < 3 {
+		select {
+		case err := <-done:
+			t.Fatal(err)
+		case <-deadline:
+			t.Fatal("the follower never caught up")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	<-s.delivered
+	cancel()
+	<-done
+	for i, err := range s.errs {
+		if err != nil {
+			t.Errorf("delivery %d: %v", i, err)
+		}
+	}
+	b.once(t, map[int64]int64{1: 6, 2: 3})
+	if len(b.applied) != 5+3 {
+		t.Errorf("applied %d events, want key 1's 2–6 and key 2's 1–3 once", len(b.applied))
+	}
+	if b.alone != 0 {
+		t.Errorf("%d events handed the batch applier one alone", b.alone)
+	}
+	for _, page := range b.batches {
+		if len(page) == 0 || len(page) > 2 {
+			t.Errorf("a page of %v: the log reads two at a time", page)
+		}
+	}
+}

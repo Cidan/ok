@@ -207,7 +207,9 @@ func (s *Store) checkUpstream(ctx context.Context, f Repository, upstream int64)
 
 // inherit makes the parent's live segments of the inherited kinds the ones repo inherits — those
 // read along main bounded at place follow, or at the parent's own bound if lower — and grants repo
-// the dictionaries the parent may read now.
+// the dictionaries the parent may read now. Its content index's pinned runs are among them, so the
+// index takes a new generation, which every replica's view reads anew (cindex.go): runs that change
+// otherwise than by a merge or a retirement, which change no lookup's answer, are a new generation's.
 func (s *Store) inherit(ctx context.Context, tx *txn, repo, parent, follow int64) error {
 	var segs []backend.Segment
 	for _, kind := range inheritedKinds {
@@ -225,6 +227,25 @@ func (s *Store) inherit(ctx context.Context, tx *txn, repo, parent, follow int64
 	}
 	if _, err := tx.SetInherited(ctx, repo, segs); err != nil {
 		return err
+	}
+	if _, ok, err := tx.ContentIndexGeneration(ctx, repoScope(repo)); err != nil {
+		return err
+	} else if ok {
+		gen, _, err := tx.LockContentIndex(ctx, repoScope(repo))
+		if err != nil {
+			return err
+		}
+		// Read once the index is held: no fold commits meanwhile.
+		st, _, err := tx.ContentIndexGeneration(ctx, repoScope(repo))
+		if err != nil {
+			return err
+		}
+		if err := tx.SetContentIndexGeneration(ctx, repoScope(repo), gen+1, st.Folded); err != nil {
+			return err
+		}
+		if err := tx.Notify(ctx, contentChannel, repoScope(repo).String()); err != nil {
+			return err
+		}
 	}
 	grants, err := s.readableDictionaries(ctx, parent)
 	if err != nil {

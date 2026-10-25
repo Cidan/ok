@@ -513,9 +513,18 @@ func (e *env) describe(p *automationpb.Pre) string {
 // queue does nothing for it until let go, and runs again within a few seconds after.
 func (e *env) holdQueue(repo int64) (letGo func()) {
 	e.t.Helper()
-	_, release, ok, err := work.Claim(e.ctx, e.automation.Work(), store.QueueWork, repo, "the test", 3*time.Second)
-	if err != nil || !ok {
-		e.t.Fatalf("holding repository %d's queue: %v, %v", repo, ok, err)
+	// The queue's runner holds it while it works, and keeps it while what it acts on changes: the
+	// hold waits for it to let go.
+	for deadline := time.Now().Add(time.Minute); ; time.Sleep(50 * time.Millisecond) {
+		_, release, ok, err := work.Claim(e.ctx, e.automation.Work(), store.QueueWork, repo, "the test", 3*time.Second)
+		if err != nil {
+			e.t.Fatalf("holding repository %d's queue: %v", repo, err)
+		}
+		if ok {
+			return release
+		}
+		if time.Now().After(deadline) {
+			e.t.Fatalf("holding repository %d's queue: its runner held it a minute", repo)
+		}
 	}
-	return release
 }

@@ -3,6 +3,7 @@ package spannerstore
 import (
 	"context"
 	"errors"
+	"slices"
 	"time"
 
 	"cloud.google.com/go/spanner"
@@ -14,7 +15,7 @@ import (
 
 // ─── ChangeLists ───
 
-const changelistColumns = `number, change_id, author, status, abandoned_from, parent_number, current_patchset,
+const changelistColumns = `id, number, change_id, author, status, abandoned_from, parent_number, current_patchset,
 	landed_commit, submitted_by, description, created_at, updated_at, rolls_back, rollback_paths, rollback_left`
 
 func changeLists(ctx context.Context, r spannerdata.Reader, sql string, params map[string]any) ([]backend.ChangeList, error) {
@@ -25,7 +26,7 @@ func changeLists(ctx context.Context, r spannerdata.Reader, sql string, params m
 		var abandonedFrom, parent spanner.NullInt64
 		var landed []byte
 		var submittedBy spanner.NullString
-		if err := row.Columns(&c.Number, &c.ChangeID, &c.Author, &status, &abandonedFrom, &parent, &patchset,
+		if err := row.Columns(&c.ID, &c.Number, &c.ChangeID, &c.Author, &status, &abandonedFrom, &parent, &patchset,
 			&landed, &submittedBy, &c.Description, &c.CreatedAt, &c.UpdatedAt, &c.RollsBack, &c.RollbackPaths, &c.RollbackLeft); err != nil {
 			return err
 		}
@@ -56,7 +57,10 @@ func (x queries) changeLists(ctx context.Context, sql string, params map[string]
 }
 
 func (x queries) ChangeLists(ctx context.Context, repo int64, numbers []int64, lock bool) ([]backend.ChangeList, error) {
-	sql := `SELECT ` + changelistColumns + ` FROM changelist WHERE repository_id = @repo AND number IN UNNEST(@numbers) ORDER BY number`
+	// Through the number index, which a read by number names: a scan of the repository's CLs would
+	// lock each in a read-write transaction.
+	sql := `SELECT ` + changelistColumns + ` FROM changelist@{FORCE_INDEX=changelist_number}
+		WHERE repository_id = @repo AND number IN UNNEST(@numbers) ORDER BY number`
 	p := map[string]any{"repo": repo, "numbers": numbers}
 	if !lock {
 		return x.changeLists(ctx, sql, p)
@@ -80,7 +84,7 @@ func int64sOf[T int16 | int32](in []T) []int64 {
 
 func (x queries) ListChangeLists(ctx context.Context, repo, before int64, statuses []int16, author string, parent int64, limit int) ([]backend.ChangeList, error) {
 	return x.changeLists(ctx, `SELECT `+changelistColumns+` FROM changelist
-		WHERE repository_id = @repo AND (@before = 0 OR number < @before)
+		WHERE repository_id = @repo AND number > 0 AND (@before = 0 OR number < @before)
 		  AND (ARRAY_LENGTH(@statuses) = 0 OR status IN UNNEST(@statuses))
 		  AND (@author = '' OR author = @author)
 		  AND (@parent = 0 OR parent_number = @parent)
@@ -89,14 +93,14 @@ func (x queries) ListChangeLists(ctx context.Context, repo, before int64, status
 }
 
 func (x queries) ChangeListsOfChanges(ctx context.Context, repo int64, changes [][]byte) ([]backend.ChangeList, error) {
-	return x.changeLists(ctx, `SELECT `+changelistColumns+` FROM changelist
+	return x.changeLists(ctx, `SELECT `+changelistColumns+` FROM changelist@{FORCE_INDEX=changelist_change}
 		WHERE repository_id = @repo AND change_id IN UNNEST(@changes) ORDER BY number`, map[string]any{"repo": repo, "changes": changes})
 }
 
 func patchsets(ctx context.Context, r spannerdata.Reader, repo int64, cls []int64) ([]backend.Patchset, error) {
 	var out []backend.Patchset
-	err := spannerdata.Each(ctx, r, `SELECT cl_number, number, commit_id, base_commit_id, IFNULL(parent_number, 0), uploaded_by, uploaded_at
-		FROM patchset WHERE repository_id = @repo AND cl_number IN UNNEST(@cls) ORDER BY cl_number, number`,
+	err := spannerdata.Each(ctx, r, `SELECT cl_id, number, commit_id, base_commit_id, IFNULL(parent_number, 0), uploaded_by, uploaded_at
+		FROM patchset WHERE repository_id = @repo AND cl_id IN UNNEST(@cls) ORDER BY cl_id, number`,
 		map[string]any{"repo": repo, "cls": cls}, func(row *spanner.Row) error {
 			var p backend.Patchset
 			var number int64
@@ -130,32 +134,53 @@ func (x queries) Patchsets(ctx context.Context, repo int64, cls []int64) ([]back
 
 func (x queries) ChangeListStatus(ctx context.Context, repo, number int64) (int16, bool, error) {
 	var st int64
-	ok, err := x.one(ctx, `SELECT status FROM changelist WHERE repository_id = @repo AND number = @number`,
+	ok, err := x.one(ctx, `SELECT status FROM changelist@{FORCE_INDEX=changelist_number} WHERE repository_id = @repo AND number = @number`,
 		map[string]any{"repo": repo, "number": number}, &st)
 	return int16(st), ok, err
 }
 
-func (x queries) SetChangeListStatus(ctx context.Context, repo, number int64, status int16, abandonedFrom *int16) error {
+func (x queries) SetChangeListStatus(ctx context.Context, repo, id int64, status int16, abandonedFrom *int16) error {
 	from := spanner.NullInt64{}
 	if abandonedFrom != nil {
 		from = spanner.NullInt64{Int64: int64(*abandonedFrom), Valid: true}
 	}
 	_, err := x.exec(ctx, `UPDATE changelist SET status = @status, abandoned_from = @from, updated_at = `+now+`
-		WHERE repository_id = @repo AND number = @number`, map[string]any{"repo": repo, "number": number, "status": int64(status), "from": from})
+		WHERE repository_id = @repo AND id = @id`, map[string]any{"repo": repo, "id": id, "status": int64(status), "from": from})
 	return err
 }
 
-func (x queries) SetLanded(ctx context.Context, repo, number int64, status int16, commit encoding.ID, by string) error {
+func (x queries) SetLanded(ctx context.Context, repo, id int64, status int16, commit encoding.ID, by string) error {
 	_, err := x.exec(ctx, `UPDATE changelist SET status = @status, landed_commit = @commit, submitted_by = @by, updated_at = `+now+`
-		WHERE repository_id = @repo AND number = @number`,
-		map[string]any{"repo": repo, "number": number, "status": int64(status), "commit": commit[:], "by": by})
+		WHERE repository_id = @repo AND id = @id`,
+		map[string]any{"repo": repo, "id": id, "status": int64(status), "commit": commit[:], "by": by})
 	return err
 }
 
+// UploadChangeLists reads by key alone, through the change and commit indexes, then the CLs of the
+// patchsets found by their IDs: in a read-write transaction a scan, or a join that builds on the
+// repository's CLs, would lock every one, and wait on any another holds.
 func (x queries) UploadChangeLists(ctx context.Context, repo int64, changes, commits [][]byte) ([]int64, error) {
-	return x.int64s(ctx, `SELECT number FROM changelist WHERE repository_id = @repo AND change_id IN UNNEST(@changes)
-		UNION DISTINCT SELECT cl_number FROM patchset WHERE repository_id = @repo AND commit_id IN UNNEST(@commits)`,
-		map[string]any{"repo": repo, "changes": changes, "commits": commits})
+	p := map[string]any{"repo": repo, "changes": changes, "commits": commits}
+	numbers, err := x.int64s(ctx, `SELECT number FROM changelist@{FORCE_INDEX=changelist_change}
+		WHERE repository_id = @repo AND change_id IN UNNEST(@changes)`, p)
+	if err != nil || len(commits) == 0 {
+		return numbers, err
+	}
+	ids, err := x.int64s(ctx, `SELECT DISTINCT cl_id FROM patchset@{FORCE_INDEX=patchset_commit}
+		WHERE repository_id = @repo AND commit_id IN UNNEST(@commits)`, p)
+	if err != nil || len(ids) == 0 {
+		return numbers, err
+	}
+	byID, err := x.ChangeListNumbers(ctx, repo, ids)
+	if err != nil {
+		return nil, err
+	}
+	for _, n := range byID {
+		if !slices.Contains(numbers, n) {
+			numbers = append(numbers, n)
+		}
+	}
+	return numbers, nil
 }
 
 func (x queries) NextChangeListNumbers(ctx context.Context, repo int64, n int64) (int64, error) {
@@ -169,11 +194,11 @@ func (x queries) NextChangeListNumbers(ctx context.Context, repo int64, n int64)
 }
 
 func (x queries) InsertChangeList(ctx context.Context, repo int64, c backend.ChangeList) error {
-	_, err := x.exec(ctx, `INSERT INTO changelist (repository_id, number, change_id, author, status, parent_number, current_patchset,
+	_, err := x.exec(ctx, `INSERT INTO changelist (repository_id, id, number, change_id, author, status, parent_number, current_patchset,
 			description, created_at, updated_at, rolls_back, rollback_paths, rollback_left)
-		VALUES (@repo, @number, @change, @author, @status, @parent, @patchset, @description, `+now+`, `+now+`,
+		VALUES (@repo, @id, @number, @change, @author, @status, @parent, @patchset, @description, `+now+`, `+now+`,
 			@rollsBack, @paths, @left)`,
-		map[string]any{"repo": repo, "number": c.Number, "change": c.ChangeID, "author": c.Author, "status": int64(c.Status),
+		map[string]any{"repo": repo, "id": c.ID, "number": c.Number, "change": c.ChangeID, "author": c.Author, "status": int64(c.Status),
 			"parent": nullable(c.Parent), "patchset": int64(c.CurrentPatchset), "description": c.Description,
 			"rollsBack": orEmpty(c.RollsBack), "paths": orEmpty(c.RollbackPaths), "left": orEmpty(c.RollbackLeft)})
 	if unique(err) {
@@ -182,20 +207,20 @@ func (x queries) InsertChangeList(ctx context.Context, repo int64, c backend.Cha
 	return err
 }
 
-func (x queries) UpdateChangeList(ctx context.Context, repo, number int64, patchset int32, description string, parent *int64, status int16) error {
+func (x queries) UpdateChangeList(ctx context.Context, repo, id int64, patchset int32, description string, parent *int64, status int16) error {
 	par := spanner.NullInt64{}
 	if parent != nil {
 		par = spanner.NullInt64{Int64: *parent, Valid: true}
 	}
 	_, err := x.exec(ctx, `UPDATE changelist SET current_patchset = @patchset, description = @description, parent_number = @parent,
-			status = @status, updated_at = `+now+` WHERE repository_id = @repo AND number = @number`,
-		map[string]any{"repo": repo, "number": number, "patchset": int64(patchset), "description": description, "parent": par,
+			status = @status, updated_at = `+now+` WHERE repository_id = @repo AND id = @id`,
+		map[string]any{"repo": repo, "id": id, "patchset": int64(patchset), "description": description, "parent": par,
 			"status": int64(status)})
 	return err
 }
 
 func (x queries) InsertPatchset(ctx context.Context, repo int64, p backend.Patchset) error {
-	_, err := x.exec(ctx, `INSERT INTO patchset (repository_id, cl_number, number, commit_id, base_commit_id, parent_number, uploaded_by,
+	_, err := x.exec(ctx, `INSERT INTO patchset (repository_id, cl_id, number, commit_id, base_commit_id, parent_number, uploaded_by,
 			uploaded_at)
 		VALUES (@repo, @cl, @number, @commit, @base, @parent, @by, `+now+`)`,
 		map[string]any{"repo": repo, "cl": p.CL, "number": int64(p.Number), "commit": p.Commit[:], "base": p.Base[:],
@@ -203,27 +228,54 @@ func (x queries) InsertPatchset(ctx context.Context, repo int64, p backend.Patch
 	return err
 }
 
+// RollingBack reads unlocked, the statuses' CLs through the status index: in a read-write
+// transaction its scan would lock each, and every write of one would wait on the rollback. The
+// rollback that asks holds its repository's head, as every rollback does, so one committed before
+// it took the head is read here, as of now.
 func (x queries) RollingBack(ctx context.Context, repo int64, numbers []int64, statuses []int16) (int64, bool, error) {
 	var n int64
-	ok, err := x.one(ctx, `SELECT number FROM changelist WHERE repository_id = @repo
-		AND EXISTS (SELECT 1 FROM UNNEST(rolls_back) AS r WHERE r IN UNNEST(@numbers))
-		AND status IN UNNEST(@statuses) ORDER BY number LIMIT 1`,
-		map[string]any{"repo": repo, "numbers": numbers, "statuses": int64sOf(statuses)}, &n)
+	var ok bool
+	err := x.unlocked(func(r spannerdata.Reader) error {
+		var err error
+		ok, err = spannerdata.First(ctx, r, `SELECT number FROM changelist@{FORCE_INDEX=changelist_status} WHERE repository_id = @repo
+			AND status IN UNNEST(@statuses) AND EXISTS (SELECT 1 FROM UNNEST(rolls_back) AS r WHERE r IN UNNEST(@numbers))
+			ORDER BY number LIMIT 1`,
+			map[string]any{"repo": repo, "numbers": numbers, "statuses": int64sOf(statuses)}, &n)
+		return err
+	})
 	return n, ok, err
 }
 
+// StackedOn reads by key alone, as UploadChangeLists does: the patchsets through the parent index,
+// then their CLs by ID.
 func (x queries) StackedOn(ctx context.Context, repo int64, parents []int64) ([][2]int64, error) {
-	var out [][2]int64
-	err := x.rows(ctx, `SELECT DISTINCT parent_number, cl_number FROM patchset WHERE repository_id = @repo AND parent_number IN UNNEST(@parents)`,
-		map[string]any{"repo": repo, "parents": parents}, func() { out = nil }, func(row *spanner.Row) error {
+	var pairs [][2]int64 // (parent, CL ID)
+	err := x.rows(ctx, `SELECT DISTINCT parent_number, cl_id FROM patchset@{FORCE_INDEX=patchset_parent}
+		WHERE repository_id = @repo AND parent_number IS NOT NULL AND parent_number IN UNNEST(@parents)`,
+		map[string]any{"repo": repo, "parents": parents}, func() { pairs = nil }, func(row *spanner.Row) error {
 			var p [2]int64
 			if err := row.Columns(&p[0], &p[1]); err != nil {
 				return err
 			}
-			out = append(out, p)
+			pairs = append(pairs, p)
 			return nil
 		})
-	return out, err
+	if err != nil || len(pairs) == 0 {
+		return nil, err
+	}
+	ids := make([]int64, len(pairs))
+	for i, p := range pairs {
+		ids[i] = p[1]
+	}
+	numbers, err := x.ChangeListNumbers(ctx, repo, ids)
+	if err != nil {
+		return nil, err
+	}
+	out := make([][2]int64, len(pairs))
+	for i, p := range pairs {
+		out[i] = [2]int64{p[0], numbers[p[1]]}
+	}
+	return out, nil
 }
 
 const headMoveColumns = `seq, old_head, new_head, cl_number, patchset, landed_by, landed_at`
@@ -276,10 +328,11 @@ func (x queries) SettledChangeLists(ctx context.Context, repo int64, limit int) 
 			return err
 		}
 		numbers := make([]int64, len(cls))
+		ids := make([]int64, len(cls))
 		for i, c := range cls {
-			numbers[i] = c.Number
+			numbers[i], ids[i] = c.Number, c.ID
 		}
-		pss, err := patchsets(ctx, r, repo, numbers)
+		pss, err := patchsets(ctx, r, repo, ids)
 		if err != nil {
 			return err
 		}
@@ -289,13 +342,13 @@ func (x queries) SettledChangeLists(ctx context.Context, repo int64, limit int) 
 			return err
 		}
 		all := make([]backend.SettledChangeList, 0, len(cls))
-		byNumber := map[int64]int{}
+		byNumber, byID := map[int64]int{}, map[int64]int{}
 		for _, c := range cls {
-			byNumber[c.Number] = len(all)
+			byNumber[c.Number], byID[c.ID] = len(all), len(all)
 			all = append(all, backend.SettledChangeList{ChangeList: c})
 		}
 		for _, p := range pss {
-			o := &all[byNumber[p.CL]]
+			o := &all[byID[p.CL]]
 			o.Patchsets = append(o.Patchsets, p)
 		}
 		landed := map[int64]bool{}

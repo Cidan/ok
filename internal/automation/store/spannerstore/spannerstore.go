@@ -93,6 +93,10 @@ func moveWhere(table string) string {
 // Moves are the backend's rows about repositories, for a move.
 func (b *Backend) Moves() move.Rows { return b.moves }
 
+// FencedWritesBesideEachOther is true: a work fence reads the holder's cell, which a mark does not
+// write (spannerdata.CheckWorkFence).
+func (b *Backend) FencedWritesBesideEachOther() bool { return true }
+
 func (x queries) RunningRuns(ctx context.Context, repos []int64) ([]int64, error) {
 	if repos == nil {
 		repos = []int64{}
@@ -577,6 +581,12 @@ func (x queries) ReleaseWork(ctx context.Context, kind string, key int64, holder
 		return err
 	})
 	return again, err
+}
+
+func (x queries) LetWork(ctx context.Context, kind string, key int64, holder string) error {
+	return x.Write(ctx, func(tx *spanner.ReadWriteTransaction) error {
+		return spannerdata.LetWork(ctx, tx, kind, key, holder)
+	})
 }
 
 func (x queries) DueWork(ctx context.Context, kind string, limit int) ([]int64, error) {

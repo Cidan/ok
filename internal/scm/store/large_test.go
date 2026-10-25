@@ -67,6 +67,8 @@ func TestLargeRepository(t *testing.T) {
 	size := largeCount(t, "OK_TEST_LARGE_BYTES", 200)
 	const stack, changed, publishBatch = 100, 3, 5000
 	ctx := context.Background()
+	defer func(was time.Duration) { eventsSettle = was }(eventsSettle)
+	eventsSettle = 0 // every published event settled
 	e := newCLEnv(t)
 	start := time.Now()
 

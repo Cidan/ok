@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/Cidan/ok/internal/scm/encoding"
 	"github.com/Cidan/ok/internal/scm/segment"
@@ -309,6 +310,8 @@ func readAllEvents(t *testing.T, s *Store, repo, after int64, limit int) []int64
 // segments, still pending in the tail, and an earlier one pending beside a later one moved.
 func TestEventsInSegments(t *testing.T) {
 	ctx := context.Background()
+	defer func(was time.Duration) { eventsSettle = was }(eventsSettle)
+	eventsSettle = 0 // every published event settled
 	e := newCLEnv(t)
 	landSteps(t, e, historySteps(3))
 	st := &stream{}

@@ -9,6 +9,7 @@ import (
 	"github.com/Cidan/ok/internal/blob"
 	"github.com/Cidan/ok/internal/scm/contentindex"
 	"github.com/Cidan/ok/internal/scm/encoding"
+	"github.com/Cidan/ok/internal/scm/pack"
 	"github.com/Cidan/ok/internal/scm/store/backend"
 	"github.com/Cidan/ok/internal/work"
 )
@@ -59,13 +60,16 @@ type GCReport struct {
 	CheckpointsPinned  int
 	// Marked counts the unpinned, stale objects still reachable, which the sweep keeps.
 	Marked int
-	// Rows swept, by table, and the stored bytes of the chunks whose locations went with them.
+	// Rows and entries swept, by table — ObjectsSwept counts trees publishes stored, which the
+	// content index held — and the stored bytes of the chunks and trees whose locations went with
+	// them.
 	CommitsSwept, ObjectsSwept, FilesSwept, ChunksSwept int64
 	ChunkBytesSwept                                     int64
-	// ChunksReleased counts the swept chunks released to the network, whose locations stay until
-	// no repository in it holds them; LocationsDropped, the released chunks of the network's whose
-	// locations the pass dropped (their bytes in ChunkBytesSwept).
-	ChunksReleased, LocationsDropped int64
+	// ChunksReleased and TreesReleased count the swept chunks and trees released to the network,
+	// whose locations stay until no repository in it holds them; LocationsDropped, the released
+	// chunks and trees of the network's whose locations the pass dropped (their bytes in
+	// ChunkBytesSwept).
+	ChunksReleased, TreesReleased, LocationsDropped int64
 	// Compaction: the packs it wrote and retired, the source bytes it read, and the pack
 	// bytes it reclaimed (the retired packs' sizes less the written packs').
 	PacksWritten, PacksRetired int
@@ -82,11 +86,16 @@ type GCReport struct {
 	DictionarySamples                     int
 	Dictionary                            uint32
 	ChunksRecompressed, BytesRecompressed int64
-	// IndexGeneration is the content index generation the pass wrote, of IndexEntries, and
-	// IndexFolded the pinned entries and moves it folded into an index segment; NetworkIndex*
-	// likewise of the repository's network's chunk index.
+	// ContentKept counts the content index's stale files and chunks the mark reached, which the
+	// pass touched.
+	ContentKept int64
+	// IndexGeneration is the content index generation the pass's fold made (0: it had nothing to
+	// fold), IndexEntries the unpinned entries and tombstones it wrote and IndexFolded the pinned
+	// entries, and IndexRunsRetired the unpinned index's runs it retired; NetworkIndex* likewise of
+	// the repository's network's chunk index, whose every record is in NetworkIndexFolded.
 	IndexGeneration                         int64
 	IndexEntries, IndexFolded               int
+	IndexRunsRetired                        int64
 	NetworkIndexGeneration                  int64
 	NetworkIndexEntries, NetworkIndexFolded int
 }
@@ -103,10 +112,13 @@ type GCReport struct {
 //     within sweepGraceDays;
 //  3. the sweep deletes the unpinned objects not touched within sweepGraceDays that the
 //     mark did not reach — commits, then trees and the other objects, then files, then
-//     chunks — each DELETE checking pinned and touched_at again under the row's lock;
+//     chunks — each DELETE checking pinned and touched_at again under the row's lock; the
+//     content index's files and chunks the mark did reach are touched, live for the window again;
 //  4. compaction merges small packs and rewrites sparse ones, retiring what it replaced;
 //  5. packs retired longer than RetiredPackGrace, and orphan packs older than
-//     OrphanPackGrace, are deleted from S3.
+//     OrphanPackGrace, are deleted from S3;
+//  6. the content index is folded, and its unpinned index's runs of the days the sweep covered
+//     retired (sweptTo).
 //
 // A pass is safe beside publishes, uploads, landings, and other passes: nothing reachable
 // or just touched is ever deleted (see the design's argument). Freshness days are the
@@ -168,8 +180,8 @@ func (s *Store) GC(ctx context.Context, repo int64, now time.Time, opts GCOption
 		return r, fmt.Errorf("deleting segments: %w", err)
 	}
 	if !opts.DryRun {
-		if r.IndexGeneration, r.IndexEntries, r.IndexFolded, err = s.RebuildContentIndex(ctx, repo); err != nil {
-			return r, fmt.Errorf("rebuilding the content index: %w", err)
+		if r.IndexGeneration, r.IndexEntries, r.IndexFolded, r.IndexRunsRetired, err = s.sweptTo(ctx, repo, contentindex.DayOf(cutoff)); err != nil {
+			return r, fmt.Errorf("folding the content index: %w", err)
 		}
 		_, netScope, err := s.networkOf(ctx, repo)
 		if err != nil {
@@ -236,11 +248,9 @@ func (s *Store) collectRepository(ctx context.Context, repo int64, keepNewer tim
 var sweepTables = []table{tCommit, tObject, tFile, tChunk}
 
 // candidates lists a table's unpinned rows not touched since cutoff: what the sweep may
-// delete, if the mark does not reach it.
+// delete, if the mark does not reach it. Files and chunks are staleContent's.
 func (s *Store) candidates(ctx context.Context, repo int64, t table, cutoff time.Time) ([]encoding.ID, error) {
 	switch t {
-	case tFile, tChunk:
-		return s.staleContent(ctx, repo, t, cutoff)
 	case tCommit:
 		return s.ops(ctx).StaleCommitIDs(ctx, repo, cutoff)
 	case tObject:
@@ -261,37 +271,116 @@ func sweepRows(ctx context.Context, q backend.Ops, repo int64, t table, batch []
 	return 0, fmt.Errorf("table %d is not a table of repository objects", t)
 }
 
-// staleContent lists the files or chunks the content index has unpinned and untouched since
-// cutoff, in ID order.
-func (s *Store) staleContent(ctx context.Context, repo int64, t table, cutoff time.Time) ([]encoding.ID, error) {
-	li := s.live(repoScope(repo))
-	if err := s.refreshIndex(ctx, repoScope(repo), li); err != nil {
+// staleContent lists the files and chunks the content index has unpinned and untouched since
+// cutoff's day, by kind, in ID order: of the unpinned index's runs, those of days from the index's
+// swept-to day through the cutoff's — a record is in a run of its day or later, and a complete pass
+// left nothing of the days before (sweptTo) — and of the log, each resolved as the index now holds
+// it. A record folded late, its run's day after its own, is listed by the pass whose window reaches
+// its run.
+func (s *Store) staleContent(ctx context.Context, repo int64, cutoff time.Time) (map[encoding.Kind][]encoding.ID, error) {
+	sc := repoScope(repo)
+	li := s.live(sc)
+	if err := s.refreshIndex(ctx, sc, li); err != nil {
 		return nil, err
 	}
-	kind := encoding.KindChunk
-	if t == tFile {
-		kind = encoding.KindFile
+	v := li.view.Load()
+	st, _, err := s.ops(ctx).ContentIndexGeneration(ctx, sc)
+	if err != nil {
+		return nil, err
 	}
 	day := contentindex.DayOf(cutoff)
-	var out []encoding.ID
-	li.x.Load().Range(func(id encoding.ID, e contentindex.Entry) bool {
-		if e.Kind == kind && !e.Pinned && e.Day < day {
-			out = append(out, id)
+	seen := map[encoding.ID]bool{}
+	var maybe []encoding.ID
+	for _, sg := range v.runs.Load().unpinned {
+		if sg.Day < st.SweptBefore || sg.Day > int64(day) {
+			continue
 		}
-		return true
-	})
-	sortIDs(out)
+		if s.scanningRun != nil {
+			s.scanningRun(sg)
+		}
+		r, err := s.segmentReader(ctx, sg)
+		if err != nil {
+			return nil, err
+		}
+		var derr error
+		if err := r.Scan(ctx, nil, nil, func(k, val []byte) bool {
+			e, err := contentindex.DecodeEntry(val)
+			if err != nil {
+				derr = fmt.Errorf("content index entry %x in a run: %w", k, err)
+				return false
+			}
+			if id := encoding.ID(k); e.Body && !e.Pinned && e.Day < day && !seen[id] {
+				seen[id] = true
+				maybe = append(maybe, id)
+			}
+			return true
+		}); err != nil || derr != nil {
+			return nil, errors.Join(err, derr)
+		}
+	}
+	for _, id := range v.log.IDs() {
+		if !seen[id] {
+			seen[id] = true
+			maybe = append(maybe, id)
+		}
+	}
+	out := map[encoding.Kind][]encoding.ID{}
+	for start := 0; start < len(maybe); start += gcResolveBatch {
+		got, err := s.resolveIn(ctx, sc, v, maybe[start:min(start+gcResolveBatch, len(maybe))])
+		if err != nil {
+			return nil, err
+		}
+		for id, e := range got {
+			if !e.Pinned && e.Day < day {
+				out[e.Kind] = append(out[e.Kind], id)
+			}
+		}
+	}
+	for _, ids := range out {
+		sortIDs(ids)
+	}
 	return out, nil
+}
+
+// gcResolveBatch is how many entries garbage collection resolves at once.
+const gcResolveBatch = 4096
+
+// indexedKinds are what the content index holds, by the table a walk names each in: files, chunks,
+// and the trees publishes stored — the object table holds the other objects, and the trees
+// landings made.
+var indexedKinds = []struct {
+	table table
+	kind  encoding.Kind
+}{{tFile, encoding.KindFile}, {tChunk, encoding.KindChunk}, {tObject, encoding.KindTree}}
+
+// indexedKind is the kind the content index holds of what a walk names in t.
+func indexedKind(t table) (encoding.Kind, bool) {
+	for _, k := range indexedKinds {
+		if k.table == t {
+			return k.kind, true
+		}
+	}
+	return 0, false
 }
 
 // markAndSweep marks the stale objects still reachable and sweeps the rest.
 func (s *Store) markAndSweep(ctx context.Context, repo int64, cutoff time.Time, opts GCOptions, r *GCReport) error {
+	content, err := s.staleContent(ctx, repo, cutoff)
+	if err != nil {
+		return err
+	}
 	cands := map[table][]encoding.ID{}
 	found := false
 	for _, t := range sweepTables {
-		c, err := s.candidates(ctx, repo, t, cutoff)
-		if err != nil {
-			return err
+		var c []encoding.ID
+		if t == tCommit || t == tObject {
+			if c, err = s.candidates(ctx, repo, t, cutoff); err != nil {
+				return err
+			}
+		}
+		if kind, ok := indexedKind(t); ok {
+			c = append(c, content[kind]...)
+			sortIDs(c)
 		}
 		cands[t] = c
 		found = found || len(c) > 0
@@ -322,6 +411,8 @@ func (s *Store) markAndSweep(ctx context.Context, repo int64, cutoff time.Time, 
 				r.CommitsSwept += n
 			case tObject:
 				r.ObjectsSwept += n
+				r.ChunkBytesSwept += bytes
+				r.TreesReleased += released
 			case tFile:
 				r.FilesSwept += n
 			case tChunk:
@@ -331,81 +422,187 @@ func (s *Store) markAndSweep(ctx context.Context, repo int64, cutoff time.Time, 
 			}
 		}
 	}
+	if opts.DryRun {
+		return nil
+	}
+	for _, k := range indexedKinds {
+		var kept []encoding.ID
+		for _, id := range cands[k.table] {
+			if marked[ref{table: k.table, id: id}] {
+				kept = append(kept, id)
+			}
+		}
+		for start := 0; start < len(kept); start += gcBatch {
+			n, err := s.touchKept(ctx, repo, k.kind, kept[start:min(start+gcBatch, len(kept))], cutoff)
+			if err != nil {
+				return err
+			}
+			r.ContentKept += n
+		}
+	}
 	return nil
+}
+
+// touchKept touches the files, chunks, or trees (kind) among batch the mark reached that the content
+// index still holds, unpinned and stale, under its row lock in share mode: live for the window again,
+// so the pass's fold writes them to a run of today and the runs it covered hold nothing a lookup
+// needs (sweptTo). It returns how many it touched.
+func (s *Store) touchKept(ctx context.Context, repo int64, kind encoding.Kind, batch []encoding.ID, cutoff time.Time) (int64, error) {
+	var n int64
+	err := s.inTx(ctx, func(ctx context.Context, tx *txn) error {
+		n = 0
+		lg, err := s.txIndex(ctx, tx, repoScope(repo))
+		if err != nil {
+			return err
+		}
+		if err := lg.load(ctx, batch); err != nil {
+			return err
+		}
+		day := contentindex.DayOf(cutoff)
+		for _, id := range batch {
+			e, ok, err := lg.has(ctx, kind, id)
+			if err != nil {
+				return err
+			}
+			if ok && !e.Pinned && e.Day < day {
+				s.logIndex(tx, repoScope(repo), touchUpdate(kind, id, lg.today.Time()))
+				n++
+			}
+		}
+		return nil
+	})
+	return n, err
+}
+
+// sweptTo ends a pass of garbage collection that swept a repository's content index to day: every
+// unpinned entry the unpinned index's runs of days before it held, last changed before it, listed
+// (staleContent) and swept, or touched if the mark reached it, all logged by now. It folds the
+// index, waiting for a fold under way to end — so the fold's snapshot is after the sweep, and every
+// such entry's outcome is in a run of today — then retires the runs of days before day, which hold
+// nothing a lookup needs, and records the index swept to day, in one transaction. It returns the
+// fold's generation and records, and the runs it retired.
+func (s *Store) sweptTo(ctx context.Context, repo int64, day contentindex.Day) (gen int64, unpinned, pinned int, retired int64, err error) {
+	sc := repoScope(repo)
+	held, release, err := s.claimFold(ctx, sc)
+	if err != nil {
+		return 0, 0, 0, 0, err
+	}
+	defer release()
+	if gen, unpinned, pinned, err = s.foldIndexHeld(held, sc); err != nil {
+		return 0, 0, 0, 0, err
+	}
+	segs, err := s.b.Segments(held, sc, segIndexUnpinned)
+	if err != nil {
+		return 0, 0, 0, 0, err
+	}
+	var old []encoding.ID
+	for _, sg := range segs {
+		if sg.Day < int64(day) {
+			old = append(old, sg.ID)
+		}
+	}
+	err = s.inTx(held, func(ctx context.Context, tx *txn) error {
+		retired = 0
+		if len(old) > 0 {
+			var err error
+			if retired, err = tx.RetireSegments(ctx, sc, segIndexUnpinned, old); err != nil {
+				return err
+			}
+			if err := tx.Notify(ctx, segmentChannel, sc.String()); err != nil {
+				return err
+			}
+		}
+		return tx.SetContentIndexSwept(ctx, sc, int64(day))
+	})
+	if err == nil && retired > 0 {
+		s.segmentsChanged(sc)
+	}
+	return gen, unpinned, pinned, retired, err
 }
 
 // sweepBatch deletes a batch of one table's unmarked candidates, each only if it is still
 // unpinned and stale under its row lock: a publish that touched it, or an upload or a
-// landing that pinned it, since the candidates were listed keeps it. A swept chunk's
+// landing that pinned it, since the candidates were listed keeps it. A swept chunk's or tree's
 // stored bytes come off its pack's live bytes, which compaction reads. It returns the rows
-// deleted, and for chunks their stored bytes.
+// and entries deleted, the stored bytes of the locations that went with them, and the chunks or
+// trees it released.
 func (s *Store) sweepBatch(ctx context.Context, repo int64, t table, batch []encoding.ID, cutoff time.Time, dryRun bool) (n, bytes, released int64, err error) {
+	kind, indexed := indexedKind(t)
 	if dryRun {
-		if t == tFile || t == tChunk {
-			_, x, err := s.contentIndex(ctx, repoScope(repo))
-			if err != nil {
+		if t == tCommit || t == tObject {
+			if n, err = sweepRows(ctx, s.ops(ctx), repo, t, batch, cutoff, true); err != nil {
 				return 0, 0, 0, err
 			}
-			_, netScope, err := s.networkOf(ctx, repo)
-			if err != nil {
+		}
+		if !indexed {
+			return n, 0, 0, nil
+		}
+		_, held, err := s.contentEntries(ctx, repoScope(repo), kind, batch)
+		if err != nil {
+			return 0, 0, 0, err
+		}
+		_, netScope, err := s.networkOf(ctx, repo)
+		if err != nil {
+			return 0, 0, 0, err
+		}
+		locs := map[encoding.ID]contentindex.Entry{}
+		if contentindex.Located(kind) {
+			if _, locs, err = s.contentEntries(ctx, netScope, kind, batch); err != nil {
 				return 0, 0, 0, err
 			}
-			_, locs, err := s.contentIndex(ctx, netScope)
-			if err != nil {
-				return 0, 0, 0, err
-			}
-			day := contentindex.DayOf(cutoff)
-			for _, id := range batch {
-				if e, ok := x.Get(id); ok && !e.Pinned && e.Day < day {
-					n++
-					if l, ok := locs.Get(id); ok && t == tChunk {
-						bytes += int64(l.Loc.Stored)
-					}
+		}
+		day := contentindex.DayOf(cutoff)
+		for _, id := range batch {
+			if e, ok := held[id]; ok && !e.Pinned && e.Day < day {
+				n++
+				if l, ok := locs[id]; ok {
+					bytes += int64(l.Loc.Stored)
 				}
 			}
-			return n, bytes, 0, nil
 		}
-		n, err = sweepRows(ctx, s.ops(ctx), repo, t, batch, cutoff, true)
-		return n, 0, 0, err
+		return n, bytes, 0, nil
 	}
 	err = s.inTx(ctx, func(ctx context.Context, tx *txn) error {
 		n, bytes, released = 0, 0, 0
-		if t == tFile || t == tChunk {
-			return s.sweepContent(ctx, tx, repo, t, batch, cutoff, &n, &bytes, &released)
+		// The content index's lock first, as a publish takes it before it touches rows.
+		if indexed {
+			if err := s.sweepContent(ctx, tx, repo, kind, batch, cutoff, &n, &bytes, &released); err != nil {
+				return err
+			}
 		}
-		var err error
-		n, err = sweepRows(ctx, tx, repo, t, batch, cutoff, false)
-		return err
+		if t == tCommit || t == tObject {
+			rows, err := sweepRows(ctx, tx, repo, t, batch, cutoff, false)
+			n += rows
+			return err
+		}
+		return nil
 	})
 	return n, bytes, released, err
 }
 
-// sweepContent drops from the content index the files or chunks among batch still unpinned and
-// untouched since cutoff, deciding under the index's row lock, so no transaction touches,
-// pins, or relies on one meanwhile. A chunk's location, under its network's chunk index's lock
-// too, goes with it in a network of one repository; in a network of more, another may hold the
-// chunk, so it is released, and the network's collection drops its location once none does
-// (collectReleases). It adds to n what it drops, to bytes the stored bytes of the locations it
-// drops, and to released what it releases.
-func (s *Store) sweepContent(ctx context.Context, tx *txn, repo int64, t table, batch []encoding.ID, cutoff time.Time, n, bytes, released *int64) error {
-	doomed, err := s.staleInIndex(ctx, tx, repo, t, batch, cutoff)
+// sweepContent drops from the content index the files, chunks, or trees (kind) among batch still
+// unpinned and untouched since cutoff, deciding under the index's row lock, so no transaction
+// touches, pins, or relies on one meanwhile. A chunk's or tree's location, under its network's
+// chunk index's lock too, goes with it in a network of one repository; in a network of more,
+// another may hold it, so it is released, and the network's collection drops its location once
+// none does (collectReleases). It adds to n what it drops, to bytes the stored bytes of the
+// locations it drops, and to released what it releases.
+func (s *Store) sweepContent(ctx context.Context, tx *txn, repo int64, kind encoding.Kind, batch []encoding.ID, cutoff time.Time, n, bytes, released *int64) error {
+	doomed, err := s.staleInIndex(ctx, tx, repo, kind, batch, cutoff)
 	if err != nil || len(doomed) == 0 {
 		return err
 	}
-	kind := encoding.KindChunk
-	if t == tFile {
-		kind = encoding.KindFile
-	}
+	located := contentindex.Located(kind)
 	var net backend.Network
 	var netScope backend.Scope
 	shared := false
-	if t == tChunk {
+	if located {
 		if net, netScope, err = s.networkOf(ctx, repo); err != nil {
 			return err
 		}
-		// A fork made after this read holds none of these unpinned chunks: forks inherit only what
-		// is pinned. One made before is counted.
-		if _, err := tx.LockContentIndex(ctx, netScope); err != nil {
+		// A fork made after this read holds none of these unpinned chunks or trees: forks inherit only
+		// what is pinned. One made before is counted.
+		if _, _, err := tx.LockContentIndex(ctx, netScope); err != nil {
 			return err
 		}
 		repos, err := tx.NetworkRepositories(ctx, net)
@@ -415,25 +612,25 @@ func (s *Store) sweepContent(ctx context.Context, tx *txn, repo int64, t table, 
 		shared = len(repos) > 1
 	}
 	var release []encoding.ID
-	// In a network of one, no other repository holds the chunks: their locations go, wherever
-	// they are — pinned, in the chunk index's segments, when a repository deleted since pinned them.
-	located := map[encoding.ID]contentindex.Entry{}
-	if t == tChunk && !shared {
-		if _, located, err = s.contentEntries(ctx, netScope, encoding.KindChunk, doomed); err != nil {
+	// In a network of one, no other repository holds them: their locations go, wherever they are —
+	// pinned, in the chunk index's runs, when a repository deleted since pinned them.
+	locs := map[encoding.ID]contentindex.Entry{}
+	if located && !shared {
+		if _, locs, err = s.contentEntries(ctx, netScope, kind, doomed); err != nil {
 			return err
 		}
 	}
 	for _, id := range doomed {
 		s.logIndex(tx, repoScope(repo), contentindex.Update{Op: contentindex.Drop, ID: id, Entry: contentindex.Entry{Kind: kind}})
 		*n++
-		if t != tChunk {
+		if !located {
 			continue
 		}
 		if shared {
 			release = append(release, id)
 			continue
 		}
-		if l, ok := located[id]; ok {
+		if l, ok := locs[id]; ok {
 			*bytes += int64(l.Loc.Stored)
 			s.logIndex(tx, netScope, contentindex.Update{Op: contentindex.Drop, ID: id, Entry: contentindex.Entry{Kind: kind}})
 		}
@@ -445,9 +642,9 @@ func (s *Store) sweepContent(ctx context.Context, tx *txn, repo int64, t table, 
 	return tx.ReleaseChunks(ctx, net, release)
 }
 
-// collectReleases drops the locations of a network's released chunks that no repository in it
-// holds — in its tail, or in a segment of its manifest, own or inherited — and forgets the
-// releases, a batch at a time. Each batch decides under the network's chunk-index lock taken
+// collectReleases drops the locations of a network's released chunks and trees that no repository
+// in it holds — in its log, or in a run of its index, own or inherited — and forgets the releases,
+// a batch at a time. Each batch decides under the network's chunk-index lock taken
 // exclusively, which a publish relying on a location takes in share mode before it records what it
 // holds: a publish that committed first is seen holding the chunk, and one after finds the location
 // gone and records its own. A location goes wherever it is: one pinned, in the chunk index's
@@ -460,7 +657,7 @@ func (s *Store) collectReleases(ctx context.Context, net backend.Network, dryRun
 		var n, b int64
 		err := s.inTx(ctx, func(ctx context.Context, tx *txn) error {
 			n, b = 0, 0
-			if _, err := tx.LockContentIndex(ctx, netScope); err != nil {
+			if _, _, err := tx.LockContentIndex(ctx, netScope); err != nil {
 				return err
 			}
 			var err error
@@ -471,14 +668,17 @@ func (s *Store) collectReleases(ctx context.Context, net backend.Network, dryRun
 			if err != nil {
 				return err
 			}
+			// A release is a chunk's or a tree's, as its location is.
 			held := map[encoding.ID]bool{}
 			for _, repo := range repos {
-				_, entries, err := s.contentEntries(ctx, repoScope(repo), encoding.KindChunk, batch)
-				if err != nil {
-					return err
-				}
-				for id := range entries {
-					held[id] = true
+				for _, kind := range pack.Kinds {
+					_, entries, err := s.contentEntries(ctx, repoScope(repo), kind, batch)
+					if err != nil {
+						return err
+					}
+					for id := range entries {
+						held[id] = true
+					}
 				}
 			}
 			var unheld []encoding.ID
@@ -487,16 +687,18 @@ func (s *Store) collectReleases(ctx context.Context, net backend.Network, dryRun
 					unheld = append(unheld, id)
 				}
 			}
-			_, locs, err := s.contentEntries(ctx, netScope, encoding.KindChunk, unheld)
-			if err != nil {
-				return err
-			}
-			for _, id := range unheld {
-				if l, ok := locs[id]; ok {
-					n++
-					b += int64(l.Loc.Stored)
-					if !dryRun {
-						s.logIndex(tx, netScope, contentindex.Update{Op: contentindex.Drop, ID: id, Entry: contentindex.Entry{Kind: encoding.KindChunk}})
+			for _, kind := range pack.Kinds {
+				_, locs, err := s.contentEntries(ctx, netScope, kind, unheld)
+				if err != nil {
+					return err
+				}
+				for _, id := range unheld {
+					if l, ok := locs[id]; ok {
+						n++
+						b += int64(l.Loc.Stored)
+						if !dryRun {
+							s.logIndex(tx, netScope, contentindex.Update{Op: contentindex.Drop, ID: id, Entry: contentindex.Entry{Kind: kind}})
+						}
 					}
 				}
 			}
@@ -513,24 +715,23 @@ func (s *Store) collectReleases(ctx context.Context, net backend.Network, dryRun
 }
 
 // staleInIndex takes the content index's row lock in tx and returns the IDs among batch whose
-// entries are of t's kind, unpinned, and untouched since cutoff.
-func (s *Store) staleInIndex(ctx context.Context, tx *txn, repo int64, t table, batch []encoding.ID, cutoff time.Time) ([]encoding.ID, error) {
-	if _, err := tx.LockContentIndex(ctx, repoScope(repo)); err != nil {
+// entries are of kind, unpinned, and untouched since cutoff.
+func (s *Store) staleInIndex(ctx context.Context, tx *txn, repo int64, kind encoding.Kind, batch []encoding.ID, cutoff time.Time) ([]encoding.ID, error) {
+	if _, _, err := tx.LockContentIndex(ctx, repoScope(repo)); err != nil {
 		return nil, err
 	}
 	li := s.live(repoScope(repo))
 	if err := s.refreshIndex(ctx, repoScope(repo), li); err != nil {
 		return nil, err
 	}
-	x := li.x.Load()
-	kind := encoding.KindChunk
-	if t == tFile {
-		kind = encoding.KindFile
+	got, err := s.resolveIn(ctx, repoScope(repo), li.view.Load(), batch)
+	if err != nil {
+		return nil, err
 	}
 	day := contentindex.DayOf(cutoff)
 	var out []encoding.ID
 	for _, id := range batch {
-		if e, ok := x.Get(id); ok && e.Kind == kind && !e.Pinned && e.Day < day {
+		if e, ok := got[id]; ok && e.Kind == kind && !e.Pinned && e.Day < day {
 			out = append(out, id)
 		}
 	}
@@ -692,20 +893,45 @@ func (s *Store) markBatch(ctx context.Context, repo int64, t table, batch []enco
 			gcRefs(rs, o)
 			next = append(next, rs.sorted()...)
 		}
+		// The trees publishes stored are the content index's, their bodies in their packs.
+		_, held, err := s.contentEntries(ctx, repoScope(repo), encoding.KindTree, batch)
+		if err != nil {
+			return nil, err
+		}
+		day := contentindex.DayOf(cutoff)
+		var stale []encoding.ID
+		for id, e := range held {
+			if !e.Pinned && e.Day < day {
+				marked[ref{table: tObject, id: id}] = true
+				stale = append(stale, id)
+			}
+		}
+		sortIDs(stale)
+		bodies, err := s.treeBodies(ctx, repo, stale)
+		if err != nil {
+			return nil, err
+		}
+		kids, err := walkedRefs(encoding.KindTree, bodies)
+		if err != nil {
+			return nil, err
+		}
+		for _, id := range stale {
+			next = append(next, kids[id]...)
+		}
 		return next, nil
 	case tFile, tChunk:
 		kind := encoding.KindChunk
 		if t == tFile {
 			kind = encoding.KindFile
 		}
-		_, x, err := s.contentIndex(ctx, repoScope(repo))
+		_, held, err := s.contentEntries(ctx, repoScope(repo), kind, batch)
 		if err != nil {
 			return nil, err
 		}
 		day := contentindex.DayOf(cutoff)
 		for _, id := range batch {
-			e, ok := x.Get(id)
-			if !ok || e.Kind != kind || e.Pinned || e.Day >= day {
+			e, ok := held[id]
+			if !ok || e.Pinned || e.Day >= day {
 				continue
 			}
 			marked[ref{table: t, id: id}] = true
@@ -787,7 +1013,7 @@ func (s *Store) deleteRetiredPacks(ctx context.Context, net *backend.Network, no
 			}
 			u = map[uint64]bool{}
 			err = v.each(ctx, func(_ encoding.ID, e contentindex.Entry) bool {
-				if e.Kind == encoding.KindChunk {
+				if contentindex.Located(e.Kind) {
 					u[e.Loc.Pack] = true
 				}
 				return true
@@ -854,6 +1080,9 @@ func (w workStore) Renew(ctx context.Context, kind string, key int64, holder str
 }
 func (w workStore) Release(ctx context.Context, kind string, key int64, holder string) (bool, error) {
 	return w.b.ReleaseWork(ctx, kind, key, holder)
+}
+func (w workStore) Let(ctx context.Context, kind string, key int64, holder string) error {
+	return w.b.LetWork(ctx, kind, key, holder)
 }
 func (w workStore) Due(ctx context.Context, kind string, limit int) ([]int64, error) {
 	return w.b.DueWork(ctx, kind, limit)
@@ -954,16 +1183,22 @@ func (r *GCReport) String() string {
 	if r.ChunksRecompressed > 0 {
 		dict += fmt.Sprintf("; compressed %d small chunks with dictionary %d, saving %d bytes", r.ChunksRecompressed, r.Dictionary, r.BytesRecompressed)
 	}
-	if r.IndexGeneration != 0 {
-		dict += fmt.Sprintf("; wrote content index generation %d of %d entries, folding %d into a segment", r.IndexGeneration, r.IndexEntries, r.IndexFolded)
+	if r.ContentKept > 0 {
+		dict += fmt.Sprintf("; touched %d files, chunks, and trees the mark kept", r.ContentKept)
 	}
-	if r.ChunksReleased > 0 || r.LocationsDropped > 0 {
-		dict += fmt.Sprintf("; released %d chunks to the network, and dropped the locations of %d no repository holds",
-			r.ChunksReleased, r.LocationsDropped)
+	if r.IndexGeneration != 0 {
+		dict += fmt.Sprintf("; folded the content index into generation %d, %d unpinned and %d pinned records", r.IndexGeneration, r.IndexEntries, r.IndexFolded)
+	}
+	if r.IndexRunsRetired > 0 {
+		dict += fmt.Sprintf("; retired %d of its unpinned index's runs", r.IndexRunsRetired)
+	}
+	if r.ChunksReleased > 0 || r.TreesReleased > 0 || r.LocationsDropped > 0 {
+		dict += fmt.Sprintf("; released %d chunks and %d trees to the network, and dropped the locations of %d no repository holds",
+			r.ChunksReleased, r.TreesReleased, r.LocationsDropped)
 	}
 	if r.NetworkIndexGeneration != 0 {
-		dict += fmt.Sprintf("; wrote its network's chunk index generation %d of %d entries, folding %d into a segment",
-			r.NetworkIndexGeneration, r.NetworkIndexEntries, r.NetworkIndexFolded)
+		dict += fmt.Sprintf("; folded its network's chunk index into generation %d, %d records",
+			r.NetworkIndexGeneration, r.NetworkIndexFolded)
 	}
 	return fmt.Sprintf("repository %d%s: deleted %d operation logs of no workspace and %d workspaces with no log; collected %d operations and %d views; thinned %d checkpoints; kept %d stale reachable objects; "+
 		"swept %d commits, %d objects, %d files, %d chunks (%d bytes); "+

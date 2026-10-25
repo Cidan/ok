@@ -18,6 +18,7 @@ import (
 func TestCodeSearch(t *testing.T) {
 	ctx := context.Background()
 	e := newBrowseEnv(t)
+	e.s.marksMade()
 	due, err := e.s.Work().Due(ctx, CodeSearchWork, 10)
 	if err != nil || !slices.Contains(due, e.repo) {
 		t.Fatalf("main's moves did not mark its indexing: %v, %v", due, err)

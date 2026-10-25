@@ -373,7 +373,7 @@ func (s *Store) Land(ctx context.Context, repo int64, items []LandItem, expected
 				Patchset: st.ps.Number, By: st.actor}); err != nil {
 				return err
 			}
-			if err := tx.SetLanded(ctx, repo, st.cl.Number, int16(StatusSubmitted), st.id, st.actor); err != nil {
+			if err := tx.SetLanded(ctx, repo, st.cl.ID, int16(StatusSubmitted), st.id, st.actor); err != nil {
 				return err
 			}
 			if err := s.indexPaths(ctx, tx, repo, lc, ts, st.parent, st.id, st.gen, &left); err != nil {

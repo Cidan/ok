@@ -3,6 +3,8 @@ package store
 import (
 	"context"
 	"encoding/binary"
+	"fmt"
+	"math/rand/v2"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -37,15 +39,34 @@ func logAs(t *testing.T, s *Store, sc backend.Scope, alone bool, updates ...cont
 	ctx := context.Background()
 	if err := s.b.Txn(ctx, func(tx backend.Ops) error {
 		if alone {
-			if _, err := tx.LockContentIndex(ctx, sc); err != nil {
+			if _, _, err := tx.LockContentIndex(ctx, sc); err != nil {
 				return err
 			}
-		} else if _, _, err := tx.ShareContentIndex(ctx, sc); err != nil {
+		} else if _, _, _, err := tx.ShareContentIndex(ctx, sc); err != nil {
 			return err
 		}
 		return tx.InsertContentLog(ctx, sc, contentindex.EncodeLog(updates))
 	}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// viewHolds reports whether a view of a content index holds id.
+func viewHolds(s *Store, sc backend.Scope, v *indexView, id encoding.ID) (bool, error) {
+	got, err := s.resolveIn(context.Background(), sc, v, []encoding.ID{id})
+	_, ok := got[id]
+	return ok, err
+}
+
+// mustHold fails the test unless a replica's live index of a content index holds id.
+func mustHold(t *testing.T, s *Store, sc backend.Scope, li *liveIndex, id encoding.ID, what string) {
+	t.Helper()
+	ok, err := viewHolds(s, sc, li.view.Load(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal(what)
 	}
 }
 
@@ -71,17 +92,13 @@ func TestLogAppliesInOrderOnce(t *testing.T) {
 	logAs(t, s, sc, true, contentindex.Update{Op: contentindex.Drop, ID: id, Entry: contentindex.Entry{Kind: encoding.KindChunk}})
 	logAs(t, s, sc, false, putChunk(id))
 	li := refreshed(t, other, sc)
-	if _, ok := li.x.Load().Get(id); !ok {
-		t.Fatal("a chunk put, dropped, and put again is not held")
-	}
+	mustHold(t, other, sc, li, id, "a chunk put, dropped, and put again is not held")
 	// Refreshed again with nothing new, it applies nothing: the drop is not applied twice.
 	before := li.tail
 	if li = refreshed(t, other, sc); li.tail != before {
 		t.Errorf("a refresh with nothing committed since applied %d rows", li.tail-before)
 	}
-	if _, ok := li.x.Load().Get(id); !ok {
-		t.Fatal("refreshed again, the chunk is not held")
-	}
+	mustHold(t, other, sc, li, id, "refreshed again, the chunk is not held")
 }
 
 // A replica's refresh applies the rows committed since its place, and no others.
@@ -98,9 +115,7 @@ func TestRefreshReadsOnlyWhatIsNew(t *testing.T) {
 		t.Errorf("after 25 rows, a refresh applied %d", got)
 	}
 	for i := range 25 {
-		if _, ok := li.x.Load().Get(chunkID(uint64(100 + i))); !ok {
-			t.Fatalf("chunk %d missing", i)
-		}
+		mustHold(t, other, sc, li, chunkID(uint64(100+i)), fmt.Sprintf("chunk %d missing", i))
 	}
 }
 
@@ -141,10 +156,7 @@ func TestFoldBesideWriters(t *testing.T) {
 		t.Errorf("folds beside writers: generations %v — one changed nothing", gens)
 	}
 	// Every chunk any writer logged is held, read afresh.
-	x := indexOf(t, s, sc.ID)
-	n := 0
-	x.Range(func(encoding.ID, contentindex.Entry) bool { n++; return true })
-	if uint64(n) != written.Load() {
+	if n := len(indexOf(t, s, sc.ID)); uint64(n) != written.Load() {
 		t.Errorf("%d chunks held, %d logged", n, written.Load())
 	}
 	// The log holds only what the last fold did not read.
@@ -157,12 +169,12 @@ func TestFoldBesideWriters(t *testing.T) {
 	}
 }
 
-// A tail longer than the fold's threshold asks for a fold; FoldDue folds it, and the rows it read
-// are deleted.
-func TestLongTailAsksForAFold(t *testing.T) {
+// A log that changed more entries than the fold's threshold asks for a fold; FoldDue folds it, and
+// the rows it read are deleted.
+func TestLongLogAsksForAFold(t *testing.T) {
 	ctx := context.Background()
-	defer func(was int) { foldTailMin = was }(foldTailMin)
-	foldTailMin = 10
+	defer func(was int) { foldLogEntries = was }(foldLogEntries)
+	foldLogEntries = 10
 	s := testStore(t)
 	repo := newRepo(t, s).ID
 	sc := repoScope(repo)
@@ -177,16 +189,16 @@ func TestLongTailAsksForAFold(t *testing.T) {
 	if !slices.Contains(due, repo) {
 		t.Fatalf("a long tail: fold work due %v, want the repository's", due)
 	}
-	gen, _, _, err := s.ops(ctx).ContentIndexGeneration(ctx, sc)
+	st, _, err := s.ops(ctx).ContentIndexGeneration(ctx, sc)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := s.FoldDue(ctx, FoldDueWork, repo); err != nil {
 		t.Fatal(err)
 	}
-	after, _, _, err := s.ops(ctx).ContentIndexGeneration(ctx, sc)
-	if err != nil || after != gen+1 {
-		t.Fatalf("after the fold: generation %d (%v), want %d", after, err, gen+1)
+	after, _, err := s.ops(ctx).ContentIndexGeneration(ctx, sc)
+	if err != nil || after.Generation != st.Generation+1 {
+		t.Fatalf("after the fold: generation %d (%v), want %d", after.Generation, err, st.Generation+1)
 	}
 	if rows, _, _, err := s.logRows(ctx, sc); err != nil || rows != 0 {
 		t.Errorf("after the fold, %d log rows (%v)", rows, err)
@@ -197,10 +209,11 @@ func TestLongTailAsksForAFold(t *testing.T) {
 // generation's fold's place.
 func (s *Store) logRows(ctx context.Context, sc backend.Scope) (rows int, folded backend.LogPlace, found bool, err error) {
 	err = s.snapshot(ctx, func(tx backend.Ops) error {
-		var err error
-		if _, folded, found, err = tx.ContentIndexGeneration(ctx, sc); err != nil || !found {
+		st, ok, err := tx.ContentIndexGeneration(ctx, sc)
+		if err != nil || !ok {
 			return err
 		}
+		folded, found = st.Folded, true
 		logs, _, err := tx.ContentLogSince(ctx, sc, nil)
 		rows = len(logs)
 		return err
@@ -231,12 +244,12 @@ func TestRefreshesCoalesce(t *testing.T) {
 		var wg sync.WaitGroup
 		for range readers {
 			wg.Go(func() {
-				_, x, err := other.contentIndex(context.Background(), sc)
+				_, v, err := other.contentIndex(context.Background(), sc)
 				if err != nil {
 					t.Error(err)
 					return
 				}
-				if _, ok := x.Get(id); !ok {
+				if ok, err := viewHolds(other, sc, v, id); err != nil || !ok {
 					t.Errorf("round %d: a reader's index lacks what was committed before it asked", round)
 				}
 			})
@@ -253,5 +266,90 @@ func TestRefreshesCoalesce(t *testing.T) {
 	}
 	if reads.Load() != 1 {
 		t.Errorf("a refresh asked for after the last read %d times", reads.Load())
+	}
+}
+
+// A content index — its log and its runs, folded, and its unpinned index merged, at random points —
+// holds what its whole log, applied in order from the start, says: on this replica and on one with
+// nothing cached, for a repository's index (pinned for good) and a network's.
+func TestIndexAgreesWithItsLog(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	repo := newRepo(t, s).ID
+	for i, sc := range []backend.Scope{repoScope(repo), backend.NetworkScope(netOf(t, s, repo))} {
+		t.Run(sc.Name(), func(t *testing.T) {
+			rnd := rand.New(rand.NewPCG(7, uint64(i)))
+			ids := make([]encoding.ID, 10)
+			for n := range ids {
+				ids[n] = chunkID(uint64(1000*(i+1) + n))
+			}
+			history := map[encoding.ID][]contentindex.Update{}
+			held, pinned := map[encoding.ID]bool{}, map[encoding.ID]bool{}
+			unpinnedRuns := 0
+			check := func(step int, r *Store) {
+				t.Helper()
+				li := refreshed(t, r, sc)
+				got, err := r.resolveIn(ctx, sc, li.view.Load(), ids)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, id := range ids {
+					want, holds := contentindex.Resolve(contentindex.Entry{}, false, history[id])
+					e, ok := got[id]
+					if ok != holds || (ok && !e.Equal(want)) {
+						t.Fatalf("step %d, chunk %x: the index holds %+v %v, its log %+v %v\nlog %+v", step, id[24:], e, ok, want, holds, history[id])
+					}
+				}
+			}
+			for step := range 150 {
+				var ups []contentindex.Update
+				alone := false
+				for range 1 + rnd.IntN(4) {
+					id := ids[rnd.IntN(len(ids))]
+					var u contentindex.Update
+					switch op := rnd.IntN(6); {
+					case !held[id] || op == 0:
+						u = putChunk(id)
+						u.Entry.Day = contentindex.Day(100 + rnd.IntN(20))
+						u.Entry.Loc.Pack = uint64(1 + rnd.IntN(3))
+						held[id] = true
+					case op == 1:
+						u = contentindex.Update{Op: contentindex.Touch, ID: id, Entry: contentindex.Entry{Kind: encoding.KindChunk, Day: contentindex.Day(100 + rnd.IntN(30))}}
+					case op == 2:
+						u = contentindex.Update{Op: contentindex.Pin, ID: id, Entry: contentindex.Entry{Kind: encoding.KindChunk}}
+						pinned[id] = true
+					case op == 3:
+						u = contentindex.Update{Op: contentindex.Move, ID: id, Entry: contentindex.Entry{Kind: encoding.KindChunk,
+							Loc: contentindex.Location{Pack: uint64(10 + rnd.IntN(5)), Stored: 10, Raw: 10}}}
+						alone = true
+					case !sc.Network && pinned[id]:
+						// Pinned is permanent in a repository's index: no sweep drops it.
+						u = contentindex.Update{Op: contentindex.Touch, ID: id, Entry: contentindex.Entry{Kind: encoding.KindChunk, Day: 125}}
+					default:
+						u = contentindex.Update{Op: contentindex.Drop, ID: id, Entry: contentindex.Entry{Kind: encoding.KindChunk}}
+						held[id], pinned[id], alone = false, false, true
+					}
+					ups = append(ups, u)
+					history[id] = append(history[id], u)
+				}
+				logAs(t, s, sc, alone, ups...)
+				if rnd.IntN(8) == 0 {
+					_, unpinned, _, err := s.foldIndex(ctx, sc)
+					if err != nil {
+						t.Fatalf("step %d: folding: %v", step, err)
+					}
+					if unpinned > 0 {
+						unpinnedRuns++
+					}
+				}
+				check(step, s)
+				if step%25 == 24 {
+					check(step, reopen(t, s))
+				}
+			}
+			if live := len(runsOf(t, s, sc, segIndexUnpinned)); !sc.Network && (live == 0 || live >= unpinnedRuns) {
+				t.Fatalf("%d unpinned runs live of the %d folds wrote: none merged", live, unpinnedRuns)
+			}
+		})
 	}
 }

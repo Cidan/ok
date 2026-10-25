@@ -5,6 +5,7 @@
 package db
 
 import (
+	"bytes"
 	"context"
 	"strings"
 	"time"
@@ -30,9 +31,11 @@ type Store interface {
 // Ops are the store's reads and writes. Outside a transaction each is its own; inside Txn they
 // are the transaction's.
 type Ops interface {
-	// UpsertChangeList records the SCM's state of a CL, unless the projection already holds a
-	// newer one (the feed and an action can race to record the same CL). The approved
-	// projection is left as it is. It reports whether it wrote.
+	// UpsertChangeList records the SCM's state of a CL, unless the projection already holds it or a
+	// newer one (the feed and an action can race to record the same CL); one it holds already
+	// (ChangeList.Holds) — what a fresh read of an unchanged CL finds, a watch's every status — is
+	// read, not locked and written. The approved projection is left as it is. It reports whether
+	// it wrote.
 	UpsertChangeList(ctx context.Context, c ChangeList) (bool, error)
 	// RollbacksOf lists the rollback CLs that roll back a CL, oldest first.
 	RollbacksOf(ctx context.Context, repo, number int64) ([]ChangeList, error)
@@ -194,6 +197,14 @@ type ChangeList struct {
 	UpdatedAt       time.Time
 	// RollsBack are the CLs a rollback CL rolls back; empty for any other CL.
 	RollsBack []int64
+}
+
+// Holds reports whether a projection of a CL, c, already holds the SCM's state of it, s: what an
+// upsert of s would write, c has (UpsertChangeList writes nothing then).
+func (c ChangeList) Holds(s ChangeList) bool {
+	return c.Status == s.Status && c.ParentNumber == s.ParentNumber && c.CurrentPatchset == s.CurrentPatchset &&
+		c.Description == s.Description && bytes.Equal(c.LandedCommit, s.LandedCommit) && c.SubmittedBy == s.SubmittedBy &&
+		c.UpdatedAt.Truncate(time.Microsecond).Equal(s.UpdatedAt.Truncate(time.Microsecond))
 }
 
 // Title is the description's first line.

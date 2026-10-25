@@ -797,8 +797,10 @@ read-write transactions with retries, partitioned DML, batch writes, and change 
   conditional updates — a lease taken by `UPDATE … WHERE` its holder is none or lapsed, replicas
   starting their scans at random places so they rarely meet; what `LISTEN` does to the bus's signals
   (*Signals*); advisory locks to the lock (*Shared primitives*).
-- **The relay.** A change stream on the event log feeds the stream (*The per-repository log*).
-  Change streams keep seven days by default; a relay that falls further behind resumes from the log.
+- **Sequencing and the relay.** A repository's CL numbers and its log's places are given just
+  after the transactions that make them commit, by its sequencing pass, not taken from counters
+  inside them (scm.md, "Sequencing"); the pass marks the events it places pending, which a relay
+  reads without a lock and takes by key (*The per-repository log*).
 - **Ancestry.** Walks that use recursive queries in PostgreSQL today use the commit graph segments
   instead (*Segments*), on both backends.
 - **Databases.** One database per role per cell; an instance holds up to 100, so twenty cells per
@@ -930,10 +932,9 @@ Spanner, past its first 32 MiB of them — an upload pins 68 bytes of log a file
 million files logs 100 MiB — the rest are staged in transactions of their own under a batch whose
 marker the transaction commits, and read only once it has (`content_log_batch`): no fold runs
 meanwhile, as the transaction holds the index's row in share mode, and the next fold deletes the
-staged rows of a transaction that did not commit. A fold writes 114 bytes of blocks an unpinned
-file, so one of a repository of a million unpinned files is more than a transaction too: it writes
-the next generation's blocks 500 to a transaction before the one that makes it the generation,
-under a claim that keeps folds of one index from overlapping (`docs/scm.md`, *Folds*). And
+staged rows of a transaction that did not commit. A fold writes what the log changed to runs in
+the bucket, not rows: its transaction records them and the next generation, under a claim that
+keeps folds of one index from overlapping (`docs/scm.md`, *Folds*). And
 a landing that changed more than 20,000 paths leaves them to compaction, which writes them 10,000
 to a transaction, its commit answered from its trees meanwhile (`docs/scm.md`, *Landing*).
 
@@ -960,9 +961,10 @@ once and never changed. Each repository keeps it as a log-structured merge tree:
 - **Kinds.** Objects (trees, symlinks, copy histories, and trees' sizes records, scm.md "Tree
   sizes"); the **commit graph** (each commit's parents, generation, change ID, and conflict flag,
   and the reverse edges — what `commit`, `commit_parent`, and `commit_path`'s ancestry walks read,
-  as Git's commit-graph does); **path history** (`commit_path`); the **content index** (which is
-  already "blocks of one generation" in `index_block`: the blocks move to segments, `content_log`
-  stays as the tail); **operation logs**; **events**.
+  as Git's commit-graph does); **path history** (`commit_path`); the **content index** (its log,
+  `content_log`, is the tail; a fold writes what it changed to runs, a repository's pinned entries
+  and its unpinned ones in kinds of their own — scm.md, "The content index"); **operation logs**;
+  **events**.
 - **Reads** check each kind's Bloom filters and fence indexes, kept in replica memory and on its
   disk, read the segment's block by range, and query the tail only for what no segment holds — so a
   read of anything not written in the last minutes asks the database nothing.
@@ -1008,8 +1010,9 @@ proven part of the SCM unchanged:
 | `commitbody` | ID | body | `commit`: the change ID, conflict flag, and the rest are in the body, and nothing reads the other columns |
 | `copychild` | parent ID ‖ copy ID | — | `copy_parent`, read from the parent (the forward edge is in the copy's body) |
 | `path` | path ‖ 0 ‖ generation ‖ commit ID | — | `commit_path`, main's path history: permanent as main is |
-| `index` | ID | content index entry | `index_block` (pinned files and chunks) |
-| `event` | repository_seq | event | `event`: never pruned; moved once the relay has published it |
+| `index` | ID | content index entry, or a tombstone | `content_log`, folded: a repository's pinned files and chunks, which forks inherit, and a network's every location |
+| `indexunpinned` | ID | content index entry, or a tombstone | `content_log`, folded: a repository's unpinned files and chunks, a run a day, retired once garbage collection swept past its day |
+| `event` | repository_seq | event | `event`: never pruned; moved once the relay has published it and it is ten minutes old |
 | `op` | op log ‖ kind ‖ ID | last touched, an operation's view, body; or a tombstone | `operation`, `view`, once settled: touched before collection's window |
 | `changelist` | `n` number; `c` change ID; `p` patchset commit ‖ number; `a` author ‖ 0 ‖ number; `s` parent ‖ number | the CL with its patchsets and landing; its number; — | `changelist`, `patchset`, once landed: no transition leaves landed, and an upload to it is refused |
 | `mainlog` | `l` place; `h` commit ID | the move (old and new head, CL, patchset, who, when); its place | `head_log`, moved with the CL that landed it: main's log only grows |
@@ -1379,9 +1382,11 @@ rewrites packs as today. No leader; a cell's GC throughput is its workers'.
 ### The per-repository log
 
 Every transaction that changes a repository or a CL appends its events to that repository's log:
-rows keyed `(repository, seq)`, the sequence the repository row's own counter, taken as the
-transaction's last lock exactly as the global counter is today — but per repository, so two
-repositories' writes never wait on each other. A repository's busiest writer, a monorepo landing
+rows keyed `(repository, seq)`, in commit order with no gap, per repository, so two repositories'
+writes never wait on each other. On PostgreSQL the place comes from the repository's own counter,
+taken as the transaction's last lock; on Spanner, where a row every request of a repository
+writes aborts the requests that meet on it, the repository's sequencing pass gives it just after
+the transaction commits (scm.md, "Sequencing"). A repository's busiest writer, a monorepo landing
 ~500 commits a minute (automation.md, "The landing queue"), is about ten events a second.
 
 The log is the source of truth; the bus only carries it:
@@ -1390,8 +1395,9 @@ The log is the source of truth; the bus only carries it:
   event's key into a pending table, which every replica's relay publishes from and clears: each
   takes pending rows `FOR UPDATE SKIP LOCKED`, publishes them, and deletes them in the transaction
   that took them, so relays never wait on one another, and one that dies first leaves its rows for
-  the next — no shards or leases to keep. On Spanner, a change stream on the log is the relay's
-  input.
+  the next — no shards or leases to keep. On Spanner the pass that places events marks them
+  pending, and a relay reads pending events without a lock, takes those no relay holds for a lease
+  by key, publishes them, and deletes them by key (scm.md, "Events").
 - **History** compacts into event segments, so the log is still never pruned (scm.md, "Events"): a
   consumer that needs old events reads them from the SCM, which reads segments.
 
@@ -1423,6 +1429,16 @@ first. So delivery may duplicate and reorder, and consumers never apply twice or
 contract today's feed has ("re-reads every 30 seconds in case a notification was lost"), per
 repository instead of per installation. A new consumer bootstraps from snapshots (the SCM's current
 state of each repository) rather than replaying a decade of every repository's history.
+
+Every replica of a consumer follows the stream, so one replica claims a repository's events before
+applying them (keyed work: automation's `feed`, control's `control-feed`) and the others leave it
+until it lets go (`follow.ErrBusy`) — otherwise every replica applies every event of a busy
+repository, racing on its cursor's row. A consumer that applies a run of events at once
+(`follow.BatchApplier`; ok control's) is handed each page of the log it reads, and an event the
+stream brings is applied through the log, its page with it: ok control applies a page of a
+repository's events in one transaction with its cursor, reading each CL they name once beforehand.
+How far each consumer runs behind is a metric (`ok_control_feed_lag_seconds`,
+`ok_automation_feed_lag_seconds`, by event kind).
 
 ### The queue
 
@@ -1563,7 +1579,10 @@ keyed work's, by its holder — and rides the context its holder works with: `lo
 own. Every role's `Txn` on PostgreSQL checks the fence its context carries first, reading the
 lease's row `FOR SHARE` — held by the lease's holder, within its lease — so that row cannot be taken
 over until the transaction ends, and a transaction under a lease its holder no longer holds fails
-with `data.ErrFenced` and commits nothing. The deployer writes its steps in a transaction when
+with `data.ErrFenced` and commits nothing. On Spanner, which locks cells, a fence on keyed work reads
+the holder's cell alone, which a takeover writes, and a mark the mark's cells alone: neither reads
+the lease's end, which the holder's renewals write, so neither holds a renewal back — a
+compaction's every fenced batch did, beside every upload's mark. The deployer writes its steps in a transaction when
 fenced, which is one statement each otherwise. The deployer plans each repository under its
 planning's keyed work (`plan`, its table new), and looks again once it holds it; starts deployments
 in `StartTurns`, one transaction at a time across replicas (`lock.InTx`), which reads what each
@@ -1652,7 +1671,11 @@ pool and in all, and its month's seconds; orders the accounts under their quotas
 runs in the pool for their weight, ties to the higher priority's head, then the older; and claims
 the first's head. What it chooses by it reads outside any transaction; the claim's transaction
 holds only the run it takes, so claims beside each other meet only on one run — one that finds its
-head taken goes on to one of the account's next few, at random. An account with a concurrent quota
+head taken goes on to one of the account's next few, at random. A run queued wakes the first lease
+waiting in each pool's line on each replica, not every waiting lease — every one woken for every
+run had each claim race the rest for it, a dozen transactions a run — and a lease that claims a run
+wakes the next in its line, for the runs queued with it; every lease still looks on its own every
+two seconds. An account with a concurrent quota
 runs each run in a **slot** of its own (`account_slot`), at most its quota — less what the other
 cells report — of them: the claim takes a free slot with the run, an insert another claim's
 refuses, and the run lets it go as it stops running, so claims beside each other never pass the
@@ -2149,6 +2172,19 @@ lock waits on per-repository rows — a CL's row range, the CL and event counter
 work row, main — and in ok control's review and automation's finish, ~18 attempts each. One
 repository at Google's scale of CLs is that redesign's: batched landing and per-repository rows
 written once a batch.
+
+**A monorepo, as run (2026-10-24).** 3,000 people in one repository shaped like a monorepo (67,000
+files), at three times their daily rate — a working day's peak. Before: half of all uploads aborted
+on per-repository rows, the CL and event counters above all (8,843 and 2,488 seconds of lock waits
+in one run), and a CL took ten minutes from submit to landing. Now a repository's CL numbers and its
+log's places are given just after commit, by its sequencing pass (scm.md, "Sequencing"), and an
+upload's pins are found before its transaction, which is 12 round trips, from 25. At the same peak
+every upload succeeded (0–2 aborts a minute of up to 79 attempts), the counters' waits 113 and 96
+seconds, the passes' own. The run named two more rows, fixed since: compaction's work row, which a
+fenced batch's read of the lease held from its holder's renewals (*No leaders, as built*), and the
+content log's commit-timestamp index, whose writers held its entry at the pending commit timestamp
+— now sharded (scm.md, "The content index"). Spanner's CPU, 70–95% throughout, went to workspace
+trees, a row each: 63% of it on the touch walk's and publishes' reads and writes of `object`.
 
 ## Operating it
 

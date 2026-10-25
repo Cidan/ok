@@ -125,48 +125,83 @@ func (b *Backend) Ping(ctx context.Context) error {
 // lapses.
 const relayLease = time.Minute
 
-// RelayEvents takes a page of pending events no other relay holds, holding them for a lease in a
-// transaction of its own; publishes them outside any transaction, as Spanner aborts a transaction
-// left waiting; then deletes them from pending, or, if publishing failed, lets them go for another
-// to take. A relay that dies after publishing has its events published again once its lease
-// lapses, as on PostgreSQL one that publishes and dies before committing does.
+// RelayEvents reads a page of pending events no relay holds without a lock — a relay's locked scan
+// of event_pending would hold off every sequencing pass that inserts into it — then takes those
+// still unheld for a lease, in a transaction of its own that reads them by key; publishes them
+// outside any transaction, as Spanner aborts a transaction left waiting; then deletes them from
+// pending by key, or, if publishing failed, lets them go for another to take. A relay that dies
+// after publishing has its events published again once its lease lapses, as on PostgreSQL one that
+// publishes and dies before committing does.
 func (b *Backend) RelayEvents(ctx context.Context, limit int, publish func([]backend.Event) error) (int, error) {
+	var seen []backend.Event
+	ro := b.c.ReadOnlyTransaction()
+	err := spannerdata.Each(ctx, ro, `SELECT e.repository_id, e.repository_seq, e.body
+		FROM event_pending p JOIN event e ON e.repository_id = p.repository_id AND e.repository_seq = p.repository_seq
+		WHERE p.lease_until IS NULL OR p.lease_until < `+now+`
+		ORDER BY p.repository_id, p.repository_seq LIMIT @limit`, map[string]any{"limit": int64(limit)}, func(row *spanner.Row) error {
+		var e backend.Event
+		if err := row.Columns(&e.Repository, &e.RepositorySeq, &e.Body); err != nil {
+			return err
+		}
+		seen = append(seen, e)
+		return nil
+	})
+	ro.Close()
+	if err != nil || len(seen) == 0 {
+		return 0, err
+	}
+	keys := make([]eventKey, len(seen))
+	for i, e := range seen {
+		keys[i] = eventKey{e.Repository, e.RepositorySeq}
+	}
 	holder := fmt.Sprintf("relay-%d", data.NewID())
 	var evs []backend.Event
-	_, err := spannertxn.ReadWrite(ctx, b.c, func(ctx context.Context, tx *spanner.ReadWriteTransaction) error {
-		evs = nil
-		var keys []eventKey
-		if err := spannerdata.Each(ctx, tx, `SELECT e.repository_id, e.repository_seq, e.body
-			FROM event_pending p JOIN event e ON e.repository_id = p.repository_id AND e.repository_seq = p.repository_seq
-			WHERE p.lease_until IS NULL OR p.lease_until < `+now+`
-			ORDER BY p.repository_id, p.repository_seq LIMIT @limit`, map[string]any{"limit": int64(limit)}, func(row *spanner.Row) error {
-			var e backend.Event
-			if err := row.Columns(&e.Repository, &e.RepositorySeq, &e.Body); err != nil {
+	var taken []eventKey
+	_, err = spannertxn.ReadWrite(ctx, b.c, func(ctx context.Context, tx *spanner.ReadWriteTransaction) error {
+		evs, taken = nil, nil
+		free := map[eventKey]bool{}
+		if err := spannerdata.Each(ctx, tx, `SELECT repository_id, repository_seq FROM event_pending
+			WHERE STRUCT<r INT64, s INT64>(repository_id, repository_seq) IN UNNEST(@keys)
+			  AND (lease_until IS NULL OR lease_until < `+now+`)`, map[string]any{"keys": keys}, func(row *spanner.Row) error {
+			var k eventKey
+			if err := row.Columns(&k.R, &k.S); err != nil {
 				return err
 			}
-			evs = append(evs, e)
-			keys = append(keys, eventKey{e.Repository, e.RepositorySeq})
+			free[k] = true
 			return nil
-		}); err != nil || len(evs) == 0 {
+		}); err != nil {
 			return err
+		}
+		for i, e := range seen {
+			if free[keys[i]] {
+				evs, taken = append(evs, e), append(taken, keys[i])
+			}
+		}
+		if len(taken) == 0 {
+			return nil
 		}
 		_, err := spannerdata.Update(ctx, tx, `UPDATE event_pending SET holder = @holder,
 				lease_until = TIMESTAMP_ADD(`+now+`, INTERVAL @lease SECOND)
 			WHERE STRUCT<r INT64, s INT64>(repository_id, repository_seq) IN UNNEST(@keys)`,
-			map[string]any{"holder": holder, "lease": int64(relayLease / time.Second), "keys": keys})
+			map[string]any{"holder": holder, "lease": int64(relayLease / time.Second), "keys": taken})
 		return err
 	})
 	if err != nil || len(evs) == 0 {
 		return 0, err
 	}
-	end := `DELETE FROM event_pending WHERE holder = @holder`
 	perr := publish(evs)
-	if perr != nil {
-		end = `UPDATE event_pending SET holder = NULL, lease_until = NULL WHERE holder = @holder`
-	}
 	if _, err := spannertxn.ReadWrite(context.WithoutCancel(ctx), b.c, func(ctx context.Context, tx *spanner.ReadWriteTransaction) error {
-		_, err := spannerdata.Update(ctx, tx, end, map[string]any{"holder": holder})
-		return err
+		if perr != nil {
+			_, err := spannerdata.Update(ctx, tx, `UPDATE event_pending SET holder = NULL, lease_until = NULL
+				WHERE STRUCT<r INT64, s INT64>(repository_id, repository_seq) IN UNNEST(@keys) AND holder = @holder`,
+				map[string]any{"holder": holder, "keys": taken})
+			return err
+		}
+		ks := make([]spanner.KeySet, len(taken))
+		for i, k := range taken {
+			ks[i] = spanner.Key{k.R, k.S}
+		}
+		return tx.BufferWrite([]*spanner.Mutation{spanner.Delete("event_pending", spanner.KeySets(ks...))})
 	}); err != nil && perr == nil {
 		return 0, fmt.Errorf("the published events, ending their lease: %w", err)
 	}
@@ -328,8 +363,9 @@ var tableKeys = map[string]string{
 	"event":                    "repository_id INT64, repository_seq INT64",
 	"work":                     "kind STRING, key INT64",
 	"candidate":                "repository_id INT64, commit_id BYTES",
-	"patchset":                 "repository_id INT64, cl_number INT64, number INT64",
-	"changelist":               "repository_id INT64, number INT64",
+	"patchset":                 "repository_id INT64, cl_id INT64, number INT64",
+	"changelist":               "repository_id INT64, id INT64",
+	"sequence_pending":         "repository_id INT64, committed_at TIMESTAMP, txn INT64, place INT64",
 	"head_log":                 "repository_id INT64, seq INT64",
 	"commit_path":              "repository_id INT64, path STRING, generation INT64, commit_id BYTES",
 	"path_index":               "repository_id INT64, generation INT64",
@@ -345,7 +381,6 @@ var tableKeys = map[string]string{
 	"checkpoint":               "repository_id INT64, id INT64",
 	"workspace":                "repository_id INT64, principal STRING, name STRING",
 	"dictionary_grant":         "repository_id INT64, trainer_id INT64",
-	"index_block":              "scope INT64, owner_id INT64, generation INT64, first_id BYTES",
 	"content_log":              "scope INT64, owner_id INT64, id INT64",
 	"content_log_batch":        "scope INT64, owner_id INT64, batch_id INT64",
 	"content_index":            "scope INT64, owner_id INT64",

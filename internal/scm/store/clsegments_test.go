@@ -164,12 +164,12 @@ func TestSettledRecord(t *testing.T) {
 	landed := encoding.ID{9}
 	at := time.UnixMicro(1_790_000_000_123_456)
 	sc := backend.SettledChangeList{
-		ChangeList: backend.ChangeList{Number: 7, ChangeID: make([]byte, encoding.ChangeIDLen), Author: alice, Status: 3,
+		ChangeList: backend.ChangeList{ID: 4242, Number: 7, ChangeID: make([]byte, encoding.ChangeIDLen), Author: alice, Status: 3,
 			Parent: 5, CurrentPatchset: 2, Landed: &landed, SubmittedBy: bob, Description: "a\nb", CreatedAt: at, UpdatedAt: at.Add(time.Second),
 			RollsBack: []int64{3, 4}, RollbackPaths: []string{"x", "y/z"}, RollbackLeft: []string{"w"}},
 		Patchsets: []backend.Patchset{
-			{CL: 7, Number: 1, Commit: encoding.ID{1}, Base: encoding.ID{2}, Parent: 5, UploadedBy: alice, UploadedAt: at},
-			{CL: 7, Number: 2, Commit: encoding.ID{3}, Base: encoding.ID{4}, UploadedBy: alice, UploadedAt: at.Add(time.Minute)},
+			{CL: 4242, Number: 1, Commit: encoding.ID{1}, Base: encoding.ID{2}, Parent: 5, UploadedBy: alice, UploadedAt: at},
+			{CL: 4242, Number: 2, Commit: encoding.ID{3}, Base: encoding.ID{4}, UploadedBy: alice, UploadedAt: at.Add(time.Minute)},
 		},
 		Landing:  backend.HeadMove{Seq: 11, Old: encoding.ID{5}, New: landed, CL: 7, Patchset: 2, By: bob},
 		LandedAt: at.Add(time.Hour),
@@ -179,7 +179,7 @@ func TestSettledRecord(t *testing.T) {
 	if err != nil || !reflect.DeepEqual(got, sc) {
 		t.Fatalf("decoded %+v, %v\nwant %+v", got, err, sc)
 	}
-	for _, bad := range [][]byte{nil, {2}, b[:len(b)-1], append(append([]byte{}, b...), 0)} {
+	for _, bad := range [][]byte{nil, {1}, {recordVersion}, b[:len(b)-1], append(append([]byte{}, b...), 0)} {
 		if _, err := decodeSettled(7, bad); err == nil {
 			t.Errorf("a damaged record of %d bytes decoded", len(bad))
 		}

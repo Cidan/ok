@@ -89,11 +89,28 @@ func (n *notifier) waitAny(ctx context.Context, max time.Duration, chs ...<-chan
 	return nil
 }
 
+// fire delivers a signal: a run queued to the leases waiting in each pool, one a pool (leaseLines);
+// the rest to their waiters.
+func (s *Store) fire(channel, payload string) {
+	if channel == chanQueue {
+		s.leases.wakeEach()
+		return
+	}
+	s.notify.fire(channel, payload)
+}
+
+// fireAll wakes every waiter, every waiting lease too: after the listener reconnects, any
+// notification may have been missed.
+func (s *Store) fireAll() {
+	s.notify.fireAll()
+	s.leases.wakeAll()
+}
+
 // Listen delivers the store's signals to its waiters until ctx ends, listening again after a
 // failure.
 func (s *Store) Listen(ctx context.Context) error {
 	for ctx.Err() == nil {
-		err := s.cfg.Signals.Listen(ctx, []string{chanQueue, chanLog, chanDone, chanSubmission}, s.notify.fireAll, s.notify.fire)
+		err := s.cfg.Signals.Listen(ctx, []string{chanQueue, chanLog, chanDone, chanSubmission}, s.fireAll, s.fire)
 		if ctx.Err() != nil {
 			return nil
 		}

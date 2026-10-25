@@ -41,22 +41,36 @@ func chunkPack(t *testing.T, e *clEnv, f encoding.ID) uint64 {
 	return chunks[c].Loc.Pack
 }
 
-// tailPinned counts the pinned entries, and the moves of chunks it lacks, in a repository's
-// content index tail as the database holds it.
-func tailPinned(t *testing.T, s *Store, repo int64) (pinned, moved int) {
+// indexLogOf is a content index's log since its last fold, as a replica with nothing cached reads it.
+func indexLogOf(t *testing.T, s *Store, sc backend.Scope) *contentindex.Log {
 	t.Helper()
-	x := indexOf(t, s, repo)
-	for _, k := range x.Sorted() {
-		if k.Entry.Pinned {
-			pinned++
-		}
+	fresh := reopen(t, s)
+	_, v, err := fresh.contentIndex(context.Background(), sc)
+	if err != nil {
+		t.Fatal(err)
 	}
-	return pinned, len(x.MovedIDs())
+	return v.log
 }
 
-// A fold moves the content index's pinned entries into a segment and keeps the unpinned in its
-// blocks; every reader of the index — reads, publishing what is held, a pin walk through what moved,
-// fsck — finds what moved, on a replica with nothing cached.
+// logMoves counts the entries a content index's log moved.
+func logMoves(t *testing.T, s *Store, sc backend.Scope) int {
+	t.Helper()
+	l := indexLogOf(t, s, sc)
+	n := 0
+	for _, id := range l.IDs() {
+		for _, u := range l.Updates(id) {
+			if u.Op == contentindex.Move {
+				n++
+				break
+			}
+		}
+	}
+	return n
+}
+
+// A fold writes the content index's pinned entries into a pinned run and its unpinned ones into the
+// unpinned index, leaving no log; every reader of the index — reads, publishing what is held, a pin
+// walk through what moved, fsck — finds them, on a replica with nothing cached.
 func TestContentIndexFold(t *testing.T) {
 	ctx := context.Background()
 	e := newCLEnv(t)
@@ -67,12 +81,12 @@ func TestContentIndexFold(t *testing.T) {
 	ub.commit(ub.tree(fileEntry("loose", loose)), "unpinned", encoding.RootCommitID)
 	mustPublish(t, e.s, e.repo, alice, ub, nil)
 
-	gen, entries, folded, err := e.s.RebuildContentIndex(ctx, e.repo)
-	if err != nil || gen == 0 || folded < 3 || entries != 2 {
-		t.Fatalf("a fold: generation %d, %d entries left, %d folded, %v; want the unpinned file and chunk left, the pinned file and its chunks folded", gen, entries, folded, err)
+	gen, unpinned, pinned, err := e.s.RebuildContentIndex(ctx, e.repo)
+	if err != nil || gen == 0 || pinned < 4 || unpinned != 3 {
+		t.Fatalf("a fold: generation %d, %d unpinned and %d pinned records, %v; want the unpinned file, chunk, and tree, and the pinned file, its chunks, and its tree", gen, unpinned, pinned, err)
 	}
-	if p, m := tailPinned(t, e.s, e.repo); p != 0 || m != 0 {
-		t.Fatalf("after the fold the tail holds %d pinned entries and %d moves", p, m)
+	if n := indexLogOf(t, e.s, repoScope(e.repo)).Len(); n != 0 {
+		t.Fatalf("after the fold the log holds %d entries", n)
 	}
 	fresh := reopen(t, e.s)
 	if got := readAll(t, fresh, e.repo, f); !bytes.Equal(got, big) {
@@ -105,20 +119,21 @@ func TestContentIndexFold(t *testing.T) {
 	}
 }
 
-// A pinned chunk repacked after its location was folded into a segment of its network's chunk
-// index is read at its new location — from the tail's move, then, folded again, from the newer
-// segment, and after the index segments merge — even once its old pack is gone.
+// A pinned chunk or tree repacked after its location was folded into a run of its network's chunk
+// index is read at its new location — from the log's move, then, folded again, from the newer run,
+// and after the runs merge — even once its old pack is gone.
 func TestRepackFoldedChunks(t *testing.T) {
 	ctx := context.Background()
 	e := newCLEnv(t)
 	a := uploadFile(t, e, "a", []byte("first pinned file\n"))
 	b := uploadFile(t, e, "b", []byte("second pinned file\n"))
 	net := backend.NetworkScope(netOf(t, e.s, e.repo))
-	if _, _, folded, err := e.s.RebuildContentIndex(ctx, e.repo); err != nil || folded != 4 {
-		t.Fatalf("folding two files and their chunks: %d, %v", folded, err)
+	trees := map[encoding.ID]encoding.ID{a: newBuilder(t).tree(fileEntry("a", a)), b: newBuilder(t).tree(fileEntry("b", b))}
+	if _, _, folded, err := e.s.RebuildContentIndex(ctx, e.repo); err != nil || folded != 6 {
+		t.Fatalf("folding two files, their chunks, and their trees: %d, %v", folded, err)
 	}
-	if _, _, folded, err := e.s.foldIndex(ctx, net); err != nil || folded != 2 {
-		t.Fatalf("folding the two chunks' locations: %d, %v", folded, err)
+	if _, _, folded, err := e.s.foldIndex(ctx, net); err != nil || folded != 4 {
+		t.Fatalf("folding the two chunks' locations and the two trees': %d, %v", folded, err)
 	}
 	before := chunkPack(t, e, a)
 
@@ -126,8 +141,8 @@ func TestRepackFoldedChunks(t *testing.T) {
 	if err := e.s.compact(ctx, e.repo, GCOptions{}, r); err != nil || r.PacksWritten != 1 || r.PacksRetired != 2 {
 		t.Fatalf("repacking two small packs: %s, %v", r, err)
 	}
-	if m := len(locationsOf(t, e.s, e.repo).MovedIDs()); m != 2 {
-		t.Fatalf("the chunk index's tail logged %d moves of folded chunks, want 2", m)
+	if m := logMoves(t, e.s, net); m != 4 {
+		t.Fatalf("the chunk index's log moved %d folded chunks and trees, want 4", m)
 	}
 	if after := chunkPack(t, e, a); after == before {
 		t.Fatalf("the repacked chunk is still read from pack %d", before)
@@ -139,21 +154,25 @@ func TestRepackFoldedChunks(t *testing.T) {
 			if got := readAll(t, fresh, e.repo, f); string(got) != want {
 				t.Fatalf("%s: read %q, want %q", stage, got, want)
 			}
+			res, err := fresh.ReadObjects(ctx, e.repo, []ObjectRef{{Kind: encoding.KindTree, ID: trees[f]}})
+			if err != nil || !res[0].Found {
+				t.Fatalf("%s: the tree of %q: %+v, %v", stage, want, res, err)
+			}
 		}
 	}
-	check("moved in the tail")
+	check("moved in the log")
 	if n, _, err := e.s.DeleteRetiredOf(ctx, e.repo, time.Now().Add(2*RetiredPackGrace)); err != nil || n != 2 {
 		t.Fatalf("deleting the two retired packs: %d, %v", n, err)
 	}
-	check("moved in the tail, the old packs gone")
+	check("moved in the log, the old packs gone")
 
-	if _, _, folded, err := e.s.foldIndex(ctx, net); err != nil || folded != 2 {
-		t.Fatalf("folding the two moves: %d, %v", folded, err)
+	if _, _, folded, err := e.s.foldIndex(ctx, net); err != nil || folded != 4 {
+		t.Fatalf("folding the four moves: %d, %v", folded, err)
 	}
-	if m := len(locationsOf(t, e.s, e.repo).MovedIDs()); m != 0 {
-		t.Fatalf("%d moves left in the chunk index's tail after the fold", m)
+	if m := logMoves(t, e.s, net); m != 0 {
+		t.Fatalf("%d moves left in the chunk index's log after the fold", m)
 	}
-	check("the moves folded into a newer segment")
+	check("the moves folded into a newer run")
 
 	// Two more folds, of two more files: four index segments at level 0, merged into one, which keeps
 	// the newer of the repacked chunks' records.
@@ -186,8 +205,8 @@ func TestRepackFoldedChunks(t *testing.T) {
 	}
 }
 
-// The whole index walks in ID order — the tail's entries and the segments' together — from the start
-// or from any ID: what dictionary training samples from.
+// The whole index walks in ID order — the log's entries and the runs' together — from the start or
+// from any ID: what dictionary training samples from.
 func TestContentViewInOrder(t *testing.T) {
 	ctx := context.Background()
 	e := newCLEnv(t)
@@ -225,7 +244,7 @@ func TestContentViewInOrder(t *testing.T) {
 	}
 	all := walk(encoding.ID{})
 	if len(all) != 9 {
-		t.Fatalf("the whole index holds %d files, want 6 folded and 3 in the tail", len(all))
+		t.Fatalf("the whole index holds %d files, want 6 folded and 3 in the log", len(all))
 	}
 	for i := 1; i < len(all); i++ {
 		if bytes.Compare(all[i-1][:], all[i][:]) >= 0 {
@@ -234,5 +253,66 @@ func TestContentViewInOrder(t *testing.T) {
 	}
 	if from := walk(all[4]); len(from) != 5 || from[0] != all[4] {
 		t.Fatalf("from the fifth: %d files, first %s", len(from), from[0])
+	}
+}
+
+// The unpinned index merges a day group's two newest runs while the older is at most four times the
+// newer, and once the group's day has ended, the whole group into one; a merge that takes the oldest
+// run drops its tombstones, which hide nothing older; every lookup is the same throughout.
+func TestUnpinnedMerges(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	sc := repoScope(newRepo(t, s).ID)
+	var bulk []contentindex.Update
+	for n := range 40 {
+		bulk = append(bulk, putChunk(chunkID(uint64(n))))
+	}
+	logAs(t, s, sc, false, bulk...)
+	fold := func() {
+		t.Helper()
+		if _, _, _, err := s.foldIndex(ctx, sc); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fold()
+	// Small folds after a large one: they merge among themselves, never into it.
+	for n := range 6 {
+		logAs(t, s, sc, false, putChunk(chunkID(uint64(100+n))))
+		fold()
+	}
+	logAs(t, s, sc, true, contentindex.Update{Op: contentindex.Drop, ID: chunkID(3), Entry: contentindex.Entry{Kind: encoding.KindChunk}})
+	fold()
+	runs := runsOf(t, s, sc, segIndexUnpinned)
+	if len(runs) < 2 || runs[len(runs)-1].Records != 40 {
+		t.Fatalf("today's runs: %+v; want the large one alone, and the small ones merged beside it", runs)
+	}
+	if runs[1].Records <= unpinnedRatio*runs[0].Records {
+		t.Fatalf("the two newest runs left unmerged though the older is at most %d times the newer: %+v", unpinnedRatio, runs)
+	}
+	held := func(r *Store) map[encoding.ID]contentindex.Entry {
+		t.Helper()
+		return readWhole(t, r, sc)
+	}
+	before := held(reopen(t, s))
+	if len(before) != 45 {
+		t.Fatalf("%d chunks held, want 45", len(before))
+	}
+	// Today's day has ended: its runs merge into one, the tombstone gone with the chunk it hid.
+	today := contentindex.DayOf(dbOf(s).today(t))
+	if err := s.mergeUnpinned(ctx, sc, today+1); err != nil {
+		t.Fatal(err)
+	}
+	runs = runsOf(t, s, sc, segIndexUnpinned)
+	if len(runs) != 1 || runs[0].Records != 45 || contentindex.Day(runs[0].Day) != today {
+		t.Fatalf("after the day ended: %+v; want one run of today's, of the 45 chunks held and no tombstone", runs)
+	}
+	after := held(reopen(t, s))
+	if len(after) != len(before) {
+		t.Fatalf("%d chunks held after the merge, %d before", len(after), len(before))
+	}
+	for id, e := range before {
+		if !after[id].Equal(e) {
+			t.Fatalf("chunk %x: %+v after the merge, %+v before", id[24:], after[id], e)
+		}
 	}
 }

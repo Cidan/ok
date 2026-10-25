@@ -6,9 +6,12 @@ import (
 	"strings"
 	"testing"
 
+	"google.golang.org/grpc"
+
 	"github.com/Cidan/ok/internal/authz"
 	"github.com/Cidan/ok/internal/control/db"
 	"github.com/Cidan/ok/internal/tenancy"
+	identitypb "github.com/Cidan/ok/proto/ok/identity/v1"
 	scmpb "github.com/Cidan/ok/proto/ok/scm/v1"
 )
 
@@ -121,5 +124,39 @@ func TestAccess(t *testing.T) {
 	}
 	if err := s.requireAction(ctx, repo, "prn_admin", authz.Propose); err == nil || !strings.Contains(err.Error(), "try again") {
 		t.Errorf("proposing while ok identity was unreachable: %v", err)
+	}
+}
+
+// adminsSource is ok identity's Authorization, counting the times it is asked for admins.
+type adminsSource struct {
+	identitypb.AuthorizationClient
+	asked int
+}
+
+func (a *adminsSource) Admins(context.Context, *identitypb.AdminsRequest, ...grpc.CallOption) (*identitypb.AdminsResponse, error) {
+	a.asked++
+	return &identitypb.AdminsResponse{PrincipalIds: []string{"prn_admin"}}, nil
+}
+
+// A repository's admins are kept a few seconds, as facts are, and forgotten with them: every
+// status a watch reads names them.
+func TestAdminsKept(t *testing.T) {
+	ctx := context.Background()
+	src := &adminsSource{}
+	a := NewAccess(src)
+	for range 5 {
+		if got, err := a.Admins(ctx, 7); err != nil || len(got) != 1 || got[0] != "prn_admin" {
+			t.Fatalf("admins: %v, %v", got, err)
+		}
+	}
+	if src.asked != 1 {
+		t.Fatalf("five reads asked ok identity %d times, want once", src.asked)
+	}
+	if _, err := a.Admins(ctx, 8); err != nil || src.asked != 2 {
+		t.Fatalf("another repository: asked %d times, %v", src.asked, err)
+	}
+	a.Forget(7)
+	if _, err := a.Admins(ctx, 7); err != nil || src.asked != 3 {
+		t.Fatalf("after the directory said it changed: asked %d times, %v", src.asked, err)
 	}
 }

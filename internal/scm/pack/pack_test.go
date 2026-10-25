@@ -236,7 +236,7 @@ func TestAddStored(t *testing.T) {
 	for i, c := range cs {
 		l := locs[i]
 		stored := src[l.DataOffset() : l.DataOffset()+int64(l.StoredLength)]
-		loc, err := w.AddStored(nil, c.id, l.Codec, l.RawLength, stored)
+		loc, err := w.AddStored(nil, encoding.KindChunk, c.id, l.Codec, l.RawLength, stored)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -245,7 +245,7 @@ func TestAddStored(t *testing.T) {
 		}
 		copied = append(copied, loc)
 	}
-	if _, err := w.AddStored(nil, cs[0].id, locs[0].Codec, locs[0].RawLength, nil); err == nil {
+	if _, err := w.AddStored(nil, encoding.KindChunk, cs[0].id, locs[0].Codec, locs[0].RawLength, nil); err == nil {
 		t.Error("a chunk added twice")
 	}
 	id, size, err := w.Close()
@@ -263,11 +263,75 @@ func TestAddStored(t *testing.T) {
 	}
 
 	w2 := NewWriter(&bytes.Buffer{})
-	if _, err := w2.AddStored(nil, cs[3].id, Stored, 1, []byte("y")); err == nil {
+	if _, err := w2.AddStored(nil, encoding.KindChunk, cs[3].id, Stored, 1, []byte("y")); err == nil {
 		t.Error("stored bytes of another chunk were accepted")
 	}
-	if _, err := w2.AddStored(nil, cs[3].id, Codec(9), 1, []byte("x")); err == nil {
+	if _, err := w2.AddStored(nil, encoding.KindChunk, cs[3].id, Codec(9), 1, []byte("x")); err == nil {
 		t.Error("an unknown codec was accepted")
+	}
+}
+
+// A pack holds trees beside chunks, each record hashing to its ID as its own kind: Verify names each
+// record's kind, a reader decodes a record as the kind it asks for and no other, AddStored copies a
+// tree's record as a tree's, and a record whose bytes hash to its ID as neither fails Verify.
+func TestTreesInAPack(t *testing.T) {
+	tree, err := encoding.Encode(&encoding.Tree{Entries: []encoding.TreeEntry{{Name: "f",
+		Value: encoding.TreeValue{Kind: encoding.TreeValueFile, ID: encoding.ID{7}}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	treeID, body := encoding.Hash(tree), tree[1:]
+	c := chunks()[3]
+	var buf bytes.Buffer
+	w := NewWriter(&buf)
+	cl, err := w.Add(c.id, c.raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tl, err := w.Add(treeID, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, size, err := w.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := buf.Bytes()
+	records, err := Verify(bytes.NewReader(data), size, id, nil)
+	if err != nil || len(records) != 2 || records[0].Kind != encoding.KindChunk || records[1].Kind != encoding.KindTree {
+		t.Fatalf("Verify: %+v, %v; want a chunk's record and a tree's", records, err)
+	}
+	stored := data[tl.DataOffset() : tl.DataOffset()+int64(tl.StoredLength)]
+	if raw, err := DecodeObject(nil, encoding.KindTree, treeID, tl.Codec, tl.RawLength, stored); err != nil || !bytes.Equal(raw, body) {
+		t.Fatalf("the tree's record, as a tree: %v", err)
+	}
+	if _, err := DecodeObject(nil, encoding.KindChunk, treeID, tl.Codec, tl.RawLength, stored); err == nil {
+		t.Fatal("the tree's record decoded as a chunk")
+	}
+	if _, err := Decode(nil, treeID, tl.Codec, tl.RawLength, stored); err == nil {
+		t.Fatal("Decode, a chunk's, took the tree's record")
+	}
+	w2 := NewWriter(&bytes.Buffer{})
+	if _, err := w2.AddStored(nil, encoding.KindTree, treeID, tl.Codec, tl.RawLength, stored); err != nil {
+		t.Fatalf("copying the tree's record: %v", err)
+	}
+	cstored := data[cl.DataOffset() : cl.DataOffset()+int64(cl.StoredLength)]
+	if _, err := w2.AddStored(nil, encoding.KindTree, c.id, cl.Codec, cl.RawLength, cstored); err == nil {
+		t.Fatal("a chunk's record was copied as a tree's")
+	}
+
+	// A record under an ID its bytes hash to as no kind.
+	var bad bytes.Buffer
+	wb := NewWriter(&bad)
+	if _, err := wb.Add(encoding.ID{1, 2, 3}, body); err != nil {
+		t.Fatal(err)
+	}
+	bid, bsize, err := wb.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Verify(bytes.NewReader(bad.Bytes()), bsize, bid, nil); err == nil {
+		t.Fatal("a record of no kind verified")
 	}
 }
 
@@ -323,7 +387,7 @@ func TestDictionaryChunks(t *testing.T) {
 	// A pack holds it as stored, and verifies with the dictionary.
 	var buf bytes.Buffer
 	w := NewWriter(&buf)
-	if _, err := w.AddStored(dicts{40000: dec}, id, ZstdDict, uint32(len(raw)), stored); err != nil {
+	if _, err := w.AddStored(dicts{40000: dec}, encoding.KindChunk, id, ZstdDict, uint32(len(raw)), stored); err != nil {
 		t.Fatal(err)
 	}
 	pid, size, err := w.Close()

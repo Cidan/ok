@@ -8,7 +8,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Cidan/ok/internal/scm/contentindex"
 	"github.com/Cidan/ok/internal/scm/encoding"
+	"github.com/Cidan/ok/internal/scm/store/backend"
 	"github.com/Cidan/ok/internal/testdb/testobjects"
 )
 
@@ -67,7 +69,7 @@ func TestFsck(t *testing.T) {
 	if len(r.Problems) != 0 || len(r.OrphanPacks) != 0 || r.DeadBytes != 0 {
 		t.Fatalf("fresh repository: %s", r)
 	}
-	if r.Packs != 1 || r.Chunks != 5 || r.Files != 2 || r.Objects != 2 || r.Commits != 2 || r.Operations != 1 || r.Views != 1 {
+	if r.Packs != 1 || r.Chunks != 5 || r.PackedTrees != 1 || r.Files != 2 || r.Objects != 1 || r.Commits != 2 || r.Operations != 1 || r.Views != 1 {
 		t.Fatalf("fresh repository counts: %+v", r)
 	}
 	var packB []byte
@@ -83,7 +85,7 @@ func TestFsck(t *testing.T) {
 	t.Run("missing chunk entry", func(t *testing.T) {
 		dropFromIndex(t, s, repo, encoding.KindChunk, lost)
 		r := fsck(false)
-		wantProblem(r, lost.String(), "not in the index")
+		wantProblem(r, lost.String(), "no location")
 		r = fsck(true)
 		if len(r.Problems) != 0 || len(r.Repaired) != 1 || !strings.Contains(r.Repaired[0], lost.String()) {
 			t.Fatalf("repair: %s", r)
@@ -117,15 +119,36 @@ func TestFsck(t *testing.T) {
 	})
 
 	t.Run("object body", func(t *testing.T) {
-		other, err := encoding.Encode(&encoding.Tree{Entries: []encoding.TreeEntry{fileEntry("z", small)}})
+		other, err := encoding.Encode(&encoding.CopyHistory{CurrentPath: "z.txt"})
 		if err != nil {
 			t.Fatal(err)
 		}
-		exec(`UPDATE object SET body = @body WHERE repository_id = @repo AND id = @id`, map[string]any{"repo": repo, "id": root[:], "body": other})
-		wantProblem(fsck(false), root.String())
+		exec(`UPDATE object SET body = @body WHERE repository_id = @repo AND id = @id`, map[string]any{"repo": repo, "id": cp[:], "body": other[1:]})
+		wantProblem(fsck(false), cp.String())
 		exec(`UPDATE object SET body = @body WHERE repository_id = @repo AND id = @id`,
-			map[string]any{"repo": repo, "id": root[:], "body": b.body(ObjectRef{Kind: encoding.KindTree, ID: root})})
-		requireClean("after restoring the tree")
+			map[string]any{"repo": repo, "id": cp[:], "body": b.body(ObjectRef{Kind: encoding.KindCopyHistory, ID: cp})})
+		requireClean("after restoring the copy history")
+	})
+
+	// A tree a publish stored is in its pack: one whose location the network lost is rebuilt from
+	// the pack's record of it, which says it is a tree's.
+	t.Run("missing tree location", func(t *testing.T) {
+		if err := s.inTx(ctx, func(ctx context.Context, tx *txn) error {
+			s.logIndex(tx, backend.NetworkScope(netOf(t, s, repo)), contentindex.Update{Op: contentindex.Drop, ID: root,
+				Entry: contentindex.Entry{Kind: encoding.KindTree}})
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		wantProblem(fsck(false), root.String(), "no location")
+		r := fsck(true)
+		if len(r.Problems) != 0 || len(r.Repaired) != 1 || !strings.Contains(r.Repaired[0], "tree "+root.String()) {
+			t.Fatalf("repair: %s", r)
+		}
+		requireClean("after rebuilding the tree's location")
+		if res, err := reopen(t, s).ReadObjects(ctx, repo, []ObjectRef{{Kind: encoding.KindTree, ID: root}}); err != nil || !res[0].Found {
+			t.Fatalf("the tree after repair: %+v, %v", res, err)
+		}
 	})
 
 	t.Run("parent index", func(t *testing.T) {

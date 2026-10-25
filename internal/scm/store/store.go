@@ -16,6 +16,7 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/Cidan/ok/internal/blob"
 	"github.com/Cidan/ok/internal/bus"
@@ -105,9 +106,6 @@ type Config struct {
 	// that changed more paths writes them after it, a transaction of up to 10,000 at a time, its
 	// commit's answered from its trees meanwhile (paths.go).
 	LandingPaths int
-	// FoldBatch bounds the blocks one transaction of a fold writes: a fold writes its index's next
-	// generation a transaction at a time before the one that makes it the generation.
-	FoldBatch int
 	// Signals carry the store's wake-ups between replicas (docs/hosted.md, "Signals"): its events,
 	// its content indexes', and its segments' changes. Nil is within the process (bus.NewLocal).
 	Signals bus.Signals
@@ -124,7 +122,6 @@ const (
 	DefaultSegmentMin           = 1 << 12
 	DefaultDeleteBatch          = 10_000
 	DefaultLandingPaths         = 20_000
-	DefaultFoldBatch            = 500
 )
 
 // readLimits bound how files are read (read.go, browse_diff.go).
@@ -196,11 +193,25 @@ type Store struct {
 	dictTrainers sync.Map
 	// holder names this replica's claims on keyed work it does inline (compactSegmentsNow).
 	holder string
-	// deletes is Config.DeleteBatch, landingPaths Config.LandingPaths, and foldBlocks
-	// Config.FoldBatch.
-	deletes, landingPaths, foldBlocks int
+	// deletes is Config.DeleteBatch, and landingPaths Config.LandingPaths.
+	deletes, landingPaths int
 	// txAttempts counts transaction attempts (a test observes deadlock retries).
 	txAttempts func()
+	// marker makes the marks transactions ask for after they commit (markSoon); marking runs before
+	// each (tests).
+	marker  marker
+	marking func(workMark)
+	// scanningRun observes each unpinned run garbage collection scans for stale entries (tests).
+	scanningRun func(backend.Segment)
+	// afterChangeListRows runs between a read of CLs' rows and the read of their patchsets (tests).
+	afterChangeListRows func()
+	// seq runs repositories' sequencing passes (sequence.go); sequencePasses observes each that
+	// ran, skipSequencing leaves what a transaction made pending, as a writer stopped between its
+	// commit and its pass does, and beforeSequenced runs as a writer begins its pass (tests).
+	seq             sequencer
+	sequencePasses  func(repo int64)
+	skipSequencing  bool
+	beforeSequenced func()
 	// indexReads counts the content index refreshes that read the database (a test observes
 	// refreshes coalescing).
 	indexReads func()
@@ -265,9 +276,6 @@ func New(b backend.Backend, blobs blob.Store, cfg Config) (*Store, error) {
 	if cfg.LandingPaths == 0 {
 		cfg.LandingPaths = DefaultLandingPaths
 	}
-	if cfg.FoldBatch == 0 {
-		cfg.FoldBatch = DefaultFoldBatch
-	}
 	s := &Store{
 		b:             b,
 		names:         cfg.Names,
@@ -284,7 +292,6 @@ func New(b backend.Backend, blobs blob.Store, cfg Config) (*Store, error) {
 		holder:        work.NewHolder(),
 		deletes:       cfg.DeleteBatch,
 		landingPaths:  cfg.LandingPaths,
-		foldBlocks:    cfg.FoldBatch,
 		segs: segmentState{
 			readers: newCache[*segment.Reader]("segment_readers", cfg.SegmentCacheBytes/4),
 			blocks:  newCache[*segment.Block]("segment_blocks", cfg.SegmentCacheBytes),
@@ -315,6 +322,19 @@ type txn struct {
 	done    atomic.Bool // the transaction has ended
 	pending bus.Pending // the signals to send once it commits
 	marks   []workMark  // the keyed work to mark once it commits (markAfter)
+	// after: its backend sequences after commit (sequence.go). tie orders the rows it leaves pending
+	// among those of a commit timestamp's, places counts them, sequence are their repositories, and
+	// appended the events among them, as its callers hold them.
+	after    bool
+	tie      int64
+	places   int64
+	sequence map[int64]bool
+	appended []appended
+	// manifests are the segment manifests it read, each once (Store.manifest).
+	manifests map[manifestKey][]backend.Segment
+	// snapshotAt is, for a read-only snapshot (inSnapshot), when it began: it sees everything
+	// committed before then, and nothing committed after its first read. Zero for a transaction.
+	snapshotAt time.Time
 }
 
 // workMark is keyed work of a kind and key.
@@ -322,6 +342,57 @@ type workMark struct {
 	kind string
 	key  int64
 }
+
+// marker marks keyed work after commits (markAfter), one mark of a piece of work in flight at a time
+// in this replica: a mark asked while one is in flight is made once that one ends. So every commit
+// is followed by a mark begun after it, the request that committed waits for none, and a busy
+// repository's writes, each asking, mark its work a few times a second rather than once each — every
+// mark of one is a write of one row, which its claims and its holder's renewals write too.
+type marker struct {
+	mu       sync.Mutex
+	inFlight map[workMark]bool
+	again    map[workMark]bool
+	running  sync.WaitGroup
+}
+
+// markSoon marks m, or has it marked again once the mark in flight ends.
+func (s *Store) markSoon(m workMark) {
+	q := &s.marker
+	q.mu.Lock()
+	if q.inFlight == nil {
+		q.inFlight, q.again = map[workMark]bool{}, map[workMark]bool{}
+	}
+	if q.inFlight[m] {
+		q.again[m] = true
+		q.mu.Unlock()
+		return
+	}
+	q.inFlight[m] = true
+	q.running.Add(1)
+	q.mu.Unlock()
+	go func() {
+		defer q.running.Done()
+		for {
+			if s.marking != nil {
+				s.marking(m)
+			}
+			if err := s.Work().Mark(context.Background(), m.kind, m.key); err != nil {
+				slog.Warn("scm: marking work", slog.String("kind", m.kind), slog.Int64("key", m.key), slog.Any("err", err))
+			}
+			q.mu.Lock()
+			if !q.again[m] {
+				delete(q.inFlight, m)
+				q.mu.Unlock()
+				return
+			}
+			delete(q.again, m)
+			q.mu.Unlock()
+		}
+	}()
+}
+
+// marksMade waits for the marks in flight to be made (tests, and Close).
+func (s *Store) marksMade() { s.marker.running.Wait() }
 
 // Notify records a signal to send once the transaction commits.
 func (t *txn) Notify(_ context.Context, channel, payload string) error {
@@ -356,6 +427,14 @@ func (s *Store) ops(ctx context.Context) backend.Ops {
 	return s.b
 }
 
+// snapshotOf is when the read-only snapshot ctx reads through began (inSnapshot), or zero.
+func snapshotOf(ctx context.Context) time.Time {
+	if tx, ok := ctx.Value(txKey{}).(*txn); ok && !tx.done.Load() {
+		return tx.snapshotAt
+	}
+	return time.Time{}
+}
+
 // inTxContext reports whether ctx is within a transaction that has not ended.
 func inTxContext(ctx context.Context) bool {
 	tx, ok := ctx.Value(txKey{}).(*txn)
@@ -377,8 +456,9 @@ func (s *Store) snapshot(ctx context.Context, fn func(backend.Ops) error) error 
 // dry run. It takes no locks, so it holds no writer back: in a Spanner read-write transaction a read
 // locks what it reads, and a check of every submittable CL would hold main's head from its landing.
 func (s *Store) inSnapshot(ctx context.Context, fn func(context.Context, *txn) error) error {
+	began := time.Now()
 	return s.b.Snapshot(ctx, func(ops backend.Ops) error {
-		tx := &txn{Ops: ops}
+		tx := &txn{Ops: ops, after: s.b.SequencesAfterCommit(), snapshotAt: began}
 		defer tx.done.Store(true)
 		return fn(context.WithValue(ctx, txKey{}, tx), tx)
 	})
@@ -394,15 +474,20 @@ func (s *Store) retryable(err error) bool {
 // deadlock victim or it loses a race the store detects. fn must have no effects outside the
 // transaction. The context fn gets holds the transaction: what fn reads through the store with it
 // reads through the transaction (ops).
+//
+// Once it commits, what it left pending is sequenced (sequence.go) before inTx returns: its CLs
+// numbered and its events placed, their places filled into the events fn appended. An error then is
+// the pass's, the transaction committed: the request's caller may ask again.
 func (s *Store) inTx(ctx context.Context, fn func(context.Context, *txn) error) error {
-	return data.Retry(ctx, s.retryable, func() error {
+	var committed *txn
+	err := data.Retry(ctx, s.retryable, func() error {
 		var logged []backend.Scope
-		var committed *txn
+		committed = nil
 		err := s.b.Txn(ctx, func(ops backend.Ops) error {
 			if s.txAttempts != nil {
 				s.txAttempts()
 			}
-			tx := &txn{Ops: ops}
+			tx := &txn{Ops: ops, after: s.b.SequencesAfterCommit(), tie: data.NewID()}
 			committed = tx
 			defer tx.done.Store(true)
 			tctx := context.WithValue(ctx, txKey{}, tx)
@@ -422,13 +507,15 @@ func (s *Store) inTx(ctx context.Context, fn func(context.Context, *txn) error) 
 			}
 			committed.pending.Send(ctx, s.signals)
 			for _, m := range committed.marks {
-				if err := s.Work().Mark(context.WithoutCancel(ctx), m.kind, m.key); err != nil {
-					slog.Warn("scm: marking work", slog.String("kind", m.kind), slog.Int64("key", m.key), slog.Any("err", err))
-				}
+				s.markSoon(m)
 			}
 		}
 		return err
 	})
+	if err != nil || len(committed.sequence) == 0 || s.skipSequencing {
+		return err
+	}
+	return s.sequenced(committed)
 }
 
 // sortIDs sorts IDs bytewise, the order every multi-row write takes its row locks in, so

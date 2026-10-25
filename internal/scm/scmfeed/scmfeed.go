@@ -79,3 +79,20 @@ func Decode(e bus.Event) (*scmpb.Event, error) {
 	}
 	return ev, nil
 }
+
+// Kind names an event's kind, for metrics.
+func Kind(ev *scmpb.Event) string {
+	switch ev.GetKind().(type) {
+	case *scmpb.Event_Uploaded:
+		return "uploaded"
+	case *scmpb.Event_Transitioned:
+		return "transitioned"
+	case *scmpb.Event_Landed:
+		return "landed"
+	case *scmpb.Event_HeadMoved:
+		return "head_moved"
+	case *scmpb.Event_RepositoryCreated:
+		return "repository_created"
+	}
+	return "other"
+}

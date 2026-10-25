@@ -98,3 +98,13 @@ func Update(ctx context.Context, tx *spanner.ReadWriteTransaction, sql string, p
 	spannertxn.Counted(tx)
 	return tx.Update(ctx, spanner.Statement{SQL: sql, Params: params})
 }
+
+// BatchUpdate runs DML statements in tx in one round trip, in order, returning the rows each
+// changed.
+func BatchUpdate(ctx context.Context, tx *spanner.ReadWriteTransaction, stmts []spanner.Statement) ([]int64, error) {
+	if len(stmts) == 0 {
+		return nil, nil
+	}
+	spannertxn.Counted(tx)
+	return tx.BatchUpdate(ctx, stmts)
+}

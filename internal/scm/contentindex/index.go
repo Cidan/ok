@@ -2,184 +2,100 @@ package contentindex
 
 import (
 	"bytes"
-	"sort"
+	"slices"
 	"sync"
 
 	"github.com/Cidan/ok/internal/scm/encoding"
 )
 
-// Index is a content index in memory, as far as the database's tables hold it — the blocks of its
-// generation and every log row applied since, once each, in the order they apply — with the moves
-// logged of chunks it lacks, whose entries are in segments, and the drops logged since, which hide
-// whatever a segment holds of what they dropped until a fold writes their tombstones. Its methods
-// are safe for concurrent use; an entry's Chunks are shared and must not be changed.
-type Index struct {
+// Log is a content index's log since its generation's fold, as a replica holds it: each entry's
+// updates, in the order they apply, every row applied once. What it says of an entry is its updates
+// applied to the entry's newest record in the runs (Resolve). Its methods are safe for concurrent
+// use; the updates it returns must not be changed.
+type Log struct {
 	mu         sync.RWMutex
 	generation int64
-	entries    map[encoding.ID]Entry
-	moved      map[encoding.ID]Location
-	dropped    map[encoding.ID]encoding.Kind
+	updates    map[encoding.ID][]Update
 }
 
-// New returns an empty index of a generation.
-func New(generation int64) *Index {
-	return &Index{generation: generation, entries: map[encoding.ID]Entry{}, moved: map[encoding.ID]Location{},
-		dropped: map[encoding.ID]encoding.Kind{}}
+// NewLog returns an empty log of a generation.
+func NewLog(generation int64) *Log {
+	return &Log{generation: generation, updates: map[encoding.ID][]Update{}}
 }
 
-// Generation is the generation of the blocks it was built from.
-func (x *Index) Generation() int64 { return x.generation }
+// Generation is the generation whose fold the log follows.
+func (l *Log) Generation() int64 { return l.generation }
 
-// Len is how many entries it holds, bodiless ones included.
-func (x *Index) Len() int {
-	x.mu.RLock()
-	defer x.mu.RUnlock()
-	return len(x.entries)
+// Len is how many entries the log changed.
+func (l *Log) Len() int {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return len(l.updates)
 }
 
-func (x *Index) put(id encoding.ID, e Entry) {
-	if have, ok := x.entries[id]; ok {
-		e = combine(have, e)
-	}
-	x.entries[id] = e
-}
-
-// ApplyBlock adds a block's entries.
-func (x *Index) ApplyBlock(body []byte) error {
-	entries, err := DecodeBlock(body)
-	if err != nil {
-		return err
-	}
-	x.mu.Lock()
-	defer x.mu.Unlock()
-	for _, k := range entries {
-		x.put(k.ID, k.Entry)
-	}
-	return nil
-}
-
-// ApplyLog applies a log row's updates. The reader applies each row once — a drop applied again
-// after a later put of the entry would drop it — as its place in the log says (backend.LogPlace).
-func (x *Index) ApplyLog(body []byte) error {
+// Apply applies a log row's updates, after every row applied before it. The reader applies each
+// row once — a drop applied again after a later put of the entry would drop it — as its place in
+// the log says (backend.LogPlace).
+func (l *Log) Apply(body []byte) error {
 	updates, err := DecodeLog(body)
 	if err != nil {
 		return err
 	}
-	x.mu.Lock()
-	defer x.mu.Unlock()
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	for _, u := range updates {
-		switch u.Op {
-		case Drop:
-			delete(x.entries, u.ID)
-			delete(x.moved, u.ID)
-			x.dropped[u.ID] = u.Entry.Kind
-		case Move:
-			if _, gone := x.dropped[u.ID]; gone {
-				// A drop is final until the entry is put again: there is nothing to move.
-				continue
-			}
-			if e, ok := x.entries[u.ID]; ok && e.Body {
-				e.Loc = u.Entry.Loc
-				x.entries[u.ID] = e
-			} else {
-				x.moved[u.ID] = u.Entry.Loc
-			}
-		default:
-			if u.Op == Put {
-				delete(x.dropped, u.ID)
-			}
-			x.put(u.ID, u.entry())
-		}
+		// Appended past the length any reader holds (Updates caps it): a reader's stays as it was.
+		l.updates[u.ID] = append(l.updates[u.ID], u)
 	}
 	return nil
 }
 
-// Dropped reports whether a drop of id was logged since, and none of its entries put after it:
-// whatever a segment holds of it is gone.
-func (x *Index) Dropped(id encoding.ID) bool {
-	x.mu.RLock()
-	defer x.mu.RUnlock()
-	_, ok := x.dropped[id]
-	return ok
+// Updates are an entry's updates, in order; none when the log did not change it.
+func (l *Log) Updates(id encoding.ID) []Update {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	ups := l.updates[id]
+	return ups[:len(ups):len(ups)]
 }
 
-// DroppedIDs returns what Dropped reports, in ID order, each with its kind.
-func (x *Index) DroppedIDs() []Keyed {
-	x.mu.RLock()
-	out := make([]Keyed, 0, len(x.dropped))
-	for id, k := range x.dropped {
-		out = append(out, Keyed{ID: id, Entry: Entry{Kind: k}})
-	}
-	x.mu.RUnlock()
-	sort.Slice(out, func(i, j int) bool { return bytes.Compare(out[i].ID[:], out[j].ID[:]) < 0 })
-	return out
-}
-
-// Moved returns the location a move logged of a chunk the index lacks, if one was.
-func (x *Index) Moved(id encoding.ID) (Location, bool) {
-	x.mu.RLock()
-	defer x.mu.RUnlock()
-	l, ok := x.moved[id]
-	return l, ok
-}
-
-// MovedIDs returns the chunks the index lacks that a move was logged of, in ID order.
-func (x *Index) MovedIDs() []encoding.ID {
-	x.mu.RLock()
-	out := make([]encoding.ID, 0, len(x.moved))
-	for id := range x.moved {
+// IDs are the entries the log changed, in ID order.
+func (l *Log) IDs() []encoding.ID {
+	l.mu.RLock()
+	out := make([]encoding.ID, 0, len(l.updates))
+	for id := range l.updates {
 		out = append(out, id)
 	}
-	x.mu.RUnlock()
-	sort.Slice(out, func(i, j int) bool { return bytes.Compare(out[i][:], out[j][:]) < 0 })
+	l.mu.RUnlock()
+	slices.SortFunc(out, func(a, b encoding.ID) int { return bytes.Compare(a[:], b[:]) })
 	return out
 }
 
-// Get returns a file's or chunk's entry, if the index knows its body.
-func (x *Index) Get(id encoding.ID) (Entry, bool) {
-	x.mu.RLock()
-	defer x.mu.RUnlock()
-	e, ok := x.entries[id]
-	return e, ok && e.Body
-}
-
-// Lookup returns whatever the index holds of an ID, a bodiless entry included.
-func (x *Index) Lookup(id encoding.ID) (Entry, bool) {
-	x.mu.RLock()
-	defer x.mu.RUnlock()
-	e, ok := x.entries[id]
-	return e, ok
-}
-
-// Range calls f with every entry that has a body, in no order, until f returns false. It holds
-// the index's read lock: f must not call back into it.
-func (x *Index) Range(f func(id encoding.ID, e Entry) bool) {
-	x.mu.RLock()
-	defer x.mu.RUnlock()
-	for id, e := range x.entries {
-		if e.Body && !f(id, e) {
-			return
+// Resolve applies an entry's updates, in order, to its newest record in the runs — base, when one
+// was found; a tombstone, bodiless, is none — and returns the entry and whether the index holds it,
+// its body known. A drop leaves nothing of what was before it; a put after a drop starts anew. A
+// move relocates a chunk the index holds, and is nothing to one it lacks. A touch or a pin of what
+// the index lacks is kept, bodiless, for a put after it, as puts, touches, and pins commute.
+func Resolve(base Entry, found bool, updates []Update) (Entry, bool) {
+	var e Entry
+	have := found && base.Body
+	if have {
+		e = base
+	}
+	for _, u := range updates {
+		switch u.Op {
+		case Drop:
+			e, have = Entry{}, false
+		case Move:
+			if have && e.Body {
+				e.Loc = u.Entry.Loc
+			}
+		default:
+			if have {
+				e = combine(e, u.entry())
+			} else {
+				e, have = u.entry(), true
+			}
 		}
 	}
-}
-
-// Sorted returns every entry, in ID order.
-func (x *Index) Sorted() []Keyed {
-	x.mu.RLock()
-	out := make([]Keyed, 0, len(x.entries))
-	for id, e := range x.entries {
-		out = append(out, Keyed{ID: id, Entry: e})
-	}
-	x.mu.RUnlock()
-	sort.Slice(out, func(i, j int) bool { return bytes.Compare(out[i].ID[:], out[j].ID[:]) < 0 })
-	return out
-}
-
-// Blocks splits entries, in ID order, into blocks of at most BlockEntries.
-func Blocks(entries []Keyed) [][]Keyed {
-	var out [][]Keyed
-	for start := 0; start < len(entries); start += BlockEntries {
-		out = append(out, entries[start:min(start+BlockEntries, len(entries))])
-	}
-	return out
+	return e, have && e.Body
 }

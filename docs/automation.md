@@ -436,7 +436,24 @@ candidate no attempt holds coming of age to be discarded, is a mark for that tim
 looks for marked work as each mark's signal arrives (the bus's, sent once the mark commits), and at
 least every ten seconds. A submission has one active attempt at a time:
 the store refuses another while one is active, so its post never runs twice. Each submission
-says what it waits for (its note: testing on top of which CLs, waiting for which to land).
+says what it waits for (its note: testing on top of which CLs, waiting for which to land), written
+only when it changes.
+
+A pass lands as soon as anything has passed: each landing lands a batch of the passed submissions in
+queue order, up to 32, in one transaction of the SCM's, then records them all in one of its own
+(`RecordLandings`), and the queue is read and decided again. Beside each landing, and once nothing
+is left to land, it does everything else that reading said — preparing attempts, releasing them,
+discarding, failing, canceling: with a landing every second at a busy monorepo's peak, doing them
+only once landings stopped left attempts unprepared for up to a minute. An attempt prepared on main
+as it lands is checked against what landed, as one another replica's landing raced is. Each
+submission's actions are done in order, up to 16 submissions at once: preparing an attempt is a few
+of the SCM's calls and a transaction, and one submission after another made a busy monorepo's pass
+minutes long.
+Attempts prepared at once that need one candidate (a chain's CL on one base) share its
+preparation. Candidates no attempt holds are collected at most once a minute. Where each landed
+submission's time went is a metric (`ok_automation_landing_stage_seconds`, by stage: queued,
+plan_wait, planning, release, job_wait, job_run, land, total), as are each pass's and each action's
+(`ok_automation_queue_pass_seconds`, `ok_automation_queue_action_seconds`).
 
 A path conflict with main is refused, as in landing: `jj sync`, resolve, and upload again.
 

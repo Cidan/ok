@@ -129,6 +129,9 @@ func (x queries) readCLs(ctx context.Context, sql string, params map[string]any)
 }
 
 func (x queries) UpsertChangeList(ctx context.Context, c db.ChangeList) (bool, error) {
+	if cur, ok, err := x.GetChangeList(ctx, c.Repo, c.Number); err != nil || ok && cur.Holds(c) {
+		return false, err
+	}
 	rollsBack := c.RollsBack
 	if rollsBack == nil {
 		rollsBack = []int64{}

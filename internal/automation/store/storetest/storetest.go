@@ -59,6 +59,7 @@ func Run(t *testing.T, open func(t *testing.T) store.Backend) {
 		{"StartRefuses", testStartRefuses},
 		{"LeaseIsFIFOAndExclusive", testLeaseIsFIFOAndExclusive},
 		{"LeaseWaits", testLeaseWaits},
+		{"LeasesWokenInTurn", testLeasesWokenInTurn},
 		{"Heartbeat", testHeartbeat},
 		{"LeaseKeys", testLeaseKeys},
 		{"LogAndFinish", testLogAndFinish},
@@ -88,6 +89,8 @@ func Run(t *testing.T, open func(t *testing.T) store.Backend) {
 		{"DiscardAndFail", testDiscardAndFail},
 		{"OneActiveAttempt", testOneActiveAttempt},
 		{"FirstLanding", testFirstLanding},
+		{"RecordLandings", testRecordLandings},
+		{"SetNotes", testSetNotes},
 		{"AdoptedLandingAtOnce", testAdoptedLandingAtOnce},
 		{"QueueState", testQueueState},
 		{"CarryFromPre", testCarryFromPre},
@@ -259,6 +262,48 @@ func testLeaseWaits(t *testing.T, e *env) {
 	// With nothing queued, a wait ends empty.
 	if r, err := s.Lease(context.Background(), "w", "", 300*time.Millisecond); r != nil || err != nil {
 		t.Errorf("an empty queue: %+v, %v", r, err)
+	}
+}
+
+// Runs queued together — a plan's jobs, in the transaction its planning run finishes in — reach
+// every lease waiting for one, though a run queued wakes one lease a pool on a replica: each that
+// claims one wakes the next in line, well before any looks on its own (Config.Poll).
+func testLeasesWokenInTurn(t *testing.T, e *env) {
+	ctx := context.Background()
+	cfg := store.DefaultConfig
+	cfg.Poll = time.Minute
+	s := e.newStore(t, cfg)
+	time.Sleep(200 * time.Millisecond) // the listener is up
+	plan(t, s, 1)
+	planning := lease(t, s, "planner")
+	got := make(chan *store.Run, 3)
+	for i := range 3 {
+		go func() {
+			r, err := s.Lease(ctx, fmt.Sprintf("w%d", i), "", 30*time.Second)
+			if err != nil {
+				t.Error(err)
+			}
+			got <- r
+		}()
+	}
+	time.Sleep(300 * time.Millisecond) // all three in line
+	jobs := &store.PlanResult{Jobs: []store.PlannedJob{
+		{Job: "one", Spec: build("//a:one")}, {Job: "two", Spec: build("//a:two")}, {Job: "three", Spec: build("//a:three")}}}
+	if err := s.Finish(ctx, planning.ID, "planner", store.StatusPassed, 0, "", jobs); err != nil {
+		t.Fatal(err)
+	}
+	seen := map[int64]bool{}
+	deadline := time.After(10 * time.Second)
+	for range 3 {
+		select {
+		case r := <-got:
+			if r == nil || seen[r.ID] {
+				t.Fatalf("a waiting lease got %+v (taken already: %v)", r, r != nil && seen[r.ID])
+			}
+			seen[r.ID] = true
+		case <-deadline:
+			t.Fatalf("%d of the 3 waiting leases got a job, the plan's 3 queued at once", len(seen))
+		}
 	}
 }
 
@@ -1666,6 +1711,90 @@ func testAdoptedLandingAtOnce(t *testing.T, e *env) {
 	for repo, want := range subs {
 		if got := submitted(repo); got != want {
 			t.Errorf("repository %d's main records submission %d, want %d", repo, got, want)
+		}
+	}
+}
+
+// A pass's notes are written in one transaction: each active submission's says what it waits for; one
+// that ended keeps its note, and one there is none of is no error.
+func testSetNotes(t *testing.T, e *env) {
+	ctx := context.Background()
+	s := e.newStore(t, store.DefaultConfig)
+	a := submit(t, s, 4, store.SubmittedCL{Number: 1, Patchset: 1})
+	b := submit(t, s, 4, store.SubmittedCL{Number: 2, Patchset: 1})
+	c := submit(t, s, 4, store.SubmittedCL{Number: 3, Patchset: 1})
+	if _, err := s.CancelSubmission(ctx, c.ID, "gone", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetNotes(ctx, map[int64]string{a.ID: "testing", b.ID: "planning post", c.ID: "never", 999999: "no such"}); err != nil {
+		t.Fatal(err)
+	}
+	for id, want := range map[int64]string{a.ID: "testing", b.ID: "planning post"} {
+		got, err := s.GetSubmission(ctx, id)
+		if err != nil || got.Note != want {
+			t.Errorf("submission %d's note: %q, %v; want %q", id, got.Note, err, want)
+		}
+	}
+	if got, err := s.GetSubmission(ctx, c.ID); err != nil || got.Note == "never" {
+		t.Errorf("the canceled submission's note: %q, %v", got.Note, err)
+	}
+}
+
+// A landing's submissions are recorded in one transaction: each landed, with main's history at
+// the places their CLs took, in the landing's order; one ended meanwhile is skipped, and named.
+func testRecordLandings(t *testing.T, e *env) {
+	ctx := context.Background()
+	s := e.newStore(t, store.DefaultConfig)
+	const repo = 3
+	type sub struct {
+		id, attempt int64
+		landed      []byte
+	}
+	var subs []sub
+	for i := range 3 {
+		n := int64(i + 1)
+		sb := submit(t, s, repo, store.SubmittedCL{Number: n, Patchset: 1})
+		id, err := s.CreateAttempt(ctx, store.NewAttempt{SubmissionID: sb.ID, Base: commit(), BaseSeq: 4,
+			Candidates: []store.NewCandidate{{SubmissionID: sb.ID, CLNumber: n, Patchset: 1, Commit: commit(), Base: commit(), Own: true,
+				WorkflowsCommit: commit(), Context: postContext(t, n)}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		subs = append(subs, sub{sb.ID, id, commit()})
+	}
+	if _, err := s.CancelSubmission(ctx, subs[1].id, "canceled as it landed", ""); err != nil {
+		t.Fatal(err)
+	}
+	recs := make([]store.Landing, len(subs))
+	for i, sb := range subs {
+		recs[i] = store.Landing{Submission: sb.id, Attempt: sb.attempt, FromSeq: 4 + int64(i),
+			Landed: []store.LandedCL{{CLNumber: int64(i + 1), Commit: sb.landed}}}
+	}
+	skipped, err := s.RecordLandings(ctx, recs)
+	if err != nil || len(skipped) != 1 || skipped[0] != subs[1].id {
+		t.Fatalf("recording the landing: skipped %v, %v; want the canceled submission %d alone", skipped, err, subs[1].id)
+	}
+	st, err := s.QueueState(ctx, repo, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.Submissions) != 0 {
+		t.Fatalf("%d submissions active after the landing", len(st.Submissions))
+	}
+	want := map[int64]sub{5: subs[0], 7: subs[2]}
+	if len(st.Main) != 2 {
+		t.Fatalf("main's history: %+v, want the two landed at 5 and 7", st.Main)
+	}
+	for _, m := range st.Main {
+		w, ok := want[m.Seq]
+		if !ok || !bytes.Equal(m.Commit, w.landed) || m.SubmissionID != w.id {
+			t.Errorf("main at %d: %+v, want submission %d's commit", m.Seq, m, w.id)
+		}
+	}
+	for _, sb := range []sub{subs[0], subs[2]} {
+		got, err := s.GetSubmission(ctx, sb.id)
+		if err != nil || got.Status != store.SubmissionLanded {
+			t.Errorf("submission %d: %+v, %v; want landed", sb.id, got, err)
 		}
 	}
 }

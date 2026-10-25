@@ -13,7 +13,7 @@ import (
 
 // ─── ChangeLists ───
 
-const changelistColumns = `number, change_id, author, status, abandoned_from, parent_number, current_patchset,
+const changelistColumns = `id, number, change_id, author, status, abandoned_from, parent_number, current_patchset,
 	landed_commit, submitted_by, description, created_at, updated_at, rolls_back, rollback_paths, rollback_left`
 
 func changeLists(rows pgx.Rows, err error) ([]backend.ChangeList, error) {
@@ -28,7 +28,7 @@ func changeLists(rows pgx.Rows, err error) ([]backend.ChangeList, error) {
 		var abandonedFrom *int16
 		var parent *int64
 		var submittedBy *string
-		if err := rows.Scan(&c.Number, &c.ChangeID, &c.Author, &c.Status, &abandonedFrom, &parent, &c.CurrentPatchset,
+		if err := rows.Scan(&c.ID, &c.Number, &c.ChangeID, &c.Author, &c.Status, &abandonedFrom, &parent, &c.CurrentPatchset,
 			&landed, &submittedBy, &c.Description, &c.CreatedAt, &c.UpdatedAt, &c.RollsBack, &c.RollbackPaths, &c.RollbackLeft); err != nil {
 			return nil, err
 		}
@@ -63,7 +63,7 @@ func (x queries) ChangeLists(ctx context.Context, repo int64, numbers []int64, l
 
 func (x queries) ListChangeLists(ctx context.Context, repo, before int64, statuses []int16, author string, parent int64, limit int) ([]backend.ChangeList, error) {
 	return changeLists(x.q.Query(ctx, `SELECT `+changelistColumns+` FROM changelist
-		WHERE repository_id = $1 AND ($2::bigint = 0 OR number < $2)
+		WHERE repository_id = $1 AND number > 0 AND ($2::bigint = 0 OR number < $2)
 		  AND (cardinality($3::smallint[]) = 0 OR status = ANY($3))
 		  AND ($4 = '' OR author = $4)
 		  AND ($6::bigint = 0 OR parent_number = $6)
@@ -76,8 +76,8 @@ func (x queries) ChangeListsOfChanges(ctx context.Context, repo int64, changes [
 }
 
 func (x queries) Patchsets(ctx context.Context, repo int64, cls []int64) ([]backend.Patchset, error) {
-	rows, err := x.q.Query(ctx, `SELECT cl_number, number, commit_id, base_commit_id, coalesce(parent_number, 0), uploaded_by, uploaded_at
-		FROM patchset WHERE repository_id = $1 AND cl_number = ANY($2) ORDER BY cl_number, number`, repo, cls)
+	rows, err := x.q.Query(ctx, `SELECT cl_id, number, commit_id, base_commit_id, coalesce(parent_number, 0), uploaded_by, uploaded_at
+		FROM patchset WHERE repository_id = $1 AND cl_id = ANY($2) ORDER BY cl_id, number`, repo, cls)
 	if err != nil {
 		return nil, err
 	}
@@ -109,21 +109,22 @@ func (x queries) ChangeListStatus(ctx context.Context, repo, number int64) (int1
 	return st, err == nil, err
 }
 
-func (x queries) SetChangeListStatus(ctx context.Context, repo, number int64, status int16, abandonedFrom *int16) error {
+func (x queries) SetChangeListStatus(ctx context.Context, repo, id int64, status int16, abandonedFrom *int16) error {
 	_, err := x.q.Exec(ctx, `UPDATE changelist SET status = $3, abandoned_from = $4, updated_at = now()
-		WHERE repository_id = $1 AND number = $2`, repo, number, status, abandonedFrom)
+		WHERE repository_id = $1 AND id = $2`, repo, id, status, abandonedFrom)
 	return err
 }
 
-func (x queries) SetLanded(ctx context.Context, repo, number int64, status int16, commit encoding.ID, by string) error {
+func (x queries) SetLanded(ctx context.Context, repo, id int64, status int16, commit encoding.ID, by string) error {
 	_, err := x.q.Exec(ctx, `UPDATE changelist SET status = $3, landed_commit = $4, submitted_by = $5, updated_at = now()
-		WHERE repository_id = $1 AND number = $2`, repo, number, status, commit[:], by)
+		WHERE repository_id = $1 AND id = $2`, repo, id, status, commit[:], by)
 	return err
 }
 
 func (x queries) UploadChangeLists(ctx context.Context, repo int64, changes, commits [][]byte) ([]int64, error) {
 	return int64s(x.q.Query(ctx, `SELECT number FROM changelist WHERE repository_id = $1 AND change_id = ANY($2)
-		UNION SELECT cl_number FROM patchset WHERE repository_id = $1 AND commit_id = ANY($3)`, repo, changes, commits))
+		UNION SELECT c.number FROM patchset p JOIN changelist c ON c.repository_id = p.repository_id AND c.id = p.cl_id
+			WHERE p.repository_id = $1 AND p.commit_id = ANY($3)`, repo, changes, commits))
 }
 
 func (x queries) NextChangeListNumbers(ctx context.Context, repo int64, n int64) (int64, error) {
@@ -149,26 +150,26 @@ func orEmpty[T any](s []T) []T {
 }
 
 func (x queries) InsertChangeList(ctx context.Context, repo int64, c backend.ChangeList) error {
-	_, err := x.q.Exec(ctx, `INSERT INTO changelist (repository_id, number, change_id, author, status, parent_number,
+	_, err := x.q.Exec(ctx, `INSERT INTO changelist (repository_id, id, number, change_id, author, status, parent_number,
 			current_patchset, description, rolls_back, rollback_paths, rollback_left)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+		VALUES ($1, $12, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
 		repo, c.Number, c.ChangeID, c.Author, c.Status, nullable(c.Parent), c.CurrentPatchset, c.Description,
-		orEmpty(c.RollsBack), orEmpty(c.RollbackPaths), orEmpty(c.RollbackLeft))
+		orEmpty(c.RollsBack), orEmpty(c.RollbackPaths), orEmpty(c.RollbackLeft), c.ID)
 	if unique(err) {
 		return errors.Join(backend.ErrDuplicate, err)
 	}
 	return err
 }
 
-func (x queries) UpdateChangeList(ctx context.Context, repo, number int64, patchset int32, description string, parent *int64, status int16) error {
+func (x queries) UpdateChangeList(ctx context.Context, repo, id int64, patchset int32, description string, parent *int64, status int16) error {
 	_, err := x.q.Exec(ctx, `UPDATE changelist SET current_patchset = $3, description = $4, parent_number = $5,
-			status = $6, updated_at = now() WHERE repository_id = $1 AND number = $2`,
-		repo, number, patchset, description, parent, status)
+			status = $6, updated_at = now() WHERE repository_id = $1 AND id = $2`,
+		repo, id, patchset, description, parent, status)
 	return err
 }
 
 func (x queries) InsertPatchset(ctx context.Context, repo int64, p backend.Patchset) error {
-	_, err := x.q.Exec(ctx, `INSERT INTO patchset (repository_id, cl_number, number, commit_id, base_commit_id, parent_number, uploaded_by)
+	_, err := x.q.Exec(ctx, `INSERT INTO patchset (repository_id, cl_id, number, commit_id, base_commit_id, parent_number, uploaded_by)
 		VALUES ($1, $2, $3, $4, $5, $6, $7)`, repo, p.CL, p.Number, p.Commit[:], p.Base[:], nullable(p.Parent), p.UploadedBy)
 	return err
 }
@@ -184,8 +185,9 @@ func (x queries) RollingBack(ctx context.Context, repo int64, numbers []int64, s
 }
 
 func (x queries) StackedOn(ctx context.Context, repo int64, parents []int64) ([][2]int64, error) {
-	rows, err := x.q.Query(ctx, `SELECT DISTINCT parent_number, cl_number FROM patchset
-		WHERE repository_id = $1 AND parent_number = ANY($2)`, repo, parents)
+	rows, err := x.q.Query(ctx, `SELECT DISTINCT p.parent_number, c.number FROM patchset p
+			JOIN changelist c ON c.repository_id = p.repository_id AND c.id = p.cl_id
+		WHERE p.repository_id = $1 AND p.parent_number = ANY($2)`, repo, parents)
 	if err != nil {
 		return nil, err
 	}
@@ -242,10 +244,11 @@ func (x queries) SettledChangeLists(ctx context.Context, repo int64, limit int) 
 		return nil, err
 	}
 	numbers := make([]int64, len(cls))
+	ids := make([]int64, len(cls))
 	for i, c := range cls {
-		numbers[i] = c.Number
+		numbers[i], ids[i] = c.Number, c.ID
 	}
-	pss, err := x.Patchsets(ctx, repo, numbers)
+	pss, err := x.Patchsets(ctx, repo, ids)
 	if err != nil {
 		return nil, err
 	}
@@ -255,13 +258,13 @@ func (x queries) SettledChangeLists(ctx context.Context, repo int64, limit int) 
 		return nil, err
 	}
 	out := make([]backend.SettledChangeList, 0, len(cls))
-	byNumber := map[int64]int{}
+	byNumber, byID := map[int64]int{}, map[int64]int{}
 	for _, c := range cls {
-		byNumber[c.Number] = len(out)
+		byNumber[c.Number], byID[c.ID] = len(out), len(out)
 		out = append(out, backend.SettledChangeList{ChangeList: c})
 	}
 	for _, p := range pss {
-		o := &out[byNumber[p.CL]]
+		o := &out[byID[p.CL]]
 		o.Patchsets = append(o.Patchsets, p)
 	}
 	landed := map[int64]bool{}

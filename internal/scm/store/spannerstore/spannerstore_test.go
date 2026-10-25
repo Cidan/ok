@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -175,7 +176,7 @@ func TestStagedContentLog(t *testing.T) {
 	}
 	logAll := func(bodies []string, fail error) error {
 		return b.Txn(ctx, func(tx backend.Ops) error {
-			if _, _, err := tx.ShareContentIndex(ctx, sc); err != nil {
+			if _, _, _, err := tx.ShareContentIndex(ctx, sc); err != nil {
 				return err
 			}
 			for _, body := range bodies {
@@ -188,7 +189,7 @@ func TestStagedContentLog(t *testing.T) {
 	}
 	bodies := []string{"first 8b", "second 8", "third 8b"}
 	err = b.Txn(ctx, func(tx backend.Ops) error {
-		if _, _, err := tx.ShareContentIndex(ctx, sc); err != nil {
+		if _, _, _, err := tx.ShareContentIndex(ctx, sc); err != nil {
 			return err
 		}
 		for _, body := range bodies {
@@ -250,6 +251,70 @@ func TestStagedContentLog(t *testing.T) {
 	}
 }
 
+// Log rows go to the commit-timestamp index's shards at random, so writers hold different keys of it
+// until they commit; a reader from a place reads every shard, and so every row committed after it,
+// once each, in commit order.
+func TestContentLogShards(t *testing.T) {
+	ctx := context.Background()
+	admin, client := spannertest.Database(t, spannerstore.Migrations)
+	b, err := spannerstore.Open(ctx, admin, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc := backend.RepositoryScope(7)
+	if err := b.InsertContentIndex(ctx, sc, 1); err != nil {
+		t.Fatal(err)
+	}
+	logOne := func(body string) {
+		t.Helper()
+		if err := txn(ctx, b, func(tx backend.Ops) error {
+			if _, _, _, err := tx.ShareContentIndex(ctx, sc); err != nil {
+				return err
+			}
+			return tx.InsertContentLog(ctx, sc, []byte(body))
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	logOne("first")
+	var place backend.LogPlace
+	if err := b.Snapshot(ctx, func(tx backend.Ops) error {
+		_, p, err := tx.ContentLogSince(ctx, sc, nil)
+		place = p
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var want []string
+	for i := range 48 {
+		want = append(want, fmt.Sprintf("row %02d", i))
+		logOne(want[i])
+	}
+	var got []string
+	if err := b.Snapshot(ctx, func(tx backend.Ops) error {
+		logs, _, err := tx.ContentLogSince(ctx, sc, place)
+		got = nil
+		for _, l := range logs {
+			got = append(got, string(l.Body))
+		}
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("from the place: %q, want %q", got, want)
+	}
+	var shards int64
+	if err := client.Single().Query(ctx, spanner.Statement{SQL: `SELECT COUNT(DISTINCT shard) FROM content_log`}).Do(func(r *spanner.Row) error {
+		return r.Columns(&shards)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if shards < 2 {
+		t.Fatalf("49 log rows went to %d shard", shards)
+	}
+}
+
 // A replica reserves a network's pack numbers a block at a time, once however many publishes find
 // its block spent together: each waits for the one reservation, rather than reserving a block of
 // its own on the one counter row, so the counter holds one block's end, and every pack a number of
@@ -293,5 +358,57 @@ func TestPackNumbersReservedOnce(t *testing.T) {
 	slices.Sort(nums)
 	if nums = slices.Compact(nums); len(nums) != packs {
 		t.Errorf("%d packs share numbers", packs-len(nums))
+	}
+}
+
+// A transaction holding a content index in share mode holds off its fold: one that locks the index
+// and moves its generation waits for it, as one that relies on the index needs, whose view of it
+// would otherwise miss what the fold folded.
+func TestShareHoldsOffAFold(t *testing.T) {
+	ctx := context.Background()
+	admin, client := spannertest.Database(t, spannerstore.Migrations)
+	b, err := spannerstore.Open(ctx, admin, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc := backend.RepositoryScope(7)
+	if err := b.InsertContentIndex(ctx, sc, 1); err != nil {
+		t.Fatal(err)
+	}
+	shared, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	sharer := make(chan error, 1)
+	go func() {
+		sharer <- b.Txn(ctx, func(tx backend.Ops) error {
+			if _, _, _, err := tx.ShareContentIndex(ctx, sc); err != nil {
+				return err
+			}
+			once.Do(func() { close(shared) })
+			<-release
+			return nil
+		})
+	}()
+	<-shared
+	folded := make(chan error, 1)
+	go func() {
+		folded <- txn(ctx, b, func(tx backend.Ops) error {
+			if _, _, err := tx.LockContentIndex(ctx, sc); err != nil {
+				return err
+			}
+			return tx.SetContentIndexGeneration(ctx, sc, 2, nil)
+		})
+	}()
+	select {
+	case err := <-folded:
+		close(release)
+		t.Fatalf("a fold committed (%v) while a transaction held the index in share mode", err)
+	case <-time.After(3 * time.Second):
+	}
+	close(release)
+	if err := <-sharer; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-folded; err != nil {
+		t.Fatal(err)
 	}
 }

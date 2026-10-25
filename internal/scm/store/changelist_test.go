@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -583,6 +584,7 @@ func TestPinMarksCompactionAfterCommit(t *testing.T) {
 	if err := <-uploaded; err != nil {
 		t.Fatal(err)
 	}
+	e.s.marksMade()
 	// Marked once compaction took it: compaction keeps it, to run again.
 	if again, err := e.s.Work().Release(ctx, SegmentWork, e.repo, "compaction"); err != nil || !again {
 		t.Fatalf("releasing compaction: again %v, %v; the upload's pins were not marked", again, err)
@@ -643,7 +645,7 @@ func TestLandFastForwardAndSplice(t *testing.T) {
 	if !pinned {
 		t.Fatal("the landed commit is not pinned")
 	}
-	if unpinned := dbOf(e.s).count(t, "object", `repository_id = @repo AND NOT pinned`, map[string]any{"repo": e.repo}); unpinned != 0 {
+	if unpinned := e.unpinnedTrees(); unpinned != 0 {
 		t.Fatalf("%d trees unpinned after landing", unpinned)
 	}
 	// Upload now knows both landed commits are on main.
@@ -933,5 +935,102 @@ func TestLandEachForItsSubmitter(t *testing.T) {
 	}
 	if r, _ := e.s.GetRepository(ctx, e.repo); r.HeadSeq != 3 {
 		t.Errorf("head_seq %d, want 3: a main move a CL", r.HeadSeq)
+	}
+}
+
+// A mark after commit asked while the same mark is in flight is made once more after it, however
+// many times it was asked meanwhile: a busy repository's writes mark its work a few times a second,
+// not once each, and every commit is followed by a mark begun after it.
+func TestMarksAfterCommitCoalesce(t *testing.T) {
+	ctx := context.Background()
+	e := newCLEnv(t)
+	m := workMark{SegmentWork, e.repo}
+	first, release := make(chan struct{}), make(chan struct{})
+	var mu sync.Mutex
+	made := 0
+	e.s.marking = func(got workMark) {
+		if got != m {
+			return
+		}
+		mu.Lock()
+		made++
+		n := made
+		mu.Unlock()
+		if n == 1 {
+			close(first)
+			<-release
+		}
+	}
+	e.s.markSoon(m)
+	<-first
+	for range 10 {
+		e.s.markSoon(m)
+	}
+	close(release)
+	e.s.marksMade()
+	if made != 2 {
+		t.Fatalf("eleven marks asked, one in flight for ten of them: %d made, want 2", made)
+	}
+	due, err := e.s.Work().Due(ctx, SegmentWork, 10)
+	if err != nil || !slices.Contains(due, e.repo) {
+		t.Fatalf("the work is not marked: %v, %v", due, err)
+	}
+}
+
+// A CL read as compaction moves it, landed, into segments is read whole — its row and its patchsets
+// from one snapshot — by number, in a list, and by its change.
+func TestChangeListReadAcrossItsMove(t *testing.T) {
+	ctx := context.Background()
+	for _, read := range []struct {
+		name string
+		do   func(r *Store, repo, n int64, change encoding.ChangeID) (ChangeList, error)
+	}{
+		{"by number", func(r *Store, repo, n int64, _ encoding.ChangeID) (ChangeList, error) {
+			return r.GetChangeList(ctx, repo, n)
+		}},
+		{"in a list", func(r *Store, repo, _ int64, _ encoding.ChangeID) (ChangeList, error) {
+			cls, _, err := r.ListChangeLists(ctx, repo, nil, "", 0, 10, 0)
+			if err != nil || len(cls) != 1 {
+				return ChangeList{}, fmt.Errorf("%d CLs, %v", len(cls), err)
+			}
+			return cls[0], nil
+		}},
+		{"by its change", func(r *Store, repo, _ int64, change encoding.ChangeID) (ChangeList, error) {
+			cls, err := r.LookupChanges(ctx, repo, []encoding.ChangeID{change})
+			if err != nil || len(cls) != 1 {
+				return ChangeList{}, fmt.Errorf("%d CLs, %v", len(cls), err)
+			}
+			return cls[0], nil
+		}},
+	} {
+		t.Run(read.name, func(t *testing.T) {
+			e := newCLEnv(t)
+			change := newChange()
+			n := e.open(e.commit(alice, change, encoding.RootCommitID, "landed", map[string]string{"a": "1"}))
+			e.mustLand(LandItem{Number: n, Patchset: 1})
+			r := reopen(t, e.s)
+			moved := false
+			r.afterChangeListRows = func() {
+				if moved {
+					return
+				}
+				moved = true
+				done := make(chan error, 1)
+				go func() {
+					_, err := e.s.CompactSegments(ctx, e.repo, 1)
+					done <- err
+				}()
+				if err := <-done; err != nil {
+					t.Error(err)
+				}
+			}
+			c, err := read.do(r, e.repo, n, change)
+			if err != nil || !moved || c.Status != StatusSubmitted || len(c.Patchsets) != 1 {
+				t.Fatalf("the CL read as it moved: %+v, %v (moved %v)", c, err, moved)
+			}
+			if rows, err := e.s.ops(ctx).ChangeLists(ctx, e.repo, []int64{n}, false); err != nil || len(rows) != 0 {
+				t.Fatalf("the CL's rows after compaction: %d, %v; want it moved", len(rows), err)
+			}
+		})
 	}
 }

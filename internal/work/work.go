@@ -33,6 +33,9 @@ type Store interface {
 	// Release ends holder's lease, unless the work was marked meanwhile, due now, when it clears
 	// the mark and keeps the lease, reporting again; a mark due later stays.
 	Release(ctx context.Context, kind string, key int64, holder string) (again bool, err error)
+	// Let ends holder's lease and leaves the work's mark as it is: work a claim (Claim) held while
+	// it was marked is done by whoever takes it next.
+	Let(ctx context.Context, kind string, key int64, holder string) error
 	// Due are up to limit keys of kind's work marked, due, and held by no one, or whose holder's
 	// lease lapsed.
 	Due(ctx context.Context, kind string, limit int) ([]int64, error)
@@ -198,7 +201,9 @@ func hold(ctx context.Context, s Store, kind string, key int64, holder string, t
 // Claim takes holder's lease on key's work, if no one holds it — ok false if another does — and
 // keeps it, renewed, until release: the context it returns ends with ErrLost if the lease is lost,
 // and carries its fence, as Runner.Do's does.
-// release lets the lease go at once, rather than when it would lapse.
+// release lets the lease go at once, rather than when it would lapse, and leaves a mark made
+// meanwhile for whoever takes the work next (Store.Let): a claimer does its work once, and Release,
+// which keeps the lease for a runner to do the work again, would hold it to its end unused.
 func Claim(ctx context.Context, s Store, kind string, key int64, holder string, ttl time.Duration) (held context.Context, release func(), ok bool, err error) {
 	if ok, err = s.Take(ctx, kind, key, holder, ttl); err != nil || !ok {
 		return nil, nil, ok, err
@@ -208,7 +213,7 @@ func Claim(ctx context.Context, s Store, kind string, key int64, holder string, 
 		stop()
 		bg, done := context.WithTimeout(context.WithoutCancel(ctx), ttl)
 		defer done()
-		if _, err := s.Release(bg, kind, key, holder); err != nil {
+		if err := s.Let(bg, kind, key, holder); err != nil {
 			slog.Warn("work: letting go", "kind", kind, "key", key, "err", err)
 		}
 	}, true, nil

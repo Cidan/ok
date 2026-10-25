@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -60,8 +61,10 @@ type Publication struct {
 	chunkLen   map[encoding.ID]uint32
 	wantChunks map[encoding.ID]bool
 	spooled    map[encoding.ID]pack.Location
-	spool      *os.File
-	pw         *pack.Writer
+	// spooledTrees are the trees the pack holds, as it holds the chunks sent.
+	spooledTrees map[encoding.ID]pack.Location
+	spool        *os.File
+	pw           *pack.Writer
 
 	missingObjects []ObjectRef
 	missingChunks  []encoding.ID
@@ -102,7 +105,7 @@ func (s *Store) BeginPublish(ctx context.Context, repo int64, principal, workspa
 		received: map[ObjectRef]encoding.Object{}, bodies: map[ObjectRef][]byte{},
 		files: map[encoding.ID]FileManifest{}, heldFiles: map[encoding.ID]bool{},
 		chunkLen: map[encoding.ID]uint32{}, wantChunks: map[encoding.ID]bool{},
-		spooled: map[encoding.ID]pack.Location{},
+		spooled: map[encoding.ID]pack.Location{}, spooledTrees: map[encoding.ID]pack.Location{},
 	}
 	for _, r := range objects {
 		switch r.Kind {
@@ -448,12 +451,8 @@ func (p *Publication) AddChunk(id encoding.ID, data []byte) error {
 	if got := pack.ChunkID(data); got != id {
 		return invalid("chunk %s: bytes hash to %s", id, got)
 	}
-	if p.pw == nil {
-		f, err := os.CreateTemp("", "ok scm-pack-*")
-		if err != nil {
-			return err
-		}
-		p.spool, p.pw = f, pack.NewWriter(f)
+	if err := p.startPack(); err != nil {
+		return err
 	}
 	loc, err := p.pw.Add(id, data)
 	if err != nil {
@@ -461,6 +460,32 @@ func (p *Publication) AddChunk(id encoding.ID, data []byte) error {
 	}
 	delete(p.wantChunks, id)
 	p.spooled[id] = loc
+	return nil
+}
+
+// spoolTree adds a tree's canonical body to the publish's pack.
+func (p *Publication) spoolTree(id encoding.ID, body []byte) error {
+	if err := p.startPack(); err != nil {
+		return err
+	}
+	loc, err := p.pw.Add(id, body)
+	if err != nil {
+		return err
+	}
+	p.spooledTrees[id] = loc
+	return nil
+}
+
+// startPack starts the publish's pack, spooled to a temporary file, if it has none yet.
+func (p *Publication) startPack() error {
+	if p.pw != nil {
+		return nil
+	}
+	f, err := os.CreateTemp("", "ok scm-pack-*")
+	if err != nil {
+		return err
+	}
+	p.spool, p.pw = f, pack.NewWriter(f)
 	return nil
 }
 
@@ -645,6 +670,13 @@ func (p *Publication) Commit(ctx context.Context, heads *OpHeadsUpdate) ([]encod
 		}
 	}
 
+	// The trees sent go in the pack, after the chunks: the content index holds them, and reads
+	// find them there, as it does the chunks.
+	for _, r := range p.sortedReceived(func(k encoding.Kind) bool { return k == encoding.KindTree }) {
+		if err := p.spoolTree(r.ID, p.bodies[r]); err != nil {
+			return nil, err
+		}
+	}
 	var packID encoding.ID
 	var packSize int64
 	if p.pw != nil {
@@ -707,12 +739,14 @@ func (p *Publication) Commit(ctx context.Context, heads *OpHeadsUpdate) ([]encod
 			}
 			return rej
 		}
+		var stored []ref
 		if p.pw != nil {
-			if err := p.insertPack(ctx, tx, packID, packSize); err != nil {
+			held, err := p.insertPack(ctx, tx, packID, packSize)
+			if err != nil {
 				return err
 			}
+			stored = append(stored, held...)
 		}
-		var stored []ref
 		found, err := p.insertFiles(ctx, tx, fileIDs)
 		if err != nil {
 			return err
@@ -775,59 +809,77 @@ func packKey(net backend.Network, id encoding.ID) string { return packPrefix(net
 // packPrefix begins the key of every pack of a network.
 func packPrefix(net backend.Network) string { return fmt.Sprintf("nets/%d/packs/", net) }
 
-// insertPack records the pack and its chunks: each the repository lacks in the repository's
-// content index, and each the network lacks a location of in the network's.
-func (p *Publication) insertPack(ctx context.Context, tx *txn, packID encoding.ID, size int64) error {
+// insertPack records the pack and what it holds — the chunks sent, and the trees — each the
+// repository lacks in the repository's content index, and each the network lacks a location of in
+// the network's. It returns the trees the repository held already, to touch with the rest.
+func (p *Publication) insertPack(ctx context.Context, tx *txn, packID encoding.ID, size int64) ([]ref, error) {
 	lg, err := p.s.txIndex(ctx, tx, repoScope(p.repo))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	net, err := p.s.txIndex(ctx, tx, backend.NetworkScope(p.net))
 	if err != nil {
-		return err
+		return nil, err
 	}
-	chunkIDs := make([]encoding.ID, 0, len(p.spooled))
-	for id := range p.spooled {
-		chunkIDs = append(chunkIDs, id)
+	type record struct {
+		id   encoding.ID
+		kind encoding.Kind
+		loc  pack.Location
 	}
-	sortIDs(chunkIDs)
-	// A chunk another publish stored first keeps its entry, and a chunk the network stores
-	// already keeps its location; this pack's copy of either is dead bytes that compaction
-	// reclaims.
-	var fresh, unlocated []encoding.ID
-	for _, id := range chunkIDs {
-		_, held, err := lg.has(ctx, encoding.KindChunk, id)
+	records := make([]record, 0, len(p.spooled)+len(p.spooledTrees))
+	ids := make([]encoding.ID, 0, cap(records))
+	for id, loc := range p.spooled {
+		records, ids = append(records, record{id, encoding.KindChunk, loc}), append(ids, id)
+	}
+	for id, loc := range p.spooledTrees {
+		records, ids = append(records, record{id, encoding.KindTree, loc}), append(ids, id)
+	}
+	slices.SortFunc(records, func(a, b record) int { return bytes.Compare(a.id[:], b.id[:]) })
+	// A record another publish stored first keeps its entry, and one the network stores already
+	// keeps its location; this pack's copy of either is dead bytes that compaction reclaims.
+	if err := lg.load(ctx, ids); err != nil {
+		return nil, err
+	}
+	if err := net.load(ctx, ids); err != nil {
+		return nil, err
+	}
+	var fresh, unlocated []record
+	var held []ref
+	for _, r := range records {
+		_, has, err := lg.has(ctx, r.kind, r.id)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		if !held {
-			fresh = append(fresh, id)
+		switch {
+		case !has:
+			fresh = append(fresh, r)
+		case r.kind == encoding.KindTree:
+			held = append(held, ref{table: tObject, kind: encoding.KindTree, id: r.id})
 		}
-		_, located, err := net.has(ctx, encoding.KindChunk, id)
+		_, located, err := net.has(ctx, r.kind, r.id)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if !located {
-			unlocated = append(unlocated, id)
+			unlocated = append(unlocated, r)
 		}
 	}
 	num, err := tx.PutPack(ctx, p.net, packID, size)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	for _, id := range fresh {
-		p.s.logIndex(tx, repoScope(p.repo), contentindex.Update{Op: contentindex.Put, ID: id, Entry: contentindex.Entry{
-			Kind: encoding.KindChunk, Day: lg.today,
+	for _, r := range fresh {
+		p.s.logIndex(tx, repoScope(p.repo), contentindex.Update{Op: contentindex.Put, ID: r.id, Entry: contentindex.Entry{
+			Kind: r.kind, Day: lg.today,
 		}})
 	}
-	for _, id := range unlocated {
-		loc := p.spooled[id]
-		p.s.logIndex(tx, backend.NetworkScope(p.net), contentindex.Update{Op: contentindex.Put, ID: id, Entry: contentindex.Entry{
-			Kind: encoding.KindChunk, Day: net.today,
-			Loc: contentindex.Location{Pack: num, Offset: loc.Offset, Stored: loc.StoredLength, Raw: loc.RawLength, Codec: uint8(loc.Codec)},
+	for _, r := range unlocated {
+		p.s.logIndex(tx, backend.NetworkScope(p.net), contentindex.Update{Op: contentindex.Put, ID: r.id, Entry: contentindex.Entry{
+			Kind: r.kind, Day: net.today,
+			Loc: contentindex.Location{Pack: num, Offset: r.loc.Offset, Stored: r.loc.StoredLength, Raw: r.loc.RawLength, Codec: uint8(r.loc.Codec)},
 		}})
 	}
-	return nil
+	return held, nil
 }
 
 // notInserted returns, as references, the IDs in want that inserted lacks: rows the
@@ -854,6 +906,9 @@ func (p *Publication) insertFiles(ctx context.Context, tx *txn, fileIDs []encodi
 	}
 	lg, err := p.s.txIndex(ctx, tx, repoScope(p.repo))
 	if err != nil {
+		return nil, err
+	}
+	if err := lg.load(ctx, fileIDs); err != nil {
 		return nil, err
 	}
 	var found []ref
@@ -889,11 +944,11 @@ func (p *Publication) sortedReceived(match func(encoding.Kind) bool) []ObjectRef
 	return out
 }
 
-// insertObjects stores the new trees, symlinks, and copy histories, and returns those it
+// insertObjects stores the new symlinks and copy histories, and returns those it
 // found already stored.
 func (p *Publication) insertObjects(ctx context.Context, tx *txn) ([]ref, error) {
 	refs := p.sortedReceived(func(k encoding.Kind) bool {
-		return k == encoding.KindSymlink || k == encoding.KindTree || k == encoding.KindCopyHistory
+		return k == encoding.KindSymlink || k == encoding.KindCopyHistory
 	})
 	if len(refs) == 0 {
 		return nil, nil

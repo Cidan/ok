@@ -1,10 +1,12 @@
 package store
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"sort"
 	"time"
@@ -202,6 +204,9 @@ func (w workStore) Renew(ctx context.Context, kind string, key int64, holder str
 func (w workStore) Release(ctx context.Context, kind string, key int64, holder string) (bool, error) {
 	return w.b.ReleaseWork(ctx, kind, key, holder)
 }
+func (w workStore) Let(ctx context.Context, kind string, key int64, holder string) error {
+	return w.b.LetWork(ctx, kind, key, holder)
+}
 func (w workStore) Due(ctx context.Context, kind string, limit int) ([]int64, error) {
 	return w.b.DueWork(ctx, kind, limit)
 }
@@ -383,6 +388,32 @@ func (s *Store) FailSubmission(ctx context.Context, id int64, reason string) err
 	return s.txn(ctx, func(tx Ops) error {
 		_, err := finishSubmission(ctx, tx, id, SubmissionFailed, reason, "")
 		return err
+	})
+}
+
+// FencedWritesBesideEachOther reports whether writes resting on one keyed-work lease may run beside
+// each other (Backend.FencedWritesBesideEachOther).
+func (s *Store) FencedWritesBesideEachOther() bool { return s.b.FencedWritesBesideEachOther() }
+
+// SetNotes records what the queue is waiting for on active submissions, by submission, in one
+// transaction, in the order of their IDs: a pass's notes, one write.
+func (s *Store) SetNotes(ctx context.Context, notes map[int64]string) error {
+	if len(notes) == 0 {
+		return nil
+	}
+	ids := slices.Sorted(maps.Keys(notes))
+	return s.txn(ctx, func(tx Ops) error {
+		for _, id := range ids {
+			if _, err := tx.LockSubmission(ctx, id); errors.Is(err, ErrNotFound) {
+				continue
+			} else if err != nil {
+				return err
+			}
+			if err := tx.SetNote(ctx, id, notes[id]); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 }
 
@@ -710,13 +741,50 @@ const MainUnknown = -1
 // and — at fromSeq, main's place before the landing, 0 for a main with nothing on it, unless it is
 // MainUnknown — main's history.
 func (s *Store) RecordLanding(ctx context.Context, submission, attempt int64, landed []LandedCL, fromSeq int64) error {
-	return s.txn(ctx, func(tx Ops) error {
-		repo, ok, err := tx.FinishSubmission(ctx, submission, SubmissionLanded, "", "")
-		if err != nil {
-			return err
+	skipped, err := s.RecordLandings(ctx, []Landing{{Submission: submission, Attempt: attempt, Landed: landed, FromSeq: fromSeq}})
+	if err == nil && len(skipped) > 0 {
+		return &ConflictError{Message: fmt.Sprintf("submission %d is no longer active", submission)}
+	}
+	return err
+}
+
+// Landing is one submission a landing landed, for RecordLandings: on which attempt, the commit each
+// of its CLs landed as, and main's place before them (RecordLanding's fromSeq).
+type Landing struct {
+	Submission, Attempt int64
+	Landed              []LandedCL
+	FromSeq             int64
+}
+
+// RecordLandings records a landing's submissions, all of one repository, in one transaction, as
+// RecordLanding records each: a batch's landings recorded one after another, each locking main's
+// history, held the queue up as long as there were submissions in it. It skips, and returns, those
+// no longer active. Each submission is finished before main is locked, as RecordLanding finishes
+// its one, in the order of their IDs: no two take the locks in another order.
+func (s *Store) RecordLandings(ctx context.Context, landings []Landing) (skipped []int64, err error) {
+	sorted := slices.Clone(landings)
+	slices.SortFunc(sorted, func(a, b Landing) int { return cmp.Compare(a.Submission, b.Submission) })
+	err = s.txn(ctx, func(tx Ops) error {
+		skipped = nil
+		repo := int64(0)
+		var finished []Landing
+		for _, l := range sorted {
+			r, ok, err := tx.FinishSubmission(ctx, l.Submission, SubmissionLanded, "", "")
+			if err != nil {
+				return err
+			}
+			if !ok {
+				skipped = append(skipped, l.Submission)
+				continue
+			}
+			if repo != 0 && r != repo {
+				return invalid("a landing's submissions are of repositories %d and %d", repo, r)
+			}
+			repo = r
+			finished = append(finished, l)
 		}
-		if !ok {
-			return &ConflictError{Message: fmt.Sprintf("submission %d is no longer active", submission)}
+		if len(finished) == 0 {
+			return nil
 		}
 		// The SCM's event of the move may be recorded at once (RecordMainCommit): the two take
 		// turns, or each — an adopted landing's record of its submission, the event's of the row —
@@ -724,37 +792,48 @@ func (s *Store) RecordLanding(ctx context.Context, submission, attempt int64, la
 		if err := tx.LockMain(ctx, repo); err != nil {
 			return err
 		}
-		a, err := tx.LockAttempt(ctx, attempt)
-		switch {
-		case err == nil && a.SubmissionID == submission:
-			if _, err := tx.SetAttemptStatus(ctx, attempt, 0, AttemptLanded, a.Reason); err != nil {
-				return err
-			}
-		case err != nil && !errors.Is(err, ErrNotFound):
-			return err
-		}
-		if err := endAttempts(ctx, tx, submission, AttemptDiscarded, "another attempt landed"); err != nil {
-			return err
-		}
-		for i, l := range landed {
-			if err := tx.SetLandedCommit(ctx, submission, l.CLNumber, l.Commit); err != nil {
-				return err
-			}
-			if err := tx.InsertLandedChange(ctx, repo, l.Commit, l.CLNumber); err != nil {
-				return err
-			}
-			if fromSeq != MainUnknown {
-				if err := tx.PutMainCommit(ctx, repo, fromSeq+int64(i)+1, l.Commit, submission); err != nil {
-					return err
-				}
-				continue
-			}
-			if err := tx.SetMainCommitSubmission(ctx, repo, l.Commit, submission); err != nil {
+		for _, l := range finished {
+			if err := recordLanded(ctx, tx, repo, l); err != nil {
 				return err
 			}
 		}
 		return notifyQueue(ctx, tx, repo)
 	})
+	return skipped, err
+}
+
+// recordLanded records, in tx holding main's history, what one finished submission landed.
+func recordLanded(ctx context.Context, tx Ops, repo int64, l Landing) error {
+	a, err := tx.LockAttempt(ctx, l.Attempt)
+	switch {
+	case err == nil && a.SubmissionID == l.Submission:
+		if _, err := tx.SetAttemptStatus(ctx, l.Attempt, 0, AttemptLanded, a.Reason); err != nil {
+			return err
+		}
+	case err != nil && !errors.Is(err, ErrNotFound):
+		return err
+	}
+	if err := endAttempts(ctx, tx, l.Submission, AttemptDiscarded, "another attempt landed"); err != nil {
+		return err
+	}
+	for i, c := range l.Landed {
+		if err := tx.SetLandedCommit(ctx, l.Submission, c.CLNumber, c.Commit); err != nil {
+			return err
+		}
+		if err := tx.InsertLandedChange(ctx, repo, c.Commit, c.CLNumber); err != nil {
+			return err
+		}
+		if l.FromSeq != MainUnknown {
+			if err := tx.PutMainCommit(ctx, repo, l.FromSeq+int64(i)+1, c.Commit, l.Submission); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := tx.SetMainCommitSubmission(ctx, repo, c.Commit, l.Submission); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // RecordMainCommit records a commit main moved to, at its place in main's history.

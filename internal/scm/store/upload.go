@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/Cidan/ok/internal/identity"
 	"github.com/Cidan/ok/internal/owners"
@@ -79,6 +80,7 @@ type UploadResult struct {
 	Number   int64
 	Patchset int32
 	Outcome  UploadOutcome
+	id       int64 // the CL's ID, by which its number is read once its pass has run
 }
 
 // maxUpload bounds how many commits one upload carries.
@@ -138,13 +140,52 @@ func (s *Store) Upload(ctx context.Context, repo int64, principal string, commit
 	if err != nil {
 		return nil, err
 	}
+	// What its commits newly reach, found before the transaction, which pins it a kind at a time.
+	roots := make([]ref, len(staged))
+	for i, u := range staged {
+		roots[i] = ref{table: tCommit, id: u.id}
+	}
+	plan, err := s.planPin(ctx, repo, roots)
+	if err != nil {
+		return nil, err
+	}
 	var results []UploadResult
-	err = s.inTx(ctx, func(ctx context.Context, tx *txn) error {
-		var err error
-		results, err = s.applyUpload(ctx, tx, repo, principal, staged, readiness, assign, rej)
-		return err
-	})
-	return results, err
+	for again := 0; ; again++ {
+		err = s.inTx(ctx, func(ctx context.Context, tx *txn) error {
+			var err error
+			results, err = s.applyUpload(ctx, tx, repo, principal, staged, readiness, assign, rej, plan)
+			return err
+		})
+		// A rejection that names a CL another upload made, which its pass has yet to number, is
+		// made again once it has: what the rejection says shows numbers alone.
+		var rejection *UploadRejection
+		if errors.As(err, &rejection) && rejection.Number < 0 && again < 3 {
+			if err := s.sequence(sequencing(), repo, time.Now()); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		break
+	}
+	if err != nil || !s.b.SequencesAfterCommit() {
+		return results, err
+	}
+	ids := make([]int64, len(results))
+	for i, r := range results {
+		ids[i] = r.id
+	}
+	numbers, err := s.ops(ctx).ChangeListNumbers(ctx, repo, ids)
+	if err != nil {
+		return nil, err
+	}
+	for i := range results {
+		n, ok := numbers[results[i].id]
+		if !ok || n < 0 {
+			return nil, fmt.Errorf("repository %d: CL %d of the upload is not numbered", repo, results[i].id)
+		}
+		results[i].Number = n
+	}
+	return results, nil
 }
 
 // checkUpload loads the commits and runs the checks that depend only on them, and on main as
@@ -457,11 +498,12 @@ type plannedCL struct {
 	number    int64       // assigned at write time for a new CL
 	patchset  int32
 	status    Status
+	id        int64 // the CL's ID
 	parentIdx int   // index of the stack parent's commit in the upload, or -1
 	parentCL  int64 // the stack parent's CL when it is not in the upload, or 0
 }
 
-func (s *Store) applyUpload(ctx context.Context, tx *txn, repo int64, principal string, staged []*uploadCommit, readiness Readiness, assign []string, reviewerRejection *UploadRejection) ([]UploadResult, error) {
+func (s *Store) applyUpload(ctx context.Context, tx *txn, repo int64, principal string, staged []*uploadCommit, readiness Readiness, assign []string, reviewerRejection *UploadRejection, plan pinPlan) ([]UploadResult, error) {
 	// Find and lock every CL the upload can touch — those of its changes, and those whose
 	// patchsets are its commits' parents — in number order. A parent on main, which stays on main,
 	// stacks on no CL (rule 2): the CL it is a patchset of, if it landed as itself, is not read —
@@ -472,6 +514,7 @@ func (s *Store) applyUpload(ctx context.Context, tx *txn, repo int64, principal 
 	}
 	changeKeys := make([][]byte, len(staged))
 	parentKeys := make([][]byte, 0, len(staged))
+	onMain := map[encoding.ID]bool{}
 	for i, u := range staged {
 		changeKeys[i] = u.c.ChangeID[:]
 		if staging[u.parent] {
@@ -481,6 +524,7 @@ func (s *Store) applyUpload(ctx context.Context, tx *txn, repo int64, principal 
 		if err != nil {
 			return nil, err
 		}
+		onMain[u.parent] = main
 		if !main {
 			parentKeys = append(parentKeys, u.parent[:])
 		}
@@ -531,9 +575,7 @@ func (s *Store) applyUpload(ctx context.Context, tx *txn, repo int64, principal 
 		p := &plannedCL{u: u, parentIdx: -1}
 		if j, ok := index[u.parent]; ok {
 			p.parentIdx = j
-		} else if main, err := s.onMain(ctx, tx, repo, u.parent); err != nil {
-			return nil, err
-		} else if !main {
+		} else if !onMain[u.parent] {
 			c, ok := byPatchset[u.parent]
 			switch {
 			case !ok:
@@ -606,29 +648,31 @@ func (s *Store) applyUpload(ctx context.Context, tx *txn, repo int64, principal 
 		return nil, &UploadRejection{Commit: last.id, Reason: ReasonNoNewChanges, Number: results[len(results)-1].Number,
 			Message: "no new changes: every change is already its CL's current patchset"}
 	}
-	if err := s.pin(ctx, tx, repo, roots); err != nil {
+	if err := s.pinPlanned(ctx, tx, repo, plan); err != nil {
 		return nil, err
 	}
 
-	// New CLs take their numbers from the repository's counter, the upload's last lock
-	// before the event counter.
+	// New CLs: their IDs, and their numbers — from the repository's counter, the upload's last
+	// lock before the event counter, or provisional, for its pass to number once the upload commits
+	// (sequence.go).
 	if created > 0 {
-		last, err := tx.NextChangeListNumbers(ctx, repo, created)
+		ids, numbers, err := s.newChangeLists(ctx, tx, repo, int(created))
 		if err != nil {
 			return nil, err
 		}
-		next := last - created + 1
+		k := 0
 		for i, p := range plans {
 			if results[i].Outcome == Created {
-				p.number = next
-				results[i].Number = next
-				next++
+				p.id, p.number = ids[k], numbers[k]
+				results[i].id, results[i].Number = ids[k], numbers[k]
+				k++
 			}
 		}
 	}
 	for i, p := range plans {
 		if p.existing != nil {
-			p.number = p.existing.Number
+			p.id, p.number = p.existing.ID, p.existing.Number
+			results[i].id = p.existing.ID
 		}
 		if results[i].Outcome == Unchanged {
 			continue
@@ -642,7 +686,7 @@ func (s *Store) applyUpload(ctx context.Context, tx *txn, repo int64, principal 
 			parentNumber = &parent
 		}
 		if results[i].Outcome == Created {
-			err := tx.InsertChangeList(ctx, repo, backend.ChangeList{Number: p.number, ChangeID: p.u.c.ChangeID[:], Author: principal,
+			err := tx.InsertChangeList(ctx, repo, backend.ChangeList{ID: p.id, Number: p.number, ChangeID: p.u.c.ChangeID[:], Author: principal,
 				Status: int16(p.status), Parent: parent, CurrentPatchset: 1, Description: p.u.c.Description})
 			if errors.Is(err, backend.ErrDuplicate) {
 				return nil, errRace
@@ -650,10 +694,10 @@ func (s *Store) applyUpload(ctx context.Context, tx *txn, repo int64, principal 
 			if err != nil {
 				return nil, err
 			}
-		} else if err := tx.UpdateChangeList(ctx, repo, p.number, p.patchset, p.u.c.Description, parentNumber, int16(p.status)); err != nil {
+		} else if err := tx.UpdateChangeList(ctx, repo, p.id, p.patchset, p.u.c.Description, parentNumber, int16(p.status)); err != nil {
 			return nil, err
 		}
-		if err := tx.InsertPatchset(ctx, repo, backend.Patchset{CL: p.number, Number: p.patchset, Commit: p.u.id, Base: p.u.parent,
+		if err := tx.InsertPatchset(ctx, repo, backend.Patchset{CL: p.id, Number: p.patchset, Commit: p.u.id, Base: p.u.parent,
 			Parent: parent, UploadedBy: principal}); err != nil {
 			return nil, err
 		}

@@ -7,7 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -56,12 +58,25 @@ type Runner struct {
 	scm   SCM
 	cfg   Config
 	log   *slog.Logger
+
+	// collected is when each repository's candidates were last collected, by this replica.
+	mu        sync.Mutex
+	collected map[int64]time.Time
 }
 
 // New builds a runner.
 func New(s *store.Store, scm SCM, cfg Config, log *slog.Logger) *Runner {
-	return &Runner{store: s, scm: scm, cfg: cfg, log: log}
+	return &Runner{store: s, scm: scm, cfg: cfg, log: log, collected: map[int64]time.Time{}}
 }
+
+// parallel bounds the submissions one pass acts on at once: each a few of the SCM's calls and a
+// transaction, which one after another made a pass over a busy monorepo's queue minutes long,
+// landing nothing meanwhile.
+const parallel = 16
+
+// collectEvery is how often a repository's unheld candidates are collected: listing them is a read
+// of every candidate the repository has.
+const collectEvery = time.Minute
 
 // Run runs the queue until ctx ends: each repository's whenever something it acts on changes —
 // every such change marks it, in its transaction — and when a candidate it left comes of age.
@@ -82,6 +97,7 @@ const maxSteps = 1000
 // repository acts on a repository's queue until nothing lands, then discards the candidates no
 // attempt holds.
 func (r *Runner) repository(ctx context.Context, repo int64) error {
+	defer queuePasses.With().Since(time.Now())
 	for step := 0; step < maxSteps; step++ {
 		rep, err := r.scm.Repositories.GetRepository(ctx, &scmpb.GetRepositoryRequest{Key: &scmpb.GetRepositoryRequest_Id{Id: repo}})
 		if err != nil {
@@ -94,30 +110,171 @@ func (r *Runner) repository(ctx context.Context, repo int64) error {
 		snap := r.snapshot(st, rep)
 		acts := Decide(snap)
 		if len(acts) > 0 && acts[0].Kind == Land {
-			// Landing moves main: everything else is decided again from the new head.
-			if err := r.land(ctx, rep, st, Batch(snap, max(r.cfg.Batch, 1))); err != nil {
+			// Landing moves main, so the queue is read and decided again after it; what else this
+			// reading says is done beside the landing, not after it: a landing a second, each over a
+			// second, otherwise left attempts unprepared and planned ones unreleased for as long as
+			// landings kept coming (up to 58 seconds at staging's peak). An attempt prepared on main
+			// before the landing is checked against what landed, as one another replica's landing
+			// raced always was.
+			batch, rest := LandingStep(snap, acts, max(r.cfg.Batch, 1))
+			p := r.newPass()
+			var landErr error
+			landed := make(chan struct{})
+			go func() {
+				defer close(landed)
+				landErr = r.land(ctx, rep, st, p, batch)
+			}()
+			restErr := r.actAll(ctx, rep, st, p, rest)
+			<-landed
+			if err := errors.Join(landErr, restErr); err != nil {
 				return err
 			}
 			continue
 		}
 		if len(acts) > 0 && acts[0].Kind == Adopt {
-			if err := r.act(ctx, rep, st, acts[0]); err != nil {
+			if err := r.act(ctx, rep, st, nil, acts[0]); err != nil {
 				return err
 			}
 			continue
 		}
-		var errs []error
-		for _, a := range acts {
-			if err := r.act(ctx, rep, st, a); err != nil {
-				errs = append(errs, err)
-			}
-		}
-		if err := errors.Join(errs...); err != nil {
+		if err := r.actAll(ctx, rep, st, r.newPass(), acts); err != nil {
 			return err
 		}
-		return r.collect(ctx, repo)
+		return r.collectDue(ctx, repo)
 	}
 	return fmt.Errorf("still landing after %d steps", maxSteps)
+}
+
+// newPass is a pass's shared state, its writes taking turns where the store needs it.
+func (r *Runner) newPass() *pass {
+	return &pass{prepared: map[string]*preparing{}, serial: !r.store.FencedWritesBesideEachOther()}
+}
+
+// actAll does a pass's actions: each submission's in order — a discard before the attempt that
+// replaces it — and up to parallel submissions at once; then the notes that changed, of the
+// submissions whose actions did not fail, in one write.
+func (r *Runner) actAll(ctx context.Context, rep *scmpb.Repository, st *store.QueueState, p *pass, acts []Action) error {
+	var order []int64
+	bySubmission := map[int64][]Action{}
+	notes := map[int64]string{}
+	for _, a := range acts {
+		if a.Kind == Note {
+			if q := submission(st, a.Submission); q == nil || q.Note != a.Reason {
+				notes[a.Submission] = a.Reason
+			}
+			continue
+		}
+		if _, ok := bySubmission[a.Submission]; !ok {
+			order = append(order, a.Submission)
+		}
+		bySubmission[a.Submission] = append(bySubmission[a.Submission], a)
+	}
+	sem := make(chan struct{}, parallel)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var errs []error
+	for _, id := range order {
+		sem <- struct{}{}
+		wg.Go(func() {
+			defer func() { <-sem }()
+			for _, a := range bySubmission[id] {
+				if err := r.act(ctx, rep, st, p, a); err != nil {
+					mu.Lock()
+					errs = append(errs, err)
+					delete(notes, id)
+					mu.Unlock()
+					return
+				}
+			}
+		})
+	}
+	wg.Wait()
+	if len(notes) > 0 {
+		t := time.Now()
+		done := p.write()
+		err := r.store.SetNotes(ctx, notes)
+		done()
+		queueActions.With(Note.String()).Since(t)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("the pass's notes: %w", err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// pass is what one pass's actions share: the candidates its attempts prepare, each once, though
+// several attempts it prepares at once need it — a chain's CL, prepared on one base — and, where the
+// store needs it, its writes' turns (write).
+type pass struct {
+	mu       sync.Mutex
+	prepared map[string]*preparing
+	serial   bool
+	writes   sync.Mutex
+}
+
+// write waits, on a store whose writes resting on one lease may not run beside each other
+// (store.FencedWritesBesideEachOther), for the pass's other writes, and returns the function that
+// lets the next go. Each of a pass's writes rests on the queue's lease and marks the queue's work
+// row; on PostgreSQL the lease's check holds that row in share mode and the mark then writes it, so
+// writes beside each other deadlock on it and hold off the lease's renewal — 16 at once committed
+// one write in eight seconds, and the lease was lost — and they take turns, the SCM's calls behind
+// them, where the time goes, still at once. Taking turns on Spanner, where each write is slower and
+// the fence reads a cell no mark writes, cost staging's peak seconds a landing.
+func (p *pass) write() func() {
+	if p == nil || !p.serial {
+		return func() {}
+	}
+	p.writes.Lock()
+	return p.writes.Unlock
+}
+
+type preparing struct {
+	done   chan struct{}
+	commit []byte
+	err    error
+}
+
+// prepare is a CL's patchset's candidate on base: prepared once a pass, by the first attempt
+// that asks, the others waiting for it.
+func (p *pass) prepare(base []byte, cl int64, patchset int32, do func() ([]byte, error)) ([]byte, error) {
+	if p == nil {
+		return do()
+	}
+	key := fmt.Sprintf("%x/%d/%d", base, cl, patchset)
+	p.mu.Lock()
+	if pr, ok := p.prepared[key]; ok {
+		p.mu.Unlock()
+		<-pr.done
+		return pr.commit, pr.err
+	}
+	pr := &preparing{done: make(chan struct{})}
+	p.prepared[key] = pr
+	p.mu.Unlock()
+	pr.commit, pr.err = do()
+	close(pr.done)
+	return pr.commit, pr.err
+}
+
+// collectDue collects a repository's candidates if this replica has not in collectEvery.
+func (r *Runner) collectDue(ctx context.Context, repo int64) error {
+	r.mu.Lock()
+	last := r.collected[repo]
+	due := time.Since(last) >= collectEvery
+	if due {
+		r.collected[repo] = time.Now()
+	}
+	r.mu.Unlock()
+	if !due {
+		return nil
+	}
+	defer queueActions.With("collect").Since(time.Now())
+	if err := r.collect(ctx, repo); err != nil {
+		r.mu.Lock()
+		r.collected[repo] = last
+		r.mu.Unlock()
+		return err
+	}
+	return nil
 }
 
 // snapshot is Decide's view of a repository's queue.
@@ -242,19 +399,54 @@ func jobName(id string) string {
 	return id
 }
 
-// act does one action.
-func (r *Runner) act(ctx context.Context, rep *scmpb.Repository, st *store.QueueState, a Action) error {
+// act does one action; p, when not nil, is the pass it is part of.
+func (r *Runner) act(ctx context.Context, rep *scmpb.Repository, st *store.QueueState, p *pass, a Action) error {
+	defer queueActions.With(a.Kind.String()).Since(time.Now())
+	var err error
+	if a.Kind == Create {
+		err = r.create(ctx, rep, st, p, a.Submission, a.Chain)
+	} else {
+		done := p.write()
+		err = r.apply(ctx, rep, st, a)
+		done()
+	}
+	var conflict *store.ConflictError
+	if errors.As(err, &conflict) {
+		// The submission or attempt moved on meanwhile — a person canceled it, a new patchset
+		// came: the next pass sees it.
+		return nil
+	}
+	var invalid *store.InvalidError
+	if a.Kind == Create && errors.As(err, &invalid) {
+		// The store refuses what it cannot hold, and always will: the submission fails, saying
+		// why, rather than holding its repository's queue up on every pass.
+		reason := "its attempt could not be recorded: " + invalid.Message
+		r.log.Warn("queue: failed a submission", "repository", rep.GetName(), "submission", a.Submission, "reason", reason)
+		done := p.write()
+		ferr := r.store.FailSubmission(ctx, a.Submission, reason)
+		done()
+		if ferr != nil && !errors.As(ferr, &conflict) {
+			return fmt.Errorf("submission %d: %w", a.Submission, ferr)
+		}
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("submission %d: %w", a.Submission, err)
+	}
+	return nil
+}
+
+// apply does an action other than preparing an attempt: a write to the store, or a landing.
+func (r *Runner) apply(ctx context.Context, rep *scmpb.Repository, st *store.QueueState, a Action) error {
 	var err error
 	switch a.Kind {
-	case Create:
-		err = r.create(ctx, rep, st, a.Submission, a.Chain)
 	case Release:
 		err = r.store.ReleaseAttempt(ctx, a.Attempt)
 	case Discard:
 		r.log.Info("queue: discarded an attempt", "repository", rep.GetName(), "submission", a.Submission, "attempt", a.Attempt, "reason", a.Reason)
 		err = r.store.DiscardAttempt(ctx, a.Attempt, a.Reason)
 	case Land:
-		err = r.land(ctx, rep, st, []Action{a})
+		err = r.land(ctx, rep, st, nil, []Action{a})
 	case Adopt:
 		var landed []store.LandedCL
 		for _, c := range submission(st, a.Submission).CLs {
@@ -271,27 +463,7 @@ func (r *Runner) act(ctx context.Context, rep *scmpb.Repository, st *store.Queue
 	case Note:
 		err = r.store.SetNote(ctx, a.Submission, a.Reason)
 	}
-	var conflict *store.ConflictError
-	if errors.As(err, &conflict) {
-		// The submission or attempt moved on meanwhile — a person canceled it, a new patchset
-		// came: the next pass sees it.
-		return nil
-	}
-	var invalid *store.InvalidError
-	if a.Kind == Create && errors.As(err, &invalid) {
-		// The store refuses what it cannot hold, and always will: the submission fails, saying
-		// why, rather than holding its repository's queue up on every pass.
-		reason := "its attempt could not be recorded: " + invalid.Message
-		r.log.Warn("queue: failed a submission", "repository", rep.GetName(), "submission", a.Submission, "reason", reason)
-		if ferr := r.store.FailSubmission(ctx, a.Submission, reason); ferr != nil && !errors.As(ferr, &conflict) {
-			return fmt.Errorf("submission %d: %w", a.Submission, ferr)
-		}
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("submission %d: %w", a.Submission, err)
-	}
-	return nil
+	return err
 }
 
 func submission(st *store.QueueState, id int64) *store.QueuedSubmission {
@@ -316,18 +488,21 @@ func attemptOf(q *store.QueuedSubmission, id int64) *store.Attempt {
 // candidate on the one before it — or one an active attempt already prepared there — then the
 // submission's own, each with its post plan. A candidate the SCM refuses ends the preparing:
 // the attempt is recorded failed with the SCM's words.
-func (r *Runner) create(ctx context.Context, rep *scmpb.Repository, st *store.QueueState, id int64, chain []int64) error {
+func (r *Runner) create(ctx context.Context, rep *scmpb.Repository, st *store.QueueState, p *pass, id int64, chain []int64) error {
 	repo := rep.GetId()
 	e := submission(st, id)
 	na := store.NewAttempt{SubmissionID: id, Base: rep.GetHead(), BaseSeq: rep.GetHeadSeq(), Chain: chain}
 	prev := rep.GetHead()
 	prepare := func(sub *store.Submission, cl store.SubmittedCL) ([]byte, error) {
-		if c, ok, err := r.store.ReusableCandidate(ctx, repo, prev, cl.Number, cl.Patchset); err != nil || ok {
-			return c, err
-		}
-		c, err := r.scm.Landing.PrepareCandidate(ctx, &scmpb.PrepareCandidateRequest{RepositoryId: repo,
-			Number: cl.Number, Patchset: cl.Patchset, Base: prev, ActorId: sub.SubmittedBy})
-		return c.GetCommitId(), err
+		base := prev
+		return p.prepare(base, cl.Number, cl.Patchset, func() ([]byte, error) {
+			if c, ok, err := r.store.ReusableCandidate(ctx, repo, base, cl.Number, cl.Patchset); err != nil || ok {
+				return c, err
+			}
+			c, err := r.scm.Landing.PrepareCandidate(ctx, &scmpb.PrepareCandidateRequest{RepositoryId: repo,
+				Number: cl.Number, Patchset: cl.Patchset, Base: base, ActorId: sub.SubmittedBy})
+			return c.GetCommitId(), err
+		})
 	}
 	var on []string
 	onCLs := 0
@@ -342,7 +517,7 @@ func (r *Runner) create(ctx context.Context, rep *scmpb.Repository, st *store.Qu
 			commit, err := prepare(s.Submission, cl)
 			if rej := landRejection(err); rej != nil {
 				na.PrepareError = fmt.Sprintf("preparing %s, which it is tested on: %s", clList(numbers(s.CLs)), rejectionMessage(rej))
-				return r.record(ctx, na)
+				return r.record(ctx, p, na)
 			}
 			if err != nil {
 				return err
@@ -367,7 +542,7 @@ func (r *Runner) create(ctx context.Context, rep *scmpb.Repository, st *store.Qu
 		commit, err := prepare(e.Submission, cl)
 		if rej := landRejection(err); rej != nil {
 			na.PrepareError = rejectionMessage(rej)
-			return r.record(ctx, na)
+			return r.record(ctx, p, na)
 		}
 		if err != nil {
 			return err
@@ -403,12 +578,14 @@ func (r *Runner) create(ctx context.Context, rep *scmpb.Repository, st *store.Qu
 		na.Candidates = append(na.Candidates, nc)
 		prev = commit
 	}
-	return r.record(ctx, na)
+	return r.record(ctx, p, na)
 }
 
-// record records a prepared attempt.
-func (r *Runner) record(ctx context.Context, na store.NewAttempt) error {
+// record records a prepared attempt, in its turn among the pass's writes.
+func (r *Runner) record(ctx context.Context, p *pass, na store.NewAttempt) error {
+	done := p.write()
 	id, err := r.store.CreateAttempt(ctx, na)
+	done()
 	if err == nil {
 		r.log.Info("queue: prepared an attempt", "submission", na.SubmissionID, "attempt", id, "chain", na.Chain,
 			"refused", na.PrepareError)
@@ -424,7 +601,8 @@ func (r *Runner) record(ctx context.Context, na store.NewAttempt) error {
 // between the two leaves every CL landed or none, and a landing not recorded is adopted on the
 // next pass (Adopt), as the SCM's record says what landed. A batch the SCM refuses lands its
 // first submission alone, which says whose the refusal is.
-func (r *Runner) land(ctx context.Context, rep *scmpb.Repository, st *store.QueueState, batch []Action) error {
+func (r *Runner) land(ctx context.Context, rep *scmpb.Repository, st *store.QueueState, p *pass, batch []Action) error {
+	defer queueActions.With("land").Since(time.Now())
 	req := &scmpb.LandRequest{RepositoryId: rep.GetId(), ExpectedHead: rep.GetHead(), ActorId: submission(st, batch[0].Submission).SubmittedBy}
 	counts := make([]int, 0, len(batch))
 	for i, a := range batch {
@@ -446,8 +624,10 @@ func (r *Runner) land(ctx context.Context, rep *scmpb.Repository, st *store.Queu
 		case rej.GetReason() == scmpb.LandRejection_REASON_HEAD_MOVED:
 			return nil
 		case len(batch) > 1:
-			return r.land(ctx, rep, st, batch[:1])
+			return r.land(ctx, rep, st, p, batch[:1])
 		}
+		done := p.write()
+		defer done()
 		return r.store.FailSubmission(ctx, batch[0].Submission, rejectionMessage(rej))
 	}
 	if err != nil {
@@ -458,23 +638,33 @@ func (r *Runner) land(ctx context.Context, rep *scmpb.Repository, st *store.Queu
 	}
 	landings.Inc()
 	landedSubmissions.Add(uint64(len(batch)))
-	var errs []error
+	recs := make([]store.Landing, len(batch))
 	from, at := rep.GetHeadSeq(), 0
 	for i, a := range batch {
 		var landed []store.LandedCL
 		for _, l := range resp.GetLanded()[at : at+counts[i]] {
 			landed = append(landed, store.LandedCL{CLNumber: l.GetNumber(), Commit: l.GetCommitId()})
 		}
-		r.log.Info("queue: landed", "repository", rep.GetName(), "submission", a.Submission, "attempt", a.Attempt,
-			"batch", len(batch), "head", short(resp.GetHead()))
-		err := r.store.RecordLanding(ctx, a.Submission, a.Attempt, landed, from)
-		var conflict *store.ConflictError
-		if err != nil && !errors.As(err, &conflict) {
-			errs = append(errs, fmt.Errorf("submission %d: %w", a.Submission, err))
-		}
+		recs[i] = store.Landing{Submission: a.Submission, Attempt: a.Attempt, Landed: landed, FromSeq: from}
 		from, at = from+int64(counts[i]), at+counts[i]
 	}
-	return errors.Join(errs...)
+	// One transaction for the batch, as the SCM landed it in one.
+	done := p.write()
+	skipped, err := r.store.RecordLandings(ctx, recs)
+	done()
+	if err != nil {
+		return fmt.Errorf("recording the landing of %d submissions: %w", len(batch), err)
+	}
+	now := time.Now()
+	for _, a := range batch {
+		if slices.Contains(skipped, a.Submission) {
+			continue // ended meanwhile, as it would have been skipped alone
+		}
+		r.log.Info("queue: landed", "repository", rep.GetName(), "submission", a.Submission, "attempt", a.Attempt,
+			"batch", len(batch), "head", short(resp.GetHead()))
+		observeStages(submission(st, a.Submission), attemptOf(submission(st, a.Submission), a.Attempt), now)
+	}
+	return nil
 }
 
 // maxLandItems bounds the CLs one landing names, as the SCM does.
@@ -485,7 +675,57 @@ var (
 		"Landings the landing queue made: one transaction in the SCM each, main moved once.")
 	landedSubmissions = metrics.NewCounter("ok_automation_landed_submissions_total",
 		"Submissions the landing queue landed, in all its landings.")
+	queuePasses = metrics.NewHistogram("ok_automation_queue_pass_seconds",
+		"How long each pass over a repository's landing queue took, from reading it to having nothing left to land.", metrics.Seconds)
+	queueActions = metrics.NewHistogram("ok_automation_queue_action_seconds",
+		"How long each of the landing queue's actions took, by kind.", metrics.Seconds, "kind")
+	landingStages = metrics.NewHistogram("ok_automation_landing_stage_seconds",
+		"Where a landed submission's time went, by stage: queued (submitted until the attempt that landed was "+
+			"prepared), plan_wait and planning (its post plan's run waiting for a worker, and running), release (the "+
+			"plan done until its jobs were queued), job_wait and job_run (each job waiting for a worker, and running), "+
+			"land (the last job done until it landed), and total.", metrics.Seconds, "stage")
 )
+
+// observeStages records where a landed submission's time went, from its attempt's runs.
+func observeStages(q *store.QueuedSubmission, a *store.Attempt, now time.Time) {
+	if q == nil || a == nil {
+		return
+	}
+	stage := func(name string, from, to time.Time) {
+		if !from.IsZero() && !to.IsZero() && !to.Before(from) {
+			landingStages.With(name).Observe(to.Sub(from).Seconds())
+		}
+	}
+	stage("total", q.CreatedAt, now)
+	stage("queued", q.CreatedAt, a.CreatedAt)
+	last := a.CreatedAt
+	for _, c := range a.Planned() {
+		p := c.PlanRun
+		if p == nil {
+			continue
+		}
+		stage("plan_wait", p.QueuedAt, p.StartedAt)
+		stage("planning", p.StartedAt, p.FinishedAt)
+		if p.FinishedAt.After(last) {
+			last = p.FinishedAt
+		}
+		var released time.Time
+		for _, j := range c.Jobs {
+			if released.IsZero() || j.QueuedAt.Before(released) {
+				released = j.QueuedAt
+			}
+			if j.CarriedFrom == 0 {
+				stage("job_wait", j.QueuedAt, j.StartedAt)
+				stage("job_run", j.StartedAt, j.FinishedAt)
+			}
+			if j.FinishedAt.After(last) {
+				last = j.FinishedAt
+			}
+		}
+		stage("release", p.FinishedAt, released)
+	}
+	stage("land", last, now)
+}
 
 // collect discards the repository's candidates no active attempt holds, once they are older
 // than the grace period, and marks the queue due when the youngest of the rest comes of age.

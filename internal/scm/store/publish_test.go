@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -373,6 +374,10 @@ func touchedToday(t *testing.T, s *Store, repo int64, tableName string, id encod
 		e, ok := indexOf(t, s, repo).Get(id)
 		return ok && e.Day == contentindex.DayOf(today)
 	}
+	if tableName == "object" {
+		touched, _ := objectState(t, s, repo, id)
+		return touched.Equal(today)
+	}
 	return dbOf(s).touched(t, tableName, repo, id).Equal(today)
 }
 
@@ -387,24 +392,20 @@ func TestTouchIsTransitiveAndStopsAtPinned(t *testing.T) {
 	outer := b.tree(treeEntry("inner", inner), treeEntry("p", pinnedTree))
 	mustPublish(t, s, repo.ID, "alice", b, nil)
 
-	age := func(tableName string, id encoding.ID) {
-		if tableName == "file" {
-			rewriteIndex(t, s, repo.ID, func(eid encoding.ID, e *contentindex.Entry) {
-				if eid == id {
-					e.Day -= 20
-				}
-			})
-			return
+	// The trees and files are the content index's: a publish stored them.
+	age := func(ids ...encoding.ID) {
+		rewriteIndex(t, s, repo.ID, func(eid encoding.ID, e *contentindex.Entry) {
+			if slices.Contains(ids, eid) {
+				e.Day -= 20
+			}
+		})
+	}
+	age(outer, inner, pinnedTree, f, pinnedFile)
+	rewriteIndex(t, s, repo.ID, func(eid encoding.ID, e *contentindex.Entry) {
+		if eid == pinnedTree {
+			e.Pinned = true
 		}
-		dbOf(s).ageRow(t, tableName, repo.ID, id, 20)
-	}
-	for _, x := range []struct {
-		table string
-		id    encoding.ID
-	}{{"object", outer}, {"object", inner}, {"object", pinnedTree}, {"file", f}, {"file", pinnedFile}} {
-		age(x.table, x.id)
-	}
-	dbOf(s).exec(t, `UPDATE object SET pinned = true WHERE repository_id = @repo AND id = @id`, map[string]any{"repo": repo.ID, "id": pinnedTree[:]})
+	})
 	// A new commit referencing the outer tree touches it and everything unpinned beneath.
 	nb := newBuilder(t)
 	nb.commit(outer, "touch\n", encoding.RootCommitID)
@@ -429,7 +430,7 @@ func TestTouchIsTransitiveAndStopsAtPinned(t *testing.T) {
 	}
 	// Once touched today, a subgraph is not walked again: age the leaf alone, and a second
 	// reference to outer (already fresh) leaves it stale.
-	age("file", f)
+	age(f)
 	nb2 := newBuilder(t)
 	nb2.commit(outer, "again\n", encoding.RootCommitID)
 	mustPublish(t, s, repo.ID, "alice", nb2, nil)

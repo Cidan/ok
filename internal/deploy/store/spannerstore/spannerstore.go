@@ -816,6 +816,12 @@ func (x queries) ReleaseWork(ctx context.Context, kind string, key int64, holder
 	return again, err
 }
 
+func (x queries) LetWork(ctx context.Context, kind string, key int64, holder string) error {
+	return x.Write(ctx, func(tx *spanner.ReadWriteTransaction) error {
+		return spannerdata.LetWork(ctx, tx, kind, key, holder)
+	})
+}
+
 func (x queries) DueWork(ctx context.Context, kind string, limit int) ([]int64, error) {
 	var keys []int64
 	err := x.Read(func(r spannerdata.Reader) error {

@@ -187,8 +187,13 @@ CREATE TABLE op_tombstone (
     id        BYTES(MAX) NOT NULL,
 ) PRIMARY KEY (op_log_id, kind, id), INTERLEAVE IN PARENT op_log ON DELETE CASCADE;
 
+-- A CL is keyed by its ID, 63 random bits; its number is the name everything outside the SCM knows
+-- it by. A CL made on Spanner is numbered just after the transaction that makes it commits
+-- (sequence_pending): until then its number is its ID negated, unique as numbers are, and so is
+-- what names it as a parent.
 CREATE TABLE changelist (
     repository_id    INT64              NOT NULL,
+    id               INT64              NOT NULL,
     number           INT64              NOT NULL,
     change_id        BYTES(MAX)         NOT NULL,
     author           STRING(MAX)        NOT NULL,
@@ -204,24 +209,26 @@ CREATE TABLE changelist (
     rolls_back       ARRAY<INT64>       NOT NULL,
     rollback_paths   ARRAY<STRING(MAX)> NOT NULL,
     rollback_left    ARRAY<STRING(MAX)> NOT NULL,
-) PRIMARY KEY (repository_id, number), INTERLEAVE IN PARENT repository ON DELETE NO ACTION;
+) PRIMARY KEY (repository_id, id), INTERLEAVE IN PARENT repository ON DELETE NO ACTION;
+CREATE UNIQUE INDEX changelist_number ON changelist (repository_id, number);
 CREATE UNIQUE INDEX changelist_change ON changelist (repository_id, change_id);
 CREATE INDEX changelist_status ON changelist (repository_id, status, number);
 CREATE INDEX changelist_author ON changelist (repository_id, author, number);
+CREATE NULL_FILTERED INDEX changelist_parent ON changelist (repository_id, parent_number);
 
 CREATE TABLE patchset (
     repository_id  INT64       NOT NULL,
-    cl_number      INT64       NOT NULL,
+    cl_id          INT64       NOT NULL,
     number         INT64       NOT NULL,
     commit_id      BYTES(MAX)  NOT NULL,
     base_commit_id BYTES(MAX)  NOT NULL,
     parent_number  INT64,                         -- the CL it was stacked on when uploaded
     uploaded_by    STRING(MAX) NOT NULL,
     uploaded_at    TIMESTAMP   NOT NULL,
-    CONSTRAINT patchset_changelist_fk FOREIGN KEY (repository_id, cl_number) REFERENCES changelist (repository_id, number) ON DELETE CASCADE,
-) PRIMARY KEY (repository_id, cl_number, number), INTERLEAVE IN PARENT repository ON DELETE NO ACTION;
+    CONSTRAINT patchset_changelist_fk FOREIGN KEY (repository_id, cl_id) REFERENCES changelist (repository_id, id) ON DELETE CASCADE,
+) PRIMARY KEY (repository_id, cl_id, number), INTERLEAVE IN PARENT repository ON DELETE NO ACTION;
 CREATE INDEX patchset_commit ON patchset (repository_id, commit_id);
-CREATE INDEX patchset_parent ON patchset (repository_id, parent_number);
+CREATE NULL_FILTERED INDEX patchset_parent ON patchset (repository_id, parent_number);
 
 CREATE TABLE candidate (
     repository_id INT64       NOT NULL,

@@ -235,9 +235,9 @@ func TestMarkWorkIdle(t *testing.T) {
 	}
 }
 
-// A transaction under keyed work's fence commits while its holder holds the work, and is refused
-// (data.ErrFenced) once the lease lapsed and another took it; a context with no fence checks
-// nothing.
+// A transaction under keyed work's fence commits while its holder holds the work — past its lease
+// too, until another takes it, as no one else writes — and is refused (data.ErrFenced) once another
+// holds it; a context with no fence checks nothing.
 func TestCheckFence(t *testing.T) {
 	ctx := context.Background()
 	c := client(t)
@@ -259,8 +259,8 @@ func TestCheckFence(t *testing.T) {
 		t.Errorf("work there is none of: %v", err)
 	}
 	time.Sleep(1100 * time.Millisecond)
-	if err := in(fa); !errors.Is(err, data.ErrFenced) {
-		t.Errorf("its holder, past its lease: %v", err)
+	if err := in(fa); err != nil {
+		t.Errorf("its holder, past its lease, no one else holding it: %v", err)
 	}
 	if ok, err := w.Take(ctx, "k", 1, "b", time.Minute); err != nil || !ok {
 		t.Fatalf("another taking it: %v %v", ok, err)
@@ -273,6 +273,64 @@ func TestCheckFence(t *testing.T) {
 	}
 	if err := in(data.WithFence(ctx, data.Fence{Kind: "k", Key: 1, Holder: "b"})); err != nil {
 		t.Errorf("the new holder: %v", err)
+	}
+}
+
+// Neither a fenced transaction nor a mark holds off the work's holder's renewals: the fence reads the
+// holder's cell and a mark the mark's, which a renewal does not write.
+func TestRenewalBesideAFence(t *testing.T) {
+	ctx := context.Background()
+	c := client(t)
+	w := spannerdata.Work(c)
+	if ok, err := w.Take(ctx, "k", 1, "a", time.Minute); err != nil || !ok {
+		t.Fatalf("taking the work: %v %v", ok, err)
+	}
+	for _, tc := range []struct {
+		name string
+		ctx  context.Context
+		in   func(ctx context.Context, tx *spanner.ReadWriteTransaction) error
+	}{
+		{"a fenced transaction", data.WithFence(ctx, data.Fence{Kind: "k", Key: 1, Holder: "a"}),
+			func(context.Context, *spanner.ReadWriteTransaction) error { return nil }},
+		{"a mark", ctx, func(ctx context.Context, tx *spanner.ReadWriteTransaction) error {
+			return spannerdata.MarkWork(ctx, tx, "k", 1)
+		}},
+	} {
+		begun, release := make(chan struct{}), make(chan struct{})
+		done := make(chan error, 1)
+		go func() {
+			var once sync.Once
+			done <- spannerdata.Txn(tc.ctx, c, func(ctx context.Context, tx *spanner.ReadWriteTransaction) error {
+				if err := tc.in(ctx, tx); err != nil {
+					return err
+				}
+				once.Do(func() { close(begun) })
+				<-release
+				return nil
+			})
+		}()
+		<-begun
+		renewed := make(chan error, 1)
+		go func() {
+			ok, err := w.Renew(ctx, "k", 1, "a", time.Minute)
+			if err == nil && !ok {
+				err = errors.New("the lease was not its holder's")
+			}
+			renewed <- err
+		}()
+		select {
+		case err := <-renewed:
+			if err != nil {
+				t.Fatalf("%s: %v", tc.name, err)
+			}
+		case <-time.After(10 * time.Second):
+			close(release)
+			t.Fatalf("a renewal waited on %s", tc.name)
+		}
+		close(release)
+		if err := <-done; err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
 	}
 }
 

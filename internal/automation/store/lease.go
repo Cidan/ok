@@ -6,9 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Cidan/ok/internal/move"
+	"github.com/Cidan/ok/internal/workflow"
 )
 
 // Lease assigns a queued run of a pool to a worker — the one admission and fair share choose
@@ -19,22 +21,102 @@ func (s *Store) Lease(ctx context.Context, worker, pool string, wait time.Durati
 	if worker == "" {
 		return nil, invalid("a worker names itself")
 	}
+	if pool == "" {
+		pool = workflow.DefaultPool
+	}
 	deadline := time.Now().Add(wait)
 	for {
-		// Waiting for a notification starts before the claim, so a run queued between an
-		// empty claim and the wait still wakes it.
-		woken := s.notify.watch(chanQueue, "")
+		// In line before the claim, so a run queued between an empty claim and the wait still
+		// wakes it.
+		w := s.leases.join(pool)
 		run, err := s.claim(ctx, worker, pool)
 		if err != nil || run != nil {
+			s.leases.leave(pool, w)
+			if run != nil {
+				// The run came queued with others, maybe: the next in line looks.
+				s.leases.wakeNext(pool)
+			}
 			return run, err
 		}
 		left := time.Until(deadline)
 		if left <= 0 {
+			s.leases.leave(pool, w)
 			return nil, nil
 		}
-		if err := s.notify.wait(ctx, woken, min(left, s.cfg.Poll)); err != nil {
+		err = s.notify.wait(ctx, w, min(left, s.cfg.Poll))
+		s.leases.leave(pool, w)
+		if err != nil {
 			return nil, err
 		}
+	}
+}
+
+// leaseLines are this replica's leases waiting for a run, in line by pool. A run queued wakes the
+// first in each pool's line, and a lease that claims a run wakes the next, for the runs queued
+// with it: every waiting lease woken by every run queued had each claim race the rest of them for
+// the one run, a dozen transactions a run, which the claims' retries and the database's CPU
+// showed. A lease looks on its own every Config.Poll still, as before.
+type leaseLines struct {
+	mu    sync.Mutex
+	lines map[string][]chan struct{}
+}
+
+func newLeaseLines() *leaseLines { return &leaseLines{lines: map[string][]chan struct{}{}} }
+
+// join puts a lease at the end of its pool's line: the channel is closed when it is woken.
+func (l *leaseLines) join(pool string) chan struct{} {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	w := make(chan struct{})
+	l.lines[pool] = append(l.lines[pool], w)
+	return w
+}
+
+// leave takes a lease out of its line, if it is in it still.
+func (l *leaseLines) leave(pool string, w chan struct{}) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	line := l.lines[pool]
+	for i, x := range line {
+		if x == w {
+			l.lines[pool] = append(line[:i:i], line[i+1:]...)
+			return
+		}
+	}
+}
+
+// wakeNext wakes the first lease in a pool's line, taking it out.
+func (l *leaseLines) wakeNext(pool string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if line := l.lines[pool]; len(line) > 0 {
+		close(line[0])
+		l.lines[pool] = line[1:]
+	}
+}
+
+// wakeEach wakes the first lease in every pool's line: a run was queued, in a pool the signal
+// does not say.
+func (l *leaseLines) wakeEach() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for pool, line := range l.lines {
+		if len(line) > 0 {
+			close(line[0])
+			l.lines[pool] = line[1:]
+		}
+	}
+}
+
+// wakeAll wakes every lease in line.
+func (l *leaseLines) wakeAll() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for pool, line := range l.lines {
+		for _, w := range line {
+			close(w)
+		}
+		delete(l.lines, pool)
 	}
 }
 
