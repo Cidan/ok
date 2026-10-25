@@ -75,7 +75,8 @@ func (s *Server) facts(ctx context.Context, callerID string, r store.Repository)
 		return authz.Facts{}, err
 	}
 	f.Caller = authz.Caller{ID: callerID, Active: caller.Active()}
-	memberships, err := s.memberships(ctx, caller)
+	sets := s.setsOnce(ctx, caller)
+	memberships, err := s.memberships(ctx, caller, sets)
 	if err != nil {
 		return authz.Facts{}, err
 	}
@@ -90,7 +91,7 @@ func (s *Server) facts(ctx context.Context, callerID string, r store.Repository)
 		return authz.Facts{}, err
 	}
 	if len(grants) > 0 {
-		in, err := s.setsOf(ctx, caller.Name)
+		in, err := sets()
 		if err != nil {
 			return authz.Facts{}, err
 		}
@@ -103,7 +104,7 @@ func (s *Server) facts(ctx context.Context, callerID string, r store.Repository)
 	// A fork that is not public reads as its fork tree's root does (GitHub's rules): it takes the
 	// root's teams' grants, the root's owners read it, and an internal one the root's enterprise.
 	if r.Parent != 0 && r.Visibility != tenancy.Public {
-		if err := s.forkFacts(ctx, &f, caller, r); err != nil {
+		if err := s.forkFacts(ctx, &f, caller, r, memberships, sets); err != nil {
 			return authz.Facts{}, err
 		}
 	}
@@ -142,17 +143,15 @@ func (s *Server) root(ctx context.Context, r store.Repository) (store.Repository
 	return r, nil
 }
 
-// forkFacts adds to a non-public fork's facts what its fork tree's root gives the caller.
-func (s *Server) forkFacts(ctx context.Context, f *authz.Facts, caller store.Principal, r store.Repository) error {
+// forkFacts adds to a non-public fork's facts what its fork tree's root gives the caller, whose
+// memberships and sets the facts already read.
+func (s *Server) forkFacts(ctx context.Context, f *authz.Facts, caller store.Principal, r store.Repository,
+	memberships map[string]tenancy.Membership, sets func() (map[string]bool, error)) error {
 	root, err := s.root(ctx, r)
 	if err != nil || root.ID == r.ID {
 		return err
 	}
 	owner, err := s.cfg.Store.PrincipalByID(ctx, root.Owner)
-	if err != nil {
-		return err
-	}
-	memberships, err := s.memberships(ctx, caller)
 	if err != nil {
 		return err
 	}
@@ -175,28 +174,41 @@ func (s *Server) forkFacts(ctx context.Context, f *authz.Facts, caller store.Pri
 	if err != nil {
 		return err
 	}
-	var sets map[string]bool
 	for _, g := range grants {
 		if !s.cfg.Store.IsSet(g.Subject) {
 			continue // the root's own people's grants are its, not its forks'
 		}
-		if sets == nil {
-			if sets, err = s.setsOf(ctx, caller.Name); err != nil {
-				return err
-			}
+		in, err := sets()
+		if err != nil {
+			return err
 		}
-		if sets[g.Subject] {
+		if in[g.Subject] {
 			f.Caller.Granted = append(f.Caller.Granted, g.Role)
 		}
 	}
 	return nil
 }
 
+// setsOnce is the sets p is in (Store.SetsOf), read the first time they are asked for and kept for
+// the rest of the request.
+func (s *Server) setsOnce(ctx context.Context, p store.Principal) func() (map[string]bool, error) {
+	var sets map[string]bool
+	var err error
+	read := false
+	return func() (map[string]bool, error) {
+		if !read {
+			sets, err = s.cfg.Store.SetsOf(ctx, p)
+			read = true
+		}
+		return sets, err
+	}
+}
+
 // memberships are a principal's memberships, by organization ID: the organizations' records, and
 // the installation's, which its administrators own and its active people and robots are members of
 // — but an organization's robots, which are members of nothing and reach repositories through their
-// grants alone.
-func (s *Server) memberships(ctx context.Context, p store.Principal) (map[string]tenancy.Membership, error) {
+// grants alone. sets are the sets p is in.
+func (s *Server) memberships(ctx context.Context, p store.Principal, sets func() (map[string]bool, error)) (map[string]tenancy.Membership, error) {
 	ms, err := s.cfg.Store.MembershipsOf(ctx, p.ID)
 	if err != nil {
 		return nil, err
@@ -210,7 +222,7 @@ func (s *Server) memberships(ctx context.Context, p store.Principal) (map[string
 	}
 	if s.cfg.Installation != "" && p.Active() && (p.Kind == store.Human || p.Kind == store.Robot) {
 		ms[s.cfg.Installation] = tenancy.Member
-		admin, _, err := s.isAdmin(ctx, p.Name)
+		admin, err := s.administers(ctx, p, sets)
 		if err != nil {
 			return nil, err
 		}
@@ -240,40 +252,6 @@ func (s *Server) internal(ctx context.Context, org store.Organization, membershi
 		}
 	}
 	return false, nil
-}
-
-// setsOf are every set — the tree's, the synced groups, organizations' teams — a principal is in,
-// directly or through others.
-func (s *Server) setsOf(ctx context.Context, name string) (map[string]bool, error) {
-	t, groups, err := s.model(ctx)
-	if err != nil {
-		return nil, err
-	}
-	out := map[string]bool{}
-	if t != nil {
-		for _, n := range t.Memberships(name) {
-			out[n] = true
-		}
-		return out, nil
-	}
-	// No tree: the groups and teams alone.
-	in := map[string][]string{} // member -> the sets directly holding it
-	for n, ms := range groups {
-		for _, m := range ms {
-			in[m] = append(in[m], n)
-		}
-	}
-	queue := append([]string(nil), in[name]...)
-	for len(queue) > 0 {
-		n := queue[0]
-		queue = queue[1:]
-		if out[n] {
-			continue
-		}
-		out[n] = true
-		queue = append(queue, in[n]...)
-	}
-	return out, nil
 }
 
 // Admins are the active people who administer a repository: its owner, if a person; its
@@ -330,7 +308,7 @@ func (s *Server) Admins(ctx context.Context, req *identitypb.AdminsRequest) (*id
 		} else if !errors.Is(err, store.ErrNotFound) {
 			return nil, grpcError(err)
 		}
-		members, _, err := s.expand(ctx, g.Subject)
+		members, _, err := s.cfg.Store.Expand(ctx, g.Subject)
 		if err != nil {
 			return nil, grpcError(err)
 		}

@@ -408,3 +408,22 @@ func TestOrgsAndTeams(t *testing.T) {
 		t.Errorf("an organization in an ACL: %v", err)
 	}
 }
+
+// A synced group or team a set names is known by its name, whoever is in it: an empty group, an
+// empty team, and a group the system of record dropped (which the store gives as nil) all load.
+func TestEmptySyncedSets(t *testing.T) {
+	names := MustNames("example.com")
+	sets := []Set{{Kind: ACL, Name: Root, Members: []string{"ada.human.example.com", "empty.group.example.com", "gone.group.example.com",
+		"t.acme.team.example.com"}}}
+	tree, err := New(names, sets, WithSynced(map[string][]string{"empty.group.example.com": {}, "gone.group.example.com": nil,
+		"t.acme.team.example.com": {}}))
+	if err != nil {
+		t.Fatalf("a tree naming empty sets: %v", err)
+	}
+	if got := tree.Expand(names.Of(ACL, Root)); len(got) != 1 || got[0] != "ada.human.example.com" {
+		t.Errorf("the root holds %v, want ada alone", got)
+	}
+	if _, err := New(names, sets, WithSynced(map[string][]string{"empty.group.example.com": {}})); err == nil {
+		t.Error("a tree naming a group and a team no one syncs loaded")
+	}
+}

@@ -8,6 +8,7 @@ package people
 import (
 	"context"
 	"errors"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -209,9 +210,8 @@ type Directory struct {
 	admins    map[string]cached // a principal's ID -> whether they administer ok (one member when so)
 	adminList cached            // every administrator's ID
 
-	syncedMu sync.Mutex
-	synced   map[string][]string // the system of record's groups, by name: their members' names
-	syncedAt time.Time
+	setsMu sync.Mutex
+	sets   map[string]reachedSets // the names a tree names, joined -> the sets they reach
 
 	mu      sync.Mutex
 	humans  []person // by name
@@ -444,24 +444,50 @@ func (d *Directory) Admins(ctx context.Context) ([]string, error) {
 	return ids, nil
 }
 
-// SyncedGroups are the groups the system of record syncs, by name, with their members as
-// declared, by name: what a tree's ACLs may hold. Cached as briefly as the people.
-func (d *Directory) SyncedGroups(ctx context.Context) (map[string][]string, error) {
-	d.syncedMu.Lock()
-	defer d.syncedMu.Unlock()
-	if d.synced != nil && time.Since(d.syncedAt) < d.ttl {
-		return d.synced, nil
-	}
-	resp, err := d.client.ListSets(ctx, &identitypb.ListSetsRequest{})
-	if err != nil {
-		return nil, err
+// reachedSets are the sets a tree's names reach, as fetched.
+type reachedSets struct {
+	sets    map[string][]string
+	fetched time.Time
+}
+
+// maxReached bounds the trees whose sets are kept; past it, expired ones are swept.
+const maxReached = 64
+
+// Sets are the synced groups, teams, and aliases names reach — those they name, and those those
+// hold, through every level — by name, with their members' names as a tree's model holds them:
+// what a groups-and-ACLs tree naming them may hold. Cached as briefly as the people, by names.
+func (d *Directory) Sets(ctx context.Context, names []string) (map[string][]string, error) {
+	names = slices.Clone(names)
+	slices.Sort(names)
+	names = slices.Compact(names)
+	key := strings.Join(names, "\n")
+	d.setsMu.Lock()
+	defer d.setsMu.Unlock()
+	if r, ok := d.sets[key]; ok && time.Since(r.fetched) < d.ttl {
+		return r.sets, nil
 	}
 	out := map[string][]string{}
-	for _, set := range resp.GetSets() {
-		if set.GetSource() == identitypb.SetSource_SET_SOURCE_SYNCED {
-			out[set.GetName()] = set.GetMembers()
+	if len(names) > 0 {
+		resp, err := d.client.ListSets(ctx, &identitypb.ListSetsRequest{ReachableFrom: names})
+		if err != nil {
+			return nil, err
+		}
+		for _, set := range resp.GetSets() {
+			if set.GetSource() != identitypb.SetSource_SET_SOURCE_TREE {
+				out[set.GetName()] = set.GetMembers()
+			}
 		}
 	}
-	d.synced, d.syncedAt = out, time.Now()
+	if d.sets == nil {
+		d.sets = map[string]reachedSets{}
+	}
+	if len(d.sets) >= maxReached {
+		for k, r := range d.sets {
+			if time.Since(r.fetched) >= d.ttl {
+				delete(d.sets, k)
+			}
+		}
+	}
+	d.sets[key] = reachedSets{sets: out, fetched: time.Now()}
 	return out, nil
 }

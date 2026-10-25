@@ -3,6 +3,7 @@ package people
 import (
 	"context"
 	"reflect"
+	"slices"
 	"testing"
 
 	"google.golang.org/grpc"
@@ -104,7 +105,7 @@ func TestNames(t *testing.T) {
 
 type fakeDirectory struct {
 	identitypb.DirectoryClient
-	calls, adminCalls int
+	calls, adminCalls, setsCalls int
 }
 
 func (f *fakeDirectory) ListPrincipals(_ context.Context, in *identitypb.ListPrincipalsRequest, _ ...grpc.CallOption) (*identitypb.ListPrincipalsResponse, error) {
@@ -139,9 +140,15 @@ func (f *fakeDirectory) ExpandSet(_ context.Context, in *identitypb.ExpandSetReq
 	return &identitypb.ExpandSetResponse{Principals: []string{"olin.human.example.com", "lina.human.example.com"}, PrincipalIds: []string{"prn_1", "prn_3"}}, nil
 }
 
-func (f *fakeDirectory) ListSets(context.Context, *identitypb.ListSetsRequest, ...grpc.CallOption) (*identitypb.ListSetsResponse, error) {
+func (f *fakeDirectory) ListSets(_ context.Context, in *identitypb.ListSetsRequest, _ ...grpc.CallOption) (*identitypb.ListSetsResponse, error) {
+	f.setsCalls++
+	if !slices.Equal(in.GetReachableFrom(), []string{"eng.group.example.com", "team.acl.example.com"}) {
+		return &identitypb.ListSetsResponse{}, nil
+	}
 	return &identitypb.ListSetsResponse{Sets: []*identitypb.Set{
 		{Name: "eng.group.example.com", Source: identitypb.SetSource_SET_SOURCE_SYNCED, Members: []string{"olin.human.example.com"}},
+		{Name: "app.acme.team.example.com", Source: identitypb.SetSource_SET_SOURCE_TEAM, Members: []string{"lina.human.example.com"}},
+		{Name: "old.group.example.com", Source: identitypb.SetSource_SET_SOURCE_ALIAS, Members: []string{"lina.human.example.com"}},
 		{Name: "team.acl.example.com", Source: identitypb.SetSource_SET_SOURCE_TREE, Members: []string{"eng.group.example.com"}},
 	}}, nil
 }
@@ -194,9 +201,16 @@ func TestDirectory(t *testing.T) {
 	if f.adminCalls != 3 {
 		t.Errorf("identity was asked about administrators %d times; each answer is cached", f.adminCalls)
 	}
-	synced, err := d.SyncedGroups(ctx)
-	if err != nil || !reflect.DeepEqual(synced, map[string][]string{"eng.group.example.com": {"olin.human.example.com"}}) {
-		t.Errorf("SyncedGroups = %v, %v", synced, err)
+	// What a tree's names reach, but its own sets; asked once while cached, the names in any order.
+	want := map[string][]string{"eng.group.example.com": {"olin.human.example.com"}, "app.acme.team.example.com": {"lina.human.example.com"},
+		"old.group.example.com": {"lina.human.example.com"}}
+	for _, names := range [][]string{{"team.acl.example.com", "eng.group.example.com"}, {"eng.group.example.com", "team.acl.example.com", "eng.group.example.com"}} {
+		if sets, err := d.Sets(ctx, names); err != nil || !reflect.DeepEqual(sets, want) {
+			t.Errorf("Sets(%v) = %v, %v", names, sets, err)
+		}
+	}
+	if f.setsCalls != 1 {
+		t.Errorf("identity was asked for sets %d times; the answer is cached", f.setsCalls)
 	}
 	retired, err := d.RetiredSetNames(ctx)
 	if err != nil || !reflect.DeepEqual(retired, map[string]bool{"old.group.example.com": true}) {

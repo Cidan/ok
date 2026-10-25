@@ -80,15 +80,22 @@ type env struct {
 // newEnv is an installation, whose organization is example.
 func newEnv(t *testing.T) *env { return newEnvWith(t, false) }
 
-func newEnvWith(t *testing.T, hosted bool) *env {
+func newEnvWith(t *testing.T, hosted bool) *env { return newEnvOver(t, hosted, nil) }
+
+// newEnvOver is newEnvWith over the store's backend as wrap wraps it (nil: as it is).
+func newEnvOver(t *testing.T, hosted bool, wrap func(store.Backend) store.Backend) *env {
 	t.Helper()
 	ctx := context.Background()
 	pool := testdb.Pool(t)
-	b, err := idpostgres.Open(ctx, pool)
-	st := store.New(b, names)
+	opened, err := idpostgres.Open(ctx, pool)
 	if err != nil {
 		t.Fatal(err)
 	}
+	var b store.Backend = opened
+	if wrap != nil {
+		b = wrap(b)
+	}
+	st := store.New(b, names)
 	dir := t.TempDir()
 	if err := ca.Init(dir, "Example"); err != nil {
 		t.Fatal(err)

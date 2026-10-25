@@ -379,37 +379,17 @@ func (s *Store) TeamSets(ctx context.Context) (map[string][]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	out := make(map[string][]string, len(teams))
-	named := map[string]string{} // ID -> name, active principals only
-	for _, t := range teams {
-		ms := []string{}
-		for _, id := range t.Members {
-			name, ok := named[id]
-			if !ok {
-				p, err := s.b.PrincipalByID(ctx, id)
-				if err != nil && !errors.Is(err, ErrNotFound) {
-					return nil, err
-				}
-				if err == nil && p.Active() {
-					name = p.Name
-				}
-				named[id] = name
-			}
-			if name != "" {
-				ms = append(ms, name)
-			}
-		}
-		out[t.Name] = ms
-	}
+	children := map[string][]string{}
 	for _, t := range teams {
 		if t.Parent != "" {
-			out[t.Parent] = append(out[t.Parent], t.Name)
+			children[t.Parent] = append(children[t.Parent], t.Name)
 		}
 	}
-	for n := range out {
-		slices.Sort(out[n])
+	recs := make([]SetRecord, len(teams))
+	for i, t := range teams {
+		recs[i] = SetRecord{Name: t.Name, Source: SetFromTeam, Members: t.Members, Children: children[t.Name], Organization: t.Organization}
 	}
-	return out, nil
+	return s.teamMemberNames(ctx, recs)
 }
 
 // ownersTeam refuses a change to a synced team, whose members and life are its organization's

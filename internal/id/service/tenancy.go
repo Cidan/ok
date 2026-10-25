@@ -88,7 +88,7 @@ func (s *Server) organization(ctx context.Context, handle string) (store.Organiz
 
 // membership is a person's membership of an organization.
 func (s *Server) membership(ctx context.Context, org string, p store.Principal) (tenancy.Membership, error) {
-	ms, err := s.memberships(ctx, p)
+	ms, err := s.memberships(ctx, p, s.setsOnce(ctx, p))
 	if err != nil {
 		return tenancy.NotMember, err
 	}

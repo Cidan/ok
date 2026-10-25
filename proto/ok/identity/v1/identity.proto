@@ -59,6 +59,9 @@ enum SetSource {
   SET_SOURCE_SYNCED = 2;
   // An organization's team, its members set by its owners (docs/hosted.md, "Tenancy, as built").
   SET_SOURCE_TEAM = 3;
+  // A name a move gave up, standing for the team that took its place: its members are the team's
+  // (ListSets with reachable_from alone answers one).
+  SET_SOURCE_ALIAS = 4;
 }
 
 // Set is a group or an ACL.
@@ -166,7 +169,13 @@ message GetSetResponse {
   Set set = 1;
 }
 
-message ListSetsRequest {}
+message ListSetsRequest {
+  // reachable_from, when given, asks for the synced groups, teams, and aliases these names reach
+  // instead of every set: those they name, and those those hold, through every level, each with
+  // its members as a groups-and-ACLs tree's model holds them (docs/identity.md, "Sets, by their
+  // members"). The tree's own sets are not among them.
+  repeated string reachable_from = 1;
+}
 
 message ListSetsResponse {
   repeated Set sets = 1;

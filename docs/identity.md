@@ -325,6 +325,30 @@ deployer applies it to ok identity ([deploy.md](deploy.md), "The groups-and-ACLs
 refuses a tree that would delete an ACL still owning sets. `ok identity check -domain D DIR` checks a
 tree, and shows each set's owner.
 
+### Sets, by their members
+
+Sets are the tree's, the system of record's groups, organizations' teams, and the names an
+installation moved in gave up (aliases, each standing for the team that took its place). Each is
+stored with its members — names, for the tree's sets and synced groups; principals' IDs, for a team,
+whose parent holds it — and each set's members are indexed by their elements: a GIN index on
+PostgreSQL, a search index over the array's tokens on Spanner. So the sets a person is in are a walk
+up from them, a statement for each level of nesting: the sets holding their name, or (while they are
+active) their ID; then the sets holding those; and so on until none is new. Who is in a set is a
+walk down from it, through the sets it holds. Neither reads any set but those on its way, whatever
+the directory holds besides — an authorization's facts (`Authorization.Facts`), whether someone
+administers ok, `CheckMembership`, `ExpandSet`, `GetSet`, and a repository's administrators.
+
+The directory's rules hold in those reads as they did when every set was read and walked whole: a
+synced group or alias named as one of the applied tree's sets is the tree's; a synced group named
+as an alias is the alias, while its team stands; a team holds its members while they are active; a
+group the tree names that the system of record no longer holds is a set of no one. Validating a
+tree — `Plan`, `Apply`, and ok control's review of a change to it — reads the groups, teams, and
+aliases its names reach, not every one (`ListSets` with `reachable_from`).
+
+On Spanner, the walk's statement names each search index, which needs the query optimizer's version
+6 or above, and asks for the latest; and it runs outside any read-write transaction, where Spanner
+uses no search index.
+
 ```
 ok admin sync | status | name | robots | robot create|delete|bind|unbind|certify | credentials | revoke
 ```

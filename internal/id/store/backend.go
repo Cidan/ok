@@ -215,6 +215,27 @@ type Ops interface {
 	// PutTreeState records the applied tree's commit and sequence, now.
 	PutTreeState(ctx context.Context, commit string, sequence int64) error
 
+	// ─── Sets, by their members (docs/identity.md, "Sets, by their members") ───
+	//
+	// Every set's members are indexed by their elements. These read them as the directory's rules
+	// have it: a synced group or an alias whose name the applied tree declares is the tree's set; an
+	// alias stands for its team, holding what the team holds, and a synced group an alias names is
+	// the alias. They read outside any transaction: on Spanner, a read-write transaction uses no
+	// search index.
+
+	// SetsHolding are the sets that directly hold any of names (tree sets and synced groups, which
+	// hold names), any of ids (teams, and the aliases standing for them, which hold principals by
+	// ID), or any of teams (a team's parent holds the team, and so does an alias standing for that
+	// parent), each with which of those it holds, sorted; ordered by set, then source.
+	SetsHolding(ctx context.Context, names, ids, teams []string) ([]Holding, error)
+	// SetRecords are those of names that are sets, as stored: tree sets, synced groups that stand,
+	// teams, and aliases with their teams'. With tree false, a synced group or alias is read as
+	// stored even where the applied tree declares its name — as a tree yet to be applied sees them
+	// — and the applied tree's sets are not read.
+	SetRecords(ctx context.Context, names []string, tree bool) ([]SetRecord, error)
+	// PrincipalsByID reads principals by ID; an ID none has is absent.
+	PrincipalsByID(ctx context.Context, ids []string) ([]Principal, error)
+
 	// ─── Tenancy ───
 
 	// InsertOrganization records an organization's settings; its principal is already recorded.
@@ -529,4 +550,40 @@ type Ops interface {
 type StoredSet struct {
 	Name, Kind, Path, Owner string
 	Members                 []string
+}
+
+// SetSource is where a set is stored.
+type SetSource int
+
+const (
+	// SetFromTree is the applied tree's set, holding names.
+	SetFromTree SetSource = iota + 1
+	// SetFromSynced is a synced group that stands, holding names.
+	SetFromSynced
+	// SetFromTeam is a team, holding its members by principal ID and its child teams by name.
+	SetFromTeam
+	// SetFromAlias is a name a move gave up, standing for a team: it holds what the team holds.
+	SetFromAlias
+)
+
+// Holding is a set holding some of what SetsHolding was asked: which, by name or ID as asked.
+type Holding struct {
+	Set    string
+	Source SetSource
+	Holds  []string
+}
+
+// SetRecord is a set as SetRecords reads it.
+type SetRecord struct {
+	Name   string
+	Source SetSource
+	// Kind ("group" or "acl"), Path, and Owner are a tree set's.
+	Kind, Path, Owner string
+	// Members are a tree set's and a synced group's, by name; a team's and an alias's — its
+	// team's — by principal ID, sorted.
+	Members []string
+	// Children are a team's child teams — an alias's, its team's — by name, sorted.
+	Children []string
+	// Team is the team an alias stands for, and Organization a team's — an alias's team's — by ID.
+	Team, Organization string
 }

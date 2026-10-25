@@ -43,12 +43,12 @@ type IdentityReq struct {
 }
 
 // IdentityDirectory is what the review asks ok identity about a change to the tree, so that one
-// it approves is one identity applies once it lands; and the groups the system of record syncs,
-// which an ACL may hold.
+// it approves is one identity applies once it lands; and the synced groups, teams, and aliases the
+// tree's names reach, which its sets may hold.
 type IdentityDirectory interface {
 	IsPrincipal(ctx context.Context, name string) (bool, error)
 	RetiredSetNames(ctx context.Context) (map[string]bool, error)
-	SyncedGroups(ctx context.Context) (map[string][]string, error)
+	Sets(ctx context.Context, names []string) (map[string][]string, error)
 }
 
 // TreeDir is the folder of ok's groups-and-ACLs tree at a commit of a repository, as its
@@ -284,16 +284,6 @@ func (s *Service) evaluateIdentity(ctx context.Context, cl db.ChangeList, dir st
 	case !present:
 		return nil, false, nil, nil
 	}
-	var synced map[string][]string
-	if s.identityDir != nil {
-		if synced, err = s.identityDir.SyncedGroups(ctx); err != nil {
-			return nil, false, nil, fmt.Errorf("the groups ok identity syncs: %w", err)
-		}
-	}
-	before, err := identity.LoadFiles(people.Names(), baseFiles, identity.WithSynced(synced))
-	if err != nil {
-		return nil, true, fmt.Errorf("main's tree is no valid tree: %w", err), nil
-	}
 	afterFiles := map[string][]byte{}
 	for p, d := range baseFiles {
 		afterFiles[p] = d
@@ -315,6 +305,18 @@ func (s *Service) evaluateIdentity(ctx context.Context, cl db.ChangeList, dir st
 	}
 	if len(afterFiles) == 0 {
 		return nil, true, errors.New("the change deletes the tree"), nil
+	}
+	// The groups, teams, and aliases both trees reach: the change's approvals expand both.
+	var synced map[string][]string
+	if s.identityDir != nil {
+		names := append(identity.Referenced(people.Names(), baseFiles), identity.Referenced(people.Names(), afterFiles)...)
+		if synced, err = s.identityDir.Sets(ctx, names); err != nil {
+			return nil, false, nil, fmt.Errorf("the sets ok identity holds: %w", err)
+		}
+	}
+	before, err := identity.LoadFiles(people.Names(), baseFiles, identity.WithSynced(synced))
+	if err != nil {
+		return nil, true, fmt.Errorf("main's tree is no valid tree: %w", err), nil
 	}
 	after, err := identity.LoadFiles(people.Names(), afterFiles, identity.WithSynced(synced))
 	if err != nil {

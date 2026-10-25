@@ -55,6 +55,15 @@ func Run(t *testing.T, open func(t *testing.T) store.Backend) {
 	} {
 		t.Run(tc.name, func(t *testing.T) { tc.fn(t, store.New(open(t), names)) })
 	}
+	for _, tc := range []struct {
+		name string
+		fn   func(t *testing.T, b store.Backend)
+	}{
+		{"Sets", testSets},
+		{"SetsAtScale", testSetsAtScale},
+	} {
+		t.Run(tc.name, func(t *testing.T) { tc.fn(t, open(t)) })
+	}
 	t.Run("SCIM", func(t *testing.T) {
 		scimtest.Run(t, func(t *testing.T) scim.Store { return store.New(open(t), names).SCIM() })
 	})

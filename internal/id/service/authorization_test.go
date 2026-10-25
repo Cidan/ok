@@ -2,11 +2,14 @@ package service_test
 
 import (
 	"context"
+	"slices"
+	"sync"
 	"testing"
 
 	"google.golang.org/grpc/codes"
 
 	"github.com/Cidan/ok/internal/authz"
+	"github.com/Cidan/ok/internal/directory"
 	"github.com/Cidan/ok/internal/id/store"
 	"github.com/Cidan/ok/internal/tenancy"
 	identitypb "github.com/Cidan/ok/proto/ok/identity/v1"
@@ -120,5 +123,100 @@ func TestAuthorization(t *testing.T) {
 	// Only ok's roles ask.
 	if _, err := identitypb.NewAuthorizationClient(e.as(ada)).Facts(ctx, &identitypb.FactsRequest{RepositoryId: lib.ID}); code(err) != codes.PermissionDenied {
 		t.Errorf("a person asking for facts: %v", err)
+	}
+}
+
+// wholeSets is a backend counting the reads of every set of a kind in the directory.
+type wholeSets struct {
+	store.Backend
+	mu    sync.Mutex
+	reads map[string]int
+}
+
+func (w *wholeSets) read(op string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.reads[op]++
+}
+
+func (w *wholeSets) taken() map[string]int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	out := w.reads
+	w.reads = map[string]int{}
+	return out
+}
+
+func (w *wholeSets) SyncedGroups(ctx context.Context) ([]directory.SyncedGroup, error) {
+	w.read("SyncedGroups")
+	return w.Backend.SyncedGroups(ctx)
+}
+
+func (w *wholeSets) AllTeams(ctx context.Context) ([]store.Team, error) {
+	w.read("AllTeams")
+	return w.Backend.AllTeams(ctx)
+}
+
+func (w *wholeSets) TreeSets(ctx context.Context) ([]store.StoredSet, error) {
+	w.read("TreeSets")
+	return w.Backend.TreeSets(ctx)
+}
+
+func (w *wholeSets) Aliases(ctx context.Context) (map[string]string, error) {
+	w.read("Aliases")
+	return w.Backend.Aliases(ctx)
+}
+
+// A person's facts about a repository — the installation's administrator or not, granted through a
+// team — and who administers it, and whether someone is in a set, read no set of the directory but
+// those the person is in: none of them reads every synced group, team, tree set, or alias.
+func TestFactsReadOnlyTheirSets(t *testing.T) {
+	ctx := context.Background()
+	w := &wholeSets{reads: map[string]int{}}
+	e := newEnvOver(t, false, func(b store.Backend) store.Backend { w.Backend = b; return w })
+	bea, err := e.store.Principal(ctx, bea)
+	if err != nil {
+		t.Fatal(err)
+	}
+	acme, err := e.store.CreateOrganization(ctx, "acme", bea.ID, store.OrganizationSettings{BaseRole: tenancy.None})
+	if err != nil {
+		t.Fatal(err)
+	}
+	web, err := e.store.CreateTeam(ctx, acme.ID, "web", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.store.AddTeamMember(ctx, web.Name, bea.ID); err != nil {
+		t.Fatal(err)
+	}
+	r, err := e.store.ReserveRepository(ctx, store.NewRepository{Owner: acme.ID, Name: "app", Visibility: tenancy.Private,
+		Propose: tenancy.Read, CreatedBy: bea.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r, err = e.store.ActivateRepository(ctx, r.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.store.SetGrant(ctx, store.Grant{Repository: r.ID, Subject: web.Name, Role: tenancy.Maintain}); err != nil {
+		t.Fatal(err)
+	}
+	auth := identitypb.NewAuthorizationClient(e.as(control))
+	w.taken()
+	f, err := auth.Facts(ctx, &identitypb.FactsRequest{CallerId: bea.ID, RepositoryId: r.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(f.GetCaller().GetGranted(), tenancy.Maintain.String()) {
+		t.Errorf("bea's facts grant %v, want maintain through web", f.GetCaller().GetGranted())
+	}
+	if _, err := auth.Admins(ctx, &identitypb.AdminsRequest{RepositoryId: r.ID}); err != nil {
+		t.Fatal(err)
+	}
+	dir := identitypb.NewDirectoryClient(e.as(control))
+	if m, err := dir.CheckMembership(ctx, &identitypb.CheckMembershipRequest{Set: web.Name, Key: &identitypb.CheckMembershipRequest_PrincipalId{PrincipalId: bea.ID}}); err != nil || !m.GetMember() {
+		t.Errorf("bea in web: %v, %v", m, err)
+	}
+	if reads := w.taken(); len(reads) > 0 {
+		t.Errorf("reading facts, admins, and a membership read every set of a kind: %v", reads)
 	}
 }

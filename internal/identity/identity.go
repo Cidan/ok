@@ -334,8 +334,8 @@ func New(names Names, sets []Set, opts ...Option) (*Tree, error) {
 			case s.Kind == Group && k == ACLMember:
 				add("%s: a group cannot contain an ACL (%s): group identity carries no authorization", describe(s), m)
 				continue
-			case k == ACLMember && t.sets[m] == nil, k == GroupMember && t.sets[m] == nil && t.synced[m] == nil,
-				k == TeamMember && t.synced[m] == nil:
+			case k == ACLMember && t.sets[m] == nil, k == GroupMember && t.sets[m] == nil && !t.Synced(m),
+				k == TeamMember && !t.Synced(m):
 				add("%s: %s is not declared in the tree, nor synced from the system of record", describe(s), m)
 				continue
 			}

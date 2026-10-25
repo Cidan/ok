@@ -138,7 +138,7 @@ func (f fakeDirectory) RetiredSetNames(context.Context) (map[string]bool, error)
 	return f.retired, nil
 }
 
-func (f fakeDirectory) SyncedGroups(context.Context) (map[string][]string, error) { return nil, nil }
+func (f fakeDirectory) Sets(context.Context, []string) (map[string][]string, error) { return nil, nil }
 
 func TestApplies(t *testing.T) {
 	ctx := context.Background()

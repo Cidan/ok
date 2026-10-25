@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -252,19 +253,22 @@ func credentialPB(c store.Credential) *identitypb.Credential {
 	return &identitypb.Credential{Id: c.ID, Principal: c.Principal.Name, Label: c.Label, Created: ts(c.Created), LastIssued: ts(c.LastIssued), Revoked: ts(c.Revoked)}
 }
 
-// tree is the applied tree with the synced groups, as the model holds it. A synced group the tree
-// names that the system of record no longer holds counts as empty, so the tree still loads.
+// tree is the applied tree with the synced groups, teams, and aliases it reaches, as the model
+// holds them (Store.SetsReachable): what the tree's validation, expansion, and approvals read of
+// them. A synced group the tree names that the system of record no longer holds counts as empty,
+// so the tree still loads.
 func (s *Server) tree(ctx context.Context) (*identity.Tree, store.Applied, error) {
 	sets, applied, err := s.cfg.Store.Tree(ctx)
-	if err != nil {
+	if err != nil || len(sets) == 0 {
 		return nil, applied, err
 	}
-	synced, err := s.groups(ctx)
+	var roots []string
+	for _, ts := range sets {
+		roots = append(append(roots, s.names.OfSet(ts.Set)), ts.Members...)
+	}
+	synced, err := s.cfg.Store.SetsReachable(ctx, roots, true)
 	if err != nil {
 		return nil, applied, err
-	}
-	if len(sets) == 0 {
-		return nil, applied, nil
 	}
 	model := make([]identity.Set, 0, len(sets))
 	for _, ts := range sets {
@@ -310,38 +314,58 @@ func (s *Server) requireAdmin(ctx context.Context) (authn.Caller, error) {
 	return c, nil
 }
 
-// isAdmin reports whether a principal administers ok, and why not when it does not.
+// isAdmin reports whether a principal, by name, administers ok, and why not when it does not.
 func (s *Server) isAdmin(ctx context.Context, principal string) (bool, string, error) {
-	t, _, err := s.tree(ctx)
+	p, err := s.cfg.Store.Principal(ctx, principal)
+	if errors.Is(err, store.ErrNotFound) {
+		p = store.Principal{Name: principal} // a name the tree may hold, though no one has it
+	} else if err != nil {
+		return false, "", err
+	}
+	admin, err := s.administers(ctx, p, s.setsOnce(ctx, p))
+	if err != nil || admin {
+		return admin, "", err
+	}
+	admins := s.names.Of(identity.ACL, identity.Root)
+	applied, err := s.cfg.Store.TreeApplied(ctx)
 	if err != nil {
 		return false, "", err
 	}
-	admins := s.names.Of(identity.ACL, identity.Root)
-	if t == nil {
-		for _, h := range s.cfg.BootstrapAdmins {
-			if s.names.Human(h) == principal {
-				return true, "", nil
-			}
-		}
+	if !applied {
 		return false, fmt.Sprintf("%s is not a bootstrap administrator, and no tree declares %s yet", principal, admins), nil
 	}
-	if _, ok := t.Contains(admins, principal); !ok {
-		return false, fmt.Sprintf("%s is not in %s", principal, admins), nil
+	return false, fmt.Sprintf("%s is not in %s", principal, admins), nil
+}
+
+// administers reports whether p, in sets, administers ok: is in admins.acl — or, before a tree is
+// applied, is a bootstrap administrator. Only a bootstrap administrator outside admins.acl costs a
+// read of whether a tree is applied.
+func (s *Server) administers(ctx context.Context, p store.Principal, sets func() (map[string]bool, error)) (bool, error) {
+	in, err := sets()
+	if err != nil {
+		return false, err
 	}
-	return true, "", nil
+	if in[s.names.Of(identity.ACL, identity.Root)] {
+		return true, nil
+	}
+	if !slices.ContainsFunc(s.cfg.BootstrapAdmins, func(h string) bool { return s.names.Human(h) == p.Name }) {
+		return false, nil
+	}
+	applied, err := s.cfg.Store.TreeApplied(ctx)
+	return !applied, err
 }
 
 func (s *Server) ListAdmins(ctx context.Context, _ *identitypb.ListAdminsRequest) (*identitypb.ListAdminsResponse, error) {
-	t, _, err := s.tree(ctx)
+	applied, err := s.cfg.Store.TreeApplied(ctx)
 	if err != nil {
 		return nil, grpcError(err)
 	}
 	var all []string
-	if t == nil {
+	if !applied {
 		for _, h := range s.cfg.BootstrapAdmins {
 			all = append(all, s.names.Human(h))
 		}
-	} else if all, _, err = s.expand(ctx, s.names.Of(identity.ACL, identity.Root)); err != nil {
+	} else if all, _, err = s.cfg.Store.Expand(ctx, s.names.Of(identity.ACL, identity.Root)); err != nil {
 		return nil, grpcError(err)
 	}
 	sort.Strings(all)
@@ -470,33 +494,55 @@ func (s *Server) sets(ctx context.Context) (map[string]*identitypb.Set, error) {
 		return nil, err
 	}
 	for name, ms := range teams {
-		// A team's owner is its organization: <team>.<org>.team.<domain> is <org>'s.
-		labels := strings.SplitN(name, ".", 3)
-		out[name] = &identitypb.Set{Name: name, Kind: identitypb.SetKind_SET_KIND_GROUP, Source: identitypb.SetSource_SET_SOURCE_TEAM,
-			Owner: s.names.Org(labels[1]), Members: ms}
+		out[name] = s.setOut(store.SetRecord{Name: name, Source: store.SetFromTeam}, ms)
 	}
 	return out, nil
 }
 
+// setOut is a set as the API has it, with its members by name. A team's owner is its organization:
+// <team>.<org>.team.<domain> is <org>'s; an alias's, its team's.
+func (s *Server) setOut(r store.SetRecord, members []string) *identitypb.Set {
+	out := &identitypb.Set{Name: r.Name, Kind: identitypb.SetKind_SET_KIND_GROUP, Members: members}
+	switch r.Source {
+	case store.SetFromTree:
+		out.Source, out.Owner, out.Path = identitypb.SetSource_SET_SOURCE_TREE, r.Owner, r.Path
+		if r.Kind == "acl" {
+			out.Kind = identitypb.SetKind_SET_KIND_ACL
+		}
+	case store.SetFromSynced:
+		out.Source, out.Owner = identitypb.SetSource_SET_SOURCE_SYNCED, s.names.Of(identity.ACL, identity.Root)
+	case store.SetFromTeam:
+		out.Source, out.Owner = identitypb.SetSource_SET_SOURCE_TEAM, s.names.Org(strings.SplitN(r.Name, ".", 3)[1])
+	case store.SetFromAlias:
+		out.Source, out.Owner = identitypb.SetSource_SET_SOURCE_ALIAS, s.names.Org(strings.SplitN(r.Team, ".", 3)[1])
+	}
+	return out
+}
+
+// GetSet reads the one set named — a name a move gave up names what took its place.
 func (s *Server) GetSet(ctx context.Context, req *identitypb.GetSetRequest) (*identitypb.GetSetResponse, error) {
-	all, err := s.sets(ctx)
+	r, members, ok, err := s.cfg.Store.NamedSet(ctx, req.GetName())
 	if err != nil {
 		return nil, grpcError(err)
-	}
-	set, ok := all[req.GetName()]
-	if !ok {
-		// A name a move gave up names what took its place.
-		if name, err := s.cfg.Store.Alias(ctx, req.GetName()); err == nil {
-			set, ok = all[name]
-		}
 	}
 	if !ok {
 		return nil, status.Errorf(codes.NotFound, "no set is named %s", req.GetName())
 	}
-	return &identitypb.GetSetResponse{Set: set}, nil
+	return &identitypb.GetSetResponse{Set: s.setOut(r, members)}, nil
 }
 
-func (s *Server) ListSets(ctx context.Context, _ *identitypb.ListSetsRequest) (*identitypb.ListSetsResponse, error) {
+func (s *Server) ListSets(ctx context.Context, req *identitypb.ListSetsRequest) (*identitypb.ListSetsResponse, error) {
+	if roots := req.GetReachableFrom(); len(roots) > 0 {
+		reached, err := s.cfg.Store.ReachableSets(ctx, roots, true)
+		if err != nil {
+			return nil, grpcError(err)
+		}
+		resp := &identitypb.ListSetsResponse{}
+		for _, r := range reached {
+			resp.Sets = append(resp.Sets, s.setOut(r.SetRecord, r.Names))
+		}
+		return resp, nil
+	}
 	all, err := s.sets(ctx)
 	if err != nil {
 		return nil, grpcError(err)
@@ -507,80 +553,6 @@ func (s *Server) ListSets(ctx context.Context, _ *identitypb.ListSetsRequest) (*
 	}
 	sort.Slice(resp.Sets, func(i, j int) bool { return resp.Sets[i].Name < resp.Sets[j].Name })
 	return resp, nil
-}
-
-// model is the tree with the synced groups, or — before a tree is applied — the synced groups
-// alone, as a tree's members would see them.
-func (s *Server) model(ctx context.Context) (*identity.Tree, map[string][]string, error) {
-	t, _, err := s.tree(ctx)
-	if err != nil {
-		return nil, nil, err
-	}
-	synced, err := s.groups(ctx)
-	return t, synced, err
-}
-
-// groups are the sets the tree may hold besides its own: the system of record's groups, and
-// organizations' teams, each by name with its members' names.
-func (s *Server) groups(ctx context.Context) (map[string][]string, error) {
-	synced, err := s.cfg.Store.SyncedGroups(ctx)
-	if err != nil {
-		return nil, err
-	}
-	teams, err := s.cfg.Store.TeamSets(ctx)
-	if err != nil {
-		return nil, err
-	}
-	for n, ms := range teams {
-		synced[n] = ms
-	}
-	// A group an installation moved in gave up is its team, under the name the tree may still use.
-	aliases, err := s.cfg.Store.Aliases(ctx)
-	if err != nil {
-		return nil, err
-	}
-	for old, name := range aliases {
-		if ms, ok := teams[name]; ok {
-			synced[old] = ms
-		}
-	}
-	return synced, nil
-}
-
-// expand is every principal in a set, through the sets it holds.
-func (s *Server) expand(ctx context.Context, name string) ([]string, bool, error) {
-	t, synced, err := s.model(ctx)
-	if err != nil {
-		return nil, false, err
-	}
-	if t != nil {
-		if _, ok := t.Set(name); ok || t.Synced(name) {
-			return t.Expand(name), true, nil
-		}
-	}
-	if _, ok := synced[name]; ok {
-		// A synced group the tree does not name: expand it over the synced groups alone.
-		seen := map[string]bool{}
-		var out []string
-		var walk func(string)
-		walk = func(n string) {
-			for _, m := range synced[n] {
-				if seen[m] {
-					continue
-				}
-				seen[m] = true
-				if _, ok := synced[m]; ok {
-					walk(m)
-				} else {
-					out = append(out, m)
-				}
-			}
-		}
-		walk(name)
-		sort.Strings(out)
-		return out, true, nil
-	}
-	return nil, false, nil
 }
 
 // activeOnly keeps the names of active principals.
@@ -623,7 +595,7 @@ func (s *Server) principalNamed(ctx context.Context, name, id string) (string, b
 }
 
 func (s *Server) ExpandSet(ctx context.Context, req *identitypb.ExpandSetRequest) (*identitypb.ExpandSetResponse, error) {
-	ms, ok, err := s.expand(ctx, req.GetName())
+	ms, ok, err := s.cfg.Store.Expand(ctx, req.GetName())
 	if err != nil {
 		return nil, grpcError(err)
 	}
@@ -645,33 +617,24 @@ func (s *Server) CheckMembership(ctx context.Context, req *identitypb.CheckMembe
 	if !found {
 		return &identitypb.CheckMembershipResponse{}, nil
 	}
-	active, err := s.activeOnly(ctx, []string{name})
-	if err != nil {
-		return nil, grpcError(err)
-	}
-	if len(active) == 0 {
+	p, err := s.cfg.Store.Principal(ctx, name)
+	if errors.Is(err, store.ErrNotFound) {
 		return &identitypb.CheckMembershipResponse{}, nil
 	}
-	t, _, err := s.model(ctx)
 	if err != nil {
 		return nil, grpcError(err)
 	}
-	if t != nil {
-		if chain, ok := t.Contains(req.GetSet(), name); ok {
-			return &identitypb.CheckMembershipResponse{Member: true, Chain: chain}, nil
-		}
+	if !p.Active() {
 		return &identitypb.CheckMembershipResponse{}, nil
 	}
-	ms, _, err := s.expand(ctx, req.GetSet())
+	chain, ok, err := s.cfg.Store.Chain(ctx, req.GetSet(), p)
 	if err != nil {
 		return nil, grpcError(err)
 	}
-	for _, m := range ms {
-		if m == name {
-			return &identitypb.CheckMembershipResponse{Member: true, Chain: []string{req.GetSet(), m}}, nil
-		}
+	if !ok {
+		return &identitypb.CheckMembershipResponse{}, nil
 	}
-	return &identitypb.CheckMembershipResponse{}, nil
+	return &identitypb.CheckMembershipResponse{Member: true, Chain: chain}, nil
 }
 
 // ---- Verify ----
@@ -1182,15 +1145,23 @@ func (s *Server) planTree(ctx context.Context, files []*identitypb.File) (*ident
 	for _, f := range files {
 		fs[f.GetPath()] = f.GetContent()
 	}
-	synced, err := s.groups(ctx)
+	before, applied, err := s.tree(ctx)
 	if err != nil {
-		return nil, store.Applied{}, nil, err
+		return nil, applied, nil, err
+	}
+	// The groups both trees reach, as stored — the new tree may not declare one's name — for the
+	// new tree's validation, and for the change's approvals, which expand both trees' owners.
+	roots := identity.Referenced(s.names, fs)
+	if before != nil {
+		for _, set := range before.Sets() {
+			roots = append(append(roots, s.names.OfSet(set)), set.Members...)
+		}
+	}
+	synced, err := s.cfg.Store.SetsReachable(ctx, roots, false)
+	if err != nil {
+		return nil, applied, nil, err
 	}
 	after, err := identity.LoadFiles(s.names, fs, identity.WithSynced(synced))
-	if err != nil {
-		return nil, store.Applied{}, nil, err
-	}
-	before, applied, err := s.tree(ctx)
 	if err != nil {
 		return nil, applied, nil, err
 	}
@@ -1234,7 +1205,7 @@ func (s *Server) Apply(ctx context.Context, req *identitypb.ApplyRequest) (*iden
 }
 
 func (s *Server) GetApplied(ctx context.Context, _ *identitypb.GetAppliedRequest) (*identitypb.GetAppliedResponse, error) {
-	_, applied, err := s.cfg.Store.Tree(ctx)
+	applied, err := s.cfg.Store.Applied(ctx)
 	if err != nil {
 		return nil, grpcError(err)
 	}

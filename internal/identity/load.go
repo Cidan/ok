@@ -58,6 +58,30 @@ func Load(names Names, fsys fs.FS, opts ...Option) (*Tree, error) {
 // (its documentation), and any other file elsewhere is refused, as is a folder that
 // is not a lowercase DNS label. The error is an *Error listing every problem.
 func LoadFiles(names Names, files map[string][]byte, opts ...Option) (*Tree, error) {
+	sets, problems := declarations(files)
+	if len(problems) > 0 {
+		return nil, &Error{Problems: problems}
+	}
+	return New(names, sets, opts...)
+}
+
+// Referenced are the full names of the sets files declare and of everything those list, sorted:
+// what a tree of them may need of the groups the system of record syncs, fetched before
+// LoadFiles validates it. Files that do not parse add nothing.
+func Referenced(names Names, files map[string][]byte) []string {
+	sets, _ := declarations(files)
+	seen := map[string]bool{}
+	for _, s := range sets {
+		seen[names.OfSet(s)] = true
+		for _, m := range s.Members {
+			seen[m] = true
+		}
+	}
+	return sortedKeys(seen)
+}
+
+// declarations are the sets files declare, and what is wrong with them, each a sentence.
+func declarations(files map[string][]byte) ([]Set, []string) {
 	var sets []Set
 	var problems []string
 	add := func(format string, a ...any) { problems = append(problems, fmt.Sprintf(format, a...)) }
@@ -117,10 +141,7 @@ func LoadFiles(names Names, files map[string][]byte, opts ...Option) (*Tree, err
 		}
 		sets = append(sets, Set{Kind: kind, Name: name, Path: folder, Members: members})
 	}
-	if len(problems) > 0 {
-		return nil, &Error{Problems: problems}
-	}
-	return New(names, sets, opts...)
+	return sets, problems
 }
 
 // parseDeclaration reads an acl.yaml or group.yaml: one key, members, a list of names.
