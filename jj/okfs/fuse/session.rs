@@ -75,7 +75,7 @@ impl Session {
     ) -> io::Result<()> {
         let negotiated = match self.negotiated {
             Some(n) => n,
-            None => match handshake(&self.fd)? {
+            None => match handshake(&self.fd, fs.posix_acl())? {
                 Some(n) => n,
                 None => return Ok(()),
             },
@@ -171,8 +171,9 @@ fn reply_err(fd: &OwnedFd, unique: u64, errno: i32) {
     write_all(fd, &w.buf);
 }
 
-/// Answers the kernel's INIT: None if the connection ended first.
-fn handshake(fd: &OwnedFd) -> io::Result<Option<Negotiated>> {
+/// Answers the kernel's INIT: None if the connection ended first. `posix_acl`: the file system
+/// keeps POSIX ACLs ([`Filesystem::posix_acl`]).
+fn handshake(fd: &OwnedFd, posix_acl: bool) -> io::Result<Option<Negotiated>> {
     let mut buf = vec![0u8; BUF_LEN];
     loop {
         let Some(n) = read_request(fd, &mut buf)? else {
@@ -216,7 +217,7 @@ fn handshake(fd: &OwnedFd) -> io::Result<Option<Negotiated>> {
                 abi::MIN_KERNEL_MINOR
             )));
         }
-        let wanted = abi::ASYNC_READ
+        let mut wanted = abi::ASYNC_READ
             | abi::ATOMIC_O_TRUNC
             | abi::BIG_WRITES
             | abi::AUTO_INVAL_DATA
@@ -225,8 +226,12 @@ fn handshake(fd: &OwnedFd) -> io::Result<Option<Negotiated>> {
             | abi::PARALLEL_DIROPS
             | abi::MAX_PAGES
             | abi::CACHE_SYMLINKS
+            | abi::SETXATTR_EXT
             | abi::INIT_EXT
             | abi::HAS_RESEND;
+        if posix_acl {
+            wanted |= abi::POSIX_ACL | abi::DONT_MASK;
+        }
         let flags = wanted & offered;
         let mut w = Writer::with_capacity(64);
         w.u32(abi::KERNEL_VERSION)
@@ -536,12 +541,15 @@ fn dispatch(
         abi::SETXATTR => {
             let size = r.u32()?;
             let flags = r.u32()?;
+            let mut setxattr_flags = 0;
             if negotiated.flags & abi::SETXATTR_EXT != 0 {
-                r.skip(8)?;
+                setxattr_flags = r.u32()?;
+                r.skip(4)?;
             }
             let n = r.cstr()?;
             let value = r.bytes(size as usize)?;
-            fs.setxattr(ctx, ino, name(n), value, flags as i32)?;
+            let kill_sgid = setxattr_flags & abi::SETXATTR_ACL_KILL_SGID != 0;
+            fs.setxattr(ctx, ino, name(n), value, flags as i32, kill_sgid)?;
             Reply::Empty
         }
         abi::GETXATTR => {

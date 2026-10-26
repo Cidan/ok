@@ -6,6 +6,9 @@ use jj_lib::repo_path::RepoPath;
 use jj_lib::repo_path::RepoPathBuf;
 use ok_proto::ok::okfs::v1 as pb;
 
+use crate::acl;
+use crate::acl_tests::extended;
+use crate::acl_tests::minimal;
 use crate::model::Kind;
 use crate::model::Model;
 use crate::model::Opened;
@@ -476,6 +479,126 @@ fn reloads() {
             [".jj", "README", "docs", "link", "moved", "run.sh", "src"]
         );
     }
+}
+
+// ACLs keep their semantics: an access ACL set on a base file pins it and sets its mode (an
+// executable bit jj records), a chmod keeps the ACL in step, only a directory takes a default ACL,
+// what is made under one inherits it, and an ACL once kept verbatim is reconciled on a reload.
+#[test]
+fn acls() {
+    let mut fx = Fixture::new();
+    let base = base_tree(&mut fx);
+    let (mut m, _) = fx.model(&base);
+    let access = name(acl::ACCESS);
+    let a = fx.at(&mut m, "src/a.rs").unwrap();
+    let mode = |m: &mut Model, ino| fx.run(m, |m| m.attr(ino)).unwrap().mode & 0o7777;
+    fx.run(&mut m, |m| {
+        m.setxattr(a, access, &minimal(7, 5, 5), 0, false)
+    })
+    .unwrap();
+    assert_eq!(mode(&mut m, a), 0o755);
+    assert_eq!(
+        fx.run(&mut m, |m| m.getxattr(a, access)),
+        Err(libc::ENODATA)
+    );
+    let listing = fx.run(&mut m, |m| m.list_dir(&path("src"))).unwrap();
+    let e = listing.entries.iter().find(|e| e.name == b"a.rs").unwrap();
+    assert!(e.value.as_ref().unwrap().executable);
+    let e = extended(6, 4, 4, 4, 0);
+    fx.run(&mut m, |m| m.setxattr(a, access, &e, 0, false))
+        .unwrap();
+    assert_eq!(mode(&mut m, a), 0o640);
+    assert_eq!(fx.run(&mut m, |m| m.getxattr(a, access)), Ok(e));
+    fx.run(&mut m, |m| {
+        m.setattr(
+            a,
+            &okfs_fuse::SetAttr {
+                mode: Some(0o750),
+                ..Default::default()
+            },
+        )
+    })
+    .unwrap();
+    assert_eq!(
+        fx.run(&mut m, |m| m.getxattr(a, access)),
+        Ok(extended(7, 4, 4, 5, 0))
+    );
+    assert_eq!(
+        fx.run(&mut m, |m| m.setxattr(
+            a,
+            name(acl::DEFAULT),
+            &minimal(7, 5, 5),
+            0,
+            false
+        )),
+        Err(libc::EACCES)
+    );
+
+    let src = fx.at(&mut m, "src").unwrap();
+    let d = extended(7, 7, 5, 7, 5);
+    fx.run(&mut m, |m| {
+        m.setxattr(src, name(acl::DEFAULT), &d, 0, false)
+    })
+    .unwrap();
+    let f = fx
+        .run(&mut m, |m| {
+            m.create_as(src, name("new.rs"), Kind::File, 0o666, 0o077)
+        })
+        .unwrap();
+    assert_eq!(mode(&mut m, f), 0o664);
+    assert_eq!(
+        fx.run(&mut m, |m| m.getxattr(f, access)),
+        Ok(extended(6, 7, 5, 6, 4))
+    );
+    let sub = fx
+        .run(&mut m, |m| {
+            m.create_as(src, name("sub"), Kind::Dir, 0o777, 0o077)
+        })
+        .unwrap();
+    assert_eq!(mode(&mut m, sub), 0o775);
+    assert_eq!(
+        fx.run(&mut m, |m| m.getxattr(sub, name(acl::DEFAULT))),
+        Ok(d)
+    );
+    let plain = fx
+        .run(&mut m, |m| {
+            m.create_as(ROOT, name("plain"), Kind::File, 0o666, 0o077)
+        })
+        .unwrap();
+    assert_eq!(mode(&mut m, plain), 0o600);
+
+    // new.rs as okfs kept it before: an ACL from before a chmod +x it did not follow.
+    let mut records = m.records();
+    for r in &mut records {
+        if let Some(pb::record::Record::Inode(i)) = &mut r.record
+            && i.ino == f
+        {
+            i.mode = 0o755;
+            i.xattrs = vec![pb::Xattr {
+                name: acl::ACCESS.as_bytes().to_vec(),
+                value: minimal(6, 4, 4),
+            }];
+        }
+    }
+    let overlay = m.overlay_path(0).parent().unwrap().to_owned();
+    let mut m2 = Model::load(
+        records,
+        overlay,
+        b"/state/jj".to_vec(),
+        Box::new(MemLog::default()),
+        crate::model::now,
+        true,
+    )
+    .unwrap();
+    assert_eq!(mode(&mut m2, f), 0o755);
+    assert_eq!(
+        fx.run(&mut m2, |m| m.getxattr(f, access)),
+        Err(libc::ENODATA)
+    );
+    assert_eq!(
+        fx.run(&mut m2, |m| m.getxattr(a, access)),
+        Ok(extended(7, 4, 4, 5, 0))
+    );
 }
 
 // Sparse patterns hide what they exclude from the base, but never what was written.

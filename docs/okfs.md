@@ -236,9 +236,20 @@ size and times, and what it would save has not been measured to matter.) A snaps
 reads written files from the overlay directly, which every write has already reached.
 
 Everything a file system is asked to hold works in the overlay, tracked or not: hard links
-between written files, FIFOs and sockets (language servers create them), extended attributes,
-`flock` and POSIX locks (kept by the kernel). A snapshot records what jj records — files,
-executables, and symlinks — and skips the rest, as jj's local working copy does.
+between written files, FIFOs and sockets (language servers create them), extended attributes and
+POSIX ACLs (below), `flock` and POSIX locks (kept by the kernel). A snapshot records what jj
+records — files, executables, and symlinks — and skips the rest, as jj's local working copy does.
+
+POSIX ACLs (`system.posix_acl_access`, `system.posix_acl_default`) are kept as a disk file system
+keeps them (`acl.rs`, after Linux's `fs/posix_acl.c`), and over FUSE the kernel enforces them
+(`FUSE_POSIX_ACL`): setting an access ACL sets the mode, and one the mode can say is not kept; a
+chmod changes the access ACL; only a directory takes a default ACL, and what is made under one
+inherits it, with the umask not applied (the kernel leaves the umask to okfs, `FUSE_DONT_MASK`,
+which applies it where there is no default ACL; over NFS the client has applied it). An ACL kept
+verbatim by an earlier build, as any other xattr, is brought in step with its inode's mode when the
+model loads. A connection an earlier build negotiated, which the daemon adopts across a restart,
+has the kernel neither enforce ACLs nor leave the umask to okfs until the workspace is mounted
+again; the ACLs themselves are kept the same way either way.
 
 ### Secrets
 

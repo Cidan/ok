@@ -2,6 +2,7 @@
 //! FUSE on Linux and NFS on macOS, presenting a commit's tree at once and reading each file from ok
 //! on first access, with what is written kept in an overlay and, as checkpoints, in ok.
 
+pub mod acl;
 pub mod client;
 pub mod control;
 pub mod daemon;
@@ -46,6 +47,8 @@ pub fn can_mount() -> Result<(), String> {
     }
 }
 
+#[cfg(test)]
+mod acl_tests;
 #[cfg(test)]
 mod checkpoint_tests;
 #[cfg(all(test, target_os = "linux"))]

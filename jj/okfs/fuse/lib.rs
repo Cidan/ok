@@ -213,6 +213,15 @@ fn write_dirent(w: &mut abi::Writer, e: &DirEntry) {
 /// Methods are called concurrently from the session's threads.
 #[allow(unused_variables)]
 pub trait Filesystem: Send + Sync + 'static {
+    /// Whether the file system keeps POSIX ACLs (`system.posix_acl_access` and
+    /// `system.posix_acl_default`) as a disk file system does: an access ACL setting the mode and
+    /// kept in step with it, and a directory's default ACL inherited by what is made in it, with
+    /// the umask applied only where there is none. INIT then has the kernel enforce ACLs
+    /// (`FUSE_POSIX_ACL`) and leave the umask to the file system (`FUSE_DONT_MASK`); otherwise the
+    /// kernel applies the umask and ignores ACLs.
+    fn posix_acl(&self) -> bool {
+        false
+    }
     /// Called once the kernel's INIT is answered (not again for a session adopted after a
     /// restart), with the notifier for the connection.
     fn init(&self, notifier: Notifier) {}
@@ -329,7 +338,17 @@ pub trait Filesystem: Send + Sync + 'static {
             ..Statfs::default()
         })
     }
-    fn setxattr(&self, ctx: &Ctx, ino: u64, name: &OsStr, value: &[u8], flags: i32) -> Result<()> {
+    /// `kill_sgid`: setting `system.posix_acl_access` clears the inode's setgid bit, the caller
+    /// being neither in its group nor privileged (`FUSE_SETXATTR_ACL_KILL_SGID`).
+    fn setxattr(
+        &self,
+        ctx: &Ctx,
+        ino: u64,
+        name: &OsStr,
+        value: &[u8],
+        flags: i32,
+        kill_sgid: bool,
+    ) -> Result<()> {
         Err(libc::ENOTSUP)
     }
     fn getxattr(&self, ctx: &Ctx, ino: u64, name: &OsStr) -> Result<Vec<u8>> {

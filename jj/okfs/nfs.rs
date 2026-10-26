@@ -493,9 +493,11 @@ impl nfs::Filesystem for NfsMount {
             nfs::Kind::Socket => Kind::Socket,
             nfs::Kind::Block | nfs::Kind::Char => return Err(libc::EPERM),
         };
-        let ino = self
-            .mount
-            .with(|m| m.create(dir, os(name), kind, mode, target))?;
+        let ino = self.mount.with(|m| match kind {
+            Kind::Symlink => m.create(dir, os(name), kind, mode, target),
+            // NFS's client has applied its umask to `mode`.
+            _ => m.create_as(dir, os(name), kind, mode, 0),
+        })?;
         self.mount.changed();
         self.handed(ino);
         Ok(ino)

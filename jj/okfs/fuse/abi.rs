@@ -70,10 +70,12 @@ pub const NOTIFY_INC_EPOCH: i32 = 8;
 pub const ASYNC_READ: u64 = 1 << 0;
 pub const ATOMIC_O_TRUNC: u64 = 1 << 3;
 pub const BIG_WRITES: u64 = 1 << 5;
+pub const DONT_MASK: u64 = 1 << 6;
 pub const AUTO_INVAL_DATA: u64 = 1 << 12;
 pub const DO_READDIRPLUS: u64 = 1 << 13;
 pub const READDIRPLUS_AUTO: u64 = 1 << 14;
 pub const PARALLEL_DIROPS: u64 = 1 << 18;
+pub const POSIX_ACL: u64 = 1 << 20;
 pub const MAX_PAGES: u64 = 1 << 22;
 pub const CACHE_SYMLINKS: u64 = 1 << 23;
 pub const SETXATTR_EXT: u64 = 1 << 29;
@@ -96,6 +98,9 @@ pub const FATTR_FH: u32 = 1 << 6;
 pub const FATTR_ATIME_NOW: u32 = 1 << 7;
 pub const FATTR_MTIME_NOW: u32 = 1 << 8;
 pub const FATTR_CTIME: u32 = 1 << 10;
+
+// setxattr_in.setxattr_flags (with SETXATTR_EXT).
+pub const SETXATTR_ACL_KILL_SGID: u32 = 1 << 0;
 
 pub const GETATTR_FH: u32 = 1 << 0;
 pub const FSYNC_FDATASYNC: u32 = 1 << 0;

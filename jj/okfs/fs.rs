@@ -539,6 +539,10 @@ fn kind_of(mode: u32) -> Option<Kind> {
 }
 
 impl fuse::Filesystem for Mount {
+    fn posix_acl(&self) -> bool {
+        true
+    }
+
     fn init(&self, notifier: fuse::Notifier) {
         *self.notifier.lock().unwrap() = Some(notifier);
     }
@@ -652,7 +656,7 @@ impl fuse::Filesystem for Mount {
             .filter(|k| *k != Kind::Dir)
             .ok_or(libc::EPERM)?;
         self.only_files_in_secrets(parent, name)?;
-        let ino = self.with(|m| m.create(parent, name, kind, mode & !umask, b""))?;
+        let ino = self.with(|m| m.create_as(parent, name, kind, mode, umask))?;
         self.changed();
         self.entry(ino)
     }
@@ -667,7 +671,7 @@ impl fuse::Filesystem for Mount {
     ) -> fuse::Result<fuse::Entry> {
         self.writable()?;
         self.utf8_in_secrets(parent, name)?;
-        let ino = self.with(|m| m.create(parent, name, Kind::Dir, mode & !umask, b""))?;
+        let ino = self.with(|m| m.create_as(parent, name, Kind::Dir, mode, umask))?;
         self.changed();
         self.entry(ino)
     }
@@ -777,7 +781,7 @@ impl fuse::Filesystem for Mount {
                 },
             ));
         }
-        let ino = self.with(|m| m.create(parent, name, Kind::File, mode & !umask, b""))?;
+        let ino = self.with(|m| m.create_as(parent, name, Kind::File, mode, umask))?;
         let opened = self.with(|m| m.open(ino, flags & !libc::O_TRUNC))?;
         self.changed();
         let fh = self.new_fh(Handle::File { opened });
@@ -904,9 +908,12 @@ impl fuse::Filesystem for Mount {
         name: &OsStr,
         value: &[u8],
         flags: i32,
+        kill_sgid: bool,
     ) -> fuse::Result<()> {
         self.writable()?;
-        self.with(|m| m.setxattr(ino, name, value, flags))
+        self.with(|m| m.setxattr(ino, name, value, flags, kill_sgid))?;
+        self.changed();
+        Ok(())
     }
 
     fn getxattr(&self, _: &fuse::Ctx, ino: u64, name: &OsStr) -> fuse::Result<Vec<u8>> {

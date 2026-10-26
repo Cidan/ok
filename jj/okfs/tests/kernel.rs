@@ -4,11 +4,15 @@
 //! its own, and reaches okfs's test fixtures through the `testkit` feature.
 #![cfg_attr(not(target_os = "linux"), allow(dead_code, unused_imports))]
 
+use std::ffi::CString;
 use std::fs;
+use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::fs::PermissionsExt as _;
+use std::path::Path;
 use std::sync::Arc;
 
+use okfs::acl;
 use okfs::fs::Mount;
 use okfs::model::resolved_terms;
 use okfs::testfix::Entry;
@@ -19,6 +23,7 @@ use okfs_fuse as fuse;
 
 /// The model served through the kernel: reads, prefetching, writes of every kind, and a checkout
 /// under the kernel's caches.
+#[cfg(target_os = "linux")]
 fn kernel() {
     let mut fx = Fixture::new();
     let base = base_tree(&mut fx);
@@ -125,6 +130,43 @@ fn kernel() {
     );
     // .jj is not ours to change.
     assert!(fs::remove_file(mnt.join(".jj")).is_err());
+
+    // ACLs, through the kernel. In a user namespace the kernel refuses ACLs from a file system
+    // that did not say it keeps them (`fuse_no_acl`), so each call working is FUSE_POSIX_ACL.
+    let acls = mnt.join("acl");
+    let f = acls.join("f");
+    fs::create_dir(&acls).unwrap();
+    fs::write(&f, b"f\n").unwrap();
+    set_xattr(&f, acl::ACCESS, &minimal(7, 5, 0)).unwrap();
+    assert_eq!(mode(&f), 0o750);
+    assert_eq!(get_xattr(&f, acl::ACCESS), Err(libc::ENODATA));
+    let e = extended(6, 4, 4, 4, 0);
+    set_xattr(&f, acl::ACCESS, &e).unwrap();
+    assert_eq!(mode(&f), 0o640);
+    assert_eq!(get_xattr(&f, acl::ACCESS), Ok(e));
+    fs::set_permissions(&f, fs::Permissions::from_mode(0o750)).unwrap();
+    assert_eq!(get_xattr(&f, acl::ACCESS), Ok(extended(7, 4, 4, 5, 0)));
+    assert_eq!(
+        set_xattr(&f, acl::DEFAULT, &minimal(7, 5, 5)),
+        Err(libc::EACCES)
+    );
+    // Under a default ACL, a new file and directory inherit it and the umask does not apply
+    // (FUSE_DONT_MASK: the kernel left it to okfs); elsewhere it does.
+    let d = extended(7, 7, 5, 7, 5);
+    set_xattr(&acls, acl::DEFAULT, &d).unwrap();
+    let umask = unsafe { libc::umask(0o077) };
+    fs::write(acls.join("g"), b"g\n").unwrap();
+    fs::create_dir(acls.join("sub")).unwrap();
+    fs::write(mnt.join("new/umasked"), b"u\n").unwrap();
+    unsafe { libc::umask(umask) };
+    assert_eq!(mode(&acls.join("g")), 0o664);
+    assert_eq!(
+        get_xattr(&acls.join("g"), acl::ACCESS),
+        Ok(extended(6, 7, 5, 6, 4))
+    );
+    assert_eq!(mode(&acls.join("sub")), 0o775);
+    assert_eq!(get_xattr(&acls.join("sub"), acl::DEFAULT), Ok(d));
+    assert_eq!(mode(&mnt.join("new/umasked")), 0o600);
 
     // A checkout under the kernel's caches: the new tree's files appear, the old ones' cached
     // pages and entries drop. Nothing was snapshotted, so the recorded tree is still the base.
@@ -242,6 +284,84 @@ fn listing_failure() {
 
     fuse::unmount(&mnt).unwrap();
     server.join().unwrap().unwrap();
+}
+
+/// An ACL's xattr value from its entries: tag, permissions, and id.
+fn acl_value(entries: &[(u16, u16, u32)]) -> Vec<u8> {
+    let mut out = 2u32.to_le_bytes().to_vec();
+    for (tag, perm, id) in entries {
+        out.extend_from_slice(&tag.to_le_bytes());
+        out.extend_from_slice(&perm.to_le_bytes());
+        out.extend_from_slice(&id.to_le_bytes());
+    }
+    out
+}
+
+/// An ACL the mode can say: the owner's, the owning group's, and others' permissions.
+fn minimal(user: u16, group: u16, other: u16) -> Vec<u8> {
+    acl_value(&[
+        (0x01, user, u32::MAX),
+        (0x04, group, u32::MAX),
+        (0x20, other, u32::MAX),
+    ])
+}
+
+/// An ACL the mode cannot say: uid 0's entry (the namespace's), and the mask.
+fn extended(user: u16, named: u16, group: u16, mask: u16, other: u16) -> Vec<u8> {
+    acl_value(&[
+        (0x01, user, u32::MAX),
+        (0x02, named, 0),
+        (0x04, group, u32::MAX),
+        (0x10, mask, u32::MAX),
+        (0x20, other, u32::MAX),
+    ])
+}
+
+fn mode(p: &Path) -> u32 {
+    fs::metadata(p).unwrap().mode() & 0o7777
+}
+
+#[cfg(target_os = "linux")]
+fn c_path(p: &Path) -> CString {
+    CString::new(p.as_os_str().as_bytes()).unwrap()
+}
+
+#[cfg(target_os = "linux")]
+fn set_xattr(p: &Path, name: &str, value: &[u8]) -> Result<(), i32> {
+    let (p, name) = (c_path(p), CString::new(name).unwrap());
+    let r = unsafe {
+        libc::setxattr(
+            p.as_ptr(),
+            name.as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+        )
+    };
+    if r == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error().raw_os_error().unwrap())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn get_xattr(p: &Path, name: &str) -> Result<Vec<u8>, i32> {
+    let (p, name) = (c_path(p), CString::new(name).unwrap());
+    let mut buf = vec![0u8; 4096];
+    let n = unsafe {
+        libc::getxattr(
+            p.as_ptr(),
+            name.as_ptr(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+        )
+    };
+    if n < 0 {
+        return Err(std::io::Error::last_os_error().raw_os_error().unwrap());
+    }
+    buf.truncate(n as usize);
+    Ok(buf)
 }
 
 #[cfg(target_os = "linux")]

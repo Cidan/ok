@@ -49,6 +49,8 @@ use jj_lib::repo_path::RepoPathBuf;
 use jj_lib::repo_path::RepoPathComponent;
 use ok_proto::ok::okfs::v1 as pb;
 
+use crate::acl;
+use crate::acl::Xattrs;
 use crate::persist::Log;
 
 pub type Ino = u64;
@@ -189,14 +191,14 @@ impl Cache {
     }
 }
 
-/// Permissions, times, and extended attributes.
+/// Permissions, times, and extended attributes (ACLs among them, `acl`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Meta {
     pub mode: u32,
     pub mtime: Time,
     pub ctime: Time,
     pub atime: Time,
-    pub xattrs: BTreeMap<OsString, Vec<u8>>,
+    pub xattrs: Xattrs,
 }
 
 #[derive(Clone, Debug)]
@@ -1507,6 +1509,38 @@ impl Model {
         perm: u32,
         target: &[u8],
     ) -> R<Ino> {
+        self.create_with(parent, name, kind, perm, Xattrs::new(), target)
+    }
+
+    /// Makes a new file, directory, FIFO, or socket as a process asks to, with the mode it asked
+    /// for and its umask: under a directory with a default ACL, the inode inherits the ACL (and
+    /// the umask is not applied); elsewhere it takes the mode less the umask (`acl::inherit`).
+    pub fn create_as(
+        &mut self,
+        parent: Ino,
+        name: &OsStr,
+        kind: Kind,
+        mode: u32,
+        umask: u32,
+    ) -> R<Ino> {
+        let (perm, xattrs) = acl::inherit(
+            &self.inode(parent)?.meta.xattrs,
+            kind == Kind::Dir,
+            mode & 0o7777,
+            umask,
+        );
+        self.create_with(parent, name, kind, perm, xattrs, b"")
+    }
+
+    fn create_with(
+        &mut self,
+        parent: Ino,
+        name: &OsStr,
+        kind: Kind,
+        perm: u32,
+        xattrs: Xattrs,
+        target: &[u8],
+    ) -> R<Ino> {
         Self::check_name(parent, name)?;
         if self.find(parent, name)?.is_some() {
             return errno(libc::EEXIST);
@@ -1516,6 +1550,7 @@ impl Model {
         {
             let i = self.inode_mut(ino)?;
             i.meta.mode = perm & 0o7777;
+            i.meta.xattrs = xattrs;
             i.target = target.to_vec();
             if kind == Kind::Dir {
                 i.dir.as_mut().unwrap().overlay = Some(Overlay {
@@ -1919,16 +1954,13 @@ impl Model {
                 Kind::File | Kind::Symlink => self.pin(ino)?,
                 _ => {}
             }
-            let t = (self.clock)();
-            let mut exec_changed = None;
-            let i = self.inode_mut(ino)?;
             if let Some(mode) = set.mode {
                 let perm = mode & 0o7777;
-                if kind == Kind::File && (perm & 0o100 != 0) != (i.meta.mode & 0o100 != 0) {
-                    exec_changed = Some(perm & 0o100 != 0);
-                }
-                i.meta.mode = perm;
+                acl::chmod(&mut self.inode_mut(ino)?.meta.xattrs, perm);
+                self.set_perm(ino, perm)?;
             }
+            let t = (self.clock)();
+            let i = self.inode_mut(ino)?;
             let resolve = |v: okfs_fuse::TimeOrNow| match v {
                 okfs_fuse::TimeOrNow::Time(t) => t,
                 okfs_fuse::TimeOrNow::Now => t,
@@ -1940,17 +1972,25 @@ impl Model {
                 i.meta.mtime = resolve(m);
             }
             i.meta.ctime = set.ctime.unwrap_or(t);
-            if let (Some(exec), Content::Fixed(Value::File { executable, .. })) =
-                (exec_changed, &mut i.content)
-            {
-                *executable = exec;
-            }
             self.touch(ino);
-            if exec_changed.is_some() {
-                self.note(ino);
-            }
         }
         self.flush()?;
+        Ok(())
+    }
+
+    /// Sets an inode's permissions, the inode already kept (pinned, or an overlay directory). A
+    /// file whose executable bit changes is a change for the snapshot.
+    fn set_perm(&mut self, ino: Ino, perm: u32) -> R<()> {
+        let i = self.inode_mut(ino)?;
+        let exec = perm & 0o100 != 0;
+        let exec_changed = i.kind == Kind::File && exec != (i.meta.mode & 0o100 != 0);
+        i.meta.mode = perm;
+        if exec_changed {
+            if let Content::Fixed(Value::File { executable, .. }) = &mut i.content {
+                *executable = exec;
+            }
+            self.note(ino);
+        }
         Ok(())
     }
 
@@ -1989,9 +2029,26 @@ impl Model {
         Ok(out)
     }
 
-    pub fn setxattr(&mut self, ino: Ino, name: &OsStr, value: &[u8], flags: i32) -> R<()> {
+    /// Sets an extended attribute. ACLs are kept with their semantics (`acl`): an access ACL
+    /// sets the inode's permissions, and clears its setgid bit for `kill_sgid`; only a directory
+    /// has a default ACL.
+    pub fn setxattr(
+        &mut self,
+        ino: Ino,
+        name: &OsStr,
+        value: &[u8],
+        flags: i32,
+        kill_sgid: bool,
+    ) -> R<()> {
         if ino == JJ || name.as_bytes().starts_with(b"user.ok.") {
             return errno(libc::EPERM);
+        }
+        let kind = self.inode(ino)?.kind;
+        if name == acl::ACCESS || name == acl::DEFAULT {
+            let parsed = acl::Acl::parse(value).map_err(Error::Errno)?;
+            if name == acl::DEFAULT && kind != Kind::Dir && parsed.is_some() {
+                return errno(libc::EACCES);
+            }
         }
         let exists = self.inode(ino)?.meta.xattrs.contains_key(name);
         if flags & libc::XATTR_CREATE != 0 && exists {
@@ -2000,15 +2057,23 @@ impl Model {
         if flags & libc::XATTR_REPLACE != 0 && !exists {
             return errno(libc::ENODATA);
         }
-        match self.inode(ino)?.kind {
+        match kind {
             Kind::Dir if ino != ROOT => self.overlay_dir(ino)?,
             Kind::File | Kind::Symlink => self.pin(ino)?,
             _ => {}
         }
-        self.inode_mut(ino)?
-            .meta
-            .xattrs
-            .insert(name.to_owned(), value.to_vec());
+        let t = (self.clock)();
+        let i = self.inode_mut(ino)?;
+        if name == acl::ACCESS {
+            let mode = acl::set_access(&mut i.meta.xattrs, i.meta.mode, value, kill_sgid)
+                .map_err(Error::Errno)?;
+            i.meta.ctime = t;
+            self.set_perm(ino, mode)?;
+        } else if name == acl::DEFAULT {
+            acl::set_default(&mut i.meta.xattrs, kind == Kind::Dir, value).map_err(Error::Errno)?;
+        } else {
+            i.meta.xattrs.insert(name.to_owned(), value.to_vec());
+        }
         self.touch(ino);
         self.flush()?;
         Ok(())
@@ -2927,11 +2992,15 @@ impl Model {
                     mtime: (r.mtime_sec, r.mtime_nsec),
                     ctime: (r.ctime_sec, r.ctime_nsec),
                     atime: (r.atime_sec, r.atime_nsec),
-                    xattrs: r
-                        .xattrs
-                        .iter()
-                        .map(|x| (OsString::from_vec(x.name.clone()), x.value.clone()))
-                        .collect(),
+                    xattrs: {
+                        let mut xattrs: Xattrs = r
+                            .xattrs
+                            .iter()
+                            .map(|x| (OsString::from_vec(x.name.clone()), x.value.clone()))
+                            .collect();
+                        acl::reconcile(&mut xattrs, r.mode, kind == Kind::Dir);
+                        xattrs
+                    },
                 },
                 version: 1,
                 size,
