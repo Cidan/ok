@@ -87,6 +87,10 @@ type Config struct {
 	ChunkCacheBytes int
 	// DiffCacheBytes bounds the cache of file pairs' diffs (DiffFiles).
 	DiffCacheBytes int
+	// DeltaCacheBytes bounds the cache of files' deltas against bases (ReadFiles with deltas).
+	DeltaCacheBytes int
+	// CheckoutCacheBytes bounds the cache of checkout layers' bytes (ReadCheckout).
+	CheckoutCacheBytes int
 	// PathCommitCacheBytes bounds the cache of the newest commits of main that changed paths, which
 	// a tree's listing with its entries' last commits reads (lastPathCommits).
 	PathCommitCacheBytes int
@@ -116,6 +120,8 @@ const (
 	DefaultObjectCacheBytes     = 256 << 20
 	DefaultChunkCacheBytes      = 512 << 20
 	DefaultDiffCacheBytes       = 64 << 20
+	DefaultDeltaCacheBytes      = 64 << 20
+	DefaultCheckoutCacheBytes   = 512 << 20
 	DefaultPathCommitCacheBytes = 32 << 20
 	DefaultSegmentCacheBytes    = 256 << 20
 	DefaultSegmentBatch         = 1 << 12
@@ -176,6 +182,14 @@ type Store struct {
 	objects *cache[[]byte]
 	chunks  *cache[storedChunk]
 	diffs   *cache[FileDiff]
+	// deltas are files' deltas against bases, compressed — empty where none pays (read.go); layers
+	// checkout layers' bytes, and checkouts the checkouts of commits, by repository and commit
+	// (checkouts.go). All are derived from IDs, so never stale.
+	deltas    *cache[[]byte]
+	layers    *cache[[]byte]
+	checkouts *cache[Checkout]
+	// deriving are checkouts this replica is deriving, by key: a reader of one waits for it.
+	deriving singleflight
 	// newestOfPaths are answers lastPathCommits read: main's history fixes each for good.
 	newestOfPaths *cache[pathCommit]
 	// codeIndexes are the code search indexes this replica holds (codesearch.go).
@@ -255,6 +269,12 @@ func New(b backend.Backend, blobs blob.Store, cfg Config) (*Store, error) {
 	if cfg.DiffCacheBytes == 0 {
 		cfg.DiffCacheBytes = DefaultDiffCacheBytes
 	}
+	if cfg.DeltaCacheBytes == 0 {
+		cfg.DeltaCacheBytes = DefaultDeltaCacheBytes
+	}
+	if cfg.CheckoutCacheBytes == 0 {
+		cfg.CheckoutCacheBytes = DefaultCheckoutCacheBytes
+	}
 	if cfg.PathCommitCacheBytes == 0 {
 		cfg.PathCommitCacheBytes = DefaultPathCommitCacheBytes
 	}
@@ -286,6 +306,9 @@ func New(b backend.Backend, blobs blob.Store, cfg Config) (*Store, error) {
 		objects:       newCache[[]byte]("objects", cfg.ObjectCacheBytes),
 		chunks:        newCache[storedChunk]("chunks", cfg.ChunkCacheBytes),
 		diffs:         newCache[FileDiff]("diffs", cfg.DiffCacheBytes),
+		deltas:        newCache[[]byte]("deltas", cfg.DeltaCacheBytes),
+		layers:        newCache[[]byte]("checkout_layers", cfg.CheckoutCacheBytes),
+		checkouts:     newCache[Checkout]("checkouts", cfg.CheckoutCacheBytes/64),
 		newestOfPaths: newCache[pathCommit]("path_commits", cfg.PathCommitCacheBytes),
 		codeIndexes:   newCache[*codeIndex]("code_indexes", cfg.CodeIndexCacheBytes),
 		reads:         defaultReadLimits,

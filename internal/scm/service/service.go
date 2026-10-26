@@ -338,6 +338,11 @@ func (s *Store) ReadFiles(req *scmpb.ReadFilesRequest, stream grpc.ServerStreami
 			return err
 		}
 		ranges[i] = store.FileRange{FileID: id, Offset: f.GetOffset(), Length: f.GetLength()}
+		if len(f.GetBaseFileId()) > 0 && req.GetStored() && req.GetDeltas() {
+			if ranges[i].Base, err = idIn(f.GetBaseFileId(), "files.base_file_id"); err != nil {
+				return err
+			}
+		}
 	}
 	if req.GetManifestsOnly() {
 		files := make([]encoding.ID, len(ranges))
@@ -365,7 +370,10 @@ func (s *Store) ReadFiles(req *scmpb.ReadFilesRequest, stream grpc.ServerStreami
 			FileId: f.FileID[:], Size: f.Size, ChunkId: chunkIDOut(f), Offset: f.Offset,
 			Data: f.Data, Last: f.Last, NotFound: f.NotFound,
 		}
-		if stored && len(f.Data) > 0 {
+		switch {
+		case f.Base != (encoding.ID{}):
+			out.Codec, out.RawLength, out.BaseFileId = scmpb.ChunkCodec_CHUNK_CODEC_DELTA, f.RawLength, f.Base[:]
+		case stored && len(f.Data) > 0:
 			out.Codec, out.RawLength = codecOut(f.Codec), f.RawLength
 		}
 		return stream.Send(out)
@@ -398,7 +406,7 @@ func (s *Store) ReadDictionary(ctx context.Context, req *scmpb.ReadDictionaryReq
 // chunkIDOut is the frame's chunk ID, or none when the frame carries no chunk: an absent
 // file's frame, or the one frame of a file with no chunks (the empty file).
 func chunkIDOut(f store.FileFrame) []byte {
-	if f.NotFound || len(f.Data) == 0 {
+	if f.NotFound || len(f.Data) == 0 || f.ChunkID == (encoding.ID{}) {
 		return nil
 	}
 	return f.ChunkID[:]
@@ -491,8 +499,51 @@ func (s *Store) ReadTreeClosure(req *scmpb.ReadTreeClosureRequest, stream grpc.S
 	if len(req.GetPathPrefixes()) > maxRefs {
 		return status.Errorf(codes.InvalidArgument, "path_prefixes: %d (at most %d)", len(req.GetPathPrefixes()), maxRefs)
 	}
-	return toStatus(s.c.store.ReadTreeClosure(ctx, req.GetRepositoryId(), id, req.GetPathPrefixes(), req.GetWithSizes(),
+	var base encoding.ID
+	if len(req.GetBaseTreeId()) > 0 {
+		if base, err = idIn(req.GetBaseTreeId(), "base_tree_id"); err != nil {
+			return err
+		}
+	}
+	return toStatus(s.c.store.ReadTreeClosure(ctx, req.GetRepositoryId(), id, base, req.GetPathPrefixes(), req.GetWithSizes(),
 		func(o store.EncodedObject) error { return stream.Send(objectOut(o)) }))
+}
+
+// ReadCheckout streams a commit's checkout: its header, then each layer the caller does not hold.
+func (s *Store) ReadCheckout(req *scmpb.ReadCheckoutRequest, stream grpc.ServerStreamingServer[scmpb.CheckoutFrame]) error {
+	ctx := stream.Context()
+	if _, err := caller(ctx); err != nil {
+		return err
+	}
+	commit, err := idIn(req.GetCommitId(), "commit_id")
+	if err != nil {
+		return err
+	}
+	if len(req.GetHeldLayers()) > maxRefs {
+		return status.Errorf(codes.InvalidArgument, "held_layers: %d (at most %d)", len(req.GetHeldLayers()), maxRefs)
+	}
+	held, err := idsIn(req.GetHeldLayers(), "held_layers")
+	if err != nil {
+		return err
+	}
+	var have encoding.ID
+	if len(req.GetHaveTree()) > 0 {
+		if have, err = idIn(req.GetHaveTree(), "have_tree"); err != nil {
+			return err
+		}
+	}
+	return toStatus(s.c.store.ReadCheckout(ctx, req.GetRepositoryId(), commit, held, have, func(co store.Checkout, since encoding.ID) error {
+		h := &scmpb.CheckoutHeader{TreeId: co.Tree[:]}
+		for _, l := range co.Layers {
+			h.Layers = append(h.Layers, l.ID[:])
+		}
+		if since != (encoding.ID{}) {
+			h.SinceTree = since[:]
+		}
+		return stream.Send(&scmpb.CheckoutFrame{Frame: &scmpb.CheckoutFrame_Header{Header: h}})
+	}, func(id encoding.ID, data []byte, last bool) error {
+		return stream.Send(&scmpb.CheckoutFrame{Frame: &scmpb.CheckoutFrame_Layer{Layer: &scmpb.LayerData{LayerId: id[:], Data: data, Last: last}}})
+	}))
 }
 
 func (s *Store) ReadTreeSizes(req *scmpb.ReadTreeSizesRequest, stream grpc.ServerStreamingServer[scmpb.TreeSizes]) error {

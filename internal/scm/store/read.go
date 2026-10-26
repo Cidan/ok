@@ -557,17 +557,23 @@ func (s *Store) contents(ctx context.Context, repo int64, ms map[encoding.ID]*ma
 	return out, nil
 }
 
-// FileRange asks for [Offset, Offset+Length) of a file; Length 0 reads to the end.
+// FileRange asks for [Offset, Offset+Length) of a file; Length 0 reads to the end. Base, read
+// stored, names a version of the file the caller holds whole, which the file may come as a delta
+// against (deltaFrames).
 type FileRange struct {
 	FileID encoding.ID
 	Offset uint64
 	Length uint64
+	Base   encoding.ID
 }
 
 // FileFrame is one frame of ReadFiles: a whole chunk and where it sits in the file.
 // A file's first frame carries its size, its last sets Last, and an absent file is one
 // frame with NotFound. Range is the index of the range the frame answers. Read stored, Data is
-// the chunk as its pack stores it, encoded by Codec, and RawLength its raw length.
+// the chunk as its pack stores it, encoded by Codec, and RawLength its raw length — or, with Base
+// set, the whole file as a compressed delta against Base (encoding.EncodeDelta, then zstd), and
+// RawLength the file's size: one frame, which carries no chunk and may come before frames of
+// ranges ahead of its own.
 type FileFrame struct {
 	Range     int
 	FileID    encoding.ID
@@ -577,6 +583,7 @@ type FileFrame struct {
 	Data      []byte
 	Codec     pack.Codec
 	RawLength uint32
+	Base      encoding.ID
 	Last      bool
 	NotFound  bool
 }
@@ -631,6 +638,17 @@ func (s *Store) ReadFiles(ctx context.Context, repo int64, ranges []FileRange, f
 	if err != nil {
 		return err
 	}
+	var deltas map[int]FileFrame
+	if stored {
+		if deltas, err = s.deltaFrames(ctx, repo, ranges, ms); err != nil {
+			return err
+		}
+		for _, f := range deltas {
+			if err := emit(f); err != nil {
+				return err
+			}
+		}
+	}
 	// Every frame, in order; a frame that carries a chunk has its length.
 	type planned struct {
 		frame  FileFrame
@@ -639,6 +657,9 @@ func (s *Store) ReadFiles(ctx context.Context, repo int64, ranges []FileRange, f
 	}
 	var plan []planned
 	for i, r := range ranges {
+		if _, ok := deltas[i]; ok {
+			continue
+		}
 		m := ms[r.FileID]
 		if m == nil {
 			plan = append(plan, planned{frame: FileFrame{Range: i, FileID: r.FileID, Last: true, NotFound: true}})
@@ -1162,8 +1183,11 @@ func cleanPrefixes(prefixes []string) ([]string, error) {
 // ReadTreeClosure streams every tree, symlink, and copy history under a tree, limited
 // to path prefixes (for sparse workspaces): the trees along each prefix, and everything
 // within one. The empty tree is virtual and not sent. withSizes sends, after each level of
-// trees, their sizes records (TreeSizes), as encoding.KindTreeSizes under each tree's ID.
-func (s *Store) ReadTreeClosure(ctx context.Context, repo int64, treeID encoding.ID, prefixes []string, withSizes bool, emit func(EncodedObject) error) error {
+// trees, their sizes records (TreeSizes), as encoding.KindTreeSizes under each tree's ID. A base
+// (zero for none) is a tree whose closure the caller holds: what it holds at the same path is not
+// sent — a subtree whose ID is the base's there, with everything beneath it, and a symlink or copy
+// history the base's tree there names too.
+func (s *Store) ReadTreeClosure(ctx context.Context, repo int64, treeID, base encoding.ID, prefixes []string, withSizes bool, emit func(EncodedObject) error) error {
 	prefixes, err := cleanPrefixes(prefixes)
 	if err != nil {
 		return err
@@ -1190,6 +1214,8 @@ func (s *Store) ReadTreeClosure(ctx context.Context, repo int64, treeID encoding
 	type node struct {
 		id   encoding.ID
 		path string
+		// base is the base's tree at path: zero for none.
+		base encoding.ID
 	}
 	sent := map[ObjectRef]bool{}
 	send := func(refs []ObjectRef) error {
@@ -1214,11 +1240,22 @@ func (s *Store) ReadTreeClosure(ctx context.Context, repo int64, treeID encoding
 		}
 		return nil
 	}
-	level := []node{{id: treeID}}
-	if treeID == encoding.EmptyTreeID {
+	level := []node{{id: treeID, base: base}}
+	if treeID == encoding.EmptyTreeID || treeID == base {
 		level = nil
 	}
 	for len(level) > 0 {
+		// The base's trees at this level's paths, read together.
+		var bases []encoding.ID
+		for _, n := range level {
+			if n.base != (encoding.ID{}) && n.base != encoding.EmptyTreeID {
+				bases = append(bases, n.base)
+			}
+		}
+		baseTrees, err := s.readTrees(ctx, repo, bases)
+		if err != nil {
+			return err
+		}
 		var trees []ObjectRef
 		for _, n := range level {
 			trees = append(trees, ObjectRef{Kind: encoding.KindTree, ID: n.id})
@@ -1252,23 +1289,36 @@ func (s *Store) ReadTreeClosure(ctx context.Context, repo int64, treeID encoding
 			if err != nil {
 				return err
 			}
+			was := map[string]encoding.TreeValue{}
+			if bt := baseTrees[n.base]; bt != nil {
+				for _, e := range bt.Entries {
+					was[e.Name] = e.Value
+				}
+			}
 			for _, e := range t.Entries {
 				p := e.Name
 				if n.path != "" {
 					p = n.path + "/" + e.Name
 				}
-				switch e.Value.Kind {
+				old, inBase := was[e.Name]
+				v := e.Value
+				switch v.Kind {
 				case encoding.TreeValueTree:
-					if e.Value.ID != encoding.EmptyTreeID && (inside(p) || along(p)) {
-						next = append(next, node{id: e.Value.ID, path: p})
+					if v.ID == encoding.EmptyTreeID || !(inside(p) || along(p)) || inBase && old.Kind == v.Kind && old.ID == v.ID {
+						continue
 					}
+					var b encoding.ID
+					if inBase && old.Kind == encoding.TreeValueTree {
+						b = old.ID
+					}
+					next = append(next, node{id: v.ID, path: p, base: b})
 				case encoding.TreeValueSymlink:
-					if inside(p) {
-						leaves = append(leaves, ObjectRef{Kind: encoding.KindSymlink, ID: e.Value.ID})
+					if inside(p) && !(inBase && old.Kind == v.Kind && old.ID == v.ID) {
+						leaves = append(leaves, ObjectRef{Kind: encoding.KindSymlink, ID: v.ID})
 					}
 				case encoding.TreeValueFile:
-					if inside(p) && e.Value.CopyID != nil {
-						leaves = append(leaves, ObjectRef{Kind: encoding.KindCopyHistory, ID: *e.Value.CopyID})
+					if inside(p) && v.CopyID != nil && !(inBase && old.Kind == v.Kind && old.CopyID != nil && *old.CopyID == *v.CopyID) {
+						leaves = append(leaves, ObjectRef{Kind: encoding.KindCopyHistory, ID: *v.CopyID})
 					}
 				}
 			}

@@ -64,7 +64,10 @@ kubectl -n ok logs -f job/ok-load > load.log   # the summary, then the report's 
 # 6b. Or as PEOPLE people at once — each signed in through the device flow and on a connection of
 #     their own, reviewing each other's CLs — from PODS pods: the system of record's people and
 #     Dex's users first (one password, its bcrypt hash), then the indexed Job, then its pods'
-#     reports added up. REPOSITORIES 1 is everyone's monorepo.
+#     reports added up. REPOSITORIES 1 is everyone's monorepo. Each synthetic worker keeps a real
+#     checkout in its pod's scratch volume. A fresh installation imports its people over a minute
+#     or so: start the Job once it has them all (ok load signs in again a person it lacks, a few
+#     times, ten seconds apart).
 ok load people -n 2000 -hash-file <bcrypt hash file> -dir people
 kubectl -n ok create secret generic ok-people --from-file=people/people.yaml --dry-run=client -o yaml | kubectl apply -f -
 helm upgrade dex dex/dex -n dex -f /tmp/dex-values.yaml -f people/dex-people.yaml

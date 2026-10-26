@@ -57,6 +57,7 @@ func loadRun(args []string, stdout io.Writer) error {
 	workers := flags.Int("workers", 16, "synthetic workers")
 	runTime := flags.Duration("run-time", 10*time.Second, "how long a synthetic job takes")
 	read := flags.Bool("read", true, "synthetic jobs read their commit's files through the SCM")
+	checkoutDir := flags.String("checkout-dir", "", "with -read, each synthetic worker keeps a real checkout in a directory of its own here and moves it to each job's commit, as a worker does (default: each job reads its whole commit)")
 	inFlight := flags.Int("max-in-flight", 2000, "an operation's requests under way at most: one offered past it is shed")
 	reportPath := flags.String("report", "", "where to write the report, JSON (default: none; -: standard output, one line marked \"ok load report:\")")
 	people := flags.Int("people", 0, "people to act as, each signed in through the installation's sign-in and on a connection of their own (0: the one person of -credential-dir or -dev-person)")
@@ -171,7 +172,8 @@ func loadRun(args []string, stdout io.Writer) error {
 			return err
 		}
 		defer conn.Close()
-		workerClients = append(workerClients, load.Clients{Work: automationpb.NewWorkClient(conn), WorkerBrowse: scmpb.NewBrowseClient(conn)})
+		workerClients = append(workerClients, load.Clients{Work: automationpb.NewWorkClient(conn), WorkerBrowse: scmpb.NewBrowseClient(conn),
+			WorkerStore: scmpb.NewStoreClient(conn)})
 	}
 
 	slog.Info("ok load: setting up repositories", "repositories", *repositories)
@@ -188,7 +190,7 @@ func loadRun(args []string, stdout io.Writer) error {
 		"browses/s", rates.Browses)
 	rep, err := load.Run(ctx, load.Config{People: who, WorkerClients: workerClients, WorkerPrefix: strconv.Itoa(*pod),
 		Repos: rs, Shape: shape, Duration: *duration, Drain: *drain, MaxInFlight: *inFlight, PublishBytes: *publishBytes, CheckpointBytes: *checkpointBytes, CLBytes: *clBytes,
-		Workers: *workers, RunTime: *runTime, Read: *read, SeedFiles: *seedFiles, SeedFileBytes: *seedFileBytes, SeedLands: *pod == 0,
+		Workers: *workers, RunTime: *runTime, Read: *read, CheckoutDir: *checkoutDir, SeedFiles: *seedFiles, SeedFileBytes: *seedFileBytes, SeedLands: *pod == 0,
 		Pod: *pod, Pods: *pods, Log: slog.Default()})
 	if err != nil {
 		return err

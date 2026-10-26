@@ -254,7 +254,7 @@ deploy:
 
 	// The deployer, whose own environment names another database, and its own cluster.
 	deployerSCM := as(t, scmAddr, deployer)
-	src := checkout.SCM(scmpb.NewBrowseClient(deployerSCM), scmpb.NewStoreClient(deployerSCM))
+	src := checkout.SCM(scmpb.NewStoreClient(deployerSCM))
 	co, err := checkout.NewReal(filepath.Join(state, "repo"), src)
 	if err != nil {
 		t.Fatal(err)
@@ -324,7 +324,7 @@ deploy:
 	agentName := robot.GetPrincipal().GetName()
 	agentSCM := as(t, scmAddr, agentName)
 	agentState := t.TempDir()
-	agentSrc := checkout.SCM(scmpb.NewBrowseClient(agentSCM), scmpb.NewStoreClient(agentSCM))
+	agentSrc := checkout.SCM(scmpb.NewStoreClient(agentSCM))
 	agentCo, err := checkout.NewReal(filepath.Join(agentState, "repo"), agentSrc)
 	if err != nil {
 		t.Fatal(err)

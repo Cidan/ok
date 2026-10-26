@@ -132,7 +132,7 @@ func deployParts(ctx context.Context, cfg *config.Config, scm grpc.ClientConnInt
 	if err != nil {
 		return nil, fmt.Errorf("Bazel: %w", err)
 	}
-	out := &deployer{bazel: bazel, source: checkout.SCM(scmpb.NewBrowseClient(scm), scmpb.NewStoreClient(scm)), close: func() {}}
+	out := &deployer{bazel: bazel, source: checkout.SCM(scmpb.NewStoreClient(scm)), close: func() {}}
 	dir := filepath.Join(d.State, "repo")
 	switch d.Checkout {
 	case "virtual":

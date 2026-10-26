@@ -20,6 +20,7 @@
 //! segments/        the entries (crate::segments)
 //! outboxes/<h>     the outboxes whose entries pin cache entries: each a file naming one
 //! op_frontier      operations whose whole ancestry was received (32-byte IDs)
+//! checkout_layers  checkout layers whose records were taken in (32-byte IDs)
 //! ```
 
 use std::collections::HashMap;
@@ -56,6 +57,9 @@ pub const SEGMENT_BYTES: u64 = 256 << 20;
 
 /// How many operations the operation frontier keeps (`Cache::op_frontier`).
 pub const FRONTIER_MAX: usize = 64;
+
+/// How many checkout layers the cache remembers taking in (`Cache::checkout_layers`).
+pub const LAYERS_MAX: usize = 64;
 
 /// What the cache keeps decoded in memory, by bytes.
 const DECODED_BYTES: usize = 64 << 20;
@@ -727,19 +731,41 @@ impl Cache {
     /// Eviction may since have taken some of their ancestors; a read that then misses one reads
     /// it directly.
     pub fn op_frontier(&self) -> Vec<Id> {
-        let Ok(b) = fs::read(self.dir.join("op_frontier")) else {
-            return Vec::new();
-        };
-        b.as_chunks::<32>().0.to_vec()
+        self.ids("op_frontier")
     }
 
     /// Adds operations whose whole ancestry is now cached to the front of the frontier, keeping
     /// the newest FRONTIER_MAX. Concurrent writers each replace the file whole; one's additions
     /// may be lost, which costs only a larger fetch later.
     pub fn add_op_frontier(&self, ops: &[Id]) -> io::Result<()> {
-        let mut out: Vec<Id> = Vec::with_capacity(FRONTIER_MAX);
-        for id in ops.iter().chain(self.op_frontier().iter()) {
-            if out.len() == FRONTIER_MAX {
+        self.add_ids("op_frontier", ops, FRONTIER_MAX)
+    }
+
+    /// Checkout layers whose records the cache took in (`checkout_layers`, newest first): a
+    /// checkout read names them as held, so the SCM sends only the layers beyond them (docs/scm.md,
+    /// "Checkouts"). Eviction may since have taken some of their records; a read that then misses
+    /// one reads it directly.
+    pub fn checkout_layers(&self) -> Vec<Id> {
+        self.ids("checkout_layers")
+    }
+
+    /// Adds checkout layers whose records are now cached, keeping the newest LAYERS_MAX, as
+    /// `add_op_frontier` keeps operations.
+    pub fn add_checkout_layers(&self, layers: &[Id]) -> io::Result<()> {
+        self.add_ids("checkout_layers", layers, LAYERS_MAX)
+    }
+
+    fn ids(&self, name: &str) -> Vec<Id> {
+        let Ok(b) = fs::read(self.dir.join(name)) else {
+            return Vec::new();
+        };
+        b.as_chunks::<32>().0.to_vec()
+    }
+
+    fn add_ids(&self, name: &str, ids: &[Id], max: usize) -> io::Result<()> {
+        let mut out: Vec<Id> = Vec::with_capacity(max);
+        for id in ids.iter().chain(self.ids(name).iter()) {
+            if out.len() == max {
                 break;
             }
             if !out.contains(id) {
@@ -748,7 +774,7 @@ impl Cache {
         }
         let mut tmp = tempfile::NamedTempFile::new_in(&self.dir)?;
         tmp.write_all(&out.concat())?;
-        tmp.persist(self.dir.join("op_frontier"))
+        tmp.persist(self.dir.join(name))
             .map(|_| ())
             .map_err(|e| e.error)
     }

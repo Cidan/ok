@@ -248,7 +248,7 @@ deploy:
 
 	// The deployer, as its robot, in a real checkout.
 	deployerSCM := as(t, scmAddr, deployer)
-	src := checkout.SCM(scmpb.NewBrowseClient(deployerSCM), scmpb.NewStoreClient(deployerSCM))
+	src := checkout.SCM(scmpb.NewStoreClient(deployerSCM))
 	co, err := checkout.NewReal(filepath.Join(state, "repo"), src)
 	if err != nil {
 		t.Fatal(err)

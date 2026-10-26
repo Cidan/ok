@@ -191,7 +191,11 @@ without reading contents, a directory at a time:
 Directory listings come from tree objects through ok's stores (cached, batched as they are
 today), with `READDIRPLUS` so a listing returns its entries' attributes in one round trip. After a
 mount the daemon prefetches every tree under the root in the background (`Store.ReadTreeClosure`
-— trees only, no contents), so `ls -R` and globbing are local soon after a clone.
+— trees only, no contents), so `ls -R` and globbing are local soon after a clone. A presentation
+(*ok's roles*) instead reads the commit's checkout before it mounts or moves ([scm.md](scm.md),
+"Checkouts"): every tree with its sizes and the files planning reads, in one request — after the
+first, the one layer of what the commit changed — so its listings, its stats, and planning's reads
+are local at once.
 
 Times: a virtual file's `mtime` is when its content last changed *in this workspace* — the
 checkout that brought it, or the write that changed it — so make-style tools see an edit or a
@@ -578,7 +582,8 @@ nothing else.
   applies no redirections.
 - **Reading ahead.** A `Present` can name globs of files to have local before it returns — the
   deployer's planning reads the build graph's files and nothing else — and the trees they are
-  found through, and every file's size, are read with them.
+  found through, and every file's size, are read with them. What the commit's checkout held
+  (scm.md, "Checkouts": the files planning reads among them) is local already, and not read again.
 - **Recovery.** If the daemon exits, the next `Present` starts it again and presents again,
   detaching the dead mount first. Presentations are not persisted: they are the role's, and end
   with it.

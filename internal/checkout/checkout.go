@@ -86,6 +86,19 @@ type Source interface {
 	// ReadFiles reads files' contents: each file's bytes, in order and in pieces, through
 	// write, the last piece with last set. A file ReadFiles does not have is an error.
 	ReadFiles(ctx context.Context, repo int64, ids []ID, write func(id ID, data []byte, last bool) error) error
+	// ReadFilesFrom reads files as ReadFiles does, each with a base the caller holds, which the
+	// SCM may send it as a delta against (docs/scm.md, "Deltas").
+	ReadFilesFrom(ctx context.Context, repo int64, reads []Read, write func(id ID, data []byte, last bool) error) error
+	// Changes is what a commit's tree changes from another — every leaf added, changed, or gone,
+	// by path — and the commit's tree. From a tree it cannot compare (none, or one it holds no
+	// checkout of), it is every leaf of the commit, and whole.
+	Changes(ctx context.Context, repo int64, from ID, commit []byte) (tree ID, changes []Change, whole bool, err error)
+}
+
+// Change is a leaf a commit's tree changes: New, or nil where the path holds no leaf now.
+type Change struct {
+	Path string
+	New  *Entry
 }
 
 // ErrInterrupted is a read the SCM broke off.

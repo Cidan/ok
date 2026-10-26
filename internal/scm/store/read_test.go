@@ -139,7 +139,7 @@ func TestReadTreeClosure(t *testing.T) {
 	closure := func(prefixes ...string) map[encoding.ID]bool {
 		t.Helper()
 		out := map[encoding.ID]bool{}
-		if err := s.ReadTreeClosure(ctx, repo, root, prefixes, false, func(o EncodedObject) error {
+		if err := s.ReadTreeClosure(ctx, repo, root, encoding.ID{}, prefixes, false, func(o EncodedObject) error {
 			if out[o.ID] {
 				t.Errorf("%s sent twice", o.ID)
 			}
@@ -163,7 +163,7 @@ func TestReadTreeClosure(t *testing.T) {
 	if want := map[encoding.ID]bool{root: true, aTree: true, bTree: true, cp: true}; !reflect.DeepEqual(sparse, want) {
 		t.Errorf("sparse closure = %d objects, want root, a, a/b, and the copy", len(sparse))
 	}
-	if err := s.ReadTreeClosure(ctx, repo, root, []string{"a/../e"}, false, func(EncodedObject) error { return nil }); !errors.Is(err, ErrInvalid) {
+	if err := s.ReadTreeClosure(ctx, repo, root, encoding.ID{}, []string{"a/../e"}, false, func(EncodedObject) error { return nil }); !errors.Is(err, ErrInvalid) {
 		t.Errorf("unclean prefix: %v", err)
 	}
 }

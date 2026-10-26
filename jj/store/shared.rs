@@ -245,6 +245,19 @@ impl Shared {
         self.outbox.chunk(id).or_else(|| self.cache.chunk(id))
     }
 
+    /// A file's whole contents, if they are local: from the cache or the outbox, never the server.
+    pub fn local_bytes(&self, id: &Id) -> Option<Vec<u8>> {
+        if let Some(b) = self.cache.whole(id) {
+            return Some(b);
+        }
+        let m = self.cache.file(id).or_else(|| self.outbox.file(id))?;
+        let mut out = Vec::with_capacity(m.size as usize);
+        for (c, _) in &m.chunks {
+            out.extend(self.chunk(c)?);
+        }
+        (out.len() as u64 == m.size).then_some(out)
+    }
+
     /// A file's manifest — its size and its chunks — whether or not its chunks are local: from
     /// the cache, the outbox, or the server's manifest-only read, batched with concurrent ones.
     pub async fn manifest(self: &Arc<Self>, id: Id) -> Result<Option<Manifest>, Status> {
@@ -486,6 +499,8 @@ pub(crate) fn stored_chunk(
                 .ok_or_else(|| lost(format!("does not decode with dictionary {dict}")))?;
             (raw, stored)
         }
+        // A delta is no chunk: only a read that asked for deltas is sent one (files_with_bases).
+        Ok(pb::ChunkCodec::Delta) => return Err(lost("a delta, which was not asked for".into())),
         Err(_) => return Err(lost(format!("unknown codec {codec}"))),
     };
     if raw.len() != n {
@@ -659,11 +674,13 @@ fn chunk_batcher(client: Client, cache: Arc<Cache>) -> Arc<Batcher<ChunkRead, Ve
                             file_id: r.file.to_vec(),
                             offset: r.offset,
                             length: r.len,
+                            base_file_id: Vec::new(),
                         })
                         .collect(),
                     manifests_only: false,
                     stored: true,
                     dictionaries: true,
+                    deltas: false,
                 };
                 let wanted: HashMap<Id, ChunkRead> = reads.iter().map(|r| (r.chunk, *r)).collect();
                 let mut found = HashMap::new();
@@ -748,11 +765,13 @@ fn manifest_batcher(client: Client, cache: Arc<Cache>) -> Arc<Batcher<Id, Manife
                             file_id: id.to_vec(),
                             offset: 0,
                             length: 0,
+                            base_file_id: Vec::new(),
                         })
                         .collect(),
                     manifests_only: true,
                     stored: false,
                     dictionaries: false,
+                    deltas: false,
                 };
                 let mut stream = store.read_files(req).await?.into_inner();
                 let mut found = HashMap::new();
@@ -831,6 +850,7 @@ fn file_batcher(client: Client, cache: Arc<Cache>) -> Arc<Batcher<Id, Manifest>>
                     manifests_only: false,
                     stored: true,
                     dictionaries: true,
+                    deltas: false,
                     repository_id: client.repository_id(),
                     files: ids
                         .iter()
@@ -838,6 +858,7 @@ fn file_batcher(client: Client, cache: Arc<Cache>) -> Arc<Batcher<Id, Manifest>>
                             file_id: id.to_vec(),
                             offset: 0,
                             length: 0,
+                            base_file_id: Vec::new(),
                         })
                         .collect(),
                 };

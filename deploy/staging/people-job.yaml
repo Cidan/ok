@@ -2,8 +2,9 @@
 # PEOPLE in — through ok's device sign-in, approved at Dex with the password in ok-load-password —
 # and acting as them, each on a connection of their own, in REPOSITORIES repositories (prefix
 # PREFIX), at SPEED times the target's rates a person, for DURATION; its synthetic workers as
-# worker.ok. Each pod's report is a line of its log, which ok load merge reads. PROJECT and TAG as
-# values.yaml's.
+# worker.ok, each keeping a real checkout in the pod's scratch volume and moving it to each job's
+# commit, as a worker does. Each pod's report is a line of its log, which ok load merge reads.
+# PROJECT and TAG as values.yaml's.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -35,13 +36,16 @@ spec:
                  -server, "http://ok-server.ok.svc:8472", -people, "PEOPLE", -pods, "PODS",
                  -password-file, /etc/ok/load/password/password, -worker-token-file, /var/run/secrets/ok/token/token,
                  -repositories, "REPOSITORIES", -prefix, PREFIX, -speed, "SPEED", -duration, DURATION, -drain, 10m,
-                 -workers, "16", -run-time, 10s, -report, "-"]
+                 -workers, "16", -run-time, 10s, -checkout-dir, /checkouts, -report, "-"]
           resources:
-            requests: {cpu: "2", memory: 4Gi}
+            requests: {cpu: "4", memory: 8Gi}
           volumeMounts:
             - {name: password, mountPath: /etc/ok/load/password}
             - {name: token, mountPath: /var/run/secrets/ok/token, readOnly: true}
+            - {name: checkouts, mountPath: /checkouts}
       volumes:
+        - name: checkouts
+          emptyDir: {sizeLimit: 40Gi}
         - name: password
           secret: {secretName: ok-load-password, defaultMode: 0440}
         - name: token

@@ -311,6 +311,34 @@ func (n *Relay) Start(ctx context.Context) error {
 	return nil
 }
 
+// checkoutLook is how often the checkouts node looks for main's moves to derive.
+const checkoutLook = time.Second
+
+// Checkouts derives the checkout of each repository's main as it moves (store.CheckoutWork), a
+// node.Application: every replica runs it, each repository's by one at a time.
+type Checkouts struct{ svc *Service }
+
+var _ node.Application = (*Checkouts)(nil)
+
+// NewCheckouts derives the service's repositories' checkouts.
+func NewCheckouts(svc *Service) *Checkouts { return &Checkouts{svc: svc} }
+
+func (*Checkouts) Name() string                 { return "ok/scm/checkouts" }
+func (n *Checkouts) Dependencies() []node.Node  { return []node.Node{n.svc} }
+func (*Checkouts) Setup(context.Context) error  { return nil }
+func (*Checkouts) Healthy(context.Context) bool { return true }
+
+func (n *Checkouts) Start(ctx context.Context) error {
+	s := n.svc.store
+	return (&work.Runner{
+		Kind:    store.CheckoutWork,
+		Store:   s.Work(),
+		Do:      s.DeriveMainCheckout,
+		Idle:    checkoutLook,
+		Workers: 4,
+	}).Run(ctx)
+}
+
 // codeSearchLook is how often the code search node looks for main's moves to index.
 const codeSearchLook = 2 * time.Second
 

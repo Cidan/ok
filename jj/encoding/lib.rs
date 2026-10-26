@@ -15,16 +15,20 @@ use jj_lib::backend::{Commit, CopyHistory, Tree};
 use jj_lib::op_store::{Operation, View};
 
 mod decode;
+mod delta;
 mod encode;
+mod layer;
 #[cfg(test)]
 mod tests;
 mod tree_sizes;
 
 pub use decode::decode;
+pub use delta::{DELTA_VERSION, apply_delta};
 pub use encode::{
     encode, encode_chunk, encode_commit, encode_copy_history, encode_file, encode_operation,
     encode_symlink, encode_tree, encode_view, signed_data,
 };
+pub use layer::{LayerRecord, decode_layer_records};
 pub use tree_sizes::{
     KIND_TREE_SIZES, TREE_SIZES_VERSION, TreeSizes, decode_tree_sizes, encode_tree_sizes,
 };

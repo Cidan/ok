@@ -113,7 +113,7 @@ func TestReadTreeClosureWithSizes(t *testing.T) {
 	mustPublish(t, s, repo, "alice", b, nil)
 	var order []string
 	sizes := map[encoding.ID][]uint64{}
-	err := s.ReadTreeClosure(ctx, repo, root, nil, true, func(o EncodedObject) error {
+	err := s.ReadTreeClosure(ctx, repo, root, encoding.ID{}, nil, true, func(o EncodedObject) error {
 		order = append(order, o.Kind.String()+" "+o.ID.String()[:8])
 		if o.Kind == encoding.KindTreeSizes {
 			sizes[o.ID] = decodeSizes(t, o.Body)

@@ -107,7 +107,7 @@ func deployAgent(args []string) error {
 		if err != nil {
 			return fmt.Errorf("Bazel, which migrations run with: %w", err)
 		}
-		src := checkout.SCM(scmpb.NewBrowseClient(conn), scmpb.NewStoreClient(conn))
+		src := checkout.SCM(scmpb.NewStoreClient(conn))
 		co, err := checkout.NewReal(filepath.Join(*state, "repo"), src)
 		if err != nil {
 			return err

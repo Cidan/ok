@@ -80,7 +80,7 @@ func (e *env) startMicroVMWorker(name string, slots int) *worker.MicroVM {
 	ok := staticOK(t)
 	scm := as(t, e.scm, workerBot)
 	browse := scmpb.NewBrowseClient(scm)
-	src := checkout.SCM(browse, scmpb.NewStoreClient(scm))
+	src := checkout.SCM(scmpb.NewStoreClient(scm))
 	state := filepath.Join(e.state, name)
 	vm.Root, vm.Init = filepath.Join(state, "microvm", "root"), ok
 	vm.System = append([]string(nil), microvm.DefaultSystem...)

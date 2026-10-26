@@ -77,6 +77,9 @@ type GCReport struct {
 	PacksDeleted, OrphanPacks  int
 	// Segments merged away past their grace, and segments no row records, deleted.
 	SegmentsDeleted, OrphanSegments int
+	// Checkouts kept past CheckoutRetention, not of main's head, and their layers no kept checkout
+	// names, deleted (checkouts.go).
+	CheckoutsDeleted, CheckoutLayersDeleted int
 	// Segments is what the pass moved from the tail into segments, however little was waiting
 	// (nil when the repository's compaction was already running).
 	Segments *SegmentReport
@@ -117,7 +120,9 @@ type GCReport struct {
 //  4. compaction merges small packs and rewrites sparse ones, retiring what it replaced;
 //  5. packs retired longer than RetiredPackGrace, and orphan packs older than
 //     OrphanPackGrace, are deleted from S3;
-//  6. the content index is folded, and its unpinned index's runs of the days the sweep covered
+//  6. checkouts kept past CheckoutRetention but main head's are deleted, and the layers no kept
+//     checkout names (pruneCheckouts);
+//  7. the content index is folded, and its unpinned index's runs of the days the sweep covered
 //     retired (sweptTo).
 //
 // A pass is safe beside publishes, uploads, landings, and other passes: nothing reachable
@@ -178,6 +183,9 @@ func (s *Store) GC(ctx context.Context, repo int64, now time.Time, opts GCOption
 	}
 	if r.SegmentsDeleted, r.OrphanSegments, err = s.deleteSegments(ctx, repo, now, opts.DryRun); err != nil {
 		return r, fmt.Errorf("deleting segments: %w", err)
+	}
+	if r.CheckoutsDeleted, r.CheckoutLayersDeleted, err = s.pruneCheckouts(ctx, repo, now, opts.DryRun); err != nil {
+		return r, fmt.Errorf("pruning checkouts: %w", err)
 	}
 	if !opts.DryRun {
 		if r.IndexGeneration, r.IndexEntries, r.IndexFolded, r.IndexRunsRetired, err = s.sweptTo(ctx, repo, contentindex.DayOf(cutoff)); err != nil {

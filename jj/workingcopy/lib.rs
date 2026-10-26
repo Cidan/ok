@@ -168,6 +168,42 @@ struct LockedOkWorkingCopy {
     root: PathBuf,
 }
 
+/// A working copy's move from one tree to another, in an ok repository.
+struct Move {
+    shared: std::sync::Arc<ok_store::Shared>,
+    old: jj_lib::backend::TreeId,
+    new: jj_lib::backend::TreeId,
+}
+
+/// Has local, before jj's checkout reads it, what a move changes: the trees the old tree does not
+/// hold at the same path, in one request, and the changed files, each as a delta against the file
+/// it replaces where that is smaller (docs/scm.md, "Deltas"). jj's checkout reads anything this did
+/// not bring itself, as it would have.
+async fn read_ahead(m: Option<Move>) {
+    let Some(m) = m else { return };
+    // A failure is jj's checkout's to meet, reading the same objects.
+    let _ = ok_store::checkouts::move_tree(m.shared, &m.old, &m.new).await;
+}
+
+impl LockedOkWorkingCopy {
+    /// The move to `commit`, where the repository is ok's and the working copy is not sparse.
+    fn move_of(&self, commit: &Commit) -> Option<Move> {
+        let shared = commit
+            .store()
+            .backend_impl::<ok_store::OkBackend>()?
+            .shared()
+            .clone();
+        if !matches!(self.inner.sparse_patterns(), Ok([p]) if p.is_root()) {
+            return None;
+        }
+        Some(Move {
+            shared,
+            old: self.inner.old_tree().tree_ids().as_resolved().cloned()?,
+            new: commit.tree().tree_ids().as_resolved().cloned()?,
+        })
+    }
+}
+
 #[async_trait]
 impl LockedWorkingCopy for LockedOkWorkingCopy {
     fn old_operation_id(&self) -> &OperationId {
@@ -198,6 +234,7 @@ impl LockedWorkingCopy for LockedOkWorkingCopy {
     }
 
     async fn check_out(&mut self, commit: &Commit) -> Result<CheckoutStats, CheckoutError> {
+        read_ahead(self.move_of(commit)).await;
         self.inner.check_out(commit).await
     }
 

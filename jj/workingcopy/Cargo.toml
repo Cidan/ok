@@ -11,6 +11,7 @@ path = "lib.rs"
 [dependencies]
 async-trait.workspace = true
 jj-lib.workspace = true
+ok-store.workspace = true
 rayon.workspace = true
 
 [dev-dependencies]

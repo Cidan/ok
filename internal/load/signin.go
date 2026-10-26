@@ -35,7 +35,14 @@ func SignIn(ctx context.Context, server, dir, login, password string) (dial.Cred
 	defer cancel()
 	approved := make(chan error, 1)
 	if _, err := auth.Login(ctx, srv, dir, "ok load", io.Discard, func(u string) error {
-		go func() { approved <- approve(ctx, u, login, password) }()
+		go func() {
+			err := approve(ctx, u, login, password)
+			approved <- err
+			if err != nil {
+				// No approval is coming: the login it would have ended ends now.
+				cancel()
+			}
+		}()
 		return nil
 	}); err != nil {
 		select {

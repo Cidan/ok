@@ -1218,3 +1218,195 @@ async fn chunks_compressed_with_a_dictionary_reach_a_cold_machine() {
         "a cached file asks ok nothing"
     );
 }
+
+/// A file of `n` lines of Go-like text.
+fn source_lines(n: usize) -> Vec<u8> {
+    (0..n)
+        .flat_map(|i| format!("func f{i}() int {{ return {} }}\n", i * 7).into_bytes())
+        .collect()
+}
+
+fn file_id_at(commit: &Commit, p: &str) -> futures::future::BoxFuture<'static, [u8; 32]> {
+    let tree = commit.tree();
+    let p = path(p);
+    Box::pin(async move {
+        match tree.path_value(&p).await.unwrap().into_resolved().unwrap() {
+            Some(TreeValue::File { id, .. }) => <[u8; 32]>::try_from(id.as_bytes()).unwrap(),
+            v => panic!("{p:?}: {v:?}"),
+        }
+    })
+}
+
+// Checkouts (docs/scm.md, "Checkouts"): a cold machine's first checkout of a commit is one
+// request of layers — every tree with its sizes, the files planning reads whole — and the next
+// commit's is one more layer, of what it changed; a presentation's read-ahead of planning's files
+// then asks for nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_checkout_arrives_as_layers() {
+    if !ok_testscm::available() {
+        return;
+    }
+    let endpoint = endpoint();
+    let remote = new_repository(&endpoint, "layers").await;
+    let a = Machine::new(&endpoint, &remote).await;
+    let repo = a.head().await;
+    let mut tx = repo.start_transaction();
+    let root = repo.store().root_commit();
+    let first = child(
+        &mut tx,
+        &root,
+        &[
+            ("BUILD", Content::File(b"cc_library(name = \"root\")\n")),
+            ("src/a.go", Content::File(b"package a\n")),
+            (
+                "lib/BUILD.bazel",
+                Content::File(b"go_library(name = \"lib\")\n"),
+            ),
+            ("lib/link", Content::Symlink("../src")),
+        ],
+        "one",
+    )
+    .await;
+    let second = child(
+        &mut tx,
+        &first,
+        &[
+            ("src/a.go", Content::File(b"package a // two\n")),
+            ("src/BUILD", Content::File(b"go_library(name = \"src\")\n")),
+        ],
+        "two",
+    )
+    .await;
+    tx.commit("layers").await.unwrap();
+
+    let b = Machine::new(&endpoint, &remote).await;
+    let shared = ok_store::Shared::for_store_path(&b.repo_dir.join("store")).unwrap();
+    let tree = ok_store::checkouts::checkout_layers(shared.clone(), first.id().as_bytes(), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        tree.as_slice(),
+        first.tree_ids().as_resolved().unwrap().as_bytes()
+    );
+    assert_eq!(
+        shared.cache.checkout_layers().len(),
+        1,
+        "the first checkout's one layer"
+    );
+    let build = file_id_at(&first, "BUILD").await;
+    let lib_build = file_id_at(&first, "lib/BUILD.bazel").await;
+    let a_go = file_id_at(&first, "src/a.go").await;
+    assert!(
+        shared.cache.has_file(&build) && shared.cache.has_file(&lib_build),
+        "planning's files, whole"
+    );
+    assert!(
+        !shared.cache.has_file(&a_go),
+        "a file planning does not read came with the layer"
+    );
+    let root_id: [u8; 32] = tree;
+    assert_eq!(
+        shared
+            .cache
+            .tree_sizes(&root_id)
+            .expect("the root's sizes")
+            .sizes
+            .len(),
+        3,
+        "BUILD, lib, src"
+    );
+
+    // The next commit's, moving from the first's tree: one layer of what it changes, holding
+    // src/BUILD.
+    ok_store::checkouts::checkout_layers(shared.clone(), second.id().as_bytes(), Some(tree))
+        .await
+        .unwrap();
+    assert_eq!(shared.cache.checkout_layers().len(), 2, "one more layer");
+    assert!(
+        shared
+            .cache
+            .has_file(&file_id_at(&second, "src/BUILD").await)
+    );
+
+    // Planning's read-ahead: everything is local.
+    let wanted: ok_store::prefetch::Wanted =
+        Arc::new(|p: &str| p == "BUILD" || p.ends_with("/BUILD") || p.ends_with("/BUILD.bazel"));
+    let got = ok_store::prefetch::tree_and_files(
+        shared.clone(),
+        second.tree_ids().as_resolved().unwrap(),
+        wanted,
+    )
+    .await
+    .unwrap();
+    assert_eq!(got.files, 0, "planning's files were all in the layers");
+}
+
+// Moves (docs/scm.md, "Deltas"): a working copy's move to the next commit reads its changed trees
+// against the old tree, and each changed file as a delta against the one it replaces.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_move_reads_changed_files_as_deltas() {
+    if !ok_testscm::available() {
+        return;
+    }
+    let endpoint = endpoint();
+    let remote = new_repository(&endpoint, "deltas").await;
+    let a = Machine::new(&endpoint, &remote).await;
+    let repo = a.head().await;
+    let text = source_lines(4000);
+    let edited = String::from_utf8(text.clone())
+        .unwrap()
+        .replacen("func f2000()", "func g2000()", 1)
+        .into_bytes();
+    let mut tx = repo.start_transaction();
+    let root = repo.store().root_commit();
+    let first = child(
+        &mut tx,
+        &root,
+        &[
+            ("big.go", Content::File(&text)),
+            ("same/x", Content::File(b"x\n")),
+        ],
+        "one",
+    )
+    .await;
+    let second = child(
+        &mut tx,
+        &first,
+        &[
+            ("big.go", Content::File(&edited)),
+            ("new/y", Content::File(b"y\n")),
+        ],
+        "two",
+    )
+    .await;
+    tx.commit("deltas").await.unwrap();
+
+    let b = Machine::new(&endpoint, &remote).await;
+    let store_path = b.repo_dir.join("store");
+    let (old, new) = (
+        first.tree_ids().as_resolved().unwrap().clone(),
+        second.tree_ids().as_resolved().unwrap().clone(),
+    );
+    ok_store::prefetch::tree(&store_path, &old).await.unwrap();
+    let shared = ok_store::Shared::for_store_path(&store_path).unwrap();
+    let got = ok_store::checkouts::move_tree(shared.clone(), &old, &new)
+        .await
+        .unwrap();
+    assert_eq!(
+        (got.files, got.deltas),
+        (2, 1),
+        "big.go as a delta, new/y whole"
+    );
+    let big = file_id_at(&second, "big.go").await;
+    assert_eq!(shared.local_bytes(&big).as_deref(), Some(edited.as_slice()));
+    // Read back through jj, it is the file.
+    let repo_b = b.head().await;
+    assert_eq!(
+        read(&repo_b, second.id(), "big.go").await.as_deref(),
+        Some(edited.as_slice())
+    );
+    assert_eq!(
+        read(&repo_b, second.id(), "new/y").await.as_deref(),
+        Some(&b"y\n"[..])
+    );
+}

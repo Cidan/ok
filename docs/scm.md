@@ -375,6 +375,10 @@ none do.
     the client publishes — so the server sends only what lies beyond them. An operation or view
     the prefetch did not bring (one eviction took) is read directly.
   - `jj sync` prefetches `main`'s new commits.
+  - A working copy's move to another commit reads, before jj's checkout, the new tree's closure
+    against the old one and each changed file against the one it replaces (*Deltas*).
+  - **Checkout layers** a presentation took in are listed in the cache (`checkout_layers`, the
+    newest 64) and named as held when it reads the next commit's checkout (*Checkouts*).
 
 ### Commands
 
@@ -525,6 +529,9 @@ subtree found to hold no value is remembered by its ID.
 
 ### Reads
 
+- **A commit's checkout** — its trees, their sizes, and the files planning reads — is one stream of
+  layers, derived once (*Checkouts*); **a changed file** may come as a delta against the version
+  the client holds (*Deltas*).
 - **Every object except file contents** is read from the tail in PostgreSQL, then — trees,
   symlinks, copy histories, and trees' sizes records the tail lacks — from the repository's
   segments (*Segments*), then — a tree a publish stored — from its pack, located as a chunk is
@@ -596,10 +603,86 @@ half of a cold build's requests in a virtual workspace).
 - **On the wire.** `Store.ReadTreeSizes` answers up to 100,000 trees in one call, and
   `ReadTreeClosure` with `with_sizes` sends each level's records after its trees
   (`OBJECT_KIND_TREE_SIZES`), so a virtual clone or a presentation receives every directory's sizes
-  with its trees, in one stream.
+  with its trees, in one stream; a commit's checkout holds every tree's record (*Checkouts*).
 - **Trust.** A record is derived, so it cannot be verified against its tree's ID; it is as trusted
   as a manifest's size, which was always the SCM's word until the contents were read and verified.
   The client checks a record's entry count against its tree and ignores one that differs.
+
+### Checkouts
+
+A commit's checkout is what a checkout of it reads besides its files' contents — every tree under
+it with its sizes record, its symlinks and copy histories — and the files planning reads, whole: the
+build graph (`MODULE.bazel`, its lock, `.bazelrc`, `.bazelversion`, every `BUILD`, `BUILD.bazel`,
+and `.bzl`), `.ok/repository.yaml`, and the workflow files (`store.PlanningReads`), each of at most
+1 MiB. The SCM derives it once for each commit and keeps it in the bucket, and `Store.ReadCheckout`
+sends it in one stream (`internal/scm/store/checkouts.go`).
+
+- **Layers.** A checkout is a list of **layers**, oldest first, which together hold the whole. A
+  layer is immutable and named by the BLAKE3 of its bytes — `OKCHKLAY`, a version, then one zstd
+  frame of its records, each a kind, an ID, and a body, sorted by kind and ID
+  (`internal/scm/layer`, `encoding.EncodeLayerRecords`; held to one format in Go and Rust by
+  `testdata/layer.json`). Each layer names the tree it and the layers below it hold the checkout
+  of. A commit's checkout is its first parent's layers and one more holding what the commit
+  changed from the top one's tree: each tree whose ID differs from that tree's at its path, with
+  its sizes, the symlinks and copy histories those name that the tree there does not, and the files
+  planning reads that are new where they are. Then the top layers merge, as git's commit-graph
+  chains and LSM trees do: while a layer is no more than twice the size of the one above it (or
+  there are more than 16), the two are replaced by one layer of what the commit changes from the
+  tree below both. So a checkout is a whole layer at the bottom and a few smaller ones above it,
+  each less than half the one under it, and the whole layer stays the bottom of every checkout
+  along a line of commits until the layers above it outweigh half of it — or a merge would take it
+  in — when the commit's checkout is one layer of the whole instead. A parent with no checkout is
+  derived first, up to four deep; past that, or for a parent with conflicts, the checkout is whole.
+- **Reading one.** `ReadCheckout` names the commit and the layers the client holds, of any commit;
+  it answers the checkout's tree and its layers' IDs, then the bytes of each layer the client lacks,
+  in pieces of up to 1 MiB. A client checks each layer against its ID, takes its records in as if
+  it had read each, and holds the layer from then on. A commit with conflicts has no checkout
+  (`INVALID_ARGUMENT`), as `Export` refuses one.
+- **Moving.** A client that holds a tree's whole checkout — the one it moves from — names it
+  (`have_tree`), and is answered one layer of what the commit changes from it, made for it on the
+  fly and kept in each replica's memory by the pair (`CheckoutHeader.since_tree` names the tree it
+  completes); nothing, for the same tree, or for a kept checkout whose every layer the client
+  holds — moving back to a commit it has seen. So a move costs what changed between the two
+  commits, never a layer some other move rewrote, and a commit only moved to — a patchset's, a
+  candidate's — derives no checkout of its own. A tree the repository does not hold is answered
+  the commit's checkout.
+- **When.** Main's head is derived as main moves (`CheckoutWork`, keyed work marked by every
+  `HeadMoved` event, run by every replica's `ok/scm/checkouts` node, one repository by one replica
+  at a time); any other commit — a patchset, a candidate, a pre run's — the first time a checkout
+  of it is asked for, one derivation at a time on a replica, the rest waiting for it.
+- **Kept.** `checkouts/<repository>/c/<commit>` (the checkout: its tree and layers) and
+  `checkouts/<repository>/l/<layer>` in the SCM's bucket; each replica keeps those it read in
+  memory (`CheckoutCacheBytes`, 512 MiB, S3-FIFO as the other caches). Garbage collection's pass
+  deletes the checkouts of commits other than main's head older than `CheckoutRetention` (14 days),
+  then the layers no kept checkout names, past a day's grace for one a derivation wrote and has not
+  named yet. A replica asked for a layer gone since it read the checkout derives the checkout
+  again. A repository deleted, or moved to another cell, takes its checkouts with it.
+- **Who reads them.** ok's workers' and deployer's checkouts — a real checkout moves to a commit
+  by comparing its tree with the one it holds from the layers it holds, walking only the subtrees
+  whose IDs differ, and lists a commit whole only when it holds no tree to compare from; okfs's
+  presentations take a commit's layers in before they move to it — and nothing else needs to: a
+  layer is a cache of what the trees already say.
+
+### Deltas
+
+A client that holds a file's previous version — the file at the same path in the tree it had — can
+name it as the file's **base** (`FileRange.base_file_id`, with `ReadFilesRequest.deltas`). Where the
+repository holds the base and both are whole files of at most 4 MiB, the SCM sends the file as one
+frame of `CHUNK_CODEC_DELTA`: copies of runs the base shares and the bytes it does not, compressed
+(`encoding.EncodeDelta`; held to one format in Go and Rust by `testdata/delta.json`) — when that is
+smaller than the file's chunks as stored, else the chunks, as without a base. A delta's frame
+carries the whole file's size and the base it was made against; the client applies it to the base
+and verifies the result against the file's ID, as it verifies every file. An edited source file is
+a few hundred bytes against tens of thousands. Each replica keeps the deltas it made, and that none
+paid, by base and file (`DeltaCacheBytes`, 64 MiB).
+
+- **ok's workers' real checkouts** name, for each file that replaces another at its path, the
+  file there as its base, read from disk and checked against what the checkout recorded writing.
+- **ok's jj**, moving a working copy to another commit (`jj new`, `jj edit`, `jj sync`), reads the
+  new tree's closure with the old tree as its base (`ReadTreeClosureRequest.base_tree_id`: a subtree
+  whose ID is the base's at its path, and a symlink or copy history the base's tree there names, are
+  not sent), then each changed file with the file it replaces as its base, before jj's checkout
+  reads them (`jj//store/checkouts.rs`, `move_tree`). A sparse working copy reads as it did.
 
 ### Workspaces
 
@@ -641,7 +724,7 @@ work on resolved trees, which is all `main` and patchsets ever hold.
 | `DiffFiles` | line hunks (histogram diff) for file pairs, several at once, with the lines each adds and removes, flagging binary and oversized files; with `stats_only`, the counts alone, computed without hunks. A pair diffed before is served from the diff cache | every diff view and file list; comment porting |
 | `Annotate` | blame for a file at a commit: back along the commit's own first parents to `main`, then `main`'s history of the path (renames are not followed) | blame |
 | `IsAncestor` | ancestry between two commits | stack and base checks in ok control |
-| `Export` | a checkout of a commit (optionally under path prefixes) as one stream; with `entries_only`, its entries (paths, file IDs, sizes, modes) without contents, so a worker that keeps a checkout reads (`ReadFiles`) only what changed | automation's workers |
+| `Export` | a checkout of a commit (optionally under path prefixes) as one stream; with `entries_only`, its entries (paths, file IDs, sizes, modes) without contents | ok control's reads of a subtree (the groups-and-ACLs tree's); `ok load`'s synthetic jobs. ok's workers read a commit's checkout instead (*Checkouts*) |
 
 Uploads refuse merge commits, so `main` is a chain of single-parent commits: the commit
 `head_log` records at sequence n has generation n. Every `Log` page is therefore an index range
@@ -1294,6 +1377,8 @@ repositories themselves are never deleted (see "Decisions").
   rather than a level of the graph at a time. A pin that finds an object missing fails the
   transaction instead of pinning a dangling graph; a landing whose splice wrote an object it found
   already stored, which a sweep then took, runs again and stores it anew.
+- **Checkouts** (*Checkouts*) are derived, not history: the pass deletes the checkouts of commits
+  other than main's head older than 14 days, and the layers no kept checkout names after a day.
 - **Operation-log retention follows jj.** Every operation reachable from an operation log's heads
   is kept, with its view and `commit_predecessors`. That is jj's own semantics, where any past
   state can be restored, and it matches CitC's snapshot history. A user sheds history with

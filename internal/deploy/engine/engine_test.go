@@ -235,6 +235,14 @@ func (r *repo) ReadFiles(context.Context, int64, []checkout.ID, func(checkout.ID
 	return nil
 }
 
+func (r *repo) ReadFilesFrom(context.Context, int64, []checkout.Read, func(checkout.ID, []byte, bool) error) error {
+	return nil
+}
+
+func (r *repo) Changes(context.Context, int64, checkout.ID, []byte) (checkout.ID, []checkout.Change, bool, error) {
+	return checkout.ID{}, nil, true, nil
+}
+
 // Changed are the files whose contents differ between two commits.
 func (r *repo) Changed(_ context.Context, _ int64, from, to []byte) ([]string, error) {
 	r.mu.Lock()

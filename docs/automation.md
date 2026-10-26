@@ -476,7 +476,10 @@ A path conflict with main is refused, as in landing: `jj sync`, resolve, and upl
     worker's daemon, in a user and mount namespace the worker makes for itself, and needs
     `/dev/fuse`;
   - **real**: written to disk from the SCM, only what differs from the slot's last commit, every
-    file read-only — for a node without `/dev/fuse`.
+    file read-only — for a node without `/dev/fuse`. What changed comes from comparing the commit's
+    tree with the slot's, both from the checkouts' layers, the files planning reads with them, and
+    each file that replaces another at its path as a delta against the one on disk where that is
+    smaller ([scm.md](scm.md), "Checkouts", "Deltas").
 - **Every Bazel command** a worker runs gets `--symlink_prefix=/` (no convenience symlinks in a
   read-only checkout), `--sandbox_default_allow_network=false` (actions and tests without network),
   the lockfile honored (`--lockfile_mode=error` when `MODULE.bazel.lock` exists), the installation's

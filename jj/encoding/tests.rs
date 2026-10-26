@@ -694,3 +694,117 @@ fn tree_sizes_are_no_object() {
     let b = encode_tree_sizes(&TreeSizes { sizes: vec![1] });
     assert_eq!(decode(&b).unwrap_err().code, Code::Kind);
 }
+
+// --- deltas -------------------------------------------------------------------------------
+
+const DELTA_VECTORS: &str = include_str!("../../internal/scm/encoding/testdata/delta.json");
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeltaVectors {
+    #[allow(dead_code)]
+    comment: Vec<String>,
+    valid: Vec<DeltaValid>,
+    invalid: Vec<DeltaInvalid>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeltaValid {
+    name: String,
+    base: Vec<String>,
+    delta: Vec<String>,
+    result: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeltaInvalid {
+    name: String,
+    base: Vec<String>,
+    delta: Vec<String>,
+    limit: String,
+}
+
+#[test]
+fn delta_vectors() {
+    let v: DeltaVectors = serde_json::from_str(DELTA_VECTORS).expect("parsing delta.json");
+    assert!(!v.valid.is_empty() && !v.invalid.is_empty());
+    for c in v.valid {
+        let result = hex_lines(&c.result);
+        let got = apply_delta(
+            &hex_lines(&c.base),
+            &hex_lines(&c.delta),
+            result.len() as u64,
+        );
+        assert_eq!(got, Ok(result), "{}", c.name);
+    }
+    for c in v.invalid {
+        let limit: u64 = c.limit.parse().unwrap();
+        let got = apply_delta(&hex_lines(&c.base), &hex_lines(&c.delta), limit);
+        assert!(got.is_err(), "{}: applied, to {got:?}", c.name);
+    }
+}
+
+// --- checkout layers ----------------------------------------------------------------------
+
+const LAYER_VECTORS: &str = include_str!("../../internal/scm/encoding/testdata/layer.json");
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LayerVectors {
+    #[allow(dead_code)]
+    comment: Vec<String>,
+    valid: Vec<LayerValid>,
+    invalid: Vec<LayerInvalid>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LayerValid {
+    name: String,
+    records: Vec<LayerJRecord>,
+    bytes: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LayerJRecord {
+    kind: String,
+    id: String,
+    body: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LayerInvalid {
+    name: String,
+    bytes: Vec<String>,
+}
+
+#[test]
+fn layer_vectors() {
+    let v: LayerVectors = serde_json::from_str(LAYER_VECTORS).expect("parsing layer.json");
+    assert!(!v.valid.is_empty() && !v.invalid.is_empty());
+    for c in v.valid {
+        let want: Vec<LayerRecord> = c
+            .records
+            .iter()
+            .map(|r| LayerRecord {
+                kind: unhex(&r.kind)[0],
+                id: unhex(&r.id).try_into().unwrap(),
+                body: hex_lines(&r.body),
+            })
+            .collect();
+        assert_eq!(
+            decode_layer_records(&hex_lines(&c.bytes)),
+            Ok(want),
+            "{}",
+            c.name
+        );
+    }
+    for c in v.invalid {
+        let got = decode_layer_records(&hex_lines(&c.bytes));
+        assert!(got.is_err(), "{}: decoded {got:?}", c.name);
+    }
+}

@@ -968,6 +968,27 @@ impl Daemon {
             });
         };
         let new = Merge::resolved(Some(tree_id.clone()));
+        // The commit's checkout, in one request (docs/scm.md, "Checkouts"): every tree with its
+        // sizes, and the files planning reads, local before the mount moves to it. One that cannot
+        // be read leaves each tree and file to be read as it is looked at.
+        // A live presentation moves from the tree it shows, whose checkout it took in.
+        let have = slot
+            .as_ref()
+            .filter(|pr| pr.repository_id == p.repository_id && pr.alive())
+            .and_then(|pr| pr.base.as_resolved().cloned().flatten())
+            .and_then(|t| <[u8; 32]>::try_from(t.as_bytes()).ok());
+        let layered =
+            match ok_store::checkouts::checkout_layers(shared.clone(), &p.commit_id, have).await {
+                Ok(_) => true,
+                Err(s) => {
+                    eprintln!(
+                        "okfs: reading commit {}'s checkout: {}",
+                        hex::encode(&p.commit_id),
+                        s.message()
+                    );
+                    false
+                }
+            };
 
         let alive = slot
             .as_ref()
@@ -1046,7 +1067,7 @@ impl Daemon {
                 reply.read_ahead_files = got.files;
                 reply.read_ahead_bytes = got.bytes;
             }
-            None if mounted => {
+            None if mounted && !layered => {
                 // Every tree under the commit, in the background: listings are local soon after.
                 tokio::spawn(async move {
                     let _ = ok_store::prefetch::trees(shared, &tree_id).await;

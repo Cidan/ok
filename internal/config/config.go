@@ -431,6 +431,10 @@ type SCMCache struct {
 	// CodeIndexes are the code search indexes a replica holds (docs/hosted.md, "ok control at
 	// scale, as built").
 	CodeIndexes int `yaml:"code_indexes"`
+	// Deltas are files' deltas against bases, and Checkouts commits' checkouts' layers (docs/scm.md,
+	// "Deltas", "Checkouts").
+	Deltas    int `yaml:"deltas"`
+	Checkouts int `yaml:"checkouts"`
 }
 
 // Objects is an object store: an S3-compatible bucket (type s3, the default), a Google Cloud Storage

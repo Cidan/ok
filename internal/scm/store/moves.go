@@ -220,6 +220,15 @@ func (m mover) Open(ctx context.Context, sc move.Scope) error {
 }
 
 func (m mover) Drop(ctx context.Context, sc move.Scope) error {
+	// What this cell derived of the repositories, which the destination derives anew.
+	for _, r := range sc.Repositories {
+		if err := m.s.dropCodeIndex(ctx, r); err != nil {
+			return err
+		}
+		if err := m.s.dropCheckouts(ctx, r); err != nil {
+			return err
+		}
+	}
 	for {
 		n, err := m.s.b.DropNetworkRows(ctx, moving(sc), dropBatch)
 		if err != nil {

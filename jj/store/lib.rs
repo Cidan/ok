@@ -13,6 +13,7 @@ mod batch;
 mod cache;
 pub mod calls;
 pub mod changelists;
+pub mod checkouts;
 mod chunk;
 pub mod client;
 pub mod config;

@@ -181,7 +181,7 @@ func workerRun(args []string) error {
 		runSecrets = secretspb.NewRunSecretsClient(sec)
 	}
 	browse := scmpb.NewBrowseClient(scm)
-	src := checkout.SCM(browse, scmpb.NewStoreClient(scm))
+	src := checkout.SCM(scmpb.NewStoreClient(scm))
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

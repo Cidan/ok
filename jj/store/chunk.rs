@@ -23,9 +23,9 @@ pub const SINGLE_CHUNK: usize = 128 << 10;
 /// The largest file the SCM holds (its MaxFileSize, docs/scm.md). A larger one is refused as it is
 /// written, so it is never staged: a staged file the SCM refuses would fail every publish after it.
 pub const MAX_FILE: u64 = 50 << 20;
-const MIN: u32 = 16 << 10;
-const AVG: u32 = 64 << 10;
-const MAX: u32 = 256 << 10;
+pub(crate) const MIN: u32 = 16 << 10;
+pub(crate) const AVG: u32 = 64 << 10;
+pub(crate) const MAX: u32 = 256 << 10;
 
 /// Writes `contents`, written at `path_hint`, and returns the file's ID. A file of one chunk — most
 /// of a repository's — is staged in one append, chunk and manifest; a larger one's chunks as they

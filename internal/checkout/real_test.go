@@ -2,12 +2,13 @@ package checkout
 
 import (
 	"context"
-	"crypto/sha256"
 	"errors"
 	"os"
 	"path/filepath"
 	"sort"
 	"testing"
+
+	"github.com/Cidan/ok/internal/scm/encoding"
 )
 
 // fakeSource serves commits named by their first byte: each a tree of files ("x" prefix:
@@ -15,9 +16,15 @@ import (
 type fakeSource struct {
 	commits map[byte]map[string]string
 	reads   int
+	// bases are the reads that named a base, and compared whether each Changes compared trees.
+	bases    []Read
+	compared []bool
 }
 
-func id(content string) ID { return ID(sha256.Sum256([]byte(content))) }
+// id is a content's file ID, as the SCM names it.
+func id(content string) ID {
+	return ID(encoding.Hash(append([]byte{byte(encoding.KindFile)}, content...)))
+}
 
 func (f *fakeSource) Entries(_ context.Context, _ int64, commit []byte) ([]Entry, error) {
 	tree, ok := f.commits[commit[0]]
@@ -34,6 +41,50 @@ func (f *fakeSource) Entries(_ context.Context, _ int64, commit []byte) ([]Entry
 		}
 	}
 	return out, nil
+}
+
+// Changes compares commits' leaves: a commit's tree is its byte, and from a tree of none of its
+// commits it lists the commit whole.
+func (f *fakeSource) Changes(ctx context.Context, repo int64, from ID, commit []byte) (ID, []Change, bool, error) {
+	entries, err := f.Entries(ctx, repo, commit)
+	if err != nil {
+		return ID{}, nil, false, err
+	}
+	tree := ID{commit[0]}
+	var old map[string]Entry
+	if _, known := f.commits[from[0]]; known && from != (ID{}) && from == (ID{from[0]}) {
+		was, err := f.Entries(ctx, repo, from[:1])
+		if err != nil {
+			return ID{}, nil, false, err
+		}
+		old = map[string]Entry{}
+		for _, e := range was {
+			old[e.Path] = e
+		}
+	}
+	f.compared = append(f.compared, old != nil)
+	var out []Change
+	for _, e := range entries {
+		if o, ok := old[e.Path]; !ok || o != e {
+			out = append(out, Change{Path: e.Path, New: &e})
+		}
+		delete(old, e.Path)
+	}
+	for p := range old {
+		out = append(out, Change{Path: p})
+	}
+	return tree, out, old == nil, nil
+}
+
+func (f *fakeSource) ReadFilesFrom(ctx context.Context, repo int64, reads []Read, write func(ID, []byte, bool) error) error {
+	ids := make([]ID, len(reads))
+	for i, r := range reads {
+		ids[i] = r.ID
+		if r.Base != (ID{}) {
+			f.bases = append(f.bases, r)
+		}
+	}
+	return f.ReadFiles(ctx, repo, ids, write)
 }
 
 func (f *fakeSource) ReadFiles(_ context.Context, _ int64, ids []ID, write func(ID, []byte, bool) error) error {
@@ -134,6 +185,14 @@ func TestReal(t *testing.T) {
 	if src.reads != 3 {
 		t.Errorf("the second sync read %d files, want 3 (a.txt, dir, lib/new/c)", src.reads)
 	}
+	// The file replacing one at its path is read against it, as it was on disk; the rest against none.
+	if len(src.bases) != 1 || src.bases[0].ID != id("two") || src.bases[0].Base != id("one") || string(src.bases[0].BaseData) != "one" {
+		t.Errorf("the second sync's bases: %+v; want a.txt against its last version", src.bases)
+	}
+	// The first listed the commit whole; the second compared it with the tree written.
+	if len(src.compared) != 2 || src.compared[0] || !src.compared[1] {
+		t.Errorf("syncs compared trees: %v; want the second alone", src.compared)
+	}
 
 	// A file becomes a directory again; emptied directories go.
 	if _, err := r.Sync(ctx, 1, []byte{3}, nil); err != nil {
@@ -157,7 +216,7 @@ func TestReal(t *testing.T) {
 	}
 
 	// Without the record of what it wrote, a Real starts over.
-	os.Remove(filepath.Join(filepath.Dir(dir), ".co.checkout.json"))
+	os.Remove(filepath.Join(filepath.Dir(dir), ".co.checkout"))
 	os.WriteFile(filepath.Join(dir, "stray"), []byte("x"), 0o644)
 	r2, _ := NewReal(dir, src)
 	if _, err := r2.Sync(ctx, 1, []byte{1}, nil); err != nil {

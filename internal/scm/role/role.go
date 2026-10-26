@@ -135,6 +135,7 @@ func open(ctx context.Context, cfg *config.Config, opts Options) (*store.Store, 
 		Names: cfg.Names(), EmailDomain: cfg.SCM.EmailDomain,
 		ObjectCacheBytes: cfg.SCM.Cache.Objects, ChunkCacheBytes: cfg.SCM.Cache.Chunks, DiffCacheBytes: cfg.SCM.Cache.Diffs,
 		PathCommitCacheBytes: cfg.SCM.Cache.PathCommits, CodeIndexCacheBytes: cfg.SCM.Cache.CodeIndexes,
+		DeltaCacheBytes: cfg.SCM.Cache.Deltas, CheckoutCacheBytes: cfg.SCM.Cache.Checkouts,
 	})
 	if err != nil {
 		done()
@@ -261,7 +262,7 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (*Role, error)
 	r.closers = append(r.closers, peers.Close)
 	svc.InCell(cfg.Cell.Name, peerSCMs{peers})
 	r.Root = &assembly{deps: []node.Node{svc, server.NewGC(svc, hour), server.NewPurge(svc), server.NewSegments(svc, 0), server.NewFolds(svc), server.NewRelay(svc, stream),
-		server.NewMovePurge(svc), server.NewCodeSearch(svc), roots}}
+		server.NewMovePurge(svc), server.NewCodeSearch(svc), server.NewCheckouts(svc), roots}}
 	ok = true
 	return r, nil
 }

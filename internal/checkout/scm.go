@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"sync"
 
 	"github.com/klauspost/compress/zstd"
@@ -15,13 +14,16 @@ import (
 	scmpb "github.com/Cidan/ok/proto/ok/scm/v1"
 )
 
-// scm is a Source over the SCM's Browse and Store services.
+// scm is a Source over the SCM's Store service.
 type scm struct {
-	browse scmpb.BrowseClient
-	store  scmpb.StoreClient
+	store scmpb.StoreClient
 	// The repositories' dictionaries read so far, as decoders, by repository and ID.
 	mu    sync.Mutex
 	dicts map[dictKey]*zstd.Decoder
+	// layers are the checkout layers read so far, and full the trees whose checkouts they hold
+	// whole (layers.go).
+	layers layerCache
+	full   holding
 }
 
 type dictKey struct {
@@ -29,9 +31,9 @@ type dictKey struct {
 	id   uint32
 }
 
-// SCM returns a Source over the SCM's Browse and Store services.
-func SCM(browse scmpb.BrowseClient, store scmpb.StoreClient) Source {
-	return &scm{browse: browse, store: store, dicts: map[dictKey]*zstd.Decoder{}}
+// SCM returns a Source over the SCM's Store service.
+func SCM(store scmpb.StoreClient) Source {
+	return &scm{store: store, dicts: map[dictKey]*zstd.Decoder{}}
 }
 
 // dictionary is a decoder holding a dictionary of the repository's, read from the SCM once.
@@ -61,46 +63,6 @@ func (s *scm) dictionary(ctx context.Context, repo int64, id uint32) (*zstd.Deco
 	return dec, nil
 }
 
-func (s *scm) Entries(ctx context.Context, repo int64, commit []byte) ([]Entry, error) {
-	stream, err := s.browse.Export(ctx, &scmpb.ExportRequest{RepositoryId: repo, CommitId: commit, EntriesOnly: true})
-	if err != nil {
-		return nil, fmt.Errorf("listing the commit: %w", interrupted(err))
-	}
-	var out []Entry
-	for {
-		frame, err := stream.Recv()
-		if err == io.EOF {
-			return out, nil
-		}
-		if err != nil {
-			// The SCM refuses a commit it cannot present as one tree: it has conflicts.
-			if status.Code(err) == codes.InvalidArgument {
-				return nil, &CommitError{Message: status.Convert(err).Message()}
-			}
-			return nil, fmt.Errorf("listing the commit: %w", interrupted(err))
-		}
-		e := frame.GetEntry()
-		if e == nil {
-			return nil, fmt.Errorf("listing the commit: the SCM sent file contents, not asked for")
-		}
-		v := e.GetValue()
-		entry := Entry{Path: e.GetPath(), Executable: v.GetExecutable(), Size: int64(v.GetSize()), Target: v.GetSymlinkTarget()}
-		switch v.GetType() {
-		case scmpb.EntryType_ENTRY_TYPE_FILE:
-			entry.Kind = File
-			if len(v.GetId()) != len(entry.ID) {
-				return nil, fmt.Errorf("listing the commit: %s has a %d-byte ID", e.GetPath(), len(v.GetId()))
-			}
-			copy(entry.ID[:], v.GetId())
-		case scmpb.EntryType_ENTRY_TYPE_SYMLINK:
-			entry.Kind = Symlink
-		default:
-			return nil, fmt.Errorf("listing the commit: %s is a %s", e.GetPath(), v.GetType())
-		}
-		out = append(out, entry)
-	}
-}
-
 // interrupted marks an error as ErrInterrupted when the SCM broke the call off: it was
 // unreachable, or its stream ended abruptly — as one does when the SCM restarts.
 func interrupted(err error) error {
@@ -113,41 +75,6 @@ func interrupted(err error) error {
 		return fmt.Errorf("%w: %w", ErrInterrupted, err)
 	}
 	return err
-}
-
-func (s *scm) ReadFiles(ctx context.Context, repo int64, ids []ID, write func(ID, []byte, bool) error) error {
-	req := &scmpb.ReadFilesRequest{RepositoryId: repo, Stored: true, Dictionaries: true}
-	for _, id := range ids {
-		req.Files = append(req.Files, &scmpb.FileRange{FileId: id[:]})
-	}
-	stream, err := s.store.ReadFiles(ctx, req)
-	if err != nil {
-		return fmt.Errorf("reading files: %w", interrupted(err))
-	}
-	for {
-		frame, err := stream.Recv()
-		if err == io.EOF {
-			return nil
-		}
-		if err != nil {
-			return fmt.Errorf("reading files: %w", interrupted(err))
-		}
-		var id ID
-		if len(frame.GetFileId()) != len(id) {
-			return fmt.Errorf("reading files: a %d-byte file ID", len(frame.GetFileId()))
-		}
-		copy(id[:], frame.GetFileId())
-		if frame.GetNotFound() {
-			return fmt.Errorf("reading files: the SCM does not have file %x", id[:])
-		}
-		data, err := chunkData(frame, func(id uint32) (*zstd.Decoder, error) { return s.dictionary(ctx, repo, id) })
-		if err != nil {
-			return fmt.Errorf("reading files: file %x: %w", id[:], err)
-		}
-		if err := write(id, data, frame.GetLast()); err != nil {
-			return err
-		}
-	}
 }
 
 // maxChunkLength bounds the raw length of a chunk the SCM sends stored: a frame claiming more is

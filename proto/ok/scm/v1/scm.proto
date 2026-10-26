@@ -163,6 +163,11 @@ service Store {
   // A dictionary of the repository's, which chunks sent as CHUNK_CODEC_ZSTD_DICT name
   // (docs/scm.md, "Dictionaries").
   rpc ReadDictionary(ReadDictionaryRequest) returns (Dictionary);
+  // A commit's checkout as layers (docs/scm.md, "Checkouts"): its whole tree — every tree, each
+  // one's sizes record, its symlinks and copy histories — and the files planning reads, in a few
+  // immutable objects the SCM derives once for each commit, each layer sent only to a client that
+  // does not hold it.
+  rpc ReadCheckout(ReadCheckoutRequest) returns (stream CheckoutFrame);
 
   // OpStore and OpHeadsStore, on the operation log of one of the caller's workspaces in the
   // repository (docs/scm.md, "Decisions", 3): each request names the workspace, and no
@@ -190,6 +195,10 @@ message FileRange {
   bytes file_id = 1;
   uint64 offset = 2;
   uint64 length = 3;  // 0 = to the end
+  // A version of the file the client holds whole — the file at the same path in the tree it had —
+  // which, with ReadFilesRequest.deltas, the SCM may send the file as a delta against
+  // (CHUNK_CODEC_DELTA). Ignored for a range that is not the whole file.
+  bytes base_file_id = 4;
 }
 
 message ReadFilesRequest {
@@ -208,6 +217,9 @@ message ReadFilesRequest {
   // dictionaries (CHUNK_CODEC_ZSTD_DICT), fetching each it lacks with ReadDictionary. Unset,
   // such a chunk is sent raw.
   bool dictionaries = 5;
+  // With stored: a file whose range names a base may come as one frame of CHUNK_CODEC_DELTA,
+  // where that is smaller than the file's chunks as stored (docs/scm.md, "Deltas").
+  bool deltas = 6;
 }
 
 // How a FileData frame's data encodes its chunk.
@@ -221,6 +233,11 @@ enum ChunkCodec {
   // One zstd frame of the raw bytes, compressed with a dictionary of the repository's, which the
   // frame's header names (RFC 8878 §3.1.1.1.3): sent only with ReadFilesRequest.dictionaries.
   CHUNK_CODEC_ZSTD_DICT = 3;
+  // The whole file as a delta against the base its range named (FileData.base_file_id): a zstd
+  // frame of copy and insert instructions over the base's bytes (encoding.Delta), sent only with
+  // ReadFilesRequest.deltas. The frame carries no chunk; the client applies it to the base and
+  // verifies the result against the file's ID.
+  CHUNK_CODEC_DELTA = 4;
 }
 
 // Files stream as whole chunks, in order; the client verifies each chunk and, for a full read,
@@ -235,9 +252,11 @@ message FileData {
   bool last = 6;  // the file's final frame
   bool not_found = 7;
   // With ReadFilesRequest.stored, on a frame that carries a chunk: how data encodes it, and its
-  // raw length.
+  // raw length — for CHUNK_CODEC_DELTA, the whole file's.
   ChunkCodec codec = 8;
   uint32 raw_length = 9;
+  // With CHUNK_CODEC_DELTA: the base the delta applies to, the one the range named.
+  bytes base_file_id = 10;
 }
 
 message GetRelatedCopiesRequest {
@@ -295,6 +314,47 @@ message ReadTreeClosureRequest {
   repeated string path_prefixes = 3;
   // After each level of trees, their sizes records, as OBJECT_KIND_TREE_SIZES under each tree's ID.
   bool with_sizes = 4;
+  // A tree whose closure the client holds — the one it checked out before. What it holds at the
+  // same path is not sent: a subtree whose ID is the base's at its path, with everything beneath
+  // it, and a symlink or copy history the base's tree there names too.
+  bytes base_tree_id = 5;
+}
+
+message ReadCheckoutRequest {
+  int64 repository_id = 1;
+  bytes commit_id = 2;
+  // Layers the client holds, any commit's: a layer of the checkout it holds is not sent.
+  repeated bytes held_layers = 3;
+  // A tree whose whole checkout the client holds — the one it moves from. Named, the answer is
+  // one layer of what the commit's tree changes from it, made for the client (CheckoutHeader's
+  // since_tree), rather than the commit's checkout's layers.
+  bytes have_tree = 4;
+}
+
+// A checkout's stream: its header, then the bytes of each of its layers the client does not hold,
+// a layer at a time, in pieces.
+message CheckoutFrame {
+  oneof frame {
+    CheckoutHeader header = 1;
+    LayerData layer = 2;
+  }
+}
+
+message CheckoutHeader {
+  // The commit's tree, resolved.
+  bytes tree_id = 1;
+  // Its layers, oldest first: together they hold the whole checkout — with since_tree's
+  // checkout, when that is set.
+  repeated bytes layers = 2;
+  // The request's have_tree, when the layers are what the commit changes from it.
+  bytes since_tree = 3;
+}
+
+// A piece of a layer: the client joins a layer's pieces and checks that their BLAKE3 is its ID.
+message LayerData {
+  bytes layer_id = 1;
+  bytes data = 2;
+  bool last = 3;
 }
 
 // At most 100,000 trees; a tree the repository does not hold is left out of the answer.

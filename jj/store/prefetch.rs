@@ -187,7 +187,7 @@ pub async fn tree(store_path: &Path, tree_id: &TreeId) -> Result<(), Status> {
     if root == ok_encoding::empty_tree_id() {
         return Ok(());
     }
-    shared::run(async move { tree_closure(shared, root, true).await }).await
+    shared::run(async move { tree_closure(shared, root, None, true).await }).await
 }
 
 /// Streams a tree's closure without its files' contents — every tree, symlink, and copy history
@@ -200,7 +200,7 @@ pub async fn trees(shared: Arc<Shared>, tree_id: &TreeId) -> Result<(), Status> 
     if root == ok_encoding::empty_tree_id() {
         return Ok(());
     }
-    shared::run(async move { tree_closure(shared, root, false).await }).await
+    shared::run(async move { tree_closure(shared, root, None, false).await }).await
 }
 
 /// Which repository-relative paths a read-ahead wants.
@@ -211,6 +211,8 @@ pub type Wanted = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 pub struct ReadAhead {
     pub files: u64,
     pub bytes: u64,
+    /// Of the files, those that came as deltas against a base (`checkouts::files_with_bases`).
+    pub deltas: u64,
 }
 
 /// Has a tree, every file's size under it, and the files whose repository-relative paths `wanted`
@@ -233,7 +235,7 @@ pub async fn tree_and_files(
     }
     shared::run(async move {
         if shared.cache.object(Key::new(Kind::Tree, root)).is_none() {
-            tree_closure(shared.clone(), root, false).await?;
+            tree_closure(shared.clone(), root, None, false).await?;
         }
         let mut files: HashMap<Id, ()> = HashMap::new();
         // Each tree, and its files whose sizes are not otherwise local: its record answers them.
@@ -322,6 +324,7 @@ pub async fn tree_and_files(
         Ok(ReadAhead {
             files: sizes.len() as u64,
             bytes: sizes.iter().sum(),
+            deltas: 0,
         })
     })
     .await
@@ -335,8 +338,14 @@ const CONCURRENT_TREES: usize = 512;
 const CONCURRENT_MANIFESTS: usize = 4 * crate::shared::MANIFESTS_PER_READ;
 
 /// Streams a tree's closure into the cache: with its files' contents (a real checkout), or with
-/// each tree's sizes instead (a virtual one, which stats files without reading them).
-async fn tree_closure(shared: Arc<Shared>, root: Id, with_files: bool) -> Result<(), Status> {
+/// each tree's sizes instead (a virtual one, which stats files without reading them). With a base —
+/// a tree whose closure the cache holds — only what the base does not hold at the same path comes.
+pub(crate) async fn tree_closure(
+    shared: Arc<Shared>,
+    root: Id,
+    base: Option<Id>,
+    with_files: bool,
+) -> Result<(), Status> {
     let mut store = shared.client.store().await?;
     let mut stream = store
         .read_tree_closure(pb::ReadTreeClosureRequest {
@@ -344,6 +353,7 @@ async fn tree_closure(shared: Arc<Shared>, root: Id, with_files: bool) -> Result
             tree_id: root.to_vec(),
             path_prefixes: Vec::new(),
             with_sizes: !with_files,
+            base_tree_id: base.map(|b| b.to_vec()).unwrap_or_default(),
         })
         .await?
         .into_inner();

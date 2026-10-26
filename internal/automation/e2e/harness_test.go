@@ -264,7 +264,7 @@ func (e *env) startWorkerAt(name string, slots int, auto string) *runningWorker 
 	t.Helper()
 	scm := as(t, e.scm, workerBot)
 	browse := scmpb.NewBrowseClient(scm)
-	src := checkout.SCM(browse, scmpb.NewStoreClient(scm))
+	src := checkout.SCM(scmpb.NewStoreClient(scm))
 	var checkouts, bases []checkout.Checkout
 	for i := 1; i <= slots; i++ {
 		for _, suffix := range []string{"", "-base"} {

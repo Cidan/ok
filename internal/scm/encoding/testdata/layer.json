@@ -1,0 +1,145 @@
+{
+  "comment": [
+    "Golden vectors for checkout layers' records (docs/scm.md, \"Checkouts\").",
+    "internal/scm/encoding (Go) must encode each valid vector's records to exactly its bytes, and both",
+    "it and jj's encoding (Rust) must decode the bytes to exactly the records, in order, and refuse every",
+    "invalid vector's bytes. A kind is one byte, an ID 32, each hex; a byte string is the concatenation",
+    "of its lines, each hex."
+  ],
+  "invalid": [
+    {
+      "name": "truncated",
+      "bytes": [
+        "04017b2a418b4b256a81dc80b96b72035749c297e4cd66142d835aff305974c8",
+        "69921763635f6c696272617279286e616d65203d20227822290a026d87022618",
+        "edf47b97aeccb1122d403cb2365c6ed14d2a78caed7661d37af6de062e2e2f6c",
+        "696203a2ace393cfe6075f03ba5c9edfd402b33322fb9215860bb7c77113a0cd",
+        "85a5706b020000000000000005000000000000004255494c44007b2a418b4b25",
+        "6a81dc80b96b72035749c297e4cd66142d835aff305974c86992000000000000",
+        "00000003000000000000006c6962016d87022618edf47b97aeccb1122d403cb2",
+        "365c6ed14d2a78caed7661d37af6de20a2ace393cfe6075f03ba5c9edfd402b3",
+        "3322fb9215860bb7c77113a0cd85a5700520010217"
+      ]
+    },
+    {
+      "name": "bytes after its records",
+      "bytes": [
+        "04017b2a418b4b256a81dc80b96b72035749c297e4cd66142d835aff305974c8",
+        "69921763635f6c696272617279286e616d65203d20227822290a026d87022618",
+        "edf47b97aeccb1122d403cb2365c6ed14d2a78caed7661d37af6de062e2e2f6c",
+        "696203a2ace393cfe6075f03ba5c9edfd402b33322fb9215860bb7c77113a0cd",
+        "85a5706b020000000000000005000000000000004255494c44007b2a418b4b25",
+        "6a81dc80b96b72035749c297e4cd66142d835aff305974c86992000000000000",
+        "00000003000000000000006c6962016d87022618edf47b97aeccb1122d403cb2",
+        "365c6ed14d2a78caed7661d37af6de20a2ace393cfe6075f03ba5c9edfd402b3",
+        "3322fb9215860bb7c77113a0cd85a57005200102170600"
+      ]
+    },
+    {
+      "name": "records out of order",
+      "bytes": [
+        "04026d87022618edf47b97aeccb1122d403cb2365c6ed14d2a78caed7661d37a",
+        "f6de062e2e2f6c6962017b2a418b4b256a81dc80b96b72035749c297e4cd6614",
+        "2d835aff305974c869921763635f6c696272617279286e616d65203d20227822",
+        "290a03a2ace393cfe6075f03ba5c9edfd402b33322fb9215860bb7c77113a0cd",
+        "85a5706b020000000000000005000000000000004255494c44007b2a418b4b25",
+        "6a81dc80b96b72035749c297e4cd66142d835aff305974c86992000000000000",
+        "00000003000000000000006c6962016d87022618edf47b97aeccb1122d403cb2",
+        "365c6ed14d2a78caed7661d37af6de20a2ace393cfe6075f03ba5c9edfd402b3",
+        "3322fb9215860bb7c77113a0cd85a570052001021706"
+      ]
+    },
+    {
+      "name": "a record twice",
+      "bytes": [
+        "02017b2a418b4b256a81dc80b96b72035749c297e4cd66142d835aff305974c8",
+        "69921763635f6c696272617279286e616d65203d20227822290a017b2a418b4b",
+        "256a81dc80b96b72035749c297e4cd66142d835aff305974c869921763635f6c",
+        "696272617279286e616d65203d20227822290a"
+      ]
+    },
+    {
+      "name": "a commit",
+      "bytes": [
+        "01057b2a418b4b256a81dc80b96b72035749c297e4cd66142d835aff305974c8",
+        "69921763635f6c696272617279286e616d65203d20227822290a"
+      ]
+    },
+    {
+      "name": "a file that does not hash to its ID",
+      "bytes": [
+        "01017b2a418b4b256a81dc80b96b72035749c297e4cd66142d835aff305974c8",
+        "69921762635f6c696272617279286e616d65203d20227822290a"
+      ]
+    },
+    {
+      "name": "a sizes record that does not decode",
+      "bytes": [
+        "0120a2ace393cfe6075f03ba5c9edfd402b33322fb9215860bb7c77113a0cd85",
+        "a570022009"
+      ]
+    },
+    {
+      "name": "more records than its bytes hold",
+      "bytes": [
+        "7f010203"
+      ]
+    }
+  ],
+  "valid": [
+    {
+      "name": "no records",
+      "records": [],
+      "bytes": [
+        "00"
+      ]
+    },
+    {
+      "name": "a tree, its sizes, a symlink, and a file",
+      "records": [
+        {
+          "kind": "01",
+          "id": "7b2a418b4b256a81dc80b96b72035749c297e4cd66142d835aff305974c86992",
+          "body": [
+            "63635f6c696272617279286e616d65203d20227822290a"
+          ]
+        },
+        {
+          "kind": "02",
+          "id": "6d87022618edf47b97aeccb1122d403cb2365c6ed14d2a78caed7661d37af6de",
+          "body": [
+            "2e2e2f6c6962"
+          ]
+        },
+        {
+          "kind": "03",
+          "id": "a2ace393cfe6075f03ba5c9edfd402b33322fb9215860bb7c77113a0cd85a570",
+          "body": [
+            "020000000000000005000000000000004255494c44007b2a418b4b256a81dc80",
+            "b96b72035749c297e4cd66142d835aff305974c8699200000000000000000003",
+            "000000000000006c6962016d87022618edf47b97aeccb1122d403cb2365c6ed1",
+            "4d2a78caed7661d37af6de"
+          ]
+        },
+        {
+          "kind": "20",
+          "id": "a2ace393cfe6075f03ba5c9edfd402b33322fb9215860bb7c77113a0cd85a570",
+          "body": [
+            "2001021706"
+          ]
+        }
+      ],
+      "bytes": [
+        "04017b2a418b4b256a81dc80b96b72035749c297e4cd66142d835aff305974c8",
+        "69921763635f6c696272617279286e616d65203d20227822290a026d87022618",
+        "edf47b97aeccb1122d403cb2365c6ed14d2a78caed7661d37af6de062e2e2f6c",
+        "696203a2ace393cfe6075f03ba5c9edfd402b33322fb9215860bb7c77113a0cd",
+        "85a5706b020000000000000005000000000000004255494c44007b2a418b4b25",
+        "6a81dc80b96b72035749c297e4cd66142d835aff305974c86992000000000000",
+        "00000003000000000000006c6962016d87022618edf47b97aeccb1122d403cb2",
+        "365c6ed14d2a78caed7661d37af6de20a2ace393cfe6075f03ba5c9edfd402b3",
+        "3322fb9215860bb7c77113a0cd85a570052001021706"
+      ]
+    }
+  ]
+}

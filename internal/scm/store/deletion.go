@@ -69,6 +69,9 @@ func (s *Store) finishDeletion(ctx context.Context, d backend.Deletion) error {
 	if err := s.dropCodeIndex(ctx, d.Repo); err != nil {
 		return err
 	}
+	if err := s.dropCheckouts(ctx, d.Repo); err != nil {
+		return err
+	}
 	repos, err := s.ops(ctx).NetworkRepositories(ctx, d.Net)
 	if err != nil {
 		return err

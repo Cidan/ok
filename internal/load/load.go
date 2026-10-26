@@ -9,6 +9,8 @@ import (
 	"log/slog"
 	"math"
 	mrand "math/rand/v2"
+	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -16,6 +18,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/Cidan/ok/internal/checkout"
 	"github.com/Cidan/ok/internal/scm/encoding"
 	"github.com/Cidan/ok/internal/scm/scmtest"
 	automationpb "github.com/Cidan/ok/proto/ok/automation/v1"
@@ -31,9 +34,10 @@ type Clients struct {
 	Workspaces   scmpb.WorkspacesClient
 	Control      controlpb.ChangeListsClient
 	Browse       scmpb.BrowseClient
-	// Work, WorkerBrowse: as a worker.
+	// Work, WorkerBrowse, WorkerStore: as a worker.
 	Work         automationpb.WorkClient
 	WorkerBrowse scmpb.BrowseClient
+	WorkerStore  scmpb.StoreClient
 }
 
 // Person is someone a run acts as, on a connection of their own.
@@ -68,10 +72,14 @@ type Config struct {
 	// PublishBytes, CheckpointBytes, and CLBytes are what each writes, in files of at most a MiB.
 	PublishBytes, CheckpointBytes, CLBytes int
 	// Workers are the synthetic workers; RunTime how long a job of theirs takes; Read whether it
-	// reads its commit's files through the SCM, as a cache's miss would.
-	Workers int
-	RunTime time.Duration
-	Read    bool
+	// reads its commit's files through the SCM: with CheckoutDir, as a worker's real checkout does
+	// — each synthetic worker keeps one, in a directory of its own under CheckoutDir, and moves it
+	// to each job's commit, reading what changed — and without it, the whole commit, as a cache's
+	// miss would.
+	Workers     int
+	RunTime     time.Duration
+	Read        bool
+	CheckoutDir string
 	// WorkerPrefix tells this run's workers from others' — another pod's of the same run.
 	WorkerPrefix string
 	// SeedFiles, when set, has each repository seeded with a tree of that many files shaped as a
@@ -103,6 +111,9 @@ type run struct {
 	// mono and trees: a run with SeedFiles' seed, and the trees it read and wrote.
 	mono  *seeded
 	trees *trees
+	// checkouts are the synthetic workers' real checkouts, by worker, with CheckoutDir.
+	checkoutsMu sync.Mutex
+	checkouts   map[string]checkout.Checkout
 }
 
 // repoState is what a run keeps of a repository.
@@ -133,7 +144,25 @@ type workspace struct {
 }
 
 // operations a run measures.
-var operations = []string{"publish", "checkpoint", "browse", "cl.upload", "cl.review", "cl.submit", "cl.landed", "worker.lease", "worker.read"}
+// checkout is a synthetic worker's real checkout, made the first time it is needed (first).
+func (r *run) checkout(worker string, c Clients) (co checkout.Checkout, first bool, err error) {
+	r.checkoutsMu.Lock()
+	defer r.checkoutsMu.Unlock()
+	if co, ok := r.checkouts[worker]; ok {
+		return co, false, nil
+	}
+	if r.checkouts == nil {
+		r.checkouts = map[string]checkout.Checkout{}
+	}
+	if co, err = checkout.NewReal(filepath.Join(r.cfg.CheckoutDir, strings.ReplaceAll(worker, "/", "_")), checkout.SCM(c.WorkerStore)); err != nil {
+		return nil, true, err
+	}
+	r.checkouts[worker] = co
+	return co, true, nil
+}
+
+var operations = []string{"publish", "checkpoint", "browse", "cl.upload", "cl.review", "cl.submit", "cl.landed", "worker.lease", "worker.read",
+	"worker.first"}
 
 // Run drives the repositories for the duration, then waits for CLs under way, and reports.
 func Run(ctx context.Context, cfg Config) (*Report, error) {
@@ -577,9 +606,13 @@ func (r *run) do(ctx context.Context, c Clients, worker string, run *automationp
 		go func() {
 			defer close(read)
 			t0 := time.Now()
-			err := r.read(ctx, c, run)
-			r.stats["worker.read"].offer()
-			r.stats["worker.read"].done(time.Since(t0), err)
+			first, err := r.read(ctx, c, worker, run)
+			op := "worker.read"
+			if first {
+				op = "worker.first"
+			}
+			r.stats[op].offer()
+			r.stats[op].done(time.Since(t0), err)
 		}()
 	} else {
 		close(read)
@@ -618,18 +651,28 @@ func (r *run) do(ctx context.Context, c Clients, worker string, run *automationp
 	finish(&automationpb.FinishRequest{Status: automationpb.Run_STATUS_PASSED})
 }
 
-// read reads a run's commit's files, as a CI checkout's misses would.
-func (r *run) read(ctx context.Context, c Clients, run *automationpb.Run) error {
+// read reads a run's commit's files: with CheckoutDir, by moving the worker's real checkout to the
+// commit — the worker's first, writing every file (first) — and without, the whole commit, as a CI
+// checkout's misses would.
+func (r *run) read(ctx context.Context, c Clients, worker string, run *automationpb.Run) (first bool, err error) {
+	if r.cfg.CheckoutDir != "" {
+		co, first, err := r.checkout(worker, c)
+		if err != nil {
+			return first, err
+		}
+		_, err = co.Sync(ctx, run.GetRepositoryId(), run.GetCommitId(), nil)
+		return first, err
+	}
 	stream, err := c.WorkerBrowse.Export(ctx, &scmpb.ExportRequest{RepositoryId: run.GetRepositoryId(), CommitId: run.GetCommitId()})
 	if err != nil {
-		return err
+		return false, err
 	}
 	for {
 		if _, err := stream.Recv(); err != nil {
 			if errors.Is(err, io.EOF) {
-				return nil
+				return false, nil
 			}
-			return err
+			return false, err
 		}
 	}
 }

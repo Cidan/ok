@@ -3,9 +3,11 @@ package load
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/Cidan/ok/internal/dial"
 )
@@ -16,8 +18,16 @@ func PersonHandle(i int) string { return fmt.Sprintf("p%05d", i) }
 // personEmail is the i-th person's address: what the installation's sign-in matches them by.
 func personEmail(i int) string { return PersonHandle(i) + "@example.com" }
 
-// SignInAll signs people [lo, hi) in, parallel at a time, each's credential kept under root; the
-// credentials are in order.
+// signInAttempts is how many times a person's sign-in is tried, signInBackoff apart: an
+// installation just started may not have its system of record's people yet, and signs in only a
+// person it has.
+const (
+	signInAttempts = 5
+	signInBackoff  = 10 * time.Second
+)
+
+// SignInAll signs people [lo, hi) in, parallel at a time, each's credential kept under root, each
+// tried again when it fails; the credentials are in order.
 func SignInAll(ctx context.Context, server, root string, lo, hi int, password string, parallel int) ([]dial.Credential, error) {
 	out := make([]dial.Credential, hi-lo)
 	errs := make([]error, hi-lo)
@@ -29,7 +39,19 @@ func SignInAll(ctx context.Context, server, root string, lo, hi int, password st
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
-			out[i-lo], errs[i-lo] = SignIn(ctx, server, filepath.Join(root, PersonHandle(i)), personEmail(i), password)
+			for attempt := range signInAttempts {
+				if attempt > 0 {
+					slog.Warn("load: signing a person in again", "person", PersonHandle(i), "err", errs[i-lo])
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(signInBackoff):
+					}
+				}
+				if out[i-lo], errs[i-lo] = SignIn(ctx, server, filepath.Join(root, PersonHandle(i)), personEmail(i), password); errs[i-lo] == nil || ctx.Err() != nil {
+					return
+				}
+			}
 		}()
 	}
 	wg.Wait()

@@ -29,6 +29,26 @@ func (m mapSource) Entries(_ context.Context, _ int64, commit []byte) ([]checkou
 	return out, nil
 }
 
+func (m mapSource) Changes(ctx context.Context, repo int64, _ checkout.ID, commit []byte) (checkout.ID, []checkout.Change, bool, error) {
+	entries, err := m.Entries(ctx, repo, commit)
+	if err != nil {
+		return checkout.ID{}, nil, false, err
+	}
+	out := make([]checkout.Change, len(entries))
+	for i := range entries {
+		out[i] = checkout.Change{Path: entries[i].Path, New: &entries[i]}
+	}
+	return checkout.ID{commit[0]}, out, true, nil
+}
+
+func (m mapSource) ReadFilesFrom(ctx context.Context, repo int64, reads []checkout.Read, write func(checkout.ID, []byte, bool) error) error {
+	ids := make([]checkout.ID, len(reads))
+	for i, r := range reads {
+		ids[i] = r.ID
+	}
+	return m.ReadFiles(ctx, repo, ids, write)
+}
+
 func (m mapSource) ReadFiles(_ context.Context, _ int64, ids []checkout.ID, write func(checkout.ID, []byte, bool) error) error {
 	for _, id := range ids {
 		found := false
