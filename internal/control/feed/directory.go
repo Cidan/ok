@@ -2,8 +2,6 @@ package feed
 
 import (
 	"context"
-	"log/slog"
-	"time"
 
 	"github.com/Cidan/ok/internal/bus"
 	"github.com/Cidan/ok/internal/bus/follow"
@@ -20,31 +18,18 @@ import (
 // cursor, as the SCM's are.
 type Directory struct {
 	db     db.Store
-	stream bus.Stream
 	events dirfeed.Events
-	// forget drops what Authorize keeps of a repository, as each of its events is applied.
-	forget func(repo int64)
 }
 
-// NewDirectory builds a follower of the directory's events on stream; forget drops what is kept
-// of a repository each event changes.
-func NewDirectory(d db.Store, stream bus.Stream, events dirfeed.Events, forget func(repo int64)) *Directory {
-	return &Directory{db: d, stream: stream, events: events, forget: forget}
+// NewDirectory builds a follower of the directory's events.
+func NewDirectory(d db.Store, events dirfeed.Events) *Directory {
+	return &Directory{db: d, events: events}
 }
 
-// Run follows the directory's events until ctx ends, starting again after a failure.
+// Run follows the directory's events until ctx ends.
 func (f *Directory) Run(ctx context.Context) error {
-	fl := &follow.Follower{Stream: f.stream, Topic: dirfeed.Topic, Group: "control", Log: dirfeed.Log{Events: f.events}, Apply: directoryApplier{f}}
-	for {
-		if err := fl.Run(ctx); ctx.Err() == nil {
-			slog.Warn("feed: stopped following the directory", "err", err)
-		}
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-time.After(2 * time.Second):
-		}
-	}
+	return (&follow.Follower{Topic: dirfeed.Topic, Log: dirfeed.Log{Events: f.events}, Apply: directoryApplier{f},
+		Work: f.db.Work(), Register: dirfeed.Register(f.events)}).Run(ctx)
 }
 
 // directoryApplier is the follower as a follow.Applier.
@@ -62,7 +47,6 @@ func (a directoryApplier) Apply(ctx context.Context, e bus.Event) error {
 	if err := a.ApplyDirectory(ctx, ev); err != nil {
 		return err
 	}
-	a.forget(ev.GetRepositoryId())
 	return nil
 }
 

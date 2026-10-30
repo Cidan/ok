@@ -113,6 +113,10 @@ func (x queries) InsertRepositoryKey(ctx context.Context, k store.RepositoryKey)
 	return tag.RowsAffected() == 1, err
 }
 
+func (x queries) MarkWorkAt(ctx context.Context, kind string, key int64, at time.Time) error {
+	return pgdata.MarkWorkAt(ctx, x.q, kind, key, at)
+}
+
 func (x queries) UpdateRepositoryKey(ctx context.Context, repo, version int64, root string, wrapped []byte) error {
 	_, err := x.q.Exec(ctx, `UPDATE repository_key SET root_id = $3, wrapped = $4
 		WHERE repository_id = $1 AND version = $2 AND wrapped IS NOT NULL`, repo, version, root, wrapped)

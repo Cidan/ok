@@ -46,7 +46,9 @@ func New(c *secretsmanager.Client, kmsKey string) *Store { return &Store{c: c, k
 // FromConfig is the store an installation's configuration names, reached with the workload's
 // credentials.
 func FromConfig(ctx context.Context, c config.SecretStore) (*Store, error) {
-	cfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(c.Region))
+	// The SDK makes again a call that fails for a moment — throttled, a 5xx — every call of the
+	// store's being one it may make again (Put), up to six times, as ok's other stores do.
+	cfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(c.Region), awsconfig.WithRetryMaxAttempts(6))
 	if err != nil {
 		return nil, fmt.Errorf("aws secrets manager: %w", err)
 	}

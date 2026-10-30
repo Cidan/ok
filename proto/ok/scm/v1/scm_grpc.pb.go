@@ -2549,23 +2549,27 @@ var Search_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
-	Events_Read_FullMethodName  = "/ok.scm.v1.Events/Read"
-	Events_Heads_FullMethodName = "/ok.scm.v1.Events/Heads"
+	Events_Read_FullMethodName   = "/ok.scm.v1.Events/Read"
+	Events_Heads_FullMethodName  = "/ok.scm.v1.Events/Heads"
+	Events_Follow_FullMethodName = "/ok.scm.v1.Events/Follow"
 )
 
 // EventsClient is the client API for Events service.
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
-// Each repository's log of events, which the SCM's relay publishes on the bus's stream (topic
-// scm.events) and its followers read from here what the stream has not brought them.
+// Each repository's log of events (topic scm.events), which its followers read from here: the SCM's
+// relay enqueues, on each follower's queue, a job naming each repository whose log grew
+// (internal/bus/follow; docs/state.md, "Events between services").
 type EventsClient interface {
-	// Read returns up to limit of a repository's events after a place in its log, in order: a
-	// follower of the bus's stream fills what the stream has not yet brought it from here.
+	// Read returns up to limit of a repository's events after a place in its log, in order.
 	Read(ctx context.Context, in *ReadEventsRequest, opts ...grpc.CallOption) (*ReadEventsResponse, error)
-	// Heads lists how far each repository's log reaches, a page at a time by repository. A follower
-	// of the stream catches up from them as it starts.
+	// Heads lists how far each repository's log reaches, a page at a time by repository: a follower
+	// catches up from them the first time it follows.
 	Heads(ctx context.Context, in *HeadsRequest, opts ...grpc.CallOption) (*HeadsResponse, error)
+	// Follow records the caller's role as one of the log's followers: from then on the relay
+	// enqueues, on its queue, a job naming each repository whose log grows.
+	Follow(ctx context.Context, in *FollowRequest, opts ...grpc.CallOption) (*FollowResponse, error)
 }
 
 type eventsClient struct {
@@ -2596,19 +2600,32 @@ func (c *eventsClient) Heads(ctx context.Context, in *HeadsRequest, opts ...grpc
 	return out, nil
 }
 
+func (c *eventsClient) Follow(ctx context.Context, in *FollowRequest, opts ...grpc.CallOption) (*FollowResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(FollowResponse)
+	err := c.cc.Invoke(ctx, Events_Follow_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // EventsServer is the server API for Events service.
 // All implementations must embed UnimplementedEventsServer
 // for forward compatibility.
 //
-// Each repository's log of events, which the SCM's relay publishes on the bus's stream (topic
-// scm.events) and its followers read from here what the stream has not brought them.
+// Each repository's log of events (topic scm.events), which its followers read from here: the SCM's
+// relay enqueues, on each follower's queue, a job naming each repository whose log grew
+// (internal/bus/follow; docs/state.md, "Events between services").
 type EventsServer interface {
-	// Read returns up to limit of a repository's events after a place in its log, in order: a
-	// follower of the bus's stream fills what the stream has not yet brought it from here.
+	// Read returns up to limit of a repository's events after a place in its log, in order.
 	Read(context.Context, *ReadEventsRequest) (*ReadEventsResponse, error)
-	// Heads lists how far each repository's log reaches, a page at a time by repository. A follower
-	// of the stream catches up from them as it starts.
+	// Heads lists how far each repository's log reaches, a page at a time by repository: a follower
+	// catches up from them the first time it follows.
 	Heads(context.Context, *HeadsRequest) (*HeadsResponse, error)
+	// Follow records the caller's role as one of the log's followers: from then on the relay
+	// enqueues, on its queue, a job naming each repository whose log grows.
+	Follow(context.Context, *FollowRequest) (*FollowResponse, error)
 	mustEmbedUnimplementedEventsServer()
 }
 
@@ -2624,6 +2641,9 @@ func (UnimplementedEventsServer) Read(context.Context, *ReadEventsRequest) (*Rea
 }
 func (UnimplementedEventsServer) Heads(context.Context, *HeadsRequest) (*HeadsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Heads not implemented")
+}
+func (UnimplementedEventsServer) Follow(context.Context, *FollowRequest) (*FollowResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Follow not implemented")
 }
 func (UnimplementedEventsServer) mustEmbedUnimplementedEventsServer() {}
 func (UnimplementedEventsServer) testEmbeddedByValue()                {}
@@ -2682,6 +2702,24 @@ func _Events_Heads_Handler(srv interface{}, ctx context.Context, dec func(interf
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Events_Follow_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(FollowRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(EventsServer).Follow(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Events_Follow_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(EventsServer).Follow(ctx, req.(*FollowRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Events_ServiceDesc is the grpc.ServiceDesc for Events service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -2696,6 +2734,10 @@ var Events_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Heads",
 			Handler:    _Events_Heads_Handler,
+		},
+		{
+			MethodName: "Follow",
+			Handler:    _Events_Follow_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

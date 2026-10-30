@@ -179,8 +179,7 @@ func (s *Scaler) Run(ctx context.Context, ws work.Store) error {
 			}
 			return err
 		},
-		Idle: Every,
-		Log:  s.Log,
+		Log: s.Log,
 	}).Run(ctx)
 }
 

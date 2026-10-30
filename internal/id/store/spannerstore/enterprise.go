@@ -19,16 +19,17 @@ import (
 func (x queries) PutIdentityProvider(ctx context.Context, p store.IdentityProvider) error {
 	return x.Write(ctx, func(tx *spanner.ReadWriteTransaction) error {
 		params := map[string]any{"org": p.Organization, "source": p.Source, "settings": []byte(p.Settings), "sealed": p.Sealed,
-			"interval": int64(p.Interval / time.Second), "updated": p.Updated, "plain": p.PlainHandles, "empty": []byte("[]")}
+			"interval": int64(p.Interval / time.Second), "updated": p.Updated, "plain": p.PlainHandles, "empty": []byte("[]"),
+			"key": spanner.NullInt64{Int64: p.Key, Valid: p.Key != 0}}
 		n, err := spannerdata.Update(ctx, tx, `UPDATE organization_identity SET source = @source, settings = @settings, sealed = @sealed,
-				interval_secs = @interval, updated_at = @updated, plain_handles = plain_handles OR @plain
+				interval_secs = @interval, updated_at = @updated, plain_handles = plain_handles OR @plain, sync_key = IFNULL(sync_key, @key)
 			WHERE organization_id = @org`, params)
 		if err != nil || n > 0 {
 			return err
 		}
 		_, err = spannerdata.Update(ctx, tx, `INSERT INTO organization_identity (organization_id, source, settings, sealed, interval_secs,
-				last_error, waiting, notes, updated_at, plain_handles)
-			VALUES (@org, @source, @settings, @sealed, @interval, '', @empty, @empty, @updated, @plain)`, params)
+				last_error, waiting, notes, updated_at, plain_handles, sync_key)
+			VALUES (@org, @source, @settings, @sealed, @interval, '', @empty, @empty, @updated, @plain, @key)`, params)
 		return err
 	})
 }
@@ -38,12 +39,14 @@ func (x queries) IdentityProviderOf(ctx context.Context, org string) (store.Iden
 	var secs int64
 	var settings, mirror, waiting, notes []byte
 	var lastRun spanner.NullTime
+	var key spanner.NullInt64
 	err := x.readOne(ctx, `SELECT organization_id, source, settings, sealed, interval_secs, mirror, last_run, last_error, waiting, notes,
-			updated_at, plain_handles
+			updated_at, plain_handles, sync_key
 		FROM organization_identity WHERE organization_id = @org`, map[string]any{"org": org}, func(row *spanner.Row) error {
 		return row.Columns(&p.Organization, &p.Source, &settings, &p.Sealed, &secs, &mirror, &lastRun, &p.LastError, &waiting, &notes, &p.Updated,
-			&p.PlainHandles)
+			&p.PlainHandles, &key)
 	})
+	p.Key = key.Int64
 	if err != nil {
 		return store.IdentityProvider{}, err
 	}
@@ -60,6 +63,19 @@ func (x queries) IdentityProviderOf(ctx context.Context, org string) (store.Iden
 func (x queries) DeleteIdentityProvider(ctx context.Context, org string) (bool, error) {
 	n, err := x.Exec(ctx, `DELETE FROM organization_identity WHERE organization_id = @org`, map[string]any{"org": org})
 	return n == 1, err
+}
+
+func (x queries) IdentityProviderOrg(ctx context.Context, key int64) (string, error) {
+	var org string
+	err := x.readOne(ctx, `SELECT organization_id FROM organization_identity@{FORCE_INDEX=organization_identity_key} WHERE sync_key = @key`,
+		map[string]any{"key": key}, func(row *spanner.Row) error { return row.Columns(&org) })
+	return org, err
+}
+
+func (x queries) SetIdentityProviderKey(ctx context.Context, org string, key int64) error {
+	_, err := x.Exec(ctx, `UPDATE organization_identity SET sync_key = @key WHERE organization_id = @org AND sync_key IS NULL`,
+		map[string]any{"org": org, "key": key})
+	return err
 }
 
 // DueIdentityProviders are the organizations whose sync is due, never run first.

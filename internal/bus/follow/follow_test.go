@@ -6,11 +6,15 @@ import (
 	"maps"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/Cidan/ok/internal/bus"
 	"github.com/Cidan/ok/internal/bus/follow"
+	"github.com/Cidan/ok/internal/data/pgdata"
+	"github.com/Cidan/ok/internal/testdb"
+	"github.com/Cidan/ok/internal/work"
 )
 
 // log is a Log in memory: each key's events numbered from 1, read two at a time, its heads two
@@ -146,189 +150,175 @@ func (a *applier) once(t *testing.T, want map[int64]int64) {
 	}
 }
 
-// stream delivers the events it is given, in the order given, then says so and waits.
-type stream struct {
-	mu        sync.Mutex
-	deliver   []bus.Event
-	group     bool
-	errs      []error
-	delivered chan struct{}
+// env is a follower's service: its keyed work in a database of its own, on a queue in the process,
+// and how often it registered.
+type env struct {
+	q          *bus.LocalQueue
+	work       work.Store
+	registered atomic.Int32
 }
 
-func (*stream) Publish(context.Context, ...bus.Event) error { return nil }
-func (s *stream) CreateGroup(context.Context, string, string) error {
-	s.group = true
-	return nil
-}
-func (s *stream) Subscribe(ctx context.Context, _, _ string, h bus.Handler) error {
-	if !s.group {
-		return errors.New("subscribed before the group was made")
-	}
-	for _, e := range s.deliver {
-		err := h(ctx, e)
-		s.mu.Lock()
-		s.errs = append(s.errs, err)
-		s.mu.Unlock()
-	}
-	close(s.delivered)
-	<-ctx.Done()
-	return ctx.Err()
-}
-
-// run follows s until it has delivered everything and every key in want has its cursor there,
-// returning Run's error if it stopped first.
-func run(t *testing.T, s *stream, l *log, a *applier, want map[int64]int64) error {
+func newEnv(t *testing.T) *env {
 	t.Helper()
-	s.delivered = make(chan struct{})
+	p := testdb.Pool(t)
+	if _, err := p.Exec(context.Background(), pgdata.WorkSchema); err != nil {
+		t.Fatal(err)
+	}
+	e := &env{q: bus.NewLocalQueue(), work: pgdata.Work(p)}
+	if _, err := work.RegisterStore(e.work, work.Jobs{Queue: e.q, Prefix: "f"}); err != nil {
+		t.Fatal(err)
+	}
+	return e
+}
+
+// follow runs a follower of l into a until the returned stop is called.
+func (e *env) follow(t *testing.T, l *log, a follow.Applier) (stop func()) {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	done := make(chan error, 1)
 	go func() {
-		done <- (&follow.Follower{Stream: s, Topic: "t", Group: "g", Log: l, Apply: a, BusyWait: 50 * time.Millisecond}).Run(ctx)
+		done <- (&follow.Follower{Topic: "t", Log: l, Apply: a, Work: e.work, Workers: 4,
+			Register: func(context.Context) error { e.registered.Add(1); return nil }}).Run(ctx)
 	}()
-	deadline := time.After(10 * time.Second)
-	for delivered := false; ; {
-		select {
-		case err := <-done:
-			return err
-		case <-s.delivered:
-			delivered, s.delivered = true, nil
-		case <-deadline:
-			t.Fatal("the follower never caught up")
-		case <-time.After(5 * time.Millisecond):
+	return func() {
+		cancel()
+		if err := <-done; err != nil {
+			t.Errorf("Run: %v", err)
 		}
-		reached := delivered
+	}
+}
+
+// relay relays events to the follower, as their log's source does.
+func (e *env) relay(t *testing.T, events ...bus.Event) {
+	t.Helper()
+	if err := follow.Relay(context.Background(), e.q, "t", []string{"f"}, events); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// until waits for every key of want to have its cursor there.
+func until(t *testing.T, a *applier, want map[int64]int64) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		reached := true
 		for k, c := range want {
 			reached = reached && a.at(k) >= c
 		}
 		if reached {
-			break
+			return
 		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the follower never reached %v", want)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
-	cancel()
-	if err := <-done; !errors.Is(err, context.Canceled) {
-		return err
-	}
-	return nil
 }
 
-// A follower catches up every key behind its log, then applies what the stream brings once each,
-// in each key's order: duplicates acknowledged, gaps filled from the log first.
+// A follower registers, catches up every key behind its log, then applies what each relay names,
+// once each, in each key's order: a relay naming a key the follower is past, or past the key's
+// last event the log already held, applies through the log.
 func TestFollow(t *testing.T) {
+	e := newEnv(t)
 	l := &log{keys: map[int64]int64{1: 5, 2: 3, 3: 0}}
 	a := &applier{cursors: map[int64]int64{1: 2}}
-	// The stream: a duplicate, an event two past what the log held at the start (its gap read
-	// from the log), the gap's own events late, and a key the log had not yet reached.
-	s := &stream{deliver: []bus.Event{ev(1, 4), ev(2, 6), ev(2, 4), ev(2, 5), ev(1, 6), ev(4, 2)}}
+	stop := e.follow(t, l, a)
+	defer stop()
+	until(t, a, map[int64]int64{1: 5, 2: 3})
+	l.mu.Lock()
 	l.keys[2], l.keys[1], l.keys[4] = 6, 6, 2
-	if err := run(t, s, l, a, map[int64]int64{1: 6, 2: 6, 4: 2}); err != nil {
-		t.Fatal(err)
-	}
-	for i, err := range s.errs {
-		if err != nil {
-			t.Errorf("delivery %d: %v", i, err)
-		}
-	}
+	l.mu.Unlock()
+	e.relay(t, ev(1, 4), ev(2, 6), ev(2, 4), ev(1, 6), ev(4, 2))
+	until(t, a, map[int64]int64{1: 6, 2: 6, 4: 2})
+	time.Sleep(50 * time.Millisecond)
 	a.once(t, map[int64]int64{1: 6, 2: 6, 4: 2})
 	if len(a.applied) != 4+6+2 {
 		t.Errorf("applied %d events, want each of key 1's 3–6, key 2's 1–6, and key 4's 1–2 once", len(a.applied))
 	}
+	if e.registered.Load() != 1 {
+		t.Errorf("registered %d times", e.registered.Load())
+	}
 }
 
-// An event the applier cannot apply yet is refused, to come again; one whose log ends before it is
-// an error.
-func TestRefusals(t *testing.T) {
-	down := errors.New("down")
-	l := &log{keys: map[int64]int64{1: 2}}
-	a := &applier{cursors: map[int64]int64{}, fail: func(e bus.Event) error {
-		if e.Seq == 2 {
-			return down
-		}
-		return nil
-	}}
-	if err := run(t, &stream{}, l, a, map[int64]int64{1: 2}); !errors.Is(err, down) {
-		t.Errorf("catching up through a failure: %v", err)
-	}
-	a.fail = nil
-	s := &stream{deliver: []bus.Event{ev(1, 9)}}
-	if err := run(t, s, l, a, map[int64]int64{1: 2}); err != nil {
-		t.Fatal(err)
-	}
-	if len(s.errs) != 1 || s.errs[0] == nil {
-		t.Errorf("an event past its log's end: %v", s.errs)
-	}
-	a.once(t, map[int64]int64{1: 2})
-}
-
-// Catching up reads a page of keys' cursors at once, and goes no further for a key its cursor has
-// reached.
-func TestCatchUpInPages(t *testing.T) {
+// Catching up reads a page of keys' cursors at once, marks only the keys behind, and is done once
+// for the service: a follower started again catches nothing up.
+func TestCatchUpOnce(t *testing.T) {
+	e := newEnv(t)
 	heads := map[int64]int64{1: 3, 2: 2, 3: 4, 4: 1, 5: 2, 6: 1}
 	l := &log{keys: maps.Clone(heads)}
 	a := &applier{cursors: map[int64]int64{1: 3, 2: 2, 4: 1, 6: 1}}
-	if err := run(t, &stream{}, l, a, heads); err != nil {
-		t.Fatal(err)
-	}
+	stop := e.follow(t, l, a)
+	until(t, a, heads)
+	stop()
 	a.once(t, heads)
 	slices.Sort(a.alone)
 	if l.pages != 3 || a.pages != 3 || !slices.Equal(a.alone, []int64{3, 5}) {
 		t.Errorf("%d pages of heads, %d reads of a page's cursors, keys read alone %v; want 3, 3, and keys 3 and 5", l.pages, a.pages, a.alone)
 	}
+	l.mu.Lock()
+	l.keys[1] = 4
+	l.mu.Unlock()
+	stop = e.follow(t, l, a)
+	time.Sleep(300 * time.Millisecond)
+	stop()
+	if l.pages != 3 || a.at(1) != 3 {
+		t.Errorf("started again: %d pages of heads, key 1 at %d; want no catching up", l.pages, a.at(1))
+	}
 }
 
-// What the stream brings is applied while catching up waits on a key's log.
+// A key's work that fails is done again a while later, and applies then.
+func TestRefusals(t *testing.T) {
+	e := newEnv(t)
+	var fails atomic.Int32
+	l := &log{keys: map[int64]int64{1: 2}}
+	a := &applier{cursors: map[int64]int64{}, fail: func(ev bus.Event) error {
+		if ev.Seq == 2 && fails.Add(1) == 1 {
+			return errors.New("down")
+		}
+		return nil
+	}}
+	stop := e.follow(t, l, a)
+	defer stop()
+	until(t, a, map[int64]int64{1: 2})
+	a.once(t, map[int64]int64{1: 2})
+}
+
+// What a relay names is applied while catching up waits on another key's log.
 func TestFollowBesideCatchingUp(t *testing.T) {
+	e := newEnv(t)
 	stuck := make(chan struct{})
 	l := &log{keys: map[int64]int64{1: 3, 2: 1}, block: map[int64]chan struct{}{1: stuck}}
 	a := &applier{cursors: map[int64]int64{}}
-	s := &stream{deliver: []bus.Event{ev(2, 2)}}
+	stop := e.follow(t, l, a)
+	defer stop()
+	until(t, a, map[int64]int64{2: 1})
+	l.mu.Lock()
 	l.keys[2] = 2
-	go func() {
-		// Released once key 2 has its event from the stream, which needs no catching up first.
-		for a.at(2) < 2 {
-			time.Sleep(time.Millisecond)
-		}
-		close(stuck)
-	}()
-	if err := run(t, s, l, a, map[int64]int64{1: 3, 2: 2}); err != nil {
-		t.Fatal(err)
-	}
+	l.mu.Unlock()
+	e.relay(t, ev(2, 2))
+	until(t, a, map[int64]int64{2: 2})
+	close(stuck)
+	until(t, a, map[int64]int64{1: 3})
 	a.once(t, map[int64]int64{1: 3, 2: 2})
 }
 
-// A key another member is applying is left to it as the follower catches up, and an event of it the
-// stream brings waits a while for it, then is refused, to come again; one freed meanwhile applies.
+// A key its applier finds held is done again a moment later, and applies once freed.
 func TestBusy(t *testing.T) {
+	e := newEnv(t)
 	l := &log{keys: map[int64]int64{1: 2, 2: 1}}
 	a := &applier{cursors: map[int64]int64{}, busy: map[int64]bool{1: true}}
-	s := &stream{deliver: []bus.Event{ev(1, 3)}}
-	l.keys[1] = 3
-	if err := run(t, s, l, a, map[int64]int64{2: 1}); err != nil {
-		t.Fatal(err)
+	stop := e.follow(t, l, a)
+	defer stop()
+	until(t, a, map[int64]int64{2: 1})
+	time.Sleep(300 * time.Millisecond)
+	if a.at(1) != 0 {
+		t.Fatalf("a held key applied to %d", a.at(1))
 	}
-	if len(s.errs) != 1 || !errors.Is(s.errs[0], follow.ErrBusy) {
-		t.Errorf("an event of a key another member applies: %v", s.errs)
-	}
-	a.once(t, map[int64]int64{1: 0, 2: 1})
-}
-
-func TestBusyWhileWaiting(t *testing.T) {
-	l := &log{keys: map[int64]int64{1: 2}}
-	a := &applier{cursors: map[int64]int64{1: 1}, busy: map[int64]bool{1: true}}
-	s := &stream{deliver: []bus.Event{ev(1, 2)}}
-	go func() {
-		time.Sleep(20 * time.Millisecond)
-		a.mu.Lock()
-		a.busy[1] = false
-		a.mu.Unlock()
-	}()
-	if err := run(t, s, l, a, map[int64]int64{1: 2}); err != nil {
-		t.Fatal(err)
-	}
-	if len(s.errs) != 1 || s.errs[0] != nil {
-		t.Errorf("an event of a key freed as it waited: %v", s.errs)
-	}
-	a.once(t, map[int64]int64{1: 2})
+	a.mu.Lock()
+	a.busy[1] = false
+	a.mu.Unlock()
+	until(t, a, map[int64]int64{1: 2})
+	a.once(t, map[int64]int64{1: 2, 2: 1})
 }
 
 // batcher is an applier that applies a page at a time: it records each page, and counts the events
@@ -367,36 +357,16 @@ func (b *batcher) ApplyBatch(ctx context.Context, evs []bus.Event) error {
 }
 
 // A batch applier is handed each page of a key's log the follower reads, from the event after its
-// cursor — what the stream brings applied through the log, its page with it — so every event is
-// applied once, in order, a page at a time, and none alone through Apply.
+// cursor, so every event is applied once, in order, a page at a time, and none alone through Apply.
 func TestBatches(t *testing.T) {
+	e := newEnv(t)
 	l := &log{keys: map[int64]int64{1: 6, 2: 3}}
 	b := &batcher{applier: &applier{cursors: map[int64]int64{1: 1}}}
-	s := &stream{deliver: []bus.Event{ev(1, 6), ev(1, 3), ev(2, 3), ev(2, 1)}, delivered: make(chan struct{})}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	done := make(chan error, 1)
-	go func() {
-		done <- (&follow.Follower{Stream: s, Topic: "t", Group: "g", Log: l, Apply: b, BusyWait: 50 * time.Millisecond}).Run(ctx)
-	}()
-	deadline := time.After(10 * time.Second)
-	for b.at(1) < 6 || b.at(2) < 3 {
-		select {
-		case err := <-done:
-			t.Fatal(err)
-		case <-deadline:
-			t.Fatal("the follower never caught up")
-		case <-time.After(5 * time.Millisecond):
-		}
-	}
-	<-s.delivered
-	cancel()
-	<-done
-	for i, err := range s.errs {
-		if err != nil {
-			t.Errorf("delivery %d: %v", i, err)
-		}
-	}
+	stop := e.follow(t, l, b)
+	until(t, b.applier, map[int64]int64{1: 6, 2: 3})
+	e.relay(t, ev(1, 6), ev(1, 3), ev(2, 3), ev(2, 1))
+	time.Sleep(100 * time.Millisecond)
+	stop()
 	b.once(t, map[int64]int64{1: 6, 2: 3})
 	if len(b.applied) != 5+3 {
 		t.Errorf("applied %d events, want key 1's 2–6 and key 2's 1–3 once", len(b.applied))
@@ -407,6 +377,28 @@ func TestBatches(t *testing.T) {
 	for _, page := range b.batches {
 		if len(page) == 0 || len(page) > 2 {
 			t.Errorf("a page of %v: the log reads two at a time", page)
+		}
+	}
+}
+
+// A relay enqueues, on each follower's queue, one job a key, through its last event's seq.
+func TestRelay(t *testing.T) {
+	q := bus.NewLocalQueue()
+	if err := follow.Relay(context.Background(), q, "t", []string{"a", "b"}, []bus.Event{ev(1, 2), ev(2, 1), ev(1, 3)}); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []string{"a", "b"} {
+		ls, err := q.Lease(context.Background(), work.Jobs{Queue: q, Prefix: f}.QueueOf("relay.t"), bus.LeaseOptions{Max: 10, Visibility: time.Minute})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var ids []string
+		for _, l := range ls {
+			ids = append(ids, l.Job().ID)
+		}
+		slices.Sort(ids)
+		if !slices.Equal(ids, []string{"1/3", "2/1"}) {
+			t.Errorf("%s's jobs: %v, want each key once, through its last", f, ids)
 		}
 	}
 }

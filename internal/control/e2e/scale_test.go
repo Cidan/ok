@@ -28,7 +28,6 @@ import (
 	"google.golang.org/grpc/status"
 
 	autorole "github.com/Cidan/ok/internal/automation/role"
-	"github.com/Cidan/ok/internal/bus"
 	"github.com/Cidan/ok/internal/bus/busconfig"
 	"github.com/Cidan/ok/internal/control/role"
 	"github.com/Cidan/ok/internal/deploy/engine"
@@ -110,20 +109,19 @@ func TestScale(t *testing.T) {
 		t.Cleanup(sdb.Close)
 		return tables{sp: sdb.Client}
 	}
-	stream := func(p *pgxpool.Pool) bus.Stream {
+	open := func() *busconfig.Bus {
 		t.Helper()
-		b, err := busconfig.Open(ctx, cfg.Bus, p)
+		b, err := busconfig.Open(ctx, cfg.Bus)
 		if err != nil {
 			t.Fatal(err)
 		}
 		t.Cleanup(b.Close)
-		return b.Stream
+		return b
 	}
 	idAddr := startIdentity(t, ctx, cfg, func(schema string) *pgxpool.Pool { return pool(schema) })
 	packs, logs := bucket(t), bucket(t)
 
 	scmPool, autoPool, ctlPool, deployPool := pool(scmrole.Schema), pool(autorole.Schema), pool(role.Schema), pool(deployrole.Schema)
-	scmStream, autoStream, ctlStream, deployStream := stream(scmPool), stream(autoPool), stream(ctlPool), stream(deployPool)
 	scmProxy, autoProxy := newProxy(t), newProxy(t)
 	_, deployAddr := startDeployer(t)
 	idSCM, idAuto, idCtl := as(t, idAddr, scmSelf), as(t, idAddr, automation), as(t, idAddr, control)
@@ -131,7 +129,7 @@ func TestScale(t *testing.T) {
 	autoAsCtl, deployAsCtl := as(t, autoProxy.addr(), control), as(t, deployAddr, control)
 
 	scms := &replicaSet{name: "the SCM", proxy: scmProxy, start: func() (string, func(), error) {
-		r, err := scmrole.Build(ctx, cfg, scmrole.Options{Dev: true, Pool: scmPool, Blobs: packs, Stream: scmStream, Identity: idSCM})
+		r, err := scmrole.Build(ctx, cfg, scmrole.Options{Dev: true, Pool: scmPool, Blobs: packs, Identity: idSCM})
 		if err != nil {
 			return "", nil, err
 		}
@@ -139,7 +137,7 @@ func TestScale(t *testing.T) {
 		return addr, func() { stop(); r.Close() }, nil
 	}}
 	autos := &replicaSet{name: "ok automation", proxy: autoProxy, start: func() (string, func(), error) {
-		r, err := autorole.Build(ctx, cfg, autorole.Options{Dev: true, Pool: autoPool, Logs: logs, Stream: autoStream, Identity: idAuto, SCM: scmAsAuto})
+		r, err := autorole.Build(ctx, cfg, autorole.Options{Dev: true, Pool: autoPool, Logs: logs, Identity: idAuto, SCM: scmAsAuto})
 		if err != nil {
 			return "", nil, err
 		}
@@ -147,8 +145,8 @@ func TestScale(t *testing.T) {
 		return addr, func() { stop(); r.Close() }, nil
 	}}
 	ctls := &replicaSet{name: "ok control", proxy: ctlProxy, start: func() (string, func(), error) {
-		r, err := role.Build(ctx, cfg, role.Options{Dev: true, Pool: ctlPool, Stream: ctlStream, Identity: idCtl, SCM: scmAsCtl,
-			Automation: autoAsCtl, Deploy: deployAsCtl, Poll: 100 * time.Millisecond})
+		r, err := role.Build(ctx, cfg, role.Options{Dev: true, Pool: ctlPool, Identity: idCtl, SCM: scmAsCtl,
+			Automation: autoAsCtl, Deploy: deployAsCtl})
 		if err != nil {
 			return "", nil, err
 		}
@@ -174,12 +172,16 @@ func TestScale(t *testing.T) {
 		deployBackend = b
 	}
 	deployStore := deploystore.New(deployBackend)
+	// Its keyed work's jobs, the relay's among them, on the bus's queue as the deployer's.
+	if err := open().RegisterWork(deployStore.Work(), "deploy"); err != nil {
+		t.Fatal(err)
+	}
 	deployEvents := scmpb.NewEventsClient(scmAsDeploy)
 	quiet := slog.New(slog.DiscardHandler)
 	follows := &replicaSet{name: "the deployer's follower", start: func() (string, func(), error) {
 		fctx, stop := context.WithCancel(ctx)
 		done := make(chan struct{})
-		go func() { defer close(done); engine.Follow(fctx, deployStore, deployStream, deployEvents, quiet) }()
+		go func() { defer close(done); engine.Follow(fctx, deployStore, deployEvents, quiet) }()
 		return "", func() { stop(); <-done }, nil
 	}}
 	sets := []*replicaSet{scms, autos, ctls, follows}
@@ -231,6 +233,8 @@ func TestScale(t *testing.T) {
 	start := time.Now()
 	sem := make(chan struct{}, atOnce)
 	var drivers sync.WaitGroup
+	var failedMu sync.Mutex
+	var failed []int64
 	for i := range n {
 		sem <- struct{}{}
 		drivers.Go(func() {
@@ -238,11 +242,19 @@ func TestScale(t *testing.T) {
 			id, err := c.drive(t, fmt.Sprintf("scale-%d", i))
 			if err != nil {
 				t.Errorf("repository %d: %v", i, err)
+				failedMu.Lock()
+				failed = append(failed, id)
+				failedMu.Unlock()
 			}
 			repos[i] = id
 		})
 	}
 	drivers.Wait()
+	if autoTables.pg != nil {
+		for _, id := range failed[:min(len(failed), 4)] {
+			dumpLanding(t, autoTables.pg, id)
+		}
+	}
 	stopChaos()
 	<-chaosDone
 	var killed []string
@@ -366,8 +378,26 @@ func standIn(ctx context.Context, work automationpb.WorkClient, name string) {
 		if resp.GetRun().GetJob().GetKind() == automationpb.Job_KIND_PLAN {
 			req.Plan = &automationpb.Plan{}
 		}
-		// A finish lost with a replica is the lease's to time out: the run goes to another worker.
-		_, _ = work.Finish(ctx, req)
+		finish(ctx, work, req)
+	}
+}
+
+// finish finishes a run as a worker does (worker.retry): again, while the replica it reached stops
+// or another has not started, until the answer is final. A run whose lease answer was lost with a
+// replica is still its lease's to time out, and goes to another worker; one whose every attempt
+// lost its finish would end in error, which no worker's does.
+func finish(ctx context.Context, work automationpb.WorkClient, req *automationpb.FinishRequest) {
+	for ctx.Err() == nil {
+		_, err := work.Finish(ctx, req)
+		switch status.Code(err) {
+		case codes.OK, codes.FailedPrecondition, codes.InvalidArgument, codes.PermissionDenied, codes.NotFound,
+			codes.ResourceExhausted:
+			return
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(200 * time.Millisecond):
+		}
 	}
 }
 
@@ -694,4 +724,40 @@ func (p *proxy) forward(c net.Conn) {
 	delete(conns, c)
 	delete(conns, b)
 	p.mu.Unlock()
+}
+
+// dumpLanding logs what ok automation holds of a repository that did not land, and the bus's jobs
+// about it, live and dead: on PostgreSQL, where the bus is beside the role's tables.
+func dumpLanding(t *testing.T, pool *pgxpool.Pool, repo int64) {
+	t.Helper()
+	ctx := context.Background()
+	for _, q := range []struct{ what, sql string }{
+		{"submissions", `SELECT id, status, note, reason FROM submission WHERE repository_id = $1 ORDER BY id`},
+		{"attempts", `SELECT a.id, a.status, a.released, a.reason FROM attempt a JOIN submission s ON s.id = a.submission_id
+			WHERE s.repository_id = $1 ORDER BY a.id`},
+		{"runs", `SELECT id, phase, kind, status, attempt, coalesce(worker, ''), coalesce(dispatch_job, ''), reason, queued_at, started_at, finished_at
+			FROM run WHERE repository_id = $1 ORDER BY id`},
+		{"work", `SELECT kind, key, dirty, due_at, holder, lease_until FROM work WHERE key = $1`},
+		{"jobs", `SELECT queue, id, attempts, not_before, created_at FROM bus.queue_job WHERE key = $1 ORDER BY created_at`},
+		{"dead", `SELECT queue, id, attempts FROM bus.queue_dead WHERE key = $1`},
+	} {
+		rows, err := pool.Query(ctx, q.sql, repo)
+		if err != nil {
+			t.Logf("repository %d's %s: %v", repo, q.what, err)
+			continue
+		}
+		n := 0
+		for rows.Next() {
+			vs, err := rows.Values()
+			if err != nil {
+				t.Logf("repository %d's %s: %v", repo, q.what, err)
+				break
+			}
+			n++
+			t.Logf("repository %d's %s: %v", repo, q.what, vs)
+		}
+		rows.Close()
+		t.Logf("repository %d's %s: %d", repo, q.what, n)
+	}
+	t.Logf("now %v", time.Now().UTC())
 }

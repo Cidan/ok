@@ -41,6 +41,7 @@ func Run(ctx context.Context, root node.Node, opts ...Option) error {
 		Health:         health.New(g.healthy),
 		Addr:           o.addr,
 		Listener:       o.listener,
+		Local:          o.local,
 		Reflection:     o.reflection,
 		StopTimeout:    o.stopTimeout,
 		MaxRecvMsgSize: o.maxRecv,

@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"time"
 
 	"github.com/Cidan/ok/internal/automation/store"
 	"github.com/Cidan/ok/internal/bus"
@@ -18,30 +17,20 @@ import (
 // purge, after which it forgets the repository whole — runs, their logs, plans, submissions.
 type Directory struct {
 	store  *store.Store
-	stream bus.Stream
 	events dirfeed.Events
 	log    *slog.Logger
 	holder string
 }
 
-// NewDirectory builds a follower of the directory's events on stream.
-func NewDirectory(s *store.Store, stream bus.Stream, events dirfeed.Events, log *slog.Logger) *Directory {
-	return &Directory{store: s, stream: stream, events: events, log: log, holder: work.NewHolder()}
+// NewDirectory builds a follower of the directory's events.
+func NewDirectory(s *store.Store, events dirfeed.Events, log *slog.Logger) *Directory {
+	return &Directory{store: s, events: events, log: log, holder: work.NewHolder()}
 }
 
-// Run follows the directory's events until ctx ends, starting again after a failure.
+// Run follows the directory's events until ctx ends.
 func (d *Directory) Run(ctx context.Context) error {
-	fl := &follow.Follower{Stream: d.stream, Topic: dirfeed.Topic, Group: "automation", Log: dirfeed.Log{Events: d.events}, Apply: directoryApplier{d}}
-	for {
-		if err := fl.Run(ctx); ctx.Err() == nil {
-			d.log.Warn("feed: stopped following the directory's events", "err", err)
-		}
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-time.After(2 * time.Second):
-		}
-	}
+	return (&follow.Follower{Topic: dirfeed.Topic, Log: dirfeed.Log{Events: d.events}, Apply: directoryApplier{d},
+		Work: d.store.Work(), Register: dirfeed.Register(d.events), Logger: d.log}).Run(ctx)
 }
 
 // directoryApplier applies a directory event with the repository claimed, as the SCM's events

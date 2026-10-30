@@ -11,6 +11,7 @@ import (
 	"github.com/Cidan/ok/internal/scm/encoding"
 	"github.com/Cidan/ok/internal/scm/pack"
 	"github.com/Cidan/ok/internal/scm/store/backend"
+	"github.com/Cidan/ok/internal/wait"
 	"github.com/Cidan/ok/internal/work"
 )
 
@@ -516,15 +517,9 @@ func (s *Store) sweptTo(ctx context.Context, repo int64, day contentindex.Day) (
 			if retired, err = tx.RetireSegments(ctx, sc, segIndexUnpinned, old); err != nil {
 				return err
 			}
-			if err := tx.Notify(ctx, segmentChannel, sc.String()); err != nil {
-				return err
-			}
 		}
 		return tx.SetContentIndexSwept(ctx, sc, int64(day))
 	})
-	if err == nil && retired > 0 {
-		s.segmentsChanged(sc)
-	}
 	return gen, unpinned, pinned, retired, err
 }
 
@@ -590,7 +585,8 @@ func (s *Store) sweepBatch(ctx context.Context, repo int64, t table, batch []enc
 
 // sweepContent drops from the content index the files, chunks, or trees (kind) among batch still
 // unpinned and untouched since cutoff, deciding under the index's row lock, so no transaction
-// touches, pins, or relies on one meanwhile. A chunk's or tree's location, under its network's
+// holding the index touches, pins, or relies on one meanwhile — and none holding no lock relies on
+// an entry this stale (txIndex). A chunk's or tree's location, under its network's
 // chunk index's lock too, goes with it in a network of one repository; in a network of more,
 // another may hold it, so it is released, and the network's collection drops its location once
 // none does (collectReleases). It adds to n what it drops, to bytes the stored bytes of the
@@ -610,7 +606,7 @@ func (s *Store) sweepContent(ctx context.Context, tx *txn, repo int64, kind enco
 		}
 		// A fork made after this read holds none of these unpinned chunks or trees: forks inherit only
 		// what is pinned. One made before is counted.
-		if _, _, err := tx.LockContentIndex(ctx, netScope); err != nil {
+		if _, _, err := tx.lockIndex(ctx, netScope); err != nil {
 			return err
 		}
 		repos, err := tx.NetworkRepositories(ctx, net)
@@ -665,7 +661,7 @@ func (s *Store) collectReleases(ctx context.Context, net backend.Network, dryRun
 		var n, b int64
 		err := s.inTx(ctx, func(ctx context.Context, tx *txn) error {
 			n, b = 0, 0
-			if _, _, err := tx.LockContentIndex(ctx, netScope); err != nil {
+			if _, _, err := tx.lockIndex(ctx, netScope); err != nil {
 				return err
 			}
 			var err error
@@ -725,7 +721,7 @@ func (s *Store) collectReleases(ctx context.Context, net backend.Network, dryRun
 // staleInIndex takes the content index's row lock in tx and returns the IDs among batch whose
 // entries are of kind, unpinned, and untouched since cutoff.
 func (s *Store) staleInIndex(ctx context.Context, tx *txn, repo int64, kind encoding.Kind, batch []encoding.ID, cutoff time.Time) ([]encoding.ID, error) {
-	if _, _, err := tx.LockContentIndex(ctx, repoScope(repo)); err != nil {
+	if _, _, err := tx.lockIndex(ctx, repoScope(repo)); err != nil {
 		return nil, err
 	}
 	li := s.live(repoScope(repo))
@@ -1070,30 +1066,12 @@ const GCWork = "gc"
 const PurgeWork = "purge"
 
 // Work is the SCM's keyed work's store (internal/work).
-func (s *Store) Work() work.Store { return workStore{s.b} }
+func (s *Store) Work() work.Store { return s.b.Work() }
 
-type workStore struct{ b backend.Backend }
-
-func (w workStore) Mark(ctx context.Context, kind string, key int64) error {
-	return w.b.MarkWork(ctx, kind, key)
-}
-func (w workStore) MarkAt(ctx context.Context, kind string, key int64, at time.Time) error {
-	return w.b.MarkWorkAt(ctx, kind, key, at)
-}
-func (w workStore) Take(ctx context.Context, kind string, key int64, holder string, ttl time.Duration) (bool, error) {
-	return w.b.TakeWork(ctx, kind, key, holder, ttl)
-}
-func (w workStore) Renew(ctx context.Context, kind string, key int64, holder string, ttl time.Duration) (bool, error) {
-	return w.b.RenewWork(ctx, kind, key, holder, ttl)
-}
-func (w workStore) Release(ctx context.Context, kind string, key int64, holder string) (bool, error) {
-	return w.b.ReleaseWork(ctx, kind, key, holder)
-}
-func (w workStore) Let(ctx context.Context, kind string, key int64, holder string) error {
-	return w.b.LetWork(ctx, kind, key, holder)
-}
-func (w workStore) Due(ctx context.Context, kind string, limit int) ([]int64, error) {
-	return w.b.DueWork(ctx, kind, limit)
+// Claims are the store's claims that waiters wait on, told as each is let go: a fold's, a
+// compaction's (wait.Claims).
+func (s *Store) Claims() wait.Claims {
+	return wait.Claims{Waits: s.b.Waits(), Queue: s.Work().Jobs().Queue, Work: s.Work()}
 }
 
 // gcSchedule is when the latest daily pass was scheduled, at now, when passes are scheduled at
@@ -1107,25 +1085,43 @@ func gcSchedule(now time.Time, hour int) (scheduled, retry time.Time) {
 	return scheduled, now.Add(-GCRetry)
 }
 
-// DueForGC lists the repositories due a pass at now, when passes are scheduled daily at
-// hour (UTC): those whose last successful pass began before the latest scheduled time, and
-// whose last failure (if any) is older than GCRetry.
-func (s *Store) DueForGC(ctx context.Context, now time.Time, hour int) ([]int64, error) {
-	scheduled, retry := gcSchedule(now, hour)
-	return s.ops(ctx).DueForGC(ctx, scheduled, retry)
-}
-
-// GCDue reports whether a repository is due a pass (DueForGC).
+// GCDue reports whether a repository is due a pass at now, when passes are scheduled daily at hour
+// (UTC): its last successful pass began before the latest scheduled time, and its last failure, if
+// any, is older than GCRetry.
 func (s *Store) GCDue(ctx context.Context, repo int64, now time.Time, hour int) (bool, error) {
 	scheduled, retry := gcSchedule(now, hour)
 	return s.ops(ctx).RepositoryDueForGC(ctx, repo, scheduled, retry)
 }
 
-// Retiring lists the repositories with segments retired more than RetiredSegmentGrace before now,
-// and the first repository of each network with packs retired more than RetiredPackGrace before
-// or segments RetiredSegmentGrace before: what DeleteRetiredOf deletes.
-func (s *Store) Retiring(ctx context.Context, now time.Time) ([]int64, error) {
-	return s.ops(ctx).RepositoriesRetiringBefore(ctx, now.Add(-RetiredPackGrace), now.Add(-RetiredSegmentGrace))
+// NextGCSlot is the first time after now passes are scheduled, daily at hour (UTC).
+func NextGCSlot(now time.Time, hour int) time.Time {
+	scheduled, _ := gcSchedule(now, hour)
+	return scheduled.AddDate(0, 0, 1)
+}
+
+// RetiredDue is when a repository's network's earliest retired pack or segment may be deleted
+// (DeleteRetiredOf), zero for none.
+func (s *Store) RetiredDue(ctx context.Context, repo int64) (time.Time, error) {
+	net, err := s.network(ctx, repo)
+	if err != nil {
+		return time.Time{}, err
+	}
+	packs, segments, err := s.ops(ctx).RetiredOf(ctx, net)
+	if err != nil {
+		return time.Time{}, err
+	}
+	var due time.Time
+	for _, t := range []time.Time{packs.Add(RetiredPackGrace), segments.Add(RetiredSegmentGrace)} {
+		if t.Year() > 1 && (due.IsZero() || t.Before(due)) {
+			due = t
+		}
+	}
+	return due, nil
+}
+
+// RepositoryIDs are up to limit repositories' IDs after after, in order.
+func (s *Store) RepositoryIDs(ctx context.Context, after int64, limit int) ([]int64, error) {
+	return s.ops(ctx).RepositoryIDs(ctx, after, limit)
 }
 
 // DeleteRetiredOf deletes a repository's network's packs compaction retired more than
@@ -1214,4 +1210,18 @@ func (r *GCReport) String() string {
 		r.Repository, dry, r.OpLogsDeleted, r.WorkspacesDeleted, r.OperationsDeleted, r.ViewsDeleted, r.CheckpointsDeleted, r.Marked,
 		r.CommitsSwept, r.ObjectsSwept, r.FilesSwept, r.ChunksSwept, r.ChunkBytesSwept,
 		r.PacksWritten, r.PacksRetired, r.BytesRead, r.BytesReclaimed, r.PacksDeleted, r.OrphanPacks, r.SegmentsDeleted, r.OrphanSegments, dict)
+}
+
+// FollowCursors, FollowCursor, and AdvanceFollowCursor are the SCM's places in the logs it follows on
+// the bus's stream (internal/bus/follow): the directory's. A cursor never moves back.
+func (s *Store) FollowCursors(ctx context.Context, topic string, keys []int64) (map[int64]int64, error) {
+	return s.ops(ctx).FollowCursors(ctx, topic, keys)
+}
+
+func (s *Store) FollowCursor(ctx context.Context, topic string, key int64) (int64, error) {
+	return s.ops(ctx).FollowCursor(ctx, topic, key)
+}
+
+func (s *Store) AdvanceFollowCursor(ctx context.Context, topic string, key, seq int64) error {
+	return s.ops(ctx).AdvanceFollowCursor(ctx, topic, key, seq)
 }

@@ -7,6 +7,7 @@ package spannerstore
 import (
 	"context"
 	"embed"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -82,6 +83,13 @@ func (s *Store) Moves() move.Rows { return s.moves }
 
 // queries are the store's operations, in a transaction or each in one of its own.
 type queries struct{ spannerdata.Ops }
+
+func (x queries) PendStep(_ context.Context, kind string, key int64, at time.Time, body []byte) error {
+	if x.Tx == nil {
+		return errors.New("spannerstore: a step is pended in a transaction, whose commit it follows")
+	}
+	return spannerdata.PendStep(x.Tx, kind, key, at, body)
+}
 
 func nullString(s string) spanner.NullString { return spanner.NullString{StringVal: s, Valid: s != ""} }
 

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -17,10 +18,13 @@ import (
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
+	"google.golang.org/grpc/test/bufconn"
 
 	"github.com/Cidan/ok/internal/authz"
 	"github.com/Cidan/ok/internal/credential"
+	"github.com/Cidan/ok/internal/serve/inproc"
 	_ "github.com/Cidan/ok/internal/serve/serving/echotest"
 	"github.com/Cidan/ok/internal/tenancy"
 	okpb "github.com/Cidan/ok/proto/ok/v1"
@@ -121,10 +125,10 @@ func newCA(t *testing.T) *ca {
 	return &ca{cert, key}
 }
 
-func (c *ca) pool() *x509.CertPool {
+func (c *ca) pool(context.Context) (*x509.CertPool, error) {
 	p := x509.NewCertPool()
 	p.AddCert(c.cert)
-	return p
+	return p, nil
 }
 
 func (c *ca) issue(t *testing.T, principal string, serial int64) ([]byte, *ecdsa.PrivateKey) {
@@ -169,8 +173,40 @@ func setup(t *testing.T, dev bool) (*Resolver, *directory, *ca) {
 		TrustedHeader: "X-Auth-Principal",
 		Dev:           dev,
 		Roles:         Roles{okpb.Caller_CALLER_CONTROL: "control.ok.robot.example.com"},
+		InProcess:     map[string]Principal{"control.ok.robot.example.com": {Name: "control.ok.robot.example.com", ID: "p3", Active: true}},
 	})
 	return r, d, c
+}
+
+// A call from within the process is the role it names, with no question of the directory; the
+// same name from any other peer — another machine, the REST gateway's in-memory listener, no
+// peer at all — is refused, never served as no one, and so is a name that is no role's.
+func TestInProcess(t *testing.T) {
+	r, d, _ := setup(t, false)
+	from := func(a net.Addr) context.Context {
+		return peer.NewContext(context.Background(), &peer.Peer{Addr: a})
+	}
+	md := metadata.Pairs(InProcessKey, "control.ok.robot.example.com")
+	asked := d.asked
+	got, ok, err := r.Resolve(from(inproc.Addr{}), md, echoMethod)
+	if err != nil || !ok || got.Principal != "control.ok.robot.example.com" || got.ID != "p3" || got.Role != okpb.Caller_CALLER_CONTROL ||
+		got.Human || got.Via != ViaInProcess || d.asked != asked {
+		t.Errorf("a role within the process: %+v, %v, %v; the directory asked %d times", got, ok, err, d.asked-asked)
+	}
+	lis := bufconn.Listen(1 << 10)
+	defer lis.Close()
+	for name, ctx := range map[string]context.Context{
+		"another machine":            from(&net.TCPAddr{IP: net.IPv4(10, 0, 0, 1), Port: 4000}),
+		"another in-memory listener": from(lis.Addr()),
+		"no peer":                    context.Background(),
+	} {
+		if _, ok, err := r.Resolve(ctx, md, echoMethod); status.Code(err) != codes.Unauthenticated || ok {
+			t.Errorf("%s naming a role: %v, %v", name, ok, err)
+		}
+	}
+	if _, ok, err := r.Resolve(from(inproc.Addr{}), metadata.Pairs(InProcessKey, "ada.human.example.com"), echoMethod); status.Code(err) != codes.Unauthenticated || ok {
+		t.Errorf("within the process, naming someone no role is: %v, %v", ok, err)
+	}
 }
 
 func withCredential(t *testing.T, c *ca, principal string, serial int64) metadata.MD {
@@ -223,6 +259,14 @@ func TestResolve(t *testing.T) {
 			}
 		})
 	}
+	// A credential's proof is accepted once.
+	md := withCredential(t, c, "ada.human.example.com", 0x10)
+	if _, ok, err := r.Resolve(ctx, md, echoMethod); err != nil || !ok {
+		t.Fatalf("a credential's proof: %v, %v", ok, err)
+	}
+	if _, ok, err := r.Resolve(ctx, md, echoMethod); status.Code(err) != codes.Unauthenticated || ok {
+		t.Errorf("the proof again: %v, %v", ok, err)
+	}
 	// A personal token's caller carries what it allows, and how they came.
 	if got, ok, err := r.Resolve(ctx, metadata.Pairs("authorization", "Bearer okp_ada"), echoMethod); err != nil || !ok ||
 		got.Via != ViaPersonalToken || got.Token == nil || got.Token.Role != tenancy.Read || len(got.Token.Repositories) != 1 {
@@ -238,7 +282,9 @@ func TestResolve(t *testing.T) {
 	}
 }
 
-func TestDirectoryCacheAndOutage(t *testing.T) {
+// The directory is asked each time a caller is resolved — what it said is kept by no replica — and a
+// directory that cannot answer refuses the caller as unavailable.
+func TestDirectoryAskedEachTimeAndOutage(t *testing.T) {
 	r, d, _ := setup(t, false)
 	ctx := context.Background()
 	md := metadata.Pairs("x-auth-principal", "ada.human.example.com")
@@ -247,11 +293,10 @@ func TestDirectoryCacheAndOutage(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if d.asked != 1 {
-		t.Errorf("the directory was asked %d times, want once", d.asked)
+	if d.asked != 3 {
+		t.Errorf("the directory was asked %d times, want each of three", d.asked)
 	}
 	d.down = true
-	r.now = func() time.Time { return time.Now().Add(PositiveTTL + time.Second) }
 	if _, _, err := r.Resolve(ctx, md, echoMethod); status.Code(err) != codes.Unavailable {
 		t.Errorf("a directory that cannot answer: %v", err)
 	}

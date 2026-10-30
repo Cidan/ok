@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/Cidan/ok/internal/scm/store/backend"
+	"github.com/jackc/pgx/v5"
 )
 
 // ─── Sequencing ───
@@ -15,6 +16,27 @@ import (
 // never aborted, and the transaction's statements take microseconds, so writers queue on the
 // counters briefly; and PostgreSQL has no commit timestamp to order by.
 func (b *Backend) SequencesAfterCommit() bool { return false }
+
+func (b *Backend) MutationBudget() int { return 0 }
+
+// SequencedAt and SetSequencedAt: a PostgreSQL transaction sequences itself, so there are no passes.
+func (x queries) SequencedAt(context.Context, int64) (time.Time, error)  { return time.Time{}, nil }
+func (x queries) SetSequencedAt(context.Context, int64, time.Time) error { return nil }
+
+func (x queries) CompactionCursor(ctx context.Context, repo int64) ([]byte, error) {
+	var c []byte
+	err := x.q.QueryRow(ctx, `SELECT cursor FROM compaction_cursor WHERE repository_id = $1`, repo).Scan(&c)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	return c, err
+}
+
+func (x queries) SetCompactionCursor(ctx context.Context, repo int64, cursor []byte) error {
+	_, err := x.q.Exec(ctx, `INSERT INTO compaction_cursor (repository_id, cursor) VALUES ($1, $2)
+		ON CONFLICT (repository_id) DO UPDATE SET cursor = EXCLUDED.cursor`, repo, cursor)
+	return err
+}
 
 // errNoSequencing refuses the sequencing pass's operations, which no PostgreSQL transaction leaves
 // work for.
@@ -44,6 +66,10 @@ func (x queries) TransactionEvents(context.Context, int64, int64) ([]int64, erro
 
 func (x queries) PendingRepositories(context.Context, time.Time, int) ([]int64, error) {
 	return nil, nil
+}
+
+func (x queries) TxnPending(context.Context, int64, int64) (bool, error) {
+	return false, nil
 }
 
 func (x queries) ChangeListNumbers(ctx context.Context, repo int64, ids []int64) (map[int64]int64, error) {

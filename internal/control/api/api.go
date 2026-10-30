@@ -8,6 +8,7 @@ package api
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"io"
 	"net/url"
@@ -26,17 +27,19 @@ import (
 	"github.com/Cidan/ok/internal/control/scm"
 	"github.com/Cidan/ok/internal/move"
 	"github.com/Cidan/ok/internal/serve/authn"
+	"github.com/Cidan/ok/internal/wait"
 	automationpb "github.com/Cidan/ok/proto/ok/automation/v1"
 	controlpb "github.com/Cidan/ok/proto/ok/control/v1"
 	deploypb "github.com/Cidan/ok/proto/ok/deploy/v1"
 )
 
-// How a watch follows a CL: it reads it every Poll (the CL page's live regions' cadence), and
-// ends after MaxWatch, for the client to watch again.
-const (
-	Poll     = 2 * time.Second
-	MaxWatch = time.Hour
-)
+// MaxWatch is how long a watch follows a CL before it ends, for the client to watch again.
+const MaxWatch = time.Hour
+
+// Waits are the other services a watch registers with, whose writes change what a CL's status
+// shows (internal/wait): ok automation's (its pre and post) and the deployer's (its landed commit's
+// deployments). Nil for one there is none of (tests).
+type Waits struct{ Automation, Deploy wait.Registrar }
 
 // API serves the ChangeLists service.
 type API struct {
@@ -47,20 +50,17 @@ type API struct {
 	runs    automationpb.RunsClient
 	deploys deploypb.DeploymentsClient
 	review  *review.Service
+	waits   Waits
 	base    string // ok's public URL, for links: https://ok.example.com
-	poll    time.Duration
 	// installation is the installation's organization's handle, "" for a hosted service: its
 	// repositories' full names are their names alone.
 	installation string
 }
 
 // New returns the service over ok control's clients; base is its public address.
-func New(d db.Store, s *scm.Client, runs automationpb.RunsClient, deploys deploypb.DeploymentsClient, rv *review.Service, base, installation string) *API {
-	return &API{db: d, scm: s, runs: runs, deploys: deploys, review: rv, base: strings.TrimRight(base, "/"), poll: Poll, installation: installation}
+func New(d db.Store, s *scm.Client, runs automationpb.RunsClient, deploys deploypb.DeploymentsClient, rv *review.Service, waits Waits, base, installation string) *API {
+	return &API{db: d, scm: s, runs: runs, deploys: deploys, review: rv, waits: waits, base: strings.TrimRight(base, "/"), installation: installation}
 }
-
-// SetPoll sets how often a watch reads its CL (tests).
-func (a *API) SetPoll(d time.Duration) { a.poll = d }
 
 // caller is the stable ID of the person a request is for. Only a person acts here, and never from
 // another site:
@@ -147,33 +147,110 @@ func (a *API) Status(ctx context.Context, req *controlpb.CLRef) (*controlpb.CLSt
 	return st, toStatus(err)
 }
 
+// Watch streams a CL's status as it stands, then each time what it shows changes, until the CL is
+// deployed or abandoned, or MaxWatch passes, for the client to watch again (WatchStatus).
 func (a *API) Watch(req *controlpb.CLRef, stream grpc.ServerStreamingServer[controlpb.CLStatus]) error {
 	ctx := stream.Context()
 	if _, err := a.caller(ctx); err != nil {
 		return err
 	}
-	deadline := time.Now().Add(MaxWatch)
-	var last *controlpb.CLStatus
+	watch, cancel := context.WithTimeout(ctx, MaxWatch)
+	defer cancel()
+	err := a.WatchStatus(watch, req, func(st *controlpb.CLStatus) error { return stream.Send(st) })
+	if watch.Err() != nil && ctx.Err() == nil {
+		return nil
+	}
+	return err
+}
+
+// WatchStatus calls send with a CL's status as it stands, then each time what it shows changes,
+// until the CL is deployed or abandoned (nil) or ctx ends (its error). It registers with each
+// service whose writes change the status (internal/wait) — ok control's (the CL and the stack below
+// it, their reviews, and what of main's head decides whether it can land: what governs every CL,
+// and the paths it changes — watched), ok automation's (their pre and post), and, once it lands,
+// the deployer's (its commit's deployments) — and reads the status again as each says it changed:
+// after it registers, so a change between a read and its registration is read too. A move of main
+// that changes none of what it registered on wakes no watch (feed's head step).
+func (a *API) WatchStatus(ctx context.Context, ref *controlpb.CLRef, send func(*controlpb.CLStatus) error) error {
 	var bc blockedCache
+	st, err := a.statusOf(ctx, ref, &bc)
+	if err != nil {
+		return toStatus(err)
+	}
+	if err := send(st); err != nil || Finished(st) {
+		return err
+	}
+	last := st
+	// What each service's writes change of the status, registered on with each: ok control's
+	// (watched), ok automation's (stackOf); a registration added as a read finds more.
+	subjects, stack := watched(&bc, ref.GetNumber()), stackOf(&bc, ref.GetNumber())
+	registered, registeredStack := map[string]bool{}, map[string]bool{}
+	for _, s := range subjects {
+		registered[s] = true
+	}
+	for _, s := range stack {
+		registeredStack[s] = true
+	}
+	regs := []wait.Reg{{Store: a.db.Waits(), Subjects: subjects}}
+	if a.waits.Automation != nil {
+		regs = append(regs, wait.Reg{Store: a.waits.Automation, Subjects: stack})
+	}
+	w, err := wait.Open(ctx, a.db.Waits().Jobs().Queue, regs...)
+	if err != nil {
+		return status.Errorf(codes.Unavailable, "watching the CL: %v", err)
+	}
+	defer w.Close()
+	deploys := false
 	for {
-		st, err := a.statusOf(ctx, req, &bc)
-		if err != nil {
+		if st, err = a.statusOf(ctx, ref, &bc); err != nil {
 			return toStatus(err)
 		}
-		if last == nil || !proto.Equal(st, last) {
-			if err := stream.Send(st); err != nil {
+		if !proto.Equal(st, last) {
+			if err := send(st); err != nil {
 				return err
 			}
 			last = st
 		}
-		if Finished(st) || time.Now().After(deadline) {
+		if Finished(st) {
 			return nil
 		}
-		select {
-		case <-ctx.Done():
-			return toStatus(ctx.Err())
-		case <-time.After(a.poll):
+		// A new patchset, a stack's change: what the status depends on now, registered on before
+		// the read after, so a change between this read and the registration is read too.
+		more, moreStack := unregistered(watched(&bc, ref.GetNumber()), registered), unregistered(stackOf(&bc, ref.GetNumber()), registeredStack)
+		if a.waits.Automation == nil {
+			moreStack = nil
 		}
+		if len(more) > 0 || len(moreStack) > 0 {
+			for _, r := range []wait.Reg{{Store: a.db.Waits(), Subjects: more}, {Store: a.waits.Automation, Subjects: moreStack}} {
+				if len(r.Subjects) == 0 {
+					continue
+				}
+				if err := w.Add(ctx, r); err != nil {
+					return status.Errorf(codes.Unavailable, "watching the CL: %v", err)
+				}
+			}
+			continue
+		}
+		if landed := st.GetCl().GetLandedCommit(); landed != "" && !deploys && a.waits.Deploy != nil {
+			commit, err := hex.DecodeString(landed)
+			if err != nil {
+				return status.Errorf(codes.Internal, "the CL's landed commit %q: %v", landed, err)
+			}
+			if err := w.Add(ctx, wait.Reg{Store: a.waits.Deploy, Subjects: []string{wait.CommitSubject(bc.repo, commit)}}); err != nil {
+				return status.Errorf(codes.Unavailable, "watching the CL's deployments: %v", err)
+			}
+			deploys = true
+			continue // registered now: what changed since the read above is read again
+		}
+		if _, err := w.Next(ctx); err != nil {
+			if ctx.Err() != nil {
+				return toStatus(ctx.Err())
+			}
+			return status.Errorf(codes.Unavailable, "watching the CL: %v", err)
+		}
+		// What changed may be what keeps the CL from submitting — its stack, its own state — which
+		// no patchset or head names: the gates are asked again.
+		bc.key = ""
 	}
 }
 
@@ -558,4 +635,16 @@ func (a *API) deploymentAction(ctx context.Context, req *controlpb.DeploymentReq
 		return nil, err
 	}
 	return a.after(ctx, req.GetCl())
+}
+
+// unregistered are those of subjects not in registered, which it adds them to.
+func unregistered(subjects []string, registered map[string]bool) []string {
+	var out []string
+	for _, s := range subjects {
+		if !registered[s] {
+			registered[s] = true
+			out = append(out, s)
+		}
+	}
+	return out
 }

@@ -56,9 +56,17 @@ func (o Ops) Read(fn func(r Reader) error) error {
 	if o.Snapshot != nil {
 		return fn(o.Snapshot)
 	}
-	ro := o.Client.ReadOnlyTransaction()
+	ro := ReadOnly(o.Client)
 	defer ro.Close()
 	return fn(ro)
+}
+
+// ReadOnly is a read-only transaction that begins with its first query, rather than a round trip
+// of its own before it: an operation's reads, most of them one query. Queries begun at once wait
+// for the first's first row; a snapshot that starts several at once begins on its own
+// (Client.ReadOnlyTransaction).
+func ReadOnly(c *spanner.Client) *spanner.ReadOnlyTransaction {
+	return c.ReadOnlyTransaction().WithBeginTransactionOption(spanner.InlinedBeginTransaction)
 }
 
 // Exec runs a DML statement, returning the rows it changed.

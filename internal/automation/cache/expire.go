@@ -32,7 +32,6 @@ func Expire(ctx context.Context, s *Server, ws work.Store, ttl time.Duration, lo
 			}
 			return ws.MarkAt(ctx, ExpireWork, 0, time.Now().Add(expireEvery))
 		},
-		Idle: expireEvery,
-		Log:  log,
+		Log: log,
 	}).Run(ctx)
 }

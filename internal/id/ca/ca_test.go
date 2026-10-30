@@ -2,6 +2,7 @@ package ca
 
 import (
 	"bytes"
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -42,7 +43,7 @@ func TestInitIssueVerify(t *testing.T) {
 	}
 	v := credential.NewVerifier(c.Pool)
 	proof, _ := credential.Prove(key, "/ok.identity.v1.Credentials/Renew", time.Now())
-	got, err := v.Verify("/ok.identity.v1.Credentials/Renew", chain[0], proof)
+	got, err := v.Verify(context.Background(), "/ok.identity.v1.Credentials/Renew", chain[0], proof)
 	if err != nil || got.Principal != "ada.human.example.com" || got.Credential != "crd_1" {
 		t.Errorf("Verify = %+v, %v", got, err)
 	}
@@ -75,7 +76,7 @@ func TestRotation(t *testing.T) {
 	}
 	v := credential.NewVerifier(cur.Pool)
 	proof, _ := credential.Prove(key, "/m", time.Now())
-	if _, err := v.Verify("/m", oldChain[0], proof); err != nil {
+	if _, err := v.Verify(context.Background(), "/m", oldChain[0], proof); err != nil {
 		t.Errorf("the old CA's certificate during the rotation: %v", err)
 	}
 
@@ -109,8 +110,10 @@ func TestLoadRefuses(t *testing.T) {
 	}
 }
 
-// A CA whose files cannot be read verifies no credential: Pool is empty, Readable says why, and
-// the log says so once — not once a request — and once more when they can be read again.
+// A CA whose certificate cannot be read verifies no credential: Pool fails, Readable says why, and
+// the log says so once — not once a request — and once more when it can be read again. One whose
+// key cannot be read still verifies — the certificate is all a verification reads — but is not
+// ready, as it can issue nothing.
 func TestUnreadableIsReported(t *testing.T) {
 	var logged bytes.Buffer
 	prev := slog.Default()
@@ -124,14 +127,14 @@ func TestUnreadableIsReported(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	key := filepath.Join(dir, "tls.key")
-	data, _ := os.ReadFile(key)
-	if err := os.Remove(key); err != nil {
+	crt := filepath.Join(dir, "tls.crt")
+	data, _ := os.ReadFile(crt)
+	if err := os.Remove(crt); err != nil {
 		t.Fatal(err)
 	}
 	for range 5 {
-		if !c.Pool().Equal(x509.NewCertPool()) {
-			t.Fatal("an unreadable CA's pool is not empty")
+		if p, err := c.Pool(context.Background()); err == nil || p != nil {
+			t.Fatal("an unreadable CA's pool is no error")
 		}
 	}
 	if err := c.Readable(); err == nil {
@@ -140,10 +143,63 @@ func TestUnreadableIsReported(t *testing.T) {
 	if n := strings.Count(logged.String(), "cannot be read"); n != 1 {
 		t.Errorf("the failure was logged %d times:\n%s", n, logged.String())
 	}
-	if err := os.WriteFile(key, data, 0o600); err != nil {
+	if err := os.WriteFile(crt, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if c.Readable() != nil || c.Pool().Equal(x509.NewCertPool()) || !strings.Contains(logged.String(), "can be read again") {
-		t.Errorf("after the key came back:\n%s", logged.String())
+	if p, err := c.Pool(context.Background()); c.Readable() != nil || err != nil || p.Equal(x509.NewCertPool()) || !strings.Contains(logged.String(), "can be read again") {
+		t.Errorf("after the certificate came back:\n%s", logged.String())
+	}
+
+	key := filepath.Join(dir, "tls.key")
+	if err := os.Remove(key); err != nil {
+		t.Fatal(err)
+	}
+	if p, err := c.Pool(context.Background()); err != nil || p.Equal(x509.NewCertPool()) {
+		t.Errorf("without its key, the CA's pool: %v", err)
+	}
+	if err := c.Readable(); err == nil {
+		t.Error("a CA without its key is ready")
+	}
+}
+
+// A rotation's certificate is trusted at the next verification, and the one it replaced no longer,
+// though the pool before was built from files that held other bytes.
+func TestPoolFollowsTheFiles(t *testing.T) {
+	dir, other := t.TempDir(), t.TempDir()
+	for _, d := range []string{dir, other} {
+		if err := Init(d, "Example"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	before, err := c.Pool(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again, _ := c.Pool(ctx); again != before {
+		t.Error("the same files built another pool")
+	}
+	oldRoots, _ := c.Roots()
+	for _, f := range []string{"tls.crt", "tls.key"} {
+		b, _ := os.ReadFile(filepath.Join(other, f))
+		if err := os.WriteFile(filepath.Join(dir, f), b, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	after, err := c.Pool(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newRoots, _ := c.Roots()
+	if len(oldRoots) != 1 || len(newRoots) != 1 || oldRoots[0].Equal(newRoots[0]) {
+		t.Fatalf("the roots before and after: %d, %d", len(oldRoots), len(newRoots))
+	}
+	subjects := after.Subjects() //nolint:staticcheck // the pool holds no system roots
+	if len(subjects) != 1 || !bytes.Equal(subjects[0], newRoots[0].RawSubject) || after == before {
+		t.Error("the pool after the rotation is not the rotated certificate's")
 	}
 }

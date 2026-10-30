@@ -6,14 +6,12 @@ import (
 )
 
 // Quotas of CI (docs/hosted.md, "Hosted automation, as built"): an account's — a person's or an
-// organization's — concurrent runs, run minutes in a calendar month (zero for unlimited), and
-// weight in fair share.
+// organization's — concurrent runs and run minutes in a calendar month (zero for unlimited).
 
 // Quota is an account's quota of CI.
 type Quota struct {
 	Concurrent int
 	Minutes    int64
-	Weight     int
 	// Default: the account has none of its own, and this is the directory's default.
 	Default bool
 }
@@ -22,9 +20,6 @@ type Quota struct {
 // store serves.
 func (s *Store) SetDefaultQuota(q Quota) {
 	q.Default = true
-	if q.Weight <= 0 {
-		q.Weight = 1
-	}
 	s.defaultQuota = q
 }
 
@@ -39,9 +34,6 @@ func (s *Store) QuotasOf(ctx context.Context, accounts []string) (map[string]Quo
 		q, ok := set[a]
 		if !ok {
 			q = s.defaultQuota
-			if q.Weight == 0 {
-				q.Weight = 1
-			}
 			q.Default = true
 		}
 		out[a] = q
@@ -83,11 +75,8 @@ func validMonth(m string) bool {
 
 // SetQuota sets an account's quota; ResetQuota gives it the default again.
 func (s *Store) SetQuota(ctx context.Context, account string, q Quota) error {
-	if q.Concurrent < 0 || q.Minutes < 0 || q.Weight < 0 {
-		return invalid("a quota's concurrent runs, minutes, and weight are not negative")
-	}
-	if q.Weight == 0 {
-		q.Weight = 1
+	if q.Concurrent < 0 || q.Minutes < 0 {
+		return invalid("a quota's concurrent runs and minutes are not negative")
 	}
 	return s.b.SetAccountQuota(ctx, account, q)
 }

@@ -14,111 +14,16 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"github.com/Cidan/ok/internal/bus"
+	"github.com/Cidan/ok/internal/bus/follow"
 	"github.com/Cidan/ok/internal/scm/scmfeed"
 	"github.com/Cidan/ok/internal/scm/store/backend"
+	"github.com/Cidan/ok/internal/wait"
+	"github.com/Cidan/ok/internal/work"
 	scmpb "github.com/Cidan/ok/proto/ok/scm/v1"
 )
 
-// eventHub wakes the relay when an event commits. Each replica listens on eventChannel (the
-// backend's Listen), which every event-writing transaction notifies at commit; each
-// notification closes the current channel and opens the next.
-type eventHub struct {
-	start sync.Once
-	mu    sync.Mutex
-	ch    chan struct{}
-	// ctx ends the listening connection (Store.Close), and done closes once it has.
-	ctx       context.Context
-	stop      context.CancelFunc
-	listening bool
-	done      chan struct{}
-}
-
-func (h *eventHub) wait() <-chan struct{} {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.ch == nil {
-		h.ch = make(chan struct{})
-	}
-	return h.ch
-}
-
-func (h *eventHub) signal() {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.ch != nil {
-		close(h.ch)
-	}
-	h.ch = make(chan struct{})
-}
-
-// startListening starts the listening connection, once.
-func (s *Store) startListening() {
-	s.events.start.Do(func() {
-		s.events.mu.Lock()
-		s.events.listening = true
-		s.events.mu.Unlock()
-		go func() {
-			defer close(s.events.done)
-			s.listen()
-		}()
-	})
-}
-
-// Close stops the store's listening connection, if it started, and waits for it to end.
-func (s *Store) Close() {
-	s.marksMade()
-	s.events.stop()
-	s.events.mu.Lock()
-	listening := s.events.listening
-	s.events.mu.Unlock()
-	if listening {
-		<-s.events.done
-	}
-}
-
-// listen listens until the store closes, reconnecting after a failure: on eventChannel, for
-// event watchers, and on contentChannel, for the content indexes. Every (re)connection signals
-// and marks every index stale, so a watcher re-reads anything committed while the connection
-// was down, and an index refreshes.
-func (s *Store) listen() {
-	ctx := s.events.ctx
-	ready := func() {
-		s.events.signal()
-		s.allIndexesChanged()
-		s.allSegmentsChanged()
-	}
-	deliver := func(channel, payload string) {
-		switch channel {
-		case contentChannel:
-			if sc, ok := backend.ParseScope(payload); ok {
-				s.indexChanged(sc)
-			}
-		case segmentChannel:
-			if sc, ok := backend.ParseScope(payload); ok {
-				s.segmentsChanged(sc)
-			}
-		default:
-			s.events.signal()
-		}
-	}
-	for backoff := time.Second; ctx.Err() == nil; {
-		start := time.Now()
-		err := s.signals.Listen(ctx, []string{eventChannel, contentChannel, segmentChannel}, ready, deliver)
-		if ctx.Err() != nil {
-			return
-		}
-		slog.Warn("ok scm: event listener", slog.Any("err", err))
-		if time.Since(start) > time.Minute {
-			backoff = time.Second
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(backoff):
-		}
-		backoff = min(backoff*2, 30*time.Second)
-	}
-}
+// Close waits for the marks in flight to be made.
+func (s *Store) Close() { s.marksMade() }
 
 // eventPage is how many events one read returns.
 const eventPage = 1000
@@ -228,51 +133,119 @@ const EventTopic = scmfeed.Topic
 // relayPage is how many events one relay round publishes.
 const relayPage = 500
 
-// Relay publishes to stream every event no relay has yet, until ctx ends: at least once each, as
-// they commit, any number of relays beside it (docs/hosted.md, "The per-repository log"). Beside
-// it, it runs the sequencing passes that writers stopped before running leave (sweep).
-func (s *Store) Relay(ctx context.Context, stream bus.Stream) error {
-	s.startListening()
-	swept := make(chan struct{})
-	go func() {
-		defer close(swept)
-		s.sweep(ctx)
-	}()
-	defer func() { <-swept }()
+// relayKind is the step that publishes the events a transaction placed: a job it enqueued as it
+// was about to commit, naming its repository and the places it gave (pendRelay).
+const relayKind = "relay"
+
+// commitWithin is how long a step's job waits for the transaction that enqueued it to commit
+// before it takes the transaction as one that never did.
+const commitWithin = time.Minute
+
+// pendRelay pends, in tx, the relay of the events it places in repo, first through last.
+func pendRelay(ctx context.Context, tx *txn, repo, first, last int64) error {
+	return tx.PendStep(ctx, relayKind, repo, time.Time{}, relayBody(first, last))
+}
+
+func relayBody(first, last int64) []byte {
+	return binary.BigEndian.AppendUint64(binary.BigEndian.AppendUint64(nil, uint64(first)), uint64(last))
+}
+
+// Relay relays every event its transaction placed, as their relay steps' jobs come, until ctx
+// ends: on q, a job for each of the log's followers naming each repository whose log grew
+// (follow.Relay), at least once each, any number of replicas beside it (docs/state.md, "Events
+// between services"). Beside it, it runs the sequencing passes writers stopped before running
+// (sequenceStep), and, once, takes up what a release before steps left (relayLeftovers).
+func (s *Store) Relay(ctx context.Context, q bus.Queue) error {
+	w := s.Work()
+	var wg sync.WaitGroup
+	wg.Go(func() { work.Consume(ctx, w, relayKind, 4, time.Second, s.relayStep(q), nil) })
+	// The writers waiting on what the store's transactions changed — a sequencing pass's end — hear
+	// of it (internal/wait), on this replica's bus.
+	wg.Go(func() { wait.Run(ctx, s.b.Waits(), q, slog.Default()) })
+	if s.b.SequencesAfterCommit() {
+		wg.Go(func() { work.Consume(ctx, w, sequenceKind, 2, time.Second, s.sequenceStep, nil) })
+	}
+	wg.Go(func() {
+		if err := work.Once(ctx, s.Work(), relayUpgrade, func(ctx context.Context) error { return s.relayLeftovers(ctx, q) }, nil); err != nil && ctx.Err() == nil {
+			slog.Warn("ok scm: taking up what a release before left to relay", slog.Any("err", err))
+		}
+	})
+	wg.Wait()
+	return ctx.Err()
+}
+
+// relayStep publishes a repository's pending events, done once those the job's transaction placed
+// are published — by it, or by another relay, which holds them meanwhile. A job whose
+// transaction's events are not placed may beat its commit: looked at again soon, until it is a
+// minute old. A job of no events (first and last 0: a move's arrival) is done once none of the
+// repository's is pending.
+func (s *Store) relayStep(q bus.Queue) work.Step {
+	return func(ctx context.Context, repo int64, body []byte, age time.Duration) error {
+		if len(body) != 16 {
+			return nil
+		}
+		first, last := int64(binary.BigEndian.Uint64(body)), int64(binary.BigEndian.Uint64(body[8:]))
+		written, relayed, err := s.b.EventsRelayed(ctx, repo, first, last)
+		switch {
+		case err != nil:
+			return err
+		case !written && age < commitWithin:
+			return work.Later{After: min(max(age, 20*time.Millisecond), 2*time.Second)}
+		case !written || relayed:
+			return nil
+		}
+		for {
+			n, err := s.relayOnce(ctx, q, repo)
+			if err != nil {
+				return err
+			}
+			if n < relayPage {
+				break
+			}
+		}
+		if _, relayed, err = s.b.EventsRelayed(ctx, repo, first, last); err != nil || relayed {
+			return err
+		}
+		return work.Later{After: time.Second} // another relay holds them
+	}
+}
+
+// relayUpgrade takes up, once, what a release before steps left: rows its writers left pending,
+// and events its relay had not published (relayLeftovers).
+const relayUpgrade = "relay-upgrade"
+
+// relayLeftovers sequences every repository's pending rows and relays every pending event.
+func (s *Store) relayLeftovers(ctx context.Context, q bus.Queue) error {
+	if err := s.sweepOnce(ctx, time.Now()); err != nil {
+		return err
+	}
 	for {
-		wake := s.events.wait()
-		n, err := s.relayOnce(ctx, stream)
-		if err != nil && ctx.Err() == nil {
-			slog.Warn("ok scm: relaying events", slog.Any("err", err))
-		}
-		if n == relayPage && err == nil {
-			continue
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-wake:
-		case <-time.After(relayPoll):
+		n, err := s.relayOnce(ctx, q, 0)
+		if err != nil || n < relayPage {
+			return err
 		}
 	}
 }
 
-// relayPoll is how often a caught-up relay looks for events without a notification.
-const relayPoll = time.Second
-
-// relayOnce publishes one page of pending events.
-func (s *Store) relayOnce(ctx context.Context, stream bus.Stream) (int, error) {
-	return s.b.RelayEvents(ctx, relayPage, func(rows []backend.Event) error {
-		evs, err := decodeEvents(rows)
-		if err != nil {
-			return err
+// relayOnce relays one page of repo's pending events — of every repository's, for 0 — to the
+// followers registered before it takes them: one registered after catches up, as it first starts,
+// past every event placed before it registered (follow.Follower). The followers are read before
+// the page is taken, which on PostgreSQL holds its connection.
+func (s *Store) relayOnce(ctx context.Context, q bus.Queue, repo int64) (int, error) {
+	followers, err := s.b.Followers(ctx, scmfeed.Topic)
+	if err != nil {
+		return 0, err
+	}
+	return s.b.RelayEvents(ctx, repo, relayPage, func(rows []backend.Event) error {
+		out := make([]bus.Event, len(rows))
+		for i, r := range rows {
+			out[i] = bus.Event{Topic: scmfeed.Topic, Key: r.Repository, Seq: r.RepositorySeq}
 		}
-		out := make([]bus.Event, len(evs))
-		for i, ev := range evs {
-			if out[i], err = scmfeed.Encode(ev); err != nil {
-				return err
-			}
-		}
-		return stream.Publish(ctx, out...)
+		return follow.Relay(ctx, q, scmfeed.Topic, followers, out)
 	})
+}
+
+// AddFollower records a role as one of the SCM's events' followers (Events.Follow).
+func (s *Store) AddFollower(ctx context.Context, name string) error {
+	return s.b.AddFollower(ctx, scmfeed.Topic, name)
 }

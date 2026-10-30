@@ -74,3 +74,29 @@ func AdvanceCursor(ctx context.Context, q Querier, topic string, key, seq int64)
 		ON CONFLICT (topic, key) DO UPDATE SET seq = greatest(follow_cursor.seq, EXCLUDED.seq)`, topic, key, seq)
 	return err
 }
+
+// FollowersSchema makes the table a log's source keeps its followers in (internal/bus/follow): the
+// roles its relay enqueues for, each as it registered.
+const FollowersSchema = `CREATE TABLE follower (
+    topic       text        NOT NULL,
+    name        text        NOT NULL,
+    followed_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (topic, name)
+);`
+
+// AddFollower records name as one of topic's followers, once.
+func AddFollower(ctx context.Context, q Querier, topic, name string) error {
+	_, err := q.Exec(ctx, `INSERT INTO follower (topic, name) VALUES ($1, $2) ON CONFLICT DO NOTHING`, topic, name)
+	return err
+}
+
+// Followers are topic's followers, by name.
+func Followers(ctx context.Context, q interface {
+	Query(context.Context, string, ...any) (pgx.Rows, error)
+}, topic string) ([]string, error) {
+	rows, err := q.Query(ctx, `SELECT name FROM follower WHERE topic = $1 ORDER BY name`, topic)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, pgx.RowTo[string])
+}

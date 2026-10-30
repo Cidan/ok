@@ -9,7 +9,7 @@ import (
 	"github.com/Cidan/ok/internal/scm/encoding"
 	"github.com/Cidan/ok/internal/scm/segment"
 	"github.com/Cidan/ok/internal/scm/store/backend"
-	"github.com/Cidan/ok/internal/work"
+	"github.com/Cidan/ok/internal/wait"
 	scmpb "github.com/Cidan/ok/proto/ok/scm/v1"
 )
 
@@ -71,6 +71,9 @@ func (s *Store) Fork(ctx context.Context, id, parent int64, createdBy string) (R
 		if err := s.inherit(ctx, tx, r.ID, parent, p.HeadSeq); err != nil {
 			return err
 		}
+		if err := made(ctx, tx, r.ID); err != nil {
+			return err
+		}
 		return appendEvent(ctx, tx, r.ID, &scmpb.Event{Kind: &scmpb.Event_RepositoryCreated{
 			RepositoryCreated: &scmpb.RepositoryCreated{CreatedById: createdBy},
 		}})
@@ -78,7 +81,6 @@ func (s *Store) Fork(ctx context.Context, id, parent int64, createdBy string) (R
 	if err != nil {
 		return Repository{}, err
 	}
-	s.segmentsChanged(repoScope(r.ID))
 	return r, nil
 }
 
@@ -173,7 +175,6 @@ func (s *Store) Sync(ctx context.Context, fork, parent int64, actor string) (Syn
 	if err != nil {
 		return SyncResult{}, err
 	}
-	s.segmentsChanged(repoScope(fork))
 	return out, nil
 }
 
@@ -231,7 +232,7 @@ func (s *Store) inherit(ctx context.Context, tx *txn, repo, parent, follow int64
 	if _, ok, err := tx.ContentIndexGeneration(ctx, repoScope(repo)); err != nil {
 		return err
 	} else if ok {
-		gen, _, err := tx.LockContentIndex(ctx, repoScope(repo))
+		gen, _, err := tx.lockIndex(ctx, repoScope(repo))
 		if err != nil {
 			return err
 		}
@@ -241,9 +242,6 @@ func (s *Store) inherit(ctx context.Context, tx *txn, repo, parent, follow int64
 			return err
 		}
 		if err := tx.SetContentIndexGeneration(ctx, repoScope(repo), gen+1, st.Folded); err != nil {
-			return err
-		}
-		if err := tx.Notify(ctx, contentChannel, repoScope(repo).String()); err != nil {
 			return err
 		}
 	}
@@ -268,30 +266,25 @@ func (s *Store) checkMainPlace(ctx context.Context, r Repository) error {
 }
 
 // compactFully moves everything pinned in a repository's tail into segments, and folds its content
-// index, holding its compaction's lease — waiting for another holder to finish — so no other
-// compaction merges its segments meanwhile.
+// index, holding its compaction's lease — waiting for another holder to finish, told as it does
+// (wait.Claims) — so no other compaction merges its segments meanwhile.
 func (s *Store) compactFully(ctx context.Context, repo int64) error {
-	for wait := 10 * time.Millisecond; ; wait = min(2*wait, time.Second) {
-		held, release, ok, err := work.Claim(ctx, s.Work(), SegmentWork, repo, s.holder, time.Minute)
+	held, release, _, err := s.Claims().Claim(ctx, SegmentWork, repo, s.holder, time.Minute, wait.Forever)
+	if err != nil {
+		return err
+	}
+	defer release()
+	// From the tail's start: what a window looked through before it was pinned moves too.
+	if err := s.ops(held).SetCompactionCursor(held, repo, tailCursor{}.encode()); err != nil {
+		return err
+	}
+	for {
+		r, err := s.CompactSegments(held, repo, 1)
 		if err != nil {
 			return err
 		}
-		if ok {
-			defer release()
-			for {
-				r, err := s.CompactSegments(held, repo, 1)
-				if err != nil {
-					return err
-				}
-				if !r.More {
-					return nil
-				}
-			}
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(wait):
+		if !r.More {
+			return nil
 		}
 	}
 }

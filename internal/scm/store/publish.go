@@ -2,15 +2,15 @@ package store
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
-	"io"
-	"os"
 	"slices"
 	"sort"
 	"time"
 
+	"github.com/Cidan/ok/internal/membuf"
 	"github.com/Cidan/ok/internal/scm/contentindex"
 	"github.com/Cidan/ok/internal/scm/encoding"
 	"github.com/Cidan/ok/internal/scm/pack"
@@ -60,11 +60,16 @@ type Publication struct {
 	heldFiles  map[encoding.ID]bool
 	chunkLen   map[encoding.ID]uint32
 	wantChunks map[encoding.ID]bool
-	spooled    map[encoding.ID]pack.Location
-	// spooledTrees are the trees the pack holds, as it holds the chunks sent.
-	spooledTrees map[encoding.ID]pack.Location
-	spool        *os.File
-	pw           *pack.Writer
+	// packs are the publish's packs, each held in memory as it is written — what it holds counted
+	// against the store's publishMemory, memory — and sent to the bucket once it is full or the
+	// publish commits. spooled are the chunks sent, and spooledTrees the trees, where they are.
+	packs        []*spoolPack
+	spooled      map[encoding.ID]spooledAt
+	spooledTrees map[encoding.ID]spooledAt
+	memory       int64
+	// window is the bytes of a sent pack the publish read last: a file's chunks, read in order, cost
+	// a request a window, not one each.
+	window spoolWindow
 
 	missingObjects []ObjectRef
 	missingChunks  []encoding.ID
@@ -105,7 +110,7 @@ func (s *Store) BeginPublish(ctx context.Context, repo int64, principal, workspa
 		received: map[ObjectRef]encoding.Object{}, bodies: map[ObjectRef][]byte{},
 		files: map[encoding.ID]FileManifest{}, heldFiles: map[encoding.ID]bool{},
 		chunkLen: map[encoding.ID]uint32{}, wantChunks: map[encoding.ID]bool{},
-		spooled: map[encoding.ID]pack.Location{}, spooledTrees: map[encoding.ID]pack.Location{},
+		spooled: map[encoding.ID]spooledAt{}, spooledTrees: map[encoding.ID]spooledAt{},
 	}
 	for _, r := range objects {
 		switch r.Kind {
@@ -438,7 +443,7 @@ func (p *Publication) isolated(r ObjectRef, obj encoding.Object) error {
 
 // AddChunk receives one missing chunk, which must be its declared length and hash to
 // its ID. It is spooled into the publish's pack.
-func (p *Publication) AddChunk(id encoding.ID, data []byte) error {
+func (p *Publication) AddChunk(ctx context.Context, id encoding.ID, data []byte) error {
 	if !p.wantChunks[id] {
 		if _, got := p.spooled[id]; got {
 			return invalid("chunk %s sent twice", id)
@@ -451,65 +456,167 @@ func (p *Publication) AddChunk(id encoding.ID, data []byte) error {
 	if got := pack.ChunkID(data); got != id {
 		return invalid("chunk %s: bytes hash to %s", id, got)
 	}
-	if err := p.startPack(); err != nil {
-		return err
-	}
-	loc, err := p.pw.Add(id, data)
+	at, err := p.spoolRecord(ctx, id, data)
 	if err != nil {
 		return err
 	}
 	delete(p.wantChunks, id)
-	p.spooled[id] = loc
+	p.spooled[id] = at
 	return nil
 }
 
 // spoolTree adds a tree's canonical body to the publish's pack.
-func (p *Publication) spoolTree(id encoding.ID, body []byte) error {
-	if err := p.startPack(); err != nil {
-		return err
-	}
-	loc, err := p.pw.Add(id, body)
+func (p *Publication) spoolTree(ctx context.Context, id encoding.ID, body []byte) error {
+	at, err := p.spoolRecord(ctx, id, body)
 	if err != nil {
 		return err
 	}
-	p.spooledTrees[id] = loc
+	p.spooledTrees[id] = at
 	return nil
 }
 
-// startPack starts the publish's pack, spooled to a temporary file, if it has none yet.
-func (p *Publication) startPack() error {
-	if p.pw != nil {
+// spoolPack is one pack of a publish: in memory until it is sent, then in the bucket as id.
+type spoolPack struct {
+	buf  membuf.Buffer
+	pw   *pack.Writer
+	sent bool
+	id   encoding.ID
+	size int64
+}
+
+// spooledAt is where a publish spooled a chunk or a tree: a record of its pack's.
+type spooledAt struct {
+	pack int
+	loc  pack.Location
+}
+
+// spoolWindow is bytes of a sent pack, from off.
+type spoolWindow struct {
+	pack int
+	off  int64
+	data []byte
+}
+
+// sentWindow is the most a read of a sent pack's records fetches beyond what it was asked for.
+const sentWindow = 4 << 20
+
+// recordCost is the memory a record of n bytes takes in a pack being written: its stored bytes at
+// most, its header, and its index entry.
+func recordCost(n int) int64 { return int64(n) + pack.Overhead(1) - pack.Overhead(0) }
+
+// spoolRecord adds a chunk's or a tree's record to the publish's pack in memory, holding what it
+// costs of the store's publishMemory: past publishPackBytes, the pack is sent first, and another
+// started; when publishes at once hold all of it, this publish sends what it holds and waits.
+func (p *Publication) spoolRecord(ctx context.Context, id encoding.ID, data []byte) (spooledAt, error) {
+	cost := min(recordCost(len(data)), p.s.publishMemoryBytes)
+	if cur := p.current(); cur != nil && cur.buf.Len()+cost > p.s.publishPackBytes {
+		if err := p.send(ctx); err != nil {
+			return spooledAt{}, err
+		}
+	}
+	if !p.s.publishMemory.TryAcquire(cost) {
+		if err := p.send(ctx); err != nil {
+			return spooledAt{}, err
+		}
+		if err := p.s.publishMemory.Acquire(ctx, cost); err != nil {
+			return spooledAt{}, err
+		}
+	}
+	p.memory += cost
+	cur := p.current()
+	if cur == nil {
+		cur = &spoolPack{}
+		cur.pw = pack.NewWriter(&cur.buf)
+		p.packs = append(p.packs, cur)
+	}
+	loc, err := cur.pw.Add(id, data)
+	if err != nil {
+		return spooledAt{}, err
+	}
+	return spooledAt{pack: len(p.packs) - 1, loc: loc}, nil
+}
+
+// current is the pack being written: nil before the first, and once the last was sent.
+func (p *Publication) current() *spoolPack {
+	if len(p.packs) == 0 || p.packs[len(p.packs)-1].sent {
 		return nil
 	}
-	f, err := os.CreateTemp("", "ok scm-pack-*")
+	return p.packs[len(p.packs)-1]
+}
+
+// send sends the pack being written to the bucket, if there is one, and lets its memory go. A pack
+// sent by a publish that never commits is an orphan, which collection deletes (deletePacks).
+func (p *Publication) send(ctx context.Context) error {
+	cur := p.current()
+	if cur == nil {
+		return nil
+	}
+	id, size, err := cur.pw.Close()
 	if err != nil {
 		return err
 	}
-	p.spool, p.pw = f, pack.NewWriter(f)
+	if err := p.s.blobs.Put(ctx, packKey(p.net, id), cur.buf.Reader(), size); err != nil {
+		return err
+	}
+	cur.sent, cur.id, cur.size, cur.pw = true, id, size, nil
+	cur.buf.Reset()
+	p.release()
 	return nil
 }
 
-// Close releases the publication's spooled pack. Commit calls it.
+// release lets go of the memory the publish holds.
+func (p *Publication) release() {
+	if p.memory > 0 {
+		p.s.publishMemory.Release(p.memory)
+		p.memory = 0
+	}
+}
+
+// Close releases the publication's spooled packs. Commit calls it.
 func (p *Publication) Close() {
 	if p.closed {
 		return
 	}
 	p.closed = true
-	if p.spool != nil {
-		p.spool.Close()
-		os.Remove(p.spool.Name())
+	for _, sp := range p.packs {
+		sp.buf.Reset()
 	}
+	p.release()
 }
 
-// chunk returns a staged file's chunk: from the spool if this publish sent it, else from
-// storage.
-func (p *Publication) chunk(ctx context.Context, c ChunkRef) ([]byte, error) {
-	if loc, ok := p.spooled[c.ID]; ok {
-		stored := make([]byte, loc.StoredLength)
-		if _, err := p.spool.ReadAt(stored, loc.DataOffset()); err != nil {
+// stored reads a spooled record's stored bytes: from memory while its pack is, else from the
+// bucket, a window at a time.
+func (p *Publication) stored(ctx context.Context, at spooledAt) ([]byte, error) {
+	sp := p.packs[at.pack]
+	off, n := at.loc.DataOffset(), int64(at.loc.StoredLength)
+	if !sp.sent {
+		out := make([]byte, n)
+		if _, err := sp.buf.ReadAt(out, off); err != nil {
 			return nil, err
 		}
-		return pack.Decode(p.s.dicts.of(p.net), c.ID, loc.Codec, loc.RawLength, stored)
+		return out, nil
+	}
+	w := p.window
+	if w.data == nil || w.pack != at.pack || off < w.off || off+n > w.off+int64(len(w.data)) {
+		data, err := p.s.blobs.GetRange(ctx, packKey(p.net, sp.id), off, min(max(n, sentWindow), sp.size-off))
+		if err != nil {
+			return nil, err
+		}
+		p.window = spoolWindow{pack: at.pack, off: off, data: data}
+		w = p.window
+	}
+	return w.data[off-w.off : off-w.off+n], nil
+}
+
+// chunk returns a staged file's chunk: from the publish's packs if this publish sent it, else from
+// storage.
+func (p *Publication) chunk(ctx context.Context, c ChunkRef) ([]byte, error) {
+	if at, ok := p.spooled[c.ID]; ok {
+		stored, err := p.stored(ctx, at)
+		if err != nil {
+			return nil, err
+		}
+		return pack.Decode(p.s.dicts.of(p.net), c.ID, at.loc.Codec, at.loc.RawLength, stored)
 	}
 	data, err := p.s.chunkBytes(ctx, p.repo, []encoding.ID{c.ID})
 	if err != nil {
@@ -577,6 +684,30 @@ func (t publishedTrees) writeTree(*encoding.Tree) (encoding.ID, error) {
 	return encoding.ID{}, errors.New("a publish's trees are read, never written")
 }
 
+// firstSpooled is where a new file's first chunk this publish sent lies: none, after every pack, for
+// a file of chunks the repository held.
+func (p *Publication) firstSpooled(file encoding.ID) spoolPlace {
+	for _, c := range p.files[file].Chunks {
+		if at, ok := p.spooled[c.ID]; ok {
+			return spoolPlace{pack: at.pack, off: at.loc.Offset}
+		}
+	}
+	return spoolPlace{pack: len(p.packs)}
+}
+
+// spoolPlace is a place in a publish's packs.
+type spoolPlace struct {
+	pack int
+	off  int64
+}
+
+func (a spoolPlace) compare(b spoolPlace) int {
+	if c := cmp.Compare(a.pack, b.pack); c != 0 {
+		return c
+	}
+	return cmp.Compare(a.off, b.off)
+}
+
 // verifyFile checks that a new file's chunks, concatenated in manifest order, hash to
 // its ID.
 func (p *Publication) verifyFile(ctx context.Context, f FileManifest) error {
@@ -612,7 +743,10 @@ func (p *Publication) Commit(ctx context.Context, heads *OpHeadsUpdate) ([]encod
 		fileIDs = append(fileIDs, id)
 	}
 	sortIDs(fileIDs)
-	for _, id := range fileIDs {
+	// In the order their first chunks lie in the packs: a sent pack is read through once.
+	verifying := slices.Clone(fileIDs)
+	slices.SortStableFunc(verifying, func(a, b encoding.ID) int { return p.firstSpooled(a).compare(p.firstSpooled(b)) })
+	for _, id := range verifying {
 		if err := p.verifyFile(ctx, p.files[id]); err != nil {
 			return nil, err
 		}
@@ -673,23 +807,12 @@ func (p *Publication) Commit(ctx context.Context, heads *OpHeadsUpdate) ([]encod
 	// The trees sent go in the pack, after the chunks: the content index holds them, and reads
 	// find them there, as it does the chunks.
 	for _, r := range p.sortedReceived(func(k encoding.Kind) bool { return k == encoding.KindTree }) {
-		if err := p.spoolTree(r.ID, p.bodies[r]); err != nil {
+		if err := p.spoolTree(ctx, r.ID, p.bodies[r]); err != nil {
 			return nil, err
 		}
 	}
-	var packID encoding.ID
-	var packSize int64
-	if p.pw != nil {
-		var err error
-		if packID, packSize, err = p.pw.Close(); err != nil {
-			return nil, err
-		}
-		if _, err := p.spool.Seek(0, io.SeekStart); err != nil {
-			return nil, err
-		}
-		if err := p.s.blobs.Put(ctx, packKey(p.net, packID), p.spool, packSize); err != nil {
-			return nil, err
-		}
+	if err := p.send(ctx); err != nil {
+		return nil, err
 	}
 
 	carriesOps := heads != nil
@@ -740,8 +863,8 @@ func (p *Publication) Commit(ctx context.Context, heads *OpHeadsUpdate) ([]encod
 			return rej
 		}
 		var stored []ref
-		if p.pw != nil {
-			held, err := p.insertPack(ctx, tx, packID, packSize)
+		if len(p.packs) > 0 {
+			held, err := p.insertPacks(ctx, tx)
 			if err != nil {
 				return err
 			}
@@ -809,10 +932,11 @@ func packKey(net backend.Network, id encoding.ID) string { return packPrefix(net
 // packPrefix begins the key of every pack of a network.
 func packPrefix(net backend.Network) string { return fmt.Sprintf("nets/%d/packs/", net) }
 
-// insertPack records the pack and what it holds — the chunks sent, and the trees — each the
-// repository lacks in the repository's content index, and each the network lacks a location of in
-// the network's. It returns the trees the repository held already, to touch with the rest.
-func (p *Publication) insertPack(ctx context.Context, tx *txn, packID encoding.ID, size int64) ([]ref, error) {
+// insertPacks records the publish's packs and what they hold — the chunks sent, and the trees —
+// each the repository lacks in the repository's content index, and each the network lacks a
+// location of in the network's. It returns the trees the repository held already, to touch with
+// the rest.
+func (p *Publication) insertPacks(ctx context.Context, tx *txn) ([]ref, error) {
 	lg, err := p.s.txIndex(ctx, tx, repoScope(p.repo))
 	if err != nil {
 		return nil, err
@@ -824,49 +948,69 @@ func (p *Publication) insertPack(ctx context.Context, tx *txn, packID encoding.I
 	type record struct {
 		id   encoding.ID
 		kind encoding.Kind
-		loc  pack.Location
+		at   spooledAt
 	}
 	records := make([]record, 0, len(p.spooled)+len(p.spooledTrees))
 	ids := make([]encoding.ID, 0, cap(records))
-	for id, loc := range p.spooled {
-		records, ids = append(records, record{id, encoding.KindChunk, loc}), append(ids, id)
+	for id, at := range p.spooled {
+		records, ids = append(records, record{id, encoding.KindChunk, at}), append(ids, id)
 	}
-	for id, loc := range p.spooledTrees {
-		records, ids = append(records, record{id, encoding.KindTree, loc}), append(ids, id)
+	for id, at := range p.spooledTrees {
+		records, ids = append(records, record{id, encoding.KindTree, at}), append(ids, id)
 	}
 	slices.SortFunc(records, func(a, b record) int { return bytes.Compare(a.id[:], b.id[:]) })
 	// A record another publish stored first keeps its entry, and one the network stores already
-	// keeps its location; this pack's copy of either is dead bytes that compaction reclaims.
-	if err := lg.load(ctx, ids); err != nil {
-		return nil, err
-	}
-	if err := net.load(ctx, ids); err != nil {
-		return nil, err
-	}
+	// keeps its location; this pack's copy of either is dead bytes that compaction reclaims. A
+	// location of what the repository does not hold is the network's collection's to drop once no
+	// repository holds it (collectReleases): relied on, it is decided by under the network's lock,
+	// as the collection decides — this publish then committed before the collection reads what
+	// repositories hold, or finds the location gone and records its own.
 	var fresh, unlocated []record
 	var held []ref
-	for _, r := range records {
-		_, has, err := lg.has(ctx, r.kind, r.id)
-		if err != nil {
+	for {
+		if err := lg.load(ctx, ids); err != nil {
 			return nil, err
 		}
-		switch {
-		case !has:
-			fresh = append(fresh, r)
-		case r.kind == encoding.KindTree:
-			held = append(held, ref{table: tObject, kind: encoding.KindTree, id: r.id})
-		}
-		_, located, err := net.has(ctx, r.kind, r.id)
-		if err != nil {
+		if err := net.load(ctx, ids); err != nil {
 			return nil, err
 		}
-		if !located {
-			unlocated = append(unlocated, r)
+		fresh, unlocated, held = fresh[:0], unlocated[:0], held[:0]
+		relied := false
+		for _, r := range records {
+			_, has, err := lg.has(ctx, r.kind, r.id)
+			if err != nil {
+				return nil, err
+			}
+			switch {
+			case !has:
+				fresh = append(fresh, r)
+			case r.kind == encoding.KindTree:
+				held = append(held, ref{table: tObject, kind: encoding.KindTree, id: r.id})
+			}
+			_, located, err := net.has(ctx, r.kind, r.id)
+			if err != nil {
+				return nil, err
+			}
+			if !located {
+				unlocated = append(unlocated, r)
+			} else if !has {
+				relied = true
+			}
+		}
+		if !relied || net.locked {
+			break
+		}
+		if err := net.lock(ctx); err != nil {
+			return nil, err
 		}
 	}
-	num, err := tx.PutPack(ctx, p.net, packID, size)
-	if err != nil {
-		return nil, err
+	nums := make([]uint64, len(p.packs))
+	for i, sp := range p.packs {
+		num, err := tx.PutPack(ctx, p.net, sp.id, sp.size)
+		if err != nil {
+			return nil, err
+		}
+		nums[i] = num
 	}
 	for _, r := range fresh {
 		p.s.logIndex(tx, repoScope(p.repo), contentindex.Update{Op: contentindex.Put, ID: r.id, Entry: contentindex.Entry{
@@ -876,7 +1020,8 @@ func (p *Publication) insertPack(ctx context.Context, tx *txn, packID encoding.I
 	for _, r := range unlocated {
 		p.s.logIndex(tx, backend.NetworkScope(p.net), contentindex.Update{Op: contentindex.Put, ID: r.id, Entry: contentindex.Entry{
 			Kind: r.kind, Day: net.today,
-			Loc: contentindex.Location{Pack: num, Offset: r.loc.Offset, Stored: r.loc.StoredLength, Raw: r.loc.RawLength, Codec: uint8(r.loc.Codec)},
+			Loc: contentindex.Location{Pack: nums[r.at.pack], Offset: r.at.loc.Offset, Stored: r.at.loc.StoredLength, Raw: r.at.loc.RawLength,
+				Codec: uint8(r.at.loc.Codec)},
 		}})
 	}
 	return held, nil

@@ -7,8 +7,8 @@ import (
 
 	"github.com/Cidan/ok/internal/directory"
 	"github.com/Cidan/ok/internal/directory/scim"
-	"github.com/Cidan/ok/internal/lock"
 	"github.com/Cidan/ok/internal/tenancy"
+	"github.com/Cidan/ok/internal/wait"
 	"github.com/Cidan/ok/internal/work"
 )
 
@@ -21,21 +21,24 @@ type Backend interface {
 	// Txn runs fn in one read-write transaction, again if the database aborts it to break a
 	// deadlock or a conflict; fn has no effects outside the transaction.
 	Txn(ctx context.Context, fn func(tx Ops) error) error
-	// Work is its keyed work's store: mail's sending.
+	// Work is its keyed work's store: mail's sending, syncs, moves, housekeeping.
 	Work() work.Store
-	// Lock runs fn holding the lock id in bucket, which one holder has at a time, waiting up to
-	// wait for it (0: not at all), with a context that ends if the lock is lost. It returns
-	// lock.ErrNotAcquired when it could not take it, and otherwise fn's error.
-	Lock(ctx context.Context, bucket, id string, wait time.Duration, fn lock.LockFn) error
+	// Waits are the live requests waiting on its subjects (internal/wait): a sync's claim.
+	Waits() wait.Store
 	// Ping reports whether the database answers.
 	Ping(ctx context.Context) error
 	// SCIM is what an identity provider provisioned (scim.Store), kept beside the directory.
 	SCIM() scim.Store
 	// SCIMOf is an organization's SCIM, by its ID.
 	SCIMOf(org string) scim.Store
-	// RelayDirectoryEvents takes up to limit pending events no other relay holds, calls publish
-	// with them in order, and marks them published if it succeeds; it returns how many it took.
-	RelayDirectoryEvents(ctx context.Context, limit int, publish func([]DirectoryEventRow) error) (int, error)
+	// RelayDirectoryEvents takes up to limit pending events of repo — of every repository, for 0 —
+	// no other relay holds, calls publish with them in order, and marks them published if it
+	// succeeds; it returns how many it took.
+	RelayDirectoryEvents(ctx context.Context, repo int64, limit int, publish func([]DirectoryEventRow) error) (int, error)
+	// DirectoryEventRelayed reports whether a repository's event at seq is placed — the
+	// transaction that placed it committed — and whether it no longer waits to be published; for
+	// seq 0, whether none of the repository's events waits.
+	DirectoryEventRelayed(ctx context.Context, repo, seq int64) (written, relayed bool, err error)
 }
 
 // Ops are the database's operations. Outside a transaction each is its own; inside Txn they are
@@ -300,12 +303,11 @@ type Ops interface {
 	// SetNotificationPrefs sets them.
 	NotificationPrefs(ctx context.Context, principal string) (uint64, bool, error)
 	SetNotificationPrefs(ctx context.Context, principal string, mailed uint64) error
-	// QueueMail queues a message; MailByID reads one; UpdateMail writes its state, attempts, next
-	// try, and last error. DueMails are up to limit waiting messages due by a time.
+	// QueueMail queues a message, its sending's work marked (MailWork) in the same transaction;
+	// MailByID reads one; UpdateMail writes its state, attempts, next try, and last error.
 	QueueMail(ctx context.Context, m Mail) error
 	MailByID(ctx context.Context, id int64) (Mail, bool, error)
 	UpdateMail(ctx context.Context, m Mail) error
-	DueMails(ctx context.Context, before time.Time, limit int) ([]int64, error)
 	// InboxVersion is the version a CL's inbox entries were set at (0: never); ReplaceInbox replaces
 	// them, at a version. InboxOf are up to limit of a person's entries — of a relation (0: both), of
 	// active CLs unless closed — those with attention first, then the latest changed.
@@ -323,6 +325,9 @@ type Ops interface {
 	ReportUsage(ctx context.Context, cell, month string, usage []Usage, at time.Time) error
 	UsageElsewhere(ctx context.Context, accounts []string, cell, month string, since time.Time) (map[string]Usage, error)
 
+	// MarkWorkAt marks identity's keyed work (internal/work), due at at, in the operations'
+	// transaction, which enqueues its job before it commits.
+	MarkWorkAt(ctx context.Context, kind string, key int64, at time.Time) error
 	// PutMove records a network's move over the one it had; LockMove reads it, held in a
 	// transaction (ErrNotFound for none); Move reads it; Moves are the latest, newest first;
 	// DueMoves the unfinished whose next_at has come, by network.
@@ -399,6 +404,10 @@ type Ops interface {
 	DeleteIdentityProvider(ctx context.Context, org string) (bool, error)
 	// DueIdentityProviders are the organizations whose provider's sync is due at now.
 	DueIdentityProviders(ctx context.Context, now time.Time) ([]string, error)
+	// IdentityProviderOrg is the organization whose provider's sync key is key; ErrNotFound for
+	// none. SetIdentityProviderKey gives an organization's provider a key, if it has none.
+	IdentityProviderOrg(ctx context.Context, key int64) (string, error)
+	SetIdentityProviderKey(ctx context.Context, org string, key int64) error
 	// PutOrganizationSync records a sync that went: the mirror it followed, what waits, its notes.
 	// PutOrganizationSyncFailure one that failed.
 	PutOrganizationSync(ctx context.Context, org string, mirror, waiting, notes []byte, at time.Time) error
@@ -538,11 +547,18 @@ type Ops interface {
 	NextDirectorySeq(ctx context.Context, repo int64) (int64, error)
 	// InsertDirectoryEvent records an event at its place, pending its publishing.
 	InsertDirectoryEvent(ctx context.Context, e DirectoryEventRow, at time.Time) error
+	// PendStep has a step taken once the transaction commits (work.Pend): the relay of an event it
+	// logged. Only in a transaction.
+	PendStep(ctx context.Context, kind string, key int64, at time.Time, body []byte) error
 	// DirectoryEvents are up to limit of a repository's events after a place, in order.
 	DirectoryEvents(ctx context.Context, repo, after int64, limit int) ([]DirectoryEventRow, error)
 	// DirectoryHeads are how far up to limit repositories' logs reach, those after one, by
 	// repository.
 	DirectoryHeads(ctx context.Context, after int64, limit int) ([]DirectoryHead, error)
+	// AddFollower records a role as one of a topic's followers, once; Followers are a topic's, by
+	// name: whom the relay enqueues for (internal/bus/follow).
+	AddFollower(ctx context.Context, topic, name string) error
+	Followers(ctx context.Context, topic string) ([]string, error)
 }
 
 // StoredSet is a set of the applied tree as the database keeps it: its full name, kind ("group"

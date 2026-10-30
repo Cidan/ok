@@ -64,6 +64,8 @@ type Config struct {
 	// Listener, when set, is served instead of listening on Addr — mainly so tests
 	// can bind an ephemeral port and know it up front.
 	Listener net.Listener
+	// Local, when set, is served gRPC alone, besides: the process's own calls (inproc.Listener).
+	Local net.Listener
 	// MaxRecvMsgSize and MaxSendMsgSize bound the gRPC server's messages, in bytes; 0 is
 	// gRPC's default.
 	MaxRecvMsgSize, MaxSendMsgSize int
@@ -255,7 +257,14 @@ func Serve(ctx context.Context, cfg Config) error {
 		protocols.SetUnencryptedHTTP2(true)
 	}
 
-	serveErr := make(chan error, 2)
+	serveErr := make(chan error, 3)
+	if cfg.Local != nil {
+		go func() {
+			if err := grpcSrv.Serve(cfg.Local); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
+				serveErr <- err
+			}
+		}()
+	}
 	go func() {
 		var err error
 		if cfg.TLS != nil {

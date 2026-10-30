@@ -63,8 +63,8 @@ func startCell(t *testing.T, ctx context.Context, id *idtest.Identity, name stri
 	return startCellOn(t, ctx, id, name, roledb.NewPostgres(t), scmLis, controlLis)
 }
 
-// startCellOn starts a cell's development SCM and ok control on its databases: PostgreSQL's, its
-// bus beside them, or Spanner's, its bus a NATS server of its own.
+// startCellOn starts a cell's development SCM and ok control on its databases, PostgreSQL's or
+// Spanner's, and a bus of its own.
 func startCellOn(t *testing.T, ctx context.Context, id *idtest.Identity, name string, dbs *roledb.DBs, scmLis, controlLis net.Listener) cellRoles {
 	t.Helper()
 	cfg, err := config.Parse([]byte("domain: example.com\npublic_url: http://127.0.0.1:1\nroles: " + idtest.Roles + "\ncell: {name: " + name + "}\n"))
@@ -72,10 +72,7 @@ func startCellOn(t *testing.T, ctx context.Context, id *idtest.Identity, name st
 		t.Fatal(err)
 	}
 	dbs.Configure(cfg)
-	if dbs.OnSpanner() {
-		n := &config.NATSBus{URL: bustest.NATS(t), AckWait: time.Second}
-		cfg.Bus = config.Bus{Stream: config.BusBackend{Type: "nats", NATS: n}, Queue: config.BusBackend{Type: "nats", NATS: n}}
-	}
+	cfg.Bus = bustest.Config(t)
 	open := func(schema string) *pgxpool.Pool { return dbs.Pool(t, schema, 0) }
 	scm, err := scmrole.Build(ctx, cfg, scmrole.Options{Dev: true, Pool: open(scmrole.Schema), Blobs: testobjects.Store(t),
 		Identity: id.As("scm.ok.robot.example.com")})
@@ -85,8 +82,7 @@ func startCellOn(t *testing.T, ctx context.Context, id *idtest.Identity, name st
 	t.Cleanup(scm.Close)
 	serveRole(t, ctx, scm.Root, scm.Resolver, scmLis)
 	ctl, err := controlrole.Build(ctx, cfg, controlrole.Options{Dev: true, Pool: open(controlrole.Schema),
-		Identity: id.As("control.ok.robot.example.com"), SCM: dialAs(t, scmLis.Addr().String(), "control.ok.robot.example.com"),
-		Poll: 100 * time.Millisecond})
+		Identity: id.As("control.ok.robot.example.com"), SCM: dialAs(t, scmLis.Addr().String(), "control.ok.robot.example.com")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -150,9 +146,17 @@ func TestMoveBetweenCells(t *testing.T) {
 	if _, err := id.Store.AskMove(ctx, r.GetId(), "c2", id.ID(ada)); err == nil {
 		t.Error("asking the move again while it runs")
 	}
-	id.Mover.Pass(ctx)
-	if m, err = id.Store.GetMove(ctx, m.Network); err != nil || m.Phase != idstore.MoveDone || m.Error != "" {
-		t.Fatalf("the move after a pass: %+v, %v", m, err)
+	// Asked, its first step is booked, and identity's mover drives it.
+	for deadline := time.Now().Add(time.Minute); ; time.Sleep(50 * time.Millisecond) {
+		if m, err = id.Store.GetMove(ctx, m.Network); err != nil {
+			t.Fatal(err)
+		}
+		if m.Phase.Finished() || time.Now().After(deadline) {
+			break
+		}
+	}
+	if m.Phase != idstore.MoveDone || m.Error != "" {
+		t.Fatalf("the move: %+v", m)
 	}
 	if e, err := id.Store.Repository(ctx, r.GetId()); err != nil || e.Cell != "c2" {
 		t.Fatalf("the entry after the move: %+v, %v", e, err)

@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
@@ -56,7 +57,7 @@ func TestOrganizationSCIM(t *testing.T) {
 		}
 	}
 	sealer, _ := seal.New(bytes.Repeat([]byte{5}, 32))
-	o := &orgSCIM{st: st, sync: &enterprise.Syncer{Store: st, Sealer: sealer, AllowPrivate: true}, base: "https://ok.example.com", pending: map[string]bool{}}
+	o := &orgSCIM{st: st, base: "https://ok.example.com"}
 	sub := chi.NewMux()
 	prefix, err := o.Mount(sub)
 	if err != nil {
@@ -92,6 +93,22 @@ func TestOrganizationSCIM(t *testing.T) {
 			t.Errorf("%s: %d", name, code)
 		}
 	}
+	// The syncs their providers' setting booked, done: nothing is booked.
+	keys := map[string]int64{}
+	for _, h := range []string{"acme", "globex"} {
+		o, _ := st.OrganizationByHandle(ctx, h)
+		p, err := st.IdentityProviderOf(ctx, o.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		keys[o.ID] = p.Key
+		if _, err := st.Work().Take(ctx, store.SyncWork, p.Key, "test", time.Minute); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.Work().Release(ctx, store.SyncWork, p.Key, "test"); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if code := post("acme", tokens[0]); code != http.StatusCreated {
 		t.Fatalf("provisioning with acme's token: %d", code)
 	}
@@ -103,7 +120,13 @@ func TestOrganizationSCIM(t *testing.T) {
 	if us, _ := st.SCIMOf(globex.ID).Users(ctx); len(us) != 0 {
 		t.Errorf("globex's SCIM users: %d", len(us))
 	}
-	if _, err := o.sync.Sync(ctx, acme.ID); err != nil {
+	// The provisioning booked acme's sync soon, and globex's not at all.
+	for org, want := range map[string]bool{acme.ID: true, globex.ID: false} {
+		if peek, err := st.Work().Peek(ctx, store.SyncWork, keys[org]); err != nil || peek.Marked != want {
+			t.Errorf("%s's sync booked: %+v, %v; want %v", org, peek, err, want)
+		}
+	}
+	if _, err := (&enterprise.Syncer{Store: st, Sealer: sealer, AllowPrivate: true}).Sync(ctx, acme.ID); err != nil {
 		t.Fatal(err)
 	}
 	people, err := st.OrganizationPeople(ctx, acme.ID)

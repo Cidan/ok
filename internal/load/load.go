@@ -5,12 +5,11 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"math"
 	mrand "math/rand/v2"
+	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -67,19 +66,25 @@ type Config struct {
 	Duration      time.Duration
 	// Drain is how long after Duration the run waits for CLs under way to finish.
 	Drain time.Duration
+	// BurstAt, when set, is how long into the run every person starts a CL at once, beside the
+	// shape's; BurstSubmitAfter how long after that every one of them whose pre passed submits at
+	// once — or as its pre passes, past it. The burst's CLs are measured apart (burst.*).
+	BurstAt, BurstSubmitAfter time.Duration
 	// MaxInFlight bounds each operation's requests under way: one offered past it is shed.
 	MaxInFlight int
 	// PublishBytes, CheckpointBytes, and CLBytes are what each writes, in files of at most a MiB.
 	PublishBytes, CheckpointBytes, CLBytes int
-	// Workers are the synthetic workers; RunTime how long a job of theirs takes; Read whether it
-	// reads its commit's files through the SCM: with CheckoutDir, as a worker's real checkout does
-	// — each synthetic worker keeps one, in a directory of its own under CheckoutDir, and moves it
-	// to each job's commit, reading what changed — and without it, the whole commit, as a cache's
-	// miss would.
-	Workers     int
-	RunTime     time.Duration
-	Read        bool
-	CheckoutDir string
+	// Workers are the synthetic workers, and RunTime how long a job of theirs takes. With Present,
+	// each presents its job's commit as a worker does — through okfs, at a presentation of its own
+	// that Present makes the first time — and reads ReadFiles of the commit's files through it, at
+	// random, as a build reads its sources.
+	Workers   int
+	RunTime   time.Duration
+	Present   func(worker string) (checkout.Checkout, error)
+	ReadFiles int
+	// WarmCheckouts has every synthetic worker present main before the run offers anything, so what
+	// the run measures is a worker's moves, not every worker's first presentation at once.
+	WarmCheckouts bool
 	// WorkerPrefix tells this run's workers from others' — another pod's of the same run.
 	WorkerPrefix string
 	// SeedFiles, when set, has each repository seeded with a tree of that many files shaped as a
@@ -111,7 +116,7 @@ type run struct {
 	// mono and trees: a run with SeedFiles' seed, and the trees it read and wrote.
 	mono  *seeded
 	trees *trees
-	// checkouts are the synthetic workers' real checkouts, by worker, with CheckoutDir.
+	// checkouts are the synthetic workers' presentations, by worker, with Present.
 	checkoutsMu sync.Mutex
 	checkouts   map[string]checkout.Checkout
 }
@@ -144,8 +149,8 @@ type workspace struct {
 }
 
 // operations a run measures.
-// checkout is a synthetic worker's real checkout, made the first time it is needed (first).
-func (r *run) checkout(worker string, c Clients) (co checkout.Checkout, first bool, err error) {
+// checkout is a synthetic worker's presentation, made the first time it is needed (first).
+func (r *run) checkout(worker string) (co checkout.Checkout, first bool, err error) {
 	r.checkoutsMu.Lock()
 	defer r.checkoutsMu.Unlock()
 	if co, ok := r.checkouts[worker]; ok {
@@ -154,15 +159,16 @@ func (r *run) checkout(worker string, c Clients) (co checkout.Checkout, first bo
 	if r.checkouts == nil {
 		r.checkouts = map[string]checkout.Checkout{}
 	}
-	if co, err = checkout.NewReal(filepath.Join(r.cfg.CheckoutDir, strings.ReplaceAll(worker, "/", "_")), checkout.SCM(c.WorkerStore)); err != nil {
+	if co, err = r.cfg.Present(worker); err != nil {
 		return nil, true, err
 	}
 	r.checkouts[worker] = co
 	return co, true, nil
 }
 
-var operations = []string{"publish", "checkpoint", "browse", "cl.upload", "cl.review", "cl.submit", "cl.landed", "worker.lease", "worker.read",
-	"worker.first"}
+var operations = []string{"publish", "checkpoint", "browse", "cl.upload", "cl.review", "cl.submit", "cl.landed", "cl.pre", "cl.post",
+	"worker.lease", "worker.present", "worker.first", "worker.files",
+	"burst.upload", "burst.review", "burst.submit", "burst.landed", "burst.pre", "burst.post"}
 
 // Run drives the repositories for the duration, then waits for CLs under way, and reports.
 func Run(ctx context.Context, cfg Config) (*Report, error) {
@@ -221,9 +227,19 @@ func Run(ctx context.Context, cfg Config) (*Report, error) {
 		}
 		cfg.Log.Info("load: seeded", "repositories", len(r.repos), "files", cfg.SeedFiles, "took", time.Since(seeded).Round(time.Millisecond))
 	}
+	if cfg.WarmCheckouts && cfg.Present != nil {
+		if err := r.warm(ctx); err != nil {
+			stopWorkers()
+			workers.Wait()
+			return nil, fmt.Errorf("load: warming the workers' checkouts: %w", err)
+		}
+	}
 	offerCtx, stopOffering := context.WithTimeout(ctx, cfg.Duration)
 	defer stopOffering()
 	started := time.Now()
+	for _, st := range r.stats {
+		st.begin(started)
+	}
 	var ops, cls sync.WaitGroup
 	offer := func(name string, rate float64, do func(context.Context) error, group *sync.WaitGroup) {
 		defer ops.Done()
@@ -262,7 +278,17 @@ func Run(ctx context.Context, cfg Config) (*Report, error) {
 	go offer("publish", rates.Publishes, r.publish, &plain)
 	go offer("checkpoint", rates.Checkpoints, r.checkpoint, &plain)
 	go offer("browse", rates.Browses, r.browse, &plain)
-	go offer("cl.landed", rates.CLs, r.cl, &cls)
+	go offer("cl.landed", rates.CLs, func(ctx context.Context) error {
+		p, rs := r.pick()
+		return r.cl(ctx, "cl", p, rs, time.Time{})
+	}, &cls)
+	if cfg.BurstAt > 0 {
+		ops.Add(1)
+		go func() {
+			defer ops.Done()
+			r.burst(offerCtx, ctx, started.Add(cfg.BurstAt), &cls)
+		}()
+	}
 	ops.Wait()
 	offered := time.Since(started)
 	plain.Wait()
@@ -424,10 +450,34 @@ func (r *run) checkpoint(ctx context.Context) error {
 	return nil
 }
 
+// burst has every person start a CL at once at at — unless offering ended first — measured as
+// burst.*: their uploads at once, then, BurstSubmitAfter on, their submits at once, each as its
+// pre passed (cl). Each is one of the run's CLs, which it waits for as it drains.
+func (r *run) burst(offering, ctx context.Context, at time.Time, cls *sync.WaitGroup) {
+	select {
+	case <-offering.Done():
+		return
+	case <-time.After(time.Until(at)):
+	}
+	submitAt := at.Add(r.cfg.BurstSubmitAfter)
+	st := r.stats["burst.landed"]
+	r.cfg.Log.Info("load: the burst", "people", len(r.people), "submitting at", submitAt.UTC().Format(time.TimeOnly))
+	for i, p := range r.people {
+		st.offer()
+		cls.Add(1)
+		go func() {
+			defer cls.Done()
+			t0 := time.Now()
+			err := r.cl(ctx, "burst", p, r.repoOf(i), submitAt)
+			st.done(time.Since(t0), err)
+		}()
+	}
+}
+
 // cl has a person upload a CL of fresh files, another review and approve it, and its author submit
-// it once its pre passed and wait for it to land — each step measured, the whole as cl.landed.
-func (r *run) cl(ctx context.Context) error {
-	p, rs := r.pick()
+// it once its pre passed — not before submitAt, when set — and wait for it to land, each step
+// measured as kind's (cl, or burst), the whole by its caller.
+func (r *run) cl(ctx context.Context, kind string, p *Person, rs *repoState, submitAt time.Time) error {
 	head, err := r.mainHead(ctx, p, rs)
 	if err != nil {
 		return err
@@ -453,12 +503,12 @@ func (r *run) cl(ctx context.Context) error {
 	step := func(name string, do func() error) error {
 		t0 := time.Now()
 		err := do()
-		r.stats[name].offer()
-		r.stats[name].done(time.Since(t0), err)
+		r.stats[kind+"."+name].offer()
+		r.stats[kind+"."+name].done(time.Since(t0), err)
 		return err
 	}
 	var number int64
-	if err := step("cl.upload", func() error {
+	if err := step("upload", func() error {
 		if _, _, err := b.Publish(ctx, p.Store, rs.ID, nil); err != nil {
 			return err
 		}
@@ -476,21 +526,31 @@ func (r *run) cl(ctx context.Context) error {
 		return err
 	}
 	ref := &controlpb.CLRef{Repository: rs.Name, Number: number}
-	if err := step("cl.review", func() error {
+	if err := step("review", func() error {
 		_, err := r.reviewer(p).Control.Reply(ctx, &controlpb.ReplyRequest{Cl: ref, Grants: []*controlpb.ReplyRequest_Grant{
 			{Label: controlpb.Label_LABEL_LGTM, Granted: true}, {Label: controlpb.Label_LABEL_APPROVAL, Granted: true}}})
 		return err
 	}); err != nil {
 		return err
 	}
+	waited := time.Now()
 	stage, err := r.until(ctx, p, ref, controlpb.Stage_STAGE_SUBMITTABLE, controlpb.Stage_STAGE_PRE_FAILED)
+	r.stats[kind+".pre"].offer()
+	r.stats[kind+".pre"].done(time.Since(waited), err)
 	if err != nil {
 		return r.outcome(ref, "", err)
 	}
 	if stage == controlpb.Stage_STAGE_PRE_FAILED {
 		return r.outcome(ref, "pre failed", nil)
 	}
-	if err := step("cl.submit", func() error {
+	if !submitAt.IsZero() {
+		select {
+		case <-ctx.Done():
+			return r.outcome(ref, "", ctx.Err())
+		case <-time.After(time.Until(submitAt)):
+		}
+	}
+	if err := step("submit", func() error {
 		_, err := p.Control.Submit(ctx, &controlpb.SubmitRequest{Cl: ref})
 		return err
 	}); err != nil {
@@ -499,7 +559,10 @@ func (r *run) cl(ctx context.Context) error {
 	r.cls.Lock()
 	r.cls.submitted++
 	r.cls.Unlock()
+	waited = time.Now()
 	stage, err = r.until(ctx, p, ref, controlpb.Stage_STAGE_LANDED, controlpb.Stage_STAGE_POST_FAILED)
+	r.stats[kind+".post"].offer()
+	r.stats[kind+".post"].done(time.Since(waited), err)
 	if err != nil {
 		return r.outcome(ref, "", err)
 	}
@@ -599,20 +662,13 @@ func (r *run) do(ctx context.Context, c Clients, worker string, run *automationp
 		return
 	}
 	r.runs.jobs.Add(1)
-	// The job reads its commit's files while its run's time passes, its lease kept by heartbeats
-	// throughout, as a worker's checkout and build are: a large tree's read may outlast a lease.
+	// The job presents its commit and reads its files while its run's time passes, its lease kept
+	// by heartbeats throughout, as a worker's checkout and build are.
 	read := make(chan struct{})
-	if r.cfg.Read {
+	if r.cfg.Present != nil {
 		go func() {
 			defer close(read)
-			t0 := time.Now()
-			first, err := r.read(ctx, c, worker, run)
-			op := "worker.read"
-			if first {
-				op = "worker.first"
-			}
-			r.stats[op].offer()
-			r.stats[op].done(time.Since(t0), err)
+			r.read(ctx, worker, run.GetRepositoryId(), run.GetCommitId())
 		}()
 	} else {
 		close(read)
@@ -651,28 +707,53 @@ func (r *run) do(ctx context.Context, c Clients, worker string, run *automationp
 	finish(&automationpb.FinishRequest{Status: automationpb.Run_STATUS_PASSED})
 }
 
-// read reads a run's commit's files: with CheckoutDir, by moving the worker's real checkout to the
-// commit — the worker's first, writing every file (first) — and without, the whole commit, as a CI
-// checkout's misses would.
-func (r *run) read(ctx context.Context, c Clients, worker string, run *automationpb.Run) (first bool, err error) {
-	if r.cfg.CheckoutDir != "" {
-		co, first, err := r.checkout(worker, c)
-		if err != nil {
-			return first, err
-		}
-		_, err = co.Sync(ctx, run.GetRepositoryId(), run.GetCommitId(), nil)
-		return first, err
-	}
-	stream, err := c.WorkerBrowse.Export(ctx, &scmpb.ExportRequest{RepositoryId: run.GetRepositoryId(), CommitId: run.GetCommitId()})
+// warm has every synthetic worker present its repository's main, all at once.
+func (r *run) warm(ctx context.Context) error {
+	t0 := time.Now()
+	rs := r.repos[0]
+	head, err := r.mainHead(ctx, r.people[0], rs)
 	if err != nil {
-		return false, err
+		return err
 	}
-	for {
-		if _, err := stream.Recv(); err != nil {
-			if errors.Is(err, io.EOF) {
-				return false, nil
-			}
-			return false, err
+	errs := make([]error, r.cfg.Workers)
+	var wg sync.WaitGroup
+	for i := range r.cfg.Workers {
+		wg.Go(func() { errs[i] = r.read(ctx, fmt.Sprintf("load-%s-%d", r.cfg.WorkerPrefix, i), rs.ID, head) })
+	}
+	wg.Wait()
+	r.cfg.Log.Info("load: presented main at every worker", "workers", r.cfg.Workers, "took", time.Since(t0).Round(time.Millisecond))
+	return errors.Join(errs...)
+}
+
+// read presents a commit at a synthetic worker's presentation — its first presentation, mounted,
+// counted as worker.first, and every later one, a move, as worker.present — then reads ReadFiles of
+// the seeded tree's files through it, at random, counted together as worker.files.
+func (r *run) read(ctx context.Context, worker string, repo int64, commit []byte) error {
+	t0 := time.Now()
+	co, first, err := r.checkout(worker)
+	if err == nil {
+		_, err = co.Sync(ctx, repo, commit, nil)
+	}
+	if ctx.Err() != nil {
+		return ctx.Err() // the run ended under it: not the server's
+	}
+	op := "worker.present"
+	if first {
+		op = "worker.first"
+	}
+	r.stats[op].offer()
+	r.stats[op].done(time.Since(t0), err)
+	if err != nil || r.cfg.ReadFiles == 0 || r.mono == nil {
+		return err
+	}
+	t1 := time.Now()
+	for range r.cfg.ReadFiles {
+		p := r.mono.paths[mrand.IntN(len(r.mono.paths))]
+		if _, err = os.ReadFile(filepath.Join(co.Dir(), filepath.FromSlash(p))); err != nil {
+			break
 		}
 	}
+	r.stats["worker.files"].offer()
+	r.stats["worker.files"].done(time.Since(t1), err)
+	return err
 }

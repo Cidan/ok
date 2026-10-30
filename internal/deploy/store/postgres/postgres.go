@@ -21,6 +21,8 @@ import (
 	"github.com/Cidan/ok/internal/lock"
 	"github.com/Cidan/ok/internal/migrate"
 	"github.com/Cidan/ok/internal/move"
+	"github.com/Cidan/ok/internal/wait"
+	"github.com/Cidan/ok/internal/work"
 	"github.com/Cidan/ok/internal/workflow"
 )
 
@@ -39,6 +41,11 @@ type Backend struct {
 }
 
 var _ store.Backend = (*Backend)(nil)
+
+// Work is the backend's keyed work's store.
+func (b *Backend) Work() work.Store { return pgdata.Work(b.pool) }
+
+func (b *Backend) Waits() wait.Store { return pgdata.Waits(b.pool) }
 
 // Open brings the database behind pool to the deployer's schema and returns a backend over it.
 func Open(ctx context.Context, pool *pgxpool.Pool) (*Backend, error) {
@@ -108,6 +115,10 @@ func (x queries) SetFollowCursor(ctx context.Context, topic string, key, seq int
 	return pgdata.SetCursor(ctx, x.q, topic, key, seq)
 }
 
+func (x queries) PendStep(_ context.Context, kind string, key int64, at time.Time, body []byte) error {
+	return pgdata.PendStep(x.q, kind, key, at, body)
+}
+
 func (x queries) DropRepository(ctx context.Context, id int64) error {
 	_, err := x.q.Exec(ctx, `DELETE FROM repository WHERE id = $1`, id) // the rest cascades
 	return err
@@ -117,6 +128,14 @@ func (x queries) NameRepository(ctx context.Context, id int64, name, owner strin
 	_, err := x.q.Exec(ctx, `INSERT INTO repository (id, name, owner_id) VALUES ($1, $2, $3)
 		ON CONFLICT (id) DO UPDATE SET name = $2, owner_id = CASE WHEN $3 = '' THEN repository.owner_id ELSE $3 END`, id, name, owner)
 	return err
+}
+
+func (x queries) OwnedRepositories(ctx context.Context, owner string) ([]int64, error) {
+	rows, err := x.q.Query(ctx, `SELECT id FROM repository WHERE owner_id = $1 ORDER BY id`, owner)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, pgx.RowTo[int64])
 }
 
 func (x queries) RepositoryOwner(ctx context.Context, id int64) (string, error) {
@@ -177,6 +196,16 @@ func (x queries) MainCommit(ctx context.Context, repo int64, commit []byte) (seq
 		return 0, false, false, nil
 	}
 	return seq, planned, err == nil, err
+}
+
+func (x queries) UnplannedRepository(ctx context.Context, id int64) (store.Repository, bool, error) {
+	var r store.Repository
+	err := x.q.QueryRow(ctx, `SELECT id, name, head, head_seq, planned_head, planned_seq FROM repository
+		WHERE id = $1 AND head_seq > planned_seq AND name <> ''`, id).Scan(&r.ID, &r.Name, &r.Head, &r.HeadSeq, &r.PlannedHead, &r.PlannedSeq)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return store.Repository{}, false, nil
+	}
+	return r, err == nil, err
 }
 
 func (x queries) Unplanned(ctx context.Context) ([]store.Repository, error) {
@@ -310,7 +339,7 @@ func gatesOf(plans []int64, waves []int32) []store.Gate {
 func (x queries) CancelWaitingOf(ctx context.Context, repo int64, deploy, reason string) ([]store.Replaced, error) {
 	rows, err := x.q.Query(ctx, `UPDATE deployment SET status = $3, stage = $4, reason = $5, finished_at = now()
 		WHERE repository_id = $1 AND deploy = $2 AND status = $6
-		RETURNING coalesce(plan_id, 0), wave, gate_plans, gate_waves`,
+		RETURNING id, coalesce(plan_id, 0), wave, gate_plans, gate_waves`,
 		repo, deploy, store.Canceled, store.Done, reason, store.Waiting)
 	if err != nil {
 		return nil, err
@@ -319,7 +348,7 @@ func (x queries) CancelWaitingOf(ctx context.Context, repo int64, deploy, reason
 		var c store.Replaced
 		var gp []int64
 		var gw []int32
-		if err := r.Scan(&c.Plan, &c.Wave, &gp, &gw); err != nil {
+		if err := r.Scan(&c.ID, &c.Plan, &c.Wave, &gp, &gw); err != nil {
 			return c, err
 		}
 		c.Gates = gatesOf(gp, gw)
@@ -350,11 +379,18 @@ func sortIDs(ids []int64) {
 	}
 }
 
-func (x queries) HaltRunningIn(ctx context.Context, plan, except int64, wave int, reason string) error {
-	_, err := x.q.Exec(ctx, `UPDATE deployment SET halt_reason = $3 WHERE id <> $2 AND status = $4 AND halt_by IS NULL AND halt_reason IS NULL
-		AND (plan_id = $1 OR EXISTS (SELECT 1 FROM unnest(gate_plans, gate_waves) AS g(p, w) WHERE g.p = $1 AND g.w >= $5))`,
+func (x queries) HaltRunningIn(ctx context.Context, plan, except int64, wave int, reason string) ([]*store.Deployment, error) {
+	rows, err := x.q.Query(ctx, `UPDATE deployment SET halt_reason = $3 WHERE id <> $2 AND status = $4 AND halt_by IS NULL AND halt_reason IS NULL
+		AND (plan_id = $1 OR EXISTS (SELECT 1 FROM unnest(gate_plans, gate_waves) AS g(p, w) WHERE g.p = $1 AND g.w >= $5))
+		RETURNING id, self, coalesce(driver, '')`,
 		plan, except, reason, store.Running, wave)
-	return err
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, func(r pgx.CollectableRow) (*store.Deployment, error) {
+		var d store.Deployment
+		return &d, r.Scan(&d.ID, &d.Self, &d.Driver)
+	})
 }
 
 const deploymentColumns = `id, repository_id, coalesce(plan_id, 0), coalesce(retry_of, 0), deploy, name, commit_id, from_seq, to_seq,
@@ -689,28 +725,4 @@ func (x queries) MarkWork(ctx context.Context, kind string, key int64) error {
 
 func (x queries) MarkWorkAt(ctx context.Context, kind string, key int64, at time.Time) error {
 	return pgdata.MarkWorkAt(ctx, x.q, kind, key, at)
-}
-
-func (x queries) MarkWorkIdle(ctx context.Context, kind string, key int64) error {
-	return pgdata.MarkWorkIdle(ctx, x.q, kind, key)
-}
-
-func (x queries) TakeWork(ctx context.Context, kind string, key int64, holder string, ttl time.Duration) (bool, error) {
-	return pgdata.TakeWork(ctx, x.q, kind, key, holder, ttl)
-}
-
-func (x queries) RenewWork(ctx context.Context, kind string, key int64, holder string, ttl time.Duration) (bool, error) {
-	return pgdata.RenewWork(ctx, x.q, kind, key, holder, ttl)
-}
-
-func (x queries) ReleaseWork(ctx context.Context, kind string, key int64, holder string) (bool, error) {
-	return pgdata.ReleaseWork(ctx, x.q, kind, key, holder)
-}
-
-func (x queries) LetWork(ctx context.Context, kind string, key int64, holder string) error {
-	return pgdata.LetWork(ctx, x.q, kind, key, holder)
-}
-
-func (x queries) DueWork(ctx context.Context, kind string, limit int) ([]int64, error) {
-	return pgdata.DueWork(ctx, x.q, kind, limit)
 }

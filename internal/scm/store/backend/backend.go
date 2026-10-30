@@ -14,6 +14,8 @@ import (
 
 	"github.com/Cidan/ok/internal/scm/encoding"
 	"github.com/Cidan/ok/internal/scm/segment"
+	"github.com/Cidan/ok/internal/wait"
+	"github.com/Cidan/ok/internal/work"
 	okpb "github.com/Cidan/ok/proto/ok/v1"
 )
 
@@ -23,6 +25,10 @@ var ErrDuplicate = errors.New("backend: duplicate")
 // Backend is the SCM's database.
 type Backend interface {
 	Ops
+	// Work is its keyed work's store (internal/work).
+	Work() work.Store
+	// Waits are the live requests waiting on its subjects (internal/wait).
+	Waits() wait.Store
 	// Txn runs fn in a read-write transaction — on Spanner, again when Spanner aborts it, as the
 	// aborted one reset, which keeps its priority — and the store runs it again when Retryable
 	// says so. fn may run more than once. Notifications fn sends are delivered when it commits.
@@ -35,14 +41,23 @@ type Backend interface {
 	// taken from its counters in it (docs/scm.md, "Sequencing"): Spanner aborts the transactions
 	// that would wait on those rows, and a long one, retried, meets the next.
 	SequencesAfterCommit() bool
+	// MutationBudget is how many mutations — each column a row writes, each index entry, each row a
+	// delete or a cascade removes — one transaction may hold, with room to spare, or 0 for no bound
+	// (PostgreSQL): a landing sizes what it writes in its transaction to it.
+	MutationBudget() int
 	// Snapshot runs fn in one read-only transaction that sees the database as of one moment.
 	Snapshot(ctx context.Context, fn func(tx Ops) error) error
 	// Ping reports whether the database answers.
 	Ping(ctx context.Context) error
-	// RelayEvents hands publish up to limit events no relay has published, by repository and
-	// place in its log, then forgets them — unless publish fails, when they stay to be published
-	// again. Relays beside it take other events. It returns how many it published.
-	RelayEvents(ctx context.Context, limit int, publish func([]Event) error) (int, error)
+	// RelayEvents hands publish up to limit events of repo — of every repository, for 0 — no relay
+	// has published, by repository and place in its log, then forgets them — unless publish fails,
+	// when they stay to be published again. Relays beside it take other events, and leave it those
+	// it holds. It returns how many it published.
+	RelayEvents(ctx context.Context, repo int64, limit int, publish func([]Event) error) (int, error)
+	// EventsRelayed reports, of a repository's events first through last, whether last is placed —
+	// the transaction that placed them committed — and whether none of them waits to be published;
+	// for none (first and last 0), whether none of the repository's events waits.
+	EventsRelayed(ctx context.Context, repo, first, last int64) (written, relayed bool, err error)
 
 	// ─── Moves (docs/hosted.md, "Cells, as built") ───
 
@@ -127,8 +142,22 @@ type Ops interface {
 	// content indexes' blocks and log rows — but its row, its deletion records, content indexes'
 	// rows, and counters, and returns how many: a transaction at a time beforehand.
 	DeleteNetworkTail(ctx context.Context, net Network, limit int) (int64, error)
-	// PendingDeletions are up to limit of the deletions not yet finished, oldest first.
-	PendingDeletions(ctx context.Context, limit int) ([]Deletion, error)
+	// PendingDeletion is a repository's deletion not yet finished, if it has one.
+	PendingDeletion(ctx context.Context, repo int64) (Deletion, bool, error)
+	// RepositoryIDs are up to limit repositories' IDs after after, in order.
+	RepositoryIDs(ctx context.Context, after int64, limit int) ([]int64, error)
+	// RetiredOf is when a network's earliest-retired pack and segment were retired (zero for
+	// none).
+	RetiredOf(ctx context.Context, net Network) (packs, segments time.Time, err error)
+	// FollowCursors, FollowCursor, and AdvanceFollowCursor are the SCM's places in the logs it
+	// follows on the bus's stream (internal/bus/follow): the directory's.
+	FollowCursors(ctx context.Context, topic string, keys []int64) (map[int64]int64, error)
+	// AddFollower records a role as one of a topic's followers, once; Followers are a topic's, by
+	// name: whom the relay enqueues for (internal/bus/follow).
+	AddFollower(ctx context.Context, topic, name string) error
+	Followers(ctx context.Context, topic string) ([]string, error)
+	FollowCursor(ctx context.Context, topic string, key int64) (int64, error)
+	AdvanceFollowCursor(ctx context.Context, topic string, key, seq int64) error
 	// FinishDeletion retires a deleted repository's segment references, deletes its content index,
 	// and deletes its deletion record.
 	FinishDeletion(ctx context.Context, id int64) error
@@ -158,6 +187,9 @@ type Ops interface {
 	// InsertEvents records a repository's events, encoded, at their places in its log, each for
 	// the relay to publish.
 	InsertEvents(ctx context.Context, repo int64, evs []LogEvent) error
+	// PendStep has a step taken once the transaction commits (work.Pend): the relay of the events
+	// it placed, the sequencing of what it left pending. Only in a transaction.
+	PendStep(ctx context.Context, kind string, key int64, at time.Time, body []byte) error
 	// RepositoryEvents are up to limit of a repository's events after place after in its log, in
 	// order.
 	RepositoryEvents(ctx context.Context, repo, after int64, limit int) ([]Event, error)
@@ -190,6 +222,17 @@ type Ops interface {
 	// PendingRepositories are up to limit of the repositories with a row pending that committed
 	// before before, by ID.
 	PendingRepositories(ctx context.Context, before time.Time, limit int) ([]int64, error)
+	// TxnPending reports whether the transaction of tie txn left rows pending in a repository that
+	// no pass has sequenced yet.
+	TxnPending(ctx context.Context, repo, txn int64) (bool, error)
+	// SequencedAt is when the latest pass of a repository that finished began, by its replica's
+	// clock (zero: none); SetSequencedAt records one, never moving back.
+	SequencedAt(ctx context.Context, repo int64) (time.Time, error)
+	SetSequencedAt(ctx context.Context, repo int64, began time.Time) error
+	// CompactionCursor is where a repository's compaction looks next through its tail, as the last
+	// pass left it (nil: from the start); SetCompactionCursor records it.
+	CompactionCursor(ctx context.Context, repo int64) ([]byte, error)
+	SetCompactionCursor(ctx context.Context, repo int64, cursor []byte) error
 
 	// ─── The content index ───
 
@@ -217,6 +260,12 @@ type Ops interface {
 	// apply, and the snapshot's place in the log. A reader goes on from that place: nothing
 	// committed since is before it, so it reads only what committed after.
 	ContentLogSince(ctx context.Context, scope Scope, since LogPlace) ([]ContentLog, LogPlace, error)
+	// ContentLogCurrent reads, at one moment and taking no lock — a write transaction's too — the
+	// database's day, whether a content index is still of generation gen, and, if it is, its log rows
+	// committed after since and the place read to, as ContentLogSince does: a fold commits a
+	// generation before it deletes the rows it read, so rows read with the generation they follow
+	// are all of them.
+	ContentLogCurrent(ctx context.Context, scope Scope, gen int64, since LogPlace) (today time.Time, current bool, logs []ContentLog, place LogPlace, err error)
 	// InsertContentLog records a content log row, applied after the transaction's earlier ones.
 	InsertContentLog(ctx context.Context, scope Scope, body []byte) error
 	// DeleteFoldedContentLogs deletes up to limit of the log rows a fold read to folded — which its
@@ -252,9 +301,6 @@ type Ops interface {
 	// RetirePacks retires the packs among ids not retired, now — or, dry, only counts them — and
 	// returns how many and their total size.
 	RetirePacks(ctx context.Context, net Network, ids []encoding.ID, dry bool) (int, int64, error)
-	// RepositoriesRetiringBefore are the first repository of each network with a pack retired
-	// before packs or a segment row retired before segments, by ID: their collections delete them.
-	RepositoriesRetiringBefore(ctx context.Context, packs, segments time.Time) ([]int64, error)
 	// RetiredPacksBefore are the packs retired before t, of one network or (net nil) every one, by
 	// network and ID.
 	RetiredPacksBefore(ctx context.Context, t time.Time, net *Network) ([]RetiredPack, error)
@@ -268,8 +314,8 @@ type Ops interface {
 	InsertObjects(ctx context.Context, repo int64, objects []Object) ([]encoding.ID, error)
 	// InsertCopyParents records copy histories' parent edges, once each.
 	InsertCopyParents(ctx context.Context, repo int64, copies, parents []encoding.ID) error
-	// InsertCommits records commits, in ID order, written by writtenBy, skipping those recorded,
-	// and returns the IDs it recorded.
+	// InsertCommits records commits, in ID order, each written by its WrittenBy or else by
+	// writtenBy, skipping those recorded, and returns the IDs it recorded.
 	InsertCommits(ctx context.Context, repo int64, commits []Commit, writtenBy string) ([]encoding.ID, error)
 	// InsertCommitParents records commits' parent edges.
 	InsertCommitParents(ctx context.Context, repo int64, edges []ParentEdge) error
@@ -383,12 +429,15 @@ type Ops interface {
 	PinnedCommits(ctx context.Context, repo int64, limit int) ([]PinnedCommit, error)
 	// PinnedObjects are up to limit of the tail's pinned objects, by ID.
 	PinnedObjects(ctx context.Context, repo int64, limit int) ([]Object, error)
-	// PinnedTreeSizes are up to limit of the tail's sizes records of trees that are pinned —
-	// pinned in the tail, or gone from it into a segment — by tree ID, each as an Object.
-	PinnedTreeSizes(ctx context.Context, repo int64, limit int) ([]Object, error)
-	// PinnedCopyEdges are up to limit of the tail's (copy, parent) edges of copies that are
-	// pinned, likewise, by parent then copy.
-	PinnedCopyEdges(ctx context.Context, repo int64, limit int) ([][2]encoding.ID, error)
+	// PinnedTreeSizes looks through up to scan of the tail's sizes records, by tree ID, after the
+	// tree after (nil: from the first), and returns of them up to limit of trees that are pinned —
+	// pinned in the tail, or gone from it into a segment — each as an Object; the last it looked
+	// at; and whether the tail holds any after it. No index finds those pinned: compaction looks
+	// through a window of the tail a pass (compactTail).
+	PinnedTreeSizes(ctx context.Context, repo int64, after []byte, scan, limit int) (rows []Object, last []byte, more bool, err error)
+	// PinnedCopyEdges is that for the tail's (copy, parent) edges of copies that are pinned,
+	// likewise, by copy then parent, after the edge after.
+	PinnedCopyEdges(ctx context.Context, repo int64, after *[2]encoding.ID, scan, limit int) (edges [][2]encoding.ID, last *[2]encoding.ID, more bool, err error)
 	// DeleteCompacted deletes from the tail what a compaction moved into segments: the objects
 	// among it still pinned, which nothing undoes; the sizes records and edges; and the CLs among
 	// it still landed, which nothing undoes either, with their patchsets and main's moves.
@@ -396,8 +445,8 @@ type Ops interface {
 
 	// ─── Main's history ───
 
-	// InsertHeadLog records one move of main.
-	InsertHeadLog(ctx context.Context, repo int64, h HeadMove) error
+	// InsertHeadLogs records moves of main.
+	InsertHeadLogs(ctx context.Context, repo int64, moves []HeadMove) error
 	// MainLog is up to limit of main's heads at seqs from to to, each with its seq as its
 	// generation, newest first unless ascending.
 	MainLog(ctx context.Context, repo, from, to int64, ascending bool, limit int) ([]GenCommit, error)
@@ -410,8 +459,8 @@ type Ops interface {
 	InsertPathIndex(ctx context.Context, repo int64, p PathIndex) error
 	PathIndexes(ctx context.Context, repo int64) ([]PathIndex, error)
 	DeletePathIndex(ctx context.Context, repo, gen int64) error
-	// InsertCommitPaths records the paths a commit on main at generation gen changed, once each.
-	InsertCommitPaths(ctx context.Context, repo, gen int64, commit encoding.ID, paths []string) error
+	// InsertCommitPaths records the paths commits on main changed, each at its generation, once each.
+	InsertCommitPaths(ctx context.Context, repo int64, rows []CommitPaths) error
 	// PathCommits are up to limit of the commits of main that changed any of paths, at
 	// generations from to to, once each, newest first unless ascending.
 	PathCommits(ctx context.Context, repo int64, paths []string, from, to int64, ascending bool, limit int) ([]GenCommit, error)
@@ -472,9 +521,12 @@ type Ops interface {
 	TailOpViewRefs(ctx context.Context, log int64, doomed []encoding.ID, before time.Time) (map[encoding.ID]bool, error)
 	// AllOpLogs are a repository's operation logs, by ID.
 	AllOpLogs(ctx context.Context, repo int64) ([]int64, error)
-	// SettledOps are up to limit of the tail's operations, and up to limit of its views, of a
-	// repository's logs last touched before before, by log, kind, and ID.
-	SettledOps(ctx context.Context, repo int64, before time.Time, limit int) ([]OpRecord, error)
+	// SettledOpsIn looks through up to scan of the tail's operations of an operation log, or its
+	// views (kind), by ID, after the one after (nil: from its first), and returns of them up to
+	// limit last touched before before; the last it looked at; and whether the log holds any after
+	// it, and how many it looked at. No index finds those settled: compaction looks through a
+	// window of the tail a pass.
+	SettledOpsIn(ctx context.Context, log int64, kind encoding.Kind, after []byte, before time.Time, scan, limit int) (ops []OpRecord, last []byte, looked int, more bool, err error)
 	// OpTombstones are up to limit of the tail's tombstones of a repository's logs, by log, kind,
 	// and ID.
 	OpTombstones(ctx context.Context, repo int64, limit int) ([]OpKey, error)
@@ -523,8 +575,8 @@ type Ops interface {
 	// SetChangeListStatus moves the CL of ID id to status, with the status an abandoned one returns
 	// to.
 	SetChangeListStatus(ctx context.Context, repo, id int64, status int16, abandonedFrom *int16) error
-	// SetLanded records the CL of ID id submitted, landed as commit by by.
-	SetLanded(ctx context.Context, repo, id int64, status int16, commit encoding.ID, by string) error
+	// SetLanded records CLs in status, each landed as its commit by its submitter.
+	SetLanded(ctx context.Context, repo int64, status int16, cls []LandedCL) error
 	// UploadChangeLists are the CLs of changes, and those whose patchsets are among commits.
 	UploadChangeLists(ctx context.Context, repo int64, changes, commits [][]byte) ([]int64, error)
 	// NextChangeListNumbers takes a repository's next n CL numbers and returns the last.
@@ -548,6 +600,8 @@ type Ops interface {
 
 	// Candidate reads a pending candidate; ok is false when there is none.
 	Candidate(ctx context.Context, repo int64, commit encoding.ID) (Candidate, bool, error)
+	// CandidatesOf reads the pending candidates of commits, by commit; one with none is absent.
+	CandidatesOf(ctx context.Context, repo int64, commits []encoding.ID) (map[encoding.ID]Candidate, error)
 	// PutCandidate records a candidate, unless it is recorded, and returns it as recorded.
 	PutCandidate(ctx context.Context, repo int64, c Candidate) (Candidate, error)
 	// Candidates are a repository's pending candidates, oldest first.
@@ -585,23 +639,16 @@ type Ops interface {
 
 	// ─── Garbage collection ───
 
-	// DueForGC are the repositories whose last successful pass began before scheduled and whose
-	// last failure, if any, is not after retry, by ID; RepositoryDueForGC reports whether a
-	// repository is one.
-	DueForGC(ctx context.Context, scheduled, retry time.Time) ([]int64, error)
+	// RepositoryDueForGC reports whether a repository's last successful pass began before
+	// scheduled, and its last failure, if any, is not after retry.
 	RepositoryDueForGC(ctx context.Context, repo int64, scheduled, retry time.Time) (bool, error)
 
 	// ─── Keyed work ───
 
-	// MarkWork, TakeWork, RenewWork, ReleaseWork, LetWork, and DueWork are the SCM's keyed work's
-	// (internal/work's Store).
+	// MarkWork and MarkWorkAt mark the SCM's keyed work (internal/work), in the operations'
+	// transaction, which enqueues their jobs before it commits, or in one of their own.
 	MarkWork(ctx context.Context, kind string, key int64) error
 	MarkWorkAt(ctx context.Context, kind string, key int64, at time.Time) error
-	TakeWork(ctx context.Context, kind string, key int64, holder string, ttl time.Duration) (bool, error)
-	RenewWork(ctx context.Context, kind string, key int64, holder string, ttl time.Duration) (bool, error)
-	ReleaseWork(ctx context.Context, kind string, key int64, holder string) (bool, error)
-	LetWork(ctx context.Context, kind string, key int64, holder string) error
-	DueWork(ctx context.Context, kind string, limit int) ([]int64, error)
 	// InsertGCPass records a pass, once.
 	InsertGCPass(ctx context.Context, p GCPass) error
 
@@ -649,4 +696,21 @@ type Ops interface {
 	// are not pinned, with their trees; SetCheckpointsPinned records theirs pinned.
 	CheckpointsToPin(ctx context.Context, repo int64, before time.Time, limit int) ([]CheckpointTreeIDs, error)
 	SetCheckpointsPinned(ctx context.Context, repo int64, ids []int64) error
+}
+
+// Window takes, of a window of the tail looked through in order — at most scan rows, each key with
+// whether its row is to be taken — up to limit of those that are: the keys taken, the key of the
+// last looked at, how many it looked at, and whether any row may follow it (the window full, or the
+// limit reached before its end).
+func Window[K any](keys []K, take []bool, scan, limit int) (taken []K, last K, looked int, more bool) {
+	for i, k := range keys {
+		last = k
+		if take[i] {
+			taken = append(taken, k)
+			if len(taken) == limit {
+				return taken, last, i + 1, i < len(keys)-1 || len(keys) == scan
+			}
+		}
+	}
+	return taken, last, len(keys), len(keys) == scan
 }

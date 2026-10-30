@@ -47,43 +47,16 @@ type Drainer struct {
 	Log       *slog.Logger
 	// Now is the clock inbox versions are read from; unset, time.Now.
 	Now func() time.Time
-	// Look is how often marked outboxes are looked for: two seconds unless set.
-	Look time.Duration
 }
 
-// sweepEvery is how often outboxes no mark names are marked.
-const sweepEvery = time.Minute
-
-// Run drains outboxes as they are marked until ctx ends; a repository whose outbox has entries no
-// mark names — moved in from another cell — is marked every sweepEvery.
+// Run drains outboxes as they are marked until ctx ends: by the transactions that fill them, and
+// by a move's arrival, for a repository whose outbox came with it.
 func (d *Drainer) Run(ctx context.Context) error {
-	look := d.Look
-	if look <= 0 {
-		look = 2 * time.Second
-	}
-	var swept time.Time
 	return (&work.Runner{
 		Kind:  db.OutboxWork,
 		Store: d.DB.Work(),
 		Do:    d.Drain,
-		Sweep: func(ctx context.Context) error {
-			if time.Since(swept) < sweepEvery {
-				return nil
-			}
-			swept = time.Now()
-			repos, err := d.DB.OutboxRepositories(ctx)
-			if err != nil {
-				return err
-			}
-			for _, r := range repos {
-				if err := d.DB.Work().Mark(ctx, db.OutboxWork, r); err != nil {
-					return err
-				}
-			}
-			return nil
-		},
-		Idle: look,
-		Log:  d.Log,
+		Log:   d.Log,
 	}).Run(ctx)
 }
 

@@ -32,6 +32,7 @@ import (
 	"github.com/Cidan/ok/internal/scm/pack"
 	"github.com/Cidan/ok/internal/scm/store"
 	"github.com/Cidan/ok/internal/serve/authn"
+	identitypb "github.com/Cidan/ok/proto/ok/identity/v1"
 	scmpb "github.com/Cidan/ok/proto/ok/scm/v1"
 	okpb "github.com/Cidan/ok/proto/ok/v1"
 )
@@ -760,7 +761,7 @@ func (s *Store) Publish(stream grpc.BidiStreamingServer[scmpb.PublishRequest, sc
 			if err != nil {
 				return err
 			}
-			if err := p.AddChunk(id, step.Chunk.GetData()); err != nil {
+			if err := p.AddChunk(ctx, id, step.Chunk.GetData()); err != nil {
 				return toStatus(err)
 			}
 		case *scmpb.PublishRequest_Commit_:
@@ -817,13 +818,18 @@ func New(s *store.Store, dir Directory, ten Tenancy, facts authz.Source) Service
 		Cells: &Cells{c: c}, Search: &Search{c: c}, SecretReferences: &SecretReferences{c: c}, access: c.access}
 }
 
-// InCell says which cell the services serve, and how they reach other cells' SCMs, before they
-// serve: they refuse the repositories other cells hold, and a creation the directory places in
-// another cell is that cell's SCM's to make. Without it they serve every repository, as a single
-// installation's do.
-func (s Services) InCell(name string, peers PeerSCMs) {
-	s.access.cell = name
+// InCell says which cell the services serve, how they reach other cells' SCMs, and where the
+// directory routes repositories, before they serve: they refuse the repositories other cells
+// hold, and a creation the directory places in another cell is that cell's SCM's to make. Without
+// it they serve every repository, as a single installation's do.
+func (s Services) InCell(name string, peers PeerSCMs, routes Router) {
+	s.access.cell, s.access.routes = name, routes
 	s.Cells.c.cell, s.Cells.c.peers = name, peers
+}
+
+// Router is where the directory says a repository is (identity's Cells.Route).
+type Router interface {
+	Route(ctx context.Context, in *identitypb.RouteRequest, opts ...grpc.CallOption) (*identitypb.RouteResponse, error)
 }
 
 // Register registers every service on reg, each method deciding a person's request with Authorize

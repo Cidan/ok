@@ -82,7 +82,7 @@ func TestTreeStoredTwice(t *testing.T) {
 			}
 		}
 		for _, c := range chunks {
-			if err := p.AddChunk(c, b.chunk(c)); err != nil {
+			if err := p.AddChunk(ctx, c, b.chunk(c)); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -168,11 +168,10 @@ func TestRefreshThroughASnapshot(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		// The view lacks tree B — no refresh since B committed saw it — so the index is stale still,
-		// for the next reader not in a snapshot to refresh. (Its publish's announcement, arriving
-		// when it will, would mark it stale again, but only by luck of timing.)
-		if !s.live(sc).stale.Load() {
-			return fmt.Errorf("the lookup through the snapshot left the index current, without tree B")
+		// The view lacks tree B — no refresh since B committed saw it — and claims to hold no more
+		// than the snapshot saw, so the next reader not in a snapshot reads past it.
+		if !s.live(sc).readFrom.Before(time.Now()) {
+			return fmt.Errorf("the lookup through the snapshot claimed to hold what came after it")
 		}
 		return nil
 	})

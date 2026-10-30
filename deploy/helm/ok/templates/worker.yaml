@@ -64,7 +64,7 @@ spec:
             httpGet: {path: /readyz, port: http}
             periodSeconds: 10
           securityContext: {{- toYaml .Values.worker.securityContext | nindent 12 }}
-          {{- with include "ok.resources" .Values.worker }}
+          {{- with include "ok.resources" (dict "root" . "v" .Values.worker) }}
           resources: {{- . | nindent 12 }}
           {{- end }}
           volumeMounts:
@@ -72,10 +72,10 @@ spec:
             - {name: ok-token, mountPath: /var/run/secrets/ok, readOnly: true}
             - {name: state, mountPath: /var/lib/ok}
             - {name: tmp, mountPath: /tmp}
-            {{- if and (eq .Values.worker.checkout "virtual") (not .Values.worker.fuseResource) }}
+            {{- if and (eq .Values.worker.checkout "virtual") (not (include "ok.deviceResource" (dict "root" . "resource" .Values.worker.fuseResource "device" "fuse"))) }}
             - {name: fuse, mountPath: /dev/fuse}
             {{- end }}
-            {{- if and .Values.worker.microvm.enabled (not .Values.worker.microvm.kvmResource) }}
+            {{- if and .Values.worker.microvm.enabled (not (include "ok.deviceResource" (dict "root" . "resource" .Values.worker.microvm.kvmResource "device" "kvm"))) }}
             - {name: kvm, mountPath: /dev/kvm}
             {{- end }}
             {{- if .Values.worker.dockerConfigSecret }}
@@ -88,11 +88,11 @@ spec:
           emptyDir: {sizeLimit: {{ .Values.worker.state.sizeLimit }}}
         - name: tmp
           emptyDir: {}
-        {{- if and (eq .Values.worker.checkout "virtual") (not .Values.worker.fuseResource) }}
+        {{- if and (eq .Values.worker.checkout "virtual") (not (include "ok.deviceResource" (dict "root" . "resource" .Values.worker.fuseResource "device" "fuse"))) }}
         - name: fuse
           hostPath: {path: /dev/fuse, type: CharDevice}
         {{- end }}
-        {{- if and .Values.worker.microvm.enabled (not .Values.worker.microvm.kvmResource) }}
+        {{- if and .Values.worker.microvm.enabled (not (include "ok.deviceResource" (dict "root" . "resource" .Values.worker.microvm.kvmResource "device" "kvm"))) }}
         - name: kvm
           hostPath: {path: /dev/kvm, type: CharDevice}
         {{- end }}

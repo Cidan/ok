@@ -1,9 +1,8 @@
-// Package bustest is the conformance suites every bus.Stream and bus.Queue passes: run
-// RunStream and RunQueue against an implementation.
+// Package bustest is the conformance suite every bus.Queue passes: run RunQueue against an
+// implementation.
 package bustest
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -25,74 +24,6 @@ func name(kind string) string {
 // patience is how long a test waits for what it expects before failing.
 const patience = 60 * time.Second
 
-// StreamOptions says how a stream behaves beyond what every stream must.
-type StreamOptions struct {
-	// Concurrent is how many deliveries, of different keys, the stream hands one member at once:
-	// at least this many are in flight before any is answered. Zero checks nothing.
-	Concurrent int
-}
-
-type delivered struct {
-	topic    string
-	key, seq int64
-}
-
-// collector records the events a subscription handled, and how many times each.
-type collector struct {
-	mu   sync.Mutex
-	seen map[delivered]int
-	body map[delivered][]byte
-}
-
-func newCollector() *collector {
-	return &collector{seen: map[delivered]int{}, body: map[delivered][]byte{}}
-}
-
-func (c *collector) handle(_ context.Context, e bus.Event) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	d := delivered{e.Topic, e.Key, e.Seq}
-	c.seen[d]++
-	c.body[d] = append([]byte(nil), e.Body...)
-	return nil
-}
-
-func (c *collector) has(want []bus.Event) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	for _, e := range want {
-		if c.seen[delivered{e.Topic, e.Key, e.Seq}] == 0 {
-			return false
-		}
-	}
-	return true
-}
-
-func (c *collector) count() int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return len(c.seen)
-}
-
-// subscribe runs h on topic's group until the test ends.
-func subscribe(t *testing.T, s bus.Stream, topic, group string, h bus.Handler) {
-	t.Helper()
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- s.Subscribe(ctx, topic, group, h) }()
-	t.Cleanup(func() {
-		cancel()
-		select {
-		case err := <-done:
-			if err != nil && !errors.Is(err, context.Canceled) {
-				t.Errorf("Subscribe %s/%s: %v", topic, group, err)
-			}
-		case <-time.After(30 * time.Second):
-			t.Errorf("Subscribe %s/%s did not return after its context ended", topic, group)
-		}
-	})
-}
-
 func eventually(t *testing.T, what string, cond func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(patience)
@@ -102,232 +33,6 @@ func eventually(t *testing.T, what string, cond func() bool) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-}
-
-func events(topic string, keys, perKey int) []bus.Event {
-	var out []bus.Event
-	for k := 1; k <= keys; k++ {
-		for s := 1; s <= perKey; s++ {
-			out = append(out, bus.Event{Topic: topic, Key: int64(k * 1_000_003), Seq: int64(s), Body: []byte(fmt.Sprintf("%d:%d", k, s))})
-		}
-	}
-	return out
-}
-
-func publish(t *testing.T, s bus.Stream, es []bus.Event) {
-	t.Helper()
-	if err := s.Publish(context.Background(), es...); err != nil {
-		t.Fatalf("Publish: %v", err)
-	}
-}
-
-func createGroup(t *testing.T, s bus.Stream, topic, group string) {
-	t.Helper()
-	if err := s.CreateGroup(context.Background(), topic, group); err != nil {
-		t.Fatalf("CreateGroup %s/%s: %v", topic, group, err)
-	}
-}
-
-// RunStream runs the stream suite on the stream open makes.
-func RunStream(t *testing.T, open func(t *testing.T) bus.Stream, o StreamOptions) {
-	t.Run("Delivery", func(t *testing.T) {
-		s := open(t)
-		topic, group := name("topic"), name("group")
-		createGroup(t, s, topic, group)
-		es := events(topic, 7, 8)
-		publish(t, s, es)
-		c := newCollector()
-		subscribe(t, s, topic, group, c.handle)
-		eventually(t, "every event", func() bool { return c.has(es) })
-		for _, e := range es {
-			if got := c.body[delivered{e.Topic, e.Key, e.Seq}]; !bytes.Equal(got, e.Body) {
-				t.Fatalf("%d/%d's body = %q, want %q", e.Key, e.Seq, got, e.Body)
-			}
-		}
-	})
-	t.Run("FanOut", func(t *testing.T) {
-		s := open(t)
-		topic, g1, g2 := name("topic"), name("group"), name("group")
-		createGroup(t, s, topic, g1)
-		createGroup(t, s, topic, g2)
-		c1, c2 := newCollector(), newCollector()
-		subscribe(t, s, topic, g1, c1.handle)
-		subscribe(t, s, topic, g2, c2.handle)
-		es := events(topic, 4, 5)
-		publish(t, s, es)
-		eventually(t, "every event in each group", func() bool { return c1.has(es) && c2.has(es) })
-	})
-	t.Run("Shared", func(t *testing.T) {
-		s := open(t)
-		topic, group := name("topic"), name("group")
-		createGroup(t, s, topic, group)
-		c := newCollector()
-		var a, b atomic.Int64
-		subscribe(t, s, topic, group, func(ctx context.Context, e bus.Event) error { a.Add(1); return c.handle(ctx, e) })
-		subscribe(t, s, topic, group, func(ctx context.Context, e bus.Event) error { b.Add(1); return c.handle(ctx, e) })
-		es := events(topic, 20, 5)
-		publish(t, s, es)
-		eventually(t, "every event, shared by two members", func() bool { return c.has(es) })
-		if a.Load()+b.Load() < int64(len(es)) {
-			t.Fatalf("the members handled %d and %d of %d", a.Load(), b.Load(), len(es))
-		}
-	})
-	t.Run("Redelivery", func(t *testing.T) {
-		s := open(t)
-		topic, group := name("topic"), name("group")
-		createGroup(t, s, topic, group)
-		var mu sync.Mutex
-		failed := map[delivered]bool{}
-		c := newCollector()
-		subscribe(t, s, topic, group, func(ctx context.Context, e bus.Event) error {
-			d := delivered{e.Topic, e.Key, e.Seq}
-			mu.Lock()
-			first := !failed[d]
-			failed[d] = true
-			mu.Unlock()
-			if first {
-				return errors.New("not yet")
-			}
-			return c.handle(ctx, e)
-		})
-		es := events(topic, 3, 3)
-		publish(t, s, es)
-		eventually(t, "every event, after each failed once", func() bool { return c.has(es) })
-	})
-	t.Run("AfterCreate", func(t *testing.T) {
-		s := open(t)
-		topic, group := name("topic"), name("group")
-		publish(t, s, events(topic, 2, 2))
-		createGroup(t, s, topic, group)
-		later := []bus.Event{{Topic: topic, Key: 99, Seq: 1, Body: []byte("later")}}
-		publish(t, s, later)
-		c := newCollector()
-		subscribe(t, s, topic, group, c.handle)
-		eventually(t, "the event published after the group was made", func() bool { return c.has(later) })
-	})
-	t.Run("Resume", func(t *testing.T) {
-		s := open(t)
-		topic, group := name("topic"), name("group")
-		createGroup(t, s, topic, group)
-		first := events(topic, 3, 3)
-		c := newCollector()
-		ctx, cancel := context.WithCancel(context.Background())
-		done := make(chan error, 1)
-		go func() { done <- s.Subscribe(ctx, topic, group, c.handle) }()
-		publish(t, s, first)
-		eventually(t, "the first events", func() bool { return c.has(first) })
-		cancel()
-		if err := <-done; err != nil && !errors.Is(err, context.Canceled) {
-			t.Fatal(err)
-		}
-		second := []bus.Event{{Topic: topic, Key: 7, Seq: 9, Body: []byte("after")}}
-		publish(t, s, second)
-		c2 := newCollector()
-		subscribe(t, s, topic, group, c2.handle)
-		eventually(t, "the event published while no member ran", func() bool { return c2.has(second) })
-	})
-	t.Run("Topics", func(t *testing.T) {
-		s := open(t)
-		t1, t2, group := name("topic"), name("topic"), name("group")
-		createGroup(t, s, t1, group)
-		createGroup(t, s, t2, group)
-		c1, c2 := newCollector(), newCollector()
-		subscribe(t, s, t1, group, c1.handle)
-		subscribe(t, s, t2, group, c2.handle)
-		e1, e2 := events(t1, 2, 2), events(t2, 3, 1)
-		publish(t, s, e1)
-		publish(t, s, e2)
-		eventually(t, "each topic's events", func() bool { return c1.has(e1) && c2.has(e2) })
-		time.Sleep(200 * time.Millisecond)
-		if c1.count() != len(e1) || c2.count() != len(e2) {
-			t.Fatalf("a topic's group saw another's events: %d and %d distinct", c1.count(), c2.count())
-		}
-	})
-	t.Run("LargeBody", func(t *testing.T) {
-		s := open(t)
-		topic, group := name("topic"), name("group")
-		createGroup(t, s, topic, group)
-		body := bytes.Repeat([]byte("0123456789abcdef"), 4096)
-		es := []bus.Event{{Topic: topic, Key: 1, Seq: 1, Body: body}}
-		publish(t, s, es)
-		c := newCollector()
-		subscribe(t, s, topic, group, c.handle)
-		eventually(t, "the large event", func() bool { return c.has(es) })
-		if got := c.body[delivered{topic, 1, 1}]; !bytes.Equal(got, body) {
-			t.Fatalf("the large body came back as %d bytes", len(got))
-		}
-	})
-	t.Run("Concurrent", func(t *testing.T) {
-		if o.Concurrent < 2 {
-			t.Skip("the stream hands a member one delivery at a time")
-		}
-		s := open(t)
-		topic, group := name("topic"), name("group")
-		createGroup(t, s, topic, group)
-		var inFlight, peak atomic.Int64
-		release := make(chan struct{})
-		c := newCollector()
-		subscribe(t, s, topic, group, func(ctx context.Context, e bus.Event) error {
-			n := inFlight.Add(1)
-			for p := peak.Load(); n > p && !peak.CompareAndSwap(p, n); p = peak.Load() {
-			}
-			select {
-			case <-release:
-			case <-time.After(patience):
-			}
-			inFlight.Add(-1)
-			return c.handle(ctx, e)
-		})
-		es := events(topic, 64, 1)
-		publish(t, s, es)
-		eventually(t, fmt.Sprintf("%d deliveries in flight at once", o.Concurrent), func() bool { return peak.Load() >= int64(o.Concurrent) })
-		close(release)
-		eventually(t, "every event", func() bool { return c.has(es) })
-	})
-	t.Run("Prompt", func(t *testing.T) {
-		s := open(t)
-		topic, group := name("topic"), name("group")
-		createGroup(t, s, topic, group)
-		c := newCollector()
-		subscribe(t, s, topic, group, c.handle)
-		// The member waits a while for events, as one does between bursts.
-		time.Sleep(1500 * time.Millisecond)
-		es := []bus.Event{{Topic: topic, Key: 5, Seq: 1, Body: []byte("now")}}
-		start := time.Now()
-		publish(t, s, es)
-		eventually(t, "the event", func() bool { return c.has(es) })
-		if took := time.Since(start); took > 5*time.Second {
-			t.Fatalf("a waiting member handled an event %v after it was published", took)
-		}
-	})
-	t.Run("ConcurrentPublishers", func(t *testing.T) {
-		s := open(t)
-		topic, group := name("topic"), name("group")
-		createGroup(t, s, topic, group)
-		c := newCollector()
-		subscribe(t, s, topic, group, c.handle)
-		var all []bus.Event
-		var wg sync.WaitGroup
-		for p := 0; p < 4; p++ {
-			es := events(topic, 5, 5)
-			for i := range es {
-				es[i].Key += int64(p)
-			}
-			all = append(all, es...)
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				for _, e := range es {
-					if err := s.Publish(context.Background(), e); err != nil {
-						t.Error(err)
-						return
-					}
-				}
-			}()
-		}
-		wg.Wait()
-		eventually(t, "every concurrently published event", func() bool { return c.has(all) })
-	})
 }
 
 // QueueOptions says how a queue behaves beyond what every queue must.
@@ -340,6 +45,109 @@ type QueueOptions struct {
 	// MinVisibility is the shortest visibility the queue keeps (Pub/Sub's is ten seconds); the
 	// suite's waits stretch to it.
 	MinVisibility time.Duration
+	// Shared: queues open makes carry one another's jobs, as processes of one installation do.
+	Shared bool
+}
+
+// next takes an inbox's next job, waiting up to wait.
+func next(t *testing.T, in bus.Inbox, wait time.Duration) (bus.Job, error) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), wait)
+	defer cancel()
+	return in.Next(ctx)
+}
+
+func openInbox(t *testing.T, q bus.Queue) bus.Inbox {
+	t.Helper()
+	in, err := q.Inbox(context.Background())
+	if err != nil {
+		t.Fatalf("Inbox: %v", err)
+	}
+	t.Cleanup(func() { in.Close() })
+	return in
+}
+
+// runInboxes is RunQueue's suite of inboxes.
+func runInboxes(t *testing.T, open func(t *testing.T, maxAttempts int) bus.Queue, o QueueOptions) {
+	// A job enqueued on an inbox's address, by another process where queues are shared, reaches that
+	// inbox alone, promptly — a reply of one change to several inboxes each of them — and nothing
+	// else does.
+	t.Run("Inbox", func(t *testing.T) {
+		ctx := context.Background()
+		q := open(t, 5)
+		t.Cleanup(func() { q.CloseInboxes(context.Background()) })
+		sender := q
+		if o.Shared {
+			sender = open(t, 5)
+		}
+		a, b := openInbox(t, q), openInbox(t, q)
+		if a.Address() == b.Address() {
+			t.Fatalf("two inboxes at %s", a.Address())
+		}
+		start := time.Now()
+		if err := bus.Reply(ctx, sender, []string{a.Address(), b.Address()}, "change-1", []byte("one")); err != nil {
+			t.Fatal(err)
+		}
+		enqueue(t, sender, bus.Job{ID: "two", Queue: a.Address(), Body: []byte("two")})
+		got := map[string]bool{}
+		for range 2 {
+			j, err := next(t, a, 10*time.Second)
+			if err != nil {
+				t.Fatalf("a's job: %v", err)
+			}
+			got[string(j.Body)] = true
+		}
+		if !got["one"] || !got["two"] {
+			t.Fatalf("a got %v, want one and two", got)
+		}
+		if took := time.Since(start); took > 5*time.Second {
+			t.Errorf("a's jobs took %s to arrive", took)
+		}
+		if j, err := next(t, b, 10*time.Second); err != nil || string(j.Body) != "one" {
+			t.Fatalf("b's job: %q, %v; want one", j.Body, err)
+		}
+		if j, err := next(t, b, time.Second); err == nil {
+			t.Fatalf("b got %q, enqueued on a", j.Body)
+		}
+	})
+	// An inbox closed takes nothing more, and a job enqueued on it is dropped; the process's other
+	// inboxes, and those it opens after none was open, go on.
+	t.Run("InboxClosed", func(t *testing.T) {
+		q := open(t, 5)
+		t.Cleanup(func() { q.CloseInboxes(context.Background()) })
+		a := openInbox(t, q)
+		b := openInbox(t, q)
+		if err := b.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := next(t, b, time.Second); !errors.Is(err, bus.ErrClosed) {
+			t.Fatalf("Next on a closed inbox: %v, want ErrClosed", err)
+		}
+		enqueue(t, q, bus.Job{Queue: b.Address(), Body: []byte("for b")}, bus.Job{Queue: a.Address(), Body: []byte("for a")})
+		if j, err := next(t, a, 10*time.Second); err != nil || string(j.Body) != "for a" {
+			t.Fatalf("a's job: %q, %v", j.Body, err)
+		}
+		a.Close()
+		c := openInbox(t, q)
+		enqueue(t, q, bus.Job{Queue: c.Address(), Body: []byte("for c")})
+		if j, err := next(t, c, 10*time.Second); err != nil || string(j.Body) != "for c" {
+			t.Fatalf("an inbox opened after none was: %q, %v", j.Body, err)
+		}
+	})
+	// Closing a process's inboxes ends every one, and no more open.
+	t.Run("CloseInboxes", func(t *testing.T) {
+		q := open(t, 5)
+		a := openInbox(t, q)
+		if err := q.CloseInboxes(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := next(t, a, time.Second); !errors.Is(err, bus.ErrClosed) {
+			t.Fatalf("Next after CloseInboxes: %v, want ErrClosed", err)
+		}
+		if _, err := q.Inbox(context.Background()); !errors.Is(err, bus.ErrClosed) {
+			t.Fatalf("Inbox after CloseInboxes: %v, want ErrClosed", err)
+		}
+	})
 }
 
 func enqueue(t *testing.T, q bus.Queue, jobs ...bus.Job) {
@@ -373,6 +181,26 @@ func RunQueue(t *testing.T, open func(t *testing.T, maxAttempts int) bus.Queue, 
 		vis = o.MinVisibility
 	}
 	long := vis * 30
+	runInboxes(t, open, o)
+	// A lease of many that waits returns as the first job is ready, not once it has many.
+	t.Run("PromptLease", func(t *testing.T) {
+		q := open(t, 5)
+		queue := name("prompt")
+		lease(t, q, queue, bus.LeaseOptions{Max: 1, Visibility: vis}) // the queue made, where leasing makes it
+		go func() {
+			time.Sleep(300 * time.Millisecond)
+			enqueue(t, q, bus.Job{ID: "one", Queue: queue, Body: []byte("one")})
+		}()
+		start := time.Now()
+		got := lease(t, q, queue, bus.LeaseOptions{Max: 8, Visibility: vis, Wait: 15 * time.Second})
+		if len(got) != 1 {
+			t.Fatalf("leased %d jobs, want the one", len(got))
+		}
+		if took := time.Since(start); took > 5*time.Second {
+			t.Errorf("a lease of up to 8 took %s to return the one job ready", took)
+		}
+		got[0].Ack(context.Background())
+	})
 	t.Run("EnqueueLeaseAck", func(t *testing.T) {
 		q := open(t, 10)
 		queue := name("queue")
@@ -453,6 +281,65 @@ func RunQueue(t *testing.T, open func(t *testing.T, maxAttempts int) bus.Queue, 
 		}
 		if err := ls[0].Ack(context.Background()); err != nil {
 			t.Fatalf("Ack after Extend: %v", err)
+		}
+	})
+	t.Run("Resume", func(t *testing.T) {
+		q := open(t, 10)
+		queue := name("queue")
+		ctx := context.Background()
+		enqueue(t, q, bus.Job{ID: "held", Queue: queue, Body: []byte("held")})
+		ls := leaseSoon(t, q, queue, 1, vis)
+		if len(ls) != 1 {
+			t.Fatal("the job was not leased")
+		}
+		r, err := q.Resume(ls[0].Handle())
+		if err != nil {
+			t.Fatalf("Resume: %v", err)
+		}
+		if r.Job().Queue != queue || r.Job().ID != "held" {
+			t.Fatalf("the resumed lease's job: %+v", r.Job())
+		}
+		// Kept from its handle past the visibility it was leased with, it is no one else's.
+		for end := time.Now().Add(3 * vis); time.Now().Before(end); time.Sleep(vis / 3) {
+			if err := r.Extend(ctx, vis); err != nil {
+				t.Fatalf("Extend from a handle: %v", err)
+			}
+			if again := lease(t, q, queue, bus.LeaseOptions{Max: 1, Visibility: vis}); len(again) != 0 {
+				t.Fatal("a job a resumed lease kept was leased again")
+			}
+		}
+		if err := r.Ack(ctx); err != nil {
+			t.Fatalf("Ack from a handle: %v", err)
+		}
+		if again := lease(t, q, queue, bus.LeaseOptions{Max: 1, Visibility: long, Wait: 2 * vis}); len(again) != 0 {
+			t.Fatal("a job acknowledged from its handle was leased again")
+		}
+		if _, err := q.Resume([]byte("not a handle")); err == nil {
+			t.Error("Resume of bytes no lease made succeeded")
+		}
+	})
+	t.Run("ResumeNack", func(t *testing.T) {
+		q := open(t, 10)
+		queue := name("queue")
+		enqueue(t, q, bus.Job{ID: "back", Queue: queue, Body: []byte("back")})
+		ls := leaseSoon(t, q, queue, 1, long)
+		if len(ls) != 1 {
+			t.Fatal("the job was not leased")
+		}
+		r, err := q.Resume(ls[0].Handle())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := r.Nack(context.Background(), 0); err != nil {
+			t.Fatalf("Nack from a handle: %v", err)
+		}
+		var again []bus.Leased
+		eventually(t, "the job returned from its handle", func() bool {
+			again = lease(t, q, queue, bus.LeaseOptions{Max: 1, Visibility: long, Wait: time.Second})
+			return len(again) == 1
+		})
+		if again[0].Attempt() != 2 || string(again[0].Job().Body) != "back" {
+			t.Fatalf("the redelivery: attempt %d, body %q", again[0].Attempt(), again[0].Job().Body)
 		}
 	})
 	t.Run("Nack", func(t *testing.T) {

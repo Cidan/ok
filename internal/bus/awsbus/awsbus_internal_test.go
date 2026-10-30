@@ -8,7 +8,6 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
-	"github.com/aws/aws-sdk-go-v2/service/sns"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	sqstypes "github.com/aws/aws-sdk-go-v2/service/sqs/types"
 
@@ -24,8 +23,7 @@ func fake(t *testing.T) (*Bus, *awsfake.Server) {
 	}
 	t.Cleanup(s.Close)
 	cfg := aws.Config{Region: awsfake.Region, Credentials: credentials.NewStaticCredentialsProvider("test", "test", "")}
-	return New(sqs.NewFromConfig(cfg, func(o *sqs.Options) { o.BaseEndpoint = aws.String(s.URL) }),
-		sns.NewFromConfig(cfg, func(o *sns.Options) { o.BaseEndpoint = aws.String(s.URL) }), Options{MaxAttempts: 3}), s
+	return New(sqs.NewFromConfig(cfg, func(o *sqs.Options) { o.BaseEndpoint = aws.String(s.URL) }), Options{MaxAttempts: 3}), s
 }
 
 // A job received before it is due — one due past SQS's fifteen-minute delay — is sent on, not

@@ -4,10 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strconv"
 	"time"
 
-	"github.com/Cidan/ok/internal/lock"
 	identitypb "github.com/Cidan/ok/proto/ok/identity/v1"
 )
 
@@ -91,9 +89,24 @@ func (s *Store) AskMove(ctx context.Context, repo int64, destination, by string)
 		now := s.now()
 		m = Move{Network: r.Network, Source: source, Destination: destination, Phase: MoveCopying, AskedBy: by, AskedAt: now, UpdatedAt: now,
 			NextAt: now}
-		return tx.PutMove(ctx, m)
+		return putMove(ctx, tx, m)
 	})
 	return m, err
+}
+
+// MoveWork is a network's move's next step, as keyed work (internal/work) keyed by the network:
+// booked by every write of an unfinished move, for its NextAt, in that write's transaction.
+const MoveWork = "move"
+
+// putMove records a move in tx and books its next step, if it has one.
+func putMove(ctx context.Context, tx Ops, m Move) error {
+	if err := tx.PutMove(ctx, m); err != nil {
+		return err
+	}
+	if m.Phase.Finished() {
+		return nil
+	}
+	return tx.MarkWorkAt(ctx, MoveWork, m.Network, m.NextAt)
 }
 
 // cellOpen reports whether a cell is open to new repositories, and whether there is one so named.
@@ -121,15 +134,27 @@ func (s *Store) DueMoves(ctx context.Context, limit int) ([]int64, error) {
 	return s.b.DueMoves(ctx, s.now(), limit)
 }
 
+// UnfinishedMoves are the unfinished moves, due a step or not, by network: what a release before
+// the moves' steps were booked left (mover.Runner).
+func (s *Store) UnfinishedMoves(ctx context.Context, limit int) ([]Move, error) {
+	ids, err := s.b.DueMoves(ctx, time.Date(9999, 1, 1, 0, 0, 0, 0, time.UTC), limit)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Move, 0, len(ids))
+	for _, id := range ids {
+		m, err := s.b.Move(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, m)
+	}
+	return out, nil
+}
+
 // NetworkRepositories are a network's repositories, every state, by ID.
 func (s *Store) NetworkRepositories(ctx context.Context, network int64) ([]Repository, error) {
 	return s.b.NetworkRepositories(ctx, network)
-}
-
-// LockMove runs fn holding a network's move's lock, which one replica holds at a time;
-// lock.ErrNotAcquired when another holds it.
-func (s *Store) LockMove(ctx context.Context, network int64, fn lock.LockFn) error {
-	return s.b.Lock(ctx, "identity", "move:"+strconv.FormatInt(network, 10), 0, fn)
 }
 
 // UpdateMove changes a network's move as fn says, in one transaction: a step done, or failed.
@@ -144,7 +169,7 @@ func (s *Store) UpdateMove(ctx context.Context, network int64, fn func(m *Move) 
 			return err
 		}
 		m.UpdatedAt = s.now()
-		return tx.PutMove(ctx, m)
+		return putMove(ctx, tx, m)
 	})
 	return m, err
 }
@@ -195,6 +220,6 @@ func (s *Store) NameDestination(ctx context.Context, network int64) error {
 		}
 		now := s.now()
 		m.Phase, m.UpdatedAt, m.NextAt, m.Error = MoveNamed, now, now, ""
-		return tx.PutMove(ctx, m)
+		return putMove(ctx, tx, m)
 	})
 }

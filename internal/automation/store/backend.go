@@ -5,6 +5,8 @@ import (
 	"time"
 
 	"github.com/Cidan/ok/internal/move"
+	"github.com/Cidan/ok/internal/wait"
+	"github.com/Cidan/ok/internal/work"
 )
 
 // Backend is automation's database: what each database it runs on implements (postgres), and
@@ -23,6 +25,10 @@ type Backend interface {
 	Snapshot(ctx context.Context, fn func(tx Ops) error) error
 	// Moves are its rows about repositories, for a move between cells.
 	Moves() move.Rows
+	// Work is its keyed work's store (internal/work).
+	Work() work.Store
+	// Waits are the live requests waiting on its subjects (internal/wait).
+	Waits() wait.Store
 	// FencedWritesBesideEachOther reports whether transactions that rest on one keyed-work lease
 	// and mark its work row may run beside each other. On Spanner they may: the fence reads the
 	// holder's cell, which a mark does not write. On PostgreSQL they may not: the fence holds the
@@ -55,8 +61,8 @@ type Ops interface {
 
 	// InsertRun records a run and returns it.
 	InsertRun(ctx context.Context, r NewRun) (*Run, error)
-	// InsertRuns records runs.
-	InsertRuns(ctx context.Context, rs []NewRun) error
+	// InsertRuns records runs, and returns their IDs, in order.
+	InsertRuns(ctx context.Context, rs []NewRun) ([]int64, error)
 	// Run reads a run; ErrNotFound when none.
 	Run(ctx context.Context, id int64) (*Run, error)
 	// LockRun is Run, held.
@@ -74,23 +80,25 @@ type Ops interface {
 	// InsertPushed records what a push run pushed, in order.
 	InsertPushed(ctx context.Context, run int64, pushed []Pushed) error
 
-	// Admission and fair share (docs/hosted.md, "Hosted automation, as built"): a run's account is
-	// its repository's owner, "" for a repository the directory's events have not named.
+	// Dispatch and admission (docs/hosted.md, "Hosted automation, as built"): a run's account is its
+	// repository's owner, "" for a repository the directory's events have not named. A queued run is
+	// dispatched by one bus job at a time, its dispatch job; while it runs, the bus's lease on that
+	// job's delivery is its lease, the delivery's handle its lease handle.
 	//
-	// QueuedHeads are, for each account with runs queued in a pool — of repositories no move holds
-	// — and each priority among them, the oldest one's queue time.
-	QueuedHeads(ctx context.Context, pool string) ([]Head, error)
 	// RunningByAccount are each account's running runs: in a pool, and in every pool.
 	RunningByAccount(ctx context.Context, pool string) (map[string]Running, error)
 	// MonthSeconds are accounts' run seconds in a month (YYYY-MM, UTC).
 	MonthSeconds(ctx context.Context, month string, accounts []string) (map[string]int64, error)
-	// ClaimCandidates are an account's next queued runs in a pool — its highest priority's oldest
-	// first — of repositories no move holds, at most limit: read outside any transaction, so a
-	// claim locks only the run it takes (ClaimRun).
-	ClaimCandidates(ctx context.Context, account, pool string, limit int) ([]Queued, error)
-	// ClaimRun leases a queued run of a pool to worker for ttl, holding a slot of its account's
-	// (slot < 0: none), the lease's key's hash recorded; nil when it is no longer queued there.
-	ClaimRun(ctx context.Context, id int64, pool, worker string, ttl time.Duration, account string, slot int64, keyHash []byte) (*Run, error)
+	// ClaimRun leases a run queued in a pool, dispatched by job, to worker for ttl, under the bus's
+	// delivery handle, holding a slot of its account's (slot < 0: none), the lease's key's hash
+	// recorded; nil when it is not queued there, or dispatched by another job.
+	ClaimRun(ctx context.Context, id int64, job, pool, worker string, ttl time.Duration, account string, slot int64, keyHash, handle []byte) (*Run, error)
+	// SetDispatchJobs makes queued runs' dispatch jobs those named, by run.
+	SetDispatchJobs(ctx context.Context, jobs map[int64]string) error
+	// QueuedRuns are the queued runs of repositories; UndispatchedRuns the queued runs no job
+	// dispatches, which a release before dispatch queued.
+	QueuedRuns(ctx context.Context, repos []int64) ([]Queued, error)
+	UndispatchedRuns(ctx context.Context) ([]Queued, error)
 	// LeaseKeyHolds reports whether a run is running under the lease whose key hashes to keyHash.
 	LeaseKeyHolds(ctx context.Context, id int64, keyHash []byte) (bool, error)
 	// Slots are an account's slots that running runs hold: an account with a concurrent quota
@@ -112,20 +120,16 @@ type Ops interface {
 	QueuedByAccount(ctx context.Context, pool string) (map[string]int64, time.Time, error)
 	// RunningOnWorkers are the runs each worker holds in a pool, by worker name.
 	RunningOnWorkers(ctx context.Context, pool string) (map[string]int64, error)
-	// RenewLease extends a worker's lease on a running run by ttl from now; ok is false when the
-	// run is not running or not the worker's.
+	// RenewLease extends a worker's lease on a running run by ttl from now, and returns its lease
+	// handle with it; ok is false when the run is not running or not the worker's.
 	RenewLease(ctx context.Context, id int64, worker string, ttl time.Duration) (l Lease, ok bool, err error)
-	// LapsedRunIDs are the running runs whose leases have lapsed, of repositories no move holds:
-	// read outside any transaction. LapsedRun holds one of them in the transaction, if it is still
-	// lapsed and its repository's network still free.
-	LapsedRunIDs(ctx context.Context) ([]int64, error)
-	LapsedRun(ctx context.Context, id int64) (Lapsed, bool, error)
-	// RequeueRun queues a running run again with reason: its worker, lease, start, stop request,
-	// and log cleared, the log's bytes deleted — and its attempt counted when nextAttempt.
+	// RequeueRun queues a running run again with reason, dispatched by job ("" for none yet): its
+	// worker, lease, lease handle, start, stop request, and log cleared, the log's bytes deleted —
+	// and its attempt counted when nextAttempt.
 	// FinishRun ends a run with status, exit code, and reason, now, its lease and stop request
 	// cleared. Each charges a run that was running its seconds since it started, by the database's
 	// clock, to its account's month (MonthSeconds).
-	RequeueRun(ctx context.Context, id int64, reason string, nextAttempt bool) error
+	RequeueRun(ctx context.Context, id int64, job, reason string, nextAttempt bool) error
 	FinishRun(ctx context.Context, id int64, status Status, exitCode int32, reason string) error
 	// CancelQueuedRun ends a queued run canceled with reason, now, by the principal by (a stable
 	// ID; "" for no one), its (empty) log stored, reporting whether it was queued.
@@ -143,8 +147,9 @@ type Ops interface {
 	AdvanceLog(ctx context.Context, id int64, worker string, started time.Time, from, to int64) (bool, error)
 	// MarkLogStored records a run's log stored in the bucket.
 	MarkLogStored(ctx context.Context, id int64) error
-	// UnstoredLogs are up to limit finished runs whose logs are not stored, by ID.
-	UnstoredLogs(ctx context.Context, limit int) ([]int64, error)
+	// UnstoredLogs are up to limit finished runs whose logs are not stored, by ID: of repos, or of
+	// every repository for none.
+	UnstoredLogs(ctx context.Context, repos []int64, limit int) ([]int64, error)
 
 	// ─── The feed, and the build cache's commits ───
 
@@ -240,18 +245,39 @@ type Ops interface {
 	ReusableCandidate(ctx context.Context, repo int64, base []byte, cl int64, patchset int32) ([]byte, bool, error)
 	// CandidatesInUse are the candidates a repository's active attempts hold, by commit ID.
 	CandidatesInUse(ctx context.Context, repo int64) (map[string]bool, error)
-	// MarkWork, TakeWork, RenewWork, ReleaseWork, LetWork, and DueWork are automation's keyed work's
-	// (internal/work's Store).
+	// MarkWork and MarkWorkAt mark automation's keyed work (internal/work), in the operations'
+	// transaction, which enqueues their jobs before it commits, or in one of their own.
 	MarkWork(ctx context.Context, kind string, key int64) error
 	MarkWorkAt(ctx context.Context, kind string, key int64, at time.Time) error
-	TakeWork(ctx context.Context, kind string, key int64, holder string, ttl time.Duration) (bool, error)
-	RenewWork(ctx context.Context, kind string, key int64, holder string, ttl time.Duration) (bool, error)
-	ReleaseWork(ctx context.Context, kind string, key int64, holder string) (bool, error)
-	LetWork(ctx context.Context, kind string, key int64, holder string) error
-	DueWork(ctx context.Context, kind string, limit int) ([]int64, error)
+	// CLsOf are the CLs, by repository and number, of plans and of runs' plans, once each.
+	CLsOf(ctx context.Context, runs, plans []int64) ([][2]int64, error)
+	// PendStep pends a step in the operations' transaction, its job enqueued before it commits
+	// (work.Pend).
+	PendStep(ctx context.Context, kind string, key int64, at time.Time, body []byte) error
 
 	// SetLandedCommit records the commit a submission's CL landed as.
 	SetLandedCommit(ctx context.Context, submission, cl int64, commit []byte) error
+
+	// A landing's record, each for all its submissions at once (RecordLandings).
+
+	// FinishSubmissions ends the active submissions of ids as FinishSubmission ends one, returning
+	// each one it ended's repository, by ID.
+	FinishSubmissions(ctx context.Context, ids []int64, status SubmissionStatus, reason, by string) (map[int64]int64, error)
+	// LandAttempts records attempts landed, now, their reasons kept: each of its pairs' attempt, if
+	// it is of the pair's submission.
+	LandAttempts(ctx context.Context, pairs []AttemptOf) error
+	// EndActiveAttemptsOf ends the active attempts of submissions as EndActiveAttempts ends one's,
+	// returning their IDs.
+	EndActiveAttemptsOf(ctx context.Context, submissions []int64, status AttemptStatus, reason string) ([]int64, error)
+	// SetLandedCommits records the commits submissions' CLs landed as.
+	SetLandedCommits(ctx context.Context, rows []SubmissionCommit) error
+	// InsertLandedChanges records the CLs landed commits are, each once.
+	InsertLandedChanges(ctx context.Context, repo int64, rows []LandedCL) error
+	// PutMainCommits records commits at their places of a repository's main and the submissions
+	// that landed them, over what was recorded; SetMainCommitSubmissions records the submissions
+	// that landed commits of main recorded.
+	PutMainCommits(ctx context.Context, repo int64, rows []MainCommit) error
+	SetMainCommitSubmissions(ctx context.Context, repo int64, rows []MainCommit) error
 	// InsertLandedChange records the CL a landed commit is, once.
 	InsertLandedChange(ctx context.Context, repo int64, commit []byte, cl int64) error
 	// LockMain, in a transaction, serializes it with every other that records a repository's main
@@ -292,23 +318,26 @@ type NewRun struct {
 	LogStored         bool
 	LogSize           int64
 	CarriedFrom       int64
+	// DispatchJob is the bus job that dispatches it, when it is queued.
+	DispatchJob string
 }
 
-// Lease is a renewed lease: whether the run's worker is asked to stop it and why, and whether
-// it has run past its timeout.
+// Lease is a renewed lease: whether the run's worker is asked to stop it and why, whether it has
+// run past its timeout, and the bus's handle of its job's delivery (nil for a run claimed before
+// dispatch), which the renewal extends.
 type Lease struct {
 	Stopping       bool
 	StopReason     string
 	Overdue        bool
 	TimeoutSeconds int32
+	Handle         []byte
 }
 
-// Lapsed is a running run whose lease lapsed.
-// Head is an account's queued runs in a pool at a priority: the oldest one's queue time.
-type Head struct {
-	Account  string
-	Priority int16
-	Oldest   time.Time
+// Queued is a queued run as dispatch names it: its repository and its pool.
+type Queued struct {
+	ID           int64
+	RepositoryID int64
+	Pool         string
 }
 
 // Running are an account's running runs: in a pool, and in every pool.
@@ -319,16 +348,6 @@ type Usage struct {
 	Account string
 	Seconds int64
 	Running int64
-}
-
-type Lapsed struct {
-	ID           int64
-	RepositoryID int64
-	Phase        Phase
-	Attempt      int32
-	Worker       string
-	Stopping     bool
-	StopReason   string
 }
 
 // NewPlan is a plan as it is first recorded.

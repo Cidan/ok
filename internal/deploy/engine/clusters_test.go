@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
 	"strings"
 	"sync"
@@ -33,6 +34,18 @@ func (c *agentCluster) set(connected bool) {
 	c.mu.Unlock()
 }
 
+// connect connects acme's agent: its session claimed, as the hub claims one, which has what
+// waited for it go on.
+func (e *env) connect(ac *agentCluster) {
+	e.t.Helper()
+	ac.set(true)
+	now := time.Now()
+	if err := e.store.ClaimAgentSession(context.Background(), store.AgentSession{Account: "org_acme", Holder: "hub", Address: "hub",
+		LeaseUntil: now.Add(time.Minute), ConnectedAt: now}); err != nil {
+		e.t.Fatal(err)
+	}
+}
+
 func (c *agentCluster) For(context.Context, int64) (Cluster, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -57,7 +70,11 @@ func TestThroughClusters(t *testing.T) {
 	en := New(Config{Store: e.store, Kube: nil, Clusters: ac, Runs: e.runs, Build: e.build, Main: e.repo, Source: e.repo, Tree: e.tree,
 		Labels: roll.LabelsFor("example.com"), Checkout: e.repo, Timing: roll.DefaultTiming,
 		Self: Self{Namespace: "ok-deploy", Name: "ok-deploy", Color: roll.Blue}, Principal: principal,
-		Now: func() time.Time { return e.cluster.Now }})
+		Now: func() time.Time { return e.cluster.Now }, Look: look, Log: slog.New(&e.failures)})
+	// The repository is acme's, whose agent its deployments go through.
+	if err := e.store.ApplyDirectory(context.Background(), store.DirectoryEvent{Seq: 2, Repository: 1, FullName: "home", Owner: "org_acme"}); err != nil {
+		t.Fatal(err)
+	}
 	e.land(1, map[string]string{".ok/workflow/deploy.yaml": workflowFile, "web/web.go": "v1"})
 	for range 3 {
 		e.tick(en)
@@ -65,7 +82,7 @@ func TestThroughClusters(t *testing.T) {
 	if n := len(e.deployments()); n != 0 {
 		t.Fatalf("%d deployments planned with no agent connected", n)
 	}
-	ac.set(true)
+	e.connect(ac)
 	e.until(en, "web to reach its canary", func() bool { return e.cluster.Replicas("web", "web-green") == 1 })
 	ac.set(false)
 	for range 5 {
@@ -78,7 +95,7 @@ func TestThroughClusters(t *testing.T) {
 	if log := e.log(web); strings.Count(log, "waiting: the organization's deploy agent is not connected") != 1 {
 		t.Errorf("web's log says it waits not once:\n%s", log)
 	}
-	ac.set(true)
+	e.connect(ac)
 	e.until(en, "everything to settle", e.settled)
 	for _, d := range e.deployments() {
 		if d.Status != store.Succeeded {

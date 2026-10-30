@@ -18,6 +18,8 @@ import (
 	"github.com/Cidan/ok/internal/migrate"
 	"github.com/Cidan/ok/internal/scm/encoding"
 	"github.com/Cidan/ok/internal/scm/store/backend"
+	"github.com/Cidan/ok/internal/wait"
+	"github.com/Cidan/ok/internal/work"
 )
 
 //go:embed migrations/*.sql
@@ -33,6 +35,11 @@ type Backend struct {
 }
 
 var _ backend.Backend = (*Backend)(nil)
+
+// Work is the backend's keyed work's store.
+func (b *Backend) Work() work.Store { return pgdata.Work(b.pool) }
+
+func (b *Backend) Waits() wait.Store { return pgdata.Waits(b.pool) }
 
 // Open brings the database behind pool to the SCM's schema and returns a backend over it.
 func Open(ctx context.Context, pool *pgxpool.Pool) (*Backend, error) {
@@ -53,7 +60,7 @@ func (b *Backend) Txn(ctx context.Context, fn func(backend.Ops) error) error {
 		if err := pgdata.CheckFence(ctx, tx); err != nil {
 			return err
 		}
-		return fn(queries{&serial{q: tx}})
+		return pgdata.Attempt(ctx, b.pool, tx, func() error { return fn(queries{&serial{q: tx}}) })
 	})
 }
 
@@ -72,15 +79,15 @@ func (b *Backend) Ping(ctx context.Context) error { return b.pool.Ping(ctx) }
 // RelayEvents takes pending events with FOR UPDATE SKIP LOCKED, so relays beside it take others, and
 // deletes them in the transaction that took them once publish has: a relay that fails or dies
 // before it commits leaves them pending.
-func (b *Backend) RelayEvents(ctx context.Context, limit int, publish func([]backend.Event) error) (int, error) {
+func (b *Backend) RelayEvents(ctx context.Context, repo int64, limit int, publish func([]backend.Event) error) (int, error) {
 	var n int
 	err := pgx.BeginFunc(ctx, b.pool, func(tx pgx.Tx) error {
 		evs, err := events(tx.Query(ctx, `WITH taken AS (
-				SELECT repository_id, repository_seq FROM event_pending
+				SELECT repository_id, repository_seq FROM event_pending WHERE $2::bigint = 0 OR repository_id = $2
 				ORDER BY repository_id, repository_seq LIMIT $1 FOR UPDATE SKIP LOCKED)
 			SELECT e.repository_id, e.repository_seq, e.body
 			FROM taken t JOIN event e ON e.repository_id = t.repository_id AND e.repository_seq = t.repository_seq
-			ORDER BY e.repository_id, e.repository_seq`, limit))
+			ORDER BY e.repository_id, e.repository_seq`, limit, repo))
 		if err != nil || len(evs) == 0 {
 			return err
 		}
@@ -101,6 +108,15 @@ func (b *Backend) RelayEvents(ctx context.Context, limit int, publish func([]bac
 	return n, err
 }
 
+func (b *Backend) EventsRelayed(ctx context.Context, repo, first, last int64) (written, relayed bool, err error) {
+	// The counter is held by the transaction that reserves places until it commits: no later one
+	// reserves past it, so the counter is past last once — and only once — it committed.
+	err = b.pool.QueryRow(ctx, `SELECT coalesce((SELECT last FROM repository_event_counter WHERE repository_id = $1), 0) >= $3,
+			NOT EXISTS (SELECT 1 FROM event_pending WHERE repository_id = $1 AND ($3 = 0 OR repository_seq BETWEEN $2 AND $3))`,
+		repo, first, last).Scan(&written, &relayed)
+	return written, relayed, err
+}
+
 type querier interface {
 	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
@@ -115,7 +131,7 @@ type queries struct{ q querier }
 // several goroutines.
 type serial struct {
 	mu sync.Mutex
-	q  querier
+	q  pgx.Tx
 	// stamps are the stamps of the transaction's content log rows, by index (ShareContentIndex,
 	// LockContentIndex).
 	stampMu sync.Mutex
@@ -145,6 +161,10 @@ func (x queries) stamped(sc backend.Scope) (int64, bool) {
 	}
 	return 0, false
 }
+
+// Conn is the transaction's connection: what the marks of keyed work made through it are recorded
+// under (pgdata.Attempt).
+func (s *serial) Conn() *pgx.Conn { return s.q.Conn() }
 
 func (s *serial) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
 	s.mu.Lock()

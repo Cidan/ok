@@ -8,7 +8,7 @@ import (
 )
 
 func (x queries) AccountQuotas(ctx context.Context, accounts []string) (map[string]store.Quota, error) {
-	rows, err := x.q.Query(ctx, `SELECT principal_id, concurrent, minutes, weight FROM account_quotas WHERE principal_id = ANY($1)`, accounts)
+	rows, err := x.q.Query(ctx, `SELECT principal_id, concurrent, minutes FROM account_quotas WHERE principal_id = ANY($1)`, accounts)
 	if err != nil {
 		return nil, err
 	}
@@ -17,7 +17,7 @@ func (x queries) AccountQuotas(ctx context.Context, accounts []string) (map[stri
 	for rows.Next() {
 		var id string
 		var q store.Quota
-		if err := rows.Scan(&id, &q.Concurrent, &q.Minutes, &q.Weight); err != nil {
+		if err := rows.Scan(&id, &q.Concurrent, &q.Minutes); err != nil {
 			return nil, err
 		}
 		out[id] = q
@@ -26,8 +26,8 @@ func (x queries) AccountQuotas(ctx context.Context, accounts []string) (map[stri
 }
 
 func (x queries) SetAccountQuota(ctx context.Context, account string, q store.Quota) error {
-	_, err := x.q.Exec(ctx, `INSERT INTO account_quotas (principal_id, concurrent, minutes, weight) VALUES ($1, $2, $3, $4)
-		ON CONFLICT (principal_id) DO UPDATE SET concurrent = $2, minutes = $3, weight = $4`, account, q.Concurrent, q.Minutes, q.Weight)
+	_, err := x.q.Exec(ctx, `INSERT INTO account_quotas (principal_id, concurrent, minutes) VALUES ($1, $2, $3)
+		ON CONFLICT (principal_id) DO UPDATE SET concurrent = $2, minutes = $3`, account, q.Concurrent, q.Minutes)
 	return err
 }
 

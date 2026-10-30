@@ -13,12 +13,28 @@ import (
 )
 
 func (x queries) PutIdentityProvider(ctx context.Context, p store.IdentityProvider) error {
-	_, err := x.q.Exec(ctx, `INSERT INTO organization_identity (organization_id, source, settings, sealed, interval_secs, updated_at, plain_handles)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
+	_, err := x.q.Exec(ctx, `INSERT INTO organization_identity (organization_id, source, settings, sealed, interval_secs, updated_at, plain_handles,
+			sync_key)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		ON CONFLICT (organization_id) DO UPDATE SET source = EXCLUDED.source, settings = EXCLUDED.settings, sealed = EXCLUDED.sealed,
 			interval_secs = EXCLUDED.interval_secs, updated_at = EXCLUDED.updated_at,
-			plain_handles = organization_identity.plain_handles OR EXCLUDED.plain_handles`,
-		p.Organization, p.Source, []byte(p.Settings), p.Sealed, int(p.Interval/time.Second), p.Updated, p.PlainHandles)
+			plain_handles = organization_identity.plain_handles OR EXCLUDED.plain_handles,
+			sync_key = coalesce(organization_identity.sync_key, EXCLUDED.sync_key)`,
+		p.Organization, p.Source, []byte(p.Settings), p.Sealed, int(p.Interval/time.Second), p.Updated, p.PlainHandles, p.Key)
+	return err
+}
+
+func (x queries) IdentityProviderOrg(ctx context.Context, key int64) (string, error) {
+	var org string
+	err := x.q.QueryRow(ctx, `SELECT organization_id FROM organization_identity WHERE sync_key = $1`, key).Scan(&org)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", store.ErrNotFound
+	}
+	return org, err
+}
+
+func (x queries) SetIdentityProviderKey(ctx context.Context, org string, key int64) error {
+	_, err := x.q.Exec(ctx, `UPDATE organization_identity SET sync_key = $2 WHERE organization_id = $1 AND sync_key IS NULL`, org, key)
 	return err
 }
 
@@ -27,9 +43,14 @@ func (x queries) IdentityProviderOf(ctx context.Context, org string) (store.Iden
 	var secs int
 	var mirror, waiting, notes []byte
 	var lastRun *time.Time
+	var key *int64
 	err := x.q.QueryRow(ctx, `SELECT organization_id, source, settings, sealed, interval_secs, mirror, last_run, last_error, waiting, notes, updated_at,
-		plain_handles FROM organization_identity WHERE organization_id = $1`, org).
-		Scan(&p.Organization, &p.Source, &p.Settings, &p.Sealed, &secs, &mirror, &lastRun, &p.LastError, &waiting, &notes, &p.Updated, &p.PlainHandles)
+		plain_handles, sync_key FROM organization_identity WHERE organization_id = $1`, org).
+		Scan(&p.Organization, &p.Source, &p.Settings, &p.Sealed, &secs, &mirror, &lastRun, &p.LastError, &waiting, &notes, &p.Updated, &p.PlainHandles,
+			&key)
+	if key != nil {
+		p.Key = *key
+	}
 	if errors.Is(err, pgx.ErrNoRows) {
 		return store.IdentityProvider{}, store.ErrNotFound
 	}

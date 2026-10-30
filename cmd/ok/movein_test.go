@@ -53,7 +53,7 @@ identity:
   sealing_key_file: `+file("sealing-key", seal.NewKey())+`
   system_of_record:
     entra: {tenant_id: contoso, client_id: ok, client_secret_file: `+file("client-secret", "the secret\n")+`}
-`)
+`+busYAML(t))
 
 	// The installation, as identity left it: its organization, and its people synced.
 	pool, err := pgdb.Open(ctx, dsn, role.Schema, 2)

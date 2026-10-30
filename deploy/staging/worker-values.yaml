@@ -1,17 +1,10 @@
-# A real worker on staging (README.md), over values.yaml: real CI — Bazel in a real checkout — in
-# place of the load generator's synthetic workers, which would take its runs (run one or the other).
-# The chart declares the workers' robot, worker.ok, itself, so values.yaml's, for the load job, goes.
-# PROJECT and TAG as values.yaml's.
+# A worker on staging (README.md), over values.yaml: real CI — Bazel on each run's commit,
+# presented through okfs — in place of the load generator's synthetic workers, which would take
+# its runs (run one or the other). The chart declares the workers' robot, worker.ok, itself, so
+# values.yaml's, for the load job, goes. PROJECT and TAG as values.yaml's.
 runnerImage: {repository: us-central1-docker.pkg.dev/PROJECT/ok/ok-runner, tag: TAG}
 identity:
   extraRobots: []
 worker:
   enabled: true
   replicas: 1
-  checkout: real
-  # GKE's Container-Optimized OS confines containers with an AppArmor profile that refuses the
-  # mount a run's sandbox makes in its user namespace (docs/install.md, "Workers' nodes").
-  securityContext:
-    seccompProfile: {type: Unconfined}
-    appArmorProfile: {type: Unconfined}
-    allowPrivilegeEscalation: false

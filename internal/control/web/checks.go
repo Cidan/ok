@@ -70,7 +70,7 @@ func (s *Server) checks(ctx context.Context, repo *scmpb.Repository, cl db.Chang
 // preChecks is a patchset's pre, as the Checks tab shows it.
 func (s *Server) preChecks(ctx context.Context, repo *scmpb.Repository, cl db.ChangeList, patchset int32, me string) pages.CLChecks {
 	link := clHref(repo.GetName(), cl.Number)
-	c := pages.CLChecks{Patchset: int64(patchset), Href: link + "/checks?ps=" + strconv.Itoa(int(patchset))}
+	c := pages.CLChecks{Patchset: int64(patchset), Href: link + "/checks?ps=" + strconv.Itoa(int(patchset)), ChangeEvents: link + "/events"}
 	pre, err := s.runs.GetPre(ctx, &automationpb.GetPreRequest{RepositoryId: repo.GetId(), ClNumber: cl.Number, Patchset: patchset})
 	if err != nil {
 		if ctx.Err() == nil {
@@ -380,19 +380,20 @@ func (s *Server) runView(ctx context.Context, t *clTarget, run *automationpb.Run
 	repo := t.repo
 	link := runHref(repo.GetName(), t.cl.Number, run.GetId())
 	v := pages.RunView{
-		Chrome:     chrome(repo, "main", repo.GetHead(), ""),
-		CLNumber:   t.cl.Number,
-		CLHref:     clHref(repo.GetName(), t.cl.Number),
-		ID:         run.GetId(),
-		Check:      runCheck(ctx, run),
-		Patchset:   int64(run.GetOrigin().GetPatchset()),
-		Commit:     scm.Short(run.GetCommitId()),
-		Live:       !finished(run),
-		StatusHref: link + "/status",
-		RawHref:    link + "/raw",
-		Queued:     when(run.GetQueuedAt()),
-		Started:    when(run.GetStartedAt()),
-		Finished:   when(run.GetFinishedAt()),
+		Chrome:       chrome(repo, "main", repo.GetHead(), ""),
+		CLNumber:     t.cl.Number,
+		CLHref:       clHref(repo.GetName(), t.cl.Number),
+		ID:           run.GetId(),
+		Check:        runCheck(ctx, run),
+		Patchset:     int64(run.GetOrigin().GetPatchset()),
+		Commit:       scm.Short(run.GetCommitId()),
+		Live:         !finished(run),
+		StatusHref:   link + "/status",
+		ChangeEvents: link + "/events",
+		RawHref:      link + "/raw",
+		Queued:       when(run.GetQueuedAt()),
+		Started:      when(run.GetStartedAt()),
+		Finished:     when(run.GetFinishedAt()),
 	}
 	if run.GetWorker() != "" {
 		v.Worker = run.GetWorker()
@@ -441,7 +442,7 @@ func (s *Server) readLog(ctx context.Context, repo string, cl, id, offset int64)
 		next = chunk.GetOffset() + int64(len(chunk.GetData()))
 		end = end || chunk.GetEnd()
 	}
-	l := pages.RunLog{Text: ansi.ReplaceAllString(strings.ToValidUTF8(b.String(), "�"), "")}
+	l := pages.RunLog{Text: ansi.ReplaceAllString(strings.ToValidUTF8(b.String(), "�"), ""), ChangeEvents: runHref(repo, cl, id) + "/events"}
 	if !end {
 		l.NextHref = fmt.Sprintf("%s/log?offset=%d", runHref(repo, cl, id), next)
 	}

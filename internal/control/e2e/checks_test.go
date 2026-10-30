@@ -33,7 +33,7 @@ func checks(t *testing.T, p page) (rows []checkRow, verdict string, live bool, s
 	}
 	body := p.body[i:]
 	open := body[:strings.IndexByte(body, '>')]
-	live = strings.Contains(open, `hx-trigger="every 3s"`)
+	live = strings.Contains(open, `hx-trigger="live" data-live-events="/example/svc/cl/`)
 	if m := regexp.MustCompile(`(?s)<h3>Pre</h3>.*?<span class="[^"]*rounded-md[^"]*">\s*([A-Za-z ]+?)\s*</span>`).FindStringSubmatch(body); m != nil {
 		verdict = m[1]
 	}

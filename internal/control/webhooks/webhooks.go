@@ -54,8 +54,6 @@ type Hooks struct {
 	// Installation is the installation's organization's handle ("" for a hosted service).
 	Installation string
 	Log          *slog.Logger
-	// Look is how often marked deliveries are looked for: two seconds unless set.
-	Look time.Duration
 	// Now is the clock; unset, time.Now.
 	Now    func() time.Time
 	client *http.Client
@@ -147,36 +145,15 @@ func (h *Hooks) Redeliver(ctx context.Context, repo, id int64) error {
 	return h.DB.QueueDeliveries(move.WithRepository(ctx, repo), repo, []db.Delivery{again})
 }
 
-// Run sends deliveries as they are marked, and as their retries fall due, until ctx ends; a
-// repository with deliveries waiting that no mark names — moved in — is marked every minute.
+// Run sends deliveries as they are marked, and as their retries fall due, until ctx ends: marked
+// by the transactions that queue them, each send for the next to fall due, and a move's arrival,
+// for a repository whose deliveries came with it.
 func (h *Hooks) Run(ctx context.Context) error {
-	look := h.Look
-	if look <= 0 {
-		look = 2 * time.Second
-	}
-	var swept time.Time
 	return (&work.Runner{
 		Kind:  db.WebhookWork,
 		Store: h.DB.Work(),
 		Do:    h.Send,
-		Sweep: func(ctx context.Context) error {
-			if time.Since(swept) < time.Minute {
-				return nil
-			}
-			swept = time.Now()
-			repos, err := h.DB.WaitingDeliveries(ctx)
-			if err != nil {
-				return err
-			}
-			for _, r := range repos {
-				if err := h.DB.Work().Mark(ctx, db.WebhookWork, r); err != nil {
-					return err
-				}
-			}
-			return nil
-		},
-		Idle: look,
-		Log:  h.Log,
+		Log:   h.Log,
 	}).Run(ctx)
 }
 

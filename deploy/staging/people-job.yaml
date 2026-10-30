@@ -2,9 +2,10 @@
 # PEOPLE in — through ok's device sign-in, approved at Dex with the password in ok-load-password —
 # and acting as them, each on a connection of their own, in REPOSITORIES repositories (prefix
 # PREFIX), at SPEED times the target's rates a person, for DURATION; its synthetic workers as
-# worker.ok, each keeping a real checkout in the pod's scratch volume and moving it to each job's
-# commit, as a worker does. Each pod's report is a line of its log, which ok load merge reads.
-# PROJECT and TAG as values.yaml's.
+# worker.ok, each presenting its jobs' commits through okfs, as a worker does — one okfs daemon a
+# pod, in the user and mount namespace unshare makes, with the FUSE device the chart's device
+# plugin offers — and reading files of each through it. Each pod's report is a line of its log,
+# which ok load merge reads. PROJECT and TAG as values.yaml's.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -21,7 +22,10 @@ spec:
   completionMode: Indexed
   completions: PODS
   parallelism: PODS
-  backoffLimit: 0
+  # Each pod runs once, and one whose checks fail ends the Job's run of it alone: under the Job's
+  # backoffLimit, the first pod to fail failed the Job, and the pods still draining were killed,
+  # their reports lost.
+  backoffLimitPerIndex: 0
   template:
     spec:
       serviceAccountName: ok-load
@@ -29,23 +33,31 @@ spec:
       securityContext: {runAsUser: 65532, runAsGroup: 65532, fsGroup: 65532, runAsNonRoot: true}
       containers:
         - name: load
-          image: us-central1-docker.pkg.dev/PROJECT/ok/ok:TAG
+          image: us-central1-docker.pkg.dev/PROJECT/ok/ok-runner:TAG
+          command: [/usr/bin/unshare, --map-root-user, --mount, --propagation, private, --, /usr/local/bin/ok]
           env:
             - {name: OK_PLAINTEXT, value: "1"} # the cluster's network, which the installation trusts
           args: [load, run, -address, "ok-server.ok.svc:8472", -insecure,
                  -server, "http://ok-server.ok.svc:8472", -people, "PEOPLE", -pods, "PODS",
                  -password-file, /etc/ok/load/password/password, -worker-token-file, /var/run/secrets/ok/token/token,
                  -repositories, "REPOSITORIES", -prefix, PREFIX, -speed, "SPEED", -duration, DURATION, -drain, 10m,
-                 -workers, "16", -run-time, 10s, -checkout-dir, /checkouts, -report, "-"]
+                 -workers, "16", -run-time, 10s, -present-dir, /present, -read-files, "200", -report, "-"]
           resources:
             requests: {cpu: "4", memory: 8Gi}
+            limits: {devic.es/fuse: 1}
+          # unshare makes a user namespace, and okfs mounts in it: seccomp and AppArmor that allow it
+          # (docs/install.md, "Workers' nodes").
+          securityContext:
+            seccompProfile: {type: Unconfined}
+            appArmorProfile: {type: Unconfined}
+            allowPrivilegeEscalation: false
           volumeMounts:
             - {name: password, mountPath: /etc/ok/load/password}
             - {name: token, mountPath: /var/run/secrets/ok/token, readOnly: true}
-            - {name: checkouts, mountPath: /checkouts}
+            - {name: present, mountPath: /present}
       volumes:
-        - name: checkouts
-          emptyDir: {sizeLimit: 40Gi}
+        - name: present
+          emptyDir: {sizeLimit: 20Gi}
         - name: password
           secret: {secretName: ok-load-password, defaultMode: 0440}
         - name: token

@@ -136,9 +136,11 @@ type Compacted struct {
 	Ops          []OpRecord
 	OpsBefore    time.Time
 	OpTombstones []OpKey
-	// ChangeLists are landed CLs, deleted with their patchsets; MainLog, main's moves by place.
-	ChangeLists []int64
-	MainLog     []int64
+	// ChangeLists are landed CLs by number, and ChangeListIDs the same CLs' IDs, deleted with their
+	// patchsets; MainLog, main's moves by place.
+	ChangeLists   []int64
+	ChangeListIDs []int64
+	MainLog       []int64
 }
 
 // OpKey names an operation or a view in an operation log.
@@ -170,6 +172,20 @@ type PathRow struct {
 type PathIndex struct {
 	Generation     int64
 	Commit, Parent encoding.ID
+}
+
+// CommitPaths are the paths a commit on main changed, at its generation.
+type CommitPaths struct {
+	Generation int64
+	Commit     encoding.ID
+	Paths      []string
+}
+
+// LandedCL is a CL a landing landed: its ID, the commit it landed as, and who submitted it.
+type LandedCL struct {
+	ID     int64
+	Commit encoding.ID
+	By     string
 }
 
 // GraphCommit is a commit as the commit graph knows it: its generation and its parents, in order.
@@ -208,6 +224,9 @@ type Commit struct {
 	Generation  int64
 	Conflicted  bool
 	CommittedAt time.Time
+	// WrittenBy is who wrote it, when not the call's: each commit a landing writes is its CL's
+	// submitter's.
+	WrittenBy string
 }
 
 // StoredCommit is a commit as fsck reads it.

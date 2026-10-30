@@ -24,6 +24,7 @@ import (
 
 	"github.com/Cidan/ok/internal/authz"
 	"github.com/Cidan/ok/internal/cells"
+	"github.com/Cidan/ok/internal/control/api"
 	"github.com/Cidan/ok/internal/control/db"
 	pages "github.com/Cidan/ok/internal/control/pages"
 	"github.com/Cidan/ok/internal/control/people"
@@ -31,6 +32,7 @@ import (
 	"github.com/Cidan/ok/internal/control/scm"
 	"github.com/Cidan/ok/internal/control/webhooks"
 	"github.com/Cidan/ok/internal/move"
+	"github.com/Cidan/ok/internal/names"
 	"github.com/Cidan/ok/internal/serve/authn"
 	"github.com/Cidan/ok/internal/tenancy"
 	automationpb "github.com/Cidan/ok/proto/ok/automation/v1"
@@ -40,12 +42,14 @@ import (
 
 // Server serves ok control's pages.
 type Server struct {
-	db          db.Store
-	scm         *scm.Client
-	runs        automationpb.RunsClient
-	deploys     deploypb.DeploymentsClient
-	review      *review.Service
-	people      *people.Directory
+	db      db.Store
+	scm     *scm.Client
+	runs    automationpb.RunsClient
+	deploys deploypb.DeploymentsClient
+	review  *review.Service
+	people  *people.Directory
+	// waits are the other services the pages' change events register with (live.go).
+	waits       api.Waits
 	changeCache *changeCache
 	// tenancy and inboxes are the directory's, for what spans cells: its search, and people's
 	// inboxes.
@@ -60,9 +64,9 @@ type Server struct {
 // deployer's deployments, and review. installation is the installation's organization's handle,
 // "" for a hosted service.
 func New(d db.Store, c *scm.Client, runs automationpb.RunsClient, deploys deploypb.DeploymentsClient, r *review.Service, dir *people.Directory,
-	identity grpc.ClientConnInterface, hooks *webhooks.Hooks, installation string) *Server {
+	identity grpc.ClientConnInterface, hooks *webhooks.Hooks, waits api.Waits, installation string) *Server {
 	installationHandle = installation
-	return &Server{db: d, scm: c, runs: runs, deploys: deploys, review: r, people: dir, changeCache: newChangeCache(),
+	return &Server{db: d, scm: c, runs: runs, deploys: deploys, review: r, people: dir, waits: waits, changeCache: newChangeCache(),
 		tenancy: identitypb.NewTenancyClient(identity), inboxes: identitypb.NewInboxClient(identity), notify: identitypb.NewNotificationsClient(identity),
 		hooks: hooks}
 }
@@ -99,6 +103,12 @@ func identify(next http.Handler) http.Handler {
 
 // Mount routes the site on r.
 func (s *Server) Mount(r chi.Router) {
+	// Each person a page names resolved once for it.
+	r.Use(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			next.ServeHTTP(w, req.WithContext(names.WithScope(req.Context())))
+		})
+	})
 	assets := pages.Assets()
 	r.Handle("/assets/*", assets)
 	r.Handle("/favicon.svg", assets)
@@ -109,6 +119,7 @@ func (s *Server) Mount(r chi.Router) {
 		r.Get("/repositories/rows", s.homeRows)
 		r.Get("/repositories/new", s.newRepository)
 		r.Get("/services", s.services)
+		r.Get("/services/events", s.servicesEvents)
 		r.Get("/services/{id}", s.service)
 		r.Get("/services/group/{name}", s.serviceGroup)
 		r.Post("/repositories/new", s.createRepository)
@@ -151,6 +162,7 @@ func (s *Server) Mount(r chi.Router) {
 			r.Route("/deploy/{id}", func(r chi.Router) {
 				r.Get("/", s.deploymentPage)
 				r.Get("/status", s.deploymentStatusFragment)
+				r.Get("/events", s.deploymentEvents)
 				r.Post("/retry", s.deploymentAction("retry"))
 				r.Post("/halt", s.deploymentAction("halt"))
 				r.Post("/allow", s.deploymentAction("allow"))
@@ -174,6 +186,7 @@ func (s *Server) Mount(r chi.Router) {
 				r.Post("/comment/{id}/unresolve", s.clResolve(false))
 				r.Post("/comment/{id}/delete", s.clDeleteComment)
 				r.Get("/checks", s.clChecks)
+				r.Get("/events", s.clEvents)
 				r.Post("/run-pre", s.clRunPre)
 				r.Get("/deployments", s.clDeploysTab)
 				r.Get("/files", s.clFiles)
@@ -181,6 +194,7 @@ func (s *Server) Mount(r chi.Router) {
 				r.Route("/run/{run}", func(r chi.Router) {
 					r.Get("/", s.runPage)
 					r.Get("/status", s.runStatus)
+					r.Get("/events", s.runEvents)
 					r.Get("/log", s.runLog)
 					r.Get("/raw", s.runRaw)
 					r.Post("/rerun", s.runAction(true))

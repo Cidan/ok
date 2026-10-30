@@ -12,6 +12,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/Cidan/ok/internal/bus/bustest"
 	"github.com/Cidan/ok/internal/config"
 	"github.com/Cidan/ok/internal/credential"
 	"github.com/Cidan/ok/internal/dial"
@@ -50,6 +51,7 @@ identity:
 	if err != nil {
 		t.Fatal(err)
 	}
+	cfg.Bus = bustest.Config(t)
 	pool := testdb.Pool(t)
 	r, err := role.Build(ctx, cfg, role.Options{Pool: pool})
 	if err != nil {
@@ -84,16 +86,14 @@ identity:
 	if _, err := d.Principal(ctx, "nobody.human.example.com"); err == nil {
 		t.Error("a principal that does not exist")
 	}
-	roots, err := idclient.NewRoots(ctx, conn, "test")
-	if err != nil {
-		t.Fatal(err)
-	}
+	roots := idclient.NewRoots(conn)
 	certDER, key, _ := w.Current(ctx)
 	first, _ := x509.ParseCertificate(certDER)
 	id, _ := credential.ID(first)
 	proof, _ := credential.Prove(key, "/m", time.Now())
-	if v, err := credential.NewVerifier(roots.Pool).Verify("/m", certDER, proof); err != nil || v.Principal != scmRobot {
-		t.Errorf("verifying the workload's credential against the roots: %+v, %v", v, err)
+	v, err := credential.NewVerifier(roots.Pool).Verify(ctx, "/m", certDER, proof)
+	if err != nil || v.Principal != scmRobot {
+		t.Fatalf("verifying the workload's credential against the roots: %+v, %v", v, err)
 	}
 	if c, err := d.Credential(ctx, id); err != nil || !c.Active || c.Name != scmRobot {
 		t.Errorf("Credential = %+v, %v", c, err)
@@ -170,6 +170,7 @@ identity:
 	if err != nil {
 		t.Fatal(err)
 	}
+	cfg.Bus = bustest.Config(t)
 	pool := testdb.Pool(t)
 	r, err := role.Build(ctx, cfg, role.Options{Pool: pool})
 	if err != nil {
@@ -188,10 +189,7 @@ identity:
 	}
 	defer early.Close()
 	lis.Close()
-	roots, err := idclient.NewRoots(ctx, early, "scm")
-	if err != nil {
-		t.Fatal(err)
-	}
+	roots := idclient.NewRoots(early)
 
 	l := idclient.NewLocal(r.Services, "scm.ok")
 	certDER, key, err := l.Current(ctx)
@@ -199,8 +197,8 @@ identity:
 		t.Fatal(err)
 	}
 	proof, _ := credential.Prove(key, "/m", time.Now())
-	if _, err := credential.NewVerifier(roots.Pool).Verify("/m", certDER, proof); err == nil {
-		t.Error("a credential verified against roots never read")
+	if _, err := credential.NewVerifier(roots.Pool).Verify(ctx, "/m", certDER, proof); err == nil {
+		t.Error("a credential verified against roots identity could not answer")
 	}
 
 	// Identity serving, roots read: the local credential is the robot's.
@@ -216,11 +214,9 @@ identity:
 		t.Fatal(err)
 	}
 	defer ready.Close()
-	if roots, err = idclient.NewRoots(ctx, ready, "scm"); err != nil {
-		t.Fatal(err)
-	}
+	roots = idclient.NewRoots(ready)
 	proof, _ = credential.Prove(key, "/m", time.Now())
-	v, err := credential.NewVerifier(roots.Pool).Verify("/m", certDER, proof)
+	v, err := credential.NewVerifier(roots.Pool).Verify(ctx, "/m", certDER, proof)
 	if err != nil || v.Principal != scmRobot {
 		t.Fatalf("the local credential: %+v, %v", v, err)
 	}

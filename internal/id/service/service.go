@@ -77,8 +77,6 @@ type Config struct {
 	// Cells are the cells repositories are placed in (config.Config.Cells), the first holding
 	// those made before there were cells.
 	Cells []config.IdentityCell
-	// MoveAsked, when set, is told a move was asked or canceled: the runner looks at once.
-	MoveAsked func()
 }
 
 // Server implements every identity service.

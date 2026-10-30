@@ -1,0 +1,36 @@
+syntax = "proto3";
+
+package ok.v1;
+
+import "google/protobuf/timestamp.proto";
+import "proto/ok/v1/annotations.proto";
+
+option go_package = "github.com/Cidan/ok/proto/ok/v1;okpb";
+
+// Waits registers another role's live request — ok control's watch of a CL — as waiting on subjects
+// this role's transactions change (docs/state.md, "Waiting"; internal/wait): each change of one is
+// a reply on the request's inbox, on the bus's queue. ok automation and the deployer serve it, to
+// ok control.
+service Waits {
+  option (ok.v1.callers) = CALLER_CONTROL;
+
+  // Register registers an inbox under subjects until a time, over what it registered: renewed by
+  // the request as it waits, it lapses should the request's process die.
+  rpc Register(RegisterWaitRequest) returns (RegisterWaitResponse);
+  // Unregister removes an inbox's registrations, as its request ends.
+  rpc Unregister(UnregisterWaitRequest) returns (UnregisterWaitResponse);
+}
+
+message RegisterWaitRequest {
+  string inbox = 1;  // its address on the bus's queue
+  repeated string subjects = 2;
+  google.protobuf.Timestamp lapses = 3;
+}
+
+message RegisterWaitResponse {}
+
+message UnregisterWaitRequest {
+  string inbox = 1;
+}
+
+message UnregisterWaitResponse {}

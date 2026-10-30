@@ -17,14 +17,14 @@ func (x queries) AccountQuotas(ctx context.Context, accounts []string) (map[stri
 	out := map[string]store.Quota{}
 	err := x.Read(func(r spannerdata.Reader) error {
 		clear(out)
-		return spannerdata.Each(ctx, r, `SELECT principal_id, concurrent, minutes, weight FROM account_quotas WHERE principal_id IN UNNEST(@ids)`,
+		return spannerdata.Each(ctx, r, `SELECT principal_id, concurrent, minutes FROM account_quotas WHERE principal_id IN UNNEST(@ids)`,
 			map[string]any{"ids": accounts}, func(row *spanner.Row) error {
 				var id string
-				var c, m, w int64
-				if err := row.Columns(&id, &c, &m, &w); err != nil {
+				var c, m int64
+				if err := row.Columns(&id, &c, &m); err != nil {
 					return err
 				}
-				out[id] = store.Quota{Concurrent: int(c), Minutes: m, Weight: int(w)}
+				out[id] = store.Quota{Concurrent: int(c), Minutes: m}
 				return nil
 			})
 	})
@@ -33,8 +33,8 @@ func (x queries) AccountQuotas(ctx context.Context, accounts []string) (map[stri
 
 func (x queries) SetAccountQuota(ctx context.Context, account string, q store.Quota) error {
 	return x.Write(ctx, func(tx *spanner.ReadWriteTransaction) error {
-		return tx.BufferWrite([]*spanner.Mutation{spanner.InsertOrUpdate("account_quotas", []string{"principal_id", "concurrent", "minutes", "weight"},
-			[]any{account, int64(q.Concurrent), q.Minutes, int64(q.Weight)})})
+		return tx.BufferWrite([]*spanner.Mutation{spanner.InsertOrUpdate("account_quotas", []string{"principal_id", "concurrent", "minutes"},
+			[]any{account, int64(q.Concurrent), q.Minutes})})
 	})
 }
 

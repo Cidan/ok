@@ -112,3 +112,25 @@ func (k *Keyring) Unwrap(_ context.Context, wrapped, aad []byte) ([]byte, error)
 	}
 	return Open(key, wrapped[1+wrapped[0]:], aad)
 }
+
+// keyringFile is a keyring root read from its file at each use, so a key added to it, or one
+// removed, takes effect at once, and no process keeps its keys (docs/state.md).
+type keyringFile struct{ file string }
+
+func (r keyringFile) ID() string { return "keyring:" + r.file }
+
+func (r keyringFile) Wrap(ctx context.Context, plaintext, aad []byte) ([]byte, error) {
+	k, err := OpenKeyring(r.file)
+	if err != nil {
+		return nil, err
+	}
+	return k.Wrap(ctx, plaintext, aad)
+}
+
+func (r keyringFile) Unwrap(ctx context.Context, wrapped, aad []byte) ([]byte, error) {
+	k, err := OpenKeyring(r.file)
+	if err != nil {
+		return nil, err
+	}
+	return k.Unwrap(ctx, wrapped, aad)
+}

@@ -44,9 +44,10 @@ Unit tests need nothing. Tests of the database, object storage, and the client a
 | `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD` | A PostgreSQL server (tested with 18) and a role that may create databases. Each Go test makes a database of its own and drops it; the Rust suites' `ok scm` keeps its tables in a schema of its own, in `PGDATABASE` or `postgres`. |
 | `AWS_ENDPOINT_URL_S3`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION` | An S3-compatible server. Tests make the buckets they use. |
 | `OK_TEST_OBJECTS` | Where the tests that keep objects keep them: `s3` (the default), the server above; `gcs`, a GCS emulator each test process runs on its loopback, needing no server (`internal/testdb/testobjects`); or `fs`, a directory. The S3 store's own tests use S3 whatever it says. |
-| `OK_TEST_BUS` | The bus the tests' roles run on: `postgres` (the default), in the test's database; `nats`, a NATS server with JetStream each test runs in its process, needing no server (`internal/bus/bustest`); `pubsub`, a Pub/Sub fake (`pstest`) likewise; `aws`, a fake of SNS and SQS (`internal/bus/bustest/awsfake`) likewise; or `kafka`, a Kafka cluster (`kfake`) likewise for the stream, beside PostgreSQL's queue. With `OK_TEST_DATABASE=spanner`, `nats` unless it names another, `postgres` refused, and Kafka's queue NATS's: a Spanner installation's bus is another backend's. The bus's own conformance suites run every backend whatever it says. |
+| `OK_TEST_BUS` | The bus the tests' roles run on: `nats` (the default), a NATS server with JetStream each test runs in its process, needing no server (`internal/bus/bustest`); `pubsub`, a Pub/Sub fake (`pstest`) likewise; or `aws`, a fake of SQS (`internal/bus/bustest/awsfake`) likewise. The bus's own conformance suites run every backend whatever it says. |
 | `OK_TEST_OBJECT_LATENCY` | A delay (`20ms`, say) added to every request the tests' object stores make: what a store across a network costs a request, which one on the test's own machine hides, so a path that makes a request per item shows as what it would cost in production (`internal/testdb/testobjects`). `TestLargeRepository` logs each phase's requests on such a store. |
 | `OK_GCS_BINARY` | The GCS emulator the Rust suites start beside their SCM with `OK_TEST_OBJECTS=gcs` (`go build -o /tmp/ok-test-gcs ./internal/testdb/testobjects/gcsserver`; default: `ok-test-gcs` on the `PATH`). |
+| `OK_NATS_BINARY` | The NATS server the Rust suites start beside their SCM, which its roles keep their work on (`go build -o /tmp/ok-test-nats ./internal/bus/bustest/natsserver`; default: `ok-test-nats` on the `PATH`). |
 | `OK_BINARY` | The `ok` binary the Rust suites run as their SCM (default: `ok` on the `PATH`). |
 | `OK_TEST_INTEGRATION` | Without the servers, those tests are skipped and say so; `require` fails them instead, as CI does. |
 | `OK_TEST_DATABASE` | The database the SCM store's suite (`internal/scm/store`) and the end-to-end suites (ok control's, ok automation's, the deployer's role suite) run their roles on: `postgres`, the default, or `spanner`, as `OK_TEST_SPANNER_*` reach it. On Spanner each end-to-end test's roles have databases of their own, `<prefix>-<role>`, made with their schemas at once and dropped when it ends (`internal/testdb/roledb`), which the roles open as their configuration says. What the SCM store's tests read and age directly goes through `testDB` (`testdb_test.go`), in the SQL every database it runs on shares or a method each implements. |
@@ -86,7 +87,8 @@ export AWS_ENDPOINT_URL_S3=http://127.0.0.1:59000 AWS_ACCESS_KEY_ID=okaccess \
 export OK_TEST_INTEGRATION=require
 
 go test ./...
-go build -o /tmp/ok ./cmd/ok && OK_BINARY=/tmp/ok cargo test --workspace
+go build -o /tmp/ok ./cmd/ok && go build -o /tmp/ok-test-nats ./internal/bus/bustest/natsserver
+OK_BINARY=/tmp/ok OK_NATS_BINARY=/tmp/ok-test-nats cargo test --workspace
 cargo build -p ok-jj && OK_JJ=$PWD/target/debug/jj go test ./internal/control/e2e ./internal/automation/e2e ./internal/deploy/role
 ```
 
@@ -95,7 +97,7 @@ cargo build -p ok-jj && OK_JJ=$PWD/target/debug/jj go test ./internal/control/e2
 ```bash
 OK_TEST_OBJECTS=gcs go test ./...
 go build -o /tmp/ok-test-gcs ./internal/testdb/testobjects/gcsserver
-OK_TEST_OBJECTS=gcs OK_GCS_BINARY=/tmp/ok-test-gcs OK_BINARY=/tmp/ok cargo test --workspace
+OK_TEST_OBJECTS=gcs OK_GCS_BINARY=/tmp/ok-test-gcs OK_NATS_BINARY=/tmp/ok-test-nats OK_BINARY=/tmp/ok cargo test --workspace
 ```
 
 ok automation's suite builds small Bazel workspaces of Starlark rules alone, so Bazel downloads

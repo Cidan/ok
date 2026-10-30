@@ -2,9 +2,10 @@ package store
 
 import (
 	"context"
+	"encoding/binary"
+	"errors"
 	"fmt"
-	"log/slog"
-	"sync"
+	"strconv"
 	"time"
 
 	"google.golang.org/protobuf/proto"
@@ -12,6 +13,8 @@ import (
 
 	"github.com/Cidan/ok/internal/data"
 	"github.com/Cidan/ok/internal/scm/store/backend"
+	"github.com/Cidan/ok/internal/wait"
+	"github.com/Cidan/ok/internal/work"
 	scmpb "github.com/Cidan/ok/proto/ok/scm/v1"
 )
 
@@ -112,6 +115,24 @@ func (s *Store) sequenced(t *txn) error {
 		if err := s.sequence(ctx, repo, need); err != nil {
 			return fmt.Errorf("sequencing repository %d: %w", repo, err)
 		}
+		// Another replica's pass, heard of, is taken to serve what committed a margin before it
+		// began by that replica's clock: should the clocks differ more, the transaction's rows are
+		// pending still, and a pass begun now serves them.
+		for tries := 0; ; tries++ {
+			pending, err := s.b.TxnPending(ctx, repo, t.tie)
+			if err != nil {
+				return fmt.Errorf("sequencing repository %d: %w", repo, err)
+			}
+			if !pending {
+				break
+			}
+			if tries == passTries {
+				return fmt.Errorf("sequencing repository %d: its rows are pending after %d passes", repo, passTries)
+			}
+			if err := s.sequence(ctx, repo, time.Now().Add(skewMargin)); err != nil {
+				return fmt.Errorf("sequencing repository %d: %w", repo, err)
+			}
+		}
 	}
 	byRepo := map[int64][]*scmpb.Event{}
 	for _, a := range t.appended {
@@ -148,69 +169,123 @@ func (s *Store) sequenced(t *txn) error {
 	return nil
 }
 
-// sequencer runs a repository's passes one at a time in this replica, each serving every caller
-// that needs what committed before it began.
-type sequencer struct {
-	mu    sync.Mutex
-	repos map[int64]*repoSequence
-}
+const (
+	// sequencePage is how many pending rows one pass's transaction sequences.
+	sequencePage = 500
+	// passClaim is a repository's sequencing pass, as keyed work claimed for its length, and
+	// passLease how long the claim lasts unrenewed.
+	passClaim = "sequence-pass"
+	passLease = 10 * time.Second
+	// skewMargin is how much earlier than another replica says its pass began it is taken to have:
+	// more than its clock and this one's differ by, as a rule — what a wider skew leaves pending, a
+	// writer finds so, and waits for another pass (sequenced, sequenceStep).
+	skewMargin = 100 * time.Millisecond
+	// passTries bounds the passes a writer waits for once its own should have served it.
+	passTries = 10
+)
 
-type repoSequence struct {
-	mu    sync.Mutex
-	began time.Time // when the last pass to finish began
-}
+// sequencedSubject is what a pass of repo changes, ending (internal/wait): what a writer waiting for
+// one waits on.
+func sequencedSubject(repo int64) string { return "sequenced/" + strconv.FormatInt(repo, 10) }
 
-func (q *sequencer) of(repo int64) *repoSequence {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	if q.repos == nil {
-		q.repos = map[int64]*repoSequence{}
-	}
-	r, ok := q.repos[repo]
-	if !ok {
-		r = &repoSequence{}
-		q.repos[repo] = r
-	}
-	return r
-}
-
-// sequencePage is how many pending rows one pass's transaction sequences.
-const sequencePage = 500
-
-// sequence runs repo's pass, unless one that began at or after need has finished in this replica:
-// that one sequenced every row committed before need. A pass sequences what is pending, a page at a
-// time, until none is; what another replica's pass took meanwhile it leaves.
+// sequence runs repo's pass, unless one that began at or after need has finished: it sequenced
+// every row committed before need. A repository's passes run one at a time in the installation,
+// each serving every writer that needs what committed before it began: a pass holds the
+// repository's claim (passClaim) and records when it began as it ends (SequencedAt), saying so
+// (sequencedSubject). A writer whose repository another replica is passing waits for that pass to
+// end — one that began after need serves it — or, should its holder die, for its claim to lapse.
+// Staging's herd of 3,000 uploads, each running passes of its own, waited two minutes for their
+// numbers, the passes meeting on the rows and counters they took.
 func (s *Store) sequence(ctx context.Context, repo int64, need time.Time) error {
 	if !s.b.SequencesAfterCommit() {
 		return nil
 	}
-	r := s.seq.of(repo)
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if !r.began.Before(need) {
-		return nil
+	var waiter *wait.Waiter
+	defer func() {
+		if waiter != nil {
+			waiter.Close()
+		}
+	}()
+	for {
+		began, err := s.b.SequencedAt(ctx, repo)
+		if err != nil {
+			return err
+		}
+		if !began.Add(-skewMargin).Before(need) {
+			return nil
+		}
+		ran, err := s.runPass(ctx, repo)
+		if err != nil || ran {
+			return err
+		}
+		if waiter == nil {
+			// Registered first, then read again: a pass that ended meanwhile is read, not missed.
+			if waiter, err = wait.Open(ctx, s.Work().Jobs().Queue, wait.Reg{Store: s.b.Waits(), Subjects: []string{sequencedSubject(repo)}}); err != nil {
+				return err
+			}
+			continue
+		}
+		p, err := s.Work().Peek(ctx, passClaim, repo)
+		if err != nil {
+			return err
+		}
+		if !p.Held {
+			continue
+		}
+		wctx, cancel := context.WithTimeout(ctx, p.Left+10*time.Millisecond)
+		_, err = waiter.Next(wctx)
+		cancel()
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if err != nil && !errors.Is(err, context.DeadlineExceeded) {
+			return err
+		}
+	}
+}
+
+// runPass runs repo's pass holding its claim, and records its beginning as it ends; false when
+// another replica holds the claim. What a pass of an older release, which claims nothing, took
+// meanwhile it leaves.
+func (s *Store) runPass(ctx context.Context, repo int64) (bool, error) {
+	_, release, ok, err := work.Claim(ctx, s.Work(), passClaim, repo, s.holder, passLease)
+	if err != nil || !ok {
+		return false, err
+	}
+	defer release()
+	if s.passing != nil {
+		s.passing(repo, true)
+		defer s.passing(repo, false)
 	}
 	began := time.Now()
 	for {
 		rows, err := s.b.PendingRows(ctx, repo, sequencePage)
 		if err != nil {
-			return err
+			return true, err
 		}
 		if len(rows) == 0 {
 			break
 		}
 		if err := s.sequencePass(ctx, repo, rows); err != nil {
-			return err
+			return true, err
 		}
 		if len(rows) < sequencePage {
 			break
 		}
 	}
-	r.began = began
+	if err := s.inTx(ctx, func(ctx context.Context, tx *txn) error {
+		if err := tx.SetSequencedAt(ctx, repo, began); err != nil {
+			return err
+		}
+		kind, key, body := wait.Changed(sequencedSubject(repo))
+		return tx.PendStep(ctx, kind, key, time.Time{}, body)
+	}); err != nil {
+		return true, err
+	}
 	if s.sequencePasses != nil {
 		s.sequencePasses(repo)
 	}
-	return nil
+	return true, nil
 }
 
 // sequencePass sequences rows, read unlocked in commit order, in one transaction: of them, those
@@ -309,7 +384,7 @@ func (s *Store) sequencePass(ctx context.Context, repo int64, rows []backend.Pen
 			if err := tx.InsertEvents(ctx, repo, out); err != nil {
 				return err
 			}
-			if err := tx.Notify(ctx, eventChannel, fmt.Sprint(repo)); err != nil {
+			if err := pendRelay(ctx, tx, repo, last-int64(len(evs))+1, last); err != nil {
 				return err
 			}
 		}
@@ -317,31 +392,62 @@ func (s *Store) sequencePass(ctx context.Context, repo int64, rows []backend.Pen
 	})
 }
 
-// sweepAfter is how long a pending row waits for its writer's pass before any replica's sweep runs
-// one: a writer that stopped between its commit and its pass leaves it.
-const sweepAfter = 5 * time.Second
+// sequenceKind is the step that runs a repository's pass should the writer that left rows pending
+// stop between its commit and its pass: a job its transaction enqueued, due SequenceAfter later,
+// which finds them pending still and runs the pass (sequenceStep), or finds them sequenced.
+const sequenceKind = "sequence"
 
-// sweepEvery is how often each replica sweeps.
-const sweepEvery = 5 * time.Second
+// SequenceAfter is how long after a writer leaves rows pending its sequence step looks for them:
+// its own pass has run long before.
+const SequenceAfter = 5 * time.Second
 
-// sweep runs the pass of every repository with a row pending since before sweepAfter, every
-// sweepEvery, until ctx ends.
-func (s *Store) sweep(ctx context.Context) {
-	if !s.b.SequencesAfterCommit() {
-		return
-	}
-	t := time.NewTicker(sweepEvery)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-		}
-		if err := s.sweepOnce(ctx, time.Now().Add(-sweepAfter)); err != nil && ctx.Err() == nil {
-			slog.Warn("ok scm: sweeping pending sequences", slog.Any("err", err))
+// pendSequence pends, in tx, the sequence step of each repository it leaves rows pending in.
+func (s *Store) pendSequence(ctx context.Context, tx *txn) error {
+	for repo := range tx.sequence {
+		if err := tx.PendStep(ctx, sequenceKind, repo, time.Now().Add(s.sequenceAfter), binary.BigEndian.AppendUint64(nil, uint64(tx.tie))); err != nil {
+			return err
 		}
 	}
+	return nil
+}
+
+// sequenceStep runs repo's pass if the transaction of the job's tie left rows pending there that no
+// pass has sequenced — or, for a tie of 0 (an upgrade's, a move's arrival), whatever is pending. A
+// transaction whose rows it finds neither pending nor placed may be committing still: looked at
+// again once it is a minute old.
+func (s *Store) sequenceStep(ctx context.Context, repo int64, body []byte, age time.Duration) error {
+	if len(body) != 8 {
+		return nil
+	}
+	tie := int64(binary.BigEndian.Uint64(body))
+	if tie != 0 {
+		pending, err := s.b.TxnPending(ctx, repo, tie)
+		if err != nil {
+			return err
+		}
+		if !pending {
+			placed, err := s.b.TransactionEvents(ctx, repo, tie)
+			switch {
+			case err != nil:
+				return err
+			case len(placed) > 0 || age >= commitWithin:
+				return nil
+			}
+			return work.Later{After: commitWithin - age}
+		}
+	}
+	if err := s.sequence(sequencing(), repo, time.Now()); err != nil || tie == 0 {
+		return err
+	}
+	// Served by another replica's pass, by its clock, that left the rows pending: another.
+	pending, err := s.b.TxnPending(ctx, repo, tie)
+	if err != nil {
+		return err
+	}
+	if pending {
+		return work.Later{After: time.Second}
+	}
+	return nil
 }
 
 // sweepOnce runs the pass of every repository with a row pending that committed before before.

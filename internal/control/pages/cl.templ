@@ -1066,7 +1066,8 @@ templ clChecksRegion(c CLChecks) {
 		class="space-y-4"
 		if c.Live {
 			hx-get={ c.Href }
-			hx-trigger="every 3s"
+			hx-trigger="live"
+			data-live-events={ c.ChangeEvents }
 			hx-target="this"
 			hx-swap="outerHTML"
 		}

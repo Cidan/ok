@@ -17,7 +17,8 @@ templ clDeploysRegion(d CLDeploys) {
 		data-live
 		if d.Live() {
 			hx-get={ d.Href }
-			hx-trigger="every 3s"
+			hx-trigger="live"
+			data-live-events={ d.ChangeEvents }
 			hx-target="this"
 			hx-swap="outerHTML"
 		}
@@ -155,7 +156,8 @@ templ deploymentStatus(v DeploymentView) {
 		data-live
 		if v.Live {
 			hx-get={ v.StatusHref }
-			hx-trigger="every 2s"
+			hx-trigger="live"
+			data-live-events={ v.ChangeEvents }
 			hx-target="this"
 			hx-swap="outerHTML"
 		}

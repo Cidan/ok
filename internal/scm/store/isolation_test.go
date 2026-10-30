@@ -58,7 +58,7 @@ func publishIn(ctx context.Context, s *Store, repo int64, principal, workspace s
 		}
 	}
 	for _, c := range chunks {
-		if err := p.AddChunk(c, b.chunk(c)); err != nil {
+		if err := p.AddChunk(ctx, c, b.chunk(c)); err != nil {
 			p.Close()
 			return nil, err
 		}

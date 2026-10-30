@@ -17,7 +17,7 @@ import (
 
 // Mover is the deployer's side of moves; its Purge deletes what moved away, a day after.
 func (s *Store) Mover() *move.RepositoryRole {
-	return &move.RepositoryRole{RoleName: cells.Deploy, Rows: s.b.Moves(), Frozen: s.idle, Arrived: s.arrived}
+	return &move.RepositoryRole{RoleName: cells.Deploy, Rows: s.b.Moves(), Work: s.Work(), Frozen: s.idle, Arrived: s.arrived, Thawed: s.thawed}
 }
 
 // idle refuses a freeze while a deployment of the repositories runs; once the gates closed, none
@@ -33,10 +33,19 @@ func (s *Store) idle(ctx context.Context, repos []int64) error {
 	return nil
 }
 
-// arrived has the repositories planned, and their services observed, here.
+// thawed has the deployments a move held up start, its gates open again.
+func (s *Store) thawed(ctx context.Context, _ []int64) error {
+	return s.Work().Mark(ctx, TurnsWork, 0)
+}
+
+// arrived has the repositories planned, their services observed, and their waiting deployments
+// started, here.
 func (s *Store) arrived(ctx context.Context, repos []int64) error {
+	if err := s.Work().Mark(ctx, TurnsWork, 0); err != nil {
+		return err
+	}
 	for _, r := range repos {
-		if err := s.MarkIdle(ctx, PlanWork, r); err != nil {
+		if err := s.Work().Mark(ctx, PlanWork, r); err != nil {
 			return err
 		}
 		services, err := s.Services(ctx, r)
@@ -44,7 +53,7 @@ func (s *Store) arrived(ctx context.Context, repos []int64) error {
 			return fmt.Errorf("repository %d's services: %w", r, err)
 		}
 		for _, sv := range services {
-			if err := s.MarkIdle(ctx, ObserveWork, sv.ID); err != nil {
+			if err := s.Work().Mark(ctx, ObserveWork, sv.ID); err != nil {
 				return err
 			}
 		}

@@ -20,7 +20,7 @@ var moveTables = []string{
 	"network", "repository", "head_log", "object", "tree_sizes", "commit", "commit_parent", "copy_parent", "commit_path", "path_index",
 	"pack", "content_index", "content_log", "dictionary", "dictionary_grant", "op_log", "operation", "view", "op_head",
 	"op_tombstone", "changelist", "patchset", "candidate", "changelist_counter", "event", "event_pending", "repository_event_counter",
-	"gc_pass", "workspace", "checkpoint", "segment", "chunk_release",
+	"gc_pass", "workspace", "checkpoint", "segment", "chunk_release", "compaction_cursor",
 }
 
 // moveWhere is the condition a table's rows about a network (@net) and its repositories (@repos)

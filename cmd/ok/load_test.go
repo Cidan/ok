@@ -56,7 +56,7 @@ scm:
   `+bucket("objects")+`
 automation:
   `+bucket("logs")+`
-`), 0o644)
+`+busYAML(t)), 0o644)
 	done := make(chan error, 1)
 	go func() {
 		done <- serveRolesUntil(ctx, []string{"-config", config, "-roles", "identity,scm,automation,control", "-dev"})
@@ -85,6 +85,8 @@ automation:
 	args := []string{"-address", addr, "-insecure", "-dev-person", "load.human.example.com", "-dev-worker", "worker.ok.robot.example.com",
 		// ~14 CLs offered over the run: one at least, all but certainly (the offers are random).
 		"-repositories", "5", "-speed", "400", "-cls-per-day", "40", "-duration", "15s", "-drain", "60s", "-run-time", "200ms", "-workers", "4",
+		// The burst: the one person's CL, three seconds in, submitted five seconds after.
+		"-burst-at", "3s", "-burst-submit-after", "5s",
 		"-publish-bytes", "200000", "-seed-files", "2000", "-seed-file-bytes", "200", "-report", reportPath}
 	var runErr error
 	for i := 0; i < 50; i++ { // the system of record's first sync makes the load's person
@@ -107,6 +109,14 @@ automation:
 	}
 	if !rep.Pass || rep.CLs.Landed == 0 || rep.Operations["publish"].OK == 0 || rep.Operations["checkpoint"].OK == 0 || rep.Runs.Jobs == 0 {
 		t.Errorf("the report:\n%s", out.String())
+	}
+	for _, op := range []string{"burst.upload", "burst.review", "burst.pre", "burst.submit", "burst.post", "burst.landed"} {
+		if n := rep.Operations[op].OK; n != 1 {
+			t.Errorf("%s: %d done, want the burst's one CL's:\n%s", op, n, out.String())
+		}
+	}
+	if took := time.Duration(rep.Operations["burst.landed"].P50) * time.Millisecond; took < 5*time.Second {
+		t.Errorf("the burst's CL landed in %s, before its submit was due", took)
 	}
 	for name, op := range rep.Operations {
 		if len(op.Errors) > 0 {

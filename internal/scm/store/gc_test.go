@@ -112,8 +112,6 @@ func rewriteIndex(t *testing.T, s *Store, repo int64, f func(encoding.ID, *conte
 	}); err != nil {
 		t.Fatal(err)
 	}
-	s.segmentsChanged(sc)
-	s.indexChanged(sc)
 }
 
 // netOf is a repository's network.
@@ -638,7 +636,7 @@ func TestGCRacesPublishes(t *testing.T) {
 					}
 				}
 				for _, id := range chunks {
-					if err := p.AddChunk(id, b.chunk(id)); err != nil {
+					if err := p.AddChunk(ctx, id, b.chunk(id)); err != nil {
 						p.Close()
 						pubErr = err
 						return
@@ -849,13 +847,11 @@ func TestCompactionReclaimsBytes(t *testing.T) {
 	if n, err := e.s.DeleteRetiredPacks(ctx, time.Now()); err != nil || n != 0 {
 		t.Fatalf("deleted %d retired packs within the grace (%v)", n, err)
 	}
-	if rs, err := e.s.Retiring(ctx, time.Now()); err != nil || len(rs) != 0 {
-		t.Fatalf("repositories retiring packs within the grace: %v, %v", rs, err)
+	// The repository's collection's next look falls when the grace ends.
+	if due, err := e.s.RetiredDue(ctx, e.repo); err != nil || time.Until(due) <= 0 || time.Until(due) > RetiredPackGrace {
+		t.Fatalf("its retired packs may be deleted at %v (%v); want within the grace's hour", due, err)
 	}
 	later := time.Now().Add(2 * RetiredPackGrace)
-	if rs, err := e.s.Retiring(ctx, later); err != nil || len(rs) != 1 || rs[0] != e.repo {
-		t.Fatalf("repositories retiring packs past the grace: %v, %v", rs, err)
-	}
 	if n, _, err := e.s.DeleteRetiredOf(ctx, e.repo+1, later); err != nil || n != 0 {
 		t.Fatalf("another repository's retired packs: %d, %v", n, err)
 	}
@@ -952,26 +948,27 @@ func TestOrphanPacks(t *testing.T) {
 }
 
 // A repository is due its daily pass once the scheduled hour passes since its last, a failure
-// tried again an hour later; GCDue answers for one repository as DueForGC does for every one.
+// tried again an hour later; the next slot is the scheduled hour's next.
 func TestGCSchedule(t *testing.T) {
 	ctx := context.Background()
 	e := newCLEnv(t)
 	other := newRepo(t, e.s).ID
 	at := func(day, hour int) time.Time { return time.Date(2026, 9, day, hour, 0, 0, 0, time.UTC) }
+	if got := NextGCSlot(at(3, 8), 9); !got.Equal(at(3, 9)) {
+		t.Errorf("the slot after 8:00: %v", got)
+	}
+	if got := NextGCSlot(at(3, 9), 9); !got.Equal(at(4, 9)) {
+		t.Errorf("the slot after 9:00: %v", got)
+	}
 	due := func(now time.Time) map[int64]bool {
 		t.Helper()
-		ids, err := e.s.DueForGC(ctx, now, 9)
-		if err != nil {
-			t.Fatal(err)
-		}
 		out := map[int64]bool{}
-		for _, id := range ids {
-			out[id] = true
-		}
 		for _, repo := range []int64{e.repo, other} {
-			if one, err := e.s.GCDue(ctx, repo, now, 9); err != nil || one != out[repo] {
-				t.Fatalf("GCDue(%d) at %s = %v, %v; DueForGC says %v", repo, now, one, err, out[repo])
+			one, err := e.s.GCDue(ctx, repo, now, 9)
+			if err != nil {
+				t.Fatal(err)
 			}
+			out[repo] = one
 		}
 		return out
 	}

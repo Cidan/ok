@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"time"
 
 	secretmanager "cloud.google.com/go/secretmanager/apiv1"
 	"cloud.google.com/go/secretmanager/apiv1/secretmanagerpb"
@@ -21,6 +22,7 @@ import (
 
 	"github.com/Cidan/ok/internal/config"
 	"github.com/Cidan/ok/internal/secrets/secretstore"
+	"github.com/googleapis/gax-go/v2"
 )
 
 const (
@@ -35,6 +37,29 @@ const (
 )
 
 var castagnoli = crc32.MakeTable(crc32.Castagnoli)
+
+// transient has a call that fails for a moment — Unavailable, ResourceExhausted, Internal — made
+// again, a while after, up to six times: every call of the store's is one it may make again, a
+// secret made already compared, a version added again holding the same bytes (Put). The client's
+// own policy makes again only reads.
+var transient = gax.WithRetry(func() gax.Retryer {
+	return &attempts{left: 5, Retryer: gax.OnCodes([]codes.Code{codes.Unavailable, codes.ResourceExhausted, codes.Internal},
+		gax.Backoff{Initial: 100 * time.Millisecond, Max: 3 * time.Second, Multiplier: 2})}
+})
+
+// attempts is a Retryer that gives up after left more attempts.
+type attempts struct {
+	gax.Retryer
+	left int
+}
+
+func (a *attempts) Retry(err error) (time.Duration, bool) {
+	if a.left == 0 {
+		return 0, false
+	}
+	a.left--
+	return a.Retryer.Retry(err)
+}
 
 // Store is Secret Manager, as a secretstore.Store.
 type Store struct {
@@ -88,7 +113,7 @@ func (s *Store) Put(ctx context.Context, key string, sealed []byte) error {
 		annotated = annotated[:maxAnnotation]
 	}
 	_, err := s.c.CreateSecret(ctx, &secretmanagerpb.CreateSecretRequest{Parent: "projects/" + s.project, SecretId: name[len("projects/"+s.project+"/secrets/"):],
-		Secret: &secretmanagerpb.Secret{Replication: repl, Annotations: map[string]string{keyAnnotation: annotated}}})
+		Secret: &secretmanagerpb.Secret{Replication: repl, Annotations: map[string]string{keyAnnotation: annotated}}}, transient)
 	switch {
 	case status.Code(err) == codes.AlreadyExists:
 		have, err := s.Get(ctx, key)
@@ -107,14 +132,14 @@ func (s *Store) Put(ctx context.Context, key string, sealed []byte) error {
 	data := append([]byte{format}, sealed...)
 	crc := int64(crc32.Checksum(data, castagnoli))
 	if _, err := s.c.AddSecretVersion(ctx, &secretmanagerpb.AddSecretVersionRequest{Parent: name,
-		Payload: &secretmanagerpb.SecretPayload{Data: data, DataCrc32C: &crc}}); err != nil {
+		Payload: &secretmanagerpb.SecretPayload{Data: data, DataCrc32C: &crc}}, transient); err != nil {
 		return fmt.Errorf("google secret manager: %w", err)
 	}
 	return nil
 }
 
 func (s *Store) Get(ctx context.Context, key string) ([]byte, error) {
-	r, err := s.c.AccessSecretVersion(ctx, &secretmanagerpb.AccessSecretVersionRequest{Name: s.secret(key) + "/versions/latest"})
+	r, err := s.c.AccessSecretVersion(ctx, &secretmanagerpb.AccessSecretVersionRequest{Name: s.secret(key) + "/versions/latest"}, transient)
 	switch {
 	case status.Code(err) == codes.NotFound:
 		return nil, secretstore.ErrNotFound
@@ -133,7 +158,7 @@ func (s *Store) Get(ctx context.Context, key string) ([]byte, error) {
 
 func (s *Store) Delete(ctx context.Context, keys []string) error {
 	for _, k := range keys {
-		err := s.c.DeleteSecret(ctx, &secretmanagerpb.DeleteSecretRequest{Name: s.secret(k)})
+		err := s.c.DeleteSecret(ctx, &secretmanagerpb.DeleteSecretRequest{Name: s.secret(k)}, transient)
 		if err != nil && status.Code(err) != codes.NotFound {
 			return fmt.Errorf("google secret manager: %w", err)
 		}

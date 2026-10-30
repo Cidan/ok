@@ -19,13 +19,13 @@ import (
 	"time"
 
 	"github.com/Cidan/ok/internal/blob"
-	"github.com/Cidan/ok/internal/bus"
 	"github.com/Cidan/ok/internal/data"
 	"github.com/Cidan/ok/internal/identity"
 	"github.com/Cidan/ok/internal/scm/encoding"
 	"github.com/Cidan/ok/internal/scm/segment"
 	"github.com/Cidan/ok/internal/scm/store/backend"
 	"github.com/Cidan/ok/internal/work"
+	"golang.org/x/sync/semaphore"
 )
 
 // Errors a caller maps to a gRPC status. Wrap them with %w.
@@ -110,9 +110,10 @@ type Config struct {
 	// that changed more paths writes them after it, a transaction of up to 10,000 at a time, its
 	// commit's answered from its trees meanwhile (paths.go).
 	LandingPaths int
-	// Signals carry the store's wake-ups between replicas (docs/hosted.md, "Signals"): its events,
-	// its content indexes', and its segments' changes. Nil is within the process (bus.NewLocal).
-	Signals bus.Signals
+	// PublishMemoryBytes bounds the memory every publish at once holds its packs in before they go
+	// to the bucket, and PublishPackBytes the most one pack of a publish holds: past it, the pack
+	// goes and another starts (publish.go).
+	PublishMemoryBytes, PublishPackBytes int64
 }
 
 // Default cache sizes, for a Config that leaves them zero.
@@ -128,6 +129,8 @@ const (
 	DefaultSegmentMin           = 1 << 12
 	DefaultDeleteBatch          = 10_000
 	DefaultLandingPaths         = 20_000
+	DefaultPublishMemoryBytes   = 512 << 20
+	DefaultPublishPackBytes     = 64 << 20
 )
 
 // readLimits bound how files are read (read.go, browse_diff.go).
@@ -173,15 +176,18 @@ func (s *Store) SetPrincipals(n Namer) { s.namer = n }
 
 // Store is the storage core over one database and one bucket.
 type Store struct {
-	b       backend.Backend
-	names   identity.Names
-	email   string // the email domain
-	signals bus.Signals
-	namer   Namer
-	blobs   blob.Store
-	objects *cache[[]byte]
-	chunks  *cache[storedChunk]
-	diffs   *cache[FileDiff]
+	b backend.Backend
+	// publishMemory is what publishes may hold their packs in, of publishMemoryBytes; each pack of
+	// one holds at most publishPackBytes.
+	publishMemory                        *semaphore.Weighted
+	publishMemoryBytes, publishPackBytes int64
+	names                                identity.Names
+	email                                string // the email domain
+	namer                                Namer
+	blobs                                blob.Store
+	objects                              *cache[[]byte]
+	chunks                               *cache[storedChunk]
+	diffs                                *cache[FileDiff]
 	// deltas are files' deltas against bases, compressed — empty where none pays (read.go); layers
 	// checkout layers' bytes, and checkouts the checkouts of commits, by repository and commit
 	// (checkouts.go). All are derived from IDs, so never stale.
@@ -196,7 +202,6 @@ type Store struct {
 	codeIndexes *cache[*codeIndex]
 	dicts       *dictionaries
 	reads       readLimits
-	events      eventHub
 	// indexes are the content indexes this replica reads files and chunks through.
 	indexes liveIndexes
 	// segs are the segments' manifests and readers this replica holds (segments.go).
@@ -219,16 +224,20 @@ type Store struct {
 	scanningRun func(backend.Segment)
 	// afterChangeListRows runs between a read of CLs' rows and the read of their patchsets (tests).
 	afterChangeListRows func()
-	// seq runs repositories' sequencing passes (sequence.go); sequencePasses observes each that
-	// ran, skipSequencing leaves what a transaction made pending, as a writer stopped between its
-	// commit and its pass does, and beforeSequenced runs as a writer begins its pass (tests).
-	seq             sequencer
+	// sequenceAfter is how long after a writer leaves rows pending its sequence step looks
+	// (SequenceAfter); sequencePasses observes each pass that ran, skipSequencing leaves what a
+	// transaction made pending, as a writer stopped between its commit and its pass does, and
+	// beforeSequenced runs as a writer begins its pass (tests).
+	sequenceAfter   time.Duration
 	sequencePasses  func(repo int64)
+	passing         func(repo int64, enter bool) // as a pass begins and ends (tests)
 	skipSequencing  bool
 	beforeSequenced func()
 	// indexReads counts the content index refreshes that read the database (a test observes
-	// refreshes coalescing).
-	indexReads func()
+	// refreshes coalescing), and indexLocked each content index a transaction took the row lock of
+	// in share mode (txLog.lock).
+	indexReads  func()
+	indexLocked func(backend.Scope)
 	// settleUnpinned moves settled operations into segments without pinning what they reach, as
 	// compaction did before (a test makes a repository of then).
 	settleUnpinned bool
@@ -259,9 +268,6 @@ func New(b backend.Backend, blobs blob.Store, cfg Config) (*Store, error) {
 	}
 	if cfg.ObjectCacheBytes == 0 {
 		cfg.ObjectCacheBytes = DefaultObjectCacheBytes
-	}
-	if cfg.Signals == nil {
-		cfg.Signals = bus.NewLocal()
 	}
 	if cfg.ChunkCacheBytes == 0 {
 		cfg.ChunkCacheBytes = DefaultChunkCacheBytes
@@ -296,25 +302,33 @@ func New(b backend.Backend, blobs blob.Store, cfg Config) (*Store, error) {
 	if cfg.LandingPaths == 0 {
 		cfg.LandingPaths = DefaultLandingPaths
 	}
+	if cfg.PublishMemoryBytes == 0 {
+		cfg.PublishMemoryBytes = DefaultPublishMemoryBytes
+	}
+	if cfg.PublishPackBytes == 0 {
+		cfg.PublishPackBytes = DefaultPublishPackBytes
+	}
 	s := &Store{
-		b:             b,
-		names:         cfg.Names,
-		email:         cfg.EmailDomain,
-		signals:       cfg.Signals,
-		namer:         cfg.Principals,
-		blobs:         blobs,
-		objects:       newCache[[]byte]("objects", cfg.ObjectCacheBytes),
-		chunks:        newCache[storedChunk]("chunks", cfg.ChunkCacheBytes),
-		diffs:         newCache[FileDiff]("diffs", cfg.DiffCacheBytes),
-		deltas:        newCache[[]byte]("deltas", cfg.DeltaCacheBytes),
-		layers:        newCache[[]byte]("checkout_layers", cfg.CheckoutCacheBytes),
-		checkouts:     newCache[Checkout]("checkouts", cfg.CheckoutCacheBytes/64),
-		newestOfPaths: newCache[pathCommit]("path_commits", cfg.PathCommitCacheBytes),
-		codeIndexes:   newCache[*codeIndex]("code_indexes", cfg.CodeIndexCacheBytes),
-		reads:         defaultReadLimits,
-		holder:        work.NewHolder(),
-		deletes:       cfg.DeleteBatch,
-		landingPaths:  cfg.LandingPaths,
+		publishMemory:      semaphore.NewWeighted(cfg.PublishMemoryBytes),
+		publishMemoryBytes: cfg.PublishMemoryBytes,
+		publishPackBytes:   cfg.PublishPackBytes,
+		b:                  b,
+		names:              cfg.Names,
+		email:              cfg.EmailDomain,
+		namer:              cfg.Principals,
+		blobs:              blobs,
+		objects:            newCache[[]byte]("objects", cfg.ObjectCacheBytes),
+		chunks:             newCache[storedChunk]("chunks", cfg.ChunkCacheBytes),
+		diffs:              newCache[FileDiff]("diffs", cfg.DiffCacheBytes),
+		deltas:             newCache[[]byte]("deltas", cfg.DeltaCacheBytes),
+		layers:             newCache[[]byte]("checkout_layers", cfg.CheckoutCacheBytes),
+		checkouts:          newCache[Checkout]("checkouts", cfg.CheckoutCacheBytes/64),
+		newestOfPaths:      newCache[pathCommit]("path_commits", cfg.PathCommitCacheBytes),
+		codeIndexes:        newCache[*codeIndex]("code_indexes", cfg.CodeIndexCacheBytes),
+		reads:              defaultReadLimits,
+		holder:             work.NewHolder(),
+		deletes:            cfg.DeleteBatch,
+		landingPaths:       cfg.LandingPaths,
 		segs: segmentState{
 			readers: newCache[*segment.Reader]("segment_readers", cfg.SegmentCacheBytes/4),
 			blocks:  newCache[*segment.Block]("segment_blocks", cfg.SegmentCacheBytes),
@@ -322,14 +336,10 @@ func New(b backend.Backend, blobs blob.Store, cfg Config) (*Store, error) {
 			min:     cfg.SegmentMin,
 		},
 	}
-	s.events.ctx, s.events.stop = context.WithCancel(context.Background())
-	s.events.done = make(chan struct{})
+	s.sequenceAfter = SequenceAfter
 	s.dicts = newDictionaries(s)
 	return s, nil
 }
-
-// SetSignals sets the signals the store sends and listens on (Config.Signals), before it serves.
-func (s *Store) SetSignals(sig bus.Signals) { s.signals = sig }
 
 // Names are the installation's names.
 func (s *Store) Names() identity.Names { return s.names }
@@ -341,10 +351,9 @@ func (s *Store) EmailDomain() string { return s.email }
 // what it changed in a repository's content index (cindex.go), written as it commits.
 type txn struct {
 	backend.Ops
-	logs    []*txLog    // the content indexes it changes: a repository's and its network's at most
-	done    atomic.Bool // the transaction has ended
-	pending bus.Pending // the signals to send once it commits
-	marks   []workMark  // the keyed work to mark once it commits (markAfter)
+	logs  []*txLog    // the content indexes it changes: a repository's and its network's at most
+	done  atomic.Bool // the transaction has ended
+	marks []workMark  // the keyed work to mark once it commits (markAfter)
 	// after: its backend sequences after commit (sequence.go). tie orders the rows it leaves pending
 	// among those of a commit timestamp's, places counts them, sequence are their repositories, and
 	// appended the events among them, as its callers hold them.
@@ -358,6 +367,30 @@ type txn struct {
 	// snapshotAt is, for a read-only snapshot (inSnapshot), when it began: it sees everything
 	// committed before then, and nothing committed after its first read. Zero for a transaction.
 	snapshotAt time.Time
+	// exclusive are the content indexes it holds alone (lockIndex), each as the lock read it.
+	exclusive map[backend.Scope]heldIndex
+}
+
+// heldIndex is a content index a transaction holds alone: its generation, and the database's day,
+// as the lock read them.
+type heldIndex struct {
+	gen   int64
+	today time.Time
+}
+
+// lockIndex holds a content index alone for the rest of the transaction (LockContentIndex): no
+// writer relying on it, sweep, compaction, or fold commits beside it. The transaction's view of it
+// is read under the lock (txIndex).
+func (t *txn) lockIndex(ctx context.Context, sc backend.Scope) (int64, time.Time, error) {
+	gen, today, err := t.LockContentIndex(ctx, sc)
+	if err != nil {
+		return gen, today, err
+	}
+	if t.exclusive == nil {
+		t.exclusive = map[backend.Scope]heldIndex{}
+	}
+	t.exclusive[sc] = heldIndex{gen, today}
+	return gen, today, nil
 }
 
 // workMark is keyed work of a kind and key.
@@ -416,12 +449,6 @@ func (s *Store) markSoon(m workMark) {
 
 // marksMade waits for the marks in flight to be made (tests, and Close).
 func (s *Store) marksMade() { s.marker.running.Wait() }
-
-// Notify records a signal to send once the transaction commits.
-func (t *txn) Notify(_ context.Context, channel, payload string) error {
-	t.pending.Add(channel, payload)
-	return nil
-}
 
 // markAfter marks keyed work once the transaction commits, not in it: marked in it, the work's row
 // is held by every transaction marking it until each commits — a repository's every upload and
@@ -504,7 +531,6 @@ func (s *Store) retryable(err error) bool {
 func (s *Store) inTx(ctx context.Context, fn func(context.Context, *txn) error) error {
 	var committed *txn
 	err := data.Retry(ctx, s.retryable, func() error {
-		var logged []backend.Scope
 		committed = nil
 		err := s.b.Txn(ctx, func(ops backend.Ops) error {
 			if s.txAttempts != nil {
@@ -520,15 +546,16 @@ func (s *Store) inTx(ctx context.Context, fn func(context.Context, *txn) error) 
 			if err := fn(tctx, tx); err != nil {
 				return err
 			}
-			var err error
-			logged, err = s.flushIndexLog(tctx, tx)
-			return err
+			if err := tx.viewsCurrent(); err != nil {
+				return err
+			}
+			if err := s.flushIndexLog(tctx, tx); err != nil {
+				return err
+			}
+			// Should this replica stop between the commit and its pass, a job runs the pass.
+			return s.pendSequence(tctx, tx)
 		})
 		if err == nil {
-			for _, sc := range logged {
-				s.indexChanged(sc)
-			}
-			committed.pending.Send(ctx, s.signals)
 			for _, m := range committed.marks {
 				s.markSoon(m)
 			}

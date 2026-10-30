@@ -3,10 +3,12 @@ package awssm
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -93,6 +95,25 @@ func newStore(t *testing.T, kmsKey string) (*Store, *fake) {
 func TestConformance(t *testing.T) {
 	st, _ := newStore(t, "")
 	storetest.Run(t, st)
+}
+
+// Through a Secrets Manager that fails every other call for a moment (503), the SDK makes each
+// again, and the store holds to its contract.
+func TestConformanceThroughFailures(t *testing.T) {
+	f := &fake{secrets: map[string][]byte{}, kms: map[string]string{}}
+	var n atomic.Int64
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if n.Add(1)%2 == 1 {
+			w.Header().Set("Content-Type", "application/x-amz-json-1.1")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			fmt.Fprint(w, `{"__type":"ServiceUnavailableException","message":"away for a moment"}`)
+			return
+		}
+		f.ServeHTTP(w, r)
+	}))
+	t.Cleanup(s.Close)
+	cfg := aws.Config{Region: "us-east-1", Credentials: credentials.NewStaticCredentialsProvider("test", "test", ""), RetryMaxAttempts: 6}
+	storetest.Run(t, New(secretsmanager.NewFromConfig(cfg, func(o *secretsmanager.Options) { o.BaseEndpoint = aws.String(s.URL) }), ""))
 }
 
 // A secret is named by its key, or past Secrets Manager's longest name by its hash; it holds the

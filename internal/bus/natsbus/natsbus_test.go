@@ -22,17 +22,6 @@ func serve(t *testing.T) *nats.Conn {
 	return nc
 }
 
-func TestStream(t *testing.T) {
-	nc := serve(t)
-	bustest.RunStream(t, func(t *testing.T) bus.Stream {
-		b, err := natsbus.Open(nc, natsbus.Options{AckWait: time.Second})
-		if err != nil {
-			t.Fatal(err)
-		}
-		return b
-	}, bustest.StreamOptions{Concurrent: 8})
-}
-
 func TestQueue(t *testing.T) {
 	nc := serve(t)
 	bustest.RunQueue(t, func(t *testing.T, maxAttempts int) bus.Queue {
@@ -41,22 +30,5 @@ func TestQueue(t *testing.T) {
 			t.Fatal(err)
 		}
 		return b
-	}, bustest.QueueOptions{Dedupe: true, DetectsLostLease: true, MinVisibility: time.Second})
-}
-
-// Each replica listens on a connection of its own to one server.
-func TestSignals(t *testing.T) {
-	url := bustest.NATS(t)
-	bustest.RunSignals(t, func(t *testing.T) bus.Signals {
-		nc, err := nats.Connect(url)
-		if err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(nc.Close)
-		b, err := natsbus.Open(nc, natsbus.Options{})
-		if err != nil {
-			t.Fatal(err)
-		}
-		return b
-	})
+	}, bustest.QueueOptions{Dedupe: true, DetectsLostLease: true, MinVisibility: time.Second, Shared: true})
 }

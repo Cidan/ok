@@ -237,7 +237,8 @@ secrets knows:
 - **References.** ok secrets' daily collection per repository asks the SCM which pointers `main`'s
   head, every open CL's current patchset, and every workspace's latest checkpoint hold
   (`Secrets.ReferencedPointers`, on the SCM); a version none holds is marked, and destroyed thirty
-  days after.
+  days after. Each repository's collection is keyed work (hosted.md, "Work without leaders"),
+  booked a day on by the transaction that makes its first key, and by each pass for the next day's.
 
 ## Clients
 

@@ -84,13 +84,24 @@ treats it as a deep link), from which htmx takes `#content`.
 **A region that is its own scroll container** keeps its scroll position across an `innerHTML`
 swap: a navigation into it adds `scroll:top` to its swap spec (ok control's browser pane).
 
-**Live regions (`[data-live]`).** A region that refreshes itself — a status that polls
-(`hx-trigger="every 2s"`), a log that grows, a row whose button rewrites the region it sits in —
-marks itself `data-live`, and so does what the server swaps back in. A swap inside a live region
-hydrates in place with no hide/reveal fade: a region the reader is watching must not blink each
-time it refreshes. A live region stops polling by being swapped for one without the trigger, or by leaving the
-document. Its poll does not go out while the page is hidden (the runtime cancels it) and resumes
-on its next tick. A refresh that must update a region elsewhere on the page from the same reading
+**Live regions (`[data-live]`).** A region that refreshes itself — a status that changes, a log
+that grows, a row whose button rewrites the region it sits in — marks itself `data-live`, and so
+does what the server swaps back in. A swap inside a live region hydrates in place with no
+hide/reveal fade: a region the reader is watching must not blink each time it refreshes.
+
+A region refreshes as what it shows changes, not on a timer (state.md, "Waiting"): it names its
+page's stream of server-sent events (`data-live-events`: a CL's `…/cl/N/events`, a run's, a
+deployment's, `/services/events`) and fetches itself again on htmx's `live` trigger
+(`hx-trigger="live"`). `live.js` keeps one `EventSource` a stream, however many regions name it,
+and on each `change` event fires `live` on each of them; a change that comes while they are being
+fetched fetches them once more after their swap, and one that comes while the page is hidden, once
+it is shown. The server's stream registers, with each service whose writes change what the page
+shows, on what it shows — ok control's record of a CL, ok automation's checks and runs, the
+deployer's deployments and services (`internal/wait`) — and says `change` as it opens, for what
+changed between the page's render and the registration, then as each change commits. A region stops
+by being swapped for one that names no stream, or by leaving the document; once no region names a
+stream, it closes. A region on a timer (`hx-trigger="every …"`) is not sent while the page is
+hidden (the runtime cancels it) and resumes on its next tick. A refresh that must update a region elsewhere on the page from the same reading
 (a sub-nav's statuses beside the pane) carries it out of band (`hx-swap-oob`); htmx 4 fires one
 `before:swap`/`after:swap` pair on the trigger for the whole response, so the out-of-band region
 is swapped without a fade. Swap a scroll container's rows (`hx-swap-oob="innerHTML"`), not the

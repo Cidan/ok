@@ -138,25 +138,17 @@ func (a *adminsSource) Admins(context.Context, *identitypb.AdminsRequest, ...grp
 	return &identitypb.AdminsResponse{PrincipalIds: []string{"prn_admin"}}, nil
 }
 
-// A repository's admins are kept a few seconds, as facts are, and forgotten with them: every
-// status a watch reads names them.
-func TestAdminsKept(t *testing.T) {
+// A repository's admins are ok identity's answer each time: no replica keeps them.
+func TestAdminsAskedEachTime(t *testing.T) {
 	ctx := context.Background()
 	src := &adminsSource{}
 	a := NewAccess(src)
-	for range 5 {
+	for range 3 {
 		if got, err := a.Admins(ctx, 7); err != nil || len(got) != 1 || got[0] != "prn_admin" {
 			t.Fatalf("admins: %v, %v", got, err)
 		}
 	}
-	if src.asked != 1 {
-		t.Fatalf("five reads asked ok identity %d times, want once", src.asked)
-	}
-	if _, err := a.Admins(ctx, 8); err != nil || src.asked != 2 {
-		t.Fatalf("another repository: asked %d times, %v", src.asked, err)
-	}
-	a.Forget(7)
-	if _, err := a.Admins(ctx, 7); err != nil || src.asked != 3 {
-		t.Fatalf("after the directory said it changed: asked %d times, %v", src.asked, err)
+	if src.asked != 3 {
+		t.Fatalf("three reads asked ok identity %d times, want each", src.asked)
 	}
 }

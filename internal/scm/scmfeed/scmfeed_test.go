@@ -11,9 +11,11 @@ import (
 	"google.golang.org/grpc"
 
 	"github.com/Cidan/ok/internal/bus"
+	"github.com/Cidan/ok/internal/bus/busconfig"
+	"github.com/Cidan/ok/internal/bus/bustest"
 	"github.com/Cidan/ok/internal/bus/follow"
-	"github.com/Cidan/ok/internal/bus/pgbus"
 	"github.com/Cidan/ok/internal/config"
+	"github.com/Cidan/ok/internal/data/pgdata"
 	"github.com/Cidan/ok/internal/dial"
 	"github.com/Cidan/ok/internal/id/idtest"
 	"github.com/Cidan/ok/internal/pgdb"
@@ -24,6 +26,7 @@ import (
 	"github.com/Cidan/ok/internal/serve"
 	"github.com/Cidan/ok/internal/testdb"
 	"github.com/Cidan/ok/internal/testdb/testobjects"
+	"github.com/Cidan/ok/internal/work"
 	scmpb "github.com/Cidan/ok/proto/ok/scm/v1"
 )
 
@@ -35,7 +38,7 @@ type scmEnv struct {
 	repos  scmpb.RepositoriesClient // as ada calls them
 	store  scmpb.StoreClient
 	cls    scmpb.ChangeListsClient
-	bus    *pgbus.Bus
+	queue  bus.Queue
 	ada    string // her stable ID
 	bumped map[int64]int
 }
@@ -53,17 +56,13 @@ func devSCM(t *testing.T) *scmEnv {
 		t.Fatal(err)
 	}
 	t.Cleanup(pool.Close)
-	busPool, err := pgdb.Beside(ctx, pool, pgbus.Schema)
+	cfg.Bus = bustest.Config(t)
+	bb, err := busconfig.Open(ctx, cfg.Bus)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(busPool.Close)
-	b, err := pgbus.Open(ctx, busPool, pgbus.Options{Poll: 50 * time.Millisecond})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(b.Close)
-	scm, err := role.Build(ctx, cfg, role.Options{Dev: true, Pool: pool, Blobs: testobjects.Store(t), Stream: b,
+	t.Cleanup(bb.Close)
+	scm, err := role.Build(ctx, cfg, role.Options{Dev: true, Pool: pool, Blobs: testobjects.Store(t),
 		Identity: id.As("scm.ok.robot.example.com")})
 	if err != nil {
 		t.Fatal(err)
@@ -86,7 +85,7 @@ func devSCM(t *testing.T) *scmEnv {
 	}
 	control, ada := as("control.ok.robot.example.com"), as("ada.human.example.com")
 	return &scmEnv{events: scmpb.NewEventsClient(control), review: scmpb.NewReviewClient(control), repos: scmpb.NewRepositoriesClient(ada),
-		store: scmpb.NewStoreClient(ada), cls: scmpb.NewChangeListsClient(ada), bus: b, ada: id.ID("ada.human.example.com"), bumped: map[int64]int{}}
+		store: scmpb.NewStoreClient(ada), cls: scmpb.NewChangeListsClient(ada), queue: bb.Queue, ada: id.ID("ada.human.example.com"), bumped: map[int64]int{}}
 }
 
 // bump writes one event to a repository's log: ada uploads a CL, a draft, then ok control asks
@@ -177,9 +176,8 @@ func (a *applier) await(t *testing.T, repo int64, want []int64) {
 	}
 }
 
-// A follower of the SCM's events catches up the repositories whose logs went past it — none of
-// which the stream brought, their events published before its group was made — and applies what
-// the stream brings next, once each.
+// A follower of the SCM's events — ok control's, as it calls — catches up the repositories whose
+// logs went past it, relayed before it registered, and applies what is relayed next, once each.
 func TestFollowTheSCM(t *testing.T) {
 	ctx := context.Background()
 	e := devSCM(t)
@@ -196,7 +194,16 @@ func TestFollowTheSCM(t *testing.T) {
 	rc := create("c")
 
 	a := &applier{cursors: map[int64]int64{}, applied: map[int64][]int64{}, changed: make(chan struct{}, 1)}
-	f := &follow.Follower{Stream: e.bus, Topic: scmfeed.Topic, Group: "test", Log: scmfeed.Log{Events: e.events}, Apply: a}
+	// Its keyed work, in a database of its own, on the bus's queue as control's.
+	p := testdb.Pool(t)
+	if _, err := p.Exec(ctx, pgdata.WorkSchema); err != nil {
+		t.Fatal(err)
+	}
+	w := pgdata.Work(p)
+	if _, err := work.RegisterStore(w, work.Jobs{Queue: e.queue, Prefix: "control"}); err != nil {
+		t.Fatal(err)
+	}
+	f := &follow.Follower{Topic: scmfeed.Topic, Log: scmfeed.Log{Events: e.events}, Apply: a, Work: w, Register: scmfeed.Register(e.events)}
 	fctx, stop := context.WithCancel(ctx)
 	done := make(chan error, 1)
 	go func() { done <- f.Run(fctx) }()

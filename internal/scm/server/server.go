@@ -16,11 +16,13 @@ import (
 
 	"github.com/Cidan/ok/internal/authz"
 	"github.com/Cidan/ok/internal/bus"
+	"github.com/Cidan/ok/internal/id/dirfeed"
 	"github.com/Cidan/ok/internal/move"
 	"github.com/Cidan/ok/internal/scm/service"
 	"github.com/Cidan/ok/internal/scm/store"
 	"github.com/Cidan/ok/internal/serve/node"
 	"github.com/Cidan/ok/internal/work"
+	identitypb "github.com/Cidan/ok/proto/ok/identity/v1"
 	okpb "github.com/Cidan/ok/proto/ok/v1"
 )
 
@@ -30,14 +32,17 @@ type Service struct {
 	dir   service.Directory
 	ten   service.Tenancy
 	facts authz.Source
-	// cell and peers are InCell's.
-	cell  string
-	peers service.PeerSCMs
+	// cell, peers, and routes are InCell's.
+	cell   string
+	peers  service.PeerSCMs
+	routes service.Router
 }
 
-// InCell says which cell the SCM serves and how it reaches the others' (service.Services.InCell);
-// before it serves.
-func (n *Service) InCell(name string, peers service.PeerSCMs) { n.cell, n.peers = name, peers }
+// InCell says which cell the SCM serves, how it reaches the others', and where the directory routes
+// repositories (service.Services.InCell); before it serves.
+func (n *Service) InCell(name string, peers service.PeerSCMs, routes service.Router) {
+	n.cell, n.peers, n.routes = name, peers, routes
+}
 
 var _ node.Service = (*Service)(nil)
 
@@ -56,9 +61,11 @@ func (n *Service) Healthy(ctx context.Context) bool { return n.store.Healthy(ctx
 func (n *Service) RegisterRPC(_ context.Context, reg grpc.ServiceRegistrar) error {
 	s := service.New(n.store, n.dir, n.ten, n.facts)
 	if n.cell != "" {
-		s.InCell(n.cell, n.peers)
+		s.InCell(n.cell, n.peers, n.routes)
 	}
-	s.Register(reg)
+	// Each call reads what it needs once for its life, and nothing for longer (store.WithRequestScope).
+	// Moves, shared by a process's roles on one server, is registered on the server's own registrar.
+	s.Register(store.ScopedRegistrar(reg))
 	move.NewServer(n.store.Mover(), okpb.Caller_CALLER_SCM, func(ctx context.Context, cell string) (okpb.MovesClient, error) {
 		if n.peers == nil {
 			return nil, fmt.Errorf("this SCM reaches no other cell")
@@ -88,7 +95,6 @@ func (n *MovePurge) Start(ctx context.Context) error {
 		Kind:    store.MovePurgeWork,
 		Store:   s.Work(),
 		Do:      s.PurgeMoved,
-		Idle:    purgeInterval,
 		Workers: 1, // a network's rows and objects, a bounded transaction at a time
 	}).Run(ctx)
 }
@@ -100,12 +106,10 @@ func aboutRepository(do func(context.Context, int64) error) func(context.Context
 	return func(ctx context.Context, repo int64) error { return do(move.WithRepository(ctx, repo), repo) }
 }
 
-// gcInterval is how often the GC node looks for work: retired packs to delete, and
-// repositories due their daily pass.
-const gcInterval = 10 * time.Minute
-
 // GC is garbage collection's node, a node.Application. Every replica runs it, each repository's
-// collection keyed work (store.GCWork) done by one replica at a time.
+// collection keyed work (store.GCWork) done by one replica at a time: booked as the repository is
+// made, and by each run for the next — its next daily pass, a failed one's retry, or the end of its
+// retired packs' and segments' grace, whichever comes first.
 type GC struct {
 	svc  *Service
 	hour int
@@ -123,36 +127,60 @@ func (*GC) Healthy(context.Context) bool { return true }
 
 func (n *GC) Start(ctx context.Context) error {
 	s := n.svc.store
+	go func() {
+		if err := work.Once(ctx, s.Work(), scheduleWork, n.schedule, slog.Default()); err != nil && ctx.Err() == nil {
+			slog.Warn("gc: booking the repositories' collections and purges", "err", err)
+		}
+	}()
 	return (&work.Runner{
 		Kind:    store.GCWork,
 		Store:   s.Work(),
 		Do:      aboutRepository(n.repository),
-		Sweep:   n.sweep,
-		Idle:    gcInterval,
 		Workers: 1, // a pass reads and rewrites a repository's packs: one at a time on a replica
 	}).Run(ctx)
 }
 
-// sweep marks the collection of every repository due its daily pass, or with retired packs past
-// their grace, and finishes the deletions a replica stopped short of.
-func (n *GC) sweep(ctx context.Context) error {
+// scheduleWork books, once, what a release that looked for its keyed work left unbooked
+// (schedule).
+const scheduleWork = "schedule"
+
+// schedule books every repository's collection, now for one due, and its purge's look: now for one
+// the directory says has expired, and a retention period on for every other — whose deletion, if it
+// came before the SCM followed the directory's events, it heard nothing of.
+func (n *GC) schedule(ctx context.Context) error {
 	s, now := n.svc.store, time.Now()
-	if finished, err := s.FinishDeletions(ctx, 100); err != nil {
-		return err
-	} else if finished > 0 {
-		slog.Info("gc: finished repository deletions", "repositories", finished)
-	}
-	due, err := s.DueForGC(ctx, now, n.hour)
-	if err != nil {
-		return err
-	}
-	retiring, err := s.Retiring(ctx, now)
-	if err != nil {
-		return err
-	}
 	w := s.Work()
-	for _, repo := range append(due, retiring...) {
-		if err := w.Mark(ctx, store.GCWork, repo); err != nil {
+	var after int64
+	for {
+		repos, err := s.RepositoryIDs(ctx, after, 1000)
+		if err != nil {
+			return err
+		}
+		for _, repo := range repos {
+			at := store.NextGCSlot(now, n.hour)
+			if due, err := s.GCDue(ctx, repo, now, n.hour); err != nil {
+				return err
+			} else if due {
+				at = now
+			}
+			if err := w.MarkAt(ctx, store.GCWork, repo, at); err != nil {
+				return err
+			}
+			if err := w.MarkAt(ctx, store.PurgeWork, repo, now.Add(dirfeed.RetentionPeriod+time.Minute)); err != nil {
+				return err
+			}
+		}
+		if len(repos) < 1000 {
+			break
+		}
+		after = repos[len(repos)-1]
+	}
+	resp, err := n.svc.ten.ListExpiredRepositories(ctx, &identitypb.ListExpiredRepositoriesRequest{Limit: 1000})
+	if err != nil {
+		return fmt.Errorf("listing expired repositories: %w", err)
+	}
+	for _, e := range resp.GetRepositories() {
+		if err := w.Mark(ctx, store.PurgeWork, e.GetRepositoryId()); err != nil {
 			return err
 		}
 	}
@@ -161,7 +189,7 @@ func (n *GC) sweep(ctx context.Context) error {
 
 // repository collects one repository: its daily pass, if it is due one — recorded, and a failed
 // one tried again an hour later (store.GCRetry) — and otherwise its retired packs past their
-// grace.
+// grace; then books its next run.
 func (n *GC) repository(ctx context.Context, repo int64) error {
 	s, now := n.svc.store, time.Now()
 	due, err := s.GCDue(ctx, repo, now, n.hour)
@@ -173,24 +201,54 @@ func (n *GC) repository(ctx context.Context, repo int64) error {
 		if packs+segments > 0 {
 			slog.Info("gc: deleted retired packs and segments", "repository", repo, "packs", packs, "segments", segments)
 		}
-		return err
-	}
-	report, err := s.GC(ctx, repo, now, store.GCOptions{})
-	if report != nil {
-		if rerr := s.RecordGC(ctx, report, err); rerr != nil {
-			return errors.Join(err, rerr)
+		if err != nil {
+			return err
+		}
+	} else {
+		report, err := s.GC(ctx, repo, now, store.GCOptions{})
+		if report != nil {
+			if rerr := s.RecordGC(ctx, report, err); rerr != nil {
+				return errors.Join(err, rerr)
+			}
+		}
+		if err != nil {
+			slog.Error("gc: pass failed", "repository", repo, "err", err) // recorded: due again after GCRetry
+		} else {
+			slog.Info("gc: pass", "report", report.String())
 		}
 	}
-	if err != nil {
-		slog.Error("gc: pass failed", "repository", repo, "err", err)
-		return nil // recorded: the pass is due again after GCRetry
-	}
-	slog.Info("gc: pass", "report", report.String())
-	return nil
+	return n.book(ctx, repo)
 }
 
-// segmentsInterval is how often the segments node looks for compaction marked since it last did.
-const segmentsInterval = 10 * time.Second
+// book books a repository's next collection: the soonest of its next daily pass, a failed pass's
+// retry, and its retired packs' and segments' grace's end. A repository no longer here is booked
+// no more.
+func (n *GC) book(ctx context.Context, repo int64) error {
+	s, now := n.svc.store, time.Now()
+	next := store.NextGCSlot(now, n.hour)
+	if retry := now.Add(store.GCRetry); retry.Before(next) {
+		// A pass due by then is a failed one's retry: a successful one is not due before the slot.
+		if due, err := s.GCDue(ctx, repo, retry, n.hour); err != nil {
+			return err
+		} else if due {
+			next = retry
+		}
+	}
+	retired, err := s.RetiredDue(ctx, repo)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !retired.IsZero() && retired.Before(next) {
+		next = retired
+		if next.Before(now) {
+			next = now
+		}
+	}
+	return s.Work().MarkAt(ctx, store.GCWork, repo, next)
+}
 
 // Segments is compaction's node, a node.Application: every replica runs it, each repository's
 // compaction keyed work (store.SegmentWork), marked when something is pinned, done by one replica
@@ -222,8 +280,9 @@ func (n *Segments) Start(ctx context.Context) error {
 		Kind:    store.SegmentWork,
 		Store:   s.Work(),
 		Do:      aboutRepository(n.repository),
-		Idle:    segmentsInterval,
 		Workers: 2, // each writes segments of up to a batch of rows
+		// A full compaction waits for this one to let go (store.Claims).
+		LetGo: s.Claims().LetGo(store.SegmentWork),
 	}).Run(ctx)
 }
 
@@ -245,9 +304,6 @@ func (n *Segments) repository(ctx context.Context, repo int64) error {
 	}
 	return nil
 }
-
-// foldsInterval is how often the folds node looks for content indexes marked since it last did.
-const foldsInterval = 10 * time.Second
 
 // Folds is the content indexes' folds' node, a node.Application: every replica runs it, each
 // repository's and network's fold keyed work (store.FoldDueWork, store.FoldNetworkDueWork) —
@@ -279,7 +335,6 @@ func (n *Folds) Start(ctx context.Context) error {
 					}
 					return s.FoldDue(move.WithRepository(ctx, id), kind, id)
 				},
-				Idle:    foldsInterval,
 				Workers: 2,
 			}).Run(ctx)
 		}()
@@ -287,17 +342,17 @@ func (n *Folds) Start(ctx context.Context) error {
 	return errors.Join(<-errs, <-errs)
 }
 
-// Relay is the relay's node, a node.Application: every replica runs one, each publishing pending
+// Relay is the relay's node, a node.Application: every replica runs one, each relaying pending
 // events beside the others (store.Relay).
 type Relay struct {
-	svc    *Service
-	stream bus.Stream
+	svc *Service
+	q   bus.Queue
 }
 
 var _ node.Application = (*Relay)(nil)
 
-// NewRelay publishes the service's store's events on stream.
-func NewRelay(svc *Service, stream bus.Stream) *Relay { return &Relay{svc: svc, stream: stream} }
+// NewRelay relays the service's store's events to their followers' queues on q.
+func NewRelay(svc *Service, q bus.Queue) *Relay { return &Relay{svc: svc, q: q} }
 
 func (*Relay) Name() string                 { return "ok/scm/relay" }
 func (n *Relay) Dependencies() []node.Node  { return []node.Node{n.svc} }
@@ -305,14 +360,11 @@ func (*Relay) Setup(context.Context) error  { return nil }
 func (*Relay) Healthy(context.Context) bool { return true }
 
 func (n *Relay) Start(ctx context.Context) error {
-	if err := n.svc.store.Relay(ctx, n.stream); ctx.Err() == nil {
+	if err := n.svc.store.Relay(ctx, n.q); ctx.Err() == nil {
 		return err
 	}
 	return nil
 }
-
-// checkoutLook is how often the checkouts node looks for main's moves to derive.
-const checkoutLook = time.Second
 
 // Checkouts derives the checkout of each repository's main as it moves (store.CheckoutWork), a
 // node.Application: every replica runs it, each repository's by one at a time.
@@ -334,13 +386,9 @@ func (n *Checkouts) Start(ctx context.Context) error {
 		Kind:    store.CheckoutWork,
 		Store:   s.Work(),
 		Do:      s.DeriveMainCheckout,
-		Idle:    checkoutLook,
 		Workers: 4,
 	}).Run(ctx)
 }
-
-// codeSearchLook is how often the code search node looks for main's moves to index.
-const codeSearchLook = 2 * time.Second
 
 // CodeSearch indexes repositories' main as it moves (store.CodeSearchWork), a node.Application:
 // every replica runs it, each repository's index built by one at a time.
@@ -362,7 +410,6 @@ func (n *CodeSearch) Start(ctx context.Context) error {
 		Kind:    store.CodeSearchWork,
 		Store:   s.Work(),
 		Do:      s.BuildCodeIndex,
-		Idle:    codeSearchLook,
 		Workers: 2, // an index's build reads all of main
 	}).Run(ctx)
 }

@@ -16,6 +16,35 @@ import (
 // sequencing pass, after the transaction that makes them commits (docs/scm.md, "Sequencing").
 func (b *Backend) SequencesAfterCommit() bool { return true }
 
+// MutationBudget is Spanner's 80,000 mutations a commit, less a quarter for what a writer's count
+// of its own rows misses.
+func (b *Backend) MutationBudget() int { return 60_000 }
+
+func (x queries) SequencedAt(ctx context.Context, repo int64) (time.Time, error) {
+	var at time.Time
+	_, err := x.one(ctx, `SELECT began_at FROM sequence_pass WHERE repository_id = @repo`, map[string]any{"repo": repo}, &at)
+	return at, err
+}
+
+func (x queries) CompactionCursor(ctx context.Context, repo int64) ([]byte, error) {
+	var c []byte
+	_, err := x.one(ctx, `SELECT cursor FROM compaction_cursor WHERE repository_id = @repo`, map[string]any{"repo": repo}, &c)
+	return c, err
+}
+
+func (x queries) SetCompactionCursor(ctx context.Context, repo int64, cursor []byte) error {
+	_, err := x.exec(ctx, `INSERT OR UPDATE INTO compaction_cursor (repository_id, cursor) VALUES (@repo, @cursor)`,
+		map[string]any{"repo": repo, "cursor": cursor})
+	return err
+}
+
+func (x queries) SetSequencedAt(ctx context.Context, repo int64, began time.Time) error {
+	_, err := x.exec(ctx, `INSERT OR UPDATE INTO sequence_pass (repository_id, began_at)
+		SELECT @repo, GREATEST(@began, IFNULL((SELECT began_at FROM sequence_pass WHERE repository_id = @repo), @began))`,
+		map[string]any{"repo": repo, "began": began})
+	return err
+}
+
 // pendingKey is a pending row's key past its repository, as a STRUCT parameter.
 type pendingKey struct {
 	C time.Time `spanner:"c"`
@@ -173,6 +202,16 @@ func (x queries) ChangeListNumbers(ctx context.Context, repo int64, ids []int64)
 func (x queries) TransactionEvents(ctx context.Context, repo, txn int64) ([]int64, error) {
 	return x.int64s(ctx, `SELECT repository_seq FROM event@{FORCE_INDEX=event_txn} WHERE repository_id = @repo AND txn = @txn
 		ORDER BY repository_seq`, map[string]any{"repo": repo, "txn": txn})
+}
+
+func (x queries) TxnPending(ctx context.Context, repo, txn int64) (bool, error) {
+	var pending bool
+	err := x.unlocked(func(r spannerdata.Reader) error {
+		pending = false
+		return spannerdata.Each(ctx, r, `SELECT 1 FROM sequence_pending WHERE repository_id = @repo AND txn = @txn LIMIT 1`,
+			map[string]any{"repo": repo, "txn": txn}, func(*spanner.Row) error { pending = true; return nil })
+	})
+	return pending, err
 }
 
 func (x queries) PendingRepositories(ctx context.Context, before time.Time, limit int) ([]int64, error) {

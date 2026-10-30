@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"math"
 	"time"
 
+	"github.com/Cidan/ok/internal/work"
 	okpb "github.com/Cidan/ok/proto/ok/v1"
 )
 
@@ -25,6 +27,12 @@ type RepositoryRole struct {
 	// Arrived, when set, runs once the repositories are open here: a role brings up to date what it
 	// keeps of them outside the rows moved.
 	Arrived func(ctx context.Context, repos []int64) error
+	// Thawed, when set, runs once a move called off opened the repositories' gates here again: a
+	// role takes up the work it gave up as they froze.
+	Thawed func(ctx context.Context, repos []int64) error
+	// Work is the role's keyed work's store: each repository that moved away has its purge booked
+	// there, Kept on (Purge).
+	Work work.Store
 }
 
 var _ Role = (*RepositoryRole)(nil)
@@ -84,11 +92,26 @@ func (r *RepositoryRole) Freeze(ctx context.Context, s Scope) error {
 }
 
 func (r *RepositoryRole) Thaw(ctx context.Context, s Scope) error {
-	return r.Rows.SetGates(ctx, s.Repositories, "", "")
+	if err := r.Rows.SetGates(ctx, s.Repositories, "", ""); err != nil {
+		return err
+	}
+	if r.Thawed == nil {
+		return nil
+	}
+	return r.Thawed(Untagged(ctx), s.Repositories)
 }
 
 func (r *RepositoryRole) Finish(ctx context.Context, s Scope, cell string) error {
-	return r.Rows.SetGates(ctx, s.Repositories, StateMoved, cell)
+	if err := r.Rows.SetGates(ctx, s.Repositories, StateMoved, cell); err != nil {
+		return err
+	}
+	at := time.Now().Add(Kept)
+	for _, repo := range s.Repositories {
+		if err := r.Work.MarkAt(ctx, MovedWork, repo, at); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (r *RepositoryRole) Objects() Objects { return r.Kept }
@@ -96,33 +119,62 @@ func (r *RepositoryRole) Objects() Objects { return r.Kept }
 // Kept is how long a role keeps what moved away before it deletes it.
 const Kept = 24 * time.Hour
 
-// purgeEvery is how often a role looks for repositories that moved away long enough ago.
-const purgeEvery = 10 * time.Minute
+// MovedWork is a repository that moved away, its purge here as keyed work (internal/work): booked
+// Kept on as the move finishes.
+const MovedWork = "moved-purge"
 
-// Purge deletes, a day after it, what a role holds of the repositories that moved away: a
-// node.Application's Start. Replicas beside each other may delete the same rows, harmlessly.
+// movedUpgrade books, once, the purges of the repositories a release before saw move away.
+const movedUpgrade = "moved-upgrade"
+
+// Purge deletes, a day after it, what a role holds of each repository that moved away: a
+// node.Application's Start. Each repository's purge comes as its job does, to one replica at a time;
+// one that moved back meanwhile keeps what it brought. Once, it books the purges of the repositories
+// a release before saw move away.
 func (r *RepositoryRole) Purge(ctx context.Context) error {
-	for {
-		repos, err := r.Rows.MovedBefore(ctx, time.Now().Add(-Kept))
-		if err == nil && len(repos) > 0 {
-			s := Scope{Repositories: repos}
-			if r.Kept != nil {
-				err = r.Kept.Drop(ctx, s)
+	go func() {
+		if err := work.Once(ctx, r.Work, movedUpgrade, r.bookMoved, nil); err != nil && ctx.Err() == nil {
+			slog.Warn("move: booking the purges of a release before", slog.String("role", r.RoleName), slog.Any("err", err))
+		}
+	}()
+	return (&work.Runner{Kind: MovedWork, Store: r.Work, Do: r.purge, Workers: 1}).Run(ctx)
+}
+
+// purge deletes what the role holds of a repository that moved away Kept ago or more; one that
+// moved less long ago is booked for then, and one that did not, or moved back, is left.
+func (r *RepositoryRole) purge(ctx context.Context, repo int64) error {
+	at, moved, err := r.Rows.MovedAt(ctx, repo)
+	switch {
+	case err != nil:
+		return err
+	case !moved:
+		return nil
+	case time.Since(at) < Kept:
+		return r.Work.MarkAt(ctx, MovedWork, repo, at.Add(Kept))
+	}
+	s := Scope{Repositories: []int64{repo}}
+	if r.Kept != nil {
+		if err := r.Kept.Drop(ctx, s); err != nil {
+			return err
+		}
+	}
+	return r.Drop(ctx, s)
+}
+
+// bookMoved books the purge of every repository that moved away.
+func (r *RepositoryRole) bookMoved(ctx context.Context) error {
+	for after := int64(math.MinInt64); ; {
+		repos, err := r.Rows.MovedBefore(ctx, time.Date(9999, 1, 1, 0, 0, 0, 0, time.UTC), after, 1000)
+		if err != nil {
+			return err
+		}
+		for _, repo := range repos {
+			if err := r.Work.Mark(ctx, MovedWork, repo); err != nil {
+				return err
 			}
-			if err == nil {
-				err = r.Drop(ctx, s)
-			}
 		}
-		if err != nil && ctx.Err() == nil {
-			slog.Warn("move: deleting what moved away", slog.String("role", r.RoleName), slog.Any("err", err))
-		}
-		if err == nil && len(repos) > 0 {
-			continue
-		}
-		select {
-		case <-ctx.Done():
+		if len(repos) < 1000 {
 			return nil
-		case <-time.After(purgeEvery):
 		}
+		after = repos[len(repos)-1]
 	}
 }

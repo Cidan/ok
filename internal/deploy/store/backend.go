@@ -6,6 +6,8 @@ import (
 
 	"github.com/Cidan/ok/internal/data"
 	"github.com/Cidan/ok/internal/move"
+	"github.com/Cidan/ok/internal/wait"
+	"github.com/Cidan/ok/internal/work"
 	"github.com/Cidan/ok/internal/workflow"
 )
 
@@ -17,11 +19,16 @@ type Backend interface {
 	// Txn runs fn in one read-write transaction, again if the database aborts it to break a
 	// deadlock or a conflict; fn has no effects outside the transaction.
 	Txn(ctx context.Context, fn func(tx Ops) error) error
-	// TryLockDeployment takes a deployment's lock, if no one holds it, until release; it is held
-	// past ctx, refreshed until released or until this process dies. fence is its lease's.
+	// TryLockDeployment takes the lock the release before stepped a deployment under, if no one
+	// holds it, until release; it is held past ctx, refreshed until released or until this process
+	// dies. Store.LockDeployment takes it beside the deployment's claim, this release only.
 	TryLockDeployment(ctx context.Context, id int64) (fence data.Fence, release func(), ok bool, err error)
 	// Moves are its rows about repositories, for a move between cells.
 	Moves() move.Rows
+	// Work is its keyed work's store (internal/work).
+	Work() work.Store
+	// Waits are the live requests waiting on its subjects (internal/wait).
+	Waits() wait.Store
 }
 
 // Ops are the database's operations. Outside a transaction each is its own; inside Txn they are
@@ -35,6 +42,8 @@ type Ops interface {
 	GateState(ctx context.Context, repo int64) (string, error)
 	// RunningDeployments are repositories' running deployments, by ID.
 	RunningDeployments(ctx context.Context, repos []int64) ([]int64, error)
+	// OwnedRepositories are the repositories an account owns, as the directory last said, by ID.
+	OwnedRepositories(ctx context.Context, owner string) ([]int64, error)
 
 	// ─── The feed ───
 
@@ -45,6 +54,9 @@ type Ops interface {
 	FollowCursors(ctx context.Context, topic string, keys []int64) (map[int64]int64, error)
 	LockFollowCursor(ctx context.Context, topic string, key int64) (int64, error)
 	SetFollowCursor(ctx context.Context, topic string, key, seq int64) error
+	// PendStep pends a step in the operations' transaction, its job enqueued before it commits
+	// (work.Pend).
+	PendStep(ctx context.Context, kind string, key int64, at time.Time, body []byte) error
 	// NameRepository records a repository by its ID, with its full name and its owner's ID (""
 	// keeps the one recorded), whether or not it was recorded. RepositoryOwner is its owner's ID,
 	// "" when unknown.
@@ -71,8 +83,9 @@ type Ops interface {
 	// it; ok is false when main never had it.
 	MainCommit(ctx context.Context, repo int64, commit []byte) (seq int64, planned, ok bool, err error)
 	// Unplanned are the repositories whose head moved past their planned head, and that the
-	// directory has named, by ID.
+	// directory has named, by ID; UnplannedRepository is one of them, if it is.
 	Unplanned(ctx context.Context) ([]Repository, error)
+	UnplannedRepository(ctx context.Context, id int64) (Repository, bool, error)
 
 	// ─── Plans ───
 
@@ -101,8 +114,9 @@ type Ops interface {
 	// in a place in it they took, except one, returning their IDs.
 	CancelWaitingIn(ctx context.Context, plan, except int64, reason string) ([]int64, error)
 	// HaltRunningIn asks to halt, with reason, the running deployments not yet asked, except one,
-	// that are in a plan or in a place in it at or after wave.
-	HaltRunningIn(ctx context.Context, plan, except int64, wave int, reason string) error
+	// that are in a plan or in a place in it at or after wave, returning each one's ID, whether it
+	// is the deployer's own, and its driver.
+	HaltRunningIn(ctx context.Context, plan, except int64, wave int, reason string) ([]*Deployment, error)
 
 	// Deployments reads deployments by ID, with their images and migrations, in no order.
 	Deployments(ctx context.Context, ids []int64) ([]*Deployment, error)
@@ -171,17 +185,10 @@ type Ops interface {
 
 	// ─── Keyed work ───
 
-	// MarkWork, MarkWorkAt, TakeWork, RenewWork, ReleaseWork, LetWork, and DueWork are the deployer's keyed
-	// work's (internal/work; pgdata's work operations, on PostgreSQL).
+	// MarkWork and MarkWorkAt mark the deployer's keyed work (internal/work), in the operations'
+	// transaction, which enqueues their jobs before it commits, or in one of their own.
 	MarkWork(ctx context.Context, kind string, key int64) error
 	MarkWorkAt(ctx context.Context, kind string, key int64, at time.Time) error
-	// MarkWorkIdle marks key's work of kind due now if nothing marks it and no one holds it.
-	MarkWorkIdle(ctx context.Context, kind string, key int64) error
-	TakeWork(ctx context.Context, kind string, key int64, holder string, ttl time.Duration) (bool, error)
-	RenewWork(ctx context.Context, kind string, key int64, holder string, ttl time.Duration) (bool, error)
-	ReleaseWork(ctx context.Context, kind string, key int64, holder string) (bool, error)
-	LetWork(ctx context.Context, kind string, key int64, holder string) error
-	DueWork(ctx context.Context, kind string, limit int) ([]int64, error)
 }
 
 // Plan is a plan the deployer made at a repository's head.
@@ -213,9 +220,10 @@ type DeploymentRow struct {
 	Reason      string
 }
 
-// Replaced is a waiting deployment a newer one replaced: its plan (0: none), its wave, and the
-// places it had taken.
+// Replaced is a waiting deployment a newer one replaced: its ID, its plan (0: none), its wave, and
+// the places it had taken.
 type Replaced struct {
+	ID    int64
 	Plan  int64
 	Wave  int
 	Gates []Gate

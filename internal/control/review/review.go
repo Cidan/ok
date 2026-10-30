@@ -17,7 +17,6 @@ import (
 	"github.com/Cidan/ok/internal/control/people"
 	"github.com/Cidan/ok/internal/control/scm"
 	"github.com/Cidan/ok/internal/owners"
-	"github.com/Cidan/ok/internal/scm/scmfeed"
 	scmpb "github.com/Cidan/ok/proto/ok/scm/v1"
 )
 
@@ -34,7 +33,7 @@ type Service struct {
 	// treeRepository names the repository whose groups-and-ACLs tree is ok's.
 	treeRepository string
 	// feedWait bounds how long an action waits for the change feed to apply its own
-	// transition or landing before the page renders.
+	// transition or landing before the page renders (WaitForFeed).
 	feedWait time.Duration
 }
 
@@ -97,8 +96,9 @@ type Evaluation struct {
 	Status *Status
 	// Head is main's head, where OWNERS were read.
 	Head []byte
-	// Files are the paths the current patchset changes (a rename's both paths).
-	Files []string
+	// Files are the paths the current patchset changes (a rename's both paths), and Added those of
+	// them it makes (a rename's new path).
+	Files, Added []string
 	// Governed are the files OWNERS govern — every file but those of main's groups-and-ACLs tree,
 	// which ACLs govern — but for a rollback only those its
 	// author edited by hand (handEdited).
@@ -198,27 +198,48 @@ func ownersFile(p string, v *scmpb.TreeValue, data []byte, truncated bool) ([]by
 
 // changedFiles lists the paths a patchset changes against its base, a rename as both its
 // paths (both need their owners' approval).
-func (s *Service) changedFiles(ctx context.Context, repo int64, ps *scmpb.Patchset) ([]string, error) {
+func (s *Service) changedFiles(ctx context.Context, repo int64, ps *scmpb.Patchset) (files, added []string, err error) {
 	baseTree, err := s.scm.Tree(ctx, repo, ps.GetBaseCommitId())
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	tree, err := s.scm.Tree(ctx, repo, ps.GetCommitId())
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	resp, err := s.scm.Browse.DiffTrees(ctx, &scmpb.DiffTreesRequest{RepositoryId: repo, FromTree: baseTree, ToTree: tree})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	var files []string
 	for _, c := range resp.GetChanges() {
 		files = append(files, c.GetPath())
-		if c.GetKind() == scmpb.PathChange_KIND_RENAMED && c.GetOldPath() != "" {
-			files = append(files, c.GetOldPath())
+		switch c.GetKind() {
+		case scmpb.PathChange_KIND_ADDED:
+			added = append(added, c.GetPath())
+		case scmpb.PathChange_KIND_RENAMED:
+			added = append(added, c.GetPath())
+			if c.GetOldPath() != "" {
+				files = append(files, c.GetOldPath())
+			}
 		}
 	}
-	return files, nil
+	return files, added, nil
+}
+
+// DirOf is the directory a path is directly in: "" for one at the repository's root.
+func DirOf(p string) string {
+	if d := path.Dir(p); d != "." {
+		return d
+	}
+	return ""
+}
+
+// Governs reports whether a path of main decides how every CL of the repository is reviewed or
+// lands: its settings (.ok/), an OWNERS file or one OWNERS imports, or a file of its
+// groups-and-ACLs tree, at treeDir ("" for none).
+func Governs(p, treeDir string) bool {
+	return strings.HasPrefix(p, ".ok/") || owners.IsOwnersFile(p) ||
+		treeDir != "" && (p == treeDir || strings.HasPrefix(p, strings.TrimSuffix(treeDir, "/")+"/"))
 }
 
 // Evaluate computes a CL's review requirements for its current patchset. OWNERS are read
@@ -244,7 +265,7 @@ func (s *Service) Evaluate(ctx context.Context, cl db.ChangeList, c *scmpb.Chang
 	if ps == nil {
 		return nil, fmt.Errorf("CL %d has no patchset %d", cl.Number, c.GetCurrentPatchset())
 	}
-	files, err := s.changedFiles(ctx, cl.Repo, ps)
+	files, added, err := s.changedFiles(ctx, cl.Repo, ps)
 	if err != nil {
 		return nil, fmt.Errorf("the files CL %d changes: %w", cl.Number, err)
 	}
@@ -302,7 +323,7 @@ func (s *Service) Evaluate(ctx context.Context, cl db.ChangeList, c *scmpb.Chang
 	}
 	st := evaluate(sets, ownersErr, grants, cl.Author, unresolved, rollback, ow)
 	st.Identity, st.IdentityErr = idReqs, idErr
-	return &Evaluation{Status: st, Head: head, Files: files, Governed: governed}, nil
+	return &Evaluation{Status: st, Head: head, Files: files, Added: added, Governed: governed}, nil
 }
 
 // handEdited are the files a rollback CL's current patchset changes to anything but what its
@@ -371,27 +392,6 @@ func (s *Service) Refresh(ctx context.Context, repo, number int64) error {
 		}
 		return tx.RecordEvent(ctx, repo, number, db.Event{Kind: kind, Patchset: cl.CurrentPatchset})
 	})
-}
-
-// WaitForFeed waits until the change feed has applied a repository's event seq (its place in
-// the repository's log), so a page rendered after an action shows it; after feedWait it gives
-// up and the page renders from the projection the action already updated.
-func (s *Service) WaitForFeed(ctx context.Context, repo, seq int64) error {
-	if seq == 0 {
-		return nil
-	}
-	deadline := time.Now().Add(s.feedWait)
-	for {
-		cur, err := s.db.FollowCursor(ctx, scmfeed.Topic, repo)
-		if err != nil || cur >= seq || time.Now().After(deadline) {
-			return err
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(20 * time.Millisecond):
-		}
-	}
 }
 
 // transition applies a lifecycle transition through the SCM on principal's behalf.

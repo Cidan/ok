@@ -255,8 +255,9 @@ func TestMicroVMs(t *testing.T) {
 	}
 
 	// The same change to repository two, also ada's: its pre runs in two's domain, whose output
-	// base never built it, and its guest takes from the remote cache what one's built under the
-	// account — through vsock and the run's pass-through.
+	// bases never built it, and its guests take from the remote cache what one's built under the
+	// account — through vsock and the run's pass-through. Whichever of its runs builds the change
+	// first in a slot takes it so; one after it in that slot finds it built.
 	b.jj("two", "new", "main@ok", "-m", "hello, world")
 	write(t, b.dir("two"), map[string]*string{"lib/a.txt": ptr("hello, world\n")})
 	cl2 := uploaded(b.jj("two", "cl", "--ready"))[0]
@@ -264,9 +265,18 @@ func TestMicroVMs(t *testing.T) {
 	if p2.GetVerdict() != automationpb.Pre_VERDICT_PASSED {
 		t.Fatalf("repository two's pre: %s", e.describe(p2))
 	}
-	if log := e.logOf(jobs(p2)["build"].GetId()); !strings.Contains(log, "in a microVM of trust domain "+domain(two, "pre")) ||
-		!strings.Contains(log, "remote cache hit") {
-		t.Errorf("repository two's build, in its microVM, took nothing from the remote cache:\n%s", log)
+	took := false
+	var logs []string
+	for _, r := range p2.GetJobs() {
+		log := e.logOf(r.GetId())
+		logs = append(logs, log)
+		if !strings.Contains(log, "in a microVM of trust domain "+domain(two, "pre")) {
+			t.Errorf("repository two's pre run %d's log does not name its domain:\n%s", r.GetId(), log)
+		}
+		took = took || strings.Contains(log, "remote cache hit")
+	}
+	if !took {
+		t.Errorf("repository two's pre, in its microVMs, took nothing from the remote cache:\n%s", strings.Join(logs, "\n\n"))
 	}
 
 	// The worker keeps the domains its runs ran in, and none else: each repository's pre (both

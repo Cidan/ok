@@ -1,8 +1,4 @@
-// Package awsbus is the bus (internal/bus) on Amazon SNS and SQS (docs/hosted.md, "Backends").
-//
-// A topic is an SNS topic, and a group an SQS queue subscribed to it with raw message delivery, its
-// policy letting the topic send to it; SNS delivers a subscription what is published after it was
-// made. A handler's error returns its event to the group's queue after a backoff.
+// Package awsbus is the bus (internal/bus) on Amazon SQS (docs/hosted.md, "Backends").
 //
 // A queue is an SQS standard queue, with another of its dead letters. A lease is a receive's
 // visibility timeout, at most SQS's twelve hours from the first receive; past it a lease is ended
@@ -13,8 +9,8 @@
 // minutes: a job due later, or nacked past the twelve hours, is sent again carrying its attempts,
 // and a Lease that receives it early sends it on. SQS standard queues drop no duplicates.
 //
-// SQS's and SNS's bodies are text, so an event's or job's bytes travel in a binary message
-// attribute — base64 on the wire, as both protocols carry binary — under a fixed body.
+// SQS's bodies are text, so a job's bytes travel in a binary message attribute — base64 on the
+// wire, as the protocol carries binary — under a fixed body.
 package awsbus
 
 import (
@@ -24,20 +20,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/service/sns"
-	snstypes "github.com/aws/aws-sdk-go-v2/service/sns/types"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	sqstypes "github.com/aws/aws-sdk-go-v2/service/sqs/types"
-	"golang.org/x/sync/errgroup"
 
 	"github.com/Cidan/ok/internal/bus"
-	"github.com/Cidan/ok/internal/bus/inflight"
 )
 
 // Options shape a Bus.
@@ -54,8 +47,6 @@ type Options struct {
 	// Visibility is how long a group's delivery is invisible to the group's other members, renewed
 	// while a handler works. Default 30 seconds.
 	Visibility time.Duration
-	// Concurrency is how many of a group's deliveries a member handles at once. Default 32.
-	Concurrency int
 }
 
 func (o *Options) defaults() {
@@ -73,9 +64,6 @@ func (o *Options) defaults() {
 	if o.Visibility <= 0 {
 		o.Visibility = 30 * time.Second
 	}
-	if o.Concurrency <= 0 {
-		o.Concurrency = 32
-	}
 }
 
 // SQS's and SNS's bounds.
@@ -91,7 +79,6 @@ const (
 // Attributes a message carries, and its body.
 const (
 	attrKey       = "ok-key"
-	attrSeq       = "ok-seq"
 	attrID        = "ok-id"
 	attrBody      = "ok-body"
 	attrNotBefore = "ok-not-before"
@@ -99,29 +86,133 @@ const (
 	body          = "ok"
 )
 
-// Bus is a bus.Stream and a bus.Queue on SNS and SQS clients.
+// Bus is a bus.Queue on an SQS client.
 type Bus struct {
 	sqs  *sqs.Client
-	sns  *sns.Client
 	opts Options
 
 	mu     sync.Mutex
-	topics map[string]string   // a topic's ARN, by name
-	queues map[string]string   // a queue's URL, by name
-	arns   map[string]string   // a queue's ARN, by URL
-	groups map[string]struct{} // groups subscribed
+	queues map[string]string // a queue's URL, by name
+	arns   map[string]string // a queue's ARN, by URL
+	// inboxes are this process's inboxes (bus.Inboxes), on an SQS queue of its own tagged with when
+	// it was last leased (seen) — every inboxSeen at most — so that any process making its own
+	// removes one unleased for inboxGone: its process stopped before it closed its inboxes.
+	inboxes *bus.Inboxes
+	seen    time.Time
 }
 
-var (
-	_ bus.Stream = (*Bus)(nil)
-	_ bus.Queue  = (*Bus)(nil)
+var _ bus.Queue = (*Bus)(nil)
+
+// New is a bus on the client's account and region.
+func New(sqsClient *sqs.Client, opts Options) *Bus {
+	opts.defaults()
+	b := &Bus{sqs: sqsClient, opts: opts, queues: map[string]string{}, arns: map[string]string{}}
+	b.inboxes = bus.NewInboxes(b, b.prepareInboxes, b.dropInboxes)
+	return b
+}
+
+// Inbox opens an inbox, on this process's own SQS queue.
+func (b *Bus) Inbox(ctx context.Context) (bus.Inbox, error) { return b.inboxes.Open(ctx) }
+
+// CloseInboxes closes the process's inboxes and removes their queue.
+func (b *Bus) CloseInboxes(ctx context.Context) error { return b.inboxes.Close(ctx) }
+
+// How long an inbox's queue goes between marks of its being leased, and unleased before any process
+// removes it.
+const (
+	inboxSeen = 10 * time.Minute
+	inboxGone = time.Hour
+	tagSeen   = "ok-seen"
 )
 
-// New is a bus on the clients' account and region.
-func New(sqsClient *sqs.Client, snsClient *sns.Client, opts Options) *Bus {
-	opts.defaults()
-	return &Bus{sqs: sqsClient, sns: snsClient, opts: opts, topics: map[string]string{}, queues: map[string]string{},
-		arns: map[string]string{}, groups: map[string]struct{}{}}
+// inboxAttrs are a process's queue of inboxes': replies kept ten minutes, and no dead letters.
+var inboxAttrs = map[string]string{"MessageRetentionPeriod": "600", "VisibilityTimeout": "30"}
+
+// prepareInboxes makes the process's queue of inboxes — looked up anew, which another process may
+// have removed — marks it leased, and removes every other process's left unleased for inboxGone.
+func (b *Bus) prepareInboxes(ctx context.Context, queue string) error {
+	qname := name(b.opts.Prefix, "q", queue)
+	b.mu.Lock()
+	delete(b.queues, qname)
+	b.mu.Unlock()
+	url, err := b.ensureQueue(ctx, qname, inboxAttrs)
+	if err != nil {
+		return err
+	}
+	if err := b.markSeen(ctx, url, true); err != nil {
+		return err
+	}
+	b.removeGoneInboxes(ctx, qname)
+	return nil
+}
+
+// markSeen tags a queue of inboxes with now, unless it did within inboxSeen and not always.
+func (b *Bus) markSeen(ctx context.Context, url string, always bool) error {
+	b.mu.Lock()
+	due := always || time.Since(b.seen) >= inboxSeen
+	if due {
+		b.seen = time.Now()
+	}
+	b.mu.Unlock()
+	if !due {
+		return nil
+	}
+	_, err := b.sqs.TagQueue(ctx, &sqs.TagQueueInput{QueueUrl: aws.String(url),
+		Tags: map[string]string{tagSeen: strconv.FormatInt(time.Now().Unix(), 10)}})
+	if err != nil {
+		return fmt.Errorf("awsbus: marking %s leased: %w", url, err)
+	}
+	return nil
+}
+
+// removeGoneInboxes removes the queues of inboxes other than own that no process has leased for
+// inboxGone. A failure is logged: the next process to make its inboxes removes them.
+func (b *Bus) removeGoneInboxes(ctx context.Context, own string) {
+	prefix := name(b.opts.Prefix, "q", "inbox.")
+	var next *string
+	for {
+		out, err := b.sqs.ListQueues(ctx, &sqs.ListQueuesInput{QueueNamePrefix: aws.String(prefix), NextToken: next})
+		if err != nil {
+			slog.Warn("awsbus: listing queues of inboxes", "err", err)
+			return
+		}
+		for _, url := range out.QueueUrls {
+			if strings.HasSuffix(url, "/"+own) {
+				continue
+			}
+			tags, err := b.sqs.ListQueueTags(ctx, &sqs.ListQueueTagsInput{QueueUrl: aws.String(url)})
+			if err != nil {
+				continue
+			}
+			at, err := strconv.ParseInt(tags.Tags[tagSeen], 10, 64)
+			if err == nil && time.Since(time.Unix(at, 0)) < inboxGone {
+				continue
+			}
+			if _, err := b.sqs.DeleteQueue(ctx, &sqs.DeleteQueueInput{QueueUrl: aws.String(url)}); err != nil {
+				slog.Warn("awsbus: removing a queue of inboxes no process leases", "queue", url, "err", err)
+			}
+		}
+		if out.NextToken == nil {
+			return
+		}
+		next = out.NextToken
+	}
+}
+
+func (b *Bus) dropInboxes(ctx context.Context, queue string) error {
+	qname := name(b.opts.Prefix, "q", queue)
+	b.mu.Lock()
+	url := b.queues[qname]
+	delete(b.queues, qname)
+	b.mu.Unlock()
+	if url == "" {
+		return nil
+	}
+	if _, err := b.sqs.DeleteQueue(ctx, &sqs.DeleteQueueInput{QueueUrl: aws.String(url)}); err != nil &&
+		!errors.As(err, new(*sqstypes.QueueDoesNotExist)) {
+		return fmt.Errorf("awsbus: removing %s: %w", queue, err)
+	}
+	return nil
 }
 
 // token is s as part of an SQS or SNS name: letters, digits, and '-' as they are, every other byte
@@ -224,133 +315,7 @@ func sized[T any](entries []T, n func(T) int) [][]T {
 	return out
 }
 
-// ─── The stream ───
-
-func (b *Bus) topicArn(ctx context.Context, topic string) (string, error) {
-	b.mu.Lock()
-	arn := b.topics[topic]
-	b.mu.Unlock()
-	if arn != "" {
-		return arn, nil
-	}
-	out, err := b.sns.CreateTopic(ctx, &sns.CreateTopicInput{Name: aws.String(name(b.opts.Prefix, "ev", topic))})
-	if err != nil {
-		return "", fmt.Errorf("awsbus: topic %s: %w", topic, err)
-	}
-	b.mu.Lock()
-	b.topics[topic] = *out.TopicArn
-	b.mu.Unlock()
-	return *out.TopicArn, nil
-}
-
-func eventAttrs(e bus.Event) map[string]snstypes.MessageAttributeValue {
-	attrs := map[string]snstypes.MessageAttributeValue{
-		attrKey: {DataType: aws.String("Number"), StringValue: aws.String(strconv.FormatInt(e.Key, 10))},
-		attrSeq: {DataType: aws.String("Number"), StringValue: aws.String(strconv.FormatInt(e.Seq, 10))},
-	}
-	if len(e.Body) > 0 {
-		attrs[attrBody] = snstypes.MessageAttributeValue{DataType: aws.String("Binary"), BinaryValue: e.Body}
-	}
-	return attrs
-}
-
-// Publish publishes events, a batch at a time.
-func (b *Bus) Publish(ctx context.Context, events ...bus.Event) error {
-	byTopic := map[string][]bus.Event{}
-	var order []string
-	for _, e := range events {
-		if _, ok := byTopic[e.Topic]; !ok {
-			order = append(order, e.Topic)
-		}
-		byTopic[e.Topic] = append(byTopic[e.Topic], e)
-	}
-	for _, topic := range order {
-		arn, err := b.topicArn(ctx, topic)
-		if err != nil {
-			return err
-		}
-		for _, batch := range sized(byTopic[topic], func(e bus.Event) int { return len(body) + len(e.Body) + 128 }) {
-			entries := make([]snstypes.PublishBatchRequestEntry, len(batch))
-			for i, e := range batch {
-				entries[i] = snstypes.PublishBatchRequestEntry{Id: aws.String(strconv.Itoa(i)), Message: aws.String(body), MessageAttributes: eventAttrs(e)}
-			}
-			out, err := b.sns.PublishBatch(ctx, &sns.PublishBatchInput{TopicArn: aws.String(arn), PublishBatchRequestEntries: entries})
-			if err != nil {
-				return fmt.Errorf("awsbus: publishing to %s: %w", topic, err)
-			}
-			if len(out.Failed) > 0 {
-				f := out.Failed[0]
-				return fmt.Errorf("awsbus: publishing %d of %d events to %s: %s: %s", len(out.Failed), len(batch), topic,
-					aws.ToString(f.Code), aws.ToString(f.Message))
-			}
-		}
-	}
-	return nil
-}
-
-// policy lets topic's SNS send to a queue.
-func policy(queueArn, topicArn string) (string, error) {
-	p, err := json.Marshal(map[string]any{
-		"Version": "2012-10-17",
-		"Statement": []map[string]any{{
-			"Sid": "ok-topic", "Effect": "Allow", "Principal": map[string]string{"Service": "sns.amazonaws.com"},
-			"Action": "sqs:SendMessage", "Resource": queueArn,
-			"Condition": map[string]any{"ArnEquals": map[string]string{"aws:SourceArn": topicArn}},
-		}},
-	})
-	return string(p), err
-}
-
-// CreateGroup makes group's queue on topic, subscribed to it: it receives what is published from
-// now on.
-func (b *Bus) CreateGroup(ctx context.Context, topic, group string) error {
-	_, err := b.group(ctx, topic, group)
-	return err
-}
-
-func (b *Bus) group(ctx context.Context, topic, group string) (string, error) {
-	arn, err := b.topicArn(ctx, topic)
-	if err != nil {
-		return "", err
-	}
-	qname := name(b.opts.Prefix, "ev", topic, group)
-	url, err := b.ensureQueue(ctx, qname, map[string]string{
-		"MessageRetentionPeriod": b.retention(), "VisibilityTimeout": strconv.Itoa(int(seconds(b.opts.Visibility)))})
-	if err != nil {
-		return "", err
-	}
-	b.mu.Lock()
-	_, done := b.groups[qname]
-	b.mu.Unlock()
-	if done {
-		return url, nil
-	}
-	qarn, err := b.queueArn(ctx, url)
-	if err != nil {
-		return "", err
-	}
-	p, err := policy(qarn, arn)
-	if err != nil {
-		return "", err
-	}
-	// The policy first: the subscription delivers from the moment it is made.
-	if _, err := b.sqs.SetQueueAttributes(ctx, &sqs.SetQueueAttributesInput{QueueUrl: aws.String(url), Attributes: map[string]string{"Policy": p}}); err != nil {
-		return "", fmt.Errorf("awsbus: group %s/%s: %w", topic, group, err)
-	}
-	if _, err := b.sns.Subscribe(ctx, &sns.SubscribeInput{TopicArn: aws.String(arn), Protocol: aws.String("sqs"), Endpoint: aws.String(qarn),
-		Attributes: map[string]string{"RawMessageDelivery": "true"}, ReturnSubscriptionArn: true}); err != nil {
-		return "", fmt.Errorf("awsbus: group %s/%s: %w", topic, group, err)
-	}
-	b.mu.Lock()
-	b.groups[qname] = struct{}{}
-	b.mu.Unlock()
-	return url, nil
-}
-
-// backoff is how long an event a handler refused waits, by its receives so far.
-func backoff(receives int) time.Duration {
-	return min(time.Second<<min(max(receives-1, 0), 6), time.Minute)
-}
+// ─── The queue ───
 
 func (b *Bus) receive(ctx context.Context, url string, n int, vis time.Duration, wait time.Duration) ([]sqstypes.Message, error) {
 	out, err := b.sqs.ReceiveMessage(ctx, &sqs.ReceiveMessageInput{
@@ -373,157 +338,12 @@ func stringAttr(m sqstypes.Message, k string) string {
 	return aws.ToString(m.MessageAttributes[k].StringValue)
 }
 
-// Subscribe handles topic's events as a member of group until ctx ends, up to Concurrency at once:
-// the stream promises no order, and a consumer applies each by its key's cursor. Receivers, each
-// long-polling for up to ten, receive only as many as they reserved free slots for, so none waits
-// for one, its visibility running, and hand each over as its receive returns; what is handled is
-// deleted ten a request.
-func (b *Bus) Subscribe(ctx context.Context, topic, group string, h bus.Handler) error {
-	url, err := b.group(ctx, topic, group)
-	if err != nil {
-		return err
-	}
-	del := b.deleter(url)
-	defer del.close()
-	slots := inflight.New(b.opts.Concurrency)
-	defer slots.Wait()
-	g, gctx := errgroup.WithContext(ctx)
-	for range (b.opts.Concurrency + maxBatch - 1) / maxBatch {
-		g.Go(func() error {
-			for gctx.Err() == nil {
-				reserved, err := slots.Reserve(gctx, maxBatch)
-				if err != nil {
-					return nil
-				}
-				msgs, err := b.receive(gctx, url, reserved, b.opts.Visibility, maxWait)
-				for _, m := range msgs {
-					slots.Run(func() error { return b.handle(ctx, url, topic, m, h, del) })
-				}
-				slots.Release(reserved - len(msgs))
-				if err != nil && gctx.Err() == nil {
-					return fmt.Errorf("awsbus: receiving %s/%s: %w", topic, group, err)
-				}
-				if err := slots.Err(); err != nil && gctx.Err() == nil {
-					return err
-				}
-			}
-			return nil
-		})
-	}
-	if err := g.Wait(); err != nil && ctx.Err() == nil {
-		return err
-	}
-	return ctx.Err()
-}
-
-// deleter deletes a queue's handled deliveries, ten a request, flushing a few milliseconds after
-// the first of a batch: a delivery not yet deleted stays invisible, and one whose delete fails is
-// delivered again, which a delivery may be.
-type deleter struct {
-	b    *Bus
-	url  string
-	in   chan *string
-	done chan struct{}
-}
-
-func (b *Bus) deleter(url string) *deleter {
-	d := &deleter{b: b, url: url, in: make(chan *string, 4*maxBatch), done: make(chan struct{})}
-	go d.run()
-	return d
-}
-
-func (d *deleter) delete(receipt *string) { d.in <- receipt }
-
-// close deletes what is pending and stops.
-func (d *deleter) close() {
-	close(d.in)
-	<-d.done
-}
-
-func (d *deleter) run() {
-	defer close(d.done)
-	var batch []*string
-	flush := func() {
-		if len(batch) == 0 {
-			return
-		}
-		entries := make([]sqstypes.DeleteMessageBatchRequestEntry, len(batch))
-		for i, r := range batch {
-			entries[i] = sqstypes.DeleteMessageBatchRequestEntry{Id: aws.String(strconv.Itoa(i)), ReceiptHandle: r}
-		}
-		d.b.sqs.DeleteMessageBatch(context.Background(), &sqs.DeleteMessageBatchInput{QueueUrl: aws.String(d.url), Entries: entries})
-		batch = batch[:0]
-	}
-	var timer <-chan time.Time
-	for {
-		select {
-		case r, ok := <-d.in:
-			if !ok {
-				flush()
-				return
-			}
-			batch = append(batch, r)
-			if len(batch) == maxBatch {
-				flush()
-				timer = nil
-			} else if timer == nil {
-				timer = time.After(20 * time.Millisecond)
-			}
-		case <-timer:
-			flush()
-			timer = nil
-		}
-	}
-}
-
-// handle hands one delivery to h, keeping it invisible while h works, and deletes it or returns it
-// after a backoff.
-func (b *Bus) handle(ctx context.Context, url, topic string, m sqstypes.Message, h bus.Handler, del *deleter) error {
-	key, kerr := strconv.ParseInt(stringAttr(m, attrKey), 10, 64)
-	seq, serr := strconv.ParseInt(stringAttr(m, attrSeq), 10, 64)
-	if kerr != nil || serr != nil {
-		// Not an event of this package's: nothing a retry would change.
-		del.delete(m.ReceiptHandle)
-		return nil
-	}
-	stop := b.renew(url, m.ReceiptHandle)
-	err := h(ctx, bus.Event{Topic: topic, Key: key, Seq: seq, Body: m.MessageAttributes[attrBody].BinaryValue})
-	stop()
-	if err == nil {
-		del.delete(m.ReceiptHandle)
-		return nil
-	}
-	if _, err := b.sqs.ChangeMessageVisibility(ctx, &sqs.ChangeMessageVisibilityInput{QueueUrl: aws.String(url), ReceiptHandle: m.ReceiptHandle,
-		VisibilityTimeout: seconds(backoff(receives(m)))}); err != nil {
-		return fmt.Errorf("awsbus: returning %s's event: %w", topic, err)
-	}
-	return nil
-}
-
-// renew keeps a group's delivery invisible a third of every visibility, until stop is called.
-func (b *Bus) renew(url string, receipt *string) (stop func()) {
-	done, finished := make(chan struct{}), make(chan struct{})
-	go func() {
-		defer close(finished)
-		t := time.NewTicker(b.opts.Visibility / 3)
-		defer t.Stop()
-		for {
-			select {
-			case <-done:
-				return
-			case <-t.C:
-				b.sqs.ChangeMessageVisibility(context.Background(), &sqs.ChangeMessageVisibilityInput{QueueUrl: aws.String(url),
-					ReceiptHandle: receipt, VisibilityTimeout: seconds(b.opts.Visibility)})
-			}
-		}
-	}()
-	return func() { close(done); <-finished }
-}
-
-// ─── The queue ───
-
 // jobQueue makes a queue and its dead letters, returning their URLs.
 func (b *Bus) jobQueue(ctx context.Context, queue string) (url, dead string, err error) {
+	if bus.IsInboxQueue(queue) {
+		url, err = b.ensureQueue(ctx, name(b.opts.Prefix, "q", queue), inboxAttrs)
+		return url, "", err
+	}
 	dead, err = b.ensureQueue(ctx, name(b.opts.Prefix, "dead", queue), map[string]string{"MessageRetentionPeriod": b.retention()})
 	if err != nil {
 		return "", "", err
@@ -591,6 +411,7 @@ func (b *Bus) Enqueue(ctx context.Context, jobs ...bus.Job) error {
 	byQueue := map[string][]sqstypes.SendMessageBatchRequestEntry{}
 	var order []string
 	for _, j := range jobs {
+		j, _ = bus.InboxJob(j)
 		if _, ok := byQueue[j.Queue]; !ok {
 			order = append(order, j.Queue)
 		}
@@ -631,6 +452,11 @@ func (b *Bus) Lease(ctx context.Context, queue string, o bus.LeaseOptions) ([]bu
 	url, dead, err := b.jobQueue(ctx, queue)
 	if err != nil {
 		return nil, err
+	}
+	if bus.IsInboxQueue(queue) {
+		if err := b.markSeen(ctx, url, false); err != nil {
+			return nil, err
+		}
 	}
 	vis := min(max(o.Visibility, time.Second), maxVisibility)
 	deadline := time.Now().Add(o.Wait)
@@ -680,6 +506,58 @@ type leased struct {
 
 func (l *leased) Job() bus.Job { return l.job }
 func (l *leased) Attempt() int { return l.attempt }
+
+// Handle names the delivery by its queue's URL and receipt handle, with which any client changes
+// its visibility or deletes it.
+func (l *leased) Handle() []byte {
+	return bus.EncodeHandle(l.job.Queue, l.job.ID, l.url, aws.ToString(l.receipt))
+}
+
+// Resume is the lease of the delivery whose queue URL and receipt handle the handle names. SQS
+// keeps a message invisible at most maxVisibility from its first receive, past which extending it
+// fails; its queue's redrive policy keeps it past its attempts.
+func (b *Bus) Resume(handle []byte) (bus.Leased, error) {
+	parts, err := bus.DecodeHandle(handle, 4)
+	if err != nil {
+		return nil, err
+	}
+	return &resumed{b: b, job: bus.Job{Queue: parts[0], ID: parts[1]}, url: parts[2], receipt: parts[3], handle: handle}, nil
+}
+
+// resumed is a delivery leased by another process, or by this one before.
+type resumed struct {
+	b            *Bus
+	job          bus.Job
+	url, receipt string
+	handle       []byte
+}
+
+func (r *resumed) Job() bus.Job   { return r.job }
+func (r *resumed) Attempt() int   { return 0 }
+func (r *resumed) Handle() []byte { return r.handle }
+
+func (r *resumed) Extend(ctx context.Context, d time.Duration) error {
+	if _, err := r.b.sqs.ChangeMessageVisibility(ctx, &sqs.ChangeMessageVisibilityInput{QueueUrl: aws.String(r.url),
+		ReceiptHandle: aws.String(r.receipt), VisibilityTimeout: seconds(max(d, time.Second))}); err != nil {
+		return fmt.Errorf("awsbus: extending: %w", err)
+	}
+	return nil
+}
+
+func (r *resumed) Ack(ctx context.Context) error {
+	if _, err := r.b.sqs.DeleteMessage(ctx, &sqs.DeleteMessageInput{QueueUrl: aws.String(r.url), ReceiptHandle: aws.String(r.receipt)}); err != nil {
+		return fmt.Errorf("awsbus: acknowledging: %w", err)
+	}
+	return nil
+}
+
+func (r *resumed) Nack(ctx context.Context, delay time.Duration) error {
+	if _, err := r.b.sqs.ChangeMessageVisibility(ctx, &sqs.ChangeMessageVisibilityInput{QueueUrl: aws.String(r.url),
+		ReceiptHandle: aws.String(r.receipt), VisibilityTimeout: seconds(max(delay, 0))}); err != nil {
+		return fmt.Errorf("awsbus: returning a job: %w", err)
+	}
+	return nil
+}
 
 // live reports bus.ErrLeaseLost if the lease has passed its deadline or ended, and with finish ends
 // it.

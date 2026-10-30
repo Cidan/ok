@@ -12,8 +12,8 @@ import (
 // (groups.go), each with its status in aggregate; and a group's page — the sub-nav of its
 // services beside the pane, which shows the group's overview or one of its services: what it
 // runs and what ok deployed, its pods, the image each runs, its recent deployments. Read-only,
-// and live: each refreshes itself every five seconds, which the deployer's observer — reading
-// the cluster every ten — keeps current.
+// and live: each refreshes itself as the deployer says its services changed — a deployment, or a
+// change in what its observer, reading the cluster every ten seconds, found (live.js).
 //
 // Regions, smallest first (docs/web.md, "Navigation & hydration"):
 //   - #service-groups, the list of groups, and #service-live, what a group's pane shows: live
@@ -24,8 +24,9 @@ import (
 //   - #content: entering a group from the list, leaving it for the list, a deployment, a commit,
 //     or a CL changes the layout, so the whole content region swaps.
 
-// liveEvery is how often a Services page's live regions refresh.
-const liveEvery = "every 5s"
+// servicesEvents are the services' change events, which refresh a Services page's live regions
+// (live.js).
+const servicesEvents = "/services/events"
 
 templ ServicesPage(n nav.Model, v ServicesView) {
 	@layout.Shell(shell("Services · "+Brand, layout.LeftNav, n)) {
@@ -40,7 +41,7 @@ templ ServicesContent(v ServicesView) {
 		</div>
 		<div id="services" data-hydrate class="hydrating flex-1 overflow-y-auto">
 			<div class="mx-auto w-full max-w-5xl px-6 pb-16 sm:px-10">
-				<div id="service-groups" data-live hx-get="/services" hx-trigger={ liveEvery } hx-target="this" hx-swap="innerHTML">
+				<div id="service-groups" data-live hx-get="/services" hx-trigger="live" data-live-events={ servicesEvents } hx-target="this" hx-swap="innerHTML">
 					@serviceGroupsPanel(v)
 				</div>
 			</div>
@@ -171,7 +172,7 @@ templ ServiceGroupMain(v ServiceGroupView) {
 		<div class="mb-4 flex min-h-9 items-center">
 			@breadcrumb.Trail(serviceGroupCrumbs(v), "")
 		</div>
-		<div id="service-live" data-live hx-get={ v.Href() } hx-trigger={ liveEvery } hx-target="this" hx-swap="innerHTML" class="space-y-4">
+		<div id="service-live" data-live hx-get={ v.Href() } hx-trigger="live" data-live-events={ servicesEvents } hx-target="this" hx-swap="innerHTML" class="space-y-4">
 			@serviceGroupBody(v)
 		</div>
 	</div>

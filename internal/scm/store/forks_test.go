@@ -147,6 +147,8 @@ func TestForkNetwork(t *testing.T) {
 	for tbl, n := range tableBytes(t, p.s, f.repo) {
 		switch tbl {
 		case "segment", "content_index", "repository_event_counter", "event", "event_pending", "workspace", "op_log", "dictionary_grant",
+			// When the fork's events were last sequenced, on Spanner: its own.
+			"sequence_pass",
 			// The network's, which the fork shares.
 			"pack", "content_log", "dictionary", "chunk_release":
 		default:

@@ -3,7 +3,6 @@ package authz
 import (
 	"context"
 	"testing"
-	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -36,8 +35,6 @@ func TestChecker(t *testing.T) {
 	ctx := context.Background()
 	src := &source{}
 	c := NewChecker(src)
-	now := time.Unix(1_000_000, 0)
-	c.now = func() time.Time { return now }
 
 	d, err := c.Decide(ctx, "prn_bob", nil, 7, Land)
 	if err != nil || !d.Allowed || d.Role != tenancy.Write {
@@ -46,12 +43,12 @@ func TestChecker(t *testing.T) {
 	if d, _ = c.Decide(ctx, "prn_bob", nil, 7, Administer); d.Allowed {
 		t.Errorf("bob administering: %+v", d)
 	}
-	if src.asked != 1 {
-		t.Errorf("identity was asked %d times; the facts are kept", src.asked)
+	if src.asked != 2 {
+		t.Errorf("identity was asked %d times for two decisions; the facts are kept by no one", src.asked)
 	}
-	// A token narrows the caller, without asking again.
-	if d, _ = c.Decide(ctx, "prn_bob", &Token{Role: tenancy.Read}, 7, Land); d.Allowed || d.Role != tenancy.Read || src.asked != 1 {
-		t.Errorf("bob's read token landing: %+v, asked %d", d, src.asked)
+	// A token narrows the caller.
+	if d, _ = c.Decide(ctx, "prn_bob", &Token{Role: tenancy.Read}, 7, Land); d.Allowed || d.Role != tenancy.Read {
+		t.Errorf("bob's read token landing: %+v", d)
 	}
 	// A stranger sees nothing of a private repository; neither does anyone of one there is none of.
 	if d, _ = c.Decide(ctx, "prn_eve", nil, 7, ReadCode); d.Allowed || d.Visible {
@@ -59,20 +56,6 @@ func TestChecker(t *testing.T) {
 	}
 	if d, err = c.Decide(ctx, "prn_bob", nil, 8, ReadCode); err != nil || d.Allowed || d.Visible {
 		t.Errorf("a repository there is none of: %+v, %v", d, err)
-	}
-	asked := src.asked
-	// Past the TTL, or forgotten, the facts are read again.
-	now = now.Add(TTL)
-	c.Decide(ctx, "prn_bob", nil, 7, ReadCode)
-	if src.asked != asked+1 {
-		t.Errorf("past the TTL: asked %d times, want %d", src.asked, asked+1)
-	}
-	c.Forget(7)
-	c.Decide(ctx, "prn_bob", nil, 7, ReadCode)
-	c.ForgetCaller("prn_bob")
-	c.Decide(ctx, "prn_bob", nil, 7, ReadCode)
-	if src.asked != asked+3 {
-		t.Errorf("forgotten: asked %d times, want %d", src.asked, asked+3)
 	}
 }
 

@@ -46,7 +46,8 @@ type Opener struct {
 	roots map[string]Root
 }
 
-// Root is the root an ID names, opened once.
+// Root is the root an ID names: a KMS's key, which it names for good, or a keyring file, read at
+// each use.
 func (o *Opener) Root(ctx context.Context, id string) (Root, error) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -61,7 +62,10 @@ func (o *Opener) Root(ctx context.Context, id string) (Root, error) {
 	var err error
 	switch scheme {
 	case "keyring":
-		r, err = OpenKeyring(rest)
+		// Its file must read as a keyring now; it is read again at each use (keyringFile).
+		if _, err = OpenKeyring(rest); err == nil {
+			r = keyringFile{file: rest}
+		}
 	case "gcp-kms":
 		if o.GCP == nil && o.DialGCP != nil {
 			if o.GCP, err = o.DialGCP(ctx); err != nil {

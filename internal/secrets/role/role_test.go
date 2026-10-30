@@ -14,6 +14,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/Cidan/ok/internal/bus/bustest"
 	"github.com/Cidan/ok/internal/config"
 	"github.com/Cidan/ok/internal/dial"
 	"github.com/Cidan/ok/internal/id/idtest"
@@ -146,6 +147,7 @@ func TestRole(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	cfg.Bus = bustest.Config(t)
 	scmPool, err := pgdb.Open(ctx, testdb.Postgres(t), scmrole.Schema, 0)
 	if err != nil {
 		t.Fatal(err)

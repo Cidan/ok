@@ -24,14 +24,13 @@ func (s *Server) SetQuota(ctx context.Context, req *identitypb.SetQuotaRequest) 
 	if req.GetReset_() {
 		err = s.cfg.Store.ResetQuota(ctx, account.ID)
 	} else {
-		err = s.cfg.Store.SetQuota(ctx, account.ID, store.Quota{Concurrent: int(req.GetConcurrent()), Minutes: req.GetMinutes(),
-			Weight: int(req.GetWeight())})
+		err = s.cfg.Store.SetQuota(ctx, account.ID, store.Quota{Concurrent: int(req.GetConcurrent()), Minutes: req.GetMinutes()})
 	}
 	if err != nil {
 		return nil, tenancyError(err)
 	}
 	s.audit(ctx, c.Principal, "account.quota", map[string]any{"account": account.Name, "concurrent": req.GetConcurrent(),
-		"minutes": req.GetMinutes(), "weight": req.GetWeight(), "reset": req.GetReset_()})
+		"minutes": req.GetMinutes(), "reset": req.GetReset_()})
 	return s.quotaOut(ctx, req.GetAccount(), account.ID)
 }
 
@@ -56,7 +55,7 @@ func (s *Server) quotaOut(ctx context.Context, handle, account string) (*identit
 }
 
 func quotaPB(account, handle string, q store.Quota) *identitypb.Quota {
-	return &identitypb.Quota{AccountId: account, Account: handle, Concurrent: int32(q.Concurrent), Minutes: q.Minutes, Weight: int32(q.Weight),
+	return &identitypb.Quota{AccountId: account, Account: handle, Concurrent: int32(q.Concurrent), Minutes: q.Minutes,
 		Default: q.Default}
 }
 

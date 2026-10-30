@@ -10,30 +10,14 @@ import (
 	"github.com/Cidan/ok/internal/automation/store"
 )
 
-// Admission and fair share (docs/hosted.md, "Hosted automation, as built"): a run's account is its
+// Dispatch and admission (docs/hosted.md, "Hosted automation, as built"): a run's account is its
 // repository's owner (repository_owner), "" for one the directory has not named.
 
-// claimable are the queued runs of a pool ($1) of repositories no move holds, each with its account.
+// claimable are the queued runs of a pool ($1) of repositories no move holds, each with its account:
+// the pool's demand.
 const claimable = `FROM run r LEFT JOIN repository_owner o ON o.repository_id = r.repository_id
 	WHERE r.status = 1 AND r.pool = $1
 		AND NOT EXISTS (SELECT 1 FROM move_gate g WHERE g.repository_id = r.repository_id AND g.move_state <> '')`
-
-func (x queries) QueuedHeads(ctx context.Context, pool string) ([]store.Head, error) {
-	rows, err := x.q.Query(ctx, `SELECT coalesce(o.account_id, ''), r.priority, min(r.queued_at) `+claimable+` GROUP BY 1, 2`, pool)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []store.Head
-	for rows.Next() {
-		var h store.Head
-		if err := rows.Scan(&h.Account, &h.Priority, &h.Oldest); err != nil {
-			return nil, err
-		}
-		out = append(out, h)
-	}
-	return out, rows.Err()
-}
 
 func (x queries) RunningByAccount(ctx context.Context, pool string) (map[string]store.Running, error) {
 	rows, err := x.q.Query(ctx, `SELECT coalesce(o.account_id, ''), count(*) FILTER (WHERE r.pool = $1), count(*)
@@ -72,16 +56,7 @@ func (x queries) MonthSeconds(ctx context.Context, month string, accounts []stri
 	return out, rows.Err()
 }
 
-func (x queries) ClaimCandidates(ctx context.Context, account, pool string, limit int) ([]store.Queued, error) {
-	rows, err := x.q.Query(ctx, `SELECT r.id, r.priority `+claimable+` AND coalesce(o.account_id, '') = $2
-		ORDER BY r.priority DESC, r.queued_at, r.id LIMIT $3`, pool, account, limit)
-	if err != nil {
-		return nil, err
-	}
-	return pgx.CollectRows(rows, pgx.RowToStructByPos[store.Queued])
-}
-
-func (x queries) ClaimRun(ctx context.Context, id int64, pool, worker string, ttl time.Duration, account string, slot int64, keyHash []byte) (*store.Run, error) {
+func (x queries) ClaimRun(ctx context.Context, id int64, job, pool, worker string, ttl time.Duration, account string, slot int64, keyHash, handle []byte) (*store.Run, error) {
 	var slotAccount *string
 	var slotN *int64
 	if slot >= 0 {
@@ -89,9 +64,9 @@ func (x queries) ClaimRun(ctx context.Context, id int64, pool, worker string, tt
 	}
 	r, err := scanRun(x.q.QueryRow(ctx, `UPDATE run
 		SET status = 2, worker = $3, lease_expires = now() + make_interval(secs => $4), started_at = now(), slot_account = $5, slot = $6,
-			lease_key_hash = $7
-		WHERE id = $1 AND status = 1 AND pool = $2
-		RETURNING `+runColumns, id, pool, worker, ttl.Seconds(), slotAccount, slotN, keyHash))
+			lease_key_hash = $7, lease_handle = $8
+		WHERE id = $1 AND status = 1 AND pool = $2 AND dispatch_job = $9
+		RETURNING `+runColumns, id, pool, worker, ttl.Seconds(), slotAccount, slotN, keyHash, handle, job))
 	if errors.Is(err, store.ErrNotFound) {
 		return nil, nil
 	}
@@ -200,4 +175,36 @@ func (x queries) RunningOnWorkers(ctx context.Context, pool string) (map[string]
 		out[w] = n
 	}
 	return out, rows.Err()
+}
+
+func (x queries) SetDispatchJobs(ctx context.Context, jobs map[int64]string) error {
+	if len(jobs) == 0 {
+		return nil
+	}
+	ids, names := make([]int64, 0, len(jobs)), make([]string, 0, len(jobs))
+	for id, job := range jobs {
+		ids, names = append(ids, id), append(names, job)
+	}
+	_, err := x.q.Exec(ctx, `UPDATE run SET dispatch_job = j.job FROM unnest($1::bigint[], $2::text[]) AS j(id, job)
+		WHERE run.id = j.id AND run.status = 1`, ids, names)
+	return err
+}
+
+func (x queries) QueuedRuns(ctx context.Context, repos []int64) ([]store.Queued, error) {
+	if len(repos) == 0 {
+		return nil, nil
+	}
+	rows, err := x.q.Query(ctx, `SELECT id, repository_id, pool FROM run WHERE repository_id = ANY($1) AND status = 1`, repos)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, pgx.RowToStructByPos[store.Queued])
+}
+
+func (x queries) UndispatchedRuns(ctx context.Context) ([]store.Queued, error) {
+	rows, err := x.q.Query(ctx, `SELECT id, repository_id, pool FROM run WHERE status = 1 AND dispatch_job IS NULL`)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, pgx.RowToStructByPos[store.Queued])
 }

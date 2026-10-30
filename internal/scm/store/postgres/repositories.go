@@ -11,6 +11,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/Cidan/ok/internal/data/pgdata"
 	"github.com/Cidan/ok/internal/scm/encoding"
 	"github.com/Cidan/ok/internal/scm/store/backend"
 )
@@ -113,6 +114,7 @@ type tableRows struct{ table, cond string }
 // repositoryTail are what DeleteRepositoryTail deletes of a repository ($1), in the order it
 // deletes them: children before their parents, which their foreign keys would delete with them.
 var repositoryTail = []tableRows{
+	{"compaction_cursor", "repository_id = $1"},
 	{"tree_sizes", "repository_id = $1"},
 	{"copy_parent", "repository_id = $1"},
 	{"event_pending", "repository_id = $1"},
@@ -180,21 +182,50 @@ func (x queries) DeleteNetworkTail(ctx context.Context, net backend.Network, lim
 	}, limit, net)
 }
 
-func (x queries) PendingDeletions(ctx context.Context, limit int) ([]backend.Deletion, error) {
-	rows, err := x.q.Query(ctx, `SELECT repository_id, network_id FROM repository_deletion ORDER BY deleted_at LIMIT $1`, limit)
-	if err != nil {
-		return nil, err
+func (x queries) PendingDeletion(ctx context.Context, repo int64) (backend.Deletion, bool, error) {
+	d := backend.Deletion{Repo: repo}
+	err := x.q.QueryRow(ctx, `SELECT network_id FROM repository_deletion WHERE repository_id = $1`, repo).Scan(&d.Net)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return backend.Deletion{}, false, nil
 	}
-	defer rows.Close()
-	var out []backend.Deletion
-	for rows.Next() {
-		var d backend.Deletion
-		if err := rows.Scan(&d.Repo, &d.Net); err != nil {
-			return nil, err
-		}
-		out = append(out, d)
+	return d, err == nil, err
+}
+
+func (x queries) RepositoryIDs(ctx context.Context, after int64, limit int) ([]int64, error) {
+	return int64s(x.q.Query(ctx, `SELECT id FROM repository WHERE id > $1 ORDER BY id LIMIT $2`, after, limit))
+}
+
+func (x queries) RetiredOf(ctx context.Context, net backend.Network) (packs, segments time.Time, err error) {
+	var p, s *time.Time
+	err = x.q.QueryRow(ctx, `SELECT (SELECT min(retired_at) FROM pack WHERE network_id = $1 AND retired_at IS NOT NULL),
+		(SELECT min(retired_at) FROM segment WHERE network_id = $1 AND retired_at IS NOT NULL)`, net).Scan(&p, &s)
+	if p != nil {
+		packs = *p
 	}
-	return out, rows.Err()
+	if s != nil {
+		segments = *s
+	}
+	return packs, segments, err
+}
+
+func (x queries) FollowCursors(ctx context.Context, topic string, keys []int64) (map[int64]int64, error) {
+	return pgdata.Cursors(ctx, x.q, topic, keys)
+}
+
+func (x queries) AddFollower(ctx context.Context, topic, name string) error {
+	return pgdata.AddFollower(ctx, x.q, topic, name)
+}
+
+func (x queries) Followers(ctx context.Context, topic string) ([]string, error) {
+	return pgdata.Followers(ctx, x.q, topic)
+}
+
+func (x queries) FollowCursor(ctx context.Context, topic string, key int64) (int64, error) {
+	return pgdata.Cursor(ctx, x.q, topic, key)
+}
+
+func (x queries) AdvanceFollowCursor(ctx context.Context, topic string, key, seq int64) error {
+	return pgdata.AdvanceCursor(ctx, x.q, topic, key, seq)
 }
 
 func (x queries) FinishDeletion(ctx context.Context, id int64) error {
@@ -329,6 +360,10 @@ func (x queries) InsertEvents(ctx context.Context, repo int64, evs []backend.Log
 		SELECT $1, u.seq, u.at, u.body FROM unnest($2::bigint[], $3::timestamptz[], $4::bytea[]) AS u(seq, at, body)`,
 		repo, seqs, ats, bodies)
 	return err
+}
+
+func (x queries) PendStep(_ context.Context, kind string, key int64, at time.Time, body []byte) error {
+	return pgdata.PendStep(x.q, kind, key, at, body)
 }
 
 func events(rows pgx.Rows, err error) ([]backend.Event, error) {
@@ -474,6 +509,35 @@ func (x queries) ContentLogSince(ctx context.Context, sc backend.Scope, since ba
 		out[i] = backend.ContentLog{Body: b}
 	}
 	return out, place, nil
+}
+
+// ContentLogCurrent is ContentLogSince, the day and the generation read in its statement: one
+// snapshot, which a write transaction under read committed takes afresh, holding no lock.
+func (x queries) ContentLogCurrent(ctx context.Context, sc backend.Scope, gen int64, since backend.LogPlace) (time.Time, bool, []backend.ContentLog, backend.LogPlace, error) {
+	scope, owner := scopeOf(sc)
+	var today time.Time
+	var current bool
+	var snap string
+	var own *string
+	var bodies [][]byte
+	err := x.q.QueryRow(ctx, `SELECT current_date,
+			coalesce((SELECT generation FROM content_index WHERE scope = $1 AND owner_id = $2) = $4, false),
+			pg_current_snapshot()::text, pg_current_xact_id_if_assigned()::text,
+			coalesce((SELECT array_agg(body ORDER BY stamp, id) FROM content_log WHERE scope = $1 AND owner_id = $2
+				AND ($3::text IS NULL OR (xid >= pg_snapshot_xmin($3::text::pg_snapshot) AND NOT pg_visible_in_snapshot(xid, $3::text::pg_snapshot)))),
+				'{}')`, scope, owner, snapshotText(since), gen).Scan(&today, &current, &snap, &own, &bodies)
+	if err != nil || !current {
+		return today, false, nil, nil, err
+	}
+	place, err := readerPlace(snap, own)
+	if err != nil {
+		return today, false, nil, nil, err
+	}
+	out := make([]backend.ContentLog, len(bodies))
+	for i, b := range bodies {
+		out[i] = backend.ContentLog{Body: b}
+	}
+	return today, true, out, place, nil
 }
 
 // readerPlace is a snapshot as the place of the transaction that took it: with its own ID among
@@ -658,14 +722,6 @@ func (x queries) RetirePacks(ctx context.Context, net backend.Network, packIDs [
 	var bytes int64
 	err := x.q.QueryRow(ctx, stmt, net, ids(packIDs)).Scan(&n, &bytes)
 	return n, bytes, err
-}
-
-func (x queries) RepositoriesRetiringBefore(ctx context.Context, packs, segments time.Time) ([]int64, error) {
-	// A network's are its first repository's to delete.
-	return int64s(x.q.Query(ctx, `SELECT m FROM (SELECT (SELECT min(r.id) FROM repository r WHERE r.network_id = n.id) AS m FROM network n
-			WHERE EXISTS (SELECT 1 FROM pack p WHERE p.network_id = n.id AND p.retired_at < $1)
-			   OR EXISTS (SELECT 1 FROM segment g WHERE g.network_id = n.id AND g.retired_at < $2)) t
-		WHERE m IS NOT NULL ORDER BY 1`, packs, segments))
 }
 
 func (x queries) RetiredPacksBefore(ctx context.Context, t time.Time, net *backend.Network) ([]backend.RetiredPack, error) {

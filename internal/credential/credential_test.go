@@ -1,6 +1,7 @@
 package credential
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -39,10 +40,10 @@ func newCA(t *testing.T) *testCA {
 	return &testCA{cert: cert, key: key}
 }
 
-func (ca *testCA) pool() *x509.CertPool {
+func (ca *testCA) pool(context.Context) (*x509.CertPool, error) {
 	p := x509.NewCertPool()
 	p.AddCert(ca.cert)
-	return p
+	return p, nil
 }
 
 func (ca *testCA) issue(t *testing.T, principal string, pub *ecdsa.PublicKey, from, to time.Time, usage x509.ExtKeyUsage) []byte {
@@ -76,7 +77,7 @@ func TestProveAndVerify(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := v.Verify("/ok.scm.v1.Store/Read", der, proof)
+	got, err := v.Verify(context.Background(), "/ok.scm.v1.Store/Read", der, proof)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,29 +85,29 @@ func TestProveAndVerify(t *testing.T) {
 		t.Errorf("verified %+v", got)
 	}
 	// A proof is good once.
-	if _, err := v.Verify("/ok.scm.v1.Store/Read", der, proof); !errors.Is(err, ErrReplay) {
+	if _, err := v.Verify(context.Background(), "/ok.scm.v1.Store/Read", der, proof); !errors.Is(err, ErrReplay) {
 		t.Errorf("a replayed proof: %v", err)
 	}
 	// A proof is for its method alone.
 	proof, _ = Prove(key, "/ok.scm.v1.Store/Read", now)
-	if _, err := v.Verify("/ok.scm.v1.Landing/Land", der, proof); !errors.Is(err, ErrProof) {
+	if _, err := v.Verify(context.Background(), "/ok.scm.v1.Landing/Land", der, proof); !errors.Is(err, ErrProof) {
 		t.Errorf("a proof for another method: %v", err)
 	}
 	// Signed by another key, it proves nothing.
 	other, _ := NewKey()
 	proof, _ = Prove(other, "/ok.scm.v1.Store/Read", now)
-	if _, err := v.Verify("/ok.scm.v1.Store/Read", der, proof); !errors.Is(err, ErrProof) {
+	if _, err := v.Verify(context.Background(), "/ok.scm.v1.Store/Read", der, proof); !errors.Is(err, ErrProof) {
 		t.Errorf("a proof by another key: %v", err)
 	}
 	// Too old, or from the future.
 	for _, at := range []time.Time{now.Add(-Skew - time.Minute), now.Add(Skew + time.Minute)} {
 		proof, _ = Prove(key, "/m", at)
-		if _, err := v.Verify("/m", der, proof); !errors.Is(err, ErrProof) {
+		if _, err := v.Verify(context.Background(), "/m", der, proof); !errors.Is(err, ErrProof) {
 			t.Errorf("a proof at %v: %v", at.Sub(now), err)
 		}
 	}
 	for _, bad := range []string{"", "v2.1.2.3", "v1.x.y.z", "v1.1.short.sig"} {
-		if _, err := v.Verify("/m", der, bad); !errors.Is(err, ErrProof) {
+		if _, err := v.Verify(context.Background(), "/m", der, bad); !errors.Is(err, ErrProof) {
 			t.Errorf("proof %q: %v", bad, err)
 		}
 	}
@@ -127,7 +128,7 @@ func TestVerifyRefusesCertificates(t *testing.T) {
 	}
 	for name, der := range cases {
 		proof, _ := Prove(key, "/m", now)
-		if _, err := v.Verify("/m", der, proof); !errors.Is(err, ErrCertificate) {
+		if _, err := v.Verify(context.Background(), "/m", der, proof); !errors.Is(err, ErrCertificate) {
 			t.Errorf("%s: %v", name, err)
 		}
 	}
@@ -139,13 +140,19 @@ func TestVerifyWithoutRoots(t *testing.T) {
 	key, _ := NewKey()
 	now := time.Now()
 	der := ca.issue(t, "ada.human.example.com", &key.PublicKey, now.Add(-time.Minute), now.Add(time.Hour), x509.ExtKeyUsageClientAuth)
-	for name, roots := range map[string]func() *x509.CertPool{
-		"no pool":    func() *x509.CertPool { return nil },
-		"empty pool": x509.NewCertPool,
+	for name, roots := range map[string]func(context.Context) (*x509.CertPool, error){
+		"no pool":    func(context.Context) (*x509.CertPool, error) { return nil, nil },
+		"empty pool": func(context.Context) (*x509.CertPool, error) { return x509.NewCertPool(), nil },
 	} {
 		proof, _ := Prove(key, "/m", now)
-		if _, err := NewVerifier(roots).Verify("/m", der, proof); !errors.Is(err, ErrCertificate) {
+		if _, err := NewVerifier(roots).Verify(context.Background(), "/m", der, proof); !errors.Is(err, ErrCertificate) {
 			t.Errorf("%s: %v", name, err)
 		}
+	}
+	// A CA whose certificates cannot be read now verifies nothing.
+	down := errors.New("identity is down")
+	proof, _ := Prove(key, "/m", now)
+	if _, err := NewVerifier(func(context.Context) (*x509.CertPool, error) { return nil, down }).Verify(context.Background(), "/m", der, proof); !errors.Is(err, down) {
+		t.Errorf("the CA unreadable: %v", err)
 	}
 }

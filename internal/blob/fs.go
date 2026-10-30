@@ -341,3 +341,66 @@ func (f *FS) Copy(ctx context.Context, src, dst string) (err error) {
 func (f *FS) SignGet(ctx context.Context, key string, ttl time.Duration) (string, error) {
 	return "", fmt.Errorf("blob: sign %s: %w", key, ErrUnsupported)
 }
+
+// Stage writes the object in the directory's temporary space, and Commit renames it into place,
+// as Put does; tmp is not needed.
+func (f *FS) Stage(ctx context.Context, tmp string) (Staged, error) {
+	t, err := os.CreateTemp(filepath.Join(f.root, tmpDir), "stage-*")
+	if err != nil {
+		return nil, f.wrap("stage", tmp, err)
+	}
+	return &fsStaged{f: f, tmp: t}, nil
+}
+
+type fsStaged struct {
+	f    *FS
+	tmp  *os.File
+	n    int64
+	done bool
+}
+
+func (s *fsStaged) Write(p []byte) (int, error) {
+	n, err := s.tmp.Write(p)
+	s.n += int64(n)
+	return n, err
+}
+
+func (s *fsStaged) Commit(ctx context.Context, key string) (err error) {
+	defer func(start time.Time) { observe(s.f.root, "put", start, s.n, err) }(time.Now())
+	if s.done {
+		return errors.New("blob: a staged object committed after it ended")
+	}
+	s.done = true
+	defer os.Remove(s.tmp.Name())
+	dst, err := s.f.file(key)
+	if err != nil {
+		s.tmp.Close()
+		return err
+	}
+	if err := s.tmp.Sync(); err != nil {
+		s.tmp.Close()
+		return s.f.wrap("put", key, err)
+	}
+	if err := s.tmp.Close(); err != nil {
+		return s.f.wrap("put", key, err)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := s.f.mkdirs(filepath.Dir(dst)); err != nil {
+		return s.f.wrap("put", key, err)
+	}
+	if err := os.Rename(s.tmp.Name(), dst); err != nil {
+		return s.f.wrap("put", key, err)
+	}
+	return wrapNil(s.f.wrap, "put", key, syncDir(filepath.Dir(dst)))
+}
+
+func (s *fsStaged) Abort() {
+	if s.done {
+		return
+	}
+	s.done = true
+	s.tmp.Close()
+	os.Remove(s.tmp.Name())
+}

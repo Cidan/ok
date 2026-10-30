@@ -1,6 +1,7 @@
 package queue
 
 import (
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -56,5 +57,31 @@ func TestPassPreparesOnce(t *testing.T) {
 	var none *pass
 	if _, err := none.prepare([]byte{1}, 12, 1, do); err != nil || calls.Load() != 5 {
 		t.Fatalf("outside a pass: %d, %v", calls.Load(), err)
+	}
+}
+
+// A step acts on the first Parallel submissions that have something to do, in the decision's order,
+// each its actions whole, and every note; the rest wait for the next step.
+func TestStepRound(t *testing.T) {
+	r := &Runner{cfg: Config{Parallel: 2}}
+	acts := []Action{
+		{Kind: Discard, Submission: 1, Attempt: 10}, {Kind: Create, Submission: 1}, {Kind: Note, Submission: 1, Reason: "planning post"},
+		{Kind: Note, Submission: 2, Reason: "testing"},
+		{Kind: Release, Submission: 3, Attempt: 30}, {Kind: Note, Submission: 3, Reason: "testing"},
+		{Kind: Create, Submission: 4}, {Kind: Note, Submission: 4, Reason: "planning post"},
+		{Kind: Fail, Submission: 5},
+	}
+	got, more := r.round(acts)
+	want := []Action{
+		{Kind: Discard, Submission: 1, Attempt: 10}, {Kind: Create, Submission: 1}, {Kind: Note, Submission: 1, Reason: "planning post"},
+		{Kind: Note, Submission: 2, Reason: "testing"},
+		{Kind: Release, Submission: 3, Attempt: 30}, {Kind: Note, Submission: 3, Reason: "testing"},
+		{Kind: Note, Submission: 4, Reason: "planning post"},
+	}
+	if !more || !reflect.DeepEqual(got, want) {
+		t.Fatalf("a round of 2: %v, more %v\nwant %v, more", actions(got), more, actions(want))
+	}
+	if got, more := (&Runner{cfg: Config{Parallel: 5}}).round(acts); more || len(got) != len(acts) {
+		t.Fatalf("a round of 5, as many as there are: %d of %d actions, more %v", len(got), len(acts), more)
 	}
 }

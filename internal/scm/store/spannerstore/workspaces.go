@@ -108,11 +108,6 @@ func (x queries) DeleteDictionary(ctx context.Context, net backend.Network, id i
 const dueForGC = `NOT EXISTS (SELECT 1 FROM gc_pass g WHERE g.repository_id = r.repository_id AND g.started_at >= @scheduled AND g.error IS NULL)
 	AND NOT EXISTS (SELECT 1 FROM gc_pass g WHERE g.repository_id = r.repository_id AND g.error IS NOT NULL AND g.started_at > @retry)`
 
-func (x queries) DueForGC(ctx context.Context, scheduled, retry time.Time) ([]int64, error) {
-	return x.int64s(ctx, `SELECT r.repository_id FROM repository r WHERE `+dueForGC+` ORDER BY r.repository_id`,
-		map[string]any{"scheduled": scheduled, "retry": retry})
-}
-
 func (x queries) RepositoryDueForGC(ctx context.Context, repo int64, scheduled, retry time.Time) (bool, error) {
 	var due bool
 	_, err := x.one(ctx, `SELECT EXISTS (SELECT 1 FROM repository r WHERE r.repository_id = @repo AND `+dueForGC+`)`,
@@ -128,52 +123,6 @@ func (x queries) MarkWork(ctx context.Context, kind string, key int64) error {
 
 func (x queries) MarkWorkAt(ctx context.Context, kind string, key int64, at time.Time) error {
 	return x.write(ctx, func(tx *spanner.ReadWriteTransaction) error { return spannerdata.MarkWorkAt(ctx, tx, kind, key, at) })
-}
-
-func (x queries) TakeWork(ctx context.Context, kind string, key int64, holder string, ttl time.Duration) (bool, error) {
-	var ok bool
-	err := x.write(ctx, func(tx *spanner.ReadWriteTransaction) error {
-		var err error
-		ok, err = spannerdata.TakeWork(ctx, tx, kind, key, holder, ttl)
-		return err
-	})
-	return ok, err
-}
-
-func (x queries) RenewWork(ctx context.Context, kind string, key int64, holder string, ttl time.Duration) (bool, error) {
-	var ok bool
-	err := x.write(ctx, func(tx *spanner.ReadWriteTransaction) error {
-		var err error
-		ok, err = spannerdata.RenewWork(ctx, tx, kind, key, holder, ttl)
-		return err
-	})
-	return ok, err
-}
-
-func (x queries) ReleaseWork(ctx context.Context, kind string, key int64, holder string) (bool, error) {
-	var again bool
-	err := x.write(ctx, func(tx *spanner.ReadWriteTransaction) error {
-		var err error
-		again, err = spannerdata.ReleaseWork(ctx, tx, kind, key, holder)
-		return err
-	})
-	return again, err
-}
-
-func (x queries) LetWork(ctx context.Context, kind string, key int64, holder string) error {
-	return x.write(ctx, func(tx *spanner.ReadWriteTransaction) error {
-		return spannerdata.LetWork(ctx, tx, kind, key, holder)
-	})
-}
-
-func (x queries) DueWork(ctx context.Context, kind string, limit int) ([]int64, error) {
-	var out []int64
-	err := x.read(func(r spannerdata.Reader) error {
-		var err error
-		out, err = spannerdata.DueWork(ctx, r, kind, limit)
-		return err
-	})
-	return out, err
 }
 
 func (x queries) InsertGCPass(ctx context.Context, p backend.GCPass) error {

@@ -12,7 +12,7 @@ import (
 	"github.com/Cidan/ok/internal/workflow"
 )
 
-// Admission and fair share (docs/hosted.md, "Hosted automation, as built"): a run's account is its
+// Dispatch and admission (docs/hosted.md, "Hosted automation, as built"): a run's account is its
 // repository's owner (repository_owner), "" for one the directory has not named.
 
 // poolOf is a pool's name as a run records it.
@@ -24,29 +24,10 @@ func poolOf(p string) string {
 }
 
 // claimable are the queued runs of a pool (@pool) of repositories no move holds, each with its
-// account.
+// account: the pool's demand.
 const claimable = `FROM run r LEFT JOIN repository_owner o ON o.repository_id = r.repository_id
 	WHERE r.status = 1 AND r.pool = @pool
 		AND NOT EXISTS (SELECT 1 FROM move_gate g WHERE g.repository_id = r.repository_id AND g.move_state != '')`
-
-func (x queries) QueuedHeads(ctx context.Context, pool string) ([]store.Head, error) {
-	var out []store.Head
-	err := x.Read(func(r spannerdata.Reader) error {
-		out = nil
-		return spannerdata.Each(ctx, r, `SELECT IFNULL(o.account_id, ''), r.priority, MIN(r.queued_at) `+claimable+`
-			GROUP BY IFNULL(o.account_id, ''), r.priority`, map[string]any{"pool": pool}, func(row *spanner.Row) error {
-			var h store.Head
-			var p int64
-			if err := row.Columns(&h.Account, &p, &h.Oldest); err != nil {
-				return err
-			}
-			h.Priority = int16(p)
-			out = append(out, h)
-			return nil
-		})
-	})
-	return out, err
-}
 
 func (x queries) RunningByAccount(ctx context.Context, pool string) (map[string]store.Running, error) {
 	out := map[string]store.Running{}
@@ -88,25 +69,7 @@ func (x queries) MonthSeconds(ctx context.Context, month string, accounts []stri
 	return out, err
 }
 
-func (x queries) ClaimCandidates(ctx context.Context, account, pool string, limit int) ([]store.Queued, error) {
-	var out []store.Queued
-	err := x.Read(func(r spannerdata.Reader) error {
-		out = nil
-		return spannerdata.Each(ctx, r, `SELECT r.run_id, r.priority `+claimable+` AND IFNULL(o.account_id, '') = @account
-			ORDER BY r.priority DESC, r.queued_at, r.run_id LIMIT @limit`, map[string]any{"pool": pool, "account": account, "limit": int64(limit)},
-			func(row *spanner.Row) error {
-				var id, p int64
-				if err := row.Columns(&id, &p); err != nil {
-					return err
-				}
-				out = append(out, store.Queued{ID: id, Priority: int16(p)})
-				return nil
-			})
-	})
-	return out, err
-}
-
-func (x queries) ClaimRun(ctx context.Context, id int64, pool, worker string, ttl time.Duration, account string, slot int64, keyHash []byte) (*store.Run, error) {
+func (x queries) ClaimRun(ctx context.Context, id int64, job, pool, worker string, ttl time.Duration, account string, slot int64, keyHash, handle []byte) (*store.Run, error) {
 	var out *store.Run
 	err := x.Write(ctx, func(tx *spanner.ReadWriteTransaction) error {
 		out = nil
@@ -116,9 +79,10 @@ func (x queries) ClaimRun(ctx context.Context, id int64, pool, worker string, tt
 		}
 		n, err := spannerdata.Update(ctx, tx, `UPDATE run SET status = 2, worker = @worker,
 				lease_expires = TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL @ttl MICROSECOND), started_at = CURRENT_TIMESTAMP(),
-				slot_account = @slot_account, slot = @slot, lease_key_hash = @key_hash
-			WHERE run_id = @id AND status = 1 AND pool = @pool`,
-			map[string]any{"id": id, "pool": pool, "worker": worker, "ttl": micros(ttl), "slot_account": slotAccount, "slot": slotN, "key_hash": keyHash})
+				slot_account = @slot_account, slot = @slot, lease_key_hash = @key_hash, lease_handle = @handle
+			WHERE run_id = @id AND status = 1 AND pool = @pool AND dispatch_job = @job`,
+			map[string]any{"id": id, "job": job, "pool": pool, "worker": worker, "ttl": micros(ttl), "slot_account": slotAccount, "slot": slotN,
+				"key_hash": keyHash, "handle": handle})
 		if err != nil || n == 0 {
 			return err
 		}
@@ -294,6 +258,58 @@ func (x queries) RunningOnWorkers(ctx context.Context, pool string) (map[string]
 					return err
 				}
 				out[w] = n
+				return nil
+			})
+	})
+	return out, err
+}
+
+func (x queries) SetDispatchJobs(ctx context.Context, jobs map[int64]string) error {
+	if len(jobs) == 0 {
+		return nil
+	}
+	return x.Write(ctx, func(tx *spanner.ReadWriteTransaction) error {
+		for id, job := range jobs {
+			if _, err := spannerdata.Update(ctx, tx, `UPDATE run SET dispatch_job = @job WHERE run_id = @id AND status = @queued`,
+				map[string]any{"id": id, "job": job, "queued": int64(store.StatusQueued)}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func (x queries) QueuedRuns(ctx context.Context, repos []int64) ([]store.Queued, error) {
+	if len(repos) == 0 {
+		return nil, nil
+	}
+	var out []store.Queued
+	err := x.Read(func(r spannerdata.Reader) error {
+		out = nil
+		return spannerdata.Each(ctx, r, `SELECT run_id, repository_id, pool FROM run WHERE repository_id IN UNNEST(@repos) AND status = @queued`,
+			map[string]any{"repos": repos, "queued": int64(store.StatusQueued)}, func(row *spanner.Row) error {
+				var q store.Queued
+				if err := row.Columns(&q.ID, &q.RepositoryID, &q.Pool); err != nil {
+					return err
+				}
+				out = append(out, q)
+				return nil
+			})
+	})
+	return out, err
+}
+
+func (x queries) UndispatchedRuns(ctx context.Context) ([]store.Queued, error) {
+	var out []store.Queued
+	err := x.Read(func(r spannerdata.Reader) error {
+		out = nil
+		return spannerdata.Each(ctx, r, `SELECT run_id, repository_id, pool FROM run WHERE status = @queued AND dispatch_job IS NULL`,
+			map[string]any{"queued": int64(store.StatusQueued)}, func(row *spanner.Row) error {
+				var q store.Queued
+				if err := row.Columns(&q.ID, &q.RepositoryID, &q.Pool); err != nil {
+					return err
+				}
+				out = append(out, q)
 				return nil
 			})
 	})

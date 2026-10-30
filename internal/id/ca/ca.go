@@ -7,6 +7,8 @@
 package ca
 
 import (
+	"bytes"
+	"context"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -42,6 +44,12 @@ type CA struct {
 
 	mu      sync.Mutex
 	failing string // why the files last could not be read; "" while they can
+	// pool is the pool the certificate files last read held, by their bytes: what a file holds is
+	// read at each verification, and parsed again only when it holds other bytes.
+	pool struct {
+		crt, trusted []byte
+		p            *x509.CertPool
+	}
 }
 
 // Load returns the CA in dir, checking its certificate and key are there, match, and may sign.
@@ -76,18 +84,40 @@ func (c *CA) current() (*x509.Certificate, crypto.Signer, error) {
 // Roots are the CA certificates credentials verify against: the current one, then those
 // trusted.crt keeps.
 func (c *CA) Roots() ([]*x509.Certificate, error) {
-	cur, _, err := c.current()
+	crt, trusted, err := c.rootFiles()
 	if err != nil {
 		return nil, err
+	}
+	return parseRoots(crt, trusted)
+}
+
+// rootFiles reads the files the CA's roots are in: its certificate, and trusted.crt (nil for
+// none). Verifying needs no key, which issuing reads (current).
+func (c *CA) rootFiles() (crt, trusted []byte, err error) {
+	if crt, err = os.ReadFile(filepath.Join(c.dir, "tls.crt")); err != nil {
+		return nil, nil, fmt.Errorf("the identity CA: %w", err)
+	}
+	trusted, err = os.ReadFile(filepath.Join(c.dir, "trusted.crt"))
+	if errors.Is(err, os.ErrNotExist) {
+		return crt, nil, nil
+	}
+	return crt, trusted, err
+}
+
+// parseRoots parses the CA's certificate — one that may sign certificates — and trusted.crt's.
+func parseRoots(crt, data []byte) ([]*x509.Certificate, error) {
+	block, _ := pem.Decode(crt)
+	if block == nil || block.Type != "CERTIFICATE" {
+		return nil, errors.New("the identity CA's certificate is no PEM certificate")
+	}
+	cur, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("the identity CA's certificate: %w", err)
+	}
+	if !cur.IsCA || cur.KeyUsage&x509.KeyUsageCertSign == 0 {
+		return nil, errors.New("the identity CA's certificate may not sign certificates")
 	}
 	out := []*x509.Certificate{cur}
-	data, err := os.ReadFile(filepath.Join(c.dir, "trusted.crt"))
-	if errors.Is(err, os.ErrNotExist) {
-		return out, nil
-	}
-	if err != nil {
-		return nil, err
-	}
 	for len(data) > 0 {
 		var block *pem.Block
 		block, data = pem.Decode(data)
@@ -108,22 +138,45 @@ func (c *CA) Roots() ([]*x509.Certificate, error) {
 	return out, nil
 }
 
-// Pool is Roots as a pool, for a credential.Verifier; it is empty when the CA cannot be read, so
-// every credential is refused — which it logs, once for each reason it cannot, and again when it
-// can.
-func (c *CA) Pool() *x509.CertPool {
-	p := x509.NewCertPool()
-	roots, err := c.Roots()
-	c.note(err)
-	for _, r := range roots {
-		p.AddCert(r)
+// Pool is Roots as a pool, its files read each time, for a credential.Verifier; an error when the
+// CA cannot be read, so every credential is refused — which it logs, once for each reason it
+// cannot, and again when it can. Files holding the bytes they held before are not parsed again: a
+// rotation's new certificate is trusted, and a removed one not, at the next verification.
+func (c *CA) Pool(context.Context) (*x509.CertPool, error) {
+	crt, trusted, err := c.rootFiles()
+	if err == nil {
+		c.mu.Lock()
+		p := c.pool
+		c.mu.Unlock()
+		if p.p != nil && bytes.Equal(p.crt, crt) && bytes.Equal(p.trusted, trusted) {
+			return p.p, nil
+		}
 	}
-	return p
+	var roots []*x509.Certificate
+	if err == nil {
+		roots, err = parseRoots(crt, trusted)
+	}
+	c.note(err)
+	if err != nil {
+		return nil, err
+	}
+	pool := x509.NewCertPool()
+	for _, r := range roots {
+		pool.AddCert(r)
+	}
+	c.mu.Lock()
+	c.pool.crt, c.pool.trusted, c.pool.p = crt, trusted, pool
+	c.mu.Unlock()
+	return pool, nil
 }
 
-// Readable reports whether the CA's files can be read: identity is not ready while they cannot.
+// Readable reports whether the CA's files can be read, its key among them: identity is not ready
+// while they cannot.
 func (c *CA) Readable() error {
-	_, err := c.Roots()
+	_, _, err := c.current()
+	if err == nil {
+		_, err = c.Roots()
+	}
 	c.note(err)
 	return err
 }

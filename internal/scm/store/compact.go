@@ -1,14 +1,15 @@
 package store
 
 import (
+	"cmp"
 	"context"
 	"fmt"
-	"io"
-	"os"
-	"path/filepath"
+	"slices"
 	"sort"
+	"sync/atomic"
 
 	"github.com/klauspost/compress/zstd"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/Cidan/ok/internal/scm/contentindex"
 	"github.com/Cidan/ok/internal/scm/encoding"
@@ -216,11 +217,17 @@ func (s *Store) compact(ctx context.Context, repo int64, opts GCOptions, r *GCRe
 		outputs = append(outputs, cur)
 	}
 	sourceIDs := make([]encoding.ID, len(chosen))
+	sizes := make(map[encoding.ID]int64, len(chosen))
 	for i, p := range chosen {
 		sourceIDs[i] = p.id
-		r.BytesRead += p.size
+		sizes[p.id] = p.size
 	}
 	if opts.DryRun {
+		for _, o := range outputs {
+			for _, c := range o {
+				r.BytesRead += int64(c.loc.StoredLength)
+			}
+		}
 		r.PacksWritten += len(outputs)
 		r.PacksRetired += len(chosen)
 		var in, out int64
@@ -237,34 +244,9 @@ func (s *Store) compact(ctx context.Context, repo int64, opts GCOptions, r *GCRe
 		return nil
 	}
 
-	dir, err := os.MkdirTemp("", "ok scm-compact-*")
-	if err != nil {
-		return err
-	}
-	defer os.RemoveAll(dir)
-	sourceFiles := map[encoding.ID]*os.File{}
-	defer func() {
-		for _, f := range sourceFiles {
-			f.Close()
-		}
-	}()
-	for _, p := range chosen {
-		f, err := os.Create(filepath.Join(dir, "source-"+p.id.String()))
-		if err != nil {
-			return err
-		}
-		sourceFiles[p.id] = f
-		size, err := s.blobs.Download(ctx, packKey(net, p.id), f)
-		if err != nil {
-			return fmt.Errorf("pack %s: %w", p.id, err)
-		}
-		if size != p.size {
-			return fmt.Errorf("pack %s: %d bytes stored, row says %d", p.id, size, p.size)
-		}
-	}
 	var written int64
-	for i, out := range outputs {
-		size, err := s.writeCompacted(ctx, net, dir, i, out, sourceFiles, enc, dictRow, r)
+	for _, out := range outputs {
+		size, err := s.writeCompacted(ctx, net, out, sizes, enc, dictRow, r)
 		if err != nil {
 			return err
 		}
@@ -381,54 +363,62 @@ func (s *Store) mainPaths(ctx context.Context, repo int64) (map[encoding.ID]stri
 	return out, err
 }
 
-// writeCompacted writes one compacted pack, uploads it, and in one transaction moves the
-// chunks it holds — each only if the index still has it where compaction read it, with its
-// codec and stored length as written. A small chunk not yet
-// compressed with the repository's dictionary is, with enc, if that shrinks it. A pack written
-// with enc records dictRow, the dictionary that considered its chunks. It returns the pack's
-// size.
-func (s *Store) writeCompacted(ctx context.Context, net backend.Network, dir string, n int, chunks []compactChunk, sources map[encoding.ID]*os.File, enc *zstd.Encoder, dictRow int64, r *GCReport) (int64, error) {
-	f, err := os.Create(filepath.Join(dir, fmt.Sprintf("out-%d", n)))
+// compactWindow bounds the source bytes compaction holds at once: the records of an output it reads
+// together, through the read path's range reads (readLimits).
+const compactWindow = 32 << 20
+
+// writeCompacted writes one output pack of chunks, read from their source packs (of sizes) a window
+// at a time, to the bucket as it is written, and records it.
+func (s *Store) writeCompacted(ctx context.Context, net backend.Network, chunks []compactChunk, sizes map[encoding.ID]int64, enc *zstd.Encoder, dictRow int64, r *GCReport) (int64, error) {
+	st, err := s.blobs.Stage(ctx, staging(packPrefix(net)))
 	if err != nil {
 		return 0, err
 	}
-	defer f.Close()
-	pw := pack.NewWriter(f)
+	defer st.Abort()
+	pw := pack.NewWriter(st)
 	locs := make([]pack.Location, len(chunks))
-	for i, c := range chunks {
-		stored := make([]byte, c.loc.StoredLength)
-		if _, err := sources[c.pack].ReadAt(stored, c.loc.DataOffset()); err != nil {
-			return 0, fmt.Errorf("pack %s: %s %s: %w", c.pack, c.kind, c.id, err)
+	for start := 0; start < len(chunks); {
+		end, window := start, int64(0)
+		for end < len(chunks) && (end == start || window+int64(chunks[end].loc.StoredLength) <= compactWindow) {
+			window += int64(chunks[end].loc.StoredLength)
+			end++
 		}
-		codec := c.loc.Codec
-		if enc != nil && c.kind == encoding.KindChunk && codec != pack.ZstdDict && c.loc.RawLength <= DictionaryChunkMax {
-			raw, err := pack.Decode(s.dicts.of(net), c.id, codec, c.loc.RawLength, stored)
-			if err != nil {
-				return 0, fmt.Errorf("pack %s: %w", c.pack, err)
-			}
-			if z := enc.EncodeAll(raw, nil); len(z) < len(stored) {
-				r.ChunksRecompressed++
-				r.BytesRecompressed += int64(len(stored) - len(z))
-				dictionaryChunks.With("compressed").Inc()
-				codec, stored = pack.ZstdDict, z
-			} else {
-				dictionaryChunks.With("not_smaller").Inc()
-			}
-		}
-		loc, err := pw.AddStored(s.dicts.of(net), c.kind, c.id, codec, c.loc.RawLength, stored)
+		stored, read, err := s.readCompactSources(ctx, net, chunks[start:end], sizes)
 		if err != nil {
-			return 0, fmt.Errorf("pack %s: %s %s: %w", c.pack, c.kind, c.id, err)
+			return 0, err
 		}
-		locs[i] = loc
+		r.BytesRead += read
+		for i := start; i < end; i++ {
+			c := chunks[i]
+			data := stored[i-start]
+			codec := c.loc.Codec
+			if enc != nil && c.kind == encoding.KindChunk && codec != pack.ZstdDict && c.loc.RawLength <= DictionaryChunkMax {
+				raw, err := pack.Decode(s.dicts.of(net), c.id, codec, c.loc.RawLength, data)
+				if err != nil {
+					return 0, fmt.Errorf("pack %s: %w", c.pack, err)
+				}
+				if z := enc.EncodeAll(raw, nil); len(z) < len(data) {
+					r.ChunksRecompressed++
+					r.BytesRecompressed += int64(len(data) - len(z))
+					dictionaryChunks.With("compressed").Inc()
+					codec, data = pack.ZstdDict, z
+				} else {
+					dictionaryChunks.With("not_smaller").Inc()
+				}
+			}
+			loc, err := pw.AddStored(s.dicts.of(net), c.kind, c.id, codec, c.loc.RawLength, data)
+			if err != nil {
+				return 0, fmt.Errorf("pack %s: %s %s: %w", c.pack, c.kind, c.id, err)
+			}
+			locs[i] = loc
+		}
+		start = end
 	}
 	packID, size, err := pw.Close()
 	if err != nil {
 		return 0, err
 	}
-	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		return 0, err
-	}
-	if err := s.blobs.Put(ctx, packKey(net, packID), f, size); err != nil {
+	if err := st.Commit(ctx, packKey(net, packID)); err != nil {
 		return 0, err
 	}
 
@@ -436,7 +426,7 @@ func (s *Store) writeCompacted(ctx context.Context, net backend.Network, dir str
 	err = s.inTx(ctx, func(ctx context.Context, tx *txn) error {
 		// No transaction changes the index while this one moves chunks in it, and the index
 		// read after the lock holds every change before.
-		if _, _, err := tx.LockContentIndex(ctx, backend.NetworkScope(net)); err != nil {
+		if _, _, err := tx.lockIndex(ctx, backend.NetworkScope(net)); err != nil {
 			return err
 		}
 		lg, err := s.txIndex(ctx, tx, backend.NetworkScope(net))
@@ -530,4 +520,65 @@ func (s *Store) retireDrained(ctx context.Context, net backend.Network, packIDs 
 		return err
 	})
 	return n, bytes, err
+}
+
+// readCompactSources reads chunks' stored bytes from their source packs (of sizes), in their order:
+// records close together in a source read with one range GET, as the read path reads them, and up
+// to fetchesAtOnce GETs at once. It returns the bytes it fetched too.
+func (s *Store) readCompactSources(ctx context.Context, net backend.Network, chunks []compactChunk, sizes map[encoding.ID]int64) ([][]byte, int64, error) {
+	type item struct {
+		i   int
+		off int64
+		n   int64
+	}
+	byPack := map[encoding.ID][]item{}
+	for i, c := range chunks {
+		byPack[c.pack] = append(byPack[c.pack], item{i, c.loc.DataOffset(), int64(c.loc.StoredLength)})
+	}
+	type rangeRead struct {
+		pack  encoding.ID
+		items []item
+	}
+	var reads []rangeRead
+	for p, items := range byPack {
+		slices.SortFunc(items, func(a, b item) int { return cmp.Compare(a.off, b.off) })
+		for start := 0; start < len(items); {
+			end := start + 1
+			for end < len(items) {
+				prev, next := items[end-1], items[end]
+				if next.off-(prev.off+prev.n) > s.reads.mergeGap || next.off+next.n-items[start].off > s.reads.maxSpan {
+					break
+				}
+				end++
+			}
+			reads = append(reads, rangeRead{p, items[start:end]})
+			start = end
+		}
+	}
+	out := make([][]byte, len(chunks))
+	var read atomic.Int64
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(s.reads.fetchesAtOnce)
+	for _, rr := range reads {
+		g.Go(func() error {
+			first, last := rr.items[0], rr.items[len(rr.items)-1]
+			end := last.off + last.n
+			if size, ok := sizes[rr.pack]; ok && end > size {
+				return fmt.Errorf("pack %s: a record at %d past its %d bytes", rr.pack, end, size)
+			}
+			data, err := s.blobs.GetRange(gctx, packKey(net, rr.pack), first.off, end-first.off)
+			if err != nil {
+				return fmt.Errorf("pack %s: %w", rr.pack, err)
+			}
+			read.Add(int64(len(data)))
+			for _, it := range rr.items {
+				out[it.i] = data[it.off-first.off : it.off-first.off+it.n]
+			}
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, 0, err
+	}
+	return out, read.Load(), nil
 }

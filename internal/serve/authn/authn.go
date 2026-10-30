@@ -11,7 +11,7 @@
 //   - a browser session's cookie.
 //
 // Each is checked against the directory — the principal active, the credential not revoked, the
-// session alive — and the answers are cached briefly. A request no method attributes has no caller,
+// session alive — for every request: no replica keeps what the directory said (docs/state.md). A request no method attributes has no caller,
 // and only a service open to anyone takes it. The directory not answering fails the request.
 package authn
 
@@ -31,6 +31,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
@@ -39,6 +40,7 @@ import (
 
 	"github.com/Cidan/ok/internal/authz"
 	"github.com/Cidan/ok/internal/credential"
+	"github.com/Cidan/ok/internal/serve/inproc"
 	okpb "github.com/Cidan/ok/proto/ok/v1"
 )
 
@@ -47,6 +49,9 @@ const (
 	DevPrincipalKey  = "ok-dev-principal"
 	authorizationKey = "authorization"
 	cookieKey        = "cookie"
+	// InProcessKey names the role's robot a call from within the process is (Config.InProcess):
+	// refused from anywhere else.
+	InProcessKey = "ok-inprocess-robot"
 )
 
 // SessionCookie is the cookie a browser session is kept in.
@@ -64,6 +69,8 @@ const (
 	// its installation (Caller.Token).
 	ViaInstallationToken = "installation-token"
 	ViaSession           = "session"
+	// ViaInProcess is one of ok's roles calling another in the same process (ok serve).
+	ViaInProcess = "inprocess"
 )
 
 // Caller is the principal a request is for.
@@ -162,64 +169,48 @@ type Config struct {
 	Dev bool
 	// Roles are the robots ok's roles run as.
 	Roles Roles
+	// InProcess are the principals of ok's roles' robots, by name, which a call from within the
+	// process (inproc.Listener) names itself as (InProcessKey): it reached a listener only the
+	// process's own code can, so it is that role, as the process is — no credential is checked
+	// against the directory, and nothing reaches the directory to answer it. A role's robot's ID
+	// never changes; the process learns its robots as it starts, as it reads its configuration.
+	InProcess map[string]Principal
 }
 
-// Directory answers are cached: a principal or credential that stops standing stops resolving
-// within PositiveTTL, and one that starts within NegativeTTL.
-const (
-	PositiveTTL   = 30 * time.Second
-	NegativeTTL   = 5 * time.Second
-	LookupTimeout = 5 * time.Second
-)
+// LookupTimeout bounds a question to the directory.
+const LookupTimeout = 5 * time.Second
 
 type entry struct {
-	p       Principal
-	ok      bool
-	expires time.Time
+	p  Principal
+	ok bool
 }
 
 // Resolver resolves callers and enforces services' callers.
 type Resolver struct {
 	cfg   Config
-	now   func() time.Time
 	group singleflight.Group
-
-	mu    sync.Mutex
-	cache map[string]entry
 }
 
 // NewResolver returns a resolver over cfg.
-func NewResolver(cfg Config) *Resolver {
-	return &Resolver{cfg: cfg, now: time.Now, cache: map[string]entry{}}
-}
+func NewResolver(cfg Config) *Resolver { return &Resolver{cfg: cfg} }
 
-// lookup asks the directory, through the cache, under key.
+// lookup asks the directory under key, each time: what it says of a principal or a credential is
+// kept by no replica, so one that stops standing stops resolving at once (docs/state.md). Callers
+// that ask the same at once share the one question in flight.
 func (r *Resolver) lookup(ctx context.Context, key string, ask func(context.Context) (Principal, error)) (Principal, bool, error) {
-	r.mu.Lock()
-	e, hit := r.cache[key]
-	r.mu.Unlock()
-	if hit && r.now().Before(e.expires) {
-		return e.p, e.ok, nil
-	}
 	ch := r.group.DoChan(key, func() (any, error) {
 		lctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), LookupTimeout)
 		defer cancel()
 		p, err := ask(lctx)
-		var e entry
 		switch {
 		case errors.Is(err, ErrNotFound) || status.Code(err) == codes.NotFound:
-			e = entry{expires: r.now().Add(NegativeTTL)}
+			return entry{}, nil
 		case err != nil:
 			return nil, err
 		case p.Active && !p.Org:
-			e = entry{p: p, ok: true, expires: r.now().Add(PositiveTTL)}
-		default:
-			e = entry{expires: r.now().Add(NegativeTTL)}
+			return entry{p: p, ok: true}, nil
 		}
-		r.mu.Lock()
-		r.cache[key] = e
-		r.mu.Unlock()
-		return e, nil
+		return entry{}, nil
 	})
 	select {
 	case <-ctx.Done():
@@ -274,6 +265,16 @@ func (r *Resolver) Resolve(ctx context.Context, md metadata.MD, method string) (
 }
 
 func (r *Resolver) resolve(ctx context.Context, md metadata.MD, method string) (Caller, bool, error) {
+	if name := single(md, InProcessKey); name != "" {
+		if p, ok := peer.FromContext(ctx); !ok || !inproc.Is(p.Addr) {
+			return Caller{}, false, errUnauthenticated{"a role names itself only to its own process"}
+		}
+		p, ok := r.cfg.InProcess[name]
+		if !ok {
+			return Caller{}, false, errUnauthenticated{fmt.Sprintf("%s is no role of this process", name)}
+		}
+		return Caller{Principal: p.Name, ID: p.ID, Via: ViaInProcess}, true, nil
+	}
 	if name := single(md, DevPrincipalKey); name != "" {
 		if !r.cfg.Dev {
 			return Caller{}, false, errUnauthenticated{"a development principal is accepted only by a development server"}
@@ -289,7 +290,7 @@ func (r *Resolver) resolve(ctx context.Context, md metadata.MD, method string) (
 		if r.cfg.Credentials == nil || len(certs) != 1 {
 			return Caller{}, false, errUnauthenticated{"this server takes no device credential"}
 		}
-		v, err := r.cfg.Credentials.Verify(method, []byte(certs[0]), single(md, credential.ProofKey))
+		v, err := r.cfg.Credentials.Verify(ctx, method, []byte(certs[0]), single(md, credential.ProofKey))
 		if err != nil {
 			return Caller{}, false, errUnauthenticated{err.Error()}
 		}

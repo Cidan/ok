@@ -55,7 +55,7 @@ and what replaces it.
 | Immutable data in rows | `object`, `tree_sizes`, `commit`, `commit_parent`, `copy_parent`, `commit_path`, `index_block`, `operation`, `view`, `event` | Trillions of rows; the content index alone is a petabyte | Segments in object storage, a tail in the database ([Segments](#segments-an-lsm-per-repository)) |
 | One database | `internal/pgdb`: every role's schema in the installation's PostgreSQL | One machine's I/O and storage | A database per cell, behind interfaces, PostgreSQL or Spanner ([The data layer](#the-data-layer)) |
 | `LISTEN`/`NOTIFY` | 16 sites, automation's queue and every feed | PostgreSQL only; one connection per channel per replica | The stream and queue interfaces ([Events and the bus](#events-and-the-bus)) |
-| One run queue | `run_queued`: `FOR UPDATE SKIP LOCKED` over every queued run, one priority order | No fairness between tenants; one index every worker contends on | Admission per organization, dispatch queues per worker pool ([Scheduling](#scheduling-and-fairness)) |
+| One run queue | `run_queued`: `FOR UPDATE SKIP LOCKED` over every queued run, one priority order | One index every worker contends on; no tenant held to a quota | Quotas per organization, dispatch queues per worker pool on the bus ([Scheduling](#scheduling-and-fairness)) |
 | Logs in the database | `log_chunk`, moved to the bucket when a run finishes | A live run's every line is a row | Logs written to object storage as they stream ([Logs](#logs-secrets-and-caches)) |
 | Finder by `LIKE` | `ListRepositories`: `name LIKE '%k%'` with `OFFSET` over every repository | A scan of a million rows per keystroke | A search service ([ok control](#ok-control-at-scale)) |
 | Cross-repository indexes | `changelist_author`, `reviewer_principal` | "My CLs" spans every repository, so every shard | An inbox per principal ([ok control](#ok-control-at-scale)) |
@@ -331,11 +331,13 @@ token. The groups-and-ACLs tree is still the installation's: an organization's o
 repository it names, comes with the hosted presentation of names.
 
 **Purging, as built.** The SCM removes expired repositories — deleted more than 30 days ago, or
-still being made after an hour — on a work lease per repository (`server.Purge`, store.PurgeWork):
-its sweep asks ok identity which have expired (`Tenancy.ListExpiredRepositories`); for each, it asks
-again by identity's clock (`GetExpiry`), deletes the repository's storage, then has the directory
-remove the entry (`PurgeRepository`), a deleted repository's purge logged on
-`directory.repositories`. Nothing brings an expired repository back: identity refuses a restore
+still being made after an hour — on a work lease per repository (`server.Purge`, store.PurgeWork),
+its job booked for when the repository may expire: by the transaction that makes the repository's
+storage, an hour on, and, as the SCM follows the directory's events (`directory.repositories`,
+group `scm`), by a repository's deletion, for its retention's end. The job asks ok identity by its
+clock (`GetExpiry`, which says when one deleted or being made will expire, and the purge books
+itself for then); one expired, it deletes the repository's storage, then has the directory remove
+the entry (`PurgeRepository`), a deleted repository's purge logged on `directory.repositories`. Nothing brings an expired repository back: identity refuses a restore
 past the retention period, and an expired creation's resumption or activation (a creation refused so
 deletes what it made). Each role follows the purge and forgets the repository whole: ok control its
 CLs and favorites, ok automation its runs' logs, runs, plans, and submissions (taking the
@@ -613,10 +615,11 @@ it (`ok admin move REPOSITORY CELL`, identity's `Admin.MoveNetwork`; `ok admin m
 `ok admin cancel-move NETWORK` abandons one): the directory records the move (`network_moves`: the
 network, its source and destination, its phase, who asked, when it is next tried, and why its last
 step failed), refusing it while another of the network runs, while a repository of it is still
-being made, or into a cell closed to new repositories. Every identity replica's runner looks for
-moves due a step every ten seconds — at once when one is asked — and drives each under its
-network's lock (`move:<network>`) as far as it goes; a step that fails is tried again 30 seconds
-later, and each is safe to repeat, so a replica that stops short leaves the move to the next. The
+being made, or into a cell closed to new repositories. Each write of an unfinished move books its
+next step (keyed work `move`, keyed by the network, for its `next_at`), whose job brings it to one
+identity replica, which drives it under its network's lock (`move:<network>`) as far as it goes;
+a step that fails is tried again 30 seconds later, and each is safe to repeat, so a replica that
+stops short leaves the move to the next. The
 directory reaches each cell's roles where `identity.cells` says, as its own robot (`CALLER_IDENTITY`),
 and each role serves a `Moves` service (`ok.v1.Moves`) to it and to the same role of another cell,
 which copies from it as itself. A move's phases:
@@ -753,15 +756,22 @@ identity (79), deploy (49), and control (34) are smaller.
   the lease's row and commits only if its holder still holds it. A lease's row lives in the same
   database as what it guards, so the check and the write are one transaction, and a holder that
   stalled past its lease — a long pause, a partition — never commits: at worst it wastes its work.
+- **Claims** — keyed work held outside a job (`work.Claim`): a sync asked for, a fold that must
+  follow what its caller did, a full compaction, a deployment's steps. One that waits for its holder
+  (`wait.Claims`) registers an inbox on the claim, tries again, and is told as the holder lets go —
+  through the claim's release, or a runner's `LetGo` — or wakes as the holder's lease would lapse,
+  should it have died holding it; no waiter asks again on a timer.
 - **Locks** — `internal/lock`: a row in the role's database, held one of two ways. As a lease, by
   a locker that refreshes it, judged by the database's clock and fenced as leases are, for what spans
-  transactions — a migration. A fence holds only what a takeover writes, the lease's holder (its
+  transactions — a migration alone, whose waiter starts before its schema exists, with neither
+  registrations nor keyed work to wait by: it asks again each second, as it starts. (The deployer
+  takes a deployment's lock beside its claim for one release, so a replica of the release before,
+  which takes only the lock, is kept out.) A fence holds only what a takeover writes, the lease's holder (its
   refresh ID: on Spanner that cell, which Spanner locks alone; on PostgreSQL `FOR KEY SHARE`,
   which a takeover's `FOR UPDATE` waits for), never what its holder's own refreshes write: a fenced
   transaction longer than the lease would otherwise keep the refresh out and lose its lock. Within a transaction (`lock.InTx`), by locking its row until the
   transaction ends, for what one transaction does — allocating names, planning a CL's patchset. The
-  two exclude each other. It is the one way a role excludes itself across replicas where what it
-  does is no keyed work, on both backends. **No advisory locks**: they are invisible to every tool
+  two exclude each other. **No advisory locks**: they are invisible to every tool
   but PostgreSQL's, held by a connection rather than a holder, and Spanner has none.
 - **Migrations** — PostgreSQL's ordered SQL, Spanner's DDL batches through the admin API, each
   version recorded, under the lock's `migrate` lock (its table made first, on its own, being what
@@ -795,8 +805,8 @@ read-write transactions with retries, partitioned DML, batch writes, and change 
   today.
 - **No queue in the database.** What `SKIP LOCKED` does today moves to the queue interface, or to
   conditional updates — a lease taken by `UPDATE … WHERE` its holder is none or lapsed, replicas
-  starting their scans at random places so they rarely meet; what `LISTEN` does to the bus's signals
-  (*Signals*); advisory locks to the lock (*Shared primitives*).
+  starting their scans at random places so they rarely meet; what `LISTEN` did to registrations and
+  inboxes (state.md, *Waiting*); advisory locks to the lock (*Shared primitives*).
 - **Sequencing and the relay.** A repository's CL numbers and its log's places are given just
   after the transactions that make them commit, by its sequencing pass, not taken from counters
   inside them (scm.md, "Sequencing"); the pass marks the events it places pending, which a relay
@@ -864,8 +874,7 @@ eight 1.9, which bounds the end-to-end scale test on Spanner (220 of its 300 rep
 its seven minutes; on PostgreSQL, `SKIP LOCKED`, all of them in 36 seconds). Claims from random
 places in the queue would not meet; that waits for the optimization after the phases are built. A
 CL's pre runs are read through `run_cl`: unhinted, Spanner reads them by status, through
-`run_leased`, locking every queued run, which every plan inserts one of. The sweep of lapsed leases
-reads them `FOR UPDATE`, so two sweeps run one after the other. A patchset's
+`run_leased`, locking every queued run, which every plan inserts one of. A patchset's
 one pre plan is a `NULL_FILTERED` unique index on a generated column that is the patchset for a pre
 plan and `NULL` for a post plan, where PostgreSQL has a partial index. A plan's JSON is kept as the
 text the store wrote: nothing queries into it. A repository's rows are purged by partitioned DML,
@@ -930,9 +939,11 @@ collection deletes outside a transaction, go in transactions of up to 10,000 too
 content index updates go in log rows of at most 4 MiB (Spanner refuses a value over 10 MiB); on
 Spanner, past its first 32 MiB of them — an upload pins 68 bytes of log a file, so one of 1.5
 million files logs 100 MiB — the rest are staged in transactions of their own under a batch whose
-marker the transaction commits, and read only once it has (`content_log_batch`): no fold runs
-meanwhile, as the transaction holds the index's row in share mode, and the next fold deletes the
-staged rows of a transaction that did not commit. A fold writes what the log changed to runs in
+marker the transaction commits, and read only once it has (`content_log_batch`). A fold deletes
+the staged rows of a transaction that did not commit, those an hour older than its place with no
+marker: staged as it is about to commit, a transaction's rows are never that old before it does —
+one holding no lock on the index commits within the hour it read it, and one holding the lock
+holds folds back. A fold writes what the log changed to runs in
 the bucket, not rows: its transaction records them and the next generation, under a claim that
 keeps folds of one index from overlapping (`docs/scm.md`, *Folds*). And
 a landing that changed more than 20,000 paths leaves them to compaction, which writes them 10,000
@@ -1053,9 +1064,9 @@ tail      meta length u32, magic "OKSCMEND"
 ```
 
 **The manifest.** `segment (repository_id, kind, id, level, records, size, created_at,
-retired_at)`; a segment is live until retired. A replica holds each repository's live
-manifest in memory, marked stale by the signal every manifest change sends once it commits
-(`ok_scm_segments`, the repository's ID; *Signals*) — the content index's pattern.
+retired_at)`; a segment is live until retired. A request reads a repository's manifest from the
+database once for its life (`store.WithRequestScope`), and again on a lookup that missed; a replica
+keeps segments' readers and blocks, named by ID, which never change — never the manifest.
 
 **Reads.** A batch of keys of a kind: the tail first, one query for the batch as today; then, for
 the keys it lacks, each live segment of the kind, newest first, through its Bloom filter and fence
@@ -1294,7 +1305,8 @@ the repository held is released, its segment references are retired — an objec
 grace only if no other manifest names it — and its content index goes; the network's collection
 drops the locations no other repository holds, pinned ones too, a drop of a location folded into
 the chunk index's segments becoming a tombstone there at the next fold. A deletion a replica stops
-short of is finished by the next collection sweep (`FinishDeletions`). A network whose last
+short of is finished by the repository's purge, which the transaction that deleted its row marked
+(`FinishDeletion`). A network whose last
 repository goes is deleted whole, `nets/<network>/` with it.
 
 **Done when** `TestForkNetwork` forks a repository, works on both sides, and checks that forking
@@ -1331,6 +1343,16 @@ type Store interface {
   support goes through its S3-compatible XML API (`internal/blob/blob.go`'s note), which has none of
   these.
 - **Filesystem** — a directory, for development and tests.
+
+**A request that fails for a moment is made again** — a 429, a 5xx, a dropped connection — writes
+too: every key's writers write what any of them may (a key named by its content, or a cache entry
+any of whose values is right), so a put made twice stores what one would. GCS's client makes again
+only what it can tell is idempotent, which an unconditional write is not, so its buckets retry
+always, up to six attempts; minio makes a request again only with a body it can rewind, so a put
+from one that cannot is held in memory up to minio's single-request size (16 MiB), past which minio
+sends held parts. The secret stores do likewise: Vault's requests, Secret Manager's writes (its
+client retries reads alone), and AWS Secrets Manager's SDK, raised to six attempts. Staging's
+publish failed on one GCS 503 on a pack, in 12,500.
 
 **Keys spread load.** S3 scales to at least 3,500 writes and 5,500 reads a second per partitioned
 prefix, with no limit on prefixes; GCS starts a bucket at about 1,000 writes and 5,000 reads a
@@ -1379,6 +1401,10 @@ rewrites packs as today. No leader; a cell's GC throughput is its workers'.
 
 ## Events and the bus
 
+Where ok's state lives, and so what the bus is and is not, is [state.md](state.md): object storage,
+the database, or a queue item, and nothing else. The bus is queues: work, the relays of logs to
+their followers, and the replies to the live requests waiting on a change.
+
 ### The per-repository log
 
 Every transaction that changes a repository or a CL appends its events to that repository's log:
@@ -1391,33 +1417,38 @@ the transaction commits (scm.md, "Sequencing"). A repository's busiest writer, a
 
 The log is the source of truth; the bus only carries it:
 
-- **The relay** publishes every event at least once. On PostgreSQL, the transaction also inserts the
-  event's key into a pending table, which every replica's relay publishes from and clears: each
-  takes pending rows `FOR UPDATE SKIP LOCKED`, publishes them, and deletes them in the transaction
-  that took them, so relays never wait on one another, and one that dies first leaves its rows for
-  the next — no shards or leases to keep. On Spanner the pass that places events marks them
-  pending, and a relay reads pending events without a lock, takes those no relay holds for a lease
-  by key, publishes them, and deletes them by key (scm.md, "Events").
+- **The relay** relays every event at least once. The transaction that places events — on
+  PostgreSQL the writer's own, on Spanner the repository's sequencing pass — inserts their keys
+  into a pending table, and enqueues, as it is about to commit, a relay job naming the repository
+  and the places it gave (`work.Pend`). Whichever replica leases the job relays the repository's
+  pending events and clears them, and acknowledges the job only once its own are gone from pending:
+  relayed by it, or by another relay, which holds them meanwhile. To relay a page of events is to
+  enqueue, on each follower's queue, a job naming each repository whose log it holds, and the last
+  place of it (*Followers*). On PostgreSQL a relay takes
+  pending rows `FOR UPDATE SKIP LOCKED` and deletes them in the transaction that took them, so one
+  that dies first leaves its rows, and its job, for the next; on Spanner it reads pending events
+  without a lock, takes those no relay holds for a lease by key, publishes them, and deletes them by
+  key (scm.md, "Events"). A job that comes before its transaction committed — the job's places past
+  the repository's counter, which the transaction holds until it commits — looks again shortly,
+  until it is a minute old. No relay looks for pending events; the directory's relay is the same.
 - **History** compacts into event segments, so the log is still never pruned (scm.md, "Events"): a
   consumer that needs old events reads them from the SCM, which reads segments.
 
-### The stream
+### Followers
 
-```go
-type Event struct {
-	Topic string // "scm.events", "directory.events", …
-	Key   int64  // the repository (or account)
-	Seq   int64  // its sequence in the key's log
-	Body  []byte
-}
-
-type Stream interface {
-	Publish(ctx context.Context, events []Event) error
-	// Subscribe delivers every event of topic to one subscriber of each group: groups fan out,
-	// subscribers within a group share the load. At least once; order is not promised.
-	Subscribe(ctx context.Context, topic, group string, h func(context.Context, Delivery) error) error
-}
-```
+ok control, ok automation, and the deployer follow the SCM's log of each repository; they and the
+SCM follow the directory's (`internal/bus/follow`). A follower registers with the log's source as
+it starts (`Events.Follow`, `DirectoryEvents.Follow`: the caller's role, a row of the source's
+`follower` table), and from then on the source's relay enqueues, on the follower's queue
+(`<role>.relay.<topic>`), a job for each repository whose log grew, its ID the repository and the
+last place relayed, so a backend that drops duplicate IDs drops a second relay of one page. Any
+worker of the follower takes the job and marks the repository's keyed work (`follow.<topic>`);
+whichever worker takes that applies the repository's events from its cursor to the log's end,
+read from the source a page at a time (`Events.Read`), and goes round again if it was marked
+meanwhile, so nothing relayed while it applied waits. Work that fails is done again a second later.
+The first time a follower follows a log — a new role, or one coming back from a release that
+followed a stream — it marks, once for its database (`work.Once`), each repository whose log reaches
+past its cursor (`Events.Heads`): what was relayed before it registered.
 
 ### Consumers
 
@@ -1425,18 +1456,24 @@ A consumer applies an event in its own transaction with its cursor for that key:
 seq = s WHERE key = k AND seq = s - 1`. One row updated: applied, exactly once. None, and the cursor
 is at or past `s`: a duplicate, acknowledged. None, and the cursor is behind: a gap, filled by
 reading `(cursor, s)` from the SCM's log (`Events.Read(repository, after)`) and applying it in order
-first. So delivery may duplicate and reorder, and consumers never apply twice or skip — the same
-contract today's feed has ("re-reads every 30 seconds in case a notification was lost"), per
-repository instead of per installation. A new consumer bootstraps from snapshots (the SCM's current
-state of each repository) rather than replaying a decade of every repository's history.
+first. So a relay may come twice or late, and consumers never apply twice or skip. A new consumer
+bootstraps from snapshots (the SCM's current state of each repository) rather than replaying a
+decade of every repository's history.
 
-Every replica of a consumer follows the stream, so one replica claims a repository's events before
-applying them (keyed work: automation's `feed`, control's `control-feed`) and the others leave it
-until it lets go (`follow.ErrBusy`) — otherwise every replica applies every event of a busy
-repository, racing on its cursor's row. A consumer that applies a run of events at once
-(`follow.BatchApplier`; ok control's) is handed each page of the log it reads, and an event the
-stream brings is applied through the log, its page with it: ok control applies a page of a
-repository's events in one transaction with its cursor, reading each CL they name once beforehand.
+A repository's events are applied by one worker at a time, the one holding its `follow.<topic>`
+work; a consumer that also holds the repository for other reasons claims it as it applies
+(automation's `feed`, control's `control-feed`, which a purge takes too), and finding it held,
+answers `follow.ErrBusy`, and the work is done again a moment later. A consumer that applies a run of
+events at once (`follow.BatchApplier`; ok control's) is handed each page of the log it reads: ok control applies a page of a
+repository's events in one transaction with its cursor, reading each CL they name once beforehand;
+ok automation applies a page's CLs' events beside each other, each CL's in order — main's moves,
+which name no CL and whose recording reads the landings recorded before them, each in its place,
+after everything before it and before everything after — and moves the cursor past those applied,
+to the first that failed. Its events' effects are their CL's and its
+stack's, each a transaction under the CL's lock acting on what the SCM says now, so different CLs'
+events commute, and a page applied again applies each CL's events in order again: one at a time,
+a repository's events applied at about five a second, and a herd of 3,000 uploads waited eleven
+minutes for pre.
 How far each consumer runs behind is a metric (`ok_control_feed_lag_seconds`,
 `ok_automation_feed_lag_seconds`, by event kind).
 
@@ -1453,8 +1490,12 @@ type Job struct {
 
 type Queue interface {
 	Enqueue(ctx context.Context, jobs []Job) error
-	// Lease hands out up to max jobs, each invisible to others for visibility.
+	// Lease hands out up to max jobs, each invisible to others for visibility: as soon as one is
+	// ready, waiting up to a time for the first.
 	Lease(ctx context.Context, queue string, max int, visibility time.Duration) ([]Leased, error)
+	// Inbox opens a live request's inbox: a queue whose address any process enqueues replies on,
+	// until it closes (state.md, "Waiting").
+	Inbox(ctx context.Context) (Inbox, error)
 }
 
 type Leased interface {
@@ -1470,79 +1511,68 @@ Queues carry work, not truth: a job names what to do, and the worker takes the w
 database (a run's claim, a repository's work lease) before doing it, so a lost or duplicated job
 costs a retry, never a double execution. Priorities are separate queues, read in order.
 
+A process's inboxes share one queue of the process's own (`inbox.<random>`), which it leases while
+any is open, handing each reply to the inbox it names; a reply to an inbox that closed is dropped.
+A live request that waits — a watch of a CL, a page's live regions, a log followed, an upload
+waiting for its CL's number, an action waiting for the feed — registers its inbox, in the database
+of each service whose writes change what it waits on, under the subjects it waits on
+(`internal/wait`), and reads what it waits for after. A transaction that changes a subject pends a
+step naming it before it commits; the worker that takes the step replies to every inbox registered
+under the subject. Another role's request registers through the service's `Waits` RPCs (ok
+automation's and the deployer's, to ok control). A registration lapses unless its request renews
+it, every third of two minutes, and a step due as it lapses removes it.
+
 ### Backends
 
-| | Stream | Queue |
-|---|---|---|
-| **PostgreSQL** | The log's pending table and `LISTEN`/`NOTIFY`, as today's feed | A table leased with `FOR UPDATE SKIP LOCKED`, as today's run queue |
-| **NATS JetStream** (`internal/bus/natsbus`) | A stream per topic, one subject (the stream promises no order, so sharding keys buys nothing), a durable pull consumer per group delivering what follows its making, replicated (R3) | One stream with work-queue retention, a subject and a pull consumer per queue, `MaxDeliver` its attempts; the ack wait the floor of a lease, which renews itself until its visibility passes; message schedules for jobs not due; the duplicate window for IDs; dead letters a stream of their own |
-| **Google Pub/Sub** (`internal/bus/pubsubbus`) | A topic, a subscription per group read by streaming pull, a refused event nacked to the subscription's retry policy (no ordering keys: the stream promises no order), retention up to seven days | A topic and a subscription read by synchronous pulls; the ack deadline the lease, renewed until its visibility (at least ten seconds) passes; a dead-letter policy for Pub/Sub's delivery counts, the last attempt's Nack dead-lettered by the client (Pub/Sub's own needs five); a delay topic per queue for jobs not due, moved on by `Lease`; no duplicate IDs dropped |
-| **AWS** (`internal/bus/awsbus`) | SNS topic fanning out to an SQS queue per group, raw delivery, the queue's policy letting the topic send; a refused event returned to the queue after a backoff | SQS standard queues: nearly unlimited throughput, the receive's visibility the lease (up to 12 hours), retention up to 14 days, a redrive policy and a dead-letter queue; delays past SQS's 15 minutes sent again carrying their attempts; no duplicate IDs dropped. Bodies travel in a binary message attribute, SQS's and SNS's bodies being text |
-| **Kafka** (MSK, Confluent, Redpanda; `internal/bus/kafkabus`) | A topic, partitioned by key, a consumer group per group started at the topic's end; each fetched partition handled in order, the partitions at once, the fetch committed once handled; a refused event set aside on the group's retry topic, due after a backoff, so it delays nothing behind it | — (Kafka has no per-message acknowledgement or visibility; an installation on Kafka takes its queue from another backend) |
+| | Queue |
+|---|---|
+| **NATS JetStream** (`internal/bus/natsbus`) | One stream with work-queue retention, a subject and a pull consumer per queue, `MaxDeliver` its attempts; the ack wait the floor of a lease, which renews itself until its visibility passes; message schedules for jobs not due; the duplicate window for IDs; dead letters a stream of their own; a process's inboxes a consumer of its own, which the server removes an hour after it was last leased |
+| **Google Pub/Sub** (`internal/bus/pubsubbus`) | A topic and a subscription read by synchronous pulls; the ack deadline the lease, renewed until its visibility (at least ten seconds) passes; a dead-letter policy for Pub/Sub's delivery counts, the last attempt's Nack dead-lettered by the client (Pub/Sub's own needs five); a delay topic per queue for jobs not due, moved on by `Lease`; no duplicate IDs dropped; a process's inboxes its subscription, filtered to its own, to one topic of replies, which Pub/Sub removes a day after it was last leased |
+| **AWS** (`internal/bus/awsbus`) | SQS standard queues: nearly unlimited throughput, the receive's visibility the lease (up to 12 hours), retention up to 14 days, a redrive policy and a dead-letter queue; delays past SQS's 15 minutes sent again carrying their attempts; no duplicate IDs dropped. Bodies travel in a binary message attribute, SQS's being text. A process's inboxes a queue of its own, tagged as it is leased, which any process making its own removes an hour after |
 
-Every stream but PostgreSQL's — the single installation's — hands a member its deliveries at once,
-up to the backend's `concurrency`: the stream promises no order, and a consumer applies each by its
-key's cursor, so a role's throughput grows with its replicas and their concurrency, not with how
-fast one replica handles one event. A member takes only as many deliveries as it has free slots, so
-none waits for one while its visibility runs, and hands each to a handler as its receive returns.
-
-The stream and the queue are configured separately (`bus.stream`, `bus.queue`), so an installation
-runs on whatever its environment has: all on PostgreSQL, Kafka with PostgreSQL's queue, NATS for
-both, Pub/Sub for both, or SNS and SQS.
-
-**On SQS.** SQS is the right AWS service for the queue: it does exactly what the interface asks, at
-any rate. On its own it is not a stream — each message goes to one consumer — which is why the
-stream is SNS fanning out to an SQS queue per consumer group. Because consumers order and
-de-duplicate by sequence themselves (*Consumers*), the stream needs neither SQS FIFO's ordering nor
-Kinesis's replay; Kinesis (1 MB/s and 1,000 records a second written per shard, up to 365 days kept)
-would work too, as Kafka does.
-
-### Signals
-
-Some news is not an event of a repository's log but a wake-up: a run was queued, a log grew, a
-repository's segments changed, work was marked. Today it rides PostgreSQL's `LISTEN`/`NOTIFY`,
-which Spanner does not have and which ties every replica to one database's connections. It moves to
-the bus, as a **signal**:
-
-```go
-type Signals interface {
-	// Signal tells every replica listening on channel, at most once and at some point: no order,
-	// no promise. A transaction's signals are sent once it commits.
-	Signal(ctx context.Context, channel, payload string) error
-	// Listen calls deliver with each signal on channels until ctx ends; ready each time it starts
-	// (again), after which none sent is missed until it returns.
-	Listen(ctx context.Context, channels []string, ready func(), deliver func(channel, payload string)) error
-}
-```
-
-- **Backends.** NATS: core subjects, which fan out to every subscriber. Pub/Sub: a topic per
-  installation and a subscription per replica that expires a day after it stops. AWS: an SNS topic
-  and an SQS queue per replica, made as it starts and deleted as it stops. Kafka: a topic, each
-  replica a consumer group of its own started at the topic's end. PostgreSQL's — the bus of an
-  installation that runs on PostgreSQL alone — is `LISTEN`/`NOTIFY` in the bus's own schema, as it
-  is the bus there; nothing else in ok uses them.
-- **Never what correctness rests on.** A signal may be lost, late, or doubled, so whatever waits on
-  one also looks again on its own (`Poll`), and whatever caches by one still re-reads when the cache
-  cannot be right: the SCM's manifests and content indexes are read fresh for ordered data, and
-  looked up again fresh on a miss for what is addressed by content. `ready` marks everything stale,
-  since signals sent while a listener was away are gone.
-- **After commit.** A store collects a transaction's signals and sends them once it commits, never
-  before: a woken replica always finds what woke it.
+There is no bus in PostgreSQL — its notifications are lost while no one listens — nor on Kafka,
+which acknowledges no single job; and no streams or signals: what reached other services as a
+stream's events is a relay's job on each follower's queue (*Followers*), and what woke a replica's
+waiters or refreshed its caches is a registered inbox (state.md, *Waiting*), or a read of the
+database each request.
 
 ## Work without leaders
 
 Every singleton becomes keyed work, leased on demand:
 
-- **Per repository.** A `work(kind, key)` row (`internal/work`): the transaction that changes what
-  the work acts on marks it dirty and wakes the replicas with a signal once it commits (*Signals*),
-  and whichever replica takes the row's lease first clears the mark, does the work, and loops until
-  it stays clean: a mark made while it works is seen as it lets go, under the row's lock, so none is
-  lost. What time decides is a mark due at that time (`MarkAt`) or, where a set falls due by a
-  schedule (the SCM's daily collection), a sweep that marks it; work whose holder's lease lapsed is
-  taken again. Many replicas drive many repositories; one drives each.
-- **Per shard.** Sweeps over a cell — repositories due for GC, runs whose leases lapsed, relays —
-  split the cell's repositories into 4,096 shards by ID, each shard leased by one replica,
-  rebalanced as replicas come and go.
+- **Per key.** A `work(kind, key)` row (`internal/work`) and a job on the bus: the transaction
+  that changes what the work acts on marks the row dirty and enqueues a job naming the work on its
+  kind's queue (`work.<role>.<kind>`) before it commits, so a mark is never without its job. A
+  replica's lease takes the job, then the row's lease — which waits for a mark's transaction still
+  open: the mark holds the cells a take writes (a row lock on PostgreSQL, the mark's read on
+  Spanner) — clears the mark, does the work, and loops until it stays clean: a mark made while it
+  works is seen as it lets go, under the row's lock, so none is lost. A job that finds the work held
+  under another job leaves the mark to that holder; one that finds it claimed (`work.Claim`, which
+  holds no job) looks again once the claim's lease may have ended; one whose work is clean — done,
+  or its mark's transaction never committed — costs a look. The holder keeps its job leased as it
+  renews the row's lease, past it: should the holder die, its job comes back once its lease has
+  lapsed, and the replica that takes it takes the work over. What time decides is a mark due then
+  (`MarkAt`), its job delayed to then; a set that falls due by a schedule — the SCM's daily
+  collection, ok secrets', a purge at a retention's end — is a chain: each run books the next from
+  the work's own state, as the repository's making booked the first, so a booking folded into a
+  sooner one is booked again when that one runs. Nothing looks for work: no replica reads the work
+  table but for the key a job names. Many replicas drive many keys; one drives each.
+- **Steps.** What a transaction leaves to do once it commits, which no row's lease guards — publish
+  the events it placed, run a sequencing pass should its writer stop, re-derive the approvals its
+  events changed — is a step: a job it enqueues as it is about to commit (`work.Pend`), whose
+  consumer (`work.Consume`) finds what the transaction wrote, or, its commit not seen yet, looks
+  again shortly until the job is a minute old. A step that fails is a fresh job a while later; a job
+  put off any number of times is a copy of its own (`bus.PutOff`, `base~n`), so no backend's dedupe
+  drops it, and none spends the attempts toward a dead letter.
+- **Upgrades.** A release before this one marked work with no job and looked for it, so what it
+  marked as it stopped would be brought by nothing. Each kind's runner books its adoption, once for
+  the life of the database, fifteen minutes after the first replica of this release starts
+  (`work.UpgradeAfter`), by when the release before has stopped: a job for every piece of work
+  marked, or held by a holder that died (`work.Store.Marked`). What a release before booked by
+  sweeps — repositories' collections and purges, identity providers' syncs, moves' steps, moved
+  repositories' purges, events pending, queued runs with no job, finished runs' logs, the
+  deployer's plans, turns, steps, and retirements — is booked by the same delay, once
+  (`work.Once`).
 
 | Today | Becomes |
 |---|---|
@@ -1551,8 +1581,8 @@ Every singleton becomes keyed work, leased on demand:
 | automation `buildcache` | Nothing: the lock was taken by no code. A cache's sweep, once caches are per organization (phase 8), is keyed work per organization |
 | deploy `leader` | Planning per repository; starting decided by the database; stepping per deployment (below) |
 | deploy `observer` | Per service: its workload read under its own lease, due ten seconds after the last read |
-| scm `gc` | Per repository and network, scheduled by shard |
-| identity `sync` | The installation's, and each organization's, under a lock of its own, its plan applied fenced |
+| scm `gc` | Per repository and network: each pass books the next, as its retired packs' grace ends or its daily slot comes |
+| identity `sync` | The installation's, and each organization's, keyed work booked for its interval and soon after a SCIM push; a sync asked for waits for the one under way to let go of its claim (*Shared primitives*); its plan applied fenced |
 
 The landing queue and the feeds went first (phase 2), and the SCM's garbage collection with them.
 The rest go in phase 6, so that no role keeps a leader: a leader is one replica's throughput for
@@ -1583,14 +1613,22 @@ with `data.ErrFenced` and commits nothing. On Spanner, which locks cells, a fenc
 the holder's cell alone, which a takeover writes, and a mark the mark's cells alone: neither reads
 the lease's end, which the holder's renewals write, so neither holds a renewal back — a
 compaction's every fenced batch did, beside every upload's mark. The deployer writes its steps in a transaction when
-fenced, which is one statement each otherwise. The deployer plans each repository under its
-planning's keyed work (`plan`, its table new), and looks again once it holds it; starts deployments
-in `StartTurns`, one transaction at a time across replicas (`lock.InTx`), which reads what each
-running deployment holds and claims what each it starts holds; retires and steps each deployment
-under that deployment's lock; and reads each service under its `observe` work, which each read
-marks due ten seconds after it ends — a sweep once a period marks only work idle, neither marked
-nor held (`pgdata.MarkWorkIdle`): a service new, or one whose reader died reading. Automation's
-build-cache leader, and ok control's lock, had no callers, and are gone.
+fenced, which is one statement each otherwise. No deployer replica looks for work; each piece is
+keyed work its own transactions mark. It plans each repository as its planning (`plan`) comes —
+marked as the feed records main's move, as the directory names the repository, and as its owner's
+deploy agent connects — and looks again once it holds it; starts deployments in `StartTurns`, one
+transaction at a time across replicas (`lock.InTx`), as the cell's turns (`turns`) come — marked as
+a deployment is queued or ends, or a repository's gate opens — which reads what each running
+deployment holds, claims what each it starts holds, and marks each one's steps; steps each running
+deployment under its lock as its steps (`step`) come — marked as it starts, as a person halts it or
+allows its hazards, as its migration ends, and booked by each step that waits on something outside
+the database (its pushes, its roll's pods; `engine.Look`, five seconds) for its next look — a
+deployment of the deployer itself on `step-<color>`, stepped by the copy that started it alone;
+retires the old copy a deployment of the deployer replaced as `retire` comes, marked as it
+succeeds; and reads each service under its `observe` work, which each read marks due ten seconds
+after it ends — first marked by the plan that declares the service, and brought back by its job
+should its reader die reading. Automation's build-cache leader, and ok control's lock, had no
+callers, and are gone.
 
 ## Automation at hosted scale
 
@@ -1604,14 +1642,15 @@ between repositories, never from a CL's pre into post.
 
 ### Scheduling and fairness
 
-- **Admission.** Runs are recorded as today, queued in the cell's automation database per
-  organization. A dispatcher — per shard — admits runs within each organization's quota (concurrent
-  runs, minutes) by weighted fair share across organizations, post before pre before manual runs,
-  older before newer, and enqueues each admitted run on the dispatch queue of the worker pool its
-  job needs (Linux x86 or Arm, macOS, larger machines).
-- **Execution.** A worker leases a dispatch job, claims the run in the database (compare-and-set on
-  its attempt, as `Lease` does today), runs it, and extends both while it runs. A worker that dies
-  lets its claim lapse; the dispatcher admits the run again.
+- **Dispatch.** Runs are recorded as today, queued in the cell's automation database, and each is
+  enqueued, as it is queued, on the dispatch queue of the worker pool its job needs (Linux x86 or
+  Arm, macOS, larger machines) — post's and deploys' runs on a first queue the workers look at
+  before their pool's.
+- **Execution.** A worker's lease takes the next job and claims its run in the database
+  (compare-and-set on its status), runs it, and extends its lease while it runs. A worker that dies
+  lets its claim lapse, and the run is queued and dispatched again. An account at its quota
+  (concurrent runs, minutes) has its run set aside until a run of its stops: quotas, not the order
+  of the queue, keep one organization's flood from holding another's runs.
 - **Pools** scale on their dispatch queues' depth and age.
 - **The landing queue** runs per repository (*Work without leaders*), so a million repositories'
   queues run side by side, each as automation.md describes.
@@ -1645,8 +1684,8 @@ cell's ok control keeps every repository's name), and which the claim charges. A
 events have not arrived yet counts under no account.
 
 **Quotas.** ok identity keeps an account's quota (`account_quotas`): its concurrent runs, its CI
-minutes in a calendar month (UTC), and its weight in fair share — `identity.default_quota` for an
-account with none (zero is unlimited; weight 1). Administrators set them (`Admin.SetQuota`,
+minutes in a calendar month (UTC) — `identity.default_quota` for an account with none (zero is
+unlimited). Administrators set them (`Admin.SetQuota`,
 `ok admin quota ACCOUNT`); ok automation reads them (`Quotas.GetQuotas`), kept 30 seconds. Each
 cell's ok automation counts each account's run seconds a month (`account_usage`), charged by the
 database's clock as each run that ran finishes or is given back. An account's repositories may be
@@ -1664,30 +1703,41 @@ repository's (`.ok/repository.yaml` `pool:`, read from main as the workflow file
 does not choose where it runs), else `default`; a planning run in `automation.plan_pool`. A worker
 serves one pool (`worker.pool`). The run records its pool, and a worker's lease names it.
 
-**Admission and fair share, at the claim.** A worker's lease is the admission. It reads the head of
-each account's queued runs in the worker's pool — post's runs and deploys' (priority 2) before
-pre's (1) before manual runs (0), older before newer — with each account's running runs, in the
-pool and in all, and its month's seconds; orders the accounts under their quotas by their running
-runs in the pool for their weight, ties to the higher priority's head, then the older; and claims
-the first's head. What it chooses by it reads outside any transaction; the claim's transaction
-holds only the run it takes, so claims beside each other meet only on one run — one that finds its
-head taken goes on to one of the account's next few, at random. A run queued wakes the first lease
-waiting in each pool's line on each replica, not every waiting lease — every one woken for every
-run had each claim race the rest for it, a dozen transactions a run — and a lease that claims a run
-wakes the next in its line, for the runs queued with it; every lease still looks on its own every
-two seconds. An account with a concurrent quota
-runs each run in a **slot** of its own (`account_slot`), at most its quota — less what the other
-cells report — of them: the claim takes a free slot with the run, an insert another claim's
-refuses, and the run lets it go as it stops running, so claims beside each other never pass the
-quota and none of them writes a row they share. An account's month's seconds are kept in sixteen
-rows, a run charged to the one its ID picks, so runs ending at once write apart. The claim gates
-the repository the head is of. An account past its minutes waits for the month, or a larger quota.
-A repository the directory's events have not named counts under no account, "". No dispatcher stands apart, and no dispatch queue: workers lease through ok
-automation already, its claim already decides on the database, and fair share needs the running
-counts the claim reads — a queue would hold a second copy of what the run table says. Each cell's
-ok automation is its shard. A lease that lapsed is found by a read outside any transaction and
-acted on in one of its own that finds it still lapsed, so the sweep holds no lease a worker
-renews.
+**Dispatch, and admission at the claim.** Every queued run is a job on its pool's dispatch queue
+on the bus (`automation.dispatch.<pool>`), enqueued before the transaction that queued it — started,
+planned, rerun, given back — commits: a run is never queued without its job. The run names the one
+job that dispatches it now (`run.dispatch_job`). A worker's lease takes the next job — the bus
+hands each to one consumer — and claims the run it names in a transaction that locks only that
+run, only while the run is queued and names that job. Workers added to a pool add as many
+consumers, and nothing they all contend on: no claim reads a queue's head, and none races another
+for a run. A job is a pointer, the run's row the truth: a delivery of any job but the run's own — a
+copy of an attempt that did not commit, one a release replaced — is acknowledged and dropped where
+it is leased, as is the job of a run no longer queued; one whose run is not there yet, its
+transaction still committing, is returned, until it is a minute old. Runs are taken in the order
+they were queued; there is no fair share among accounts — an account's quota is what bounds it. An
+account with a concurrent quota runs each run in a **slot** of its own (`account_slot`), at most its
+quota — less what the other cells report — of them: the claim takes a free slot with the run, an
+insert another claim's refuses, and the run lets it go as it stops running. A run the claim finds
+its account at its quota, or past its minutes, for **waits**: its job is enqueued again, due five
+seconds on (a minute, past its minutes), and held up behind it is nothing — the next job is another
+account's run. The queue's own schedule brings it back; nothing scans for it.
+An account's month's seconds are kept in sixteen rows, a run charged to the one its ID picks, so
+runs ending at once write apart. The claim gates the run's repository: a run of a repository a move
+holds is dropped there, and dispatched again where the repository arrives, or here once the move is
+called off. A repository the directory's events have not named counts under no account, "".
+
+**The run's lease is its job's.** The bus's lease on the job's delivery is the run's lease while it
+runs: the run records the delivery's handle (`run.lease_handle`), each heartbeat — whichever
+replica it reaches — extends it (`bus.Queue.Resume`, on every backend), and the run's outcome, or
+its release, acknowledges it. A worker that stops heartbeating lets the delivery lapse, and the bus
+delivers the job again: the lease that takes it takes the run over — its next attempt, with a fresh
+log, or, on its last, an error; one its worker was asked to stop ends canceled. No sweep looks for
+lapsed leases, nor for runs whose jobs were lost: a job is enqueued in its run's transaction, and
+the bus redelivers what its consumer did not finish. A finished run's log is stored by a job of its
+own (`automation.logs`), enqueued in the transaction that finished it and done as it finishes —
+again by whichever replica leases it, should that fail. Once the release before this one has
+stopped, one replica dispatches the queued runs it left with no job, and stores their logs
+(*Work without leaders*, "Upgrades").
 
 **Pools scale.** ok automation's scaler (keyed work `pools`, every 15 seconds) sets each pool's
 worker Deployment's replicas through Kubernetes' scale subresource: its running and claimable runs
@@ -1725,8 +1775,10 @@ an installation shares a cache of Bazel's releases read-only (`worker.microvm.sh
 **The remote cache.** ok automation serves Bazel's remote cache — the Remote Execution API's
 `Capabilities`, `ContentAddressableStorage`, and `ActionCache`, and `ByteStream` — to workers alone,
 over its logs' bucket (`cache/<namespace>/cas/<sha256>`, `…/ac/<sha256>`) and a memory tier in each
-replica: a blob written is checked against its digest, and an action's result is answered only
-when every output it names is there. A run's Bazel reaches it through its worker: a gRPC
+replica: a blob written goes to its key as it arrives, its last byte held back until every byte
+hashes to its digest — a bucket stores nothing it has not read whole, so a blob that is not its
+digest is never stored, and nothing touches the replica's disk — and an action's result is
+answered only when every output it names is there. A run's Bazel reaches it through its worker: a gRPC
 pass-through on a socket of the run's own (`--remote_cache=unix:…`; in a microVM, the guest's
 `/run/ok/cache.sock`, over vsock), which names the run on every call (`x-ok-run`). ok automation
 answers a call only while that run runs, in the namespaces the run's own facts give it — so
@@ -1736,12 +1788,22 @@ may not writes `<account>/u/<author>`, and reads that, then the account's, so no
 another's results. Entries go `automation.cache.ttl` (30 days) after they were written, swept by
 keyed work (`cache`) every hour.
 
-**Done when**, as built. *Fair share* — `Flood` in ok automation's store conformance suite, on
-PostgreSQL and Spanner: an account floods a pool of eight workers with a thousand runs and
-another's ten arrive behind them; the late account takes each of the first four workers that free,
-holds half the pool while it has runs, and none of its runs waits behind the flood. `FairShare`
-holds an account to its concurrent quota with the runs it has elsewhere, and a weight-2 account
-admitted twice as often; `Usage` refuses an account past its month's seconds. *Isolation* —
+**Done when**, as built. *Dispatch and quotas* — ok automation's store conformance suite, on
+PostgreSQL and Spanner: `Quotas` holds an account to its concurrent quota with the runs it has
+elsewhere, its further runs waiting while another account's, queued behind them, are leased at
+once, one starting as one of its runs finishes, and as many more as a larger quota admits as their
+jobs come back; `ConcurrentClaims` has 24 workers claim at once, each run of an unlimited account
+leased exactly once and an account of quota 3 given exactly 3; `DispatchWithTheRun` refuses to queue
+a run whose job the bus refuses, and drops a stale copy of a run's job and an orphan's where they
+are leased; `LapsedLeases` keeps a run its worker heartbeats, its job leased past three heartbeats'
+span, and takes over one whose worker stopped — its next attempt, then, on its last, an error, its
+log stored by its log's job; `ReleaseDispatches` hands a released run to the next worker at once;
+`DispatchUndispatched` dispatches a run an older release queued as a replica starts; `Usage` holds
+back an account past its month's seconds. *Keyed work* — `internal/work`'s tests (runners driven by
+jobs alone, none looking for work; a holder that dies taken over once its lease lapses, not
+before; marks while held and while claimed; a job come early) and the work stores' suite
+(`worktest`) on PostgreSQL and Spanner, which holds a take of work a transaction marks, open, until
+it commits. *Isolation* —
 `TestMicroVM` boots real microVMs and checks what a guest is given: read-only shares the host
 refuses writes to, the host's other paths absent, loopback its only interface, egress only through
 the proxy to the hosts it allows, commands as the worker's user. `TestMicroVMs` runs pre and post
@@ -1752,7 +1814,7 @@ account's; the worker's pass-through names the run it serves whatever the run se
 (`TestCachePassThrough`). Secrets are [secrets.md](secrets.md)'s: post runs of submitted changes read
 what a folder grants their job, and pre none.
 
-**The order.** (1) This design. (2) Accounts, quotas, pools, and fair share at the claim. (3)
+**The order.** (1) This design. (2) Accounts, quotas, pools, and dispatch over the bus. (3)
 microVMs and trust domains. (4) The remote cache. (5) Pools scaling.
 
 *As built, (5):* `internal/automation/scale`, through a two-method view of Deployments (the scale
@@ -1908,9 +1970,8 @@ entries of no CL. A webhook added is pinged. Payloads name people by their stabl
 asked is one notification per reviewer per patchset (its source names both), however it was
 asked: a reviewer added to an open CL, or a draft's reviewers when its author asks for review.
 Notifications of repositories the person may no longer see are not listed; a purge removes them.
-A notification is recorded and its mail queued in one transaction, so a retried `Notify` that
-finds it recorded never loses its mail; the queue is marked after, and a sweep each minute marks
-waiting messages whose mark was lost. Mail is sent at least once — a send that succeeded but whose
+A notification is recorded and its mail queued — its sending's work marked, its job enqueued — in
+one transaction, so a retried `Notify` that finds it recorded never loses its mail. Mail is sent at least once — a send that succeeded but whose
 record failed is sent again. Without `identity.mail`, notifications are recorded and none is
 queued. The failure of a CL in the landing queue does not notify: ok control records no event of
 it.
@@ -1919,9 +1980,9 @@ it.
 `CreateComment`, on PostgreSQL one statement of writable CTEs (event, outbox entry, work mark),
 on Spanner one transaction — so no call site can forget it; it moves with its repository. ok
 control's `work` table and `pgdata.Work`, PostgreSQL's keyed work store beside `spannerdata.Work`.
-The drainer (`internal/control/outbox`) looks for marked outboxes every two seconds, marks those
-moved in unmarked once a minute, and sets each touched CL's entries from the projection, at the
-drain's clock in nanoseconds — drains of a repository are one at a time, its keyed work's —
+The drainer (`internal/control/outbox`) drains each outbox as its mark's job comes — a move's
+arrival marks the outboxes that came with it — and sets each touched CL's entries from the
+projection, at the drain's clock in nanoseconds — drains of a repository are one at a time, its keyed work's —
 then its consumers (notifications, webhooks), then removes the entries. A repository the
 directory's events have not named in the projection yet is named by the directory
 (`GetRepositoryEntry`). The inbox carries no checks verdict: ok control is not told when pre
@@ -2066,12 +2127,14 @@ control, and workers call — nothing internal — as an organization's people a
   shows as latency and backlog, not as less load offered — at a fraction of a cell's share: publish
   (a commit changing a few files of a repository's main, sent as jj sends it); checkpoint;
   upload a CL, review it (LGTM and Approval, the author's own where no OWNERS apply), and submit it
-  once pre passes; CI, by synthetic workers that lease runs — a plan of one job, a job that reads
-  its commit's files and passes after a run's time. Rates are the target's per account and day:
+  once pre passes; CI, by synthetic workers that lease runs — a plan of one job, a job that, with
+  `-present-dir`, presents its commit through okfs as a worker does and reads files of it, and
+  passes after a run's time. Rates are the target's per account and day:
   200 publishes, 50 CI runs; a CL rate, which the target does not name, is a flag (10 a day).
 - It measures each operation — requests, errors by code, latency at p50, p90, p99, and p99.9 (a
-  log-bucketed histogram), offered and achieved rates — and how long a CL took from upload to
-  landing, and writes a report (JSON).
+  log-bucketed histogram), offered and achieved rates, and each by the minute of the run it began
+  in — and how long a CL took from upload to landing, its wait for pre and for post apart, and
+  writes a report (JSON).
 - It checks what must hold however a run went: every CL it submitted landed or failed with a
   reason, none stuck; no operation lost silently.
 
@@ -2136,7 +2199,7 @@ What it found, each fixed and tested on both databases:
 - *Claims.* Every claim wrote its account's usage row and counted its running runs inside its
   transaction (aborted 85–99% at a quarter of a cell's share; workers waited 204 s for a lease).
   Now a claim reads outside its transaction and locks only its run; a concurrent quota is slots;
-  seconds are sharded (*Admission and fair share, at the claim*). At the same load: every CL
+  seconds are sharded (*Dispatch, and admission at the claim*). At the same load: every CL
   landed, leases 3 s at p50.
 - *The lock's fence* read the cell its own refreshes wrote: a fenced transaction past the lease
   lost its lock. Identity's sync of 2,000 people did so, then exceeded a Spanner transaction's
@@ -2263,15 +2326,15 @@ with a test that proves it.
    `TestMoveIn`: an installation with a landed CL is stopped, moved in as `acme`, and started as a
    hosted service — its old URLs redirect, its history names people `@bob`, a clone made before the
    move syncs and lands another CL, and the bare name clones it still.
-5. **Bus backends.** NATS JetStream, Google Pub/Sub, AWS SNS and SQS, and Kafka, each passing the
-   stream and queue suites it implements, against servers in the test process (an embedded NATS
-   server, Pub/Sub's `pstest`, Kafka's `kfake`, and a fake of SNS and SQS). *Done when:* phase 2's
+5. **Bus backends.** NATS JetStream, Google Pub/Sub, and AWS SQS, each passing the queue suite,
+   against servers in the test process (an embedded NATS server, Pub/Sub's `pstest`, and a fake of
+   SQS). *Done when:* phase 2's
    test passes on each.
 6. **Spanner.** A Spanner implementation of every role's data interface and of the directory; Spanner
    Omni on every change and a real instance nightly; cell moves from PostgreSQL to Spanner; random IDs for
    runs, plans, comments, deployments, and checkpoints, their pages ordered by time. First what
-   Spanner lacks leaves PostgreSQL's own mechanisms behind, on PostgreSQL: the bus's signals in place
-   of `LISTEN`/`NOTIFY`; the lock in place of advisory locks; no leaders, and fencing; random IDs.
+   Spanner lacks leaves PostgreSQL's own mechanisms behind, on PostgreSQL: registrations and inboxes
+   in place of `LISTEN`/`NOTIFY`; the lock in place of advisory locks; no leaders, and fencing; random IDs.
    Then `internal/data`'s Spanner primitives and Spanner Omni, and each role's Spanner
    implementation, smallest first — the deployer's, ok control's, ok automation's, identity's, the
    SCM's — each passing its conformance suite on Spanner Omni and on the real instance.
@@ -2282,9 +2345,11 @@ with a test that proves it.
    built*, its order).
    *Done when:* three cells in two regions serve one namespace, and repositories move between them
    under load.
-8. **Hosted automation.** microVM isolation, admission and fair share, dispatch queues per pool,
-   autoscaling, the remote cache per organization, secrets.
-   *Done when:* an organization flooding CI cannot delay another's runs beyond its fair share, and a
+8. **Hosted automation.** microVM isolation, quotas, dispatch queues per pool, autoscaling, the
+   remote cache per organization, secrets.
+   *Done when:* an organization flooding CI holds no more workers than its quota, the rest of its
+   runs set aside so none of another's waits behind them; workers added to a pool add consumers
+   with nothing they contend on; and a
    run cannot read another tenant's checkout, cache, or secrets.
 9. **ok control at scale.** Inboxes, search (repositories, people, code), webhooks, notifications.
 10. **Deploy agents.**
@@ -2295,9 +2360,9 @@ with a test that proves it.
 
 ## Testing
 
-- **Conformance suites** for the data interfaces, the object store, the stream, and the queue, each
-  run against every implementation on every change: PostgreSQL, Spanner Omni; MinIO, a GCS
-  fake, a directory; PostgreSQL, a NATS server, Pub/Sub's fake, Kafka's fake, a fake of SNS and SQS.
+- **Conformance suites** for the data interfaces, the object store, and the queue, each run against
+  every implementation on every change: PostgreSQL, Spanner Omni; MinIO, a GCS fake, a directory; a
+  NATS server, Pub/Sub's fake, a fake of SQS.
 - **Equivalence**: ok's suites and e2e run on each supported combination, as today's suites run a
   scenario in a real and a virtual workspace (okfs.md, "Testing"). The database is
   `OK_TEST_DATABASE`'s and the bus `OK_TEST_BUS`'s: the end-to-end suites on Spanner give each
@@ -2312,16 +2377,15 @@ with a test that proves it.
    interface; no generic SQL or key-value layer.
 3. **Immutable data in object storage as segments**, the database holding mutable state, the
    manifest, and a bounded tail.
-4. **The log is the truth; the bus delivers** at least once, in any order; consumers apply exactly
-   once by cursor.
-5. **Stream backends:** PostgreSQL, NATS JetStream, Pub/Sub, SNS with SQS, Kafka; **queue
-   backends:** PostgreSQL, NATS JetStream, Pub/Sub, SQS; each configured on its own.
+4. **The log is the truth; the relay names what grew** at least once, in any order; consumers
+   apply exactly once by cursor.
+5. **Queue backends:** NATS JetStream, Pub/Sub, SQS.
 6. **Object stores:** S3-compatible, native GCS, filesystem.
 7. **Cells and one global directory**, Spanner multi-region in the hosted service, in its GoogleSQL
    dialect.
 8. **No leaders**: work leased per repository, organization, or shard, fenced where a late write
    could harm; exclusion that is no work by `internal/lock`'s leases, never advisory locks; wake-ups
-   by the bus's signals, never `LISTEN`/`NOTIFY` outside PostgreSQL's own bus.
+   by a registered inbox, never `LISTEN`/`NOTIFY`.
 9. **A Firecracker microVM per hosted run**, caches per trust domain.
 10. **A single installation is one cell**, on today's backends.
 11. **Every cloud, by configuration.** No backend is the default for the hosted service: each

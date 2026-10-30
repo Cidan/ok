@@ -30,7 +30,6 @@ func (s *Server) MoveNetwork(ctx context.Context, req *identitypb.MoveNetworkReq
 		return nil, moveError(err)
 	}
 	s.audit(ctx, c.Principal, "network.move", map[string]any{"network": m.Network, "from": m.Source, "to": m.Destination})
-	s.moveAsked()
 	return s.moveOut(ctx, m)
 }
 
@@ -65,14 +64,7 @@ func (s *Server) CancelMove(ctx context.Context, req *identitypb.CancelMoveReque
 		return nil, moveError(err)
 	}
 	s.audit(ctx, c.Principal, "network.move.cancel", map[string]any{"network": m.Network})
-	s.moveAsked()
 	return s.moveOut(ctx, m)
-}
-
-func (s *Server) moveAsked() {
-	if s.cfg.MoveAsked != nil {
-		s.cfg.MoveAsked()
-	}
 }
 
 // moveError maps a move's refusals to gRPC statuses.

@@ -10,12 +10,14 @@ import (
 	"encoding/base32"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
+	"github.com/Cidan/ok/internal/bus"
 	"github.com/Cidan/ok/internal/directory"
 	"github.com/Cidan/ok/internal/identity"
-	"github.com/Cidan/ok/internal/lock"
+	"github.com/Cidan/ok/internal/wait"
 	"github.com/Cidan/ok/internal/work"
 )
 
@@ -58,8 +60,6 @@ type Store struct {
 	b     Backend
 	names identity.Names
 	now   func() time.Time
-	// relayWake tells this replica's relay there may be events to publish.
-	relayWake chan struct{}
 	// installation is the installation's organization, by ID; "" for a hosted service.
 	installation string
 	// movedIn is the organization an installation moved in as; "" for none.
@@ -162,7 +162,7 @@ func (s *Store) SetOwnerRegion(ctx context.Context, owner, region string) error 
 
 // New is a store over a backend, its principals and sets named under names.
 func New(b Backend, names identity.Names) *Store {
-	return &Store{b: b, names: names, now: time.Now, relayWake: make(chan struct{}, 1)}
+	return &Store{b: b, names: names, now: time.Now}
 }
 
 // SetInstallation names the installation's organization (EnsureOrganization), whose repositories'
@@ -182,16 +182,24 @@ func (s *Store) Names() identity.Names { return s.names }
 // Healthy reports whether the database answers.
 func (s *Store) Healthy(ctx context.Context) bool { return s.b.Ping(ctx) == nil }
 
-// LockSync runs fn holding the sync's lock, which one replica holds at a time, waiting up to wait
-// for it; it returns lock.ErrNotAcquired when it could not take it, and otherwise fn's error.
-func (s *Store) LockSync(ctx context.Context, wait time.Duration, fn lock.LockFn) error {
-	return s.b.Lock(ctx, "identity", "sync", wait, fn)
+// DirectorySyncWork is the installation's sync from its system of record, and HousekeepingWork the
+// deletion of what has expired — sessions, ceremonies, device logins, proofs' nonces — each keyed
+// work (internal/work) of key 0, booked for when it is next due: one replica at a time does it.
+const (
+	DirectorySyncWork = "directory-sync"
+	HousekeepingWork  = "housekeeping"
+)
+
+// Claims are the store's claims that waiters wait on: a sync asked for while another runs waits for
+// its claim, told as it is let go (wait.Claims).
+func (s *Store) Claims() wait.Claims {
+	return wait.Claims{Waits: s.b.Waits(), Queue: s.b.Work().Jobs().Queue, Work: s.b.Work()}
 }
 
-// LockOrganizationSync runs fn holding an organization's sync's lock, as LockSync does the
-// installation's.
-func (s *Store) LockOrganizationSync(ctx context.Context, org string, wait time.Duration, fn lock.LockFn) error {
-	return s.b.Lock(ctx, "identity", "sync:"+org, wait, fn)
+// RunWaits removes lapsed registrations as their steps come, and replies on q — this replica's
+// bus — until ctx ends (wait.Run): every replica runs it.
+func (s *Store) RunWaits(ctx context.Context, q bus.Queue) {
+	wait.Run(ctx, s.b.Waits(), q, slog.Default())
 }
 
 // newID makes an ID: prefix and 26 random base32 characters.

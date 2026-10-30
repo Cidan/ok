@@ -724,10 +724,11 @@ service Admin {
 }
 
 message SetQuotaRequest {
+  reserved 4;
+  reserved "weight";
   string account = 1;  // a person's or an organization's handle
   int32 concurrent = 2;
   int64 minutes = 3;
-  int32 weight = 4;
   bool reset = 5;  // to the default; the rest unset
 }
 
@@ -736,13 +737,14 @@ message GetQuotaRequest {
 }
 
 // Quota is an account's quota of CI: its concurrent runs and its run minutes in a calendar month
-// (UTC), zero for unlimited, and its weight in fair share among the accounts whose runs wait.
+// (UTC), zero for unlimited.
 message Quota {
+  reserved 5;
+  reserved "weight";
   string account_id = 1;
   string account = 2;  // its handle; empty where only its ID was asked
   int32 concurrent = 3;
   int64 minutes = 4;
-  int32 weight = 5;
   bool default = 6;  // identity.default_quota: none set
   // GetQuotas': the account's running runs and this month's run seconds in the cells but the one
   // asking, as each last reported them (ReportUsage) — running runs only from reports of the last
@@ -957,8 +959,8 @@ message GetAppliedResponse {
 }
 
 // DirectoryEvents serves the directory's log of repositories' entries to ok's roles, which follow
-// it (internal/bus/follow) on the bus's topic directory.repositories: each repository's changes,
-// numbered by their place in its log (docs/hosted.md, "Tenancy, as built").
+// it (internal/bus/follow), topic directory.repositories: each repository's changes, numbered by
+// their place in its log (docs/hosted.md, "Tenancy, as built").
 service DirectoryEvents {
   option (ok.v1.callers) = CALLER_SCM;
   option (ok.v1.callers) = CALLER_CONTROL;
@@ -969,7 +971,13 @@ service DirectoryEvents {
   // Heads returns how far each repository's log reaches, a page of repositories at a time, by
   // repository.
   rpc Heads(DirectoryHeadsRequest) returns (DirectoryHeadsResponse);
+  // Follow records the caller's role as one of the log's followers: from then on the relay
+  // enqueues, on its queue, a job naming each repository whose log grows (docs/state.md).
+  rpc Follow(FollowDirectoryRequest) returns (FollowDirectoryResponse);
 }
+
+message FollowDirectoryRequest {}
+message FollowDirectoryResponse {}
 
 // DirectoryEvent is a change to a repository's entry: what happened, and the entry as it stands
 // after. Its owner is named by ID alone — an owner's handle changes apart from its repositories —
@@ -1715,6 +1723,9 @@ message Expiry {
   }
   int64 repository_id = 1;
   Kind kind = 2;
+  // When it expires, by the directory's clock, for one that will and has not yet: deleted, or
+  // still being made.
+  google.protobuf.Timestamp expires_at = 3;
 }
 
 message ListExpiredRepositoriesRequest {

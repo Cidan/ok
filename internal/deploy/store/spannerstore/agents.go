@@ -10,6 +10,23 @@ import (
 	"github.com/Cidan/ok/internal/deploy/store"
 )
 
+func (x queries) OwnedRepositories(ctx context.Context, owner string) ([]int64, error) {
+	var out []int64
+	err := x.Read(func(r spannerdata.Reader) error {
+		out = nil
+		return spannerdata.Each(ctx, r, `SELECT repository_id FROM repository WHERE owner_id = @owner ORDER BY repository_id`,
+			map[string]any{"owner": owner}, func(row *spanner.Row) error {
+				var id int64
+				if err := row.Columns(&id); err != nil {
+					return err
+				}
+				out = append(out, id)
+				return nil
+			})
+	})
+	return out, err
+}
+
 func (x queries) RepositoryOwner(ctx context.Context, id int64) (string, error) {
 	var owner string
 	err := x.Read(func(r spannerdata.Reader) error {

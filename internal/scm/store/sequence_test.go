@@ -363,3 +363,111 @@ func TestUploadPinsWhatItPlanned(t *testing.T) {
 		t.Fatalf("%d trees unpinned after the refused pin, want %d", n, len(trees)-1)
 	}
 }
+
+// A writer that stops between its commit and its pass has what it left pending sequenced by its
+// sequence step's job, SequenceAfter on, and its events published after: no replica looks for what
+// is pending.
+func TestSequencedByItsJob(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	e := newCLEnv(t)
+	if !e.s.b.SequencesAfterCommit() {
+		t.Skip("a PostgreSQL transaction sequences itself")
+	}
+	st := &stream{}
+	r := reopen(t, e.s)
+	relays, stop := context.WithCancel(ctx)
+	defer stop()
+	done := make(chan struct{})
+	go func() { defer close(done); r.Relay(relays, st) }()
+	e.s.skipSequencing, e.s.sequenceAfter = true, 200*time.Millisecond
+	if _, err := e.upload(alice, Ready, nil, e.commit(alice, newChange(), encoding.RootCommitID, "one", map[string]string{"a": "1"})); err == nil {
+		t.Fatal("an upload left unsequenced answered with its CL's number")
+	}
+	if n := e.pendingRows(); n != 2 {
+		t.Fatalf("the upload left %d rows pending, want its CL's and its event's", n)
+	}
+	for e.pendingRows() != 0 {
+		select {
+		case <-ctx.Done():
+			t.Fatal("the stopped writer's rows were never sequenced")
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	e.s.skipSequencing = false
+	for {
+		if seqs, _ := st.published(t, e.repo); seqs[2] {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal("the stopped writer's event was never published")
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	if c := e.cl(1); c.Number != 1 {
+		t.Errorf("the CL: %+v", c)
+	}
+	stop()
+	<-done
+}
+
+// A repository's passes run one at a time across replicas: uploads at once on three, each waiting
+// for a pass, never have two passes of the repository under way, and every one learns its number
+// and places — the pass serving it this replica's or another's, heard of — the log without a gap,
+// and fewer passes run than uploads.
+func TestOnePassAtATime(t *testing.T) {
+	e := newCLEnv(t)
+	if !e.s.b.SequencesAfterCommit() {
+		t.Skip("a PostgreSQL transaction sequences itself")
+	}
+	replicas := []*Store{e.s, reopen(t, e.s), reopen(t, e.s)}
+	var mu sync.Mutex
+	now, most, passes := 0, 0, 0
+	for _, r := range replicas {
+		r.passing = func(repo int64, enter bool) {
+			mu.Lock()
+			defer mu.Unlock()
+			if enter {
+				now++
+				passes++
+				most = max(most, now)
+			} else {
+				now--
+			}
+		}
+	}
+	const waves, width = 3, 24
+	for w := range waves {
+		commits := make([]encoding.ID, width)
+		for i := range commits {
+			commits[i] = e.commit(alice, newChange(), encoding.RootCommitID, fmt.Sprintf("wave %d, %d", w, i),
+				map[string]string{fmt.Sprintf("w%d/f%d", w, i): "x"})
+		}
+		errs := make([]error, width)
+		var wg sync.WaitGroup
+		for i, c := range commits {
+			wg.Go(func() {
+				on := &clEnv{t: t, s: replicas[i%len(replicas)], repo: e.repo}
+				res, err := on.upload(alice, Ready, nil, c)
+				if err == nil && (len(res) != 1 || res[0].Number <= 0) {
+					err = fmt.Errorf("the upload's CLs: %+v", res)
+				}
+				errs[i] = err
+			})
+		}
+		wg.Wait()
+		for i, err := range errs {
+			if err != nil {
+				t.Fatalf("wave %d, upload %d: %v", w, i, err)
+			}
+		}
+	}
+	if log := e.checkLog(); len(log) != 1+waves*width {
+		t.Fatalf("the log holds %d events, for the repository and %d uploads", len(log), waves*width)
+	}
+	t.Logf("%d uploads, %d passes", waves*width, passes)
+	if most != 1 || passes >= waves*width {
+		t.Errorf("at most %d passes at once, %d passes for %d uploads", most, passes, waves*width)
+	}
+}

@@ -3,14 +3,15 @@ package store
 import (
 	"context"
 	"errors"
+	"fmt"
+	"slices"
 	"sync"
 	"testing"
 	"time"
 
-	"google.golang.org/protobuf/proto"
-
 	"github.com/Cidan/ok/internal/bus"
-	scmpb "github.com/Cidan/ok/proto/ok/scm/v1"
+	"github.com/Cidan/ok/internal/scm/scmfeed"
+	"github.com/Cidan/ok/internal/work"
 )
 
 // busy makes events in a repository: two CLs uploaded, sent for review, and landed — eight.
@@ -65,57 +66,65 @@ func TestRepositoryEventLogs(t *testing.T) {
 	}
 }
 
-// stream is a bus.Stream that records what is published, failing while fail is set.
+// testFollower is the follower the test environments register, whose relays stream records.
+const testFollower = "x"
+
+// stream is a bus.Queue that records the relay's jobs for testFollower, failing while fail is set.
 type stream struct {
+	bus.Queue
 	mu   sync.Mutex
-	got  []bus.Event
+	got  []bus.Job
 	fail error
 }
 
-func (s *stream) Publish(_ context.Context, events ...bus.Event) error {
+func (s *stream) Enqueue(_ context.Context, jobs ...bus.Job) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.fail != nil {
 		return s.fail
 	}
-	s.got = append(s.got, events...)
+	for _, j := range jobs {
+		if j.Queue == (work.Jobs{Prefix: testFollower}).QueueOf("relay."+scmfeed.Topic) {
+			s.got = append(s.got, j)
+		}
+	}
 	return nil
 }
 
-func (*stream) CreateGroup(context.Context, string, string) error { return nil }
-func (*stream) Subscribe(context.Context, string, string, bus.Handler) error {
-	return errors.ErrUnsupported
-}
-
-// published are the events of repo the stream got, by place in its log, each checked against what
-// it carries; dup is set when any came twice.
+// published are the events of repo the relay relayed, by place in its log: each job names a key
+// through its page's last event, so a key's jobs, in order, cover its events after the one before
+// through theirs. dup is set when a page was relayed twice: two jobs through one event.
 func (s *stream) published(t *testing.T, repo int64) (seqs map[int64]bool, dup bool) {
 	t.Helper()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	seqs = map[int64]bool{}
-	for _, e := range s.got {
-		ev := &scmpb.Event{}
-		if err := proto.Unmarshal(e.Body, ev); err != nil {
-			t.Fatal(err)
+	var lasts []int64
+	seen := map[int64]bool{}
+	for _, j := range s.got {
+		var key, last int64
+		if _, err := fmt.Sscanf(j.ID, "%d/%d", &key, &last); err != nil || key != j.Key {
+			t.Fatalf("a relay's job %+v: %v", j, err)
 		}
-		if e.Topic != EventTopic || e.Key != ev.GetRepositoryId() || e.Seq != ev.GetRepositorySeq() || ev.GetKind() == nil {
-			t.Fatalf("a published event %+v carries %v", e, ev)
-		}
-		if e.Key != repo {
+		if key != repo {
 			continue
 		}
-		dup = dup || seqs[e.Seq]
-		seqs[e.Seq] = true
+		dup = dup || seen[last]
+		seen[last] = true
+		lasts = append(lasts, last)
+	}
+	slices.Sort(lasts)
+	seqs = map[int64]bool{}
+	for i := int64(1); len(lasts) > 0 && i <= lasts[len(lasts)-1]; i++ {
+		seqs[i] = true
 	}
 	return seqs, dup
 }
 
 // drain relays until no event is pending.
-func drain(t *testing.T, s *Store, st bus.Stream) {
+func drain(t *testing.T, s *Store, st bus.Queue) {
 	t.Helper()
 	for {
-		n, err := s.relayOnce(context.Background(), st)
+		n, err := s.relayOnce(context.Background(), st, 0)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -134,7 +143,7 @@ func TestRelay(t *testing.T) {
 	drain(t, e.s, st)
 	e.busy()
 	st.fail = errors.New("the stream is down")
-	if _, err := e.s.relayOnce(ctx, st); !errors.Is(err, st.fail) {
+	if _, err := e.s.relayOnce(ctx, st, 0); !errors.Is(err, st.fail) {
 		t.Fatalf("a failed publish: %v", err)
 	}
 	st.fail = nil
@@ -148,7 +157,7 @@ func TestRelay(t *testing.T) {
 			t.Errorf("event %d was not published", s)
 		}
 	}
-	if n, err := e.s.relayOnce(ctx, st); err != nil || n != 0 {
+	if n, err := e.s.relayOnce(ctx, st, 0); err != nil || n != 0 {
 		t.Errorf("a relay with nothing pending: %d, %v", n, err)
 	}
 }
@@ -185,4 +194,97 @@ func TestRelaysTogether(t *testing.T) {
 	}
 	stop()
 	wg.Wait()
+}
+
+// A relay step's job that beats its transaction's commit — its events not placed yet — is looked at
+// again soon, until it is a minute old; one whose events another relay published is done, and one
+// whose events wait is done once it published them.
+func TestRelayStep(t *testing.T) {
+	ctx := context.Background()
+	e := newCLEnv(t)
+	st := &stream{}
+	drain(t, e.s, st)
+	step := e.s.relayStep(st)
+	head := int64(len(e.checkLog()))
+	var later work.Later
+	if err := step(ctx, e.repo, relayBody(head+1, head+2), 0); !errors.As(err, &later) || later.After <= 0 || later.After > 2*time.Second {
+		t.Fatalf("a step whose transaction has not committed: %v", err)
+	}
+	if err := step(ctx, e.repo, relayBody(head+1, head+2), commitWithin); err != nil {
+		t.Fatalf("a step whose transaction never committed, a minute on: %v", err)
+	}
+	if err := step(ctx, e.repo, relayBody(1, head), 0); err != nil {
+		t.Fatalf("a step whose events are published: %v", err)
+	}
+	e.busy()
+	after := int64(len(e.checkLog()))
+	if err := step(ctx, e.repo, relayBody(head+1, after), 0); err != nil {
+		t.Fatalf("a step whose events wait: %v", err)
+	}
+	seqs, dup := st.published(t, e.repo)
+	if int64(len(seqs)) != after || dup {
+		t.Fatalf("published %d events of %d (twice: %v)", len(seqs), after, dup)
+	}
+	if n, err := e.s.relayOnce(ctx, st, 0); err != nil || n != 0 {
+		t.Errorf("events left pending: %d, %v", n, err)
+	}
+}
+
+// Every event a write places reaches the stream by its relay step's job alone: no relay looks for
+// events, and one with none to relay reads nothing.
+func TestRelayedByJobs(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	e := newCLEnv(t)
+	st := &stream{}
+	drain(t, e.s, st)
+	relays, stop := context.WithCancel(ctx)
+	defer stop()
+	done := make(chan struct{})
+	go func() { defer close(done); reopen(t, e.s).Relay(relays, st) }()
+	e.busy()
+	want := int64(len(e.checkLog()))
+	for {
+		seqs, dup := st.published(t, e.repo)
+		if dup {
+			t.Fatal("an event was published twice")
+		}
+		if int64(len(seqs)) == want {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("published %d of %d events", len(seqs), want)
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	stop()
+	<-done
+}
+
+// The relay enqueues for the followers registered as it relays: none before one registers — its
+// events are relayed all the same — and, after, for what it relays from then on.
+func TestRelayToFollowers(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	e := &clEnv{t: t, s: s, repo: newRepo(t, s).ID}
+	st := &stream{}
+	e.busy()
+	drain(t, s, st)
+	if seqs, _ := st.published(t, e.repo); len(seqs) != 0 {
+		t.Fatalf("relayed %v with no follower", seqs)
+	}
+	if n, err := s.relayOnce(ctx, st, 0); err != nil || n != 0 {
+		t.Fatalf("with no follower, events left pending: %d, %v", n, err)
+	}
+	before := int64(len(e.checkLog()))
+	if err := s.AddFollower(ctx, testFollower); err != nil {
+		t.Fatal(err)
+	}
+	e.busy()
+	drain(t, s, st)
+	after := int64(len(e.checkLog()))
+	if seqs, dup := st.published(t, e.repo); int64(len(seqs)) != after || dup || after <= before {
+		t.Fatalf("relayed through %d (twice: %v), want through %d, past %d", len(seqs), dup, after, before)
+	}
 }

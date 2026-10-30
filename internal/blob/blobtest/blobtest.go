@@ -44,6 +44,11 @@ func Run(t *testing.T, open func(t *testing.T) blob.Store, o Options) {
 		{"IfAbsent", testIfAbsent},
 		{"IfAbsentRace", testIfAbsentRace},
 		{"ShortReader", testShortReader},
+		{"StreamedReader", testStreamedReader},
+		{"FailingReader", testFailingReader},
+		{"Stage", testStage},
+		{"StageLarge", testStageLarge},
+		{"StageAbort", testStageAbort},
 		{"Delete", testDelete},
 		{"List", testList},
 		{"ListPage", testListPage},
@@ -226,6 +231,27 @@ func testShortReader(t *testing.T, s blob.Store) {
 	}
 	if _, err := s.Stat(ctx, "short"); !errors.Is(err, blob.ErrNotFound) {
 		t.Fatalf("a failed Put left an object: %v", err)
+	}
+}
+
+// streamed is a reader that can only be read once, as a pipe or a reader that checks what it reads
+// is: a store that makes a put again cannot rewind it.
+type streamed struct{ r io.Reader }
+
+func (s *streamed) Read(p []byte) (int, error) { return s.r.Read(p) }
+
+// A put from a reader that cannot be rewound stores every byte, small and past a request's part.
+func testStreamedReader(t *testing.T, s blob.Store) {
+	ctx := context.Background()
+	for _, n := range []int{0, 1, 300 << 10, 17 << 20} {
+		d := data(n)
+		key := fmt.Sprint("streamed/", n)
+		if err := s.Put(ctx, key, &streamed{bytes.NewReader(d)}, int64(n)); err != nil {
+			t.Fatalf("Put %s: %v", key, err)
+		}
+		if got := get(t, s, key); !bytes.Equal(got, d) {
+			t.Fatalf("%s holds %d bytes, want the %d put", key, len(got), n)
+		}
 	}
 }
 
@@ -416,5 +442,139 @@ func testSignGet(t *testing.T, s blob.Store, client *http.Client) {
 	}
 	if got := fetch("bytes=1000-1999"); !bytes.Equal(got, d[1000:2000]) {
 		t.Fatalf("a range of the signed URL served %d bytes", len(got))
+	}
+}
+
+// failing reads data, then fails in place of its last byte, as a reader that checks what it read
+// does when the check refuses it.
+type failing struct {
+	r    io.Reader
+	left int64
+}
+
+var errRefused = errors.New("the bytes were refused")
+
+func (f *failing) Read(p []byte) (int, error) {
+	if int64(len(p)) >= f.left {
+		p = p[:f.left-1]
+		n, err := f.r.Read(p)
+		f.left -= int64(n)
+		if f.left == 1 {
+			return 0, errRefused
+		}
+		return n, err
+	}
+	n, err := f.r.Read(p)
+	f.left -= int64(n)
+	return n, err
+}
+
+// A Put whose reader fails in place of its last byte stores nothing, and leaves an object already
+// at the key as it was: small, sent in one request, and larger than one part of a multipart
+// upload.
+func testFailingReader(t *testing.T, s blob.Store) {
+	ctx := context.Background()
+	for _, n := range []int{1 << 10, 20 << 20} {
+		key := fmt.Sprintf("failing/%d", n)
+		err := s.Put(ctx, key, &failing{r: bytes.NewReader(data(n)), left: int64(n)}, int64(n))
+		if err == nil {
+			t.Fatalf("a Put of %d bytes whose reader failed for its last succeeded", n)
+		}
+		if _, err := s.Stat(ctx, key); !errors.Is(err, blob.ErrNotFound) {
+			t.Fatalf("a Put of %d bytes whose reader failed left an object: %v", n, err)
+		}
+		put(t, s, key, []byte("kept"))
+		if err := s.Put(ctx, key, &failing{r: bytes.NewReader(data(n)), left: int64(n)}, int64(n)); err == nil {
+			t.Fatalf("replacing with %d bytes whose reader failed succeeded", n)
+		}
+		if got := get(t, s, key); string(got) != "kept" {
+			t.Fatalf("a failed Put of %d bytes replaced what was there: %d bytes", n, len(got))
+		}
+	}
+}
+
+// stage writes d to a staged object in pieces of piece bytes.
+func stage(t *testing.T, s blob.Store, tmp string, d []byte, piece int) blob.Staged {
+	t.Helper()
+	st, err := s.Stage(context.Background(), tmp)
+	if err != nil {
+		t.Fatalf("Stage: %v", err)
+	}
+	for rest := d; len(rest) > 0; {
+		n := min(len(rest), piece)
+		if _, err := st.Write(rest[:n]); err != nil {
+			t.Fatalf("writing a staged object: %v", err)
+		}
+		rest = rest[n:]
+	}
+	return st
+}
+
+// A staged object, committed, is at its key — replacing what was there — and its temporary key
+// holds nothing after.
+func testStage(t *testing.T, s blob.Store) {
+	ctx := context.Background()
+	d := data(300_000)
+	st := stage(t, s, "tmp/staged-1", d, 7_000)
+	if err := st.Commit(ctx, "named/one"); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	if got := get(t, s, "named/one"); !bytes.Equal(got, d) {
+		t.Fatalf("the committed object: %d bytes, want %d", len(got), len(d))
+	}
+	if o, err := s.Stat(ctx, "named/one"); err != nil || o.Size != int64(len(d)) {
+		t.Fatalf("Stat of the committed object: %+v, %v", o, err)
+	}
+	if objs, err := s.List(ctx, "tmp/"); err != nil || len(objs) != 0 {
+		t.Fatalf("after Commit, the temporary space holds %v, %v", keys(objs), err)
+	}
+	st.Abort() // after Commit, nothing
+	if got := get(t, s, "named/one"); !bytes.Equal(got, d) {
+		t.Fatal("an Abort after Commit undid it")
+	}
+	put(t, s, "named/two", []byte("old"))
+	if err := stage(t, s, "tmp/staged-2", []byte("new"), 1).Commit(ctx, "named/two"); err != nil {
+		t.Fatalf("Commit over an object: %v", err)
+	}
+	if got := get(t, s, "named/two"); string(got) != "new" {
+		t.Fatalf("a Commit over an object left %q", got)
+	}
+	empty := stage(t, s, "tmp/staged-3", nil, 1)
+	if err := empty.Commit(ctx, "named/empty"); err != nil {
+		t.Fatalf("Commit of nothing: %v", err)
+	}
+	if o, err := s.Stat(ctx, "named/empty"); err != nil || o.Size != 0 {
+		t.Fatalf("an empty staged object: %+v, %v", o, err)
+	}
+}
+
+// A staged object larger than one part of a multipart upload is whole once committed.
+func testStageLarge(t *testing.T, s blob.Store) {
+	d := data(37 << 20)
+	if err := stage(t, s, "tmp/large", d, 1<<20+3).Commit(context.Background(), "named/large"); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	if got := get(t, s, "named/large"); !bytes.Equal(got, d) {
+		t.Fatalf("the committed object: %d bytes, want %d", len(got), len(d))
+	}
+}
+
+// An aborted staged object is nowhere: not at a key, and not at its temporary key.
+func testStageAbort(t *testing.T, s blob.Store) {
+	ctx := context.Background()
+	for _, n := range []int{100, 20 << 20} {
+		tmp := fmt.Sprintf("tmp/aborted-%d", n)
+		st := stage(t, s, tmp, data(n), 1<<20)
+		st.Abort()
+		st.Abort()
+		if err := st.Commit(ctx, "named/aborted"); err == nil {
+			t.Fatalf("a Commit after Abort of %d bytes succeeded", n)
+		}
+		if _, err := s.Stat(ctx, "named/aborted"); !errors.Is(err, blob.ErrNotFound) {
+			t.Fatalf("an aborted object of %d bytes was named: %v", n, err)
+		}
+		if _, err := s.Stat(ctx, tmp); !errors.Is(err, blob.ErrNotFound) {
+			t.Fatalf("an aborted object of %d bytes is at its temporary key: %v", n, err)
+		}
 	}
 }

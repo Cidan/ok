@@ -4,9 +4,12 @@ import (
 	"context"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/Cidan/ok/internal/identity"
 	"github.com/Cidan/ok/internal/names"
@@ -113,17 +116,35 @@ func (f *fakeDirectory) ListPrincipals(_ context.Context, in *identitypb.ListPri
 	if in.GetKind() != identitypb.Kind_KIND_HUMAN {
 		panic("asked for non-humans")
 	}
-	active := identitypb.Status_STATUS_ACTIVE
-	if in.GetPageToken() == "" {
-		return &identitypb.ListPrincipalsResponse{NextPageToken: "2", Principals: []*identitypb.Principal{
-			{Id: "prn_3", Name: "lina.human.example.com", Status: active},
-			{Id: "prn_9", Name: "gone.human.example.com", Status: identitypb.Status_STATUS_DELETED},
-		}}, nil
+	page := allPeople[:2]
+	resp := &identitypb.ListPrincipalsResponse{NextPageToken: "2"}
+	if in.GetPageToken() != "" {
+		page, resp.NextPageToken = allPeople[2:], ""
 	}
-	return &identitypb.ListPrincipalsResponse{Principals: []*identitypb.Principal{
-		{Id: "prn_1", Name: "olin.human.example.com", Status: active},
-		{Id: "prn_2", Name: "linda.human.example.com", Status: active},
-	}}, nil
+	for _, p := range page {
+		if strings.Contains(p.GetName(), in.GetQuery()) {
+			resp.Principals = append(resp.Principals, p)
+		}
+	}
+	return resp, nil
+}
+
+// allPeople are the fake's, two a page.
+var allPeople = []*identitypb.Principal{
+	{Id: "prn_3", Name: "lina.human.example.com", Kind: identitypb.Kind_KIND_HUMAN, Status: identitypb.Status_STATUS_ACTIVE},
+	{Id: "prn_9", Name: "gone.human.example.com", Kind: identitypb.Kind_KIND_HUMAN, Status: identitypb.Status_STATUS_DELETED},
+	{Id: "prn_1", Name: "olin.human.example.com", Kind: identitypb.Kind_KIND_HUMAN, Status: identitypb.Status_STATUS_ACTIVE},
+	{Id: "prn_2", Name: "linda.human.example.com", Kind: identitypb.Kind_KIND_HUMAN, Status: identitypb.Status_STATUS_ACTIVE},
+}
+
+func (f *fakeDirectory) GetPrincipal(_ context.Context, in *identitypb.GetPrincipalRequest, _ ...grpc.CallOption) (*identitypb.GetPrincipalResponse, error) {
+	f.calls++
+	for _, p := range allPeople {
+		if p.GetId() == in.GetId() {
+			return &identitypb.GetPrincipalResponse{Principal: p}, nil
+		}
+	}
+	return nil, status.Error(codes.NotFound, "no such principal")
 }
 
 func (f *fakeDirectory) CheckAdmin(_ context.Context, in *identitypb.CheckAdminRequest, _ ...grpc.CallOption) (*identitypb.CheckAdminResponse, error) {
@@ -157,8 +178,8 @@ func (f *fakeDirectory) ListRetiredNames(context.Context, *identitypb.ListRetire
 	return &identitypb.ListRetiredNamesResponse{Names: []*identitypb.RetiredName{{Name: "old.group.example.com"}, {Name: "gone.human.example.com"}}}, nil
 }
 
-// The directory answers by stable ID: people in their names' order, a search by handle, ACL
-// members, and administrators.
+// The directory answers by stable ID — people in their names' order, a search by handle, ACL
+// members, and administrators — asking ok identity each time.
 func TestDirectory(t *testing.T) {
 	ctx := context.Background()
 	f := &fakeDirectory{}
@@ -177,8 +198,8 @@ func TestDirectory(t *testing.T) {
 	if err != nil || !reflect.DeepEqual(got, []string{"prn_3", "prn_1"}) {
 		t.Errorf("search: %v, %v", got, err)
 	}
-	if f.calls != 2 {
-		t.Errorf("identity was asked %d times; the cache should hold one listing", f.calls)
+	if f.calls != 2+2+2 {
+		t.Errorf("identity was asked %d times; want a listing's two pages, two lookups, and a search's two pages", f.calls)
 	}
 	if members, err := d.ACLMembers(ctx, "team.acl.example.com"); err != nil || !reflect.DeepEqual(members, []string{"prn_1", "prn_3"}) {
 		t.Errorf("ACLMembers = %v, %v", members, err)
@@ -198,10 +219,10 @@ func TestDirectory(t *testing.T) {
 		t.Errorf("Admins = %v, %v", admins, err)
 	}
 	d.Admins(ctx)
-	if f.adminCalls != 3 {
-		t.Errorf("identity was asked about administrators %d times; each answer is cached", f.adminCalls)
+	if f.adminCalls != 6 {
+		t.Errorf("identity was asked about administrators %d times; want each time", f.adminCalls)
 	}
-	// What a tree's names reach, but its own sets; asked once while cached, the names in any order.
+	// What a tree's names reach, but its own sets, the names in any order.
 	want := map[string][]string{"eng.group.example.com": {"olin.human.example.com"}, "app.acme.team.example.com": {"lina.human.example.com"},
 		"old.group.example.com": {"lina.human.example.com"}}
 	for _, names := range [][]string{{"team.acl.example.com", "eng.group.example.com"}, {"eng.group.example.com", "team.acl.example.com", "eng.group.example.com"}} {
@@ -209,8 +230,8 @@ func TestDirectory(t *testing.T) {
 			t.Errorf("Sets(%v) = %v, %v", names, sets, err)
 		}
 	}
-	if f.setsCalls != 1 {
-		t.Errorf("identity was asked for sets %d times; the answer is cached", f.setsCalls)
+	if f.setsCalls != 2 {
+		t.Errorf("identity was asked for sets %d times; want each time", f.setsCalls)
 	}
 	retired, err := d.RetiredSetNames(ctx)
 	if err != nil || !reflect.DeepEqual(retired, map[string]bool{"old.group.example.com": true}) {

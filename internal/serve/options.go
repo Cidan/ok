@@ -23,6 +23,7 @@ type options struct {
 	metricsAddr      string
 	profiling        bool
 	listener         net.Listener
+	local            net.Listener
 	reflection       bool
 	tls              *tls.Config
 	middleware       func(http.Handler) http.Handler
@@ -48,6 +49,10 @@ func WithReflection() Option { return func(o *options) { o.reflection = true } }
 // WithListener serves l instead of listening on an address: tests bind an ephemeral port and
 // know it up front.
 func WithListener(l net.Listener) Option { return func(o *options) { o.listener = l } }
+
+// WithLocal serves gRPC on l too: the process's own calls to its roles (inproc.Listener), which
+// WithAuthn's resolver takes as the roles they name.
+func WithLocal(l net.Listener) Option { return func(o *options) { o.local = l } }
 
 // WithUnaryInterceptor installs unary gRPC server interceptors on the shared server, outermost
 // first, after authentication's. It covers every Service's REST surface too: REST is served as

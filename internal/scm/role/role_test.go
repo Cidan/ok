@@ -12,10 +12,10 @@ import (
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"google.golang.org/protobuf/proto"
 
 	"github.com/Cidan/ok/internal/bus"
-	"github.com/Cidan/ok/internal/bus/pgbus"
+	"github.com/Cidan/ok/internal/bus/busconfig"
+	"github.com/Cidan/ok/internal/bus/bustest"
 	"github.com/Cidan/ok/internal/cells"
 	"github.com/Cidan/ok/internal/config"
 	"github.com/Cidan/ok/internal/credential"
@@ -32,6 +32,7 @@ import (
 	"github.com/Cidan/ok/internal/serve"
 	"github.com/Cidan/ok/internal/testdb"
 	"github.com/Cidan/ok/internal/testdb/testobjects"
+	"github.com/Cidan/ok/internal/work"
 	identitypb "github.com/Cidan/ok/proto/ok/identity/v1"
 	scmpb "github.com/Cidan/ok/proto/ok/scm/v1"
 )
@@ -63,6 +64,7 @@ identity:
 	if err != nil {
 		t.Fatal(err)
 	}
+	cfg.Bus = bustest.Config(t)
 	url := testdb.Postgres(t)
 	idPool, err := pgdb.Open(ctx, url, idrole.Schema, 0)
 	if err != nil {
@@ -179,6 +181,7 @@ func TestSCMDev(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	cfg.Bus = bustest.Config(t)
 	pool, err := pgdb.Open(ctx, testdb.Postgres(t), role.Schema, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -191,30 +194,12 @@ func TestSCMDev(t *testing.T) {
 	}
 	defer scm.Close()
 	adaID := id.ID("ada.human.example.com")
-	// The SCM publishes its events on the bus the configuration names: PostgreSQL's, beside its
-	// own tables.
-	busPool, err := pgdb.Beside(ctx, pool, pgbus.Schema)
+	// The SCM relays its events to the roles that follow them, on the bus the configuration names.
+	bb, err := busconfig.Open(ctx, cfg.Bus)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer busPool.Close()
-	b, err := pgbus.Open(ctx, busPool, pgbus.Options{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer b.Close()
-	if err := b.CreateGroup(ctx, store.EventTopic, "test"); err != nil {
-		t.Fatal(err)
-	}
-	published := make(chan *scmpb.Event, 16)
-	go b.Subscribe(ctx, store.EventTopic, "test", func(_ context.Context, e bus.Event) error {
-		ev := &scmpb.Event{}
-		if err := proto.Unmarshal(e.Body, ev); err != nil || e.Key != ev.GetRepositoryId() || e.Seq != ev.GetRepositorySeq() {
-			t.Errorf("a published event %+v: %v, %v", e, ev, err)
-		}
-		published <- ev
-		return nil
-	})
+	defer bb.Close()
 	lis, _ := net.Listen("tcp", "127.0.0.1:0")
 	done := make(chan error, 1)
 	go func() { done <- serve.Run(ctx, scm.Root, serve.WithAuthn(scm.Resolver), serve.WithListener(lis)) }()
@@ -227,6 +212,16 @@ func TestSCMDev(t *testing.T) {
 		t.Cleanup(func() { conn.Close() })
 		return scmpb.NewRepositoriesClient(conn)
 	}
+	// ok control follows them.
+	ctlConn, err := dial.Dial(lis.Addr().String(), dial.Options{DevPrincipal: "control.ok.robot.example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ctlConn.Close()
+	events := scmpb.NewEventsClient(ctlConn)
+	if _, err := events.Follow(ctx, &scmpb.FollowRequest{}); err != nil {
+		t.Fatalf("ok control following the SCM's events: %v", err)
+	}
 	r, err := as("ada.human.example.com").CreateRepository(ctx, &scmpb.CreateRepositoryRequest{Name: "dev"})
 	if err != nil || r.GetName() != "dev" || r.GetCreatedBy() != "ada.human.example.com" || r.GetCreatedById() != adaID {
 		t.Fatalf("CreateRepository = %v, %v", r, err)
@@ -234,13 +229,19 @@ func TestSCMDev(t *testing.T) {
 	if got, err := as("ada.human.example.com").GetRepository(ctx, &scmpb.GetRepositoryRequest{Key: &scmpb.GetRepositoryRequest_Name{Name: "dev"}}); err != nil || got.GetId() != r.GetId() {
 		t.Errorf("by its name = %v, %v", got, err)
 	}
-	select {
-	case ev := <-published:
-		if ev.GetRepositoryId() != r.GetId() || ev.GetRepositorySeq() != 1 || ev.GetRepositoryCreated().GetCreatedById() != adaID {
-			t.Errorf("the published event: %v", ev)
-		}
-	case <-time.After(30 * time.Second):
-		t.Fatal("the repository's creation was never published")
+	// The relay names the repository, through its first event, on ok control's queue; the event is
+	// read from the SCM.
+	relays := work.Jobs{Queue: bb.Queue, Prefix: "control"}.QueueOf("relay." + store.EventTopic)
+	ls, err := bb.Queue.Lease(ctx, relays, bus.LeaseOptions{Max: 1, Visibility: time.Minute, Wait: 30 * time.Second})
+	if err != nil || len(ls) != 1 || ls[0].Job().ID != fmt.Sprintf("%d/1", r.GetId()) {
+		t.Fatalf("the relay of the repository's creation: %v, %v", ls, err)
+	}
+	read, err := events.Read(ctx, &scmpb.ReadEventsRequest{RepositoryId: r.GetId()})
+	if err != nil || len(read.GetEvents()) != 1 {
+		t.Fatalf("the repository's log: %v, %v", read, err)
+	}
+	if ev := read.GetEvents()[0]; ev.GetRepositorySeq() != 1 || ev.GetRepositoryCreated().GetCreatedById() != adaID {
+		t.Errorf("the repository's first event: %v", ev)
 	}
 	if _, err := as("not a name").GetRepository(ctx, &scmpb.GetRepositoryRequest{Key: &scmpb.GetRepositoryRequest_Name{Name: "dev"}}); status.Code(err) != codes.Unauthenticated {
 		t.Errorf("a name that is no principal's: %v", err)
@@ -289,6 +290,7 @@ func TestSCMCells(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		cfg.Bus = bustest.Config(t)
 		pool, err := pgdb.Open(ctx, testdb.Postgres(t), role.Schema, 0)
 		if err != nil {
 			t.Fatal(err)

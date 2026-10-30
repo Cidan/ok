@@ -20,9 +20,7 @@ database:
   spanner: {instance: projects/PROJECT/instances/ok-staging, prefix: staging}
 config:
   profiling: true # Go's profiles on the metrics port: what a run under load spends its CPU on
-  bus:
-    stream: {type: nats, nats: {url: "nats://nats.nats.svc:4222", prefix: ok}}
-    queue: {type: nats, nats: {url: "nats://nats.nats.svc:4222", prefix: ok}}
+  bus: {type: nats, nats: {url: "nats://nats.nats.svc:4222", prefix: ok}}
   identity:
     sign_in:
       oidc:

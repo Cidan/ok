@@ -14,7 +14,7 @@ import (
 // that drives a self deployment it starts: this one. It returns those it started.
 func (s *Store) StartTurns(ctx context.Context, driver string) ([]*Deployment, error) {
 	var started []*Deployment
-	err := s.b.Txn(ctx, func(tx Ops) error {
+	err := s.txn(ctx, func(tx Ops) error {
 		started = nil
 		if err := tx.LockStarts(ctx); err != nil {
 			return err
@@ -64,6 +64,10 @@ func (s *Store) StartTurns(ctx context.Context, driver string) ([]*Deployment, e
 			}
 			busy.take(d)
 			d.Status, d.Driver = Running, drv
+			// Stepped from now on, by its driver for one of the deployer itself.
+			if err := tx.MarkWork(ctx, StepKind(d), d.ID); err != nil {
+				return err
+			}
 			started = append(started, d)
 		}
 		return nil

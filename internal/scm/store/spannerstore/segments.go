@@ -233,18 +233,90 @@ func (x queries) PinnedObjects(ctx context.Context, repo int64, limit int) ([]ba
 		map[string]any{"repo": repo, "limit": int64(limit)})
 }
 
-func (x queries) PinnedTreeSizes(ctx context.Context, repo int64, limit int) ([]backend.Object, error) {
-	return x.objects(ctx, `SELECT ts.tree_id, ts.body FROM tree_sizes ts
-		LEFT JOIN object o ON o.repository_id = ts.repository_id AND o.id = ts.tree_id
-		WHERE ts.repository_id = @repo AND (o.id IS NULL OR o.pinned) ORDER BY ts.tree_id LIMIT @limit`,
-		map[string]any{"repo": repo, "limit": int64(limit)}, encoding.KindTree)
+// window reads a window of the tail's keys, each with whether its row is to be taken: sql selects
+// them, a key's columns then a BOOL, in order.
+func (x queries) window(ctx context.Context, sql string, params map[string]any, key func(*spanner.Row) ([]byte, error)) (keys [][]byte, take []bool, err error) {
+	err = x.rows(ctx, sql, params, func() { keys, take = nil, nil }, func(row *spanner.Row) error {
+		k, err := key(row)
+		if err != nil {
+			return err
+		}
+		var t spanner.NullBool
+		if err := row.Column(row.Size()-1, &t); err != nil {
+			return err
+		}
+		keys, take = append(keys, k), append(take, t.Valid && t.Bool)
+		return nil
+	})
+	return keys, take, err
 }
 
-func (x queries) PinnedCopyEdges(ctx context.Context, repo int64, limit int) ([][2]encoding.ID, error) {
-	return x.pairs(ctx, `SELECT cp.copy_id, cp.parent_id FROM copy_parent cp
-		LEFT JOIN object o ON o.repository_id = cp.repository_id AND o.id = cp.copy_id
-		WHERE cp.repository_id = @repo AND (o.id IS NULL OR o.pinned) ORDER BY cp.parent_id, cp.copy_id LIMIT @limit`,
-		map[string]any{"repo": repo, "limit": int64(limit)})
+func oneKey(row *spanner.Row) ([]byte, error) {
+	var k []byte
+	return k, row.Column(0, &k)
+}
+
+// PinnedTreeSizes reads the window's keys, each with whether its tree is pinned, then the records
+// it takes.
+func (x queries) PinnedTreeSizes(ctx context.Context, repo int64, after []byte, scan, limit int) ([]backend.Object, []byte, bool, error) {
+	p := map[string]any{"repo": repo, "scan": int64(scan)}
+	window := `SELECT tree_id FROM tree_sizes WHERE repository_id = @repo ORDER BY tree_id LIMIT @scan`
+	if after != nil {
+		p["after"] = after
+		window = `SELECT tree_id FROM tree_sizes WHERE repository_id = @repo AND tree_id > @after ORDER BY tree_id LIMIT @scan`
+	}
+	keys, take, err := x.window(ctx, `SELECT w.tree_id, (o.id IS NULL OR IFNULL(o.pinned, FALSE)) FROM (`+window+`) w
+		LEFT JOIN object o ON o.repository_id = @repo AND o.id = w.tree_id ORDER BY w.tree_id`, p, oneKey)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	taken, last, _, more := backend.Window(keys, take, scan, limit)
+	if len(taken) == 0 {
+		return nil, last, more, nil
+	}
+	objs, err := x.objects(ctx, `SELECT tree_id, body FROM tree_sizes WHERE repository_id = @repo AND tree_id IN UNNEST(@ids) ORDER BY tree_id`,
+		map[string]any{"repo": repo, "ids": taken}, encoding.KindTree)
+	return objs, last, more, err
+}
+
+// PinnedCopyEdges reads the window's edges — those of the copy after's after its parent, then those
+// of later copies, each a seek — each with whether its copy is pinned.
+func (x queries) PinnedCopyEdges(ctx context.Context, repo int64, after *[2]encoding.ID, scan, limit int) ([][2]encoding.ID, *[2]encoding.ID, bool, error) {
+	p := map[string]any{"repo": repo, "scan": int64(scan)}
+	window := `SELECT copy_id, parent_id FROM copy_parent WHERE repository_id = @repo ORDER BY copy_id, parent_id LIMIT @scan`
+	if after != nil {
+		p["copy"], p["parent"] = after[0][:], after[1][:]
+		window = `SELECT copy_id, parent_id FROM (
+			(SELECT copy_id, parent_id FROM copy_parent WHERE repository_id = @repo AND copy_id = @copy AND parent_id > @parent
+				ORDER BY parent_id LIMIT @scan)
+			UNION ALL
+			(SELECT copy_id, parent_id FROM copy_parent WHERE repository_id = @repo AND copy_id > @copy ORDER BY copy_id, parent_id LIMIT @scan))
+			ORDER BY copy_id, parent_id LIMIT @scan`
+	}
+	keys, take, err := x.window(ctx, `SELECT w.copy_id, w.parent_id, (o.id IS NULL OR IFNULL(o.pinned, FALSE)) FROM (`+window+`) w
+		LEFT JOIN object o ON o.repository_id = @repo AND o.id = w.copy_id ORDER BY w.copy_id, w.parent_id`, p,
+		func(row *spanner.Row) ([]byte, error) {
+			var c, pa []byte
+			if err := row.Columns(&c, &pa, new(spanner.NullBool)); err != nil {
+				return nil, err
+			}
+			return append(c, pa...), nil
+		})
+	if err != nil || len(keys) == 0 {
+		return nil, nil, false, err
+	}
+	taken, last, _, more := backend.Window(keys, take, scan, limit)
+	edge := func(k []byte) (e [2]encoding.ID) {
+		copy(e[0][:], k[:encoding.IDLen])
+		copy(e[1][:], k[encoding.IDLen:])
+		return e
+	}
+	out := make([][2]encoding.ID, len(taken))
+	for i, k := range taken {
+		out[i] = edge(k)
+	}
+	l := edge(last)
+	return out, &l, more, nil
 }
 
 // pathKey is a row of main's path history's key, as a STRUCT parameter.
@@ -329,15 +401,14 @@ func (x queries) DeleteCompacted(ctx context.Context, repo int64, c backend.Comp
 		}
 		add(`DELETE FROM copy_parent WHERE repository_id = @repo AND STRUCT<a BYTES, b BYTES>(copy_id, parent_id) IN UNNEST(@edges)`, "edges", edges)
 	}
-	if len(c.ChangeLists) > 0 {
-		// Their patchsets go first: deleted with them (patchset's foreign key), they would count in the
-		// CLs' statement.
-		add(`DELETE FROM patchset WHERE repository_id = @repo
-			AND cl_id IN (SELECT id FROM changelist WHERE repository_id = @repo AND number IN UNNEST(@numbers) AND status = @settled)`,
-			"numbers", c.ChangeLists)
-		stmts[len(stmts)-1].p["settled"] = int64(settledStatus)
-		add(`DELETE FROM changelist WHERE repository_id = @repo AND number IN UNNEST(@numbers) AND status = @settled`, "numbers", c.ChangeLists)
-		stmts[len(stmts)-1].p["settled"] = int64(settledStatus)
+	// Landed CLs go by key, their patchsets with them (patchset's foreign key cascades), read nowhere
+	// in the transaction: a landed CL changes no more, and only the compaction that read it settled
+	// deletes it. Deleted by statements that found them by number and status, the transaction read
+	// the repository's CLs, holding them — every upload, transition, and sequencing pass waited, up
+	// to twenty seconds a compaction, for a scan that grew with every CL landed.
+	var muts []*spanner.Mutation
+	for _, id := range c.ChangeListIDs {
+		muts = append(muts, spanner.Delete("changelist", spanner.Key{repo, id}))
 	}
 	if len(c.MainLog) > 0 {
 		add(`DELETE FROM head_log WHERE repository_id = @repo AND seq IN UNNEST(@seqs)`, "seqs", c.MainLog)
@@ -348,6 +419,9 @@ func (x queries) DeleteCompacted(ctx context.Context, repo int64, c backend.Comp
 				return err
 			}
 		}
-		return nil
+		if len(muts) == 0 {
+			return nil
+		}
+		return tx.BufferWrite(muts)
 	})
 }

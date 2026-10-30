@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"cloud.google.com/go/storage"
+	"github.com/googleapis/gax-go/v2"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
@@ -63,8 +64,20 @@ func NewGCS(ctx context.Context, cfg GCSConfig) (*GCS, error) {
 // NewGCSFromClient is a Store over bucket through client, which the caller keeps: tests, with an
 // in-process server's client.
 func NewGCSFromClient(client *storage.Client, bucket string) *GCS {
-	return &GCS{client: client, bucket: client.Bucket(bucket), name: bucket}
+	return &GCS{client: client, bucket: retrying(client.Bucket(bucket)), name: bucket}
 }
+
+// retrying has every request of b that fails for a moment — a 429, a 5xx, a dropped connection —
+// made again, a while after, up to gcsAttempts times: writes too, whose writers write what any of
+// them may (Store.Put). GCS's own policy makes again only what it can tell is idempotent, which an
+// unconditional write is not: staging's publish failed on one 503 on its pack.
+func retrying(b *storage.BucketHandle) *storage.BucketHandle {
+	return b.Retryer(storage.WithPolicy(storage.RetryAlways), storage.WithMaxAttempts(gcsAttempts),
+		storage.WithBackoff(gax.Backoff{Initial: 100 * time.Millisecond, Max: 3 * time.Second, Multiplier: 2}))
+}
+
+// gcsAttempts bounds the attempts at a request: about six seconds of backing off.
+const gcsAttempts = 6
 
 // WithSigner signs URLs as the service account id with its PEM private key, instead of with what
 // the client's credentials offer: for a client whose credentials hold no key and cannot reach IAM
@@ -115,6 +128,9 @@ func (g *GCS) Put(ctx context.Context, key string, r io.Reader, size int64, opts
 	w := obj.NewWriter(ctx)
 	w.ContentType = "application/octet-stream"
 	w.StorageClass = gcsClasses[o.class]
+	// The writer buffers a chunk to retry with: a small object's own size, not the default 16 MiB
+	// each of many uploads at once would hold.
+	w.ChunkSize = min(gcsChunkSize, int(max(size, 1)))
 	if err := copyN(w, r, size); err != nil {
 		// The abort must reach the upload before Close does: canceling the context aborts it
 		// from another goroutine, which a Close could beat, committing what was written so far.
@@ -262,4 +278,61 @@ func (g *GCS) SignGet(ctx context.Context, key string, ttl time.Duration) (_ str
 		return "", g.wrap("sign", key, err)
 	}
 	return u, nil
+}
+
+// gcsChunkSize is the most an upload buffers to retry a request with: the client's default.
+const gcsChunkSize = 16 << 20
+
+// Stage uploads the object at tmp as it is written, and Commit copies it to its key within the
+// bucket — a rewrite that moves no bytes through this process — then deletes tmp.
+func (g *GCS) Stage(ctx context.Context, tmp string) (Staged, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	w := g.bucket.Object(tmp).NewWriter(ctx)
+	w.ContentType = "application/octet-stream"
+	w.ChunkSize = gcsChunkSize
+	return &gcsStaged{g: g, tmp: tmp, w: w, cancel: cancel}, nil
+}
+
+type gcsStaged struct {
+	g      *GCS
+	tmp    string
+	w      *storage.Writer
+	cancel context.CancelFunc
+	n      int64
+	done   bool
+}
+
+func (s *gcsStaged) Write(p []byte) (int, error) {
+	n, err := s.w.Write(p)
+	s.n += int64(n)
+	return n, err
+}
+
+func (s *gcsStaged) Commit(ctx context.Context, key string) (err error) {
+	defer func(start time.Time) { observe(s.g.name, "put", start, s.n, err) }(time.Now())
+	if s.done {
+		return errors.New("blob: a staged object committed after it ended")
+	}
+	s.done = true
+	defer s.cancel()
+	if err := s.w.Close(); err != nil {
+		return s.g.wrap("put", s.tmp, err)
+	}
+	// tmp goes whether the copy succeeds or not; one this delete misses, the caller's sweep takes.
+	defer s.g.bucket.Object(s.tmp).Delete(context.WithoutCancel(ctx))
+	if _, err := s.g.bucket.Object(key).CopierFrom(s.g.bucket.Object(s.tmp)).Run(ctx); err != nil {
+		return s.g.wrap("put", key, err)
+	}
+	return nil
+}
+
+func (s *gcsStaged) Abort() {
+	if s.done {
+		return
+	}
+	s.done = true
+	// As Put's: the abort reaches the upload before Close, which would otherwise commit it.
+	s.cancel()
+	_ = s.w.CloseWithError(errAborted)
+	_ = s.w.Close()
 }

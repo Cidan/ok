@@ -48,7 +48,7 @@ func (c *countingBlobs) GetRange(ctx context.Context, key string, offset, length
 func counted(t *testing.T, s *Store) (*Store, *countingBlobs) {
 	t.Helper()
 	c := &countingBlobs{Store: s.blobs}
-	return mustOpen(t, dbOf(s), c, Config{ObjectCacheBytes: 8 << 20, ChunkCacheBytes: 64 << 20, DiffCacheBytes: 8 << 20, Signals: s.signals}), c
+	return mustOpen(t, dbOf(s), c, Config{ObjectCacheBytes: 8 << 20, ChunkCacheBytes: 64 << 20, DiffCacheBytes: 8 << 20}), c
 }
 
 // textOf is n lines of text, line i reading "<prefix> i".

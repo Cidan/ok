@@ -109,14 +109,12 @@ func TestAuthorize(t *testing.T) {
 	// Granted read, bob reads, publishes to his workspace, and proposes; where proposing needs
 	// write, he is told so.
 	c.ten.grant(repo, "id-bob.human.example.com", "read")
-	c.access.checker.Forget(repo)
 	for what, do := range all {
 		if err := do(bob); refused(err) {
 			t.Errorf("bob, a reader, %s: %v", what, err)
 		}
 	}
 	c.ten.set(repo, "", "write")
-	c.access.checker.Forget(repo)
 	err = upload(bob)
 	if status.Code(err) != codes.PermissionDenied || status.Convert(err).Message() != "To propose needs write, and the caller is read" {
 		t.Errorf("a reader uploading where proposing needs write: %v", err)
@@ -217,7 +215,6 @@ func TestAuthorizeRobots(t *testing.T) {
 		t.Errorf("a robot granted nothing naming it: %v", err)
 	}
 	c.ten.grant(shared.GetId(), "id-ci.acme.robot.example.com", "read")
-	c.access.checker.Forget(shared.GetId())
 	if err := read(); err != nil {
 		t.Errorf("a robot granted read reading: %v", err)
 	}

@@ -2,8 +2,8 @@ package storetest
 
 import (
 	"context"
+	"fmt"
 	"reflect"
-	gosync "sync"
 	"testing"
 	"time"
 
@@ -14,36 +14,36 @@ import (
 	"github.com/Cidan/ok/internal/id/dirfeed"
 	"github.com/Cidan/ok/internal/id/store"
 	"github.com/Cidan/ok/internal/tenancy"
+	"github.com/Cidan/ok/internal/work"
 	identitypb "github.com/Cidan/ok/proto/ok/identity/v1"
 )
 
-// stream is a bus stream that keeps what is published.
-type stream struct {
-	mu        gosync.Mutex
-	published []bus.Event
-}
-
-func (s *stream) Publish(_ context.Context, es ...bus.Event) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.published = append(s.published, es...)
-	return nil
-}
-func (*stream) CreateGroup(context.Context, string, string) error { return nil }
-func (*stream) Subscribe(ctx context.Context, _, _ string, _ bus.Handler) error {
-	<-ctx.Done()
-	return ctx.Err()
-}
-
-func (s *stream) events() []bus.Event {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return append([]bus.Event(nil), s.published...)
+// relayed are the keys, each through its last seq, that the jobs on queue name, taken as they come
+// until want is met or the wait ends.
+func relayed(t *testing.T, q bus.Queue, queue string, want map[int64]int64) map[int64]int64 {
+	t.Helper()
+	got := map[int64]int64{}
+	deadline := time.Now().Add(10 * time.Second)
+	for !reflect.DeepEqual(got, want) && time.Now().Before(deadline) {
+		ls, err := q.Lease(context.Background(), queue, bus.LeaseOptions{Max: 100, Visibility: time.Minute, Wait: 100 * time.Millisecond})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, l := range ls {
+			var key, seq int64
+			if _, err := fmt.Sscanf(l.Job().ID, "%d/%d", &key, &seq); err != nil {
+				t.Fatalf("a relay's job %q: %v", l.Job().ID, err)
+			}
+			got[key] = max(got[key], seq)
+			l.Ack(context.Background())
+		}
+	}
+	return got
 }
 
 // The directory's log: each change to an entry that stands is an event in its repository's log, in
 // order, carrying the entry after it; an entry being made is in none; the relay publishes each
-// once.
+// once to each follower registered.
 func testDirectoryLog(t *testing.T, s *store.Store) {
 	ctx := context.Background()
 	now := time.Unix(1_800_000_000, 0)
@@ -156,35 +156,31 @@ func testDirectoryLog(t *testing.T, s *store.Store) {
 		t.Errorf("heads = %v, want %v", got, want)
 	}
 
-	// The relay publishes each event once, on the directory's topic.
-	st := &stream{}
+	// The relay enqueues, on a registered follower's queue, a job naming each repository whose log
+	// grew, through its last event; on none for a role that never registered.
+	if err := s.AddFollower(ctx, "x"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AddFollower(ctx, "x"); err != nil {
+		t.Fatalf("registering twice: %v", err)
+	}
+	q := bus.NewLocalQueue()
 	rctx, cancel := context.WithCancel(ctx)
 	done := make(chan error, 1)
-	go func() { done <- s.Relay(rctx, st) }()
-	deadline := time.Now().Add(10 * time.Second)
-	for len(st.events()) < 13 && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
+	go func() { done <- s.Relay(rctx, q) }()
+	queue := work.Jobs{Queue: q, Prefix: "x"}.QueueOf("relay." + dirfeed.Topic)
+	if got := relayed(t, q, queue, map[int64]int64{r.ID: 10, other.ID: 3}); !reflect.DeepEqual(got, map[int64]int64{r.ID: 10, other.ID: 3}) {
+		t.Fatalf("relayed %v, want each repository through its head", got)
 	}
 	if _, err := s.SetVisibility(ctx, other.ID, tenancy.Internal); err != nil {
 		t.Fatal(err)
 	}
-	for len(st.events()) < 14 && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
+	if got := relayed(t, q, queue, map[int64]int64{other.ID: 4}); !reflect.DeepEqual(got, map[int64]int64{other.ID: 4}) {
+		t.Fatalf("relayed %v after a change, want the repository through it", got)
 	}
-	time.Sleep(50 * time.Millisecond)
 	cancel()
 	<-done
-	pub := st.events()
-	if len(pub) != 14 {
-		t.Fatalf("published %d events, want 14", len(pub))
-	}
-	for _, e := range pub {
-		ev, err := dirfeed.Decode(e)
-		if err != nil || e.Topic != dirfeed.Topic {
-			t.Errorf("published %v: %v", e, err)
-		}
-		if e.Key == other.ID && e.Seq == 4 && ev.GetRepository().GetVisibility() != "internal" {
-			t.Errorf("the last event = %v", ev)
-		}
+	if ls, err := q.Lease(ctx, work.Jobs{Queue: q, Prefix: "y"}.QueueOf("relay."+dirfeed.Topic), bus.LeaseOptions{Max: 1, Visibility: time.Minute}); err != nil || len(ls) != 0 {
+		t.Errorf("a role that never registered got %d jobs, %v", len(ls), err)
 	}
 }

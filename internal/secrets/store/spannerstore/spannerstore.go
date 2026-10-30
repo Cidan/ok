@@ -111,6 +111,10 @@ func (x queries) InsertRepositoryKey(ctx context.Context, k store.RepositoryKey)
 	return n == 1, err
 }
 
+func (x queries) MarkWorkAt(ctx context.Context, kind string, key int64, at time.Time) error {
+	return x.Write(ctx, func(tx *spanner.ReadWriteTransaction) error { return spannerdata.MarkWorkAt(ctx, tx, kind, key, at) })
+}
+
 func (x queries) UpdateRepositoryKey(ctx context.Context, repo, version int64, root string, wrapped []byte) error {
 	_, err := x.Exec(ctx, `UPDATE repository_key SET root_id = @root, wrapped = @wrapped
 		WHERE repository_id = @repo AND version = @version AND wrapped IS NOT NULL`,

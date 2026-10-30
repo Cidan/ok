@@ -1,9 +1,5 @@
 // Package pubsubbus is the bus (internal/bus) on Google Pub/Sub (docs/hosted.md, "Backends").
 //
-// A topic is a Pub/Sub topic of its own, and a group a subscription to it, which receives what is
-// published after it was made; a handler's error nacks its event, delivered again by the
-// subscription's retry policy.
-//
 // A queue is a topic and a subscription read by synchronous pulls. A job's ack deadline is its
 // lease: set to the visibility asked for, up to Pub/Sub's ten minutes, and renewed until the
 // visibility has passed — at least ten seconds, Pub/Sub's shortest deadline. Past it a lease is
@@ -46,12 +42,6 @@ type Options struct {
 	// MaxAttempts is how many deliveries a job gets before it is a dead letter: at most 100.
 	// Default 10.
 	MaxAttempts int
-	// AckDeadline is a group's deliveries' deadline, which the client extends while a handler
-	// works. Default a minute.
-	AckDeadline time.Duration
-	// Concurrency is how many of a group's deliveries a member handles at once, and holds
-	// unacknowledged. Default 32.
-	Concurrency int
 }
 
 func (o *Options) defaults() {
@@ -65,12 +55,6 @@ func (o *Options) defaults() {
 		o.MaxAttempts = 10
 	}
 	o.MaxAttempts = min(o.MaxAttempts, 100)
-	if o.AckDeadline <= 0 {
-		o.AckDeadline = time.Minute
-	}
-	if o.Concurrency <= 0 {
-		o.Concurrency = 32
-	}
 }
 
 // Pub/Sub's bounds on an ack deadline.
@@ -82,13 +66,13 @@ const (
 // Attributes a message carries.
 const (
 	attrKey       = "ok-key"
-	attrSeq       = "ok-seq"
 	attrID        = "ok-id"
 	attrNotBefore = "ok-not-before"
 	attrAttempts  = "ok-attempts" // deliveries before it was moved onto a topic anew
+	attrQueue     = "ok-queue"    // the process's queue of inboxes a reply is for
 )
 
-// Bus is a bus.Stream and a bus.Queue on one Pub/Sub client.
+// Bus is a bus.Queue on one Pub/Sub client.
 type Bus struct {
 	c    *pubsub.Client
 	opts Options
@@ -96,18 +80,54 @@ type Bus struct {
 	mu         sync.Mutex
 	made       map[string]bool // topics and subscriptions made
 	publishers map[string]*pubsub.Publisher
+	// inboxes are this process's inboxes (bus.Inboxes): every process's replies share one topic,
+	// each process's queue a subscription to it that keeps its own, which Pub/Sub removes a day
+	// after it was last leased, should the process stop before it closes its inboxes.
+	inboxes *bus.Inboxes
 }
 
-var (
-	_ bus.Stream  = (*Bus)(nil)
-	_ bus.Queue   = (*Bus)(nil)
-	_ bus.Signals = (*Bus)(nil)
-)
+var _ bus.Queue = (*Bus)(nil)
 
 // Open is a bus on c's project.
 func Open(c *pubsub.Client, opts Options) *Bus {
 	opts.defaults()
-	return &Bus{c: c, opts: opts, made: map[string]bool{}, publishers: map[string]*pubsub.Publisher{}}
+	b := &Bus{c: c, opts: opts, made: map[string]bool{}, publishers: map[string]*pubsub.Publisher{}}
+	b.inboxes = bus.NewInboxes(b, b.prepareInboxes, b.dropInboxes)
+	return b
+}
+
+// Inbox opens an inbox, on this process's subscription to the topic of replies.
+func (b *Bus) Inbox(ctx context.Context) (bus.Inbox, error) { return b.inboxes.Open(ctx) }
+
+// CloseInboxes closes the process's inboxes and removes their subscription.
+func (b *Bus) CloseInboxes(ctx context.Context) error { return b.inboxes.Close(ctx) }
+
+func (b *Bus) inboxTopic() string { return b.topicName(b.opts.Prefix + "-inbox") }
+
+// prepareInboxes makes the process's subscription to the topic of replies, filtered to its own,
+// unless it is there: a reply published before it is made is not delivered to it.
+func (b *Bus) prepareInboxes(ctx context.Context, queue string) error {
+	if err := b.ensureTopic(ctx, b.inboxTopic(), 0); err != nil {
+		return err
+	}
+	_, err := b.c.SubscriptionAdminClient.CreateSubscription(ctx, &pubsubpb.Subscription{
+		Name: b.queueSub(queue), Topic: b.inboxTopic(), AckDeadlineSeconds: int32(minDeadline / time.Second),
+		Filter:                   fmt.Sprintf("attributes.%s = %q", attrQueue, queue),
+		MessageRetentionDuration: durationpb.New(10 * time.Minute),
+		ExpirationPolicy:         &pubsubpb.ExpirationPolicy{Ttl: durationpb.New(24 * time.Hour)},
+	})
+	if err != nil && status.Code(err) != codes.AlreadyExists {
+		return fmt.Errorf("pubsubbus: the subscription of %s: %w", queue, err)
+	}
+	return nil
+}
+
+func (b *Bus) dropInboxes(ctx context.Context, queue string) error {
+	err := b.c.SubscriptionAdminClient.DeleteSubscription(ctx, &pubsubpb.DeleteSubscriptionRequest{Subscription: b.queueSub(queue)})
+	if err != nil && status.Code(err) != codes.NotFound {
+		return fmt.Errorf("pubsubbus: removing %s: %w", queue, err)
+	}
+	return nil
 }
 
 // Close stops the bus's publishers, sending what they hold.
@@ -202,74 +222,12 @@ func (b *Bus) publish(ctx context.Context, topics []string, msgs []*pubsub.Messa
 	return nil
 }
 
-// ─── The stream ───
-
-func (b *Bus) eventTopic(topic string) string {
-	return b.topicName(b.opts.Prefix + "-ev-" + token(topic))
-}
-func (b *Bus) groupSub(topic, group string) string {
-	return b.subName(b.opts.Prefix + "-ev-" + token(topic) + "-" + token(group))
-}
-
-// Publish publishes events.
-func (b *Bus) Publish(ctx context.Context, events ...bus.Event) error {
-	topics := make([]string, len(events))
-	msgs := make([]*pubsub.Message, len(events))
-	for i, e := range events {
-		topics[i] = b.eventTopic(e.Topic)
-		if err := b.ensureTopic(ctx, topics[i], 0); err != nil {
-			return err
-		}
-		msgs[i] = &pubsub.Message{Data: e.Body, Attributes: map[string]string{
-			attrKey: strconv.FormatInt(e.Key, 10), attrSeq: strconv.FormatInt(e.Seq, 10)}}
-	}
-	return b.publish(ctx, topics, msgs)
-}
-
-// CreateGroup makes group's subscription to topic, which receives what is published from now on.
-func (b *Bus) CreateGroup(ctx context.Context, topic, group string) error {
-	t := b.eventTopic(topic)
-	if err := b.ensureTopic(ctx, t, 0); err != nil {
-		return err
-	}
-	return b.ensureSub(ctx, &pubsubpb.Subscription{
-		Name: b.groupSub(topic, group), Topic: t, AckDeadlineSeconds: int32(b.opts.AckDeadline / time.Second),
-		MessageRetentionDuration: durationpb.New(b.opts.Retention),
-		RetryPolicy:              &pubsubpb.RetryPolicy{MinimumBackoff: durationpb.New(time.Second), MaximumBackoff: durationpb.New(time.Minute)},
-	})
-}
-
-// Subscribe handles topic's events as a member of group until ctx ends.
-func (b *Bus) Subscribe(ctx context.Context, topic, group string, h bus.Handler) error {
-	if err := b.CreateGroup(ctx, topic, group); err != nil {
-		return err
-	}
-	s := b.c.Subscriber(b.groupSub(topic, group))
-	// The client runs a callback for each delivery it holds, up to what flow control lets it hold:
-	// the stream promises no order, and a consumer applies each by its key's cursor.
-	s.ReceiveSettings.MaxOutstandingMessages = b.opts.Concurrency
-	err := s.Receive(ctx, func(ctx context.Context, m *pubsub.Message) {
-		key, kerr := strconv.ParseInt(m.Attributes[attrKey], 10, 64)
-		seq, serr := strconv.ParseInt(m.Attributes[attrSeq], 10, 64)
-		if kerr != nil || serr != nil {
-			m.Ack() // not an event of this package's: nothing a retry would change
-			return
-		}
-		if h(ctx, bus.Event{Topic: topic, Key: key, Seq: seq, Body: m.Data}) == nil {
-			m.Ack()
-		} else {
-			m.Nack()
-		}
-	})
-	if err != nil && ctx.Err() == nil {
-		return fmt.Errorf("pubsubbus: receiving %s/%s: %w", topic, group, err)
-	}
-	return ctx.Err()
-}
-
 // ─── The queue ───
 
 func (b *Bus) queueTopic(queue string) string {
+	if bus.IsInboxQueue(queue) {
+		return b.inboxTopic()
+	}
 	return b.topicName(b.opts.Prefix + "-q-" + token(queue))
 }
 func (b *Bus) queueSub(queue string) string { return b.subName(b.opts.Prefix + "-q-" + token(queue)) }
@@ -283,8 +241,12 @@ func (b *Bus) deadTopic(queue string) string {
 	return b.topicName(b.opts.Prefix + "-dead-" + token(queue))
 }
 
-// ensureQueue makes a queue's topics and subscriptions.
+// ensureQueue makes a queue's topics and subscriptions; a process's queue of inboxes, the topic of
+// replies alone (prepareInboxes makes its subscription).
 func (b *Bus) ensureQueue(ctx context.Context, queue string) error {
+	if bus.IsInboxQueue(queue) {
+		return b.ensureTopic(ctx, b.inboxTopic(), 0)
+	}
 	dead := b.deadTopic(queue)
 	if err := b.ensureTopic(ctx, dead, b.opts.Retention); err != nil {
 		return err
@@ -327,6 +289,7 @@ func (b *Bus) Enqueue(ctx context.Context, jobs ...bus.Job) error {
 	topics := make([]string, len(jobs))
 	msgs := make([]*pubsub.Message, len(jobs))
 	for i, j := range jobs {
+		j, reply := bus.InboxJob(j)
 		if err := b.ensureQueue(ctx, j.Queue); err != nil {
 			return err
 		}
@@ -335,6 +298,9 @@ func (b *Bus) Enqueue(ctx context.Context, jobs ...bus.Job) error {
 			topics[i] = b.laterTopic(j.Queue)
 		}
 		msgs[i] = jobMessage(j, 0)
+		if reply {
+			msgs[i].Attributes[attrQueue] = j.Queue
+		}
 	}
 	return b.publish(ctx, topics, msgs)
 }
@@ -405,8 +371,10 @@ func (b *Bus) Lease(ctx context.Context, queue string, o bus.LeaseOptions) ([]bu
 	if err := b.ensureQueue(ctx, queue); err != nil {
 		return nil, err
 	}
-	if err := b.promote(ctx, queue); err != nil {
-		return nil, err
+	if !bus.IsInboxQueue(queue) {
+		if err := b.promote(ctx, queue); err != nil {
+			return nil, err
+		}
 	}
 	sub := b.queueSub(queue)
 	msgs, err := b.pull(ctx, sub, max(o.Max, 1), o.Wait)
@@ -451,6 +419,53 @@ type leased struct {
 
 func (l *leased) Job() bus.Job { return l.job }
 func (l *leased) Attempt() int { return l.attempt }
+
+// Handle names the delivery by its subscription and ack ID, which any client acknowledges.
+func (l *leased) Handle() []byte { return bus.EncodeHandle(l.job.Queue, l.job.ID, l.sub, l.ackID) }
+
+// Resume is the lease of the delivery whose subscription and ack ID the handle names.
+func (b *Bus) Resume(handle []byte) (bus.Leased, error) {
+	parts, err := bus.DecodeHandle(handle, 4)
+	if err != nil {
+		return nil, err
+	}
+	return &resumed{b: b, job: bus.Job{Queue: parts[0], ID: parts[1]}, sub: parts[2], ackID: parts[3], handle: handle}, nil
+}
+
+// resumed is a delivery leased by another process, or by this one before: its ack deadline is
+// modified, and it is acknowledged, by its ack ID. Its subscription's dead-letter policy keeps it
+// past its attempts.
+type resumed struct {
+	b          *Bus
+	job        bus.Job
+	sub, ackID string
+	handle     []byte
+}
+
+func (r *resumed) Job() bus.Job   { return r.job }
+func (r *resumed) Attempt() int   { return 0 }
+func (r *resumed) Handle() []byte { return r.handle }
+
+func (r *resumed) Extend(ctx context.Context, d time.Duration) error {
+	if err := r.b.modify(ctx, r.sub, []string{r.ackID}, min(max(d, minDeadline), maxDeadline)); err != nil {
+		return fmt.Errorf("pubsubbus: extending: %w", err)
+	}
+	return nil
+}
+
+func (r *resumed) Ack(ctx context.Context) error {
+	if err := r.b.ack(ctx, r.sub, r.ackID); err != nil {
+		return fmt.Errorf("pubsubbus: acknowledging: %w", err)
+	}
+	return nil
+}
+
+func (r *resumed) Nack(ctx context.Context, delay time.Duration) error {
+	if err := r.b.modify(ctx, r.sub, []string{r.ackID}, min(max(delay, 0), maxDeadline)); err != nil {
+		return fmt.Errorf("pubsubbus: returning a job: %w", err)
+	}
+	return nil
+}
 
 // start renews the ack deadline every few seconds until the lease's deadline passes or it is
 // finished, each renewal reaching at least past the deadline or the most Pub/Sub keeps.

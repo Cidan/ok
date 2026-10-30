@@ -2,6 +2,7 @@ package spannerstore
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"slices"
 	"time"
@@ -72,6 +73,7 @@ func (x queries) InsertCommits(ctx context.Context, repo int64, commits []backen
 	var gens []int64
 	var conflicted []bool
 	var committed []time.Time
+	var by []string
 	for _, c := range commits {
 		if seen[c.ID] {
 			continue
@@ -79,14 +81,15 @@ func (x queries) InsertCommits(ctx context.Context, repo int64, commits []backen
 		seen[c.ID] = true
 		idCol, changes, bs = append(idCol, c.ID[:]), append(changes, c.ChangeID), append(bs, c.Body)
 		gens, conflicted, committed = append(gens, c.Generation), append(conflicted, c.Conflicted), append(committed, micros(c.CommittedAt))
+		by = append(by, cmp.Or(c.WrittenBy, writtenBy))
 	}
 	return x.returningIDs(ctx, `INSERT OR IGNORE INTO commit (repository_id, id, change_id, body, generation, conflicted, committed_at, written_by,
 			pinned, touched_at)
-		SELECT @repo, id, @changes[OFFSET(i)], @bodies[OFFSET(i)], @gens[OFFSET(i)], @conflicted[OFFSET(i)], @committed[OFFSET(i)], @by,
+		SELECT @repo, id, @changes[OFFSET(i)], @bodies[OFFSET(i)], @gens[OFFSET(i)], @conflicted[OFFSET(i)], @committed[OFFSET(i)], @by[OFFSET(i)],
 			FALSE, CURRENT_DATE('UTC')
 		FROM UNNEST(@ids) AS id WITH OFFSET i THEN RETURN id`,
 		map[string]any{"repo": repo, "ids": idCol, "changes": changes, "bodies": bs, "gens": gens, "conflicted": conflicted,
-			"committed": committed, "by": writtenBy}, bodySize(bs), "ids", "changes", "bodies", "gens", "conflicted", "committed")
+			"committed": committed, "by": by}, bodySize(bs), "ids", "changes", "bodies", "gens", "conflicted", "committed", "by")
 }
 
 func (x queries) InsertCommitParents(ctx context.Context, repo int64, edges []backend.ParentEdge) error {
@@ -511,10 +514,21 @@ func (x queries) InsertTreeSizes(ctx context.Context, repo int64, trees []encodi
 
 // ─── Main's history ───
 
-func (x queries) InsertHeadLog(ctx context.Context, repo int64, h backend.HeadMove) error {
-	_, err := x.exec(ctx, `INSERT INTO head_log (repository_id, seq, old_head, new_head, cl_number, patchset, landed_by, landed_at)
-		VALUES (@repo, @seq, @old, @new, @cl, @patchset, @by, `+now+`)`,
-		map[string]any{"repo": repo, "seq": h.Seq, "old": h.Old[:], "new": h.New[:], "cl": h.CL, "patchset": int64(h.Patchset), "by": h.By})
+func (x queries) InsertHeadLogs(ctx context.Context, repo int64, moves []backend.HeadMove) error {
+	if len(moves) == 0 {
+		return nil
+	}
+	seqs, cls, patchsets := make([]int64, len(moves)), make([]int64, len(moves)), make([]int64, len(moves))
+	olds, news, by := make([][]byte, len(moves)), make([][]byte, len(moves)), make([]string, len(moves))
+	for i, h := range moves {
+		seqs[i], cls[i], patchsets[i] = h.Seq, h.CL, int64(h.Patchset)
+		olds[i], news[i], by[i] = h.Old[:], h.New[:], h.By
+	}
+	_, err := x.execIn(ctx, `INSERT INTO head_log (repository_id, seq, old_head, new_head, cl_number, patchset, landed_by, landed_at)
+		SELECT @repo, seq, @olds[OFFSET(i)], @news[OFFSET(i)], @cls[OFFSET(i)], @patchsets[OFFSET(i)], @by[OFFSET(i)], `+now+`
+		FROM UNNEST(@seqs) AS seq WITH OFFSET i`,
+		map[string]any{"repo": repo, "seqs": seqs, "olds": olds, "news": news, "cls": cls, "patchsets": patchsets, "by": by},
+		[]string{"seqs", "olds", "news", "cls", "patchsets", "by"}, nil)
 	return err
 }
 
@@ -589,13 +603,31 @@ func (x queries) DeletePathIndex(ctx context.Context, repo, gen int64) error {
 	return err
 }
 
-func (x queries) InsertCommitPaths(ctx context.Context, repo, gen int64, commit encoding.ID, paths []string) error {
+// InsertCommitPaths writes every commit's paths in one statement, a chunk of rows at a time.
+func (x queries) InsertCommitPaths(ctx context.Context, repo int64, rows []backend.CommitPaths) error {
+	type key struct {
+		path string
+		gen  int64
+		c    encoding.ID
+	}
+	seen := map[key]bool{}
+	var paths []string
+	var gens []int64
+	var commits [][]byte
+	for _, r := range rows {
+		for _, p := range r.Paths {
+			if k := (key{p, r.Generation, r.Commit}); !seen[k] {
+				seen[k] = true
+				paths, gens, commits = append(paths, p), append(gens, r.Generation), append(commits, r.Commit[:])
+			}
+		}
+	}
 	if len(paths) == 0 {
 		return nil
 	}
 	_, err := x.execIn(ctx, `INSERT OR IGNORE INTO commit_path (repository_id, path, generation, commit_id)
-		SELECT DISTINCT @repo, p, @gen, @commit FROM UNNEST(@paths) AS p`,
-		map[string]any{"repo": repo, "gen": gen, "commit": commit[:], "paths": paths}, []string{"paths"}, nil)
+		SELECT @repo, p, @gens[OFFSET(i)], @commits[OFFSET(i)] FROM UNNEST(@paths) AS p WITH OFFSET i`,
+		map[string]any{"repo": repo, "paths": paths, "gens": gens, "commits": commits}, []string{"paths", "gens", "commits"}, nil)
 	return err
 }
 

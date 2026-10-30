@@ -20,6 +20,7 @@ import (
 
 	"google.golang.org/grpc"
 
+	"github.com/Cidan/ok/internal/checkout"
 	"github.com/Cidan/ok/internal/client/auth"
 	"github.com/Cidan/ok/internal/dial"
 	"github.com/Cidan/ok/internal/idclient"
@@ -49,6 +50,8 @@ func loadRun(args []string, stdout io.Writer) error {
 	clsPerDay := flags.Float64("cls-per-day", 10, "CLs a repository a day: the target names no rate")
 	duration := flags.Duration("duration", 5*time.Minute, "how long load is offered")
 	drain := flags.Duration("drain", 5*time.Minute, "how long after that it waits for CLs under way")
+	burstAt := flags.Duration("burst-at", 0, "how long into the run every person starts a CL at once, beside the shape's (0: never)")
+	burstSubmit := flags.Duration("burst-submit-after", 0, "how long after the burst every one of its CLs whose pre passed is submitted at once")
 	publishBytes := flags.Int("publish-bytes", load.PublishBytes, "bytes a publish sends: by default, an account's ingest a day over its publishes")
 	checkpointBytes := flags.Int("checkpoint-bytes", load.CheckpointFile, "bytes a checkpoint's changed file holds")
 	clBytes := flags.Int("cl-bytes", 64<<10, "bytes a CL's change holds")
@@ -56,8 +59,10 @@ func loadRun(args []string, stdout io.Writer) error {
 	seedFileBytes := flags.Int("seed-file-bytes", load.SeedFileBytes, "bytes each seeded file holds")
 	workers := flags.Int("workers", 16, "synthetic workers")
 	runTime := flags.Duration("run-time", 10*time.Second, "how long a synthetic job takes")
-	read := flags.Bool("read", true, "synthetic jobs read their commit's files through the SCM")
-	checkoutDir := flags.String("checkout-dir", "", "with -read, each synthetic worker keeps a real checkout in a directory of its own here and moves it to each job's commit, as a worker does (default: each job reads its whole commit)")
+	presentDir := flags.String("present-dir", "", "each synthetic worker presents its jobs' commits through okfs, as a worker does, at a directory of its own here; the load must then run in a user and mount namespace of its own (unshare --map-root-user --mount --propagation private), with /dev/fuse (default: synthetic jobs present nothing)")
+	jjPath := flags.String("jj", "", "ok's jj, the okfs daemon (with -present-dir; default: jj on the PATH)")
+	readFiles := flags.Int("read-files", 200, "files a synthetic job reads through its presentation, at random among the seeded tree's, as a build reads its sources")
+	warmCheckouts := flags.Bool("warm-checkouts", false, "with -present-dir, every synthetic worker presents main before the run offers anything")
 	inFlight := flags.Int("max-in-flight", 2000, "an operation's requests under way at most: one offered past it is shed")
 	reportPath := flags.String("report", "", "where to write the report, JSON (default: none; -: standard output, one line marked \"ok load report:\")")
 	people := flags.Int("people", 0, "people to act as, each signed in through the installation's sign-in and on a connection of their own (0: the one person of -credential-dir or -dev-person)")
@@ -188,10 +193,21 @@ func loadRun(args []string, stdout io.Writer) error {
 	rates := shape.Rates()
 	slog.Info("ok load: offering", "shape", shape.String(), "publishes/s", rates.Publishes, "checkpoints/s", rates.Checkpoints, "cls/s", rates.CLs,
 		"browses/s", rates.Browses)
+	var present func(worker string) (checkout.Checkout, error)
+	if *presentDir != "" {
+		v, err := loadPresentations(ctx, *presentDir, *jjPath, *addr, !*plaintext, *caFile, wo)
+		if err != nil {
+			return err
+		}
+		defer v.Close()
+		present = func(worker string) (checkout.Checkout, error) {
+			return v.At(filepath.Join(*presentDir, "workers", strings.ReplaceAll(worker, "/", "_")))
+		}
+	}
 	rep, err := load.Run(ctx, load.Config{People: who, WorkerClients: workerClients, WorkerPrefix: strconv.Itoa(*pod),
-		Repos: rs, Shape: shape, Duration: *duration, Drain: *drain, MaxInFlight: *inFlight, PublishBytes: *publishBytes, CheckpointBytes: *checkpointBytes, CLBytes: *clBytes,
-		Workers: *workers, RunTime: *runTime, Read: *read, CheckoutDir: *checkoutDir, SeedFiles: *seedFiles, SeedFileBytes: *seedFileBytes, SeedLands: *pod == 0,
-		Pod: *pod, Pods: *pods, Log: slog.Default()})
+		Repos: rs, Shape: shape, Duration: *duration, Drain: *drain, BurstAt: *burstAt, BurstSubmitAfter: *burstSubmit, MaxInFlight: *inFlight, PublishBytes: *publishBytes, CheckpointBytes: *checkpointBytes, CLBytes: *clBytes,
+		Workers: *workers, RunTime: *runTime, Present: present, ReadFiles: *readFiles, WarmCheckouts: *warmCheckouts, SeedFiles: *seedFiles, SeedFileBytes: *seedFileBytes,
+		SeedLands: *pod == 0, Pod: *pod, Pods: *pods, Log: slog.Default()})
 	if err != nil {
 		return err
 	}
@@ -371,4 +387,26 @@ func loadCost(args []string, stdout io.Writer) error {
 		fmt.Fprintln(stdout, "  "+a)
 	}
 	return nil
+}
+
+// loadPresentations is the okfs daemon the synthetic workers present through, as a worker's: run
+// from dir/okfs, acting as the workers' robot — its credential kept current for the daemon, or
+// the development principal it names.
+func loadPresentations(ctx context.Context, dir, jjPath, addr string, tls bool, caFile string, wo dial.Options) (*checkout.Virtual, error) {
+	if err := checkout.RequireIsolated(); err != nil {
+		return nil, err
+	}
+	jj, err := lookPath(jjPath, "jj")
+	if err != nil {
+		return nil, fmt.Errorf("ok's jj, the okfs daemon: %w", err)
+	}
+	vc := checkout.VirtualConfig{Dir: filepath.Join(dir, "main"), State: filepath.Join(dir, "okfs"), JJ: jj, SCM: addr, TLS: tls, CAFile: caFile,
+		DevPrincipal: wo.DevPrincipal, Log: os.Stderr}
+	if wo.Credential != nil {
+		vc.ConfigDir = filepath.Join(dir, "okfs", "config")
+		if err := keepCredential(ctx, wo.Credential, filepath.Join(vc.ConfigDir, "credential"), auth.Server{Addr: addr, TLS: tls}); err != nil {
+			return nil, fmt.Errorf("the okfs daemon's credential: %w", err)
+		}
+	}
+	return checkout.NewVirtual(vc)
 }

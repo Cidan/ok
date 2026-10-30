@@ -36,7 +36,7 @@ func TestDefaultsAndRefusals(t *testing.T) {
 		t.Fatal(err)
 	}
 	if c.Listen != ":8472" || c.MetricsListen != ":8473" || c.Installation != "ok" || c.Identity.SystemOfRecord.Interval != 10*time.Minute ||
-		c.Bus.Stream.Type != "postgres" || c.Bus.Queue.Type != "postgres" || c.Tenancy.Mode != "installation" || c.Tenancy.Organization != "example" {
+		c.Bus.Type != "" || c.Tenancy.Mode != "installation" || c.Tenancy.Organization != "example" {
 		t.Errorf("defaults: %+v", c)
 	}
 	if c, err := Parse([]byte("domain: corp.example.com\npublic_url: https://ok.example.com\ntenancy: {organization: acme}\n")); err != nil || c.Tenancy.Organization != "acme" {
@@ -60,16 +60,15 @@ func TestDefaultsAndRefusals(t *testing.T) {
 		"a bad admin":                    "domain: example.com\npublic_url: https://ok.example.com\nidentity: {bootstrap_admins: [Ada Lovelace]}\n",
 		"oidc ids twice":                 "domain: example.com\npublic_url: https://ok.example.com\nidentity: {sign_in: {oidc: [{id: g}, {id: g}]}}\n",
 		"no audience":                    "domain: example.com\npublic_url: https://ok.example.com\nidentity: {federation: [{issuer: https://x}]}\n",
-		"an unknown stream":              "domain: example.com\npublic_url: https://ok.example.com\nbus: {stream: {type: carrier-pigeon}}\n",
-		"nats, no url":                   "domain: example.com\npublic_url: https://ok.example.com\nbus: {stream: {type: nats}}\n",
-		"nats on postgres":               "domain: example.com\npublic_url: https://ok.example.com\nbus: {queue: {type: postgres, nats: {url: nats://n:4222}}}\n",
-		"pubsub, no project":             "domain: example.com\npublic_url: https://ok.example.com\nbus: {stream: {type: pubsub, pubsub: {}}}\n",
-		"aws, no region":                 "domain: example.com\npublic_url: https://ok.example.com\nbus: {queue: {type: aws, aws: {}}}\n",
-		"aws, half a key":                "domain: example.com\npublic_url: https://ok.example.com\nbus: {queue: {type: aws, aws: {region: r, access_key_file: k}}}\n",
-		"a kafka queue":                  "domain: example.com\npublic_url: https://ok.example.com\nbus: {queue: {type: kafka, kafka: {brokers: [b:9092]}}}\n",
-		"kafka, no brokers":              "domain: example.com\npublic_url: https://ok.example.com\nbus: {stream: {type: kafka, kafka: {}}}\n",
-		"kafka, scram, no password":      "domain: example.com\npublic_url: https://ok.example.com\nbus: {stream: {type: kafka, kafka: {brokers: [b:9092], sasl: {mechanism: scram-sha-512, username: ok}}}}\n",
-		"kafka, gssapi":                  "domain: example.com\npublic_url: https://ok.example.com\nbus: {stream: {type: kafka, kafka: {brokers: [b:9092], sasl: {mechanism: gssapi}}}}\n",
+		"an unknown bus":                 "domain: example.com\npublic_url: https://ok.example.com\nbus: {type: carrier-pigeon}\n",
+		"nats, no url":                   "domain: example.com\npublic_url: https://ok.example.com\nbus: {type: nats}\n",
+		"a postgres bus":                 "domain: example.com\npublic_url: https://ok.example.com\nbus: {type: postgres}\n",
+		"nats on pubsub":                 "domain: example.com\npublic_url: https://ok.example.com\nbus: {type: pubsub, pubsub: {project: p}, nats: {url: nats://n:4222}}\n",
+		"pubsub, no project":             "domain: example.com\npublic_url: https://ok.example.com\nbus: {type: pubsub, pubsub: {}}\n",
+		"aws, no region":                 "domain: example.com\npublic_url: https://ok.example.com\nbus: {type: aws, aws: {}}\n",
+		"aws, half a key":                "domain: example.com\npublic_url: https://ok.example.com\nbus: {type: aws, aws: {region: r, access_key_file: k}}\n",
+		"a kafka bus":                    "domain: example.com\npublic_url: https://ok.example.com\nbus: {type: kafka}\n",
+		"a stream and a queue":           "domain: example.com\npublic_url: https://ok.example.com\nbus: {stream: {type: nats}, queue: {type: nats}}\n",
 		"a tenancy mode":                 "domain: example.com\npublic_url: https://ok.example.com\ntenancy: {mode: federated}\n",
 		"a reserved organization":        "domain: example.com\npublic_url: https://ok.example.com\ntenancy: {organization: settings}\n",
 		"a bad organization":             "domain: example.com\npublic_url: https://ok.example.com\ntenancy: {organization: Acme Corp}\n",
@@ -83,7 +82,6 @@ func TestDefaultsAndRefusals(t *testing.T) {
 		"spanner, a bad instance":        "domain: example.com\npublic_url: https://ok.example.com\ndatabase: {type: spanner, spanner: {instance: ok-test}}\n" + natsBus,
 		"spanner, a long prefix":         "domain: example.com\npublic_url: https://ok.example.com\ndatabase: {type: spanner, spanner: {instance: projects/p/instances/i, prefix: a-very-long-prefix-xx}}\n" + natsBus,
 		"spanner, a postgres url":        "domain: example.com\npublic_url: https://ok.example.com\ndatabase: {type: spanner, url_file: u, spanner: {instance: projects/p/instances/i}}\n" + natsBus,
-		"spanner, the postgres bus":      "domain: example.com\npublic_url: https://ok.example.com\ndatabase: {type: spanner, spanner: {instance: projects/p/instances/i}}\n",
 		"spanner on postgres":            "domain: example.com\npublic_url: https://ok.example.com\ndatabase: {spanner: {instance: projects/p/instances/i}}\n",
 		"omni, no address":               "domain: example.com\npublic_url: https://ok.example.com\ndatabase: {type: spanner, spanner: {instance: projects/default/instances/default, omni: {plain_text: true}}}\n" + natsBus,
 		"omni, half a password":          "domain: example.com\npublic_url: https://ok.example.com\ndatabase: {type: spanner, spanner: {instance: projects/default/instances/default, omni: {address: o:15000, username: ok}}}\n" + natsBus,
@@ -102,7 +100,7 @@ func TestDefaultsAndRefusals(t *testing.T) {
 	}
 }
 
-const natsBus = "bus: {stream: {type: nats, nats: {url: nats://n:4222}}, queue: {type: nats, nats: {url: nats://n:4222}}}\n"
+const natsBus = "bus: {type: nats, nats: {url: nats://n:4222}}\n"
 
 // A Spanner database reads its instance, its prefix (ok unless set), and a Spanner Omni deployment
 // to reach in place of Google's; each role's database is named for it.
@@ -128,56 +126,41 @@ func TestSpannerDatabase(t *testing.T) {
 	}
 }
 
-// The stream on Kafka reads its brokers, how to sign in, and how to keep the topics there.
-func TestKafkaBus(t *testing.T) {
-	c, err := Parse([]byte("domain: example.com\npublic_url: https://ok.example.com\n" +
-		"bus: {stream: {type: kafka, kafka: {brokers: [b-1:9098, b-2:9098], tls: true, sasl: {mechanism: aws-msk-iam}, partitions: 24, replication_factor: 3}}}\n"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	k := c.Bus.Stream.Kafka
-	if k == nil || len(k.Brokers) != 2 || !k.TLS || k.SASL == nil || k.SASL.Mechanism != "aws-msk-iam" || k.Partitions != 24 || k.ReplicationFactor != 3 || c.Bus.Queue.Type != "postgres" {
-		t.Errorf("the bus: %+v, %+v", k, c.Bus.Queue)
-	}
-}
-
-// The bus on AWS reads its region, its key, and how to keep the topics and queues there.
+// The bus on AWS reads its region, its key, and how to keep the queues there.
 func TestAWSBus(t *testing.T) {
 	c, err := Parse([]byte("domain: example.com\npublic_url: https://ok.example.com\n" +
-		"bus: {stream: {type: aws, aws: {region: eu-west-1}}, queue: {type: aws, aws: {region: eu-west-1, access_key_file: k, secret_key_file: s, retention: 72h, max_attempts: 4}}}\n"))
+		"bus: {type: aws, aws: {region: eu-west-1, access_key_file: k, secret_key_file: s, retention: 72h, max_attempts: 4}}\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	s, q := c.Bus.Stream.AWS, c.Bus.Queue.AWS
-	if s == nil || s.Region != "eu-west-1" || q == nil || q.AccessKeyFile != "k" || q.SecretKeyFile != "s" || q.Retention != 72*time.Hour || q.MaxAttempts != 4 {
-		t.Errorf("the bus: %+v, %+v", s, q)
+	if a := c.Bus.AWS; c.Bus.Type != "aws" || a == nil || a.Region != "eu-west-1" || a.AccessKeyFile != "k" || a.SecretKeyFile != "s" ||
+		a.Retention != 72*time.Hour || a.MaxAttempts != 4 {
+		t.Errorf("the bus: %+v, %+v", c.Bus, a)
 	}
 }
 
 // The bus on Pub/Sub reads its project and how to keep the topics there.
 func TestPubSubBus(t *testing.T) {
 	c, err := Parse([]byte("domain: example.com\npublic_url: https://ok.example.com\n" +
-		"bus: {stream: {type: pubsub, pubsub: {project: p, endpoint: pubsub.us-east1.rep.googleapis.com:443}}, queue: {type: pubsub, pubsub: {project: p, max_attempts: 7}}}\n"))
+		"bus: {type: pubsub, pubsub: {project: p, endpoint: pubsub.us-east1.rep.googleapis.com:443, max_attempts: 7}}\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	s, q := c.Bus.Stream.PubSub, c.Bus.Queue.PubSub
-	if s == nil || s.Project != "p" || s.Endpoint != "pubsub.us-east1.rep.googleapis.com:443" || q == nil || q.MaxAttempts != 7 {
-		t.Errorf("the bus: %+v, %+v", s, q)
+	if p := c.Bus.PubSub; p == nil || p.Project != "p" || p.Endpoint != "pubsub.us-east1.rep.googleapis.com:443" || p.MaxAttempts != 7 {
+		t.Errorf("the bus: %+v", p)
 	}
 }
 
-// The bus on NATS reads its servers and how to keep the streams there.
+// The bus on NATS reads its servers and how to keep the queues there.
 func TestNATSBus(t *testing.T) {
 	c, err := Parse([]byte("domain: example.com\npublic_url: https://ok.example.com\n" +
-		"bus: {stream: {type: nats, nats: {url: nats://a:4222, replicas: 3, retention: 72h}}, queue: {type: nats, nats: {url: nats://a:4222, ack_wait: 45s, max_attempts: 5}}}\n"))
+		"bus: {type: nats, nats: {url: nats://a:4222, replicas: 3, retention: 72h, ack_wait: 45s, max_attempts: 5}}\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	s, q := c.Bus.Stream.NATS, c.Bus.Queue.NATS
-	if c.Bus.Stream.Type != "nats" || s == nil || s.URL != "nats://a:4222" || s.Replicas != 3 || s.Retention != 72*time.Hour ||
-		q == nil || q.AckWait != 45*time.Second || q.MaxAttempts != 5 {
-		t.Errorf("the bus: %+v, %+v, %+v", c.Bus, s, q)
+	if n := c.Bus.NATS; c.Bus.Type != "nats" || n == nil || n.URL != "nats://a:4222" || n.Replicas != 3 || n.Retention != 72*time.Hour ||
+		n.AckWait != 45*time.Second || n.MaxAttempts != 5 {
+		t.Errorf("the bus: %+v, %+v", c.Bus, n)
 	}
 }
 

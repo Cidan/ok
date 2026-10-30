@@ -35,67 +35,80 @@ type SCM struct {
 type Config struct {
 	// Depth bounds how many earlier submissions an attempt speculates on.
 	Depth int
-	// Idle bounds how long the runner waits for a notification between passes.
-	Idle time.Duration
 	// Grace is how old a candidate no attempt holds must be before it is discarded: one
 	// prepared just now is recorded a moment later.
 	Grace time.Duration
 	// Batch bounds how many submissions one landing lands (Batch).
 	Batch int
+	// Parallel is how many submissions a step acts on, each its actions in order, all at once:
+	// preparing an attempt is a few of the SCM's calls, which its replicas share.
+	Parallel int
 }
 
 // DefaultBatch is how many submissions one landing lands at most.
 const DefaultBatch = 32
 
+// DefaultParallel is how many submissions a step acts on at once.
+const DefaultParallel = 128
+
 // DefaultConfig is the service's.
-var DefaultConfig = Config{Depth: DefaultDepth, Idle: 10 * time.Second, Grace: 5 * time.Minute, Batch: DefaultBatch}
+var DefaultConfig = Config{Depth: DefaultDepth, Grace: 5 * time.Minute, Batch: DefaultBatch, Parallel: DefaultParallel}
 
 // Runner runs the landing queue: each repository's queue is keyed work (internal/work), done by
 // one replica at a time and by every replica between them, which reads the queue, asks Decide
 // what to do, and does it through the SCM and the store.
 type Runner struct {
-	store *store.Store
-	scm   SCM
-	cfg   Config
-	log   *slog.Logger
-
-	// collected is when each repository's candidates were last collected, by this replica.
-	mu        sync.Mutex
-	collected map[int64]time.Time
+	store  *store.Store
+	scm    SCM
+	cfg    Config
+	log    *slog.Logger
+	holder string
 }
 
 // New builds a runner.
 func New(s *store.Store, scm SCM, cfg Config, log *slog.Logger) *Runner {
-	return &Runner{store: s, scm: scm, cfg: cfg, log: log, collected: map[int64]time.Time{}}
+	return &Runner{store: s, scm: scm, cfg: cfg, log: log, holder: work.NewHolder()}
 }
 
-// parallel bounds the submissions one pass acts on at once: each a few of the SCM's calls and a
-// transaction, which one after another made a pass over a busy monorepo's queue minutes long,
-// landing nothing meanwhile.
-const parallel = 16
-
-// collectEvery is how often a repository's unheld candidates are collected: listing them is a read
-// of every candidate the repository has.
-const collectEvery = time.Minute
+// collectEvery is how long after a pass of a repository's queue finds nothing left to do its unheld
+// candidates are collected — at most that often: listing them is a read of every candidate the
+// repository has. collectAgain is how long a collection that finds the queue's claim held is put
+// off.
+const (
+	collectEvery = time.Minute
+	collectAgain = 5 * time.Second
+)
 
 // Run runs the queue until ctx ends: each repository's whenever something it acts on changes —
-// every such change marks it, in its transaction — and when a candidate it left comes of age.
+// every such change marks it, in its transaction — and when a candidate it left comes of age; and
+// each repository's collection of candidates, as it falls due.
 func (r *Runner) Run(ctx context.Context) error {
-	return (&work.Runner{
+	errs := make(chan error, 1)
+	go func() {
+		errs <- (&work.Runner{
+			Kind:  store.CollectWork,
+			Store: r.store.Work(),
+			Do:    r.collectHeld,
+			Log:   r.log,
+		}).Run(ctx)
+	}()
+	err := (&work.Runner{
 		Kind:  store.QueueWork,
 		Store: r.store.Work(),
 		Do:    r.repository,
-		Watch: r.store.WatchQueue,
-		Idle:  r.cfg.Idle,
 		Log:   r.log,
 	}).Run(ctx)
+	return errors.Join(err, <-errs)
 }
 
 // maxSteps bounds one pass over a repository: each step lands at most one batch.
 const maxSteps = 1000
 
-// repository acts on a repository's queue until nothing lands, then discards the candidates no
-// attempt holds.
+// repository acts on a repository's queue until nothing lands and nothing is left to do, then
+// discards the candidates no attempt holds. Each step acts on the first Parallel submissions with
+// something to do, in queue order — beside its landing, if one is due — and decides again: a step
+// that did every submission's actions waited, its landing done, for the slowest of thousands of
+// preparations, and a herd of 3,000 submissions landed one batch every few minutes.
 func (r *Runner) repository(ctx context.Context, repo int64) error {
 	defer queuePasses.With().Since(time.Now())
 	for step := 0; step < maxSteps; step++ {
@@ -117,6 +130,7 @@ func (r *Runner) repository(ctx context.Context, repo int64) error {
 			// before the landing is checked against what landed, as one another replica's landing
 			// raced always was.
 			batch, rest := LandingStep(snap, acts, max(r.cfg.Batch, 1))
+			rest, _ = r.round(rest)
 			p := r.newPass()
 			var landErr error
 			landed := make(chan struct{})
@@ -137,12 +151,38 @@ func (r *Runner) repository(ctx context.Context, repo int64) error {
 			}
 			continue
 		}
+		acts, more := r.round(acts)
 		if err := r.actAll(ctx, rep, st, r.newPass(), acts); err != nil {
 			return err
 		}
-		return r.collectDue(ctx, repo)
+		if more {
+			continue
+		}
+		return r.bookCollection(ctx, repo)
 	}
 	return fmt.Errorf("still landing after %d steps", maxSteps)
+}
+
+// round is what a step does of acts: the actions of the first Parallel submissions that have any
+// but notes, and every note; and whether submissions' actions are left for the next step.
+func (r *Runner) round(acts []Action) ([]Action, bool) {
+	limit := max(r.cfg.Parallel, 1)
+	taken := map[int64]bool{}
+	out := make([]Action, 0, len(acts))
+	more := false
+	for _, a := range acts {
+		if a.Kind == Note || taken[a.Submission] {
+			out = append(out, a)
+			continue
+		}
+		if len(taken) == limit {
+			more = true
+			continue
+		}
+		taken[a.Submission] = true
+		out = append(out, a)
+	}
+	return out, more
 }
 
 // newPass is a pass's shared state, its writes taking turns where the store needs it.
@@ -169,7 +209,7 @@ func (r *Runner) actAll(ctx context.Context, rep *scmpb.Repository, st *store.Qu
 		}
 		bySubmission[a.Submission] = append(bySubmission[a.Submission], a)
 	}
-	sem := make(chan struct{}, parallel)
+	sem := make(chan struct{}, max(r.cfg.Parallel, 1))
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	var errs []error
@@ -255,26 +295,29 @@ func (p *pass) prepare(base []byte, cl int64, patchset int32, do func() ([]byte,
 	return pr.commit, pr.err
 }
 
-// collectDue collects a repository's candidates if this replica has not in collectEvery.
-func (r *Runner) collectDue(ctx context.Context, repo int64) error {
-	r.mu.Lock()
-	last := r.collected[repo]
-	due := time.Since(last) >= collectEvery
-	if due {
-		r.collected[repo] = time.Now()
-	}
-	r.mu.Unlock()
-	if !due {
-		return nil
-	}
-	defer queueActions.With("collect").Since(time.Now())
-	if err := r.collect(ctx, repo); err != nil {
-		r.mu.Lock()
-		r.collected[repo] = last
-		r.mu.Unlock()
+// bookCollection books a repository's collection collectEvery on, unless one is booked: a pass
+// that finds nothing left to do reads whether one is, so passes book no job each.
+func (r *Runner) bookCollection(ctx context.Context, repo int64) error {
+	p, err := r.store.Work().Peek(ctx, store.CollectWork, repo)
+	if err != nil || p.Marked {
 		return err
 	}
-	return nil
+	return r.store.Work().MarkAt(ctx, store.CollectWork, repo, time.Now().Add(collectEvery))
+}
+
+// collectHeld collects a repository's candidates holding its queue's claim, so no pass decides on
+// a candidate as it is discarded; a pass under way puts the collection off a moment.
+func (r *Runner) collectHeld(ctx context.Context, repo int64) error {
+	held, release, ok, err := work.Claim(ctx, r.store.Work(), store.QueueWork, repo, r.holder, time.Minute)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return r.store.Work().MarkAt(ctx, store.CollectWork, repo, time.Now().Add(collectAgain))
+	}
+	defer release()
+	defer queueActions.With("collect").Since(time.Now())
+	return r.collect(held, repo)
 }
 
 // snapshot is Decide's view of a repository's queue.

@@ -7,9 +7,4 @@ config:
     tree_repository: tree
 deploy:
   enabled: true
-  checkout: real
   serviceAccountAnnotations: {iam.gke.io/gcp-service-account: ok-staging-ok@PROJECT.iam.gserviceaccount.com}
-  securityContext:
-    seccompProfile: {type: Unconfined}
-    appArmorProfile: {type: Unconfined}
-    allowPrivilegeEscalation: false

@@ -102,7 +102,7 @@ func TestDeleteInBatches(t *testing.T) {
 	compactAll(t, e.s, e.repo)
 	e.landChange("in the tail", map[string]string{"a": "tail\n"})
 	net := netOf(t, e.s, e.repo)
-	small := mustOpen(t, dbOf(e.s), e.s.blobs, Config{DeleteBatch: 2, Signals: e.s.signals})
+	small := mustOpen(t, dbOf(e.s), e.s.blobs, Config{DeleteBatch: 2})
 	txns := 0
 	small.txAttempts = func() { txns++ }
 	if err := small.DeleteRepository(ctx, e.repo); err != nil {
@@ -120,9 +120,10 @@ func TestDeleteInBatches(t *testing.T) {
 	networkGone(t, small, net)
 }
 
-// A deletion a replica stopped short of — after the transaction that deleted the repository's row —
-// is finished by the next one that looks.
-func TestFinishDeletions(t *testing.T) {
+// A deletion a replica stopped short of — after the transaction that deleted the repository's row,
+// which marked its purge — is finished by the repository's purge (FinishDeletion), and by its
+// deletion asked again.
+func TestFinishDeletion(t *testing.T) {
 	ctx := context.Background()
 	e := newCLEnv(t)
 	e.landChange("base", map[string]string{"a": "a0\n"})
@@ -133,18 +134,30 @@ func TestFinishDeletions(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if n, err := e.s.FinishDeletions(ctx, 1000); err != nil || n == 0 {
-		t.Fatalf("finishing deletions: %d, %v", n, err)
+	if finished, err := e.s.FinishDeletion(ctx, e.repo); err != nil || !finished {
+		t.Fatalf("finishing the deletion: %v, %v", finished, err)
 	}
 	networkGone(t, e.s, net)
-	pending, err := e.s.ops(ctx).PendingDeletions(ctx, 1000)
-	if err != nil {
+	if _, pending, err := e.s.ops(ctx).PendingDeletion(ctx, e.repo); err != nil || pending {
+		t.Errorf("the deletion pending once finished: %v, %v", pending, err)
+	}
+	if finished, err := e.s.FinishDeletion(ctx, e.repo); err != nil || finished {
+		t.Errorf("finishing it again: %v, %v", finished, err)
+	}
+
+	// Stopped short again, its deletion asked again finishes it.
+	other := newRepo(t, e.s).ID
+	if err := e.s.inTx(ctx, func(ctx context.Context, tx *txn) error {
+		_, _, err := tx.DeleteRepository(ctx, other)
+		return err
+	}); err != nil {
 		t.Fatal(err)
 	}
-	for _, d := range pending {
-		if d.Repo == e.repo {
-			t.Error("the deletion is still pending")
-		}
+	if err := e.s.DeleteRepository(ctx, other); err != nil {
+		t.Fatalf("deleting it again: %v", err)
+	}
+	if _, pending, err := e.s.ops(ctx).PendingDeletion(ctx, other); err != nil || pending {
+		t.Errorf("the second deletion pending once asked again: %v, %v", pending, err)
 	}
 }
 

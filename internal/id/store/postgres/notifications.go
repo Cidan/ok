@@ -64,11 +64,17 @@ func (x queries) SetNotificationPrefs(ctx context.Context, principal string, mai
 	return err
 }
 
+func (x queries) MarkWorkAt(ctx context.Context, kind string, key int64, at time.Time) error {
+	return pgdata.MarkWorkAt(ctx, x.q, kind, key, at)
+}
+
 func (x queries) QueueMail(ctx context.Context, m store.Mail) error {
-	_, err := x.q.Exec(ctx, `INSERT INTO mail_outbox (mail_id, principal_id, to_address, subject, body, state, attempts, next_try, last_error, created_at)
+	if _, err := x.q.Exec(ctx, `INSERT INTO mail_outbox (mail_id, principal_id, to_address, subject, body, state, attempts, next_try, last_error, created_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`, m.ID, m.Principal, m.To, m.Subject, m.Body, int16(m.State), m.Attempts, m.NextTry,
-		m.LastError, m.CreatedAt)
-	return err
+		m.LastError, m.CreatedAt); err != nil {
+		return err
+	}
+	return pgdata.MarkWork(ctx, x.q, store.MailWork, m.ID)
 }
 
 func (x queries) MailByID(ctx context.Context, id int64) (store.Mail, bool, error) {
@@ -88,12 +94,4 @@ func (x queries) UpdateMail(ctx context.Context, m store.Mail) error {
 	_, err := x.q.Exec(ctx, `UPDATE mail_outbox SET state = $2, attempts = $3, next_try = $4, last_error = $5 WHERE mail_id = $1`,
 		m.ID, int16(m.State), m.Attempts, m.NextTry, m.LastError)
 	return err
-}
-
-func (x queries) DueMails(ctx context.Context, before time.Time, limit int) ([]int64, error) {
-	rows, err := x.q.Query(ctx, `SELECT mail_id FROM mail_outbox WHERE state = 0 AND next_try <= $1 ORDER BY next_try LIMIT $2`, before, limit)
-	if err != nil {
-		return nil, err
-	}
-	return pgx.CollectRows(rows, pgx.RowTo[int64])
 }

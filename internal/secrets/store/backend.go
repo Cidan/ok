@@ -38,6 +38,9 @@ type Ops interface {
 	RepositoryKeys(ctx context.Context, repo int64) ([]RepositoryKey, error)
 	// InsertRepositoryKey records a key version; false when the repository has that version.
 	InsertRepositoryKey(ctx context.Context, k RepositoryKey) (bool, error)
+	// MarkWorkAt marks ok secrets' keyed work (internal/work), due at at, in the operations'
+	// transaction, which enqueues its job before it commits, or in one of its own.
+	MarkWorkAt(ctx context.Context, kind string, key int64, at time.Time) error
 	// UpdateRepositoryKey records a key version wrapped again, by a root.
 	UpdateRepositoryKey(ctx context.Context, repo, version int64, root string, wrapped []byte) error
 	// ShredRepositoryKeys forgets every wrapped key of a repository, keeping the rows: what a

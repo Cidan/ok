@@ -19,6 +19,7 @@ import (
 	"github.com/Cidan/ok/internal/secrets/keys/keystest"
 	"github.com/Cidan/ok/internal/secrets/secretstore"
 	"github.com/Cidan/ok/internal/secrets/store"
+	"github.com/Cidan/ok/internal/work/worktest"
 	"github.com/Cidan/ok/internal/workflow"
 	okpb "github.com/Cidan/ok/proto/ok/v1"
 )
@@ -534,18 +535,17 @@ func testAudit(t *testing.T, e *env) {
 	}
 }
 
-// The store's keyed work is marked, taken, and released.
+// The store's keyed work is marked — its job enqueued — taken, and released.
 func testWork(t *testing.T, e *env) {
 	w := e.s.Work()
 	if err := w.Mark(e.ctx, store.CollectWork, 7); err != nil {
 		t.Fatal(err)
 	}
-	due, err := w.Due(e.ctx, store.CollectWork, 10)
-	if err != nil || !slices.Equal(due, []int64{7}) {
-		t.Fatalf("due %v, %v", due, err)
+	if got := worktest.Ready(t, w, store.CollectWork); !slices.Equal(got, []int64{7}) {
+		t.Fatalf("the collection's jobs: %v", got)
 	}
-	if ok, err := w.Take(e.ctx, store.CollectWork, 7, "me", time.Minute); err != nil || !ok {
-		t.Fatal(ok, err)
+	if got, err := w.Take(e.ctx, store.CollectWork, 7, "me", time.Minute); err != nil || !got.Took || !got.Due {
+		t.Fatal(got, err)
 	}
 	if again, err := w.Release(e.ctx, store.CollectWork, 7, "me"); err != nil || again {
 		t.Fatal(again, err)

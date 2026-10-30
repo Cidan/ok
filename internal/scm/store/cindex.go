@@ -16,13 +16,14 @@ import (
 	"github.com/Cidan/ok/internal/scm/segment"
 	"github.com/Cidan/ok/internal/scm/store/backend"
 	"github.com/Cidan/ok/internal/serve/metrics"
-	"github.com/Cidan/ok/internal/work"
+	"github.com/Cidan/ok/internal/wait"
 )
 
 // The content index (docs/scm.md, "The content index") is ok scm's only record of
 // files and chunks: every transaction that changes one logs the change, in one content_log row
-// written as it commits; a transaction that relies on what the index holds reads it under the
-// index's row lock (txIndex); and a fold writes what the log changed since the last into runs —
+// written as it commits; a transaction that relies on what the index holds reads it as it stands —
+// under the index's row lock only when it relies on what garbage collection may take meanwhile
+// (txIndex); and a fold writes what the log changed since the last into runs —
 // segments in the bucket — each entry whole, as it now is (foldIndex). A replica holds the log
 // since the last fold (contentindex.Log) and reads the runs through, newest first
 // (cindexsegments.go): its memory is that log, not the index.
@@ -34,21 +35,21 @@ import (
 // there, and repacking moves them there alone. A transaction that writes both takes the
 // repository's lock before the network's.
 
-// contentChannel is the channel each logging transaction notifies, with its index's scope, as it
-// commits.
-const contentChannel = "ok_scm_content"
-
 // txLog is what one transaction changed in a content index, and the index it decides by
 // (txIndex).
 type txLog struct {
 	s       *Store
+	tx      *txn
 	scope   backend.Scope
 	updates []contentindex.Update
-	// view is the content index as of when the transaction took its row lock, today the
-	// database's day then; touched, pinned, and puts are what the transaction touched, pinned,
-	// and put.
+	// view is the content index the transaction decides by, today the database's day as it read
+	// it; locked, that it read it holding the index's row lock, which it holds until it ends, and
+	// otherwise viewAt, when it read it (viewsCurrent). touched, pinned, and puts are what the
+	// transaction touched, pinned, and put.
 	view    *indexView
 	today   contentindex.Day
+	locked  bool
+	viewAt  time.Time
 	touched map[encoding.ID]bool
 	pinned  map[encoding.ID]bool
 	puts    map[encoding.ID]contentindex.Entry
@@ -76,7 +77,7 @@ func (s *Store) txLogOf(tx *txn, sc backend.Scope) *txLog {
 			panic(fmt.Sprintf("store: one transaction changes the content indexes of %s and %s", lg.scope.Name(), sc.Name()))
 		}
 	}
-	lg := &txLog{s: s, scope: sc, touched: map[encoding.ID]bool{}, pinned: map[encoding.ID]bool{},
+	lg := &txLog{s: s, tx: tx, scope: sc, touched: map[encoding.ID]bool{}, pinned: map[encoding.ID]bool{},
 		puts: map[encoding.ID]contentindex.Entry{}, found: map[encoding.ID]heldEntry{}}
 	tx.logs = append(tx.logs, lg)
 	return lg
@@ -103,31 +104,210 @@ func (s *Store) logIndex(tx *txn, sc backend.Scope, updates ...contentindex.Upda
 	lg.updates = append(lg.updates, updates...)
 }
 
-// txIndex is the content index a transaction that writes it decides by: read once the
-// transaction holds the index's row lock in share mode, so no sweep, compaction, or fold changes
-// it before the transaction commits — what it finds stays — while other writers, whose puts,
-// touches, and pins commute with its own, run beside it. It returns the database's day too.
+// lockFreeDays is how recently a repository's unpinned entry was changed for a transaction to rely
+// on it holding no lock: garbage collection drops only an unpinned entry changed before its cutoff,
+// OperationRetention ago, so it reaches one changed since then two days after the transaction read
+// it — a day for its cutoff's rounding to days, and a day more than any such transaction may last
+// (lockFreeFor) before it commits, by when the sweep sees what it did.
+const lockFreeDays = contentindex.Day(OperationRetention/(24*time.Hour)) - 2
+
+// lockFreeFor is how long a transaction may last after it read a content index holding no lock on
+// it: one that would commit later is refused, and runs again (viewsCurrent). A var for tests.
+var lockFreeFor = time.Hour
+
+// txIndex is the content index a transaction that writes it decides by, and the database's day. It
+// is read as it stands, holding no lock (viewLockFree), while the transaction relies only on what no sweep,
+// compaction, or fold can change before it commits: entries pinned, absent, or changed in the last
+// lockFreeDays; puts, touches, and pins of those commute with everything that takes the index
+// alone. Writers then run beside each other, and beside what takes the index alone. A lookup that
+// finds what garbage collection may take meanwhile — an unpinned entry changed before then — has
+// the transaction hold the index's row lock in share mode from then on, and read it again under
+// the lock (txLog.lock): no sweep, compaction, or fold then changes it before the transaction
+// commits, and what it finds stays. A transaction that holds the index alone reads it under that
+// lock.
 func (s *Store) txIndex(ctx context.Context, tx *txn, sc backend.Scope) (*txLog, error) {
 	lg := s.txLogOf(tx, sc)
 	if lg.view != nil {
 		return lg, nil
 	}
-	today, gen, ok, err := tx.ShareContentIndex(ctx, sc)
+	if held, ok := tx.exclusive[sc]; ok {
+		return lg, lg.viewUnder(ctx, held.gen, held.today)
+	}
+	if tx.snapshotAt.IsZero() {
+		ok, err := lg.viewLockFree(ctx)
+		if err != nil || ok {
+			return lg, err
+		}
+	}
+	return lg, lg.lock(ctx)
+}
+
+// viewLockFree reads the transaction's view of the index holding no lock: the replica's view
+// brought up to date by the log since its place, read with the index's generation at one moment
+// (ContentLogCurrent), so no fold slips between them; or, the replica holding none or a fold having
+// made a generation since, the generation's runs and the log since its fold, read so too. One read
+// at a time on a replica, as refreshes are: a read that began since a transaction asked serves it,
+// so the transactions that ask together read the database once. False when folds kept making
+// generations as it read, when the transaction reads under the index's lock (lock).
+func (lg *txLog) viewLockFree(ctx context.Context) (bool, error) {
+	s, sc := lg.s, lg.scope
+	li := s.live(sc)
+	asked := time.Now()
+	li.mu.Lock()
+	began := time.Now()
+	indexWaits.Observe(began.Sub(asked).Seconds())
+	if v := li.view.Load(); v != nil && li.freeGen == v.log.Generation() && !li.freeAt.Before(asked) {
+		today, at := li.freeToday, li.freeAt
+		li.mu.Unlock()
+		indexRefreshes.With("lock_free_served").Inc()
+		lg.view, lg.today, lg.viewAt = v, dayOf(today), at
+		return true, nil
+	}
+	v, today, result, err := lg.readLockFree(ctx, li, began)
+	markFold := v != nil && s.foldDue(li, v)
+	li.mu.Unlock()
+	if err != nil || v == nil {
+		return false, err
+	}
+	indexRefreshes.With(result).Inc()
+	indexHolds.With(result).Since(began)
+	if markFold {
+		s.markFoldDue(ctx, sc, li)
+	}
+	lg.view, lg.today, lg.viewAt = v, dayOf(today), began
+	return true, nil
+}
+
+// lockFreeLoads is how many times a read for a transaction holding no lock tries to load a
+// generation before it gives up to the index's lock: each try lost to a fold that committed as it
+// read.
+const lockFreeLoads = 3
+
+// readLockFree is viewLockFree's read, under li.mu: the replica's view, brought up to date, or a
+// generation loaded; nil after lockFreeLoads folds beside it. A generation's runs and log are read
+// apart, and the log with the generation it follows, which no fold since has moved: a fold commits
+// its generation before it deletes what it folded, so the log read then is whole, and the runs
+// read before it are the generation's.
+func (lg *txLog) readLockFree(ctx context.Context, li *liveIndex, began time.Time) (*indexView, time.Time, string, error) {
+	s, sc := lg.s, lg.scope
+	for range lockFreeLoads {
+		if s.indexReads != nil {
+			s.indexReads()
+		}
+		if v := li.view.Load(); v != nil {
+			today, current, logs, place, err := lg.tx.ContentLogCurrent(ctx, sc, v.log.Generation(), li.place)
+			if err != nil {
+				return nil, time.Time{}, "", err
+			}
+			if current {
+				for i, r := range logs {
+					if err := v.log.Apply(r.Body); err != nil {
+						// What it applied of the rows is not where its place says: load it anew.
+						li.view.Store(nil)
+						return nil, time.Time{}, "", fmt.Errorf("%s's content log, row %d: %w", sc.Name(), i, err)
+					}
+				}
+				li.place, li.tail, li.readFrom = place, li.tail+len(logs), began
+				li.freeAt, li.freeGen, li.freeToday = began, v.log.Generation(), today
+				return v, today, "lock_free", nil
+			}
+		}
+		st, ok, err := lg.tx.ContentIndexGeneration(ctx, sc)
+		if err == nil && !ok {
+			err = fmt.Errorf("%s has no content index", sc.Name())
+		}
+		if err != nil {
+			return nil, time.Time{}, "", err
+		}
+		runs, err := s.readRuns(ctx, lg.tx, sc)
+		if err != nil {
+			return nil, time.Time{}, "", err
+		}
+		today, current, logs, place, err := lg.tx.ContentLogCurrent(ctx, sc, st.Generation, st.Folded)
+		if err != nil {
+			return nil, time.Time{}, "", err
+		}
+		if !current {
+			continue // a fold committed as it read: the next generation
+		}
+		v := &indexView{log: contentindex.NewLog(st.Generation)}
+		v.runs.Store(runs)
+		for i, r := range logs {
+			if err := v.log.Apply(r.Body); err != nil {
+				return nil, time.Time{}, "", fmt.Errorf("%s's content log, row %d: %w", sc.Name(), i, err)
+			}
+		}
+		li.place, li.tail, li.foldMarked = place, len(logs), false
+		li.view.Store(v)
+		li.readFrom = began
+		li.freeAt, li.freeGen, li.freeToday = began, st.Generation, today
+		return v, today, "lock_free_loaded", nil
+	}
+	return nil, time.Time{}, "", nil
+}
+
+// lock holds the index's row in share mode for the rest of the transaction and reads its view
+// again under the hold (viewUnder): what the transaction finds from then on, no sweep, compaction,
+// or fold changes before it commits. The repository's index is held before its network's, the
+// order every transaction takes them in.
+func (lg *txLog) lock(ctx context.Context) error {
+	if lg.locked {
+		return nil
+	}
+	if lg.scope.Network {
+		for _, o := range lg.tx.logs {
+			if !o.scope.Network && o.view != nil {
+				if err := o.lock(ctx); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	today, gen, ok, err := lg.tx.ShareContentIndex(ctx, lg.scope)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if !ok {
-		return nil, fmt.Errorf("%s has no content index", sc.Name())
+		return fmt.Errorf("%s has no content index", lg.scope.Name())
 	}
-	// What was committed before the transaction held the index's row is what it must see: no fold
-	// commits meanwhile, so a refresh begun since serves it, whoever's it is — and the generation
-	// the share read is the index's while it is held.
-	li := s.live(sc)
-	if err := s.refreshIndexAt(ctx, sc, li, time.Now(), gen); err != nil {
-		return nil, err
+	if lg.s.indexLocked != nil {
+		lg.s.indexLocked(lg.scope)
 	}
-	lg.view, lg.today = li.view.Load(), dayOf(today)
-	return lg, nil
+	return lg.viewUnder(ctx, gen, today)
+}
+
+// viewUnder reads the transaction's view of the index under a lock it holds on it, of generation
+// gen: what was committed before the transaction held the index's row is what it must see, and no
+// fold commits meanwhile, so a refresh begun since serves it, whoever's it is. What the transaction
+// resolved before is resolved again in it.
+func (lg *txLog) viewUnder(ctx context.Context, gen int64, today time.Time) error {
+	li := lg.s.live(lg.scope)
+	if err := lg.s.refreshIndexAt(ctx, lg.scope, li, time.Now(), gen); err != nil {
+		return err
+	}
+	lg.view, lg.today, lg.locked = li.view.Load(), dayOf(today), true
+	clear(lg.found)
+	return nil
+}
+
+// mayChange reports whether garbage collection may take an entry a lookup found before a
+// transaction that holds no lock commits: a repository's, unpinned, changed before the last
+// lockFreeDays. A network's location is taken once no repository holds its chunk, which a
+// transaction relying on one its repository does not hold decides under its lock (insertPacks).
+func (lg *txLog) mayChange(e contentindex.Entry) bool {
+	return !lg.scope.Network && !e.Pinned && e.Day < lg.today-lockFreeDays
+}
+
+// viewsCurrent refuses a transaction about to commit whose view of a content index it holds no lock
+// on is older than lockFreeFor: what it relied on, a sweep could have taken since. It runs again.
+func (t *txn) viewsCurrent() error {
+	for _, lg := range t.logs {
+		if lg.view != nil && !lg.locked && time.Since(lg.viewAt) > lockFreeFor {
+			return fmt.Errorf("%w: %s's content index was read %s ago, holding no lock", errRace, lg.scope.Name(),
+				time.Since(lg.viewAt).Round(time.Second))
+		}
+	}
+	return nil
 }
 
 // load resolves ids in the transaction's view, those it has not, all at once: what has finds
@@ -147,6 +327,16 @@ func (lg *txLog) load(ctx context.Context, ids []encoding.ID) error {
 	got, err := lg.s.resolveIn(ctx, lg.scope, lg.view, want)
 	if err != nil {
 		return err
+	}
+	if !lg.locked {
+		for _, e := range got {
+			if lg.mayChange(e) {
+				if err := lg.lock(ctx); err != nil {
+					return err
+				}
+				return lg.load(ctx, ids)
+			}
+		}
 	}
 	for _, id := range want {
 		e, held := got[id]
@@ -169,26 +359,21 @@ func (lg *txLog) has(ctx context.Context, kind encoding.Kind, id encoding.ID) (c
 }
 
 // flushIndexLog writes tx's logged changes to each index it changed as content_log rows — one,
-// unless they are more than logRowBytes — and notifies; it returns the scopes it wrote.
-func (s *Store) flushIndexLog(ctx context.Context, tx *txn) ([]backend.Scope, error) {
+// unless they are more than logRowBytes.
+func (s *Store) flushIndexLog(ctx context.Context, tx *txn) error {
 	logs := tx.logs
 	tx.logs = nil
-	var wrote []backend.Scope
 	for _, lg := range logs {
 		if len(lg.updates) == 0 {
 			continue
 		}
 		for _, row := range contentindex.EncodeLogs(lg.updates, logRowBytes) {
 			if err := tx.InsertContentLog(ctx, lg.scope, row); err != nil {
-				return nil, err
+				return err
 			}
 		}
-		if err := tx.Notify(ctx, contentChannel, lg.scope.String()); err != nil {
-			return nil, err
-		}
-		wrote = append(wrote, lg.scope)
 	}
-	return wrote, nil
+	return nil
 }
 
 // logRowBytes bounds a content log row's body: a transaction's updates go in as many rows as it
@@ -246,7 +431,7 @@ func (s *Store) foldIndex(ctx context.Context, sc backend.Scope) (gen int64, unp
 	// One fold of an index at a time, across replicas: what a fold writes it writes only while it
 	// holds the claim (data.Fence). A fold that finds another running changes nothing, as one
 	// another finished first does.
-	held, release, ok, err := work.Claim(ctx, s.Work(), foldWork(sc), sc.ID, s.holder, time.Minute)
+	held, release, ok, err := s.Claims().Claim(ctx, foldWork(sc), sc.ID, s.holder, time.Minute, 0)
 	if err != nil || !ok {
 		return 0, 0, 0, err
 	}
@@ -258,21 +443,12 @@ func (s *Store) foldIndex(ctx context.Context, sc backend.Scope) (gen int64, unp
 	return gen, unpinned, pinned, err
 }
 
-// claimFold claims a content index's fold, waiting while another holds it: for a caller that must
-// fold after what it did, which a fold under way may not have read. It returns the claim's context
-// and its release.
+// claimFold claims a content index's fold, waiting while another holds it — told as it lets go
+// (wait.Claims) — for a caller that must fold after what it did, which a fold under way may not
+// have read. It returns the claim's context and its release.
 func (s *Store) claimFold(ctx context.Context, sc backend.Scope) (context.Context, func(), error) {
-	for wait := 50 * time.Millisecond; ; wait = min(2*wait, 2*time.Second) {
-		held, release, ok, err := work.Claim(ctx, s.Work(), foldWork(sc), sc.ID, s.holder, time.Minute)
-		if err != nil || ok {
-			return held, release, err
-		}
-		select {
-		case <-ctx.Done():
-			return nil, nil, ctx.Err()
-		case <-time.After(wait):
-		}
-	}
+	held, release, _, err := s.Claims().Claim(ctx, foldWork(sc), sc.ID, s.holder, time.Minute, wait.Forever)
+	return held, release, err
 }
 
 // errFoldRaced is a fold that found the index's generation moved since its snapshot: another fold
@@ -366,7 +542,7 @@ func (s *Store) foldIndexHeld(ctx context.Context, sc backend.Scope) (gen int64,
 	var today time.Time
 	err = s.inTx(ctx, func(ctx context.Context, tx *txn) error {
 		gen = 0
-		current, t, err := tx.LockContentIndex(ctx, sc)
+		current, t, err := tx.lockIndex(ctx, sc)
 		if err != nil {
 			return err
 		}
@@ -385,17 +561,12 @@ func (s *Store) foldIndexHeld(ctx context.Context, sc backend.Scope) (gen int64,
 		if err := tx.InsertSegments(ctx, runs); err != nil {
 			return err
 		}
-		if err := tx.Notify(ctx, segmentChannel, sc.String()); err != nil {
-			return err
-		}
 		gen = next
 		return nil
 	})
 	if err != nil {
 		return 0, 0, 0, err
 	}
-	s.indexChanged(sc)
-	s.segmentsChanged(sc)
 	// The log rows it folded, which a reader of the new generation skips. The next fold deletes
 	// what this does not.
 	if err := s.deleteTail(ctx, func(ctx context.Context, tx *txn, limit int) (int64, error) {
@@ -450,13 +621,16 @@ type liveIndex struct {
 	// pack's for good, so they are kept across generations.
 	packMu sync.Mutex
 	packs  map[uint64]encoding.ID
-	// stale is set when another replica's commit was announced, or this one committed: the next
-	// read refreshes first.
-	stale atomic.Bool
 	// readFrom is when the last refresh that succeeded began reading — once it held mu, before its
 	// view's first read — so it holds what was committed before then: a refresh asked for since a
 	// moment it began after is done already. Under mu.
 	readFrom time.Time
+	// freeAt is when the last read for a transaction holding no lock (txLog.viewLockFree) began,
+	// freeGen the generation it read, and freeToday the database's day as it read it: a
+	// transaction that asked before then is served by it. Under mu.
+	freeAt    time.Time
+	freeGen   int64
+	freeToday time.Time
 }
 
 // liveIndexes are the content indexes this replica holds, by scope.
@@ -479,36 +653,21 @@ func (s *Store) live(sc backend.Scope) *liveIndex {
 	return li
 }
 
-// indexChanged marks a live index stale, if this replica holds it.
-func (s *Store) indexChanged(sc backend.Scope) {
-	s.indexes.mu.Lock()
-	li := s.indexes.byScope[sc]
-	s.indexes.mu.Unlock()
-	if li != nil {
-		li.stale.Store(true)
-	}
-}
-
-// allIndexesChanged marks every live index stale: announcements may have been missed.
-func (s *Store) allIndexesChanged() {
+// forgetIndex drops what this replica holds of a content index: deleted, or moved away.
+func (s *Store) forgetIndex(sc backend.Scope) {
 	s.indexes.mu.Lock()
 	defer s.indexes.mu.Unlock()
-	for _, li := range s.indexes.byScope {
-		li.stale.Store(true)
-	}
+	delete(s.indexes.byScope, sc)
 }
 
-// contentIndex returns a live index's view, loading it on first use and refreshing it when it is
-// stale.
+// contentIndex returns a live index's view as the database holds it now: what this replica holds
+// of the index's generation — its log, which within a generation only grows, read to a place —
+// brought up to date by the log since, or a generation since loaded (refreshIndexAt). Every read
+// reads the database: no news of another's commit is waited for, nor trusted. A refresh begun since
+// this read was asked for serves it, so the reads that come together read the database once.
 func (s *Store) contentIndex(ctx context.Context, sc backend.Scope) (*liveIndex, *indexView, error) {
-	s.startListening()
 	li := s.live(sc)
-	seen := time.Now()
-	if v := li.view.Load(); v != nil && !li.stale.Load() {
-		return li, v, nil
-	}
-	// Stale when seen: a refresh begun since serves this read.
-	if err := s.refreshIndexAt(ctx, sc, li, seen, 0); err != nil {
+	if err := s.refreshIndexAt(ctx, sc, li, time.Now(), 0); err != nil {
 		return nil, nil, err
 	}
 	return li, li.view.Load(), nil
@@ -528,19 +687,18 @@ func (s *Store) refreshIndex(ctx context.Context, sc backend.Scope, li *liveInde
 
 // refreshIndexAt is refreshIndex for a caller that needs what was committed before need: a refresh
 // that began since — another caller's, which this one waited for on the mutex — serves it, so
-// callers that find the index stale together read the database once, not one after another (a
-// repository's publishes, each staling every replica's index, would otherwise queue on its mutex a
-// read each). A caller that knows the index's generation (known; 0 for none) — a transaction
+// callers that read the index together read the database once, not one after another (a busy
+// repository's readers would otherwise queue on its mutex a read each). A caller that knows the index's generation (known; 0 for none) — a transaction
 // holding the index in share mode, which no fold moves meanwhile — has a view of that generation
 // brought up to date by the log since its place alone, one read; the generation is read otherwise.
 //
 // A caller reading through a read-only snapshot (inSnapshot) refreshes through it, which sees what
 // was committed before the snapshot began and nothing after its first read: it needs no more, and
-// its refresh claims no more — its view is current as of the snapshot's beginning, not its own —
-// leaves the index stale for the next reader that is not, and never replaces a view of a later
-// generation than its snapshot sees. Otherwise a commit after the snapshot, which it cleared the
-// index's staleness for and claimed to hold, was missing from the view every replica's readers took
-// as current: an upload's pin then found the tree its publish stored missing.
+// its refresh claims no more — its view is current as of the snapshot's beginning, not its own, so
+// the next reader that is not refreshes past it — and never replaces a view of a later generation
+// than its snapshot sees. Otherwise a commit after the snapshot, which it claimed to hold, was
+// missing from the view the replica's next readers took as current: an upload's pin then found the
+// tree its publish stored missing.
 func (s *Store) refreshIndexAt(ctx context.Context, sc backend.Scope, li *liveIndex, need time.Time, known int64) error {
 	snap := snapshotOf(ctx)
 	if !snap.IsZero() && need.After(snap) {
@@ -569,10 +727,6 @@ func (s *Store) refreshIndexAt(ctx context.Context, sc backend.Scope, li *liveIn
 		result = "applied"
 		if s.indexReads != nil {
 			s.indexReads()
-		}
-		// Cleared first, so an announcement during the refresh marks it again.
-		if snap.IsZero() {
-			li.stale.Store(false)
 		}
 		if v := li.view.Load(); v != nil && known != 0 && v.log.Generation() == known {
 			place, rows, err := s.applyLogs(ctx, tx, sc, v.log, li.place)
@@ -620,20 +774,24 @@ func (s *Store) refreshIndexAt(ctx context.Context, sc backend.Scope, li *liveIn
 	})
 	indexRefreshes.With(result).Inc()
 	if err != nil {
-		li.stale.Store(true)
 		return err
 	}
 	if markFold {
-		// Marked once its snapshot is done: on PostgreSQL, another connection while one is held
-		// could wait on a pool every other reader holds so.
-		if err := s.Work().Mark(ctx, foldDueWork(sc), sc.ID); err != nil {
-			li.mu.Lock()
-			li.foldMarked = false
-			li.mu.Unlock()
-			slog.Warn("scm: asking for a content index's fold", slog.String("index", sc.Name()), slog.Any("err", err))
-		}
+		s.markFoldDue(ctx, sc, li)
 	}
 	return nil
+}
+
+// markFoldDue asks for a content index's fold, its log long (foldDue): marked once the read that
+// found it so is done — on PostgreSQL, another connection while one is held could wait on a pool
+// every other reader holds so.
+func (s *Store) markFoldDue(ctx context.Context, sc backend.Scope, li *liveIndex) {
+	if err := s.Work().Mark(ctx, foldDueWork(sc), sc.ID); err != nil {
+		li.mu.Lock()
+		li.foldMarked = false
+		li.mu.Unlock()
+		slog.Warn("scm: asking for a content index's fold", slog.String("index", sc.Name()), slog.Any("err", err))
+	}
 }
 
 var (
@@ -762,7 +920,6 @@ func (s *Store) entries(ctx context.Context, sc backend.Scope, kind encoding.Kin
 	var li *liveIndex
 	var v *indexView
 	if asIs {
-		s.startListening()
 		li = s.live(sc)
 		v = li.view.Load()
 	}

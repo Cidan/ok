@@ -22,7 +22,6 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 
 	"github.com/Cidan/ok/internal/buildsys/bazel"
-	"github.com/Cidan/ok/internal/bus"
 	"github.com/Cidan/ok/internal/bus/busconfig"
 	"github.com/Cidan/ok/internal/cells"
 	"github.com/Cidan/ok/internal/checkout"
@@ -44,6 +43,7 @@ import (
 	"github.com/Cidan/ok/internal/serve/authn"
 	"github.com/Cidan/ok/internal/serve/node"
 	"github.com/Cidan/ok/internal/spannerdb"
+	"github.com/Cidan/ok/internal/wait"
 	automationpb "github.com/Cidan/ok/proto/ok/automation/v1"
 	deploypb "github.com/Cidan/ok/proto/ok/deploy/v1"
 	identitypb "github.com/Cidan/ok/proto/ok/identity/v1"
@@ -54,9 +54,6 @@ import (
 
 // Schema is the PostgreSQL schema the deployer keeps its tables in.
 const Schema = "deploy"
-
-// Interval is how often the engine plans and drives.
-const Interval = 5 * time.Second
 
 // Role is the deployer, assembled.
 type Role struct {
@@ -89,18 +86,18 @@ type Options struct {
 	// run, for the Bazel Build.
 	Bazel string
 	Env   []string
-	// Pool, Stream, Kube, Identity, SCM, and Automation, when set, are the database, the bus's
-	// stream, the cluster, and the roles, dialed as the deployer already: tests.
+	// Pool, Kube, Identity, SCM, and Automation, when set, are the database, the cluster, and the
+	// roles, dialed as the deployer already: tests.
 	Pool                      *pgxpool.Pool
-	Stream                    bus.Stream
 	Kube                      kubernetes.Interface
 	Identity, SCM, Automation grpc.ClientConnInterface
 	// Secrets, when set, is ok secrets, dialed as the deployer: tests, and ok serve. Unset, it is
 	// dialed at services.secrets, where the installation runs it.
 	Secrets grpc.ClientConnInterface
-	// Timing and Interval, when set, are the watch's and the engine's: tests.
-	Timing   *roll.Timing
-	Interval time.Duration
+	// Timing and Look, when set, are the watch's, and how long the engine's waiting steps wait
+	// before they look again (engine.Look): tests.
+	Timing *roll.Timing
+	Look   time.Duration
 	// Roots, when set, are the identity CA's certificates as identity in the same process holds
 	// them (ok serve); unset, they are read from identity.
 	Roots *idclient.Roots
@@ -162,14 +159,14 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (*Role, error)
 	}
 	st := store.New(b)
 	r.Store = st
-	stream := opts.Stream
-	if stream == nil {
-		bb, err := busconfig.Open(ctx, cfg.Bus, pool)
-		if err != nil {
-			return nil, err
-		}
-		r.closers = append(r.closers, bb.Close)
-		stream = bb.Stream
+	bb, err := busconfig.Open(ctx, cfg.Bus)
+	if err != nil {
+		return nil, err
+	}
+	r.closers = append(r.closers, bb.Close)
+	// Its keyed work's jobs go on the bus's queue (docs/hosted.md, "Work without leaders").
+	if err := bb.RegisterWork(st.Work(), "deploy"); err != nil {
+		return nil, err
 	}
 	kube := opts.Kube
 	if kube == nil {
@@ -240,9 +237,7 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (*Role, error)
 	}
 	roots := opts.Roots
 	if roots == nil {
-		if roots, err = idclient.NewRoots(ctx, idConn, "deploy"); err != nil {
-			return nil, err
-		}
+		roots = idclient.NewRoots(idConn)
 	}
 	r.Resolver = authn.NewResolver(authn.Config{
 		Directory:     idclient.NewDirectory(idConn),
@@ -316,12 +311,9 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (*Role, error)
 		Tree:           identitypb.NewTreeClient(idConn),
 		Secrets:        deploySecrets,
 		TreeRepository: cfg.Identity.TreeRepository,
+		Look:           opts.Look,
 		Log:            slog.Default(),
 	})
-	interval := Interval
-	if opts.Interval > 0 {
-		interval = opts.Interval
-	}
 	events := scmpb.NewEventsClient(scmConn)
 	// Moves of its repositories' rows between cells, from the same role of the source cell
 	// (docs/hosted.md, "Cells, as built").
@@ -340,17 +332,16 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (*Role, error)
 		}), mover.Purge)
 	r.Root = &assembly{deps: []node.Node{
 		moves,
-		&services{svc: service.New(st), hub: hub},
-		&app{name: "ok/deploy/feed", run: func(ctx context.Context) error { return engine.Follow(ctx, st, stream, events, slog.Default()) }},
+		&services{svc: service.New(st), hub: hub, waits: st.Waits()},
+		&app{name: "ok/deploy/feed", run: func(ctx context.Context) error { return engine.Follow(ctx, st, events, slog.Default()) }},
+		&app{name: "ok/deploy/waits", run: func(ctx context.Context) error { st.RunWaits(ctx, bb.Queue); return nil }},
 		&app{name: "ok/deploy/directory", run: func(ctx context.Context) error {
-			return engine.FollowDirectory(ctx, st, stream, identitypb.NewDirectoryEventsClient(idConn), slog.Default())
+			return engine.FollowDirectory(ctx, st, identitypb.NewDirectoryEventsClient(idConn), slog.Default())
 		}},
 		&app{name: "ok/deploy/observer", run: (&observe.Observer{Store: st, Kube: kube, Cluster: clusterOf, Labels: labels, Log: slog.Default()}).Run},
 		&app{name: "ok/deploy/engine", run: func(ctx context.Context) error {
-			defer r.Engine.Wait()
-			return r.Engine.Run(ctx, interval)
+			return r.Engine.Run(ctx)
 		}},
-		roots,
 	}}
 	ok = true
 	return r, nil
@@ -380,8 +371,9 @@ func dialPeer(cfg *config.Config, opts Options, addr string) (grpc.ClientConnInt
 
 // services are the Deployments service, and the deploy agents' (Agents, AgentRelay).
 type services struct {
-	svc *service.Service
-	hub *tunnel.Hub
+	svc   *service.Service
+	hub   *tunnel.Hub
+	waits wait.Store
 }
 
 var _ node.Service = (*services)(nil)
@@ -395,6 +387,7 @@ func (s *services) RegisterRPC(_ context.Context, reg grpc.ServiceRegistrar) err
 	deploypb.RegisterDeploymentsServer(reg, s.svc)
 	deploypb.RegisterAgentsServer(reg, s.hub)
 	deploypb.RegisterAgentRelayServer(reg, s.hub)
+	okpb.RegisterWaitsServer(reg, &wait.Server{Store: s.waits})
 	return nil
 }
 

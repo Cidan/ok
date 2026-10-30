@@ -22,43 +22,52 @@ import (
 
 // Mover is ok automation's side of moves; its Purge deletes what moved away, a day after.
 func (s *Store) Mover() *move.RepositoryRole {
-	return &move.RepositoryRole{RoleName: cells.Automation, Rows: s.b.Moves(), Kept: logObjects{s}, Frozen: s.giveBack, Arrived: s.arrived}
+	return &move.RepositoryRole{RoleName: cells.Automation, Rows: s.b.Moves(), Work: s.Work(), Kept: logObjects{s}, Frozen: s.giveBack, Arrived: s.arrived,
+		Thawed: s.dispatchQueued}
 }
 
 // movingReason is why a run a worker held was given back: it runs again where its repository goes.
 const movingReason = "its repository is moving to another cell"
 
-// giveBack requeues the runs workers hold of frozen repositories, without spending an attempt:
-// they run again, from the start, where the repositories go. No worker claims another of them
-// meanwhile, nor may one write about it.
+// giveBack requeues the runs workers hold of frozen repositories, without spending an attempt, and
+// with no job: they run again, from the start, where the repositories go — dispatched there as
+// they arrive, or here once the move is called off. The deliveries they ran under are
+// acknowledged. No worker claims another of them meanwhile, nor may one write about it.
 func (s *Store) giveBack(ctx context.Context, repos []int64) error {
 	ids, err := s.b.RunningRuns(ctx, repos)
 	if err != nil {
 		return err
 	}
 	for _, id := range ids {
+		var handle []byte
 		if err := s.b.Txn(ctx, func(tx Ops) error {
+			handle = nil
 			run, err := tx.LockRun(ctx, id)
 			if err != nil || run.Status != StatusRunning {
 				return err
 			}
-			return tx.RequeueRun(ctx, id, movingReason, false)
+			handle = run.LeaseHandle
+			return tx.RequeueRun(ctx, id, "", movingReason, false)
 		}); err != nil {
 			return fmt.Errorf("giving back run %d: %w", id, err)
 		}
+		s.acknowledge(ctx, [][]byte{handle})
 	}
 	return nil
 }
 
-// arrived has the repositories' landing queues looked at here: what they held to land came with
-// them.
+// arrived dispatches the repositories' queued runs here, stores their finished runs' logs, and has
+// their landing queues looked at: what they held to run, to store, and to land came with them.
 func (s *Store) arrived(ctx context.Context, repos []int64) error {
 	for _, r := range repos {
 		if err := s.b.MarkWork(ctx, QueueWork, r); err != nil {
 			return err
 		}
 	}
-	return nil
+	if err := s.dispatchQueued(ctx, repos); err != nil {
+		return err
+	}
+	return s.enqueueUnstoredLogs(ctx, repos)
 }
 
 // logObjects are the repositories' runs' logs: each run's whole log (runs/<id>) and the segments of

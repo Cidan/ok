@@ -29,6 +29,8 @@ import (
 	"github.com/Cidan/ok/internal/migrate"
 	"github.com/Cidan/ok/internal/scm/encoding"
 	"github.com/Cidan/ok/internal/scm/store/backend"
+	"github.com/Cidan/ok/internal/wait"
+	"github.com/Cidan/ok/internal/work"
 )
 
 //go:embed migrations/*.sql
@@ -39,6 +41,11 @@ var Migrations = migrate.MustLoad(migrations, "migrations")
 
 // Backend is the SCM's database on Spanner.
 type Backend struct{ queries }
+
+// Work is the backend's keyed work's store.
+func (b *Backend) Work() work.Store { return spannerdata.Work(b.c) }
+
+func (b *Backend) Waits() wait.Store { return spannerdata.Waits(b.c) }
 
 // defaultStageLogBytes are the bytes of content log a transaction writes itself before it stages
 // the rest (InsertContentLog).
@@ -85,10 +92,16 @@ func (b *Backend) Txn(ctx context.Context, fn func(backend.Ops) error) error {
 		t := &txn{tx: &stx.ReadWriteTransaction}
 		done := spannertxn.Begun(t.tx)
 		defer func() { done(err) }()
+		work.Begin(b.c, t.tx)
+		defer work.End(t.tx)
 		// What ctx's lease guards is written only while its holder holds it (data.Fence).
 		err = spannerdata.CheckFence(ctx, t.tx)
 		if err == nil {
 			err = fn(queries{c: b.c, tx: t, stageBytes: b.stageBytes, packNums: b.packNums})
+		}
+		if err == nil {
+			// The jobs of the work it marked, before it commits.
+			err = work.Flush(ctx, t.tx)
 		}
 		t.mu.Lock()
 		defer t.mu.Unlock()
@@ -132,13 +145,13 @@ const relayLease = time.Minute
 // pending by key, or, if publishing failed, lets them go for another to take. A relay that dies
 // after publishing has its events published again once its lease lapses, as on PostgreSQL one that
 // publishes and dies before committing does.
-func (b *Backend) RelayEvents(ctx context.Context, limit int, publish func([]backend.Event) error) (int, error) {
+func (b *Backend) RelayEvents(ctx context.Context, repo int64, limit int, publish func([]backend.Event) error) (int, error) {
 	var seen []backend.Event
-	ro := b.c.ReadOnlyTransaction()
+	ro := spannerdata.ReadOnly(b.c)
 	err := spannerdata.Each(ctx, ro, `SELECT e.repository_id, e.repository_seq, e.body
 		FROM event_pending p JOIN event e ON e.repository_id = p.repository_id AND e.repository_seq = p.repository_seq
-		WHERE p.lease_until IS NULL OR p.lease_until < `+now+`
-		ORDER BY p.repository_id, p.repository_seq LIMIT @limit`, map[string]any{"limit": int64(limit)}, func(row *spanner.Row) error {
+		WHERE (@repo = 0 OR p.repository_id = @repo) AND (p.lease_until IS NULL OR p.lease_until < `+now+`)
+		ORDER BY p.repository_id, p.repository_seq LIMIT @limit`, map[string]any{"repo": repo, "limit": int64(limit)}, func(row *spanner.Row) error {
 		var e backend.Event
 		if err := row.Columns(&e.Repository, &e.RepositorySeq, &e.Body); err != nil {
 			return err
@@ -211,6 +224,18 @@ func (b *Backend) RelayEvents(ctx context.Context, limit int, publish func([]bac
 	return len(evs), nil
 }
 
+// EventsRelayed reads the repository's counter, which the pass that places events holds until it
+// commits, and its pending events, at one moment.
+func (b *Backend) EventsRelayed(ctx context.Context, repo, first, last int64) (written, relayed bool, err error) {
+	ro := b.c.Single()
+	err = spannerdata.Each(ctx, ro, `SELECT IFNULL((SELECT last FROM repository_event_counter WHERE repository_id = @repo), 0) >= @last,
+			NOT EXISTS (SELECT 1 FROM event_pending WHERE repository_id = @repo AND (@last = 0 OR repository_seq BETWEEN @first AND @last))`,
+		map[string]any{"repo": repo, "first": first, "last": last}, func(row *spanner.Row) error {
+			return row.Columns(&written, &relayed)
+		})
+	return written, relayed, err
+}
+
 // eventKey is an event's key, as a STRUCT parameter.
 type eventKey struct {
 	R int64 `spanner:"r"`
@@ -268,7 +293,7 @@ func (x queries) read(fn func(r spannerdata.Reader) error) error {
 	case x.ro != nil:
 		return fn(x.ro)
 	}
-	ro := x.c.ReadOnlyTransaction()
+	ro := spannerdata.ReadOnly(x.c)
 	defer ro.Close()
 	return fn(ro)
 }
@@ -284,7 +309,7 @@ func (x queries) unlocked(fn func(r spannerdata.Reader) error) error {
 	if x.ro != nil {
 		return fn(x.ro)
 	}
-	ro := x.c.ReadOnlyTransaction()
+	ro := spannerdata.ReadOnly(x.c)
 	defer ro.Close()
 	return fn(ro)
 }
@@ -391,6 +416,8 @@ var tableKeys = map[string]string{
 	"repository_deletion":      "repository_id INT64",
 	"counter":                  "name STRING, scope_id INT64",
 	"changelist_counter":       "repository_id INT64",
+	"compaction_cursor":        "repository_id INT64",
+	"sequence_pass":            "repository_id INT64",
 	"repository_event_counter": "repository_id INT64",
 }
 

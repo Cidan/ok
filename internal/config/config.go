@@ -310,6 +310,9 @@ type Automation struct {
 	// LandingBatch bounds how many submissions the landing queue lands in one landing: 32 unless
 	// set; 1 lands each alone.
 	LandingBatch *int `yaml:"landing_batch"`
+	// QueueParallel is how many submissions the landing queue acts on at once — preparing their
+	// attempts, releasing them — beside each landing: 128 unless set.
+	QueueParallel *int `yaml:"queue_parallel"`
 	// PlanPool is the pool of workers planning runs run in (docs/hosted.md, "Hosted automation, as
 	// built"): default unless set.
 	PlanPool string `yaml:"plan_pool"`
@@ -418,6 +421,9 @@ type SCM struct {
 	GCHour *int `yaml:"gc_hour"`
 	// Cache bounds the SCM's caches, in bytes; zero for the defaults.
 	Cache SCMCache `yaml:"cache"`
+	// PublishMemory bounds, in bytes, the memory every publish at once holds its packs in before
+	// they go to the bucket; zero for the default.
+	PublishMemory int64 `yaml:"publish_memory"`
 }
 
 // SCMCache bounds the SCM's in-memory caches.
@@ -455,74 +461,66 @@ type Objects struct {
 	Dir string `yaml:"dir"`
 }
 
-// Bus is how the roles hear of what happened — the stream — and hand out work — the queue
-// (docs/hosted.md, "Events and the bus"), each a backend of its own.
+// Bus is where ok keeps its work, and the replies to the live requests waiting on a change
+// (docs/state.md; docs/hosted.md, "Events and the bus"), by its type: nats keeps it in NATS
+// JetStream; pubsub in Google Pub/Sub; aws in Amazon SQS. Every role but the worker runs on it.
 type Bus struct {
-	Stream BusBackend `yaml:"stream"`
-	Queue  BusBackend `yaml:"queue"`
-}
-
-// BusBackend is one of the bus's backends: postgres, the default, keeps it in the installation's
-// database, in a schema of its own (bus); nats keeps it in NATS JetStream; pubsub in Google Pub/Sub;
-// aws in Amazon SNS (the stream) and SQS; kafka, the stream alone, in Kafka.
-type BusBackend struct {
 	Type   string     `yaml:"type"`
 	NATS   *NATSBus   `yaml:"nats"`
 	PubSub *PubSubBus `yaml:"pubsub"`
 	AWS    *AWSBus    `yaml:"aws"`
-	Kafka  *KafkaBus  `yaml:"kafka"`
 }
 
-// KafkaBus is how to reach a Kafka cluster and how to keep the stream there (internal/bus/kafkabus).
-type KafkaBus struct {
-	// Brokers are some of the cluster's, host:port, to learn the rest from.
-	Brokers []string `yaml:"brokers"`
-	// TLS reaches them over TLS; CAFile is their certificate authority when not the system's.
-	TLS    bool   `yaml:"tls"`
-	CAFile string `yaml:"ca_file"`
-	// SASL is how ok signs in, when the cluster asks.
-	SASL *KafkaSASL `yaml:"sasl"`
-	// Prefix begins every topic and group name. Default ok.
-	Prefix string `yaml:"prefix"`
-	// Partitions is how many partitions a topic is made with. Default 12.
-	Partitions int32 `yaml:"partitions"`
-	// ReplicationFactor is how many brokers keep each partition. Default the cluster's.
-	ReplicationFactor int16 `yaml:"replication_factor"`
-	// Retention is how long a topic keeps its events. Default 168h.
-	Retention time.Duration `yaml:"retention"`
-	// Concurrency is how many events a role's member handles at once, and fetches at most.
-	// Default 32.
-	Concurrency int `yaml:"concurrency"`
+// check says what is wrong with the bus's configuration. None named is the worker's: the roles that
+// run on one ask for it (busconfig.Open).
+func (b Bus) check(add func(format string, args ...any)) {
+	const field = "bus"
+	switch b.Type {
+	case "": // the roles that run on it ask for it (busconfig.Open); a worker runs on none
+	case "nats":
+		if b.NATS == nil || b.NATS.URL == "" {
+			add("%s.nats.url: the NATS servers, for type nats", field)
+		}
+	case "pubsub":
+		if b.PubSub == nil || b.PubSub.Project == "" {
+			add("%s.pubsub.project: the Google Cloud project, for type pubsub", field)
+		}
+	case "aws":
+		if b.AWS == nil || b.AWS.Region == "" {
+			add("%s.aws.region: the AWS region, for type aws", field)
+		} else if (b.AWS.AccessKeyFile == "") != (b.AWS.SecretKeyFile == "") {
+			add("%s.aws: access_key_file and secret_key_file together, or neither", field)
+		}
+	default:
+		add("%s.type: %q is none of nats, pubsub, and aws", field, b.Type)
+	}
+	if b.NATS != nil && b.Type != "nats" {
+		add("%s.nats: for type nats, not %s", field, b.Type)
+	}
+	if b.PubSub != nil && b.Type != "pubsub" {
+		add("%s.pubsub: for type pubsub, not %s", field, b.Type)
+	}
+	if b.AWS != nil && b.Type != "aws" {
+		add("%s.aws: for type aws, not %s", field, b.Type)
+	}
 }
 
-// KafkaSASL is how ok signs in to a Kafka cluster.
-type KafkaSASL struct {
-	// Mechanism is plain, scram-sha-256, scram-sha-512, or aws-msk-iam (an MSK cluster's IAM
-	// authentication, with credentials from AWS's chain and the region from the brokers' names).
-	Mechanism string `yaml:"mechanism"`
-	// Username and PasswordFile are plain's and SCRAM's.
-	Username     string `yaml:"username"`
-	PasswordFile string `yaml:"password_file"`
-}
-
-// AWSBus is how to reach SNS and SQS and how to keep the bus there (internal/bus/awsbus).
+// AWSBus is how to reach SQS and how to keep the bus there (internal/bus/awsbus).
 type AWSBus struct {
-	// Region is the AWS region the topics and queues are in.
+	// Region is the AWS region the queues are in.
 	Region string `yaml:"region"`
-	// Endpoint is SNS's and SQS's address when not AWS's: a fake's, or LocalStack's.
+	// Endpoint is SQS's address when not AWS's: a fake's, or LocalStack's.
 	Endpoint string `yaml:"endpoint"`
 	// AccessKeyFile and SecretKeyFile hold an access key; unset, credentials come from AWS's chain
 	// (its environment variables, its credentials file, the instance's or pod's role).
 	AccessKeyFile string `yaml:"access_key_file"`
 	SecretKeyFile string `yaml:"secret_key_file"`
-	// Prefix begins every topic and queue name. Default ok.
+	// Prefix begins every queue name. Default ok.
 	Prefix string `yaml:"prefix"`
 	// Retention is how long a queue keeps what it holds: at most 336h. Default 168h.
 	Retention time.Duration `yaml:"retention"`
 	// MaxAttempts is how many deliveries a job gets before it is a dead letter. Default 10.
 	MaxAttempts int `yaml:"max_attempts"`
-	// Concurrency is how many events a role's member handles at once. Default 32.
-	Concurrency int `yaml:"concurrency"`
 }
 
 // PubSubBus is how to reach Google Pub/Sub and how to keep the bus there (internal/bus/pubsubbus).
@@ -542,8 +540,6 @@ type PubSubBus struct {
 	// MaxAttempts is how many deliveries a job gets before it is a dead letter: at most 100.
 	// Default 10.
 	MaxAttempts int `yaml:"max_attempts"`
-	// Concurrency is how many events a role's member handles, and holds, at once. Default 32.
-	Concurrency int `yaml:"concurrency"`
 }
 
 // NATSBus is how to reach NATS JetStream and how to keep the bus there (internal/bus/natsbus).
@@ -558,14 +554,12 @@ type NATSBus struct {
 	Prefix string `yaml:"prefix"`
 	// Replicas is how many servers keep each stream: 3 in a cluster. Default 1.
 	Replicas int `yaml:"replicas"`
-	// Retention is how long events, jobs, and dead letters are kept. Default 168h.
+	// Retention is how long jobs and dead letters are kept. Default 168h.
 	Retention time.Duration `yaml:"retention"`
 	// AckWait is the floor of a job's lease, and how long a dead worker holds it. Default 30s.
 	AckWait time.Duration `yaml:"ack_wait"`
 	// MaxAttempts is how many deliveries a job gets before it is a dead letter. Default 10.
 	MaxAttempts int `yaml:"max_attempts"`
-	// Concurrency is how many events a role's member handles at once. Default 16.
-	Concurrency int `yaml:"concurrency"`
 }
 
 // TLS is a certificate and key, as files.
@@ -712,17 +706,14 @@ type Identity struct {
 	// own: one of the cells'. Unset, any open cell's.
 	DefaultRegion string `yaml:"default_region"`
 	// DefaultQuota is an account's quota of CI when an administrator set it none (docs/hosted.md,
-	// "Hosted automation, as built"): zero concurrent runs or minutes for unlimited; weight 1
-	// unless set.
+	// "Hosted automation, as built"): zero concurrent runs or minutes for unlimited.
 	DefaultQuota Quota `yaml:"default_quota"`
 }
 
-// Quota is an account's quota of CI: concurrent runs, run minutes in a calendar month (UTC), and
-// its weight in fair share.
+// Quota is an account's quota of CI: concurrent runs and run minutes in a calendar month (UTC).
 type Quota struct {
 	Concurrent int   `yaml:"concurrent"`
 	Minutes    int64 `yaml:"minutes"`
-	Weight     int   `yaml:"weight"`
 }
 
 // Session bounds a browser session.
@@ -971,10 +962,8 @@ func (c *Config) check() error {
 	if len(c.Identity.Cells) > 0 && !cellOpen {
 		add("identity.cells: every cell is closed: new repositories have nowhere to go")
 	}
-	if q := &c.Identity.DefaultQuota; q.Concurrent < 0 || q.Minutes < 0 || q.Weight < 0 {
-		add("identity.default_quota: concurrent, minutes, and weight are not negative")
-	} else if q.Weight == 0 {
-		q.Weight = 1
+	if q := c.Identity.DefaultQuota; q.Concurrent < 0 || q.Minutes < 0 {
+		add("identity.default_quota: concurrent and minutes are not negative")
 	}
 	if r := c.Identity.DefaultRegion; r != "" {
 		known := false
@@ -1008,58 +997,7 @@ func (c *Config) check() error {
 	if c.TLS != nil && (c.TLS.Cert == "" || c.TLS.Key == "") {
 		add("tls names a cert and a key")
 	}
-	for field, b := range map[string]*BusBackend{"bus.stream": &c.Bus.Stream, "bus.queue": &c.Bus.Queue} {
-		switch b.Type {
-		case "":
-			b.Type = "postgres"
-		case "postgres":
-		case "nats":
-			if b.NATS == nil || b.NATS.URL == "" {
-				add("%s.nats.url: the NATS servers, for type nats", field)
-			}
-		case "pubsub":
-			if b.PubSub == nil || b.PubSub.Project == "" {
-				add("%s.pubsub.project: the Google Cloud project, for type pubsub", field)
-			}
-		case "aws":
-			if b.AWS == nil || b.AWS.Region == "" {
-				add("%s.aws.region: the AWS region, for type aws", field)
-			} else if (b.AWS.AccessKeyFile == "") != (b.AWS.SecretKeyFile == "") {
-				add("%s.aws: access_key_file and secret_key_file together, or neither", field)
-			}
-		case "kafka":
-			switch {
-			case field == "bus.queue":
-				add("bus.queue.type: kafka carries the stream alone (it acknowledges no single message): take the queue from another backend")
-			case b.Kafka == nil || len(b.Kafka.Brokers) == 0:
-				add("%s.kafka.brokers: some of the cluster's brokers, for type kafka", field)
-			case b.Kafka.SASL != nil:
-				switch b.Kafka.SASL.Mechanism {
-				case "plain", "scram-sha-256", "scram-sha-512":
-					if b.Kafka.SASL.Username == "" || b.Kafka.SASL.PasswordFile == "" {
-						add("%s.kafka.sasl: %s takes a username and a password_file", field, b.Kafka.SASL.Mechanism)
-					}
-				case "aws-msk-iam":
-				default:
-					add("%s.kafka.sasl.mechanism: %q is none of plain, scram-sha-256, scram-sha-512, and aws-msk-iam", field, b.Kafka.SASL.Mechanism)
-				}
-			}
-		default:
-			add("%s.type: %q is none of postgres, nats, pubsub, aws, and kafka", field, b.Type)
-		}
-		if b.NATS != nil && b.Type != "nats" {
-			add("%s.nats: for type nats, not %s", field, b.Type)
-		}
-		if b.PubSub != nil && b.Type != "pubsub" {
-			add("%s.pubsub: for type pubsub, not %s", field, b.Type)
-		}
-		if b.AWS != nil && b.Type != "aws" {
-			add("%s.aws: for type aws, not %s", field, b.Type)
-		}
-		if b.Kafka != nil && b.Type != "kafka" {
-			add("%s.kafka: for type kafka, not %s", field, b.Type)
-		}
-	}
+	c.Bus.check(add)
 	switch c.Database.Type {
 	case "":
 		c.Database.Type = "postgres"
@@ -1095,15 +1033,6 @@ func (c *Config) check() error {
 		}
 		if c.Database.URLFile != "" || c.Database.MaxConnections != 0 {
 			add("database.url_file and database.max_connections: for type postgres, not spanner")
-		}
-		for _, field := range []string{"stream", "queue"} {
-			b := c.Bus.Stream
-			if field == "queue" {
-				b = c.Bus.Queue
-			}
-			if b.Type == "postgres" {
-				add("bus.%s.type: postgres keeps the bus in PostgreSQL, which database.type spanner leaves none of: take it from another backend", field)
-			}
 		}
 	} else if s != nil {
 		add("database.spanner: for type spanner, not %s", c.Database.Type)
@@ -1202,6 +1131,9 @@ func (c *Config) check() error {
 			s.Interval = 10 * time.Minute
 		}
 	}
+	if c.SCM.PublishMemory < 0 {
+		add("scm.publish_memory is not negative")
+	}
 	if h := c.SCM.GCHour; h != nil && (*h < 0 || *h > 23) {
 		add("scm.gc_hour is an hour, 0 to 23")
 	}
@@ -1254,6 +1186,9 @@ func (c *Config) check() error {
 	}
 	if b := c.Automation.LandingBatch; b != nil && *b < 1 {
 		add("automation.landing_batch is a count, 1 or more")
+	}
+	if p := c.Automation.QueueParallel; p != nil && *p < 1 {
+		add("automation.queue_parallel is a count, 1 or more")
 	}
 	switch c.Worker.Checkout {
 	case "":

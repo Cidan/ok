@@ -5,14 +5,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/Cidan/ok/internal/blob"
+	"github.com/Cidan/ok/internal/bus"
 	"github.com/Cidan/ok/internal/cells"
 	"github.com/Cidan/ok/internal/move"
+	"github.com/Cidan/ok/internal/wait"
 )
 
 // A run's log is in the logs bucket (automation.logs), never in the database. While a run is
@@ -151,7 +154,7 @@ func (s *Store) advanceLog(ctx context.Context, run *Run, from, to int64) (bool,
 		if moved, err = tx.AdvanceLog(ctx, run.ID, run.Worker, run.StartedAt, from, to); err != nil || !moved {
 			return err
 		}
-		return notify(ctx, tx, chanLog, run.ID)
+		return changed(ctx, tx, run.ID)
 	})
 	return moved, err
 }
@@ -163,12 +166,23 @@ func (s *Store) ReadLog(ctx context.Context, id, offset int64, follow bool, emit
 		return invalid("a log offset is not negative")
 	}
 	var segs segments
+	var waiter *wait.Waiter
+	defer func() {
+		if waiter != nil {
+			waiter.Close()
+		}
+	}()
 	short := 0
 	for {
-		// Watching starts before the read, so a write between the read and the wait still
-		// wakes it.
-		woken := s.notify.watch(chanLog, strconv.FormatInt(id, 10))
-		done := s.notify.watch(chanDone, strconv.FormatInt(id, 10))
+		// A follower waits on the run's changes from before its read (wait.Open), so a write between
+		// the read and the wait still wakes it.
+		if follow && waiter == nil {
+			w, err := wait.Open(ctx, s.queue, wait.Reg{Store: s.b.Waits(), Subjects: []string{wait.RunSubject(id)}})
+			if err != nil {
+				return err
+			}
+			waiter = w
+		}
 		run, err := s.b.Run(ctx, id)
 		if err != nil {
 			return err
@@ -226,7 +240,7 @@ func (s *Store) ReadLog(ctx context.Context, id, offset int64, follow bool, emit
 		case !follow:
 			return nil
 		}
-		if err := s.notify.waitAny(ctx, s.cfg.Poll, woken, done); err != nil {
+		if _, err := waiter.Next(ctx); err != nil {
 			return err
 		}
 	}
@@ -426,26 +440,112 @@ func (s *Store) storeLog(ctx context.Context, id int64) error {
 	return s.b.MarkLogStored(ctx, id)
 }
 
-// sweepLogs gathers the logs of finished runs a failed move left unstored.
-func (s *Store) sweepLogs(ctx context.Context) error {
-	ids, err := s.b.UnstoredLogs(ctx, 100)
+// logQueue carries the jobs that store finished runs' logs: one a run, enqueued before the
+// transaction that finished it commits, done as it finishes and again by whichever replica leases
+// it should that fail — the queue retries it, and nothing sweeps the database for logs left behind.
+const logQueue = "automation.logs"
+
+func logJob(id int64) bus.Job {
+	return bus.Job{ID: "log-" + strconv.FormatInt(id, 10), Queue: logQueue, Key: id, Body: jobBody(id, time.Now())}
+}
+
+// enqueueLogs enqueues the jobs storing runs' logs.
+func (s *Store) enqueueLogs(ctx context.Context, ids []int64) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	jobs := make([]bus.Job, len(ids))
+	for i, id := range ids {
+		jobs[i] = logJob(id)
+	}
+	if err := s.queue.Enqueue(ctx, jobs...); err != nil {
+		return fmt.Errorf("enqueueing runs' logs: %w", err)
+	}
+	return nil
+}
+
+// StoreLogs stores finished runs' logs as their jobs come, until ctx ends: every replica runs it.
+func (s *Store) StoreLogs(ctx context.Context) error {
+	for ctx.Err() == nil {
+		if _, err := s.storeLogs(ctx, 30*time.Second); err != nil && ctx.Err() == nil {
+			slog.Warn("automation: leasing log jobs", "err", err)
+			time.Sleep(time.Second)
+		}
+	}
+	return nil
+}
+
+// StoreReadyLogs stores the logs whose jobs are ready now, and returns.
+func (s *Store) StoreReadyLogs(ctx context.Context) error {
+	for {
+		n, err := s.storeLogs(ctx, 0)
+		if err != nil || n == 0 {
+			return err
+		}
+	}
+}
+
+// storeLogs stores the logs of a batch of log jobs, waiting up to wait for one; it returns how many
+// it leased. A log of a repository moving, or moved, goes with it, as it is; a failure is tried
+// again later.
+func (s *Store) storeLogs(ctx context.Context, wait time.Duration) (int, error) {
+	ls, err := s.queue.Lease(ctx, logQueue, bus.LeaseOptions{Max: 8, Visibility: 2 * time.Minute, Wait: wait})
+	if err != nil {
+		return 0, err
+	}
+	for _, l := range ls {
+		id, made, ok := parseJobBody(l.Job().Body)
+		if !ok {
+			_ = l.Ack(ctx)
+			continue
+		}
+		copies := bus.Copies(l.Job().ID)
+		var err error
+		run, rerr := s.b.Run(ctx, id)
+		switch {
+		case (errors.Is(rerr, ErrNotFound) || rerr == nil && !run.Status.Finished()) && time.Since(made) < notThereFor:
+			// The transaction that finished it, which enqueued the job, commits in moments.
+			err = bus.PutOff(ctx, s.queue, l, bus.Backoff(copies, 20*time.Millisecond, 2*time.Second))
+		case errors.Is(rerr, ErrNotFound) || rerr == nil && !run.Status.Finished():
+			err = l.Ack(ctx) // its transaction never committed, or the run is gone
+		case rerr != nil:
+			err = bus.PutOff(ctx, s.queue, l, bus.Backoff(copies, time.Second, 5*time.Minute))
+		default:
+			switch serr := s.storeLog(ctx, id); {
+			case serr == nil || errors.Is(serr, ErrNotFound) || move.IsFrozen(serr) || moved(serr):
+				err = l.Ack(ctx)
+			default:
+				slog.Warn("automation: storing a run's log", "run", id, "copies", copies, "err", serr)
+				err = bus.PutOff(ctx, s.queue, l, bus.Backoff(copies, time.Second, 5*time.Minute))
+			}
+		}
+		if err != nil && !errors.Is(err, bus.ErrLeaseLost) && ctx.Err() == nil {
+			slog.Warn("automation: finishing a log job", "run", id, "err", err)
+		}
+	}
+	return len(ls), nil
+}
+
+// enqueueUnstoredLogs enqueues the jobs of the finished runs whose logs are not stored, of repos,
+// or of every repository for none: a move's arrival, and, once as a replica starts, the logs an
+// older release left.
+func (s *Store) enqueueUnstoredLogs(ctx context.Context, repos []int64) error {
+	ids, err := s.b.UnstoredLogs(ctx, repos, 1<<20)
 	if err != nil {
 		return err
 	}
-	var errs []error
-	for _, id := range ids {
-		// A log of a repository moving, or moved, goes with it, as it is.
-		if err := s.storeLog(ctx, id); err != nil && !move.IsFrozen(err) && !moved(err) {
-			errs = append(errs, err)
+	for start := 0; start < len(ids); start += 1000 {
+		if err := s.enqueueLogs(ctx, ids[start:min(start+1000, len(ids))]); err != nil {
+			return err
 		}
 	}
-	return errors.Join(errs...)
+	return nil
 }
 
-// Sweep does the work no request does: it acts on lapsed leases and moves the logs a
-// failed move left behind. Every replica may run it; each step is safe to repeat.
-func (s *Store) Sweep(ctx context.Context) error {
-	return errors.Join(s.sweepLeases(ctx), s.sweepLogs(ctx))
+// Started does what a release before dispatch left for this one: its queued runs dispatched, and
+// its finished runs' logs stored — once, once that release has stopped (work.Once).
+func (s *Store) Started(ctx context.Context) error {
+	return errors.Join(s.DispatchUndispatched(ctx), s.enqueueUnstoredLogs(ctx, nil))
 }
 
 // moved reports a refusal because the repository moved to another cell.

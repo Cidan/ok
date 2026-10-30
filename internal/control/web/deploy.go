@@ -26,7 +26,7 @@ import (
 // (docs/deploy.md, "On the CL"), newest first, and whether the deployer has planned it yet.
 // When the deployer cannot be asked, the tab says so and the page still renders.
 func (s *Server) clDeploys(ctx context.Context, repo *scmpb.Repository, cl db.ChangeList) pages.CLDeploys {
-	d := pages.CLDeploys{Href: clHref(repo.GetName(), cl.Number) + "/deployments",
+	d := pages.CLDeploys{Href: clHref(repo.GetName(), cl.Number) + "/deployments", ChangeEvents: clHref(repo.GetName(), cl.Number) + "/events",
 		Landed: cl.Status == db.StatusSubmitted && len(cl.LandedCommit) > 0}
 	if !d.Landed {
 		return d
@@ -249,9 +249,10 @@ func (s *Server) deploymentView(ctx context.Context, t *deployTarget, me, notice
 		Commit: scm.Short(d.GetCommitId()), CommitHref: commitHref(repoName, d.GetCommitId()),
 		Why: d.GetWhy(), Workload: workloadName(d.GetWorkload()), RequestedBy: people.Handle(ctx, d.GetRequestedById()),
 		StatusLabel: label, StatusKind: kind, Stage: stageLabel(d), Reason: people.HaltReason(ctx, d.GetReason(), d.GetHaltById()), Roll: rollLabel(d),
-		Live:       d.GetStatus() == deploypb.Deployment_STATUS_WAITING || d.GetStatus() == deploypb.Deployment_STATUS_RUNNING,
-		StatusHref: base + "/status" + query,
-		Notice:     notice,
+		Live:         d.GetStatus() == deploypb.Deployment_STATUS_WAITING || d.GetStatus() == deploypb.Deployment_STATUS_RUNNING,
+		StatusHref:   base + "/status" + query,
+		ChangeEvents: base + "/events",
+		Notice:       notice,
 	}
 	if clNumber > 0 {
 		v.CLNumber, v.CLHref = clNumber, clHref(repoName, clNumber)

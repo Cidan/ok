@@ -55,6 +55,11 @@ type Options struct {
 	// Insecure allows plaintext to an address that is not loopback: a network the installation
 	// trusts, such as a service mesh's.
 	Insecure bool
+	// InProcess, when set, reaches a role in this process over its listener (inproc.Listener's
+	// Dial), each call naming the role's robot it is, InProcessRobot (authn.InProcessKey): no
+	// credential, no TLS — nothing leaves the process. addr is not dialed.
+	InProcess      func(ctx context.Context, addr string) (net.Conn, error)
+	InProcessRobot string
 	// WaitForReady has a call wait for a connection, for as long as its context allows, rather than
 	// fail while there is none — while the service's replicas roll, say; the call is sent once,
 	// when there is one. For a client with its own deadline that would rather wait a restart out:
@@ -67,6 +72,14 @@ func Dial(addr string, o Options) (*grpc.ClientConn, error) {
 	opts := []grpc.DialOption{
 		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(MaxMessage), grpc.MaxCallSendMsgSize(MaxMessage), grpc.WaitForReady(o.WaitForReady)),
 		metrics.DialOption(),
+	}
+	if o.InProcess != nil {
+		if o.InProcessRobot == "" {
+			return nil, errors.New("dial: a call within the process names the role's robot it is")
+		}
+		opts = append(opts, grpc.WithContextDialer(o.InProcess), grpc.WithTransportCredentials(insecure.NewCredentials()))
+		opts = append(opts, naming(authn.InProcessKey, o.InProcessRobot)...)
+		return grpc.NewClient("passthrough:///inproc", opts...)
 	}
 	loopback := isLoopback(addr)
 	switch {
@@ -82,17 +95,7 @@ func Dial(addr string, o Options) (*grpc.ClientConn, error) {
 		if !loopback {
 			return nil, fmt.Errorf("a development principal is only for a loopback service, not %s", addr)
 		}
-		name := func(ctx context.Context) context.Context {
-			return metadata.AppendToOutgoingContext(ctx, authn.DevPrincipalKey, o.DevPrincipal)
-		}
-		opts = append(opts,
-			grpc.WithUnaryInterceptor(func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, co ...grpc.CallOption) error {
-				return invoker(name(ctx), method, req, reply, cc, co...)
-			}),
-			grpc.WithStreamInterceptor(func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, co ...grpc.CallOption) (grpc.ClientStream, error) {
-				return streamer(name(ctx), desc, cc, method, co...)
-			}),
-		)
+		opts = append(opts, naming(authn.DevPrincipalKey, o.DevPrincipal)...)
 	case o.Credential != nil:
 		opts = append(opts, grpc.WithPerRPCCredentials(perRPC{cred: o.Credential, secure: o.TLS != nil}))
 	case o.Token != nil:
@@ -156,4 +159,17 @@ func isLoopback(addr string) bool {
 	}
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()
+}
+
+// naming has each call carry the caller's name under key.
+func naming(key, name string) []grpc.DialOption {
+	with := func(ctx context.Context) context.Context { return metadata.AppendToOutgoingContext(ctx, key, name) }
+	return []grpc.DialOption{
+		grpc.WithUnaryInterceptor(func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, co ...grpc.CallOption) error {
+			return invoker(with(ctx), method, req, reply, cc, co...)
+		}),
+		grpc.WithStreamInterceptor(func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, co ...grpc.CallOption) (grpc.ClientStream, error) {
+			return streamer(with(ctx), desc, cc, method, co...)
+		}),
+	}
 }

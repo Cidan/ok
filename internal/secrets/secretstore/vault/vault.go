@@ -218,15 +218,39 @@ func (s *Store) login(ctx context.Context) (string, error) {
 	return s.token, nil
 }
 
-// do makes one request of Vault's API, decoding a 2xx's body into out. Its error names what
-// Vault said.
+// vaultAttempts bounds the attempts at a request that fails for a moment.
+const vaultAttempts = 6
+
+// do makes a request of Vault's API, decoding a 2xx's body into out — again, a while after, should
+// it fail for a moment (a 429, a 5xx, a dropped connection): every request of the store's is one it
+// may make again, a put refused once the key holds a version, whosever it is (Put). Its error names
+// what Vault said.
 func (s *Store) do(ctx context.Context, method, path, token string, body, out any) (int, error) {
-	var r io.Reader
+	var b []byte
 	if body != nil {
-		b, err := json.Marshal(body)
-		if err != nil {
+		var err error
+		if b, err = json.Marshal(body); err != nil {
 			return 0, err
 		}
+	}
+	for attempt := 1; ; attempt++ {
+		code, err := s.once(ctx, method, path, token, b, body != nil, out)
+		transient := code == http.StatusTooManyRequests || code >= 500 || (code == 0 && err != nil && ctx.Err() == nil)
+		if !transient || attempt == vaultAttempts {
+			return code, err
+		}
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		case <-time.After(time.Duration(100<<(attempt-1)) * time.Millisecond):
+		}
+	}
+}
+
+// once makes one request of Vault's API.
+func (s *Store) once(ctx context.Context, method, path, token string, b []byte, hasBody bool, out any) (int, error) {
+	var r io.Reader
+	if hasBody {
 		r = bytes.NewReader(b)
 	}
 	req, err := http.NewRequestWithContext(ctx, method, s.cfg.Address+"/v1/"+path, r)
@@ -234,7 +258,7 @@ func (s *Store) do(ctx context.Context, method, path, token string, body, out an
 		return 0, err
 	}
 	req.Header.Set("X-Vault-Request", "true")
-	if body != nil {
+	if hasBody {
 		req.Header.Set("Content-Type", "application/json")
 	}
 	if token != "" {

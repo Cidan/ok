@@ -389,10 +389,8 @@ func (s *Store) mergeRuns(ctx context.Context, sc backend.Scope, segs []backend.
 			return fmt.Errorf("another merge took %s's unpinned runs first", sc.Name())
 		}
 		if ok {
-			if err := tx.InsertSegments(ctx, []backend.Segment{merged}); err != nil {
-				return err
-			}
+			return tx.InsertSegments(ctx, []backend.Segment{merged})
 		}
-		return tx.Notify(ctx, segmentChannel, sc.String())
+		return nil
 	})
 }

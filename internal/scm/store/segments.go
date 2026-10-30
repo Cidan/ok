@@ -4,23 +4,20 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"crypto/rand"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
-	"os"
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/Cidan/ok/internal/blob"
 	"github.com/Cidan/ok/internal/scm/encoding"
 	"github.com/Cidan/ok/internal/scm/segment"
 	"github.com/Cidan/ok/internal/scm/store/backend"
-	"github.com/Cidan/ok/internal/work"
 )
 
 // Segments (docs/hosted.md, "Segments, as built") hold what a repository holds pinned, in
@@ -127,9 +124,6 @@ const RetiredSegmentGrace = 24 * time.Hour
 // a compaction writes it, then records it.
 const OrphanSegmentGrace = 24 * time.Hour
 
-// segmentChannel is the channel a change to a repository's segments notifies, with its ID.
-const segmentChannel = "ok_scm_segments"
-
 // mergeAt is how many segments of a kind at one level are merged into one at the next.
 const mergeAt = 4
 
@@ -142,6 +136,15 @@ func segmentKey(net backend.Network, kind segment.Kind, id encoding.ID) string {
 // repositories', which any manifest in the network may name (a fork names its parent's).
 func segmentPrefix(net backend.Network) string { return fmt.Sprintf("nets/%d/segments/", net) }
 
+// staging is a fresh key under prefix to stage an object at while it is written (blob.Store.Stage):
+// one under a network's packs or segments, which collection deletes as an orphan should the writer
+// stop before it commits.
+func staging(prefix string) string {
+	var b [16]byte
+	rand.Read(b[:])
+	return prefix + "staging/" + hex.EncodeToString(b[:])
+}
+
 // repoScope is a repository's scope.
 func repoScope(repo int64) backend.Scope { return backend.RepositoryScope(repo) }
 
@@ -151,67 +154,25 @@ type manifestKey struct {
 	kind  segment.Kind
 }
 
-// liveManifest is a repository's live segments of one kind as this replica holds them, newest
-// first, marked stale when a change to them is announced.
-type liveManifest struct {
-	segs  atomic.Pointer[[]backend.Segment]
-	stale atomic.Bool
-}
-
-// segmentState is the segments this replica holds: manifests, opened readers, and decoded blocks.
+// segmentState is the segments this replica holds, each named by its ID and never changing:
+// opened readers, and decoded blocks.
 type segmentState struct {
-	mu        sync.Mutex
-	manifests map[manifestKey]*liveManifest
-	readers   *cache[*segment.Reader]
-	blocks    *cache[*segment.Block]
+	readers *cache[*segment.Reader]
+	blocks  *cache[*segment.Block]
 	// batch bounds the records one compaction moves of each kind, and min is the fewest a
 	// compaction waits for (Config.SegmentBatch, SegmentMin).
 	batch, min int
 }
 
-func (s *Store) liveManifest(sc backend.Scope, kind segment.Kind) *liveManifest {
-	s.segs.mu.Lock()
-	defer s.segs.mu.Unlock()
-	if s.segs.manifests == nil {
-		s.segs.manifests = map[manifestKey]*liveManifest{}
-	}
-	k := manifestKey{sc, kind}
-	m := s.segs.manifests[k]
-	if m == nil {
-		m = &liveManifest{}
-		s.segs.manifests[k] = m
-	}
-	return m
-}
-
-// segmentsChanged marks a repository's manifests stale.
-func (s *Store) segmentsChanged(sc backend.Scope) {
-	s.segs.mu.Lock()
-	defer s.segs.mu.Unlock()
-	for k, m := range s.segs.manifests {
-		if k.scope == sc {
-			m.stale.Store(true)
-		}
-	}
-}
-
-// allSegmentsChanged marks every manifest stale: announcements may have been missed.
-func (s *Store) allSegmentsChanged() {
-	s.segs.mu.Lock()
-	defer s.segs.mu.Unlock()
-	for _, m := range s.segs.manifests {
-		m.stale.Store(true)
-	}
-}
-
-// manifest is a repository's live segments of kind, newest first: within a transaction, read
-// through it, unlocked (backend.Ops.SegmentsUnlocked) — what the segments hold is all a reader
-// reads; otherwise the replica's, read again if stale or fresh is set.
+// manifest is a repository's live segments of kind, newest first, read from the database: within
+// a transaction, read through it, unlocked (backend.Ops.SegmentsUnlocked) — what the segments hold
+// is all a reader reads — once for the transaction; within a request, once for the request
+// (requestScope); and again whenever fresh is set, as a lookup that missed asks.
 func (s *Store) manifest(ctx context.Context, sc backend.Scope, kind segment.Kind, fresh bool) ([]backend.Segment, error) {
+	k := manifestKey{sc, kind}
 	if tx, ok := ctx.Value(txKey{}).(*txn); ok && !tx.done.Load() {
 		// Read unlocked, once a transaction — but again, fresh, for a key the first missed — so all
 		// its lookups see one manifest, from when it first needed it.
-		k := manifestKey{sc, kind}
 		if segs, ok := tx.manifests[k]; ok && !fresh {
 			return segs, nil
 		}
@@ -225,19 +186,27 @@ func (s *Store) manifest(ctx context.Context, sc backend.Scope, kind segment.Kin
 		tx.manifests[k] = segs
 		return segs, nil
 	}
-	s.startListening()
-	m := s.liveManifest(sc, kind)
-	if p := m.segs.Load(); p != nil && !m.stale.Load() && !fresh {
-		return *p, nil
+	rs := scopeOf(ctx)
+	if rs != nil && !fresh {
+		rs.mu.Lock()
+		segs, ok := rs.manifests[k]
+		rs.mu.Unlock()
+		if ok {
+			return segs, nil
+		}
 	}
-	// Cleared first, so an announcement during the read marks it again.
-	m.stale.Store(false)
 	segs, err := s.b.Segments(ctx, sc, kind)
 	if err != nil {
-		m.stale.Store(true)
 		return nil, err
 	}
-	m.segs.Store(&segs)
+	if rs != nil {
+		rs.mu.Lock()
+		if rs.manifests == nil {
+			rs.manifests = map[manifestKey][]backend.Segment{}
+		}
+		rs.manifests[k] = segs
+		rs.mu.Unlock()
+	}
 	return segs, nil
 }
 
@@ -496,16 +465,19 @@ func prefixEnd(p []byte) []byte {
 	return nil
 }
 
-// writeSegment writes it as a segment of a repository's kind at level, to the bucket, and says
-// what it wrote; nothing is written for no records.
+// writeSegment writes it as a segment of a repository's kind at level, to the bucket as it is
+// written, and says what it wrote; nothing is written for no records.
 func (s *Store) writeSegment(ctx context.Context, sc backend.Scope, kind segment.Kind, level int16, it segment.Iterator) (backend.Segment, bool, error) {
-	f, err := os.CreateTemp("", "ok-segment-*")
+	net, err := s.scopeNetwork(ctx, sc)
 	if err != nil {
 		return backend.Segment{}, false, err
 	}
-	defer os.Remove(f.Name())
-	defer f.Close()
-	w := segment.NewWriter(f, kind, segmentPrefixOf[kind])
+	st, err := s.blobs.Stage(ctx, staging(segmentPrefix(net)))
+	if err != nil {
+		return backend.Segment{}, false, err
+	}
+	defer st.Abort()
+	w := segment.NewWriter(st, kind, segmentPrefixOf[kind])
 	n := 0
 	for it.Next() {
 		if err := w.Add(it.Key(), it.Value()); err != nil {
@@ -523,14 +495,7 @@ func (s *Store) writeSegment(ctx context.Context, sc backend.Scope, kind segment
 	if err != nil {
 		return backend.Segment{}, false, err
 	}
-	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		return backend.Segment{}, false, err
-	}
-	net, err := s.scopeNetwork(ctx, sc)
-	if err != nil {
-		return backend.Segment{}, false, err
-	}
-	if err := s.blobs.Put(ctx, segmentKey(net, kind, meta.ID), f, meta.Size, blob.IfAbsent()); err != nil {
+	if err := st.Commit(ctx, segmentKey(net, kind, meta.ID)); err != nil {
 		return backend.Segment{}, false, fmt.Errorf("writing a segment of %s: %w", sc.Name(), err)
 	}
 	return backend.Segment{Scope: sc, Net: net, Kind: kind, ID: meta.ID, Level: level, Records: meta.Records, Size: meta.Size,
@@ -605,19 +570,178 @@ var networkKinds = []segment.Kind{segIndex}
 // published them, before it reads.
 var eventsSettle = 10 * time.Minute
 
+// tailCursor is where a repository's compaction looks through the parts of its tail
+// that no index finds what moves of — trees' sizes records and copy edges of what is pinned, and
+// operations and views settled: each a window of a batch a pass, from where the last pass's moved
+// what it found (or found nothing), round from the start once a window reaches the end. Looking
+// through all of them every pass, compaction — which every pin asks for — read the repository's
+// whole history each time: 13,000 operations a pass ten minutes into a herd, and growing.
+type tailCursor struct {
+	sizes []byte          // the last sizes record looked at; nil: from the first
+	edges *[2]encoding.ID // the last edge looked at
+	// logs are the operation logs a round of their operations and views looks through, read as it
+	// begins; log the one it is at, views whether at its views (its operations looked through), and
+	// op the last of them looked at.
+	logs  []int64
+	log   int
+	views bool
+	op    []byte
+}
+
+// encode is the cursor as its row holds it (backend.Ops.CompactionCursor): a version, then each
+// field in order, a byte string's or a list's length before it.
+func (c tailCursor) encode() []byte {
+	b := []byte{1}
+	b = binary.AppendUvarint(b, uint64(len(c.sizes)))
+	b = append(b, c.sizes...)
+	if c.edges == nil {
+		b = append(b, 0)
+	} else {
+		b = append(b, 1)
+		b = append(b, c.edges[0][:]...)
+		b = append(b, c.edges[1][:]...)
+	}
+	b = binary.AppendUvarint(b, uint64(len(c.logs)))
+	for _, l := range c.logs {
+		b = binary.AppendVarint(b, l)
+	}
+	b = binary.AppendUvarint(b, uint64(c.log))
+	if c.views {
+		b = append(b, 1)
+	} else {
+		b = append(b, 0)
+	}
+	b = binary.AppendUvarint(b, uint64(len(c.op)))
+	return append(b, c.op...)
+}
+
+// decodeCursor is the cursor a row holds; one it cannot read, from the start.
+func decodeCursor(b []byte) tailCursor {
+	var c tailCursor
+	if len(b) == 0 || b[0] != 1 {
+		return c
+	}
+	b = b[1:]
+	bytesOf := func() ([]byte, bool) {
+		n, k := binary.Uvarint(b)
+		if k <= 0 || uint64(len(b)-k) < n {
+			return nil, false
+		}
+		out := append([]byte(nil), b[k:k+int(n)]...)
+		b = b[k+int(n):]
+		return out, true
+	}
+	sizes, ok := bytesOf()
+	if !ok || len(b) < 1 {
+		return tailCursor{}
+	}
+	if len(sizes) > 0 {
+		c.sizes = sizes
+	}
+	has := b[0]
+	b = b[1:]
+	if has == 1 {
+		if len(b) < 2*encoding.IDLen {
+			return tailCursor{}
+		}
+		var e [2]encoding.ID
+		copy(e[0][:], b)
+		copy(e[1][:], b[encoding.IDLen:])
+		c.edges = &e
+		b = b[2*encoding.IDLen:]
+	}
+	n, k := binary.Uvarint(b)
+	if k <= 0 {
+		return tailCursor{}
+	}
+	b = b[k:]
+	for range n {
+		l, k := binary.Varint(b)
+		if k <= 0 {
+			return tailCursor{}
+		}
+		c.logs, b = append(c.logs, l), b[k:]
+	}
+	at, k := binary.Uvarint(b)
+	if k <= 0 || len(b) < k+1 {
+		return tailCursor{}
+	}
+	c.log, c.views, b = int(at), b[k] == 1, b[k+1:]
+	op, ok := bytesOf()
+	if !ok {
+		return tailCursor{}
+	}
+	if len(op) > 0 {
+		c.op = op
+	}
+	return c
+}
+
+// settledOps looks through a window of a repository's operations and views — a log at a time, from
+// where cur stopped, up to a batch of them — for those settled before before, up to a batch, and
+// returns them and where the next pass goes on from.
+func (s *Store) settledOps(ctx context.Context, repo int64, cur tailCursor, before time.Time) ([]backend.OpRecord, tailCursor, error) {
+	next := cur
+	if next.logs == nil {
+		logs, err := s.ops(ctx).AllOpLogs(ctx, repo)
+		if err != nil {
+			return nil, cur, err
+		}
+		next.logs, next.log, next.views, next.op = logs, 0, false, nil
+	}
+	var out []backend.OpRecord
+	for budget := s.segs.batch; budget > 0 && next.log < len(next.logs); {
+		kind := encoding.KindOperation
+		if next.views {
+			kind = encoding.KindView
+		}
+		got, last, looked, more, err := s.ops(ctx).SettledOpsIn(ctx, next.logs[next.log], kind, next.op, before, budget, s.segs.batch-len(out))
+		if err != nil {
+			return nil, cur, err
+		}
+		out = append(out, got...)
+		if more {
+			next.op = last
+			break
+		}
+		// The log's operations, or its views, looked through.
+		budget -= looked
+		if next.views {
+			next.log++
+		}
+		next.views, next.op = !next.views, nil
+	}
+	if next.log >= len(next.logs) {
+		next.logs, next.log, next.views, next.op = nil, 0, false, nil // the round's end: the next reads the logs anew
+	}
+	return out, next, nil
+}
+
 // compactTail moves the tail's pinned rows into segments, if at least min of them wait.
 func (s *Store) compactTail(ctx context.Context, repo int64, min int, r *SegmentReport) error {
 	objs, err := s.ops(ctx).PinnedObjects(ctx, repo, s.segs.batch)
 	if err != nil {
 		return err
 	}
-	sizes, err := s.ops(ctx).PinnedTreeSizes(ctx, repo, s.segs.batch)
+	row, err := s.ops(ctx).CompactionCursor(ctx, repo)
 	if err != nil {
 		return err
 	}
-	edges, err := s.ops(ctx).PinnedCopyEdges(ctx, repo, s.segs.batch)
+	cur := decodeCursor(row)
+	next := cur
+	sizes, lastSize, moreSizes, err := s.ops(ctx).PinnedTreeSizes(ctx, repo, cur.sizes, s.segs.batch, s.segs.batch)
 	if err != nil {
 		return err
+	}
+	if next.sizes = nil; moreSizes {
+		next.sizes = lastSize
+	}
+	edges, lastEdge, moreEdges, err := s.ops(ctx).PinnedCopyEdges(ctx, repo, cur.edges, s.segs.batch, s.segs.batch)
+	if err != nil {
+		return err
+	}
+	if next.edges = nil; moreEdges {
+		next.edges = lastEdge
 	}
 	commits, err := s.ops(ctx).PinnedCommits(ctx, repo, s.segs.batch)
 	if err != nil {
@@ -632,10 +756,11 @@ func (s *Store) compactTail(ctx context.Context, repo int64, min int, r *Segment
 		return err
 	}
 	opsBefore := time.Now().Add(-opSettled)
-	ops, err := s.ops(ctx).SettledOps(ctx, repo, opsBefore, s.segs.batch)
+	ops, nextOps, err := s.settledOps(ctx, repo, cur, opsBefore)
 	if err != nil {
 		return err
 	}
+	next.logs, next.log, next.views, next.op = nextOps.logs, nextOps.log, nextOps.views, nextOps.op
 	tombstones, err := s.ops(ctx).OpTombstones(ctx, repo, s.segs.batch)
 	if err != nil {
 		return err
@@ -644,23 +769,29 @@ func (s *Store) compactTail(ctx context.Context, repo int64, min int, r *Segment
 	if err != nil {
 		return err
 	}
-	var nOps, nViews int
-	for _, o := range ops {
-		if o.Kind == encoding.KindOperation {
-			nOps++
-		} else {
-			nViews++
-		}
-	}
-	counts := []int{len(objs), len(sizes), len(edges), len(commits), len(paths), len(events), nOps, nViews, len(tombstones), len(settled)}
+	counts := []int{len(objs), len(sizes), len(edges), len(commits), len(paths), len(events), len(ops), len(tombstones), len(settled)}
 	total := 0
 	for _, n := range counts {
 		total += n
 		r.More = r.More || n == s.segs.batch
 	}
+	// Compacting fully (min 1), a window not at its tail's end is more to look through.
+	unlooked := min <= 1 && (moreSizes || moreEdges || next.logs != nil)
 	if total == 0 || total < min {
-		r.More = false
-		return nil
+		r.More = unlooked
+		// Nothing moves: a window that found nothing to move goes on past it; one that found some
+		// is looked through again.
+		keep := cur
+		if len(sizes) == 0 {
+			keep.sizes = next.sizes
+		}
+		if len(edges) == 0 {
+			keep.edges = next.edges
+		}
+		if len(ops) == 0 {
+			keep.logs, keep.log, keep.views, keep.op = next.logs, next.log, next.views, next.op
+		}
+		return s.ops(ctx).SetCompactionCursor(ctx, repo, keep.encode())
 	}
 	// What the settled operations and views reach is pinned before they move (settle.go): from a
 	// segment, the mark reads them no more.
@@ -683,6 +814,8 @@ func (s *Store) compactTail(ctx context.Context, repo int64, min int, r *Segment
 		edgeRecs = append(edgeRecs, segment.Record{Key: append(append([]byte{}, e[1][:]...), e[0][:]...)})
 		c.CopyEdges = append(c.CopyEdges, e)
 	}
+	// Edges are found by copy, and kept by parent.
+	slices.SortFunc(edgeRecs, func(a, b segment.Record) int { return bytes.Compare(a.Key, b.Key) })
 	for _, cm := range commits {
 		graphRecs = append(graphRecs, segment.Record{Key: cm.ID[:], Value: encodeGraph(cm.Generation, cm.Parents)})
 		bodyRecs = append(bodyRecs, segment.Record{Key: cm.ID[:], Value: cm.Body})
@@ -712,7 +845,7 @@ func (s *Store) compactTail(ctx context.Context, repo int64, min int, r *Segment
 			return err
 		}
 		clRecs, logRecs = append(clRecs, cls...), append(logRecs, log...)
-		c.ChangeLists = append(c.ChangeLists, sc.Number)
+		c.ChangeLists, c.ChangeListIDs = append(c.ChangeLists, sc.Number), append(c.ChangeListIDs, sc.ID)
 		c.MainLog = append(c.MainLog, sc.Landing.Seq)
 	}
 	for _, recs := range [][]segment.Record{clRecs, logRecs} {
@@ -740,13 +873,13 @@ func (s *Store) compactTail(ctx context.Context, repo int64, min int, r *Segment
 		if err := tx.DeleteCompacted(ctx, repo, c); err != nil {
 			return err
 		}
-		return tx.Notify(ctx, segmentChannel, repoScope(repo).String())
+		return tx.SetCompactionCursor(ctx, repo, next.encode())
 	})
 	if err != nil {
 		// The segments are orphans, deleted once a day old (deleteSegments).
 		return err
 	}
-	s.segmentsChanged(repoScope(repo))
+	r.More = r.More || unlooked
 	r.Objects, r.TreeSizes, r.CopyEdges, r.Commits, r.Paths, r.Events, r.Ops, r.ChangeLists, r.Written =
 		len(objs), len(sizes), len(edges), len(commits), len(paths), len(events), len(ops)+len(tombstones), len(settled), len(written)
 	return nil
@@ -756,7 +889,7 @@ func (s *Store) compactTail(ctx context.Context, repo int64, min int, r *Segment
 // compaction's claim (SegmentWork) so it never runs beside the compaction that pins mark; it
 // returns nil when that one is running.
 func (s *Store) compactSegmentsNow(ctx context.Context, repo int64) (*SegmentReport, error) {
-	held, release, ok, err := work.Claim(ctx, s.Work(), SegmentWork, repo, s.holder, time.Minute)
+	held, release, ok, err := s.Claims().Claim(ctx, SegmentWork, repo, s.holder, time.Minute, 0)
 	if err != nil || !ok {
 		return nil, err
 	}
@@ -842,11 +975,9 @@ func (s *Store) mergeLevel(ctx context.Context, sc backend.Scope, kind segment.K
 			return fmt.Errorf("another merge took %s's segments of kind %d first", sc.Name(), kind)
 		}
 		if ok {
-			if err := tx.InsertSegments(ctx, []backend.Segment{merged}); err != nil {
-				return err
-			}
+			return tx.InsertSegments(ctx, []backend.Segment{merged})
 		}
-		return tx.Notify(ctx, segmentChannel, sc.String())
+		return nil
 	})
 }
 

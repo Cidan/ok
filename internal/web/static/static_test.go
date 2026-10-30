@@ -16,7 +16,7 @@ func TestServesWhatIsReferenced(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	paths := []string{"/htmx.min.js", "/hydrate.js", "/nav.js", "/infinite.js", "/livefilter.js", "/clipboard.js", "/fonts.css", "/favicon.svg"}
+	paths := []string{"/htmx.min.js", "/hydrate.js", "/nav.js", "/infinite.js", "/livefilter.js", "/live.js", "/clipboard.js", "/fonts.css", "/favicon.svg"}
 	for _, m := range regexp.MustCompile(`url\('/assets(/[^']+)'\)`).FindAllStringSubmatch(string(css), -1) {
 		paths = append(paths, m[1])
 	}

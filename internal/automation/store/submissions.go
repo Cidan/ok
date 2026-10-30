@@ -164,7 +164,7 @@ func (s *Store) Submit(ctx context.Context, req SubmitRequest) (*Submission, err
 		if id, err = tx.InsertSubmission(ctx, req.RepositoryID, req.SubmittedBy, req.CLs); err != nil {
 			return err
 		}
-		return notifyQueue(ctx, tx, req.RepositoryID)
+		return markQueue(ctx, tx, req.RepositoryID)
 	})
 	if err != nil {
 		return nil, err
@@ -172,44 +172,23 @@ func (s *Store) Submit(ctx context.Context, req SubmitRequest) (*Submission, err
 	return s.GetSubmission(ctx, id)
 }
 
-// notifyQueue wakes the landing queue for a repository, when tx commits.
-func notifyQueue(ctx context.Context, tx Ops, repo int64) error {
-	if err := tx.MarkWork(ctx, QueueWork, repo); err != nil {
-		return err
-	}
-	return notify(ctx, tx, chanSubmission, repo)
+// markQueue marks a repository's landing queue's work: its job, enqueued before tx commits, brings
+// the queue.
+func markQueue(ctx context.Context, tx Ops, repo int64) error {
+	return tx.MarkWork(ctx, QueueWork, repo)
 }
 
 // QueueWork is a repository's landing queue, as keyed work: marked whenever what the queue acts on
-// changes, and done by one replica at a time.
-const QueueWork = "queue"
+// changes, and done by one replica at a time. CollectWork is the collection of its candidates no
+// attempt holds, booked by a pass of the queue that finds nothing left to do, and done holding the
+// queue's claim.
+const (
+	QueueWork   = "queue"
+	CollectWork = "collect"
+)
 
 // Work is automation's keyed work's store (internal/work).
-func (s *Store) Work() work.Store { return workStore{s.b} }
-
-type workStore struct{ b Backend }
-
-func (w workStore) Mark(ctx context.Context, kind string, key int64) error {
-	return w.b.MarkWork(ctx, kind, key)
-}
-func (w workStore) MarkAt(ctx context.Context, kind string, key int64, at time.Time) error {
-	return w.b.MarkWorkAt(ctx, kind, key, at)
-}
-func (w workStore) Take(ctx context.Context, kind string, key int64, holder string, ttl time.Duration) (bool, error) {
-	return w.b.TakeWork(ctx, kind, key, holder, ttl)
-}
-func (w workStore) Renew(ctx context.Context, kind string, key int64, holder string, ttl time.Duration) (bool, error) {
-	return w.b.RenewWork(ctx, kind, key, holder, ttl)
-}
-func (w workStore) Release(ctx context.Context, kind string, key int64, holder string) (bool, error) {
-	return w.b.ReleaseWork(ctx, kind, key, holder)
-}
-func (w workStore) Let(ctx context.Context, kind string, key int64, holder string) error {
-	return w.b.LetWork(ctx, kind, key, holder)
-}
-func (w workStore) Due(ctx context.Context, kind string, limit int) ([]int64, error) {
-	return w.b.DueWork(ctx, kind, limit)
-}
+func (s *Store) Work() work.Store { return s.b.Work() }
 
 // GetSubmission returns a submission.
 func (s *Store) GetSubmission(ctx context.Context, id int64) (*Submission, error) {
@@ -341,7 +320,7 @@ func finishSubmission(ctx context.Context, tx Ops, id int64, status SubmissionSt
 	if err := endAttempts(ctx, tx, id, attempt, reason); err != nil {
 		return false, err
 	}
-	return true, notifyQueue(ctx, tx, repo)
+	return true, markQueue(ctx, tx, repo)
 }
 
 // CancelSubmission cancels an active submission: its runs stop, and nothing of it lands. A
@@ -504,7 +483,6 @@ func (s *Store) CreateAttempt(ctx context.Context, na NewAttempt) (int64, error)
 			return err
 		}
 		repo := sub.RepositoryID
-		anyQueued := false
 		for i, c := range na.Candidates {
 			var planID int64
 			if c.Own && c.Context != nil {
@@ -530,19 +508,14 @@ func (s *Store) CreateAttempt(ctx context.Context, na NewAttempt) (int64, error)
 				}); err != nil {
 					return err
 				}
-				planID, anyQueued = p.ID, true
+				planID = p.ID
 			}
 			if err := tx.InsertCandidate(ctx, id, i, repo, AttemptCandidate{SubmissionID: c.SubmissionID, CLNumber: c.CLNumber,
 				Patchset: c.Patchset, Commit: c.Commit, Base: c.Base, PlanID: planID}); err != nil {
 				return err
 			}
 		}
-		if anyQueued {
-			if err := queued(ctx, tx); err != nil {
-				return err
-			}
-		}
-		return notifyQueue(ctx, tx, repo)
+		return markQueue(ctx, tx, repo)
 	})
 	return id, err
 }
@@ -594,7 +567,7 @@ func (s *Store) ReleaseAttempt(ctx context.Context, id int64) error {
 		if err := tx.SetReleased(ctx, id); err != nil {
 			return err
 		}
-		return notifyQueue(ctx, tx, sub.RepositoryID)
+		return markQueue(ctx, tx, sub.RepositoryID)
 	})
 	if err != nil {
 		return err
@@ -637,7 +610,7 @@ func (s *Store) releasePlan(ctx context.Context, tx Ops, repo int64, p *Plan, re
 		if err != nil {
 			return nil, err
 		}
-		if err := notify(ctx, tx, chanDone, run.ID); err != nil {
+		if err := changed(ctx, tx, run.ID); err != nil {
 			return nil, err
 		}
 		carried = append(carried, run.ID)
@@ -722,7 +695,7 @@ func (s *Store) DiscardAttempt(ctx context.Context, id int64, reason string) err
 		if len(subs) == 0 {
 			return ErrNotFound
 		}
-		return notifyQueue(ctx, tx, subs[0].RepositoryID)
+		return markQueue(ctx, tx, subs[0].RepositoryID)
 	})
 }
 
@@ -730,6 +703,15 @@ func (s *Store) DiscardAttempt(ctx context.Context, id int64, reason string) err
 type LandedCL struct {
 	CLNumber int64
 	Commit   []byte
+}
+
+// AttemptOf is an attempt, and the submission it is of.
+type AttemptOf struct{ Attempt, Submission int64 }
+
+// SubmissionCommit is the commit a submission's CL landed as.
+type SubmissionCommit struct {
+	Submission, CLNumber int64
+	Commit               []byte
 }
 
 // MainUnknown is a landing's place on main before it when the queue does not know it (an adopted
@@ -756,23 +738,28 @@ type Landing struct {
 	FromSeq             int64
 }
 
-// RecordLandings records a landing's submissions, all of one repository, in one transaction, as
-// RecordLanding records each: a batch's landings recorded one after another, each locking main's
-// history, held the queue up as long as there were submissions in it. It skips, and returns, those
-// no longer active. Each submission is finished before main is locked, as RecordLanding finishes
-// its one, in the order of their IDs: no two take the locks in another order.
+// RecordLandings records a landing's submissions, all of one repository, in one transaction: a
+// batch's landings recorded one after another, each locking main's history, held the queue up as
+// long as there were submissions in it. It skips, and returns, those no longer active. The
+// submissions are finished, locked in the order of their IDs, before main is locked; then each kind
+// of row is written for all of them in a statement of its own (recordLanded).
 func (s *Store) RecordLandings(ctx context.Context, landings []Landing) (skipped []int64, err error) {
 	sorted := slices.Clone(landings)
 	slices.SortFunc(sorted, func(a, b Landing) int { return cmp.Compare(a.Submission, b.Submission) })
+	ids := make([]int64, len(sorted))
+	for i, l := range sorted {
+		ids[i] = l.Submission
+	}
 	err = s.txn(ctx, func(tx Ops) error {
 		skipped = nil
+		ended, err := tx.FinishSubmissions(ctx, ids, SubmissionLanded, "", "")
+		if err != nil {
+			return err
+		}
 		repo := int64(0)
 		var finished []Landing
 		for _, l := range sorted {
-			r, ok, err := tx.FinishSubmission(ctx, l.Submission, SubmissionLanded, "", "")
-			if err != nil {
-				return err
-			}
+			r, ok := ended[l.Submission]
 			if !ok {
 				skipped = append(skipped, l.Submission)
 				continue
@@ -792,48 +779,63 @@ func (s *Store) RecordLandings(ctx context.Context, landings []Landing) (skipped
 		if err := tx.LockMain(ctx, repo); err != nil {
 			return err
 		}
-		for _, l := range finished {
-			if err := recordLanded(ctx, tx, repo, l); err != nil {
-				return err
-			}
+		if err := recordLanded(ctx, tx, repo, finished); err != nil {
+			return err
 		}
-		return notifyQueue(ctx, tx, repo)
+		return markQueue(ctx, tx, repo)
 	})
 	return skipped, err
 }
 
-// recordLanded records, in tx holding main's history, what one finished submission landed.
-func recordLanded(ctx context.Context, tx Ops, repo int64, l Landing) error {
-	a, err := tx.LockAttempt(ctx, l.Attempt)
-	switch {
-	case err == nil && a.SubmissionID == l.Submission:
-		if _, err := tx.SetAttemptStatus(ctx, l.Attempt, 0, AttemptLanded, a.Reason); err != nil {
-			return err
-		}
-	case err != nil && !errors.Is(err, ErrNotFound):
-		return err
-	}
-	if err := endAttempts(ctx, tx, l.Submission, AttemptDiscarded, "another attempt landed"); err != nil {
-		return err
-	}
-	for i, c := range l.Landed {
-		if err := tx.SetLandedCommit(ctx, l.Submission, c.CLNumber, c.Commit); err != nil {
-			return err
-		}
-		if err := tx.InsertLandedChange(ctx, repo, c.Commit, c.CLNumber); err != nil {
-			return err
-		}
-		if l.FromSeq != MainUnknown {
-			if err := tx.PutMainCommit(ctx, repo, l.FromSeq+int64(i)+1, c.Commit, l.Submission); err != nil {
-				return err
+// recordLanded records, in tx holding main's history, what finished submissions landed: each one's
+// attempt landed (if it is the submission's), its other active attempts discarded and their runs
+// canceled, the commits its CLs landed as, and its place on main.
+func recordLanded(ctx context.Context, tx Ops, repo int64, landings []Landing) error {
+	if t, ok := tx.(txOps); ok {
+		for _, l := range landings {
+			for _, c := range l.Landed {
+				t.touched.cls[[2]int64{repo, c.CLNumber}] = true
 			}
-			continue
-		}
-		if err := tx.SetMainCommitSubmission(ctx, repo, c.Commit, l.Submission); err != nil {
-			return err
 		}
 	}
-	return nil
+	pairs := make([]AttemptOf, len(landings))
+	subs := make([]int64, len(landings))
+	var commits []SubmissionCommit
+	var changes []LandedCL
+	var put, set []MainCommit
+	for i, l := range landings {
+		pairs[i], subs[i] = AttemptOf{Attempt: l.Attempt, Submission: l.Submission}, l.Submission
+		for j, c := range l.Landed {
+			commits = append(commits, SubmissionCommit{Submission: l.Submission, CLNumber: c.CLNumber, Commit: c.Commit})
+			changes = append(changes, c)
+			if l.FromSeq != MainUnknown {
+				put = append(put, MainCommit{Seq: l.FromSeq + int64(j) + 1, Commit: c.Commit, SubmissionID: l.Submission})
+			} else {
+				set = append(set, MainCommit{Commit: c.Commit, SubmissionID: l.Submission})
+			}
+		}
+	}
+	if err := tx.LandAttempts(ctx, pairs); err != nil {
+		return err
+	}
+	const discarded = "another attempt landed"
+	others, err := tx.EndActiveAttemptsOf(ctx, subs, AttemptDiscarded, discarded)
+	if err != nil {
+		return err
+	}
+	if err := cancelAttemptRuns(ctx, tx, others, discarded); err != nil {
+		return err
+	}
+	if err := tx.SetLandedCommits(ctx, commits); err != nil {
+		return err
+	}
+	if err := tx.InsertLandedChanges(ctx, repo, changes); err != nil {
+		return err
+	}
+	if err := tx.PutMainCommits(ctx, repo, put); err != nil {
+		return err
+	}
+	return tx.SetMainCommitSubmissions(ctx, repo, set)
 }
 
 // RecordMainCommit records a commit main moved to, at its place in main's history.
@@ -845,7 +847,7 @@ func (s *Store) RecordMainCommit(ctx context.Context, repo, seq int64, commit []
 		if err := tx.InsertMainCommit(ctx, repo, seq, commit); err != nil {
 			return err
 		}
-		return notifyQueue(ctx, tx, repo)
+		return markQueue(ctx, tx, repo)
 	})
 }
 
@@ -979,14 +981,4 @@ func (s *Store) QueueState(ctx context.Context, repo, from int64) (*QueueState, 
 		return nil
 	})
 	return st, err
-}
-
-// WatchQueue starts watching for what the landing queue acts on — a submission's change, a
-// post plan's, a run's end, a commit on main — and returns the wait: it returns once one came
-// after WatchQueue was called, max passes, or ctx ends.
-func (s *Store) WatchQueue() func(ctx context.Context, max time.Duration) error {
-	changed, done := s.notify.watch(chanSubmission, ""), s.notify.watch(chanDone, "")
-	return func(ctx context.Context, max time.Duration) error {
-		return s.notify.waitAny(ctx, max, changed, done)
-	}
 }

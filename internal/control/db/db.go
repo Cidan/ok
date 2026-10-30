@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Cidan/ok/internal/move"
+	"github.com/Cidan/ok/internal/wait"
 	"github.com/Cidan/ok/internal/work"
 )
 
@@ -26,11 +27,16 @@ type Store interface {
 	Moves() move.Rows
 	// Work is its keyed work's store: the outboxes' draining (OutboxWork).
 	Work() work.Store
+	// Waits are the live requests waiting on its subjects (internal/wait).
+	Waits() wait.Store
 }
 
 // Ops are the store's reads and writes. Outside a transaction each is its own; inside Txn they
 // are the transaction's.
 type Ops interface {
+	// PendStep has a step taken once the transaction commits (work.Pend): the re-derivation of a
+	// CL's approval its events changed. Only in a transaction.
+	PendStep(ctx context.Context, kind string, key int64, at time.Time, body []byte) error
 	// UpsertChangeList records the SCM's state of a CL, unless the projection already holds it or a
 	// newer one (the feed and an action can race to record the same CL); one it holds already
 	// (ChangeList.Holds) — what a fresh read of an unchanged CL finds, a watch's every status — is
@@ -125,10 +131,9 @@ type Ops interface {
 	// record in the repository's outbox, and mark its keyed work (OutboxWork), in what they write.
 	RecordEvent(ctx context.Context, repo, number int64, e Event) error
 	// Outbox are up to limit of a repository's outbox's entries, oldest first; DoneOutbox removes
-	// those done. OutboxRepositories are the repositories with entries waiting.
+	// those done.
 	Outbox(ctx context.Context, repo int64, limit int) ([]OutboxEntry, error)
 	DoneOutbox(ctx context.Context, repo int64, ids []int64) error
-	OutboxRepositories(ctx context.Context) ([]int64, error)
 	// GetEvent is one of a CL's events.
 	GetEvent(ctx context.Context, repo, number, id int64) (Event, bool, error)
 	// QueueHeadMoved puts main's move to a head, the repository's head_seq'th, in its outbox, and
@@ -148,8 +153,6 @@ type Ops interface {
 	// first; NextDelivery is when its next waiting one is due (zero: none).
 	DueDeliveries(ctx context.Context, repo int64, before time.Time, limit int) ([]Delivery, error)
 	NextDelivery(ctx context.Context, repo int64) (time.Time, error)
-	// WaitingDeliveries are the repositories with deliveries waiting.
-	WaitingDeliveries(ctx context.Context) ([]int64, error)
 	// UpdateDelivery writes a delivery's state, attempts, next try, and last answer.
 	UpdateDelivery(ctx context.Context, d Delivery) error
 	// Deliveries are a webhook's latest, up to limit; GetDelivery is one; PruneDeliveries removes

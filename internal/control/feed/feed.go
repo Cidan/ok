@@ -12,6 +12,7 @@ package feed
 
 import (
 	"context"
+	"encoding/binary"
 	"log/slog"
 	"strings"
 	"sync"
@@ -29,6 +30,7 @@ import (
 	"github.com/Cidan/ok/internal/owners"
 	"github.com/Cidan/ok/internal/scm/scmfeed"
 	"github.com/Cidan/ok/internal/serve/metrics"
+	"github.com/Cidan/ok/internal/wait"
 	"github.com/Cidan/ok/internal/work"
 	"github.com/Cidan/ok/internal/workflow"
 	scmpb "github.com/Cidan/ok/proto/ok/scm/v1"
@@ -37,21 +39,30 @@ import (
 // Follower applies the SCM's change feed.
 type Follower struct {
 	db     db.Store
-	stream bus.Stream
 	scm    *scm.Client
 	review *review.Service
 	// holder names this replica's claims on repositories (feedClaim).
 	holder string
-
-	// retry holds CLs whose approval could not be re-derived, for the next pass.
-	mu    sync.Mutex
-	retry map[[2]int64]bool
 }
 
-// New builds a follower of the SCM's events on stream.
-func New(d db.Store, stream bus.Stream, c *scm.Client, r *review.Service) *Follower {
-	return &Follower{db: d, stream: stream, scm: c, review: r, holder: work.NewHolder(), retry: map[[2]int64]bool{}}
+// New builds a follower of the SCM's events.
+func New(d db.Store, c *scm.Client, r *review.Service) *Follower {
+	return &Follower{db: d, scm: c, review: r, holder: work.NewHolder()}
 }
+
+// approvalKind is the step that re-derives a CL's approval its events changed: a job the
+// transaction that applies them enqueues as it is about to commit, naming the repository, the CL,
+// and the place the transaction moves the repository's cursor to, which the queue retries until
+// the approval is derived. A job that beats its transaction's commit waits for the cursor.
+const approvalKind = "approval"
+
+// approvalRetry is how long after a failed re-derivation it is tried again, and commitWithin how
+// long a job waits for its transaction's cursor before it takes the transaction as one that never
+// committed — another's applies its events, with jobs of its own.
+const (
+	approvalRetry = 30 * time.Second
+	commitWithin  = time.Minute
+)
 
 // feedClaim is a repository's events being applied, as keyed work (internal/work): every replica
 // follows the stream, and the one that claims a repository applies a page of its log at a time,
@@ -64,32 +75,13 @@ const feedClaim = "control-feed"
 // repository this long.
 const feedLease = 30 * time.Second
 
-// Run follows the SCM's events until ctx ends, starting again after a failure, and retries the
-// approvals it could not re-derive every 30 seconds.
+// Run follows the SCM's events until ctx ends, and re-derives the approvals a first try could not
+// as their jobs come (approvalKind).
 func (f *Follower) Run(ctx context.Context) error {
-	go func() {
-		retry := time.NewTicker(30 * time.Second)
-		defer retry.Stop()
-		for {
-			select {
-			case <-retry.C:
-				f.refreshPending(ctx)
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
-	fl := &follow.Follower{Stream: f.stream, Topic: scmfeed.Topic, Group: "control", Log: scmfeed.Log{Events: f.scm.Events}, Apply: applier{f}}
-	for {
-		if err := fl.Run(ctx); ctx.Err() == nil {
-			slog.Warn("feed: stopped following", "err", err)
-		}
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-time.After(2 * time.Second):
-		}
-	}
+	go work.Consume(ctx, f.db.Work(), approvalKind, 4, approvalRetry, f.approvalStep, nil)
+	go work.Consume(ctx, f.db.Work(), headKind, 4, time.Second, f.headStep, nil)
+	return (&follow.Follower{Topic: scmfeed.Topic, Log: scmfeed.Log{Events: f.scm.Events}, Apply: applier{f},
+		Work: f.db.Work(), Register: scmfeed.Register(f.scm.Events)}).Run(ctx)
 }
 
 // applier is the follower as a follow.BatchApplier: the repository claimed, a page of its events
@@ -327,13 +319,27 @@ func (f *Follower) applyAll(ctx context.Context, repo int64, evs []*scmpb.Event)
 				if err := tx.QueueHeadMoved(ctx, repo, k.HeadMoved.GetHeadSeq(), k.HeadMoved.GetNewHead()); err != nil {
 					return err
 				}
+				// For the watchers of CLs whose landing main's head decides (api.WatchStatus): those
+				// the move can change hear of it once it commits (headStep).
+				if err := tx.PendStep(ctx, headKind, repo, time.Time{}, headBody(k.HeadMoved.GetOldHead(), k.HeadMoved.GetNewHead())); err != nil {
+					return err
+				}
 			}
 			applied = append(applied, ev)
 		}
 		if len(applied) == 0 {
 			return nil
 		}
-		return tx.SetFollowCursor(ctx, scmfeed.Topic, repo, applied[len(applied)-1].GetRepositorySeq())
+		seq := applied[len(applied)-1].GetRepositorySeq()
+		if err := pendApprovals(ctx, tx, repo, seq, append(refreshAll, refresh...)); err != nil {
+			return err
+		}
+		// The actions waiting for the feed to apply what they did read its cursor again.
+		kind, key, body := wait.Changed(review.FeedSubject(repo))
+		if err := tx.PendStep(ctx, kind, key, time.Time{}, body); err != nil {
+			return err
+		}
+		return tx.SetFollowCursor(ctx, scmfeed.Topic, repo, seq)
 	})
 	if err != nil || len(applied) == 0 {
 		return err
@@ -341,27 +347,7 @@ func (f *Follower) applyAll(ctx context.Context, repo int64, evs []*scmpb.Event)
 	for _, ev := range applied {
 		feedLag.With(scmfeed.Kind(ev)).Observe(time.Since(ev.GetAt().AsTime()).Seconds())
 	}
-	f.refreshAll(ctx, repo, append(refreshAll, refresh...))
 	return nil
-}
-
-// refreshAll re-derives the approval of a repository's CLs, each once, a few at once.
-func (f *Follower) refreshAll(ctx context.Context, repo int64, numbers []int64) {
-	seen := map[int64]bool{}
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, prefetchAtOnce)
-	for _, n := range numbers {
-		if seen[n] {
-			continue
-		}
-		seen[n] = true
-		sem <- struct{}{}
-		wg.Go(func() {
-			defer func() { <-sem }()
-			f.refresh(ctx, [2]int64{repo, n})
-		})
-	}
-	wg.Wait()
 }
 
 var feedLag = metrics.NewHistogram("ok_control_feed_lag_seconds",
@@ -397,23 +383,134 @@ func (f *Follower) editsOwners(ctx context.Context, repo int64, moved *scmpb.Hea
 	return false, nil
 }
 
-// refresh re-derives a CL's approval, keeping it for a retry when that fails.
-func (f *Follower) refresh(ctx context.Context, cl [2]int64) {
-	if err := f.review.Refresh(ctx, cl[0], cl[1]); err != nil {
-		slog.Warn("feed: re-deriving approval", "repository", cl[0], "cl", cl[1], "err", err)
-		f.mu.Lock()
-		f.retry[cl] = true
-		f.mu.Unlock()
+// approvalStep re-derives a CL's approval once the transaction that enqueued its job committed: the
+// repository's cursor at or past the job's place.
+func (f *Follower) approvalStep(ctx context.Context, repo int64, body []byte, age time.Duration) error {
+	if len(body) != 16 {
+		return nil
 	}
+	number, seq := int64(binary.BigEndian.Uint64(body)), int64(binary.BigEndian.Uint64(body[8:]))
+	cursor, err := f.db.FollowCursor(ctx, scmfeed.Topic, repo)
+	switch {
+	case err != nil:
+		return err
+	case cursor < seq && age < commitWithin:
+		return work.Later{After: min(max(age, 20*time.Millisecond), 2*time.Second)}
+	case cursor < seq:
+		return nil
+	}
+	if err := f.review.Refresh(ctx, repo, number); err != nil {
+		slog.Warn("feed: re-deriving approval", "repository", repo, "cl", number, "err", err)
+		return err
+	}
+	return nil
 }
 
-// refreshPending retries the CLs whose approval could not be re-derived.
-func (f *Follower) refreshPending(ctx context.Context) {
-	f.mu.Lock()
-	pending := f.retry
-	f.retry = map[[2]int64]bool{}
-	f.mu.Unlock()
-	for cl := range pending {
-		f.refresh(ctx, cl)
+// pendApprovals pends, in tx, the re-derivation of each CL's approval among numbers, once each,
+// once tx — which moves repo's cursor to seq — commits.
+func pendApprovals(ctx context.Context, tx db.Ops, repo, seq int64, numbers []int64) error {
+	seen := map[int64]bool{}
+	for _, n := range numbers {
+		if seen[n] {
+			continue
+		}
+		seen[n] = true
+		body := binary.BigEndian.AppendUint64(binary.BigEndian.AppendUint64(nil, uint64(n)), uint64(seq))
+		if err := tx.PendStep(ctx, approvalKind, repo, time.Time{}, body); err != nil {
+			return err
+		}
 	}
+	return nil
+}
+
+// headKind is the step of a move of main's head: the watchers of the CLs it can change hear of it
+// (headStep), once the transaction that applies it commits.
+const headKind = "head"
+
+// maxMovedPaths bounds the paths of a move of main whose watchers are told by path: past it, every
+// watcher of the repository's CLs is.
+const maxMovedPaths = 4096
+
+// headBody is a head step's body: the head main moved from, its length first, and the one it moved to.
+func headBody(old, new []byte) []byte {
+	return append(append([]byte{byte(len(old))}, old...), new...)
+}
+
+func parseHead(b []byte) (old, new []byte, ok bool) {
+	if len(b) == 0 || len(b) < 1+int(b[0]) {
+		return nil, nil, false
+	}
+	return b[1 : 1+b[0]], b[1+b[0]:], true
+}
+
+// headStep tells the watchers of a repository's CLs that a move of main's head can change: those
+// registered on a path it changed, or on a directory a file it changed is directly in (a CL that
+// adds a file there); every one, when it changed what governs them all (review.Governs) or more
+// paths than maxMovedPaths; and those of CLs too large to watch by path, at every move.
+func (f *Follower) headStep(ctx context.Context, repo int64, body []byte, _ time.Duration) error {
+	old, new, ok := parseHead(body)
+	if !ok {
+		return nil
+	}
+	subjects, err := f.movedSubjects(ctx, repo, old, new)
+	if err != nil {
+		return err
+	}
+	waits := f.db.Waits()
+	inboxes, err := waits.Waiting(ctx, subjects, time.Now())
+	if err != nil {
+		return err
+	}
+	return bus.Reply(ctx, waits.Jobs().Queue, inboxes, "", []byte(wait.HeadSubject(repo)))
+}
+
+// movedSubjects are the subjects a move of main from old to new changes.
+func (f *Follower) movedSubjects(ctx context.Context, repo int64, old, new []byte) ([]string, error) {
+	subjects := []string{wait.HeadSubject(repo)}
+	if len(old) == 0 {
+		return append(subjects, wait.GoverningSubject(repo)), nil
+	}
+	from, err := f.scm.Tree(ctx, repo, old)
+	if err != nil {
+		return nil, err
+	}
+	to, err := f.scm.Tree(ctx, repo, new)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := f.scm.Browse.DiffTrees(ctx, &scmpb.DiffTreesRequest{RepositoryId: repo, FromTree: from, ToTree: to})
+	if err != nil {
+		return nil, err
+	}
+	treeDir, err := f.review.TreeDir(ctx, repo, new)
+	if err != nil {
+		return nil, err
+	}
+	return append(subjects, changedSubjects(repo, resp.GetChanges(), treeDir)...), nil
+}
+
+// changedSubjects are the subjects of a move of main that made changes: each path it changed and
+// the directory each is directly in; or what governs every CL, when it changed any of that —
+// treeDir is the groups-and-ACLs tree's ("" for none) — or more than maxMovedPaths.
+func changedSubjects(repo int64, changes []*scmpb.PathChange, treeDir string) []string {
+	paths := map[string]bool{}
+	for _, c := range changes {
+		for _, p := range []string{c.GetPath(), c.GetOldPath()} {
+			if p == "" {
+				continue
+			}
+			if review.Governs(p, treeDir) {
+				return []string{wait.GoverningSubject(repo)}
+			}
+			paths[p], paths[review.DirOf(p)] = true, true
+		}
+	}
+	if len(paths) > maxMovedPaths {
+		return []string{wait.GoverningSubject(repo)}
+	}
+	out := make([]string, 0, len(paths))
+	for p := range paths {
+		out = append(out, wait.PathSubject(repo, p))
+	}
+	return out
 }

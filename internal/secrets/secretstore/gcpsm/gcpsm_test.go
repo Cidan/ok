@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -61,7 +62,9 @@ func (f *fake) AddSecretVersion(_ context.Context, r *secretmanagerpb.AddSecretV
 	defer f.mu.Unlock()
 	if f.failAdd {
 		f.failAdd = false
-		return nil, status.Error(codes.Unavailable, "the connection was lost")
+		// Its deadline passed, the connection lost: no call to make again, as one that failed for
+		// a moment is.
+		return nil, status.Error(codes.DeadlineExceeded, "the connection was lost")
 	}
 	if _, ok := f.secrets[r.GetParent()]; !ok {
 		return nil, status.Error(codes.NotFound, "no secret")
@@ -98,13 +101,13 @@ func (f *fake) DeleteSecret(_ context.Context, r *secretmanagerpb.DeleteSecretRe
 	return &emptypb.Empty{}, nil
 }
 
-func newStore(t *testing.T, locations []string) (*Store, *fake) {
+func newStore(t *testing.T, locations []string, opts ...grpc.ServerOption) (*Store, *fake) {
 	f := &fake{secrets: map[string]*secretmanagerpb.Secret{}, versions: map[string][][]byte{}}
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := grpc.NewServer()
+	srv := grpc.NewServer(opts...)
 	secretmanagerpb.RegisterSecretManagerServiceServer(srv, f)
 	go func() { _ = srv.Serve(lis) }()
 	t.Cleanup(srv.Stop)
@@ -119,6 +122,20 @@ func newStore(t *testing.T, locations []string) (*Store, *fake) {
 
 func TestConformance(t *testing.T) {
 	st, _ := newStore(t, nil)
+	storetest.Run(t, st)
+}
+
+// Through a Secret Manager that fails every other call for a moment (Unavailable) — a secret made, a
+// version added, one read or deleted — every call is made again, and the store holds to its
+// contract.
+func TestConformanceThroughFailures(t *testing.T) {
+	var n atomic.Int64
+	st, _ := newStore(t, nil, grpc.UnaryInterceptor(func(ctx context.Context, req any, _ *grpc.UnaryServerInfo, h grpc.UnaryHandler) (any, error) {
+		if n.Add(1)%2 == 1 {
+			return nil, status.Error(codes.Unavailable, "Secret Manager is away for a moment")
+		}
+		return h(ctx, req)
+	}))
 	storetest.Run(t, st)
 }
 

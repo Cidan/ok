@@ -66,7 +66,8 @@ templ runStatus(v RunView) {
 		data-live
 		if v.Live {
 			hx-get={ v.StatusHref }
-			hx-trigger="every 2s"
+			hx-trigger="live"
+			data-live-events={ v.ChangeEvents }
 			hx-target="this"
 			hx-swap="outerHTML"
 		}
@@ -114,6 +115,6 @@ templ runInfoRow(label, value string) {
 templ runLogChunk(l RunLog) {
 	<span data-live>{ l.Text }</span>
 	if l.NextHref != "" {
-		<span data-live hx-get={ l.NextHref } hx-trigger="every 2s" hx-target="this" hx-swap="outerHTML"></span>
+		<span data-live hx-get={ l.NextHref } hx-trigger="live" data-live-events={ l.ChangeEvents } hx-target="this" hx-swap="outerHTML"></span>
 	}
 }

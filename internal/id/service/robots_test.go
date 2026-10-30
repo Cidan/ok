@@ -80,7 +80,6 @@ func TestOrganizationRobots(t *testing.T) {
 	checker := authz.NewChecker(identitypb.NewAuthorizationClient(e.as(scm)))
 	decide := func(repo int64, a authz.Action) authz.Decision {
 		t.Helper()
-		checker.Forget(repo)
 		d, err := checker.Decide(ctx, robot.Id, nil, repo, a)
 		if err != nil {
 			t.Fatal(err)

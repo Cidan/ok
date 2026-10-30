@@ -6,68 +6,42 @@ package quota
 import (
 	"context"
 	"log/slog"
-	"sync"
 	"time"
 
 	"github.com/Cidan/ok/internal/automation/store"
+	"github.com/Cidan/ok/internal/work"
 	identitypb "github.com/Cidan/ok/proto/ok/identity/v1"
 )
 
-// Kept is how long a quota read from the directory is used before it is read again.
-const Kept = 30 * time.Second
-
-// Cache keeps accounts' quotas, read from the directory, for Kept: a store.Quotas.
-type Cache struct {
+// Reader reads accounts' quotas from the directory each time it is asked: a store.Quotas. No
+// replica keeps them, so a quota changed is admitted by at once (docs/state.md).
+type Reader struct {
 	Quotas identitypb.QuotasClient
 	// Cell is this cell's: its own use is not elsewhere.
 	Cell string
-	now  func() time.Time
-
-	mu   sync.Mutex
-	kept map[string]entry
+	now  func() time.Time // the clock the month is read by (tests); nil is time.Now
 }
 
-type entry struct {
-	q  store.Quota
-	at time.Time
-}
-
-// NewCache reads quotas through client, for a cell.
-func NewCache(client identitypb.QuotasClient, cell string) *Cache {
-	return &Cache{Quotas: client, Cell: cell, now: time.Now, kept: map[string]entry{}}
-}
-
-// Get is accounts' quotas: those kept, and those not read from the directory now.
-func (c *Cache) Get(ctx context.Context, accounts []string) (map[string]store.Quota, error) {
-	now := c.now()
+// Get is accounts' quotas, as the directory says them now.
+func (r Reader) Get(ctx context.Context, accounts []string) (map[string]store.Quota, error) {
 	out := make(map[string]store.Quota, len(accounts))
-	var missing []string
-	c.mu.Lock()
-	for _, a := range accounts {
-		if e, ok := c.kept[a]; ok && now.Sub(e.at) < Kept {
-			out[a] = e.q
-		} else {
-			missing = append(missing, a)
-		}
-	}
-	c.mu.Unlock()
-	if len(missing) == 0 {
+	if len(accounts) == 0 {
 		return out, nil
 	}
-	resp, err := c.Quotas.GetQuotas(ctx, &identitypb.GetQuotasRequest{AccountIds: missing, Cell: c.Cell, Month: store.MonthOf(now)})
+	now := time.Now
+	if r.now != nil {
+		now = r.now
+	}
+	resp, err := r.Quotas.GetQuotas(ctx, &identitypb.GetQuotasRequest{AccountIds: accounts, Cell: r.Cell, Month: store.MonthOf(now())})
 	if err != nil {
 		return nil, err
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	for i, q := range resp.GetQuotas() {
-		if i >= len(missing) {
+		if i >= len(accounts) {
 			break
 		}
-		sq := store.Quota{Concurrent: int64(q.GetConcurrent()), Seconds: q.GetMinutes() * 60, Weight: int64(q.GetWeight()),
+		out[accounts[i]] = store.Quota{Concurrent: int64(q.GetConcurrent()), Seconds: q.GetMinutes() * 60,
 			RunningElsewhere: q.GetRunningElsewhere(), SecondsElsewhere: q.GetSecondsElsewhere()}
-		out[missing[i]] = sq
-		c.kept[missing[i]] = entry{q: sq, at: now}
 	}
 	return out, nil
 }
@@ -76,8 +50,9 @@ func (c *Cache) Get(ctx context.Context, accounts []string) (map[string]store.Qu
 const Every = 15 * time.Second
 
 // Reporter reports a cell's use this month to the directory, every Every: a node.Application's
-// Start. Every replica reports the same totals, read from the cell's database, so each report
-// stands for the cell whichever replica made it.
+// Start. Its report is keyed work (Work), done by one replica at a time, which books the next; the
+// totals are read from the cell's database, so each report stands for the cell whichever replica
+// made it.
 type Reporter struct {
 	Store  *store.Store
 	Quotas identitypb.QuotasClient
@@ -85,18 +60,27 @@ type Reporter struct {
 	Log    *slog.Logger
 }
 
-// Run reports until ctx ends.
+// Work is the cell's report of its use, as keyed work.
+const Work = "usage"
+
+// Run reports until ctx ends: once as it starts, and every Every after.
 func (r *Reporter) Run(ctx context.Context) error {
-	for {
-		if err := r.Report(ctx); err != nil && ctx.Err() == nil {
-			r.Log.Warn("quota: reporting the cell's use", "err", err)
-		}
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-time.After(Every):
-		}
+	ws := r.Store.Work()
+	if err := ws.MarkAt(ctx, Work, 0, time.Now()); err != nil && ctx.Err() == nil {
+		r.Log.Warn("quota: booking the cell's report", "err", err)
 	}
+	return (&work.Runner{
+		Kind:  Work,
+		Store: ws,
+		Do: func(ctx context.Context, _ int64) error {
+			err := r.Report(ctx)
+			if merr := ws.MarkAt(ctx, Work, 0, time.Now().Add(Every)); merr != nil && err == nil {
+				err = merr
+			}
+			return err
+		},
+		Log: r.Log,
+	}).Run(ctx)
 }
 
 // Report reports the cell's use this month once.

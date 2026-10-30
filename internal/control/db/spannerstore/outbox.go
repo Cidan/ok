@@ -8,6 +8,7 @@ import (
 	"github.com/Cidan/ok/internal/control/db"
 	"github.com/Cidan/ok/internal/data"
 	"github.com/Cidan/ok/internal/data/spannerdata"
+	"github.com/Cidan/ok/internal/wait"
 	"github.com/Cidan/ok/internal/work"
 )
 
@@ -50,22 +51,6 @@ func (x queries) DoneOutbox(ctx context.Context, repo int64, ids []int64) error 
 	})
 }
 
-func (x queries) OutboxRepositories(ctx context.Context) ([]int64, error) {
-	var out []int64
-	err := x.Read(func(r spannerdata.Reader) error {
-		out = nil
-		return spannerdata.Each(ctx, r, `SELECT DISTINCT repository_id FROM outbox ORDER BY 1`, nil, func(row *spanner.Row) error {
-			var id int64
-			if err := row.Columns(&id); err != nil {
-				return err
-			}
-			out = append(out, id)
-			return nil
-		})
-	})
-	return out, err
-}
-
 func (x queries) GetEvent(ctx context.Context, repo, number, id int64) (db.Event, bool, error) {
 	var e db.Event
 	var ok bool
@@ -89,3 +74,5 @@ func (x queries) GetEvent(ctx context.Context, repo, number, id int64) (db.Event
 
 // Work is ok control's keyed work's store.
 func (s *Store) Work() work.Store { return spannerdata.Work(s.Client) }
+
+func (s *Store) Waits() wait.Store { return spannerdata.Waits(s.Client) }

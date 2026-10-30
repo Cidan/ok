@@ -22,6 +22,7 @@ import (
 	"github.com/Cidan/ok/internal/id/store"
 	"github.com/Cidan/ok/internal/lock"
 	"github.com/Cidan/ok/internal/migrate"
+	"github.com/Cidan/ok/internal/wait"
 )
 
 //go:embed migrations/*.sql
@@ -33,8 +34,7 @@ var Migrations = migrate.MustLoad(migrations, "migrations")
 // Backend is identity's store backend on PostgreSQL.
 type Backend struct {
 	queries
-	pool  *pgxpool.Pool
-	locks *lock.Lock
+	pool *pgxpool.Pool
 }
 
 var _ store.Backend = (*Backend)(nil)
@@ -44,7 +44,7 @@ func Open(ctx context.Context, pool *pgxpool.Pool) (*Backend, error) {
 	if _, err := migrate.Apply(ctx, pool, "identity", Migrations); err != nil {
 		return nil, err
 	}
-	return &Backend{queries: queries{pool}, pool: pool, locks: lock.New(pool)}, nil
+	return &Backend{queries: queries{pool}, pool: pool}, nil
 }
 
 // Txn runs fn in a transaction, again if PostgreSQL aborts it to break a deadlock or a
@@ -59,9 +59,7 @@ func (b *Backend) Txn(ctx context.Context, fn func(store.Ops) error) error {
 	})
 }
 
-func (b *Backend) Lock(ctx context.Context, bucket, id string, wait time.Duration, fn lock.LockFn) error {
-	return b.locks.LockFn(ctx, bucket, id, wait, fn)
-}
+func (b *Backend) Waits() wait.Store { return pgdata.Waits(b.pool) }
 
 func (b *Backend) Ping(ctx context.Context) error { return b.pool.Ping(ctx) }
 

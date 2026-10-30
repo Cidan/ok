@@ -99,6 +99,29 @@ type querier interface {
 // queries are the store's operations over a pool or a transaction.
 type queries struct{ q querier }
 
+func (x queries) PendStep(_ context.Context, kind string, key int64, at time.Time, body []byte) error {
+	return pgdata.PendStep(x.q, kind, key, at, body)
+}
+
+// atomically runs fn in the operations' transaction, or, over the pool, in one of its own, gated
+// and fenced as Txn's are: what writes rows and marks their keyed work — its job enqueued before
+// the transaction commits — is one transaction either way.
+func (x queries) atomically(ctx context.Context, fn func(queries) error) error {
+	g, ok := x.q.(move.GatedPool)
+	if !ok {
+		return fn(x)
+	}
+	return pgdata.Txn(ctx, g.Pool, func(tx pgx.Tx) error {
+		if err := pgdata.CheckFence(ctx, tx); err != nil {
+			return err
+		}
+		if err := move.PostgresGate(ctx, tx); err != nil {
+			return err
+		}
+		return fn(queries{&move.CheckedTx{Tx: tx, Tables: g.Tables}})
+	})
+}
+
 const clColumns = `repository_id, number, change_id, author, status, coalesce(parent_number, 0), current_patchset,
 	description, landed_commit, coalesce(submitted_by, ''), approved, created_at, updated_at, rolls_back`
 

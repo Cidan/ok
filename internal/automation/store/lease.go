@@ -5,120 +5,12 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/Cidan/ok/internal/move"
-	"github.com/Cidan/ok/internal/workflow"
 )
-
-// Lease assigns a queued run of a pool to a worker — the one admission and fair share choose
-// (claim): of the accounts under their quotas, the one with the fewest running in the pool for its
-// weight, its highest priority's oldest — waiting up to wait for one; it returns nil when none
-// came.
-func (s *Store) Lease(ctx context.Context, worker, pool string, wait time.Duration) (*Run, error) {
-	if worker == "" {
-		return nil, invalid("a worker names itself")
-	}
-	if pool == "" {
-		pool = workflow.DefaultPool
-	}
-	deadline := time.Now().Add(wait)
-	for {
-		// In line before the claim, so a run queued between an empty claim and the wait still
-		// wakes it.
-		w := s.leases.join(pool)
-		run, err := s.claim(ctx, worker, pool)
-		if err != nil || run != nil {
-			s.leases.leave(pool, w)
-			if run != nil {
-				// The run came queued with others, maybe: the next in line looks.
-				s.leases.wakeNext(pool)
-			}
-			return run, err
-		}
-		left := time.Until(deadline)
-		if left <= 0 {
-			s.leases.leave(pool, w)
-			return nil, nil
-		}
-		err = s.notify.wait(ctx, w, min(left, s.cfg.Poll))
-		s.leases.leave(pool, w)
-		if err != nil {
-			return nil, err
-		}
-	}
-}
-
-// leaseLines are this replica's leases waiting for a run, in line by pool. A run queued wakes the
-// first in each pool's line, and a lease that claims a run wakes the next, for the runs queued
-// with it: every waiting lease woken by every run queued had each claim race the rest of them for
-// the one run, a dozen transactions a run, which the claims' retries and the database's CPU
-// showed. A lease looks on its own every Config.Poll still, as before.
-type leaseLines struct {
-	mu    sync.Mutex
-	lines map[string][]chan struct{}
-}
-
-func newLeaseLines() *leaseLines { return &leaseLines{lines: map[string][]chan struct{}{}} }
-
-// join puts a lease at the end of its pool's line: the channel is closed when it is woken.
-func (l *leaseLines) join(pool string) chan struct{} {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	w := make(chan struct{})
-	l.lines[pool] = append(l.lines[pool], w)
-	return w
-}
-
-// leave takes a lease out of its line, if it is in it still.
-func (l *leaseLines) leave(pool string, w chan struct{}) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	line := l.lines[pool]
-	for i, x := range line {
-		if x == w {
-			l.lines[pool] = append(line[:i:i], line[i+1:]...)
-			return
-		}
-	}
-}
-
-// wakeNext wakes the first lease in a pool's line, taking it out.
-func (l *leaseLines) wakeNext(pool string) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if line := l.lines[pool]; len(line) > 0 {
-		close(line[0])
-		l.lines[pool] = line[1:]
-	}
-}
-
-// wakeEach wakes the first lease in every pool's line: a run was queued, in a pool the signal
-// does not say.
-func (l *leaseLines) wakeEach() {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	for pool, line := range l.lines {
-		if len(line) > 0 {
-			close(line[0])
-			l.lines[pool] = line[1:]
-		}
-	}
-}
-
-// wakeAll wakes every lease in line.
-func (l *leaseLines) wakeAll() {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	for pool, line := range l.lines {
-		for _, w := range line {
-			close(w)
-		}
-		delete(l.lines, pool)
-	}
-}
 
 // RunOfLease is a run, when it is running under the lease whose key its worker was given
 // (docs/secrets.md, "Readers that are not people"): ErrNotFound otherwise — no such run, another
@@ -156,6 +48,10 @@ func (s *Store) Heartbeat(ctx context.Context, id int64, worker string) (stop St
 		return StopNone, "", err
 	case !ok:
 		return StopLeaseLost, ErrLeaseLost.Error(), nil
+	}
+	// The run's lease is its job's delivery: kept as long as the worker reports.
+	s.extend(ctx, l.Handle, s.leaseTTL())
+	switch {
 	case l.Stopping:
 		return StopCanceled, l.StopReason, nil
 	case l.Overdue:
@@ -174,7 +70,8 @@ func leased(ctx context.Context, tx Ops, id int64, worker string) (*Run, error) 
 }
 
 // Release gives a leased run back to the queue, its log cleared, without spending an
-// attempt: its worker is shutting down. A run canceled meanwhile ends canceled instead.
+// attempt: its worker is shutting down. It is dispatched by a job of its own, and the delivery it
+// ran under acknowledged. A run canceled meanwhile ends canceled instead.
 func (s *Store) Release(ctx context.Context, id int64, worker, reason string) error {
 	return s.txn(ctx, func(tx Ops) error {
 		run, err := leased(ctx, tx, id, worker)
@@ -189,23 +86,22 @@ func (s *Store) Release(ctx context.Context, id int64, worker, reason string) er
 			if err := tx.FinishRun(ctx, id, StatusCanceled, 0, stopReason); err != nil {
 				return err
 			}
+			tx.(txOps).end(run.LeaseHandle)
 			if err := finishedPost(ctx, tx, run.RepositoryID, run.Origin.Phase); err != nil {
 				return err
 			}
-			return notify(ctx, tx, chanDone, id)
+			return changed(ctx, tx, id)
 		}
 		if reason == "" {
 			reason = "released by its worker"
 		}
-		if err := tx.RequeueRun(ctx, id, reason, false); err != nil {
-			return err
-		}
-		return queued(ctx, tx)
+		return tx.(txOps).requeue(ctx, run, reason, false)
 	})
 }
 
-// Finish records a leased run's outcome, ends the lease, and moves its log to the bucket. A
-// planning run that passed carries its plan, whose jobs are queued with the outcome.
+// Finish records a leased run's outcome, ends the lease — its job's delivery acknowledged — and
+// moves its log to the bucket. A planning run that passed carries its plan, whose jobs are queued
+// with the outcome.
 func (s *Store) Finish(ctx context.Context, id int64, worker string, status Status, exitCode int32, reason string, plan *PlanResult, pushed ...Pushed) error {
 	if !status.Finished() {
 		return invalid("a run finishes passed, failed, canceled, or in error")
@@ -215,6 +111,7 @@ func (s *Store) Finish(ctx context.Context, id int64, worker string, status Stat
 		if err != nil {
 			return err
 		}
+		tx.(txOps).end(run.LeaseHandle)
 		switch {
 		case run.Job.Kind == KindPlan && status == StatusPassed && plan == nil:
 			return invalid("a planning run that passed carries its plan")
@@ -246,13 +143,16 @@ func (s *Store) Finish(ctx context.Context, id int64, worker string, status Stat
 		if err := finishedPost(ctx, tx, run.RepositoryID, run.Origin.Phase); err != nil {
 			return err
 		}
-		return notify(ctx, tx, chanDone, id)
+		return changed(ctx, tx, id)
 	})
 	if err != nil {
 		return err
 	}
-	// The log moves after the outcome is recorded; a failed move is the sweep's to retry.
-	return s.storeLog(ctx, id)
+	// The log moves after the outcome is recorded; a failed move is its log job's to retry.
+	if err := s.storeLog(ctx, id); err != nil {
+		slog.Warn("automation: storing a run's log; its job retries it", "run", id, "err", err)
+	}
+	return nil
 }
 
 // finishedPost marks the landing queue of a repository a run of phase finished in, if the run was
@@ -261,7 +161,7 @@ func finishedPost(ctx context.Context, tx Ops, repo int64, phase Phase) error {
 	if phase != PhasePost {
 		return nil
 	}
-	return notifyQueue(ctx, tx, repo)
+	return markQueue(ctx, tx, repo)
 }
 
 // validDigest reports whether d is a sha256 digest, sha256:<64 hex>.
@@ -276,54 +176,4 @@ func validDigest(d string) bool {
 		}
 	}
 	return true
-}
-
-// sweepLeases acts on the leases that lapsed: a canceled run ends canceled; any other is
-// queued again, once, with its log cleared, and then ends in error. The lapsed are found outside
-// any transaction, and each acted on in one of its own that finds it still lapsed, so the sweep
-// locks no lease a worker renews.
-func (s *Store) sweepLeases(ctx context.Context) error {
-	ids, err := s.b.LapsedRunIDs(ctx)
-	if err != nil {
-		return err
-	}
-	var errs []error
-	for _, id := range ids {
-		if err := s.txn(ctx, func(tx Ops) error { return s.sweepLease(ctx, tx, id) }); err != nil {
-			errs = append(errs, fmt.Errorf("run %d: %w", id, err))
-		}
-	}
-	return errors.Join(errs...)
-}
-
-// sweepLease acts on a run whose lease lapsed, if it still has.
-func (s *Store) sweepLease(ctx context.Context, tx Ops, id int64) error {
-	l, ok, err := tx.LapsedRun(ctx, id)
-	if err != nil || !ok {
-		return err
-	}
-	// Its repository's network may have frozen since it was read: then it is the move's.
-	if err := tx.Gate(ctx, l.RepositoryID); err != nil {
-		return err
-	}
-	switch {
-	case l.Stopping:
-		if err := tx.FinishRun(ctx, l.ID, StatusCanceled, 0, l.StopReason); err != nil {
-			return err
-		}
-	case l.Attempt < s.cfg.Attempts:
-		// The lost attempt's log goes; the next attempt writes its own from the start.
-		if err := tx.RequeueRun(ctx, l.ID, "its worker "+l.Worker+" was lost; it runs again", true); err != nil {
-			return err
-		}
-		return queued(ctx, tx)
-	default:
-		if err := tx.FinishRun(ctx, l.ID, StatusError, 0, "its worker "+l.Worker+" was lost, on its last attempt"); err != nil {
-			return err
-		}
-	}
-	if err := finishedPost(ctx, tx, l.RepositoryID, l.Phase); err != nil {
-		return err
-	}
-	return notify(ctx, tx, chanDone, l.ID)
 }

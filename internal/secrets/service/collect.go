@@ -67,18 +67,32 @@ type Collector struct {
 	Log   *slog.Logger
 }
 
-// Run does the passes as they come due until ctx ends.
+// Run does the passes as they come due until ctx ends: each repository's booked by the
+// transaction that makes its first key, and by each pass for the next day's.
 func (c *Collector) Run(ctx context.Context) error {
+	go func() {
+		if err := work.Once(ctx, c.Store.Work(), scheduleWork, c.schedule, c.log()); err != nil && ctx.Err() == nil {
+			c.log().Warn("ok secrets: booking the repositories' collections", "err", err)
+		}
+	}()
 	return (&work.Runner{
-		Kind:    store.CollectWork,
-		Store:   c.Store.Work(),
-		Do:      func(ctx context.Context, repo int64) error { return c.Pass(move.WithRepository(ctx, repo), repo) },
-		Sweep:   c.sweep,
-		Idle:    10 * time.Minute,
+		Kind:  store.CollectWork,
+		Store: c.Store.Work(),
+		Do: func(ctx context.Context, repo int64) error {
+			ctx = move.WithRepository(ctx, repo)
+			purged, err := c.pass(ctx, repo)
+			if err != nil || purged {
+				return err
+			}
+			return c.Store.Work().MarkAt(ctx, store.CollectWork, repo, nextDue(time.Now().UTC(), c.Hour))
+		},
 		Workers: 2,
 		Log:     c.log(),
 	}).Run(ctx)
 }
+
+// scheduleWork books, once, what a release that looked for its keyed work left unbooked (schedule).
+const scheduleWork = "schedule"
 
 func (c *Collector) log() *slog.Logger {
 	if c.Log == nil {
@@ -87,8 +101,8 @@ func (c *Collector) log() *slog.Logger {
 	return c.Log
 }
 
-// sweep marks every repository with keys due its next daily pass.
-func (c *Collector) sweep(ctx context.Context) error {
+// schedule books every repository with keys for its next daily pass.
+func (c *Collector) schedule(ctx context.Context) error {
 	next := nextDue(time.Now().UTC(), c.Hour)
 	w := c.Store.Work()
 	var after int64
@@ -120,22 +134,28 @@ func nextDue(now time.Time, hour int) time.Time {
 
 // Pass collects one repository now.
 func (c *Collector) Pass(ctx context.Context, repo int64) error {
+	_, err := c.pass(ctx, repo)
+	return err
+}
+
+// pass collects one repository now, and reports whether it purged it, as the SCM had.
+func (c *Collector) pass(ctx context.Context, repo int64) (bool, error) {
 	refs, purged, err := c.Refs.References(ctx, repo)
 	if err != nil {
-		return fmt.Errorf("repository %d's references: %w", repo, err)
+		return false, fmt.Errorf("repository %d's references: %w", repo, err)
 	}
 	if purged {
 		if err := c.Store.Purge(ctx, repo); err != nil {
-			return fmt.Errorf("purging repository %d: %w", repo, err)
+			return false, fmt.Errorf("purging repository %d: %w", repo, err)
 		}
 		c.log().Info("ok secrets: purged a repository the SCM purged", "repository", repo)
-		return nil
+		return true, nil
 	}
 	if moved, err := c.Store.FollowRoot(ctx, repo); err != nil {
-		return fmt.Errorf("repository %d's root: %w", repo, err)
+		return false, fmt.Errorf("repository %d's root: %w", repo, err)
 	} else if moved {
 		if err := c.Store.Audit(ctx, store.AuditEntry{Repository: repo, Actor: collector, Op: "rewrap", Outcome: "keys brought under the repository's root"}); err != nil {
-			return err
+			return false, err
 		}
 	}
 	grace := c.Grace
@@ -145,15 +165,15 @@ func (c *Collector) Pass(ctx context.Context, repo int64) error {
 	res, err := c.Store.Collect(ctx, repo, func(path string, d secrets.Digest) bool { return refs[store.VersionKey{Path: path, Digest: d}] },
 		time.Now(), grace, collector)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if res.Destroyed > 0 {
 		if err := c.Store.Audit(ctx, store.AuditEntry{Repository: repo, Actor: collector, Op: "destroy",
 			Outcome: fmt.Sprintf("%d versions unreferenced for %v", res.Destroyed, grace)}); err != nil {
-			return err
+			return false, err
 		}
 	}
 	c.log().Info("ok secrets: collected", "repository", repo, "marked", res.Marked, "cleared", res.Cleared, "destroyed", res.Destroyed,
 		"unseals", res.Unseals)
-	return nil
+	return false, nil
 }

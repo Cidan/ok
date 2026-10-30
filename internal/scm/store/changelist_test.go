@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"github.com/Cidan/ok/internal/scm/encoding"
-	"github.com/Cidan/ok/internal/scm/store/backend"
+	"github.com/Cidan/ok/internal/work/worktest"
 )
 
 const (
@@ -94,6 +94,10 @@ type clEnv struct {
 
 func newCLEnv(t *testing.T) *clEnv {
 	s := testStore(t)
+	// The relay's follower, whose jobs the tests' fake queue records (stream).
+	if err := s.AddFollower(context.Background(), testFollower); err != nil {
+		t.Fatal(err)
+	}
 	return &clEnv{t: t, s: s, repo: newRepo(t, s).ID}
 }
 
@@ -536,52 +540,17 @@ func TestUploadOntoMainLocksNoLandedCL(t *testing.T) {
 	}
 }
 
-// What an upload pins is compaction's, marked once the upload commits rather than in it: an upload's
-// transaction commits while compaction's claim holds the work's row, and compaction, done, finds
-// the work marked again.
+// What an upload pins is compaction's, marked once the upload commits rather than in it — the
+// upload writes no work row — and compaction, holding the work as the upload commits, finds the
+// work marked again as it lets go.
 func TestPinMarksCompactionAfterCommit(t *testing.T) {
 	ctx := context.Background()
 	e := newCLEnv(t)
-	// The work is not marked before compaction takes it: on Spanner a mark of work already
-	// marked writes nothing, and may commit before the claim, which then covers the upload's pins
-	// itself; one of work unmarked is written, after the claim.
-	held, release := make(chan struct{}), make(chan struct{})
-	holder := make(chan error, 1)
-	go func() {
-		holder <- e.s.b.Txn(ctx, func(tx backend.Ops) error {
-			if ok, err := tx.TakeWork(ctx, SegmentWork, e.repo, "compaction", time.Minute); err != nil || !ok {
-				return errors.Join(err, fmt.Errorf("took the work: %v", ok))
-			}
-			select {
-			case <-held:
-			default:
-				close(held)
-			}
-			<-release
-			return nil
-		})
-	}()
-	<-held
+	if got, err := e.s.Work().Take(ctx, SegmentWork, e.repo, "compaction", time.Minute); err != nil || !got.Took {
+		t.Fatalf("compaction taking the work: %+v, %v", got, err)
+	}
 	c := e.commit(alice, newChange(), encoding.RootCommitID, "one", map[string]string{"a": "1"})
-	uploaded := make(chan error, 1)
-	go func() {
-		_, err := e.upload(alice, Ready, nil, c)
-		uploaded <- err
-	}()
-	// The upload commits while compaction holds the work: its mark, after, waits for the claim.
-	db := dbOf(e.s)
-	for deadline := time.Now().Add(10 * time.Second); db.count(t, "changelist", "repository_id = @repo", map[string]any{"repo": e.repo}) == 0; {
-		if time.Now().After(deadline) {
-			close(release)
-			t.Fatal("an upload's transaction waited on compaction's claim of its work")
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	close(release)
-	if err := <-holder; err != nil {
-		t.Fatal(err)
-	}
-	if err := <-uploaded; err != nil {
+	if _, err := e.upload(alice, Ready, nil, c); err != nil {
 		t.Fatal(err)
 	}
 	e.s.marksMade()
@@ -942,7 +911,6 @@ func TestLandEachForItsSubmitter(t *testing.T) {
 // many times it was asked meanwhile: a busy repository's writes mark its work a few times a second,
 // not once each, and every commit is followed by a mark begun after it.
 func TestMarksAfterCommitCoalesce(t *testing.T) {
-	ctx := context.Background()
 	e := newCLEnv(t)
 	m := workMark{SegmentWork, e.repo}
 	first, release := make(chan struct{}), make(chan struct{})
@@ -971,9 +939,8 @@ func TestMarksAfterCommitCoalesce(t *testing.T) {
 	if made != 2 {
 		t.Fatalf("eleven marks asked, one in flight for ten of them: %d made, want 2", made)
 	}
-	due, err := e.s.Work().Due(ctx, SegmentWork, 10)
-	if err != nil || !slices.Contains(due, e.repo) {
-		t.Fatalf("the work is not marked: %v, %v", due, err)
+	if got := worktest.Ready(t, e.s.Work(), SegmentWork); !slices.Contains(got, e.repo) {
+		t.Fatalf("the work's jobs: %v; want the repository's", got)
 	}
 }
 

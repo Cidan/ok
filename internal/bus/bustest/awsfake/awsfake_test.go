@@ -9,15 +9,13 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
-	"github.com/aws/aws-sdk-go-v2/service/sns"
-	snstypes "github.com/aws/aws-sdk-go-v2/service/sns/types"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	sqstypes "github.com/aws/aws-sdk-go-v2/service/sqs/types"
 
 	"github.com/Cidan/ok/internal/bus/bustest/awsfake"
 )
 
-func clients(t *testing.T) (*sqs.Client, *sns.Client, *awsfake.Server) {
+func client(t *testing.T) (*sqs.Client, *awsfake.Server) {
 	t.Helper()
 	s, err := awsfake.Start()
 	if err != nil {
@@ -25,13 +23,12 @@ func clients(t *testing.T) (*sqs.Client, *sns.Client, *awsfake.Server) {
 	}
 	t.Cleanup(s.Close)
 	cfg := aws.Config{Region: awsfake.Region, Credentials: credentials.NewStaticCredentialsProvider("k", "s", "")}
-	return sqs.NewFromConfig(cfg, func(o *sqs.Options) { o.BaseEndpoint = aws.String(s.URL) }),
-		sns.NewFromConfig(cfg, func(o *sns.Options) { o.BaseEndpoint = aws.String(s.URL) }), s
+	return sqs.NewFromConfig(cfg, func(o *sqs.Options) { o.BaseEndpoint = aws.String(s.URL) }), s
 }
 
 func TestSQS(t *testing.T) {
 	ctx := context.Background()
-	q, _, srv := clients(t)
+	q, srv := client(t)
 	if _, err := q.GetQueueUrl(ctx, &sqs.GetQueueUrlInput{QueueName: aws.String("none")}); !errors.As(err, new(*sqstypes.QueueDoesNotExist)) {
 		t.Fatalf("a missing queue: %v", err)
 	}
@@ -118,56 +115,5 @@ func TestSQS(t *testing.T) {
 	}
 	if _, err := q.DeleteMessage(ctx, &sqs.DeleteMessageInput{QueueUrl: cq.QueueUrl, ReceiptHandle: y[0].ReceiptHandle}); err != nil || srv.Messages("work") != 0 {
 		t.Fatalf("deleting: %v, %d left", err, srv.Messages("work"))
-	}
-}
-
-func TestSNS(t *testing.T) {
-	ctx := context.Background()
-	q, n, srv := clients(t)
-	topic, err := n.CreateTopic(ctx, &sns.CreateTopicInput{Name: aws.String("events")})
-	if err != nil {
-		t.Fatal(err)
-	}
-	mk := func(name string, policy bool) *string {
-		cq, err := q.CreateQueue(ctx, &sqs.CreateQueueInput{QueueName: aws.String(name)})
-		if err != nil {
-			t.Fatal(err)
-		}
-		a, err := q.GetQueueAttributes(ctx, &sqs.GetQueueAttributesInput{QueueUrl: cq.QueueUrl, AttributeNames: []sqstypes.QueueAttributeName{"QueueArn"}})
-		if err != nil {
-			t.Fatal(err)
-		}
-		arn := a.Attributes["QueueArn"]
-		if policy {
-			q.SetQueueAttributes(ctx, &sqs.SetQueueAttributesInput{QueueUrl: cq.QueueUrl, Attributes: map[string]string{"Policy": fmt.Sprintf(
-				`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"sns.amazonaws.com"},"Action":"sqs:SendMessage","Resource":%q,"Condition":{"ArnEquals":{"aws:SourceArn":%q}}}]}`,
-				arn, *topic.TopicArn)}})
-		}
-		if _, err := n.Subscribe(ctx, &sns.SubscribeInput{TopicArn: topic.TopicArn, Protocol: aws.String("sqs"), Endpoint: aws.String(arn),
-			Attributes: map[string]string{"RawMessageDelivery": "true"}}); err != nil {
-			t.Fatal(err)
-		}
-		return cq.QueueUrl
-	}
-	allowed, refused := mk("allowed", true), mk("refused", false)
-	if _, err := n.PublishBatch(ctx, &sns.PublishBatchInput{TopicArn: topic.TopicArn, PublishBatchRequestEntries: []snstypes.PublishBatchRequestEntry{
-		{Id: aws.String("a"), Message: aws.String("one"), MessageAttributes: map[string]snstypes.MessageAttributeValue{"b": {DataType: aws.String("Binary"), BinaryValue: []byte{9, 0, 9}}}},
-		{Id: aws.String("b"), Message: aws.String("two")},
-	}}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := n.Publish(ctx, &sns.PublishInput{TopicArn: topic.TopicArn, Message: aws.String("three")}); err != nil {
-		t.Fatal(err)
-	}
-	out, err := q.ReceiveMessage(ctx, &sqs.ReceiveMessageInput{QueueUrl: allowed, MaxNumberOfMessages: 10, MessageAttributeNames: []string{"All"}})
-	if err != nil || len(out.Messages) != 3 || *out.Messages[0].Body != "one" || string(out.Messages[0].MessageAttributes["b"].BinaryValue) != "\x09\x00\x09" {
-		t.Fatalf("the allowed queue: %+v, %v", out, err)
-	}
-	if srv.Messages("refused") != 0 {
-		t.Fatal("SNS delivered to a queue whose policy refuses it")
-	}
-	_ = refused
-	if _, err := n.Publish(ctx, &sns.PublishInput{TopicArn: aws.String("arn:aws:sns:us-east-1:000000000000:none"), Message: aws.String("x")}); !errors.As(err, new(*snstypes.NotFoundException)) {
-		t.Fatalf("publishing to a missing topic: %v", err)
 	}
 }

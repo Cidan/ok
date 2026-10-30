@@ -2,6 +2,7 @@ package move
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"sync"
@@ -31,8 +32,10 @@ type Rows interface {
 	Drop(ctx context.Context, repos []int64, limit int) (int64, error)
 	// SetGates sets the repositories' gates, waiting for the writes under way about them.
 	SetGates(ctx context.Context, repos []int64, state, cell string) error
-	// MovedBefore are the repositories that moved away before a time, which the purge deletes.
-	MovedBefore(ctx context.Context, before time.Time) ([]int64, error)
+	// MovedBefore are up to limit of the repositories that moved away before a time, after one, by
+	// ID; MovedAt is when one moved away, if it did — its gate says it moved.
+	MovedBefore(ctx context.Context, before time.Time, after int64, limit int) ([]int64, error)
+	MovedAt(ctx context.Context, repo int64) (at time.Time, moved bool, err error)
 }
 
 // PostgresRows are a role's rows about repositories in PostgreSQL: Tables, each's rows about
@@ -128,12 +131,22 @@ func (p *PostgresRows) SetGates(ctx context.Context, repos []int64, state, cell 
 	return SetGates(ctx, p.Pool, repos, state, cell)
 }
 
-func (p *PostgresRows) MovedBefore(ctx context.Context, before time.Time) ([]int64, error) {
-	rows, err := p.Pool.Query(ctx, `SELECT repository_id FROM move_gate WHERE move_state = 'moved' AND moved_at < $1 ORDER BY repository_id LIMIT 1000`, before)
+func (p *PostgresRows) MovedBefore(ctx context.Context, before time.Time, after int64, limit int) ([]int64, error) {
+	rows, err := p.Pool.Query(ctx, `SELECT repository_id FROM move_gate WHERE move_state = 'moved' AND moved_at < $1 AND repository_id > $2
+		ORDER BY repository_id LIMIT $3`, before, after, limit)
 	if err != nil {
 		return nil, err
 	}
 	return pgx.CollectRows(rows, pgx.RowTo[int64])
+}
+
+func (p *PostgresRows) MovedAt(ctx context.Context, repo int64) (time.Time, bool, error) {
+	var at *time.Time
+	err := p.Pool.QueryRow(ctx, `SELECT moved_at FROM move_gate WHERE repository_id = $1 AND move_state = 'moved'`, repo).Scan(&at)
+	if errors.Is(err, pgx.ErrNoRows) || err == nil && at == nil {
+		return time.Time{}, false, nil
+	}
+	return *at, err == nil, err
 }
 
 // SpannerRows are a role's rows about repositories in Spanner: Tables, each's rows about
@@ -255,10 +268,22 @@ func (s *SpannerRows) SetGates(ctx context.Context, repos []int64, state, cell s
 	return err
 }
 
-func (s *SpannerRows) MovedBefore(ctx context.Context, before time.Time) ([]int64, error) {
+func (s *SpannerRows) MovedAt(ctx context.Context, repo int64) (time.Time, bool, error) {
+	var at spanner.NullTime
+	var moved bool
+	err := s.Client.Single().Query(ctx, spanner.Statement{SQL: `SELECT moved_at FROM move_gate WHERE repository_id = @repo AND move_state = 'moved'`,
+		Params: map[string]any{"repo": repo}}).Do(func(r *spanner.Row) error {
+		moved = true
+		return r.Columns(&at)
+	})
+	return at.Time, moved && at.Valid, err
+}
+
+func (s *SpannerRows) MovedBefore(ctx context.Context, before time.Time, after int64, limit int) ([]int64, error) {
 	var out []int64
 	err := s.Client.Single().Query(ctx, spanner.Statement{SQL: `SELECT repository_id FROM move_gate
-		WHERE move_state = 'moved' AND moved_at < @before ORDER BY repository_id LIMIT 1000`, Params: map[string]any{"before": before}}).
+		WHERE move_state = 'moved' AND moved_at < @before AND repository_id > @after ORDER BY repository_id LIMIT @limit`,
+		Params: map[string]any{"before": before, "after": after, "limit": int64(limit)}}).
 		Do(func(r *spanner.Row) error {
 			var id int64
 			if err := r.Columns(&id); err != nil {

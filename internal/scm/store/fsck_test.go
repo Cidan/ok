@@ -188,7 +188,7 @@ func TestFsckReadsEachPackOnce(t *testing.T) {
 	ctx := context.Background()
 	base := testStore(t)
 	slow := testobjects.NewSlow(base.blobs, 0)
-	s := mustOpen(t, dbOf(base), slow, Config{Signals: base.signals})
+	s := mustOpen(t, dbOf(base), slow, Config{})
 	repo := newRepo(t, s).ID
 	// Two publishes, two packs of 300 files each; the second's last file begins with a chunk the
 	// first stored, so its chunks are in both.

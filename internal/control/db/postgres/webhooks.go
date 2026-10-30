@@ -9,15 +9,17 @@ import (
 
 	"github.com/Cidan/ok/internal/control/db"
 	"github.com/Cidan/ok/internal/data"
+	"github.com/Cidan/ok/internal/data/pgdata"
 )
 
 func (x queries) QueueHeadMoved(ctx context.Context, repo, seq int64, head []byte) error {
-	_, err := x.q.Exec(ctx, `WITH ob AS (
-			INSERT INTO outbox (repository_id, entry_id, number, queued_at, head_seq, head) VALUES ($1, $2, 0, clock_timestamp(), $3, $4)
-		)
-		INSERT INTO work (kind, key, dirty) VALUES ($5, $1, true) ON CONFLICT (kind, key) DO UPDATE SET dirty = true, due_at = NULL`,
-		repo, data.NewID(), seq, head, db.OutboxWork)
-	return err
+	return x.atomically(ctx, func(x queries) error {
+		if _, err := x.q.Exec(ctx, `INSERT INTO outbox (repository_id, entry_id, number, queued_at, head_seq, head)
+			VALUES ($1, $2, 0, clock_timestamp(), $3, $4)`, repo, data.NewID(), seq, head); err != nil {
+			return err
+		}
+		return pgdata.MarkWork(ctx, x.q, db.OutboxWork, repo)
+	})
 }
 
 func (x queries) CreateWebhook(ctx context.Context, w db.Webhook) error {
@@ -54,16 +56,17 @@ func (x queries) QueueDeliveries(ctx context.Context, repo int64, ds []db.Delive
 	for i, d := range ds {
 		ids[i], hooks[i], events[i], payloads[i], tries[i], created[i] = d.ID, d.Webhook, d.Event, d.Payload, d.NextTry, d.CreatedAt
 	}
-	_, err := x.q.Exec(ctx, `WITH q AS (
-			INSERT INTO webhook_delivery (repository_id, delivery_id, webhook_id, event, payload, state, attempts, next_try, last_status, last_error,
-				created_at)
+	return x.atomically(ctx, func(x queries) error {
+		if _, err := x.q.Exec(ctx, `INSERT INTO webhook_delivery (repository_id, delivery_id, webhook_id, event, payload, state, attempts,
+				next_try, last_status, last_error, created_at)
 			SELECT $1, d, w, e, p, 0, 0, t, 0, '', c FROM unnest($2::bigint[], $3::bigint[], $4::text[], $5::bytea[], $6::timestamptz[],
 				$7::timestamptz[]) AS u(d, w, e, p, t, c)
-			ON CONFLICT (repository_id, delivery_id) DO NOTHING
-		)
-		INSERT INTO work (kind, key, dirty) VALUES ($8, $1, true) ON CONFLICT (kind, key) DO UPDATE SET dirty = true, due_at = NULL`,
-		repo, ids, hooks, events, payloads, tries, created, db.WebhookWork)
-	return err
+			ON CONFLICT (repository_id, delivery_id) DO NOTHING`,
+			repo, ids, hooks, events, payloads, tries, created); err != nil {
+			return err
+		}
+		return pgdata.MarkWork(ctx, x.q, db.WebhookWork, repo)
+	})
 }
 
 const deliveryColumns = `repository_id, delivery_id, webhook_id, event, payload, state, attempts, next_try, last_status, last_error, created_at`
@@ -121,12 +124,4 @@ func (x queries) PruneDeliveries(ctx context.Context, repo, webhook int64, keep 
 			SELECT delivery_id FROM webhook_delivery WHERE repository_id = $1 AND webhook_id = $2
 			ORDER BY created_at DESC, delivery_id OFFSET $3)`, repo, webhook, keep)
 	return err
-}
-
-func (x queries) WaitingDeliveries(ctx context.Context) ([]int64, error) {
-	rows, err := x.q.Query(ctx, `SELECT DISTINCT repository_id FROM webhook_delivery WHERE state = 0 ORDER BY 1`)
-	if err != nil {
-		return nil, err
-	}
-	return pgx.CollectRows(rows, pgx.RowTo[int64])
 }

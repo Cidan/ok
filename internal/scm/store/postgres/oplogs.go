@@ -257,19 +257,41 @@ func opRecords(rows pgx.Rows, err error) ([]backend.OpRecord, error) {
 	})
 }
 
-func (x queries) SettledOps(ctx context.Context, repo int64, before time.Time, limit int) ([]backend.OpRecord, error) {
-	ops, err := opRecords(x.q.Query(ctx, `SELECT o.op_log_id, $4::smallint, o.id, o.view_id, o.body, o.touched_at
-		FROM operation o JOIN op_log l ON l.id = o.op_log_id
-		WHERE l.repository_id = $1 AND o.touched_at < $2 ORDER BY o.op_log_id, o.id LIMIT $3`,
-		repo, before, limit, int16(encoding.KindOperation)))
-	if err != nil {
-		return nil, err
+// SettledOpsIn reads the window's IDs, each with whether it is settled, then the records it takes.
+func (x queries) SettledOpsIn(ctx context.Context, log int64, kind encoding.Kind, after []byte, before time.Time, scan, limit int) ([]backend.OpRecord, []byte, int, bool, error) {
+	table, record := "operation", `SELECT op_log_id, $3::smallint, id, view_id, body, touched_at FROM operation`
+	if kind == encoding.KindView {
+		table, record = "view", `SELECT op_log_id, $3::smallint, id, NULL::bytea, body, touched_at FROM view`
 	}
-	views, err := opRecords(x.q.Query(ctx, `SELECT v.op_log_id, $4::smallint, v.id, NULL::bytea, v.body, v.touched_at
-		FROM view v JOIN op_log l ON l.id = v.op_log_id
-		WHERE l.repository_id = $1 AND v.touched_at < $2 ORDER BY v.op_log_id, v.id LIMIT $3`,
-		repo, before, limit, int16(encoding.KindView)))
-	return append(ops, views...), err
+	window, args := `SELECT id, touched_at < $3 FROM `+table+` WHERE op_log_id = $1 ORDER BY id LIMIT $2`, []any{log, scan, before}
+	if after != nil {
+		window, args = `SELECT id, touched_at < $3 FROM `+table+` WHERE op_log_id = $1 AND id > $4 ORDER BY id LIMIT $2`, append(args, after)
+	}
+	rows, err := x.q.Query(ctx, window, args...)
+	if err != nil {
+		return nil, nil, 0, false, err
+	}
+	var keys [][]byte
+	var take []bool
+	for rows.Next() {
+		var k []byte
+		var t bool
+		if err := rows.Scan(&k, &t); err != nil {
+			rows.Close()
+			return nil, nil, 0, false, err
+		}
+		keys, take = append(keys, k), append(take, t)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, nil, 0, false, err
+	}
+	taken, last, looked, more := backend.Window(keys, take, scan, limit)
+	if len(taken) == 0 {
+		return nil, last, looked, more, nil
+	}
+	ops, err := opRecords(x.q.Query(ctx, record+` WHERE op_log_id = $1 AND id = ANY($2) ORDER BY id`, log, taken, int16(kind)))
+	return ops, last, looked, more, err
 }
 
 func (x queries) OpTombstones(ctx context.Context, repo int64, limit int) ([]backend.OpKey, error) {

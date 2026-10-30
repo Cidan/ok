@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"google.golang.org/grpc"
 
+	"github.com/Cidan/ok/internal/bus/busconfig"
 	"github.com/Cidan/ok/internal/cells"
 	"github.com/Cidan/ok/internal/config"
 	"github.com/Cidan/ok/internal/credential"
@@ -174,6 +175,22 @@ func OpenStore(ctx context.Context, cfg *config.Config, opts Options) (*store.St
 		done()
 		return nil, nil, err
 	}
+	// Its keyed work's jobs go on the bus's queue (docs/hosted.md, "Work without leaders"); a test's
+	// pool, with no bus, keeps them within the process.
+	if opts.Pool == nil {
+		bb, err := busconfig.Open(ctx, cfg.Bus)
+		if err != nil {
+			done()
+			return nil, nil, err
+		}
+		if err := bb.RegisterWork(st.Work(), "secrets"); err != nil {
+			bb.Close()
+			done()
+			return nil, nil, err
+		}
+		closeRest := done
+		done = func() { bb.Close(); closeRest() }
+	}
 	return st, done, nil
 }
 
@@ -261,9 +278,7 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (*Role, error)
 	r.Store = st
 	roots := opts.Roots
 	if roots == nil {
-		if roots, err = idclient.NewRoots(ctx, idConn, "secrets"); err != nil {
-			return nil, err
-		}
+		roots = idclient.NewRoots(idConn)
 	}
 	r.Resolver = authn.NewResolver(authn.Config{
 		Directory:     idclient.NewDirectory(idConn),
@@ -331,7 +346,6 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (*Role, error)
 		&services{secrets: service.NewSecrets(scfg), versions: service.NewVersions(scfg), deploys: service.NewDeploySecrets(scfg),
 			runs: service.NewRunSecrets(scfg, runs)},
 		&app{name: "ok/secrets/collect", run: collect.Run},
-		roots,
 	}}
 	ok = true
 	return r, nil

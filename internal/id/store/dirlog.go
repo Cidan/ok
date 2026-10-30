@@ -2,16 +2,20 @@ package store
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/Cidan/ok/internal/bus"
+	"github.com/Cidan/ok/internal/bus/follow"
 	"github.com/Cidan/ok/internal/id/dirfeed"
 	"github.com/Cidan/ok/internal/tenancy"
+	"github.com/Cidan/ok/internal/work"
 	identitypb "github.com/Cidan/ok/proto/ok/identity/v1"
 )
 
@@ -83,21 +87,15 @@ func (s *Store) logRepository(ctx context.Context, tx Ops, repo int64, after *Re
 	if err != nil {
 		return err
 	}
-	return tx.InsertDirectoryEvent(ctx, DirectoryEventRow{Repository: repo, Seq: seq, Body: body}, at)
+	if err := tx.InsertDirectoryEvent(ctx, DirectoryEventRow{Repository: repo, Seq: seq, Body: body}, at); err != nil {
+		return err
+	}
+	// Its relay's job, enqueued as the transaction is about to commit, publishes it.
+	return tx.PendStep(ctx, relayKind, repo, time.Time{}, binary.BigEndian.AppendUint64(nil, uint64(seq)))
 }
 
-// txn runs fn in a transaction that may log events, and wakes this replica's relay once it
-// commits: at worst for nothing, which costs it one look.
-func (s *Store) txn(ctx context.Context, fn func(tx Ops) error) error {
-	err := s.b.Txn(ctx, fn)
-	if err == nil {
-		select {
-		case s.relayWake <- struct{}{}:
-		default:
-		}
-	}
-	return err
-}
+// txn runs fn in a transaction that may log events: each is published by its relay's job.
+func (s *Store) txn(ctx context.Context, fn func(tx Ops) error) error { return s.b.Txn(ctx, fn) }
 
 // DirectoryEvents returns up to a page of a repository's events after a place in its log.
 func (s *Store) DirectoryEvents(ctx context.Context, repo, after int64) ([]DirectoryEventRow, error) {
@@ -110,32 +108,85 @@ func (s *Store) DirectoryHeads(ctx context.Context, after int64) ([]DirectoryHea
 	return s.b.DirectoryHeads(ctx, after, dirPage)
 }
 
-// relayPoll is how often a caught-up relay looks for events another replica logged.
-const relayPoll = time.Second
+// relayKind is the step that publishes an event the directory logged: a job its transaction
+// enqueued as it was about to commit, naming its repository and its place.
+const relayKind = "relay"
 
-// Relay publishes the log's pending events on stream until ctx ends: at once for what this replica
-// logs, and within relayPoll for another's. Every replica runs one; each takes a page no other
-// holds.
-func (s *Store) Relay(ctx context.Context, stream bus.Stream) error {
+// commitWithin is how long a relay's job waits for the transaction that enqueued it to commit
+// before it takes the transaction as one that never did.
+const commitWithin = time.Minute
+
+// relayUpgrade takes up, once, the events a release before relays' jobs left unpublished.
+const relayUpgrade = "relay-upgrade"
+
+// Relay relays the log's events to its followers' queues on q (follow.Relay), as their relays'
+// jobs come, until ctx ends: every replica runs one, each taking a page no other holds. Once, it
+// relays what a release before left pending.
+func (s *Store) Relay(ctx context.Context, q bus.Queue) error {
+	w := s.b.Work()
+	var wg sync.WaitGroup
+	wg.Go(func() { work.Consume(ctx, w, relayKind, 2, time.Second, s.relayStep(q), nil) })
+	wg.Go(func() {
+		if err := work.Once(ctx, w, relayUpgrade, func(ctx context.Context) error { return s.relayAll(ctx, q, 0) }, nil); err != nil && ctx.Err() == nil {
+			slog.Warn("identity: publishing what a release before left", slog.Any("err", err))
+		}
+	})
+	wg.Wait()
+	return ctx.Err()
+}
+
+// relayStep publishes a repository's pending events, done once the job's event is published — by
+// it, or by another relay, which holds it meanwhile. A job whose event is not placed may beat its
+// transaction's commit: looked at again soon, until it is a minute old.
+func (s *Store) relayStep(q bus.Queue) work.Step {
+	return func(ctx context.Context, repo int64, body []byte, age time.Duration) error {
+		if len(body) != 8 {
+			return nil
+		}
+		seq := int64(binary.BigEndian.Uint64(body))
+		written, relayed, err := s.b.DirectoryEventRelayed(ctx, repo, seq)
+		switch {
+		case err != nil:
+			return err
+		case !written && age < commitWithin:
+			return work.Later{After: min(max(age, 20*time.Millisecond), 2*time.Second)}
+		case !written || relayed:
+			return nil
+		}
+		if err := s.relayAll(ctx, q, repo); err != nil {
+			return err
+		}
+		if _, relayed, err = s.b.DirectoryEventRelayed(ctx, repo, seq); err != nil || relayed {
+			return err
+		}
+		return work.Later{After: time.Second} // another relay holds it
+	}
+}
+
+// relayAll relays repo's pending events — every repository's, for 0 — a page at a time, to the
+// followers registered before it takes them: one registered after catches up, as it first starts,
+// past every event placed before it registered (follow.Follower). The followers are read before a
+// page is taken, which on PostgreSQL holds its connection.
+func (s *Store) relayAll(ctx context.Context, q bus.Queue, repo int64) error {
 	for {
-		n, err := s.b.RelayDirectoryEvents(ctx, relayPage, func(rows []DirectoryEventRow) error {
+		followers, err := s.b.Followers(ctx, dirfeed.Topic)
+		if err != nil {
+			return err
+		}
+		n, err := s.b.RelayDirectoryEvents(ctx, repo, relayPage, func(rows []DirectoryEventRow) error {
 			out := make([]bus.Event, len(rows))
 			for i, r := range rows {
-				out[i] = bus.Event{Topic: dirfeed.Topic, Key: r.Repository, Seq: r.Seq, Body: r.Body}
+				out[i] = bus.Event{Topic: dirfeed.Topic, Key: r.Repository, Seq: r.Seq}
 			}
-			return stream.Publish(ctx, out...)
+			return follow.Relay(ctx, q, dirfeed.Topic, followers, out)
 		})
-		if err != nil && ctx.Err() == nil {
-			slog.Warn("identity: relaying the directory's events", slog.Any("err", err))
-		}
-		if n == relayPage && err == nil {
-			continue
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-s.relayWake:
-		case <-time.After(relayPoll):
+		if err != nil || n < relayPage {
+			return err
 		}
 	}
+}
+
+// AddFollower records a role as one of the directory's events' followers (DirectoryEvents.Follow).
+func (s *Store) AddFollower(ctx context.Context, name string) error {
+	return s.b.AddFollower(ctx, dirfeed.Topic, name)
 }

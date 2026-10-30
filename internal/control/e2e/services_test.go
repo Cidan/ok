@@ -129,7 +129,7 @@ func TestServices(t *testing.T) {
 	if hrefs["edge"] != "/services/group/edge" || hrefs["lonely"] != "/services/5" || hrefs["drift"] != "/services/4" || len(rows) != 4 {
 		t.Errorf("the groups' pages: %v", hrefs)
 	}
-	if !p.has(`id="service-groups" data-live hx-get="/services" hx-trigger="every 5s"`) {
+	if !p.has(`id="service-groups" data-live hx-get="/services" hx-trigger="live" data-live-events="/services/events"`) {
 		t.Errorf("the list does not refresh itself: %s", excerpt(p.body))
 	}
 
@@ -137,7 +137,7 @@ func TestServices(t *testing.T) {
 	// beside the sub-nav — the overview selected.
 	p = e.get(carol, "/services/group/edge")
 	for _, want := range []string{"edge", "Last Deploy Failed", "1 of 4 services", "Recent Deployments", "Deployment 1", `href="/example/svc/deploy/1"`,
-		`href="/services/7"`, "other · deployment smoke/cache", `aria-current="page"`, `hx-get="/services/group/edge" hx-trigger="every 5s"`} {
+		`href="/services/7"`, "other · deployment smoke/cache", `aria-current="page"`, `hx-get="/services/group/edge" hx-trigger="live" data-live-events="/services/events"`} {
 		if !p.has(want) {
 			t.Errorf("edge's overview lacks %q: %s", want, excerpt(p.body))
 		}

@@ -14,6 +14,7 @@ import (
 	"github.com/Cidan/ok/internal/scm/contentindex"
 	"github.com/Cidan/ok/internal/scm/encoding"
 	"github.com/Cidan/ok/internal/scm/store/backend"
+	"github.com/Cidan/ok/internal/work/worktest"
 )
 
 // The content index's log at scale (docs/scm.md, "The content index"): a replica reads only what
@@ -182,12 +183,8 @@ func TestLongLogAsksForAFold(t *testing.T) {
 		logAs(t, s, sc, false, putChunk(chunkID(uint64(i))))
 	}
 	refreshed(t, s, sc)
-	due, err := s.Work().Due(ctx, FoldDueWork, 10)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !slices.Contains(due, repo) {
-		t.Fatalf("a long tail: fold work due %v, want the repository's", due)
+	if got := worktest.Ready(t, s.Work(), FoldDueWork); !slices.Contains(got, repo) {
+		t.Fatalf("a long tail: fold work's jobs %v, want the repository's", got)
 	}
 	st, _, err := s.ops(ctx).ContentIndexGeneration(ctx, sc)
 	if err != nil {
@@ -221,9 +218,9 @@ func (s *Store) logRows(ctx context.Context, sc backend.Scope) (rows int, folded
 	return rows, folded, found, err
 }
 
-// Readers that find an index stale together read the database once between them, not a read each
-// one after another — a repository's publishes stale every replica's index at once — and each holds
-// what was committed before it asked; a reader that asks after a refresh began reads again.
+// Readers of an index together read the database once between them, not a read each one after
+// another — every read of an index reads the database — and each holds what was committed before
+// it asked; a reader that asks after a refresh began reads again.
 func TestRefreshesCoalesce(t *testing.T) {
 	s := testStore(t)
 	sc := repoScope(newRepo(t, s).ID)
@@ -239,7 +236,6 @@ func TestRefreshesCoalesce(t *testing.T) {
 	for round := range 3 {
 		id := chunkID(uint64(100 + round))
 		logAs(t, s, sc, false, putChunk(id))
-		li.stale.Store(true)
 		reads.Store(0)
 		var wg sync.WaitGroup
 		for range readers {
@@ -256,7 +252,7 @@ func TestRefreshesCoalesce(t *testing.T) {
 		}
 		wg.Wait()
 		if n := reads.Load(); n == 0 || n > 3 {
-			t.Errorf("round %d: %d readers of a stale index read it %d times", round, readers, n)
+			t.Errorf("round %d: %d readers of an index read it %d times", round, readers, n)
 		}
 	}
 	// One that asks after the last refresh began reads again, though the index is not stale.

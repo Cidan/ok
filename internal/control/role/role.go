@@ -18,7 +18,6 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"github.com/Cidan/ok/internal/bus"
 	"github.com/Cidan/ok/internal/bus/busconfig"
 	"github.com/Cidan/ok/internal/cells"
 	"github.com/Cidan/ok/internal/config"
@@ -44,6 +43,7 @@ import (
 	"github.com/Cidan/ok/internal/serve/authn"
 	"github.com/Cidan/ok/internal/serve/node"
 	"github.com/Cidan/ok/internal/spannerdb"
+	"github.com/Cidan/ok/internal/wait"
 	automationpb "github.com/Cidan/ok/proto/ok/automation/v1"
 	controlpb "github.com/Cidan/ok/proto/ok/control/v1"
 	deploypb "github.com/Cidan/ok/proto/ok/deploy/v1"
@@ -75,16 +75,11 @@ func (r *Role) Close() {
 type Options struct {
 	// Dev accepts development principals: a role on loopback, for local development and tests.
 	Dev bool
-	// Pool and Stream, when set, are the database and the bus's stream instead of the
-	// configuration's: tests.
-	Pool   *pgxpool.Pool
-	Stream bus.Stream
+	// Pool, when set, is the database instead of the configuration's: tests.
+	Pool *pgxpool.Pool
 	// The other roles, when set, dialed as ok control: tests. Unset, each is dialed at its
 	// services address.
 	Identity, SCM, Automation, Deploy grpc.ClientConnInterface
-	// Poll, when set, is how often the ChangeLists service's Watch reads a CL again, and the outboxes
-	// are looked at: tests.
-	Poll time.Duration
 	// Roots, when set, are the identity CA's certificates as identity in the same process holds
 	// them (ok serve); unset, they are read from identity.
 	Roots *idclient.Roots
@@ -159,15 +154,17 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (*Role, error)
 		}
 		d = pd
 	}
-	stream := opts.Stream
-	if stream == nil {
-		bb, err := busconfig.Open(ctx, cfg.Bus, pool)
-		if err != nil {
-			return nil, err
-		}
-		r.closers = append(r.closers, bb.Close)
-		stream = bb.Stream
+	bb, err := busconfig.Open(ctx, cfg.Bus)
+	if err != nil {
+		return nil, err
 	}
+	r.closers = append(r.closers, bb.Close)
+	// Its keyed work's jobs go on the bus's queue (docs/hosted.md, "Work without leaders").
+	if err := bb.RegisterWork(d.Work(), "control"); err != nil {
+		return nil, err
+	}
+	// Its writes say which CLs they changed, for the CLs' watchers (api.Watch).
+	d = db.Changing(d)
 	r.DB = d
 
 	var base dial.Options
@@ -223,9 +220,7 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (*Role, error)
 	pages.Brand = cfg.Installation
 	roots := opts.Roots
 	if roots == nil {
-		if roots, err = idclient.NewRoots(ctx, idConn, "control"); err != nil {
-			return nil, err
-		}
+		roots = idclient.NewRoots(idConn)
 	}
 	r.Resolver = authn.NewResolver(authn.Config{
 		Directory:     idclient.NewDirectory(idConn),
@@ -250,20 +245,19 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (*Role, error)
 	// Repositories' webhooks, their secrets sealed under the cells' shared key (docs/hosted.md, "ok
 	// control at scale, as built").
 	hooks := &webhooks.Hooks{DB: d, AllowPrivate: cfg.Control.Webhooks.AllowPrivateNetworks, PublicURL: cfg.PublicURL, Installation: installation,
-		Log: slog.Default(), Look: opts.Poll}
+		Log: slog.Default()}
 	if f := cfg.Control.SealingKeyFile; f != "" {
 		if hooks.Sealer, err = seal.Load(f); err != nil {
 			return nil, fmt.Errorf("control.sealing_key_file: %w", err)
 		}
 	}
-	site := &site{handler: web.New(d, sc, runs, deploys, r.Review, dir, idConn, hooks, installation).Handler()}
-	cl := api.New(d, sc, runs, deploys, r.Review, cfg.PublicURL, installation)
-	if opts.Poll > 0 {
-		cl.SetPoll(opts.Poll)
-	}
+	// The other services a watch of a CL, and a page's live regions, register with (internal/wait).
+	remotes := api.Waits{Automation: wait.Remote(autoConn), Deploy: wait.Remote(deployConn)}
+	site := &site{handler: web.New(d, sc, runs, deploys, r.Review, dir, idConn, hooks, remotes, installation).Handler()}
+	cl := api.New(d, sc, runs, deploys, r.Review, remotes, cfg.PublicURL, installation)
 	cls := &changeLists{api: cl}
-	follow := &follower{f: feed.New(d, stream, sc, r.Review)}
-	directory := &directoryFollower{f: feed.NewDirectory(d, stream, identitypb.NewDirectoryEventsClient(idConn), access.Forget)}
+	follow := &follower{f: feed.New(d, sc, r.Review)}
+	directory := &directoryFollower{f: feed.NewDirectory(d, identitypb.NewDirectoryEventsClient(idConn))}
 	// Moves of its repositories' rows between cells, from the same role of the source cell
 	// (docs/hosted.md, "Cells, as built").
 	peers := cells.NewPeers(identitypb.NewCellsClient(idConn), func(addr string) (grpc.ClientConnInterface, func(), error) {
@@ -288,7 +282,7 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (*Role, error)
 		return c, nil, err
 	})
 	r.closers = append(r.closers, peers.Close)
-	mover := &move.RepositoryRole{RoleName: cells.Control, Rows: d.Moves(), Arrived: func(ctx context.Context, repos []int64) error {
+	mover := &move.RepositoryRole{RoleName: cells.Control, Rows: d.Moves(), Work: d.Work(), Arrived: func(ctx context.Context, repos []int64) error {
 		// Its row names it as the directory does; its head is what this cell's SCM's feed would
 		// have recorded, had the repository been here.
 		repositories := scmpb.NewRepositoriesClient(scmConn)
@@ -299,6 +293,12 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (*Role, error)
 			}
 			if err := d.MoveHead(ctx, id, r.GetHeadSeq(), time.Now()); err != nil {
 				return err
+			}
+			// Its outbox and webhook deliveries came with it: drained, and sent, here.
+			for _, kind := range []string{db.OutboxWork, db.WebhookWork} {
+				if err := d.Work().Mark(ctx, kind, id); err != nil {
+					return err
+				}
 			}
 		}
 		return nil
@@ -315,11 +315,12 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (*Role, error)
 	// as built").
 	delivery := identitypb.NewDeliveryClient(idConn)
 	drain := &outboxDrainer{d: &outbox.Drainer{DB: d, Delivery: delivery, Tenancy: identitypb.NewTenancyClient(idConn),
-		Consumers: []outbox.Consumer{&outbox.Notifier{DB: d, Delivery: delivery, Installation: installation}}, Log: slog.Default(), Look: opts.Poll}}
+		Consumers: []outbox.Consumer{&outbox.Notifier{DB: d, Delivery: delivery, Installation: installation}}, Log: slog.Default()}}
 	if hooks.Sealer != nil {
 		drain.d.Consumers = append(drain.d.Consumers, hooks)
 	}
-	deps := []node.Node{site, cls, follow, directory, moves, drain, roots}
+	deps := []node.Node{site, cls, follow, directory, moves, drain}
+	deps = append(deps, &waits{db: d})
 	if hooks.Sealer != nil {
 		deps = append(deps, &webhookSender{h: hooks})
 	}
@@ -368,6 +369,21 @@ func (*follower) Dependencies() []node.Node         { return nil }
 func (*follower) Setup(context.Context) error       { return nil }
 func (*follower) Healthy(context.Context) bool      { return true }
 func (f *follower) Start(ctx context.Context) error { return f.f.Run(ctx) }
+
+// waits replies to the live requests waiting on what ok control's transactions changed while the
+// role runs (internal/wait): actions waiting for the feed, a CL's watchers.
+type waits struct{ db db.Store }
+
+var _ node.Application = (*waits)(nil)
+
+func (*waits) Name() string                 { return "ok/control/waits" }
+func (*waits) Dependencies() []node.Node    { return nil }
+func (*waits) Setup(context.Context) error  { return nil }
+func (*waits) Healthy(context.Context) bool { return true }
+func (n *waits) Start(ctx context.Context) error {
+	wait.Run(ctx, n.db.Waits(), n.db.Work().Jobs().Queue, slog.Default())
+	return nil
+}
 
 // directoryFollower applies the directory's events while the role runs: repositories' names.
 type directoryFollower struct{ f *feed.Directory }

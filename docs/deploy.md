@@ -272,9 +272,9 @@ ServiceAccount, and adds no host access.
 ## Where it runs
 
 - **The deployer** is a role of its own (`ok deploy serve`), on its tables (the schema `deploy`).
-  It follows `main`, checks each commit it plans out — through okfs, reading ahead only the build
-  graph and the workflow files planning reads, or written to disk (`deploy.checkout`) — plans with
-  Bazel, runs migrations, rolls, and watches. No replica leads ([hosted.md](hosted.md), "Work
+  It follows `main`, presents each commit it plans through okfs — the build graph and the workflow
+  files planning reads arrive with the commit's checkout — plans with Bazel, runs migrations,
+  rolls, and watches. No replica leads ([hosted.md](hosted.md), "Work
   without leaders"): every replica plans each repository whose main moved under that repository's
   lease, starts the deployments whose turn has come in one transaction at a time — so no two
   deployments ever hold one deploy or workload, whichever replicas start them — and steps each
@@ -309,6 +309,11 @@ repository so; a single installation deploys to its own cluster unless an owner 
 ```
 ok deploy agent -address ok.example.com:443 -token-file /var/run/secrets/ok/token/token -state /var/lib/ok-agent
 ```
+
+The agent presents each migration's commit through okfs, as the deployer does, in a user and mount
+namespace of its own, with `/dev/fuse`: the chart runs it under `unshare` with the FUSE device its
+device plugin offers (`devicePlugin`; or a plugin of your own, its resource named in
+`migrations.fuseResource`).
 
 What the agent does for a deployer is narrow, whatever its RBAC allows: it reads and rolls
 Deployments and StatefulSets, reads ReplicaSets and pods, and reads discovery — never a Secret, a

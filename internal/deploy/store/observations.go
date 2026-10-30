@@ -1,6 +1,9 @@
 package store
 
-import "time"
+import (
+	"maps"
+	"time"
+)
 
 // Observation is what the cluster runs of a service's workload, as the observer last read it.
 type Observation struct {
@@ -24,4 +27,20 @@ type ObservedPod struct {
 	Images      map[string]string `json:"images,omitempty"` // container → the image it runs
 	Started     time.Time         `json:"started"`
 	Terminating bool              `json:"terminating,omitempty"`
+}
+
+// sameObservation reports whether two readings of a workload agree.
+func sameObservation(a, b Observation) bool {
+	if a.Error != b.Error || a.Found != b.Found || a.Live != b.Live || a.Replicas != b.Replicas || a.Ready != b.Ready ||
+		!maps.Equal(a.Images, b.Images) || len(a.Pods) != len(b.Pods) {
+		return false
+	}
+	for i, p := range a.Pods {
+		q := b.Pods[i]
+		if p.Name != q.Name || p.Copy != q.Copy || p.Ready != q.Ready || p.Restarts != q.Restarts || p.Phase != q.Phase ||
+			p.Reason != q.Reason || !maps.Equal(p.Images, q.Images) || !p.Started.Equal(q.Started) || p.Terminating != q.Terminating {
+			return false
+		}
+	}
+	return true
 }

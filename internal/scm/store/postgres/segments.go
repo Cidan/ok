@@ -195,17 +195,77 @@ func (x queries) PinnedObjects(ctx context.Context, repo int64, limit int) ([]ba
 	return kindedObjects(x.q.Query(ctx, `SELECT id, kind, body FROM object WHERE repository_id = $1 AND pinned ORDER BY id LIMIT $2`, repo, limit))
 }
 
-func (x queries) PinnedTreeSizes(ctx context.Context, repo int64, limit int) ([]backend.Object, error) {
-	return kindedObjects(x.q.Query(ctx, `SELECT ts.tree_id, $3::smallint, ts.body FROM tree_sizes ts
-		LEFT JOIN object o ON o.repository_id = ts.repository_id AND o.id = ts.tree_id
-		WHERE ts.repository_id = $1 AND (o.id IS NULL OR o.pinned) ORDER BY ts.tree_id LIMIT $2`,
-		repo, limit, int16(encoding.KindTree)))
+// PinnedTreeSizes reads the window's keys, each with whether its tree is pinned, then the records
+// it takes.
+func (x queries) PinnedTreeSizes(ctx context.Context, repo int64, after []byte, scan, limit int) ([]backend.Object, []byte, bool, error) {
+	window, args := `SELECT tree_id FROM tree_sizes WHERE repository_id = $1 ORDER BY tree_id LIMIT $2`, []any{repo, scan}
+	if after != nil {
+		window, args = `SELECT tree_id FROM tree_sizes WHERE repository_id = $1 AND tree_id > $3 ORDER BY tree_id LIMIT $2`, append(args, after)
+	}
+	rows, err := x.q.Query(ctx, `SELECT w.tree_id, (o.id IS NULL OR o.pinned) FROM (`+window+`) w
+		LEFT JOIN object o ON o.repository_id = $1 AND o.id = w.tree_id ORDER BY w.tree_id`, args...)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	var keys [][]byte
+	var take []bool
+	for rows.Next() {
+		var k []byte
+		var t bool
+		if err := rows.Scan(&k, &t); err != nil {
+			rows.Close()
+			return nil, nil, false, err
+		}
+		keys, take = append(keys, k), append(take, t)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, nil, false, err
+	}
+	taken, last, _, more := backend.Window(keys, take, scan, limit)
+	if len(taken) == 0 {
+		return nil, last, more, nil
+	}
+	objs, err := kindedObjects(x.q.Query(ctx, `SELECT tree_id, $3::smallint, body FROM tree_sizes WHERE repository_id = $1 AND tree_id = ANY($2)
+		ORDER BY tree_id`, repo, taken, int16(encoding.KindTree)))
+	return objs, last, more, err
 }
 
-func (x queries) PinnedCopyEdges(ctx context.Context, repo int64, limit int) ([][2]encoding.ID, error) {
-	return pairs(x.q.Query(ctx, `SELECT cp.copy_id, cp.parent_id FROM copy_parent cp
-		LEFT JOIN object o ON o.repository_id = cp.repository_id AND o.id = cp.copy_id
-		WHERE cp.repository_id = $1 AND (o.id IS NULL OR o.pinned) ORDER BY cp.parent_id, cp.copy_id LIMIT $2`, repo, limit))
+func (x queries) PinnedCopyEdges(ctx context.Context, repo int64, after *[2]encoding.ID, scan, limit int) ([][2]encoding.ID, *[2]encoding.ID, bool, error) {
+	window, args := `SELECT copy_id, parent_id FROM copy_parent WHERE repository_id = $1 ORDER BY copy_id, parent_id LIMIT $2`, []any{repo, scan}
+	if after != nil {
+		window = `SELECT copy_id, parent_id FROM copy_parent WHERE repository_id = $1 AND (copy_id, parent_id) > ($3, $4)
+			ORDER BY copy_id, parent_id LIMIT $2`
+		args = append(args, after[0][:], after[1][:])
+	}
+	rows, err := x.q.Query(ctx, `SELECT w.copy_id, w.parent_id, (o.id IS NULL OR o.pinned) FROM (`+window+`) w
+		LEFT JOIN object o ON o.repository_id = $1 AND o.id = w.copy_id ORDER BY w.copy_id, w.parent_id`, args...)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	var keys [][2]encoding.ID
+	var take []bool
+	for rows.Next() {
+		var c, p []byte
+		var t bool
+		if err := rows.Scan(&c, &p, &t); err != nil {
+			rows.Close()
+			return nil, nil, false, err
+		}
+		var e [2]encoding.ID
+		copy(e[0][:], c)
+		copy(e[1][:], p)
+		keys, take = append(keys, e), append(take, t)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, nil, false, err
+	}
+	taken, last, _, more := backend.Window(keys, take, scan, limit)
+	if len(keys) == 0 {
+		return nil, nil, more, nil
+	}
+	return taken, &last, more, nil
 }
 
 func (x queries) DeleteCompacted(ctx context.Context, repo int64, c backend.Compacted) error {

@@ -3,6 +3,7 @@ package store
 import (
 	"cmp"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -203,17 +204,27 @@ func (m mover) Imported(ctx context.Context, sc move.Scope) error {
 	return nil
 }
 
-// Open lets the network be written here; its keyed work stayed behind, so what its tail holds is
-// compacted, and it is collected, here.
+// Open lets the network be written here; its keyed work and its steps stayed behind, so what its
+// tail holds is compacted, it is collected, the rows its writers left pending are sequenced, and
+// its pending events are published, here.
 func (m mover) Open(ctx context.Context, sc move.Scope) error {
 	if err := m.s.b.SetNetworkMove(ctx, backend.Network(sc.Network), "", ""); err != nil {
 		return err
 	}
+	jobs := m.s.Work().Jobs()
 	for _, r := range sc.Repositories {
 		for _, kind := range []string{SegmentWork, GCWork} {
 			if err := m.s.Work().Mark(ctx, kind, r); err != nil {
 				return err
 			}
+		}
+		if m.s.b.SequencesAfterCommit() {
+			if err := jobs.Step(ctx, sequenceKind, r, time.Time{}, binary.BigEndian.AppendUint64(nil, 0)); err != nil {
+				return err
+			}
+		}
+		if err := jobs.Step(ctx, relayKind, r, time.Time{}, relayBody(0, 0)); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -301,9 +312,9 @@ func (s *Store) PurgeMoved(ctx context.Context, net int64) error {
 func (s *Store) forgetNetwork(sc move.Scope) {
 	for _, r := range sc.Repositories {
 		s.networks.Delete(r)
-		s.indexChanged(repoScope(r))
+		s.forgetIndex(repoScope(r))
 	}
-	s.indexChanged(backend.NetworkScope(backend.Network(sc.Network)))
+	s.forgetIndex(backend.NetworkScope(backend.Network(sc.Network)))
 }
 
 // netObjects are a network's objects: under nets/<network>/, its packs and segments.

@@ -380,7 +380,7 @@ func (x DirectoryEvent_Kind) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use DirectoryEvent_Kind.Descriptor instead.
 func (DirectoryEvent_Kind) EnumDescriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{120, 0}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{122, 0}
 }
 
 type Notification_Kind int32
@@ -441,7 +441,7 @@ func (x Notification_Kind) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use Notification_Kind.Descriptor instead.
 func (Notification_Kind) EnumDescriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{125, 0}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{127, 0}
 }
 
 type InboxEntry_Relation int32
@@ -490,7 +490,7 @@ func (x InboxEntry_Relation) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use InboxEntry_Relation.Descriptor instead.
 func (InboxEntry_Relation) EnumDescriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{134, 0}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{136, 0}
 }
 
 type Expiry_Kind int32
@@ -542,7 +542,7 @@ func (x Expiry_Kind) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use Expiry_Kind.Descriptor instead.
 func (Expiry_Kind) EnumDescriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{201, 0}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{203, 0}
 }
 
 type Approval_State int32
@@ -597,7 +597,7 @@ func (x Approval_State) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use Approval_State.Descriptor instead.
 func (Approval_State) EnumDescriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{219, 0}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{221, 0}
 }
 
 // Principal is a person or a robot.
@@ -4903,7 +4903,6 @@ type SetQuotaRequest struct {
 	Account       string                 `protobuf:"bytes,1,opt,name=account,proto3" json:"account,omitempty"` // a person's or an organization's handle
 	Concurrent    int32                  `protobuf:"varint,2,opt,name=concurrent,proto3" json:"concurrent,omitempty"`
 	Minutes       int64                  `protobuf:"varint,3,opt,name=minutes,proto3" json:"minutes,omitempty"`
-	Weight        int32                  `protobuf:"varint,4,opt,name=weight,proto3" json:"weight,omitempty"`
 	Reset_        bool                   `protobuf:"varint,5,opt,name=reset,proto3" json:"reset,omitempty"` // to the default; the rest unset
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -4960,13 +4959,6 @@ func (x *SetQuotaRequest) GetMinutes() int64 {
 	return 0
 }
 
-func (x *SetQuotaRequest) GetWeight() int32 {
-	if x != nil {
-		return x.Weight
-	}
-	return 0
-}
-
 func (x *SetQuotaRequest) GetReset_() bool {
 	if x != nil {
 		return x.Reset_
@@ -5019,14 +5011,13 @@ func (x *GetQuotaRequest) GetAccount() string {
 }
 
 // Quota is an account's quota of CI: its concurrent runs and its run minutes in a calendar month
-// (UTC), zero for unlimited, and its weight in fair share among the accounts whose runs wait.
+// (UTC), zero for unlimited.
 type Quota struct {
 	state      protoimpl.MessageState `protogen:"open.v1"`
 	AccountId  string                 `protobuf:"bytes,1,opt,name=account_id,json=accountId,proto3" json:"account_id,omitempty"`
 	Account    string                 `protobuf:"bytes,2,opt,name=account,proto3" json:"account,omitempty"` // its handle; empty where only its ID was asked
 	Concurrent int32                  `protobuf:"varint,3,opt,name=concurrent,proto3" json:"concurrent,omitempty"`
 	Minutes    int64                  `protobuf:"varint,4,opt,name=minutes,proto3" json:"minutes,omitempty"`
-	Weight     int32                  `protobuf:"varint,5,opt,name=weight,proto3" json:"weight,omitempty"`
 	Default    bool                   `protobuf:"varint,6,opt,name=default,proto3" json:"default,omitempty"` // identity.default_quota: none set
 	// GetQuotas': the account's running runs and this month's run seconds in the cells but the one
 	// asking, as each last reported them (ReportUsage) — running runs only from reports of the last
@@ -5091,13 +5082,6 @@ func (x *Quota) GetConcurrent() int32 {
 func (x *Quota) GetMinutes() int64 {
 	if x != nil {
 		return x.Minutes
-	}
-	return 0
-}
-
-func (x *Quota) GetWeight() int32 {
-	if x != nil {
-		return x.Weight
 	}
 	return 0
 }
@@ -7028,6 +7012,78 @@ func (x *GetAppliedResponse) GetApplied() *timestamppb.Timestamp {
 	return nil
 }
 
+type FollowDirectoryRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *FollowDirectoryRequest) Reset() {
+	*x = FollowDirectoryRequest{}
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[120]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *FollowDirectoryRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*FollowDirectoryRequest) ProtoMessage() {}
+
+func (x *FollowDirectoryRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[120]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use FollowDirectoryRequest.ProtoReflect.Descriptor instead.
+func (*FollowDirectoryRequest) Descriptor() ([]byte, []int) {
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{120}
+}
+
+type FollowDirectoryResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *FollowDirectoryResponse) Reset() {
+	*x = FollowDirectoryResponse{}
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[121]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *FollowDirectoryResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*FollowDirectoryResponse) ProtoMessage() {}
+
+func (x *FollowDirectoryResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[121]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use FollowDirectoryResponse.ProtoReflect.Descriptor instead.
+func (*FollowDirectoryResponse) Descriptor() ([]byte, []int) {
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{121}
+}
+
 // DirectoryEvent is a change to a repository's entry: what happened, and the entry as it stands
 // after. Its owner is named by ID alone — an owner's handle changes apart from its repositories —
 // which a follower names as it shows it. An entry being made is in no event until it is made.
@@ -7051,7 +7107,7 @@ type DirectoryEvent struct {
 
 func (x *DirectoryEvent) Reset() {
 	*x = DirectoryEvent{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[120]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[122]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7063,7 +7119,7 @@ func (x *DirectoryEvent) String() string {
 func (*DirectoryEvent) ProtoMessage() {}
 
 func (x *DirectoryEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[120]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[122]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7076,7 +7132,7 @@ func (x *DirectoryEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DirectoryEvent.ProtoReflect.Descriptor instead.
 func (*DirectoryEvent) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{120}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{122}
 }
 
 func (x *DirectoryEvent) GetRepositoryId() int64 {
@@ -7145,7 +7201,7 @@ type ReadDirectoryEventsRequest struct {
 
 func (x *ReadDirectoryEventsRequest) Reset() {
 	*x = ReadDirectoryEventsRequest{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[121]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[123]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7157,7 +7213,7 @@ func (x *ReadDirectoryEventsRequest) String() string {
 func (*ReadDirectoryEventsRequest) ProtoMessage() {}
 
 func (x *ReadDirectoryEventsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[121]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[123]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7170,7 +7226,7 @@ func (x *ReadDirectoryEventsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReadDirectoryEventsRequest.ProtoReflect.Descriptor instead.
 func (*ReadDirectoryEventsRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{121}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{123}
 }
 
 func (x *ReadDirectoryEventsRequest) GetRepositoryId() int64 {
@@ -7196,7 +7252,7 @@ type ReadDirectoryEventsResponse struct {
 
 func (x *ReadDirectoryEventsResponse) Reset() {
 	*x = ReadDirectoryEventsResponse{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[122]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[124]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7208,7 +7264,7 @@ func (x *ReadDirectoryEventsResponse) String() string {
 func (*ReadDirectoryEventsResponse) ProtoMessage() {}
 
 func (x *ReadDirectoryEventsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[122]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[124]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7221,7 +7277,7 @@ func (x *ReadDirectoryEventsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReadDirectoryEventsResponse.ProtoReflect.Descriptor instead.
 func (*ReadDirectoryEventsResponse) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{122}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{124}
 }
 
 func (x *ReadDirectoryEventsResponse) GetEvents() []*DirectoryEvent {
@@ -7240,7 +7296,7 @@ type DirectoryHeadsRequest struct {
 
 func (x *DirectoryHeadsRequest) Reset() {
 	*x = DirectoryHeadsRequest{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[123]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[125]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7252,7 +7308,7 @@ func (x *DirectoryHeadsRequest) String() string {
 func (*DirectoryHeadsRequest) ProtoMessage() {}
 
 func (x *DirectoryHeadsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[123]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[125]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7265,7 +7321,7 @@ func (x *DirectoryHeadsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DirectoryHeadsRequest.ProtoReflect.Descriptor instead.
 func (*DirectoryHeadsRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{123}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{125}
 }
 
 func (x *DirectoryHeadsRequest) GetAfterRepositoryId() int64 {
@@ -7284,7 +7340,7 @@ type DirectoryHeadsResponse struct {
 
 func (x *DirectoryHeadsResponse) Reset() {
 	*x = DirectoryHeadsResponse{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[124]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[126]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7296,7 +7352,7 @@ func (x *DirectoryHeadsResponse) String() string {
 func (*DirectoryHeadsResponse) ProtoMessage() {}
 
 func (x *DirectoryHeadsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[124]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[126]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7309,7 +7365,7 @@ func (x *DirectoryHeadsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DirectoryHeadsResponse.ProtoReflect.Descriptor instead.
 func (*DirectoryHeadsResponse) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{124}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{126}
 }
 
 func (x *DirectoryHeadsResponse) GetHeads() []*DirectoryHeadsResponse_Head {
@@ -7341,7 +7397,7 @@ type Notification struct {
 
 func (x *Notification) Reset() {
 	*x = Notification{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[125]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[127]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7353,7 +7409,7 @@ func (x *Notification) String() string {
 func (*Notification) ProtoMessage() {}
 
 func (x *Notification) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[125]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[127]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7366,7 +7422,7 @@ func (x *Notification) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Notification.ProtoReflect.Descriptor instead.
 func (*Notification) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{125}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{127}
 }
 
 func (x *Notification) GetSource() string {
@@ -7462,7 +7518,7 @@ type NotifyRequest struct {
 
 func (x *NotifyRequest) Reset() {
 	*x = NotifyRequest{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[126]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[128]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7474,7 +7530,7 @@ func (x *NotifyRequest) String() string {
 func (*NotifyRequest) ProtoMessage() {}
 
 func (x *NotifyRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[126]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[128]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7487,7 +7543,7 @@ func (x *NotifyRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NotifyRequest.ProtoReflect.Descriptor instead.
 func (*NotifyRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{126}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{128}
 }
 
 func (x *NotifyRequest) GetNotifications() []*Notification {
@@ -7507,7 +7563,7 @@ type NotifyResponse struct {
 
 func (x *NotifyResponse) Reset() {
 	*x = NotifyResponse{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[127]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[129]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7519,7 +7575,7 @@ func (x *NotifyResponse) String() string {
 func (*NotifyResponse) ProtoMessage() {}
 
 func (x *NotifyResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[127]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[129]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7532,7 +7588,7 @@ func (x *NotifyResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NotifyResponse.ProtoReflect.Descriptor instead.
 func (*NotifyResponse) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{127}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{129}
 }
 
 func (x *NotifyResponse) GetAdded() int32 {
@@ -7560,7 +7616,7 @@ type ListNotificationsRequest struct {
 
 func (x *ListNotificationsRequest) Reset() {
 	*x = ListNotificationsRequest{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[128]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[130]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7572,7 +7628,7 @@ func (x *ListNotificationsRequest) String() string {
 func (*ListNotificationsRequest) ProtoMessage() {}
 
 func (x *ListNotificationsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[128]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[130]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7585,7 +7641,7 @@ func (x *ListNotificationsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListNotificationsRequest.ProtoReflect.Descriptor instead.
 func (*ListNotificationsRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{128}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{130}
 }
 
 func (x *ListNotificationsRequest) GetForPersonId() string {
@@ -7619,7 +7675,7 @@ type ListNotificationsResponse struct {
 
 func (x *ListNotificationsResponse) Reset() {
 	*x = ListNotificationsResponse{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[129]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[131]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7631,7 +7687,7 @@ func (x *ListNotificationsResponse) String() string {
 func (*ListNotificationsResponse) ProtoMessage() {}
 
 func (x *ListNotificationsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[129]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[131]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7644,7 +7700,7 @@ func (x *ListNotificationsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListNotificationsResponse.ProtoReflect.Descriptor instead.
 func (*ListNotificationsResponse) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{129}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{131}
 }
 
 func (x *ListNotificationsResponse) GetNotifications() []*Notification {
@@ -7672,7 +7728,7 @@ type MarkReadRequest struct {
 
 func (x *MarkReadRequest) Reset() {
 	*x = MarkReadRequest{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[130]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[132]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7684,7 +7740,7 @@ func (x *MarkReadRequest) String() string {
 func (*MarkReadRequest) ProtoMessage() {}
 
 func (x *MarkReadRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[130]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[132]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7697,7 +7753,7 @@ func (x *MarkReadRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MarkReadRequest.ProtoReflect.Descriptor instead.
 func (*MarkReadRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{130}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{132}
 }
 
 func (x *MarkReadRequest) GetForPersonId() string {
@@ -7729,7 +7785,7 @@ type MarkReadResponse struct {
 
 func (x *MarkReadResponse) Reset() {
 	*x = MarkReadResponse{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[131]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[133]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7741,7 +7797,7 @@ func (x *MarkReadResponse) String() string {
 func (*MarkReadResponse) ProtoMessage() {}
 
 func (x *MarkReadResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[131]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[133]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7754,7 +7810,7 @@ func (x *MarkReadResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MarkReadResponse.ProtoReflect.Descriptor instead.
 func (*MarkReadResponse) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{131}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{133}
 }
 
 type GetNotificationPreferencesRequest struct {
@@ -7766,7 +7822,7 @@ type GetNotificationPreferencesRequest struct {
 
 func (x *GetNotificationPreferencesRequest) Reset() {
 	*x = GetNotificationPreferencesRequest{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[132]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[134]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7778,7 +7834,7 @@ func (x *GetNotificationPreferencesRequest) String() string {
 func (*GetNotificationPreferencesRequest) ProtoMessage() {}
 
 func (x *GetNotificationPreferencesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[132]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[134]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7791,7 +7847,7 @@ func (x *GetNotificationPreferencesRequest) ProtoReflect() protoreflect.Message 
 
 // Deprecated: Use GetNotificationPreferencesRequest.ProtoReflect.Descriptor instead.
 func (*GetNotificationPreferencesRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{132}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{134}
 }
 
 func (x *GetNotificationPreferencesRequest) GetForPersonId() string {
@@ -7814,7 +7870,7 @@ type NotificationPreferences struct {
 
 func (x *NotificationPreferences) Reset() {
 	*x = NotificationPreferences{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[133]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[135]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7826,7 +7882,7 @@ func (x *NotificationPreferences) String() string {
 func (*NotificationPreferences) ProtoMessage() {}
 
 func (x *NotificationPreferences) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[133]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[135]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7839,7 +7895,7 @@ func (x *NotificationPreferences) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NotificationPreferences.ProtoReflect.Descriptor instead.
 func (*NotificationPreferences) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{133}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{135}
 }
 
 func (x *NotificationPreferences) GetForPersonId() string {
@@ -7882,7 +7938,7 @@ type InboxEntry struct {
 
 func (x *InboxEntry) Reset() {
 	*x = InboxEntry{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[134]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[136]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7894,7 +7950,7 @@ func (x *InboxEntry) String() string {
 func (*InboxEntry) ProtoMessage() {}
 
 func (x *InboxEntry) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[134]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[136]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7907,7 +7963,7 @@ func (x *InboxEntry) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use InboxEntry.ProtoReflect.Descriptor instead.
 func (*InboxEntry) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{134}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{136}
 }
 
 func (x *InboxEntry) GetPrincipalId() string {
@@ -7985,7 +8041,7 @@ type SetInboxRequest struct {
 
 func (x *SetInboxRequest) Reset() {
 	*x = SetInboxRequest{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[135]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[137]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7997,7 +8053,7 @@ func (x *SetInboxRequest) String() string {
 func (*SetInboxRequest) ProtoMessage() {}
 
 func (x *SetInboxRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[135]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[137]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8010,7 +8066,7 @@ func (x *SetInboxRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetInboxRequest.ProtoReflect.Descriptor instead.
 func (*SetInboxRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{135}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{137}
 }
 
 func (x *SetInboxRequest) GetRepositoryId() int64 {
@@ -8050,7 +8106,7 @@ type SetInboxResponse struct {
 
 func (x *SetInboxResponse) Reset() {
 	*x = SetInboxResponse{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[136]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[138]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8062,7 +8118,7 @@ func (x *SetInboxResponse) String() string {
 func (*SetInboxResponse) ProtoMessage() {}
 
 func (x *SetInboxResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[136]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[138]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8075,7 +8131,7 @@ func (x *SetInboxResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetInboxResponse.ProtoReflect.Descriptor instead.
 func (*SetInboxResponse) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{136}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{138}
 }
 
 func (x *SetInboxResponse) GetApplied() bool {
@@ -8097,7 +8153,7 @@ type ListInboxRequest struct {
 
 func (x *ListInboxRequest) Reset() {
 	*x = ListInboxRequest{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[137]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[139]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8109,7 +8165,7 @@ func (x *ListInboxRequest) String() string {
 func (*ListInboxRequest) ProtoMessage() {}
 
 func (x *ListInboxRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[137]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[139]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8122,7 +8178,7 @@ func (x *ListInboxRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListInboxRequest.ProtoReflect.Descriptor instead.
 func (*ListInboxRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{137}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{139}
 }
 
 func (x *ListInboxRequest) GetForPersonId() string {
@@ -8162,7 +8218,7 @@ type ListInboxResponse struct {
 
 func (x *ListInboxResponse) Reset() {
 	*x = ListInboxResponse{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[138]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[140]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8174,7 +8230,7 @@ func (x *ListInboxResponse) String() string {
 func (*ListInboxResponse) ProtoMessage() {}
 
 func (x *ListInboxResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[138]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[140]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8187,7 +8243,7 @@ func (x *ListInboxResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListInboxResponse.ProtoReflect.Descriptor instead.
 func (*ListInboxResponse) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{138}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{140}
 }
 
 func (x *ListInboxResponse) GetEntries() []*InboxEntry {
@@ -8207,7 +8263,7 @@ type AgentRepositoryResponse struct {
 
 func (x *AgentRepositoryResponse) Reset() {
 	*x = AgentRepositoryResponse{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[139]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[141]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8219,7 +8275,7 @@ func (x *AgentRepositoryResponse) String() string {
 func (*AgentRepositoryResponse) ProtoMessage() {}
 
 func (x *AgentRepositoryResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[139]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[141]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8232,7 +8288,7 @@ func (x *AgentRepositoryResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AgentRepositoryResponse.ProtoReflect.Descriptor instead.
 func (*AgentRepositoryResponse) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{139}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{141}
 }
 
 func (x *AgentRepositoryResponse) GetOwned() bool {
@@ -8260,7 +8316,7 @@ type SetDeployAgentRequest struct {
 
 func (x *SetDeployAgentRequest) Reset() {
 	*x = SetDeployAgentRequest{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[140]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[142]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8272,7 +8328,7 @@ func (x *SetDeployAgentRequest) String() string {
 func (*SetDeployAgentRequest) ProtoMessage() {}
 
 func (x *SetDeployAgentRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[140]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[142]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8285,7 +8341,7 @@ func (x *SetDeployAgentRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetDeployAgentRequest.ProtoReflect.Descriptor instead.
 func (*SetDeployAgentRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{140}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{142}
 }
 
 func (x *SetDeployAgentRequest) GetHandle() string {
@@ -8324,7 +8380,7 @@ type GetDeployAgentRequest struct {
 
 func (x *GetDeployAgentRequest) Reset() {
 	*x = GetDeployAgentRequest{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[141]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[143]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8336,7 +8392,7 @@ func (x *GetDeployAgentRequest) String() string {
 func (*GetDeployAgentRequest) ProtoMessage() {}
 
 func (x *GetDeployAgentRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[141]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[143]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8349,7 +8405,7 @@ func (x *GetDeployAgentRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetDeployAgentRequest.ProtoReflect.Descriptor instead.
 func (*GetDeployAgentRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{141}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{143}
 }
 
 func (x *GetDeployAgentRequest) GetKey() isGetDeployAgentRequest_Key {
@@ -8429,7 +8485,7 @@ type DeployAgent struct {
 
 func (x *DeployAgent) Reset() {
 	*x = DeployAgent{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[142]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[144]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8441,7 +8497,7 @@ func (x *DeployAgent) String() string {
 func (*DeployAgent) ProtoMessage() {}
 
 func (x *DeployAgent) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[142]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[144]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8454,7 +8510,7 @@ func (x *DeployAgent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeployAgent.ProtoReflect.Descriptor instead.
 func (*DeployAgent) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{142}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{144}
 }
 
 func (x *DeployAgent) GetAccountId() string {
@@ -8507,7 +8563,7 @@ type DeployCellsRequest struct {
 
 func (x *DeployCellsRequest) Reset() {
 	*x = DeployCellsRequest{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[143]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[145]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8519,7 +8575,7 @@ func (x *DeployCellsRequest) String() string {
 func (*DeployCellsRequest) ProtoMessage() {}
 
 func (x *DeployCellsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[143]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[145]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8532,7 +8588,7 @@ func (x *DeployCellsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeployCellsRequest.ProtoReflect.Descriptor instead.
 func (*DeployCellsRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{143}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{145}
 }
 
 type DeployCellsResponse struct {
@@ -8545,7 +8601,7 @@ type DeployCellsResponse struct {
 
 func (x *DeployCellsResponse) Reset() {
 	*x = DeployCellsResponse{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[144]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[146]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8557,7 +8613,7 @@ func (x *DeployCellsResponse) String() string {
 func (*DeployCellsResponse) ProtoMessage() {}
 
 func (x *DeployCellsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[144]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[146]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8570,7 +8626,7 @@ func (x *DeployCellsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeployCellsResponse.ProtoReflect.Descriptor instead.
 func (*DeployCellsResponse) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{144}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{146}
 }
 
 func (x *DeployCellsResponse) GetAccountId() string {
@@ -8598,7 +8654,7 @@ type SearchRequest struct {
 
 func (x *SearchRequest) Reset() {
 	*x = SearchRequest{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[145]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[147]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8610,7 +8666,7 @@ func (x *SearchRequest) String() string {
 func (*SearchRequest) ProtoMessage() {}
 
 func (x *SearchRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[145]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[147]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8623,7 +8679,7 @@ func (x *SearchRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SearchRequest.ProtoReflect.Descriptor instead.
 func (*SearchRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{145}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{147}
 }
 
 func (x *SearchRequest) GetQuery() string {
@@ -8658,7 +8714,7 @@ type SearchResponse struct {
 
 func (x *SearchResponse) Reset() {
 	*x = SearchResponse{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[146]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[148]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8670,7 +8726,7 @@ func (x *SearchResponse) String() string {
 func (*SearchResponse) ProtoMessage() {}
 
 func (x *SearchResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[146]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[148]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8683,7 +8739,7 @@ func (x *SearchResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SearchResponse.ProtoReflect.Descriptor instead.
 func (*SearchResponse) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{146}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{148}
 }
 
 func (x *SearchResponse) GetRepositories() []*RepositoryEntry {
@@ -8719,7 +8775,7 @@ type SearchHit struct {
 
 func (x *SearchHit) Reset() {
 	*x = SearchHit{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[147]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[149]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8731,7 +8787,7 @@ func (x *SearchHit) String() string {
 func (*SearchHit) ProtoMessage() {}
 
 func (x *SearchHit) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[147]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[149]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8744,7 +8800,7 @@ func (x *SearchHit) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SearchHit.ProtoReflect.Descriptor instead.
 func (*SearchHit) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{147}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{149}
 }
 
 func (x *SearchHit) GetId() string {
@@ -8783,7 +8839,7 @@ type Organization struct {
 
 func (x *Organization) Reset() {
 	*x = Organization{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[148]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[150]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8795,7 +8851,7 @@ func (x *Organization) String() string {
 func (*Organization) ProtoMessage() {}
 
 func (x *Organization) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[148]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[150]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8808,7 +8864,7 @@ func (x *Organization) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Organization.ProtoReflect.Descriptor instead.
 func (*Organization) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{148}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{150}
 }
 
 func (x *Organization) GetId() string {
@@ -8873,7 +8929,7 @@ type CreateOrganizationRequest struct {
 
 func (x *CreateOrganizationRequest) Reset() {
 	*x = CreateOrganizationRequest{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[149]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[151]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8885,7 +8941,7 @@ func (x *CreateOrganizationRequest) String() string {
 func (*CreateOrganizationRequest) ProtoMessage() {}
 
 func (x *CreateOrganizationRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[149]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[151]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8898,7 +8954,7 @@ func (x *CreateOrganizationRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateOrganizationRequest.ProtoReflect.Descriptor instead.
 func (*CreateOrganizationRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{149}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{151}
 }
 
 func (x *CreateOrganizationRequest) GetHandle() string {
@@ -8945,7 +9001,7 @@ type GetOrganizationRequest struct {
 
 func (x *GetOrganizationRequest) Reset() {
 	*x = GetOrganizationRequest{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[150]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[152]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8957,7 +9013,7 @@ func (x *GetOrganizationRequest) String() string {
 func (*GetOrganizationRequest) ProtoMessage() {}
 
 func (x *GetOrganizationRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[150]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[152]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8970,7 +9026,7 @@ func (x *GetOrganizationRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetOrganizationRequest.ProtoReflect.Descriptor instead.
 func (*GetOrganizationRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{150}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{152}
 }
 
 func (x *GetOrganizationRequest) GetHandle() string {
@@ -8990,7 +9046,7 @@ type OrganizationDeletionRequest struct {
 
 func (x *OrganizationDeletionRequest) Reset() {
 	*x = OrganizationDeletionRequest{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[151]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[153]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9002,7 +9058,7 @@ func (x *OrganizationDeletionRequest) String() string {
 func (*OrganizationDeletionRequest) ProtoMessage() {}
 
 func (x *OrganizationDeletionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[151]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[153]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9015,7 +9071,7 @@ func (x *OrganizationDeletionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use OrganizationDeletionRequest.ProtoReflect.Descriptor instead.
 func (*OrganizationDeletionRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{151}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{153}
 }
 
 func (x *OrganizationDeletionRequest) GetHandle() string {
@@ -9043,7 +9099,7 @@ type DeleteAccountRequest struct {
 
 func (x *DeleteAccountRequest) Reset() {
 	*x = DeleteAccountRequest{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[152]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[154]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9055,7 +9111,7 @@ func (x *DeleteAccountRequest) String() string {
 func (*DeleteAccountRequest) ProtoMessage() {}
 
 func (x *DeleteAccountRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[152]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[154]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9068,7 +9124,7 @@ func (x *DeleteAccountRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteAccountRequest.ProtoReflect.Descriptor instead.
 func (*DeleteAccountRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{152}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{154}
 }
 
 func (x *DeleteAccountRequest) GetConfirm() string {
@@ -9096,7 +9152,7 @@ type DeletionInfo struct {
 
 func (x *DeletionInfo) Reset() {
 	*x = DeletionInfo{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[153]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[155]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9108,7 +9164,7 @@ func (x *DeletionInfo) String() string {
 func (*DeletionInfo) ProtoMessage() {}
 
 func (x *DeletionInfo) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[153]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[155]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9121,7 +9177,7 @@ func (x *DeletionInfo) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeletionInfo.ProtoReflect.Descriptor instead.
 func (*DeletionInfo) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{153}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{155}
 }
 
 func (x *DeletionInfo) GetRequested() *timestamppb.Timestamp {
@@ -9147,7 +9203,7 @@ type RestoreAccountRequest struct {
 
 func (x *RestoreAccountRequest) Reset() {
 	*x = RestoreAccountRequest{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[154]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[156]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9159,7 +9215,7 @@ func (x *RestoreAccountRequest) String() string {
 func (*RestoreAccountRequest) ProtoMessage() {}
 
 func (x *RestoreAccountRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[154]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[156]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9172,7 +9228,7 @@ func (x *RestoreAccountRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RestoreAccountRequest.ProtoReflect.Descriptor instead.
 func (*RestoreAccountRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{154}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{156}
 }
 
 func (x *RestoreAccountRequest) GetName() string {
@@ -9190,7 +9246,7 @@ type RestoreResponse struct {
 
 func (x *RestoreResponse) Reset() {
 	*x = RestoreResponse{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[155]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[157]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9202,7 +9258,7 @@ func (x *RestoreResponse) String() string {
 func (*RestoreResponse) ProtoMessage() {}
 
 func (x *RestoreResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[155]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[157]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9215,7 +9271,7 @@ func (x *RestoreResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RestoreResponse.ProtoReflect.Descriptor instead.
 func (*RestoreResponse) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{155}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{157}
 }
 
 type SetRegionRequest struct {
@@ -9229,7 +9285,7 @@ type SetRegionRequest struct {
 
 func (x *SetRegionRequest) Reset() {
 	*x = SetRegionRequest{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[156]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[158]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9241,7 +9297,7 @@ func (x *SetRegionRequest) String() string {
 func (*SetRegionRequest) ProtoMessage() {}
 
 func (x *SetRegionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[156]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[158]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9254,7 +9310,7 @@ func (x *SetRegionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetRegionRequest.ProtoReflect.Descriptor instead.
 func (*SetRegionRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{156}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{158}
 }
 
 func (x *SetRegionRequest) GetOwner() string {
@@ -9287,7 +9343,7 @@ type GetRegionRequest struct {
 
 func (x *GetRegionRequest) Reset() {
 	*x = GetRegionRequest{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[157]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[159]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9299,7 +9355,7 @@ func (x *GetRegionRequest) String() string {
 func (*GetRegionRequest) ProtoMessage() {}
 
 func (x *GetRegionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[157]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[159]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9312,7 +9368,7 @@ func (x *GetRegionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetRegionRequest.ProtoReflect.Descriptor instead.
 func (*GetRegionRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{157}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{159}
 }
 
 func (x *GetRegionRequest) GetOwner() string {
@@ -9333,7 +9389,7 @@ type Region struct {
 
 func (x *Region) Reset() {
 	*x = Region{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[158]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[160]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9345,7 +9401,7 @@ func (x *Region) String() string {
 func (*Region) ProtoMessage() {}
 
 func (x *Region) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[158]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[160]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9358,7 +9414,7 @@ func (x *Region) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Region.ProtoReflect.Descriptor instead.
 func (*Region) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{158}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{160}
 }
 
 func (x *Region) GetOwner() string {
@@ -9396,7 +9452,7 @@ type UpdateOrganizationRequest struct {
 
 func (x *UpdateOrganizationRequest) Reset() {
 	*x = UpdateOrganizationRequest{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[159]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[161]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9408,7 +9464,7 @@ func (x *UpdateOrganizationRequest) String() string {
 func (*UpdateOrganizationRequest) ProtoMessage() {}
 
 func (x *UpdateOrganizationRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[159]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[161]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9421,7 +9477,7 @@ func (x *UpdateOrganizationRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UpdateOrganizationRequest.ProtoReflect.Descriptor instead.
 func (*UpdateOrganizationRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{159}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{161}
 }
 
 func (x *UpdateOrganizationRequest) GetHandle() string {
@@ -9477,7 +9533,7 @@ type Member struct {
 
 func (x *Member) Reset() {
 	*x = Member{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[160]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[162]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9489,7 +9545,7 @@ func (x *Member) String() string {
 func (*Member) ProtoMessage() {}
 
 func (x *Member) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[160]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[162]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9502,7 +9558,7 @@ func (x *Member) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Member.ProtoReflect.Descriptor instead.
 func (*Member) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{160}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{162}
 }
 
 func (x *Member) GetPrincipalId() string {
@@ -9536,7 +9592,7 @@ type ListMembersRequest struct {
 
 func (x *ListMembersRequest) Reset() {
 	*x = ListMembersRequest{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[161]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[163]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9548,7 +9604,7 @@ func (x *ListMembersRequest) String() string {
 func (*ListMembersRequest) ProtoMessage() {}
 
 func (x *ListMembersRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[161]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[163]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9561,7 +9617,7 @@ func (x *ListMembersRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListMembersRequest.ProtoReflect.Descriptor instead.
 func (*ListMembersRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{161}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{163}
 }
 
 func (x *ListMembersRequest) GetHandle() string {
@@ -9587,7 +9643,7 @@ type ListMembersResponse struct {
 
 func (x *ListMembersResponse) Reset() {
 	*x = ListMembersResponse{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[162]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[164]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9599,7 +9655,7 @@ func (x *ListMembersResponse) String() string {
 func (*ListMembersResponse) ProtoMessage() {}
 
 func (x *ListMembersResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[162]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[164]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9612,7 +9668,7 @@ func (x *ListMembersResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListMembersResponse.ProtoReflect.Descriptor instead.
 func (*ListMembersResponse) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{162}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{164}
 }
 
 func (x *ListMembersResponse) GetMembers() []*Member {
@@ -9634,7 +9690,7 @@ type SetMemberRequest struct {
 
 func (x *SetMemberRequest) Reset() {
 	*x = SetMemberRequest{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[163]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[165]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9646,7 +9702,7 @@ func (x *SetMemberRequest) String() string {
 func (*SetMemberRequest) ProtoMessage() {}
 
 func (x *SetMemberRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[163]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[165]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9659,7 +9715,7 @@ func (x *SetMemberRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetMemberRequest.ProtoReflect.Descriptor instead.
 func (*SetMemberRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{163}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{165}
 }
 
 func (x *SetMemberRequest) GetHandle() string {
@@ -9698,7 +9754,7 @@ type SetMemberResponse struct {
 
 func (x *SetMemberResponse) Reset() {
 	*x = SetMemberResponse{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[164]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[166]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9710,7 +9766,7 @@ func (x *SetMemberResponse) String() string {
 func (*SetMemberResponse) ProtoMessage() {}
 
 func (x *SetMemberResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[164]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[166]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9723,7 +9779,7 @@ func (x *SetMemberResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetMemberResponse.ProtoReflect.Descriptor instead.
 func (*SetMemberResponse) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{164}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{166}
 }
 
 type RemoveMemberRequest struct {
@@ -9737,7 +9793,7 @@ type RemoveMemberRequest struct {
 
 func (x *RemoveMemberRequest) Reset() {
 	*x = RemoveMemberRequest{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[165]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[167]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9749,7 +9805,7 @@ func (x *RemoveMemberRequest) String() string {
 func (*RemoveMemberRequest) ProtoMessage() {}
 
 func (x *RemoveMemberRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[165]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[167]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9762,7 +9818,7 @@ func (x *RemoveMemberRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RemoveMemberRequest.ProtoReflect.Descriptor instead.
 func (*RemoveMemberRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{165}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{167}
 }
 
 func (x *RemoveMemberRequest) GetHandle() string {
@@ -9795,7 +9851,7 @@ type RemoveMemberResponse struct {
 
 func (x *RemoveMemberResponse) Reset() {
 	*x = RemoveMemberResponse{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[166]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[168]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9807,7 +9863,7 @@ func (x *RemoveMemberResponse) String() string {
 func (*RemoveMemberResponse) ProtoMessage() {}
 
 func (x *RemoveMemberResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[166]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[168]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9820,7 +9876,7 @@ func (x *RemoveMemberResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RemoveMemberResponse.ProtoReflect.Descriptor instead.
 func (*RemoveMemberResponse) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{166}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{168}
 }
 
 func (x *RemoveMemberResponse) GetRemoved() bool {
@@ -9841,7 +9897,7 @@ type Team struct {
 
 func (x *Team) Reset() {
 	*x = Team{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[167]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[169]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9853,7 +9909,7 @@ func (x *Team) String() string {
 func (*Team) ProtoMessage() {}
 
 func (x *Team) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[167]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[169]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9866,7 +9922,7 @@ func (x *Team) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Team.ProtoReflect.Descriptor instead.
 func (*Team) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{167}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{169}
 }
 
 func (x *Team) GetName() string {
@@ -9902,7 +9958,7 @@ type CreateTeamRequest struct {
 
 func (x *CreateTeamRequest) Reset() {
 	*x = CreateTeamRequest{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[168]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[170]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9914,7 +9970,7 @@ func (x *CreateTeamRequest) String() string {
 func (*CreateTeamRequest) ProtoMessage() {}
 
 func (x *CreateTeamRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[168]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[170]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9927,7 +9983,7 @@ func (x *CreateTeamRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateTeamRequest.ProtoReflect.Descriptor instead.
 func (*CreateTeamRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{168}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{170}
 }
 
 func (x *CreateTeamRequest) GetHandle() string {
@@ -9968,7 +10024,7 @@ type ListTeamsRequest struct {
 
 func (x *ListTeamsRequest) Reset() {
 	*x = ListTeamsRequest{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[169]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[171]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9980,7 +10036,7 @@ func (x *ListTeamsRequest) String() string {
 func (*ListTeamsRequest) ProtoMessage() {}
 
 func (x *ListTeamsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[169]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[171]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9993,7 +10049,7 @@ func (x *ListTeamsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListTeamsRequest.ProtoReflect.Descriptor instead.
 func (*ListTeamsRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{169}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{171}
 }
 
 func (x *ListTeamsRequest) GetHandle() string {
@@ -10019,7 +10075,7 @@ type ListTeamsResponse struct {
 
 func (x *ListTeamsResponse) Reset() {
 	*x = ListTeamsResponse{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[170]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[172]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10031,7 +10087,7 @@ func (x *ListTeamsResponse) String() string {
 func (*ListTeamsResponse) ProtoMessage() {}
 
 func (x *ListTeamsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[170]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[172]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10044,7 +10100,7 @@ func (x *ListTeamsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListTeamsResponse.ProtoReflect.Descriptor instead.
 func (*ListTeamsResponse) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{170}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{172}
 }
 
 func (x *ListTeamsResponse) GetTeams() []*Team {
@@ -10064,7 +10120,7 @@ type OrganizationRobot struct {
 
 func (x *OrganizationRobot) Reset() {
 	*x = OrganizationRobot{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[171]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[173]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10076,7 +10132,7 @@ func (x *OrganizationRobot) String() string {
 func (*OrganizationRobot) ProtoMessage() {}
 
 func (x *OrganizationRobot) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[171]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[173]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10089,7 +10145,7 @@ func (x *OrganizationRobot) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use OrganizationRobot.ProtoReflect.Descriptor instead.
 func (*OrganizationRobot) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{171}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{173}
 }
 
 func (x *OrganizationRobot) GetPrincipal() *Principal {
@@ -10117,7 +10173,7 @@ type OrganizationIssuerRequest struct {
 
 func (x *OrganizationIssuerRequest) Reset() {
 	*x = OrganizationIssuerRequest{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[172]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[174]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10129,7 +10185,7 @@ func (x *OrganizationIssuerRequest) String() string {
 func (*OrganizationIssuerRequest) ProtoMessage() {}
 
 func (x *OrganizationIssuerRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[172]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[174]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10142,7 +10198,7 @@ func (x *OrganizationIssuerRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use OrganizationIssuerRequest.ProtoReflect.Descriptor instead.
 func (*OrganizationIssuerRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{172}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{174}
 }
 
 func (x *OrganizationIssuerRequest) GetHandle() string {
@@ -10176,7 +10232,7 @@ type ListIssuersRequest struct {
 
 func (x *ListIssuersRequest) Reset() {
 	*x = ListIssuersRequest{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[173]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[175]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10188,7 +10244,7 @@ func (x *ListIssuersRequest) String() string {
 func (*ListIssuersRequest) ProtoMessage() {}
 
 func (x *ListIssuersRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[173]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[175]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10201,7 +10257,7 @@ func (x *ListIssuersRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListIssuersRequest.ProtoReflect.Descriptor instead.
 func (*ListIssuersRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{173}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{175}
 }
 
 func (x *ListIssuersRequest) GetHandle() string {
@@ -10229,7 +10285,7 @@ type OrganizationIssuers struct {
 
 func (x *OrganizationIssuers) Reset() {
 	*x = OrganizationIssuers{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[174]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[176]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10241,7 +10297,7 @@ func (x *OrganizationIssuers) String() string {
 func (*OrganizationIssuers) ProtoMessage() {}
 
 func (x *OrganizationIssuers) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[174]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[176]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10254,7 +10310,7 @@ func (x *OrganizationIssuers) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use OrganizationIssuers.ProtoReflect.Descriptor instead.
 func (*OrganizationIssuers) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{174}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{176}
 }
 
 func (x *OrganizationIssuers) GetIssuers() []string {
@@ -10286,7 +10342,7 @@ type IdentityProviderSettings struct {
 
 func (x *IdentityProviderSettings) Reset() {
 	*x = IdentityProviderSettings{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[175]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[177]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10298,7 +10354,7 @@ func (x *IdentityProviderSettings) String() string {
 func (*IdentityProviderSettings) ProtoMessage() {}
 
 func (x *IdentityProviderSettings) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[175]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[177]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10311,7 +10367,7 @@ func (x *IdentityProviderSettings) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use IdentityProviderSettings.ProtoReflect.Descriptor instead.
 func (*IdentityProviderSettings) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{175}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{177}
 }
 
 func (x *IdentityProviderSettings) GetGoogle() *GoogleProvider {
@@ -10368,7 +10424,7 @@ type GoogleProvider struct {
 
 func (x *GoogleProvider) Reset() {
 	*x = GoogleProvider{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[176]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[178]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10380,7 +10436,7 @@ func (x *GoogleProvider) String() string {
 func (*GoogleProvider) ProtoMessage() {}
 
 func (x *GoogleProvider) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[176]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[178]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10393,7 +10449,7 @@ func (x *GoogleProvider) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GoogleProvider.ProtoReflect.Descriptor instead.
 func (*GoogleProvider) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{176}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{178}
 }
 
 func (x *GoogleProvider) GetSubject() string {
@@ -10437,7 +10493,7 @@ type EntraProvider struct {
 
 func (x *EntraProvider) Reset() {
 	*x = EntraProvider{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[177]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[179]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10449,7 +10505,7 @@ func (x *EntraProvider) String() string {
 func (*EntraProvider) ProtoMessage() {}
 
 func (x *EntraProvider) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[177]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[179]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10462,7 +10518,7 @@ func (x *EntraProvider) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EntraProvider.ProtoReflect.Descriptor instead.
 func (*EntraProvider) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{177}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{179}
 }
 
 func (x *EntraProvider) GetTenantId() string {
@@ -10515,7 +10571,7 @@ type LDAPProvider struct {
 
 func (x *LDAPProvider) Reset() {
 	*x = LDAPProvider{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[178]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[180]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10527,7 +10583,7 @@ func (x *LDAPProvider) String() string {
 func (*LDAPProvider) ProtoMessage() {}
 
 func (x *LDAPProvider) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[178]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[180]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10540,7 +10596,7 @@ func (x *LDAPProvider) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LDAPProvider.ProtoReflect.Descriptor instead.
 func (*LDAPProvider) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{178}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{180}
 }
 
 func (x *LDAPProvider) GetUrl() string {
@@ -10607,7 +10663,7 @@ type LDAPPeople struct {
 
 func (x *LDAPPeople) Reset() {
 	*x = LDAPPeople{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[179]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[181]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10619,7 +10675,7 @@ func (x *LDAPPeople) String() string {
 func (*LDAPPeople) ProtoMessage() {}
 
 func (x *LDAPPeople) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[179]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[181]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10632,7 +10688,7 @@ func (x *LDAPPeople) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LDAPPeople.ProtoReflect.Descriptor instead.
 func (*LDAPPeople) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{179}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{181}
 }
 
 func (x *LDAPPeople) GetBaseDn() string {
@@ -10697,7 +10753,7 @@ type LDAPGroups struct {
 
 func (x *LDAPGroups) Reset() {
 	*x = LDAPGroups{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[180]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[182]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10709,7 +10765,7 @@ func (x *LDAPGroups) String() string {
 func (*LDAPGroups) ProtoMessage() {}
 
 func (x *LDAPGroups) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[180]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[182]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10722,7 +10778,7 @@ func (x *LDAPGroups) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LDAPGroups.ProtoReflect.Descriptor instead.
 func (*LDAPGroups) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{180}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{182}
 }
 
 func (x *LDAPGroups) GetBaseDn() string {
@@ -10770,7 +10826,7 @@ type SCIMProvider struct {
 
 func (x *SCIMProvider) Reset() {
 	*x = SCIMProvider{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[181]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[183]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10782,7 +10838,7 @@ func (x *SCIMProvider) String() string {
 func (*SCIMProvider) ProtoMessage() {}
 
 func (x *SCIMProvider) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[181]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[183]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10795,7 +10851,7 @@ func (x *SCIMProvider) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SCIMProvider.ProtoReflect.Descriptor instead.
 func (*SCIMProvider) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{181}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{183}
 }
 
 type OIDCSignIn struct {
@@ -10811,7 +10867,7 @@ type OIDCSignIn struct {
 
 func (x *OIDCSignIn) Reset() {
 	*x = OIDCSignIn{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[182]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[184]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10823,7 +10879,7 @@ func (x *OIDCSignIn) String() string {
 func (*OIDCSignIn) ProtoMessage() {}
 
 func (x *OIDCSignIn) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[182]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[184]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10836,7 +10892,7 @@ func (x *OIDCSignIn) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use OIDCSignIn.ProtoReflect.Descriptor instead.
 func (*OIDCSignIn) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{182}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{184}
 }
 
 func (x *OIDCSignIn) GetIssuer() string {
@@ -10885,7 +10941,7 @@ type SetIdentityProviderRequest struct {
 
 func (x *SetIdentityProviderRequest) Reset() {
 	*x = SetIdentityProviderRequest{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[183]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[185]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10897,7 +10953,7 @@ func (x *SetIdentityProviderRequest) String() string {
 func (*SetIdentityProviderRequest) ProtoMessage() {}
 
 func (x *SetIdentityProviderRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[183]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[185]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10910,7 +10966,7 @@ func (x *SetIdentityProviderRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetIdentityProviderRequest.ProtoReflect.Descriptor instead.
 func (*SetIdentityProviderRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{183}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{185}
 }
 
 func (x *SetIdentityProviderRequest) GetHandle() string {
@@ -10944,7 +11000,7 @@ type IdentityProviderRequest struct {
 
 func (x *IdentityProviderRequest) Reset() {
 	*x = IdentityProviderRequest{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[184]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[186]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10956,7 +11012,7 @@ func (x *IdentityProviderRequest) String() string {
 func (*IdentityProviderRequest) ProtoMessage() {}
 
 func (x *IdentityProviderRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[184]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[186]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10969,7 +11025,7 @@ func (x *IdentityProviderRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use IdentityProviderRequest.ProtoReflect.Descriptor instead.
 func (*IdentityProviderRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{184}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{186}
 }
 
 func (x *IdentityProviderRequest) GetHandle() string {
@@ -11001,7 +11057,7 @@ type IdentityProviderInfo struct {
 
 func (x *IdentityProviderInfo) Reset() {
 	*x = IdentityProviderInfo{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[185]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[187]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11013,7 +11069,7 @@ func (x *IdentityProviderInfo) String() string {
 func (*IdentityProviderInfo) ProtoMessage() {}
 
 func (x *IdentityProviderInfo) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[185]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[187]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11026,7 +11082,7 @@ func (x *IdentityProviderInfo) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use IdentityProviderInfo.ProtoReflect.Descriptor instead.
 func (*IdentityProviderInfo) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{185}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{187}
 }
 
 func (x *IdentityProviderInfo) GetSettings() *IdentityProviderSettings {
@@ -11087,7 +11143,7 @@ type RemoveIdentityProviderResponse struct {
 
 func (x *RemoveIdentityProviderResponse) Reset() {
 	*x = RemoveIdentityProviderResponse{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[186]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[188]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11099,7 +11155,7 @@ func (x *RemoveIdentityProviderResponse) String() string {
 func (*RemoveIdentityProviderResponse) ProtoMessage() {}
 
 func (x *RemoveIdentityProviderResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[186]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[188]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11112,7 +11168,7 @@ func (x *RemoveIdentityProviderResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RemoveIdentityProviderResponse.ProtoReflect.Descriptor instead.
 func (*RemoveIdentityProviderResponse) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{186}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{188}
 }
 
 func (x *RemoveIdentityProviderResponse) GetRemoved() bool {
@@ -11132,7 +11188,7 @@ type ResetSCIMTokenResponse struct {
 
 func (x *ResetSCIMTokenResponse) Reset() {
 	*x = ResetSCIMTokenResponse{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[187]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[189]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11144,7 +11200,7 @@ func (x *ResetSCIMTokenResponse) String() string {
 func (*ResetSCIMTokenResponse) ProtoMessage() {}
 
 func (x *ResetSCIMTokenResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[187]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[189]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11157,7 +11213,7 @@ func (x *ResetSCIMTokenResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResetSCIMTokenResponse.ProtoReflect.Descriptor instead.
 func (*ResetSCIMTokenResponse) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{187}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{189}
 }
 
 func (x *ResetSCIMTokenResponse) GetToken() string {
@@ -11186,7 +11242,7 @@ type OrganizationRobotBindingRequest struct {
 
 func (x *OrganizationRobotBindingRequest) Reset() {
 	*x = OrganizationRobotBindingRequest{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[188]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[190]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11198,7 +11254,7 @@ func (x *OrganizationRobotBindingRequest) String() string {
 func (*OrganizationRobotBindingRequest) ProtoMessage() {}
 
 func (x *OrganizationRobotBindingRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[188]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[190]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11211,7 +11267,7 @@ func (x *OrganizationRobotBindingRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use OrganizationRobotBindingRequest.ProtoReflect.Descriptor instead.
 func (*OrganizationRobotBindingRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{188}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{190}
 }
 
 func (x *OrganizationRobotBindingRequest) GetHandle() string {
@@ -11253,7 +11309,7 @@ type CreateOrganizationRobotRequest struct {
 
 func (x *CreateOrganizationRobotRequest) Reset() {
 	*x = CreateOrganizationRobotRequest{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[189]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[191]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11265,7 +11321,7 @@ func (x *CreateOrganizationRobotRequest) String() string {
 func (*CreateOrganizationRobotRequest) ProtoMessage() {}
 
 func (x *CreateOrganizationRobotRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[189]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[191]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11278,7 +11334,7 @@ func (x *CreateOrganizationRobotRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateOrganizationRobotRequest.ProtoReflect.Descriptor instead.
 func (*CreateOrganizationRobotRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{189}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{191}
 }
 
 func (x *CreateOrganizationRobotRequest) GetHandle() string {
@@ -11312,7 +11368,7 @@ type ListOrganizationRobotsRequest struct {
 
 func (x *ListOrganizationRobotsRequest) Reset() {
 	*x = ListOrganizationRobotsRequest{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[190]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[192]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11324,7 +11380,7 @@ func (x *ListOrganizationRobotsRequest) String() string {
 func (*ListOrganizationRobotsRequest) ProtoMessage() {}
 
 func (x *ListOrganizationRobotsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[190]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[192]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11337,7 +11393,7 @@ func (x *ListOrganizationRobotsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListOrganizationRobotsRequest.ProtoReflect.Descriptor instead.
 func (*ListOrganizationRobotsRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{190}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{192}
 }
 
 func (x *ListOrganizationRobotsRequest) GetHandle() string {
@@ -11363,7 +11419,7 @@ type ListOrganizationRobotsResponse struct {
 
 func (x *ListOrganizationRobotsResponse) Reset() {
 	*x = ListOrganizationRobotsResponse{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[191]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[193]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11375,7 +11431,7 @@ func (x *ListOrganizationRobotsResponse) String() string {
 func (*ListOrganizationRobotsResponse) ProtoMessage() {}
 
 func (x *ListOrganizationRobotsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[191]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[193]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11388,7 +11444,7 @@ func (x *ListOrganizationRobotsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListOrganizationRobotsResponse.ProtoReflect.Descriptor instead.
 func (*ListOrganizationRobotsResponse) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{191}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{193}
 }
 
 func (x *ListOrganizationRobotsResponse) GetRobots() []*OrganizationRobot {
@@ -11411,7 +11467,7 @@ type CertifyOrganizationRobotRequest struct {
 
 func (x *CertifyOrganizationRobotRequest) Reset() {
 	*x = CertifyOrganizationRobotRequest{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[192]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[194]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11423,7 +11479,7 @@ func (x *CertifyOrganizationRobotRequest) String() string {
 func (*CertifyOrganizationRobotRequest) ProtoMessage() {}
 
 func (x *CertifyOrganizationRobotRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[192]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[194]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11436,7 +11492,7 @@ func (x *CertifyOrganizationRobotRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CertifyOrganizationRobotRequest.ProtoReflect.Descriptor instead.
 func (*CertifyOrganizationRobotRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{192}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{194}
 }
 
 func (x *CertifyOrganizationRobotRequest) GetHandle() string {
@@ -11485,7 +11541,7 @@ type DeleteOrganizationRobotRequest struct {
 
 func (x *DeleteOrganizationRobotRequest) Reset() {
 	*x = DeleteOrganizationRobotRequest{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[193]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[195]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11497,7 +11553,7 @@ func (x *DeleteOrganizationRobotRequest) String() string {
 func (*DeleteOrganizationRobotRequest) ProtoMessage() {}
 
 func (x *DeleteOrganizationRobotRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[193]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[195]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11510,7 +11566,7 @@ func (x *DeleteOrganizationRobotRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteOrganizationRobotRequest.ProtoReflect.Descriptor instead.
 func (*DeleteOrganizationRobotRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{193}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{195}
 }
 
 func (x *DeleteOrganizationRobotRequest) GetHandle() string {
@@ -11542,7 +11598,7 @@ type DeleteOrganizationRobotResponse struct {
 
 func (x *DeleteOrganizationRobotResponse) Reset() {
 	*x = DeleteOrganizationRobotResponse{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[194]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[196]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11554,7 +11610,7 @@ func (x *DeleteOrganizationRobotResponse) String() string {
 func (*DeleteOrganizationRobotResponse) ProtoMessage() {}
 
 func (x *DeleteOrganizationRobotResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[194]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[196]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11567,7 +11623,7 @@ func (x *DeleteOrganizationRobotResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteOrganizationRobotResponse.ProtoReflect.Descriptor instead.
 func (*DeleteOrganizationRobotResponse) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{194}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{196}
 }
 
 type TeamMemberRequest struct {
@@ -11581,7 +11637,7 @@ type TeamMemberRequest struct {
 
 func (x *TeamMemberRequest) Reset() {
 	*x = TeamMemberRequest{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[195]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[197]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11593,7 +11649,7 @@ func (x *TeamMemberRequest) String() string {
 func (*TeamMemberRequest) ProtoMessage() {}
 
 func (x *TeamMemberRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[195]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[197]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11606,7 +11662,7 @@ func (x *TeamMemberRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TeamMemberRequest.ProtoReflect.Descriptor instead.
 func (*TeamMemberRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{195}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{197}
 }
 
 func (x *TeamMemberRequest) GetTeam() string {
@@ -11640,7 +11696,7 @@ type DeleteTeamRequest struct {
 
 func (x *DeleteTeamRequest) Reset() {
 	*x = DeleteTeamRequest{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[196]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[198]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11652,7 +11708,7 @@ func (x *DeleteTeamRequest) String() string {
 func (*DeleteTeamRequest) ProtoMessage() {}
 
 func (x *DeleteTeamRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[196]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[198]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11665,7 +11721,7 @@ func (x *DeleteTeamRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteTeamRequest.ProtoReflect.Descriptor instead.
 func (*DeleteTeamRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{196}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{198}
 }
 
 func (x *DeleteTeamRequest) GetTeam() string {
@@ -11690,7 +11746,7 @@ type DeleteTeamResponse struct {
 
 func (x *DeleteTeamResponse) Reset() {
 	*x = DeleteTeamResponse{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[197]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[199]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11702,7 +11758,7 @@ func (x *DeleteTeamResponse) String() string {
 func (*DeleteTeamResponse) ProtoMessage() {}
 
 func (x *DeleteTeamResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[197]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[199]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11715,7 +11771,7 @@ func (x *DeleteTeamResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteTeamResponse.ProtoReflect.Descriptor instead.
 func (*DeleteTeamResponse) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{197}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{199}
 }
 
 type RepositoryEntry struct {
@@ -11744,7 +11800,7 @@ type RepositoryEntry struct {
 
 func (x *RepositoryEntry) Reset() {
 	*x = RepositoryEntry{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[198]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[200]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11756,7 +11812,7 @@ func (x *RepositoryEntry) String() string {
 func (*RepositoryEntry) ProtoMessage() {}
 
 func (x *RepositoryEntry) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[198]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[200]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11769,7 +11825,7 @@ func (x *RepositoryEntry) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RepositoryEntry.ProtoReflect.Descriptor instead.
 func (*RepositoryEntry) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{198}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{200}
 }
 
 func (x *RepositoryEntry) GetId() int64 {
@@ -11894,7 +11950,7 @@ type RepositoryRef struct {
 
 func (x *RepositoryRef) Reset() {
 	*x = RepositoryRef{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[199]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[201]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11906,7 +11962,7 @@ func (x *RepositoryRef) String() string {
 func (*RepositoryRef) ProtoMessage() {}
 
 func (x *RepositoryRef) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[199]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[201]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11919,7 +11975,7 @@ func (x *RepositoryRef) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RepositoryRef.ProtoReflect.Descriptor instead.
 func (*RepositoryRef) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{199}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{201}
 }
 
 func (x *RepositoryRef) GetId() int64 {
@@ -11944,7 +12000,7 @@ type AbandonRepositoryResponse struct {
 
 func (x *AbandonRepositoryResponse) Reset() {
 	*x = AbandonRepositoryResponse{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[200]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[202]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11956,7 +12012,7 @@ func (x *AbandonRepositoryResponse) String() string {
 func (*AbandonRepositoryResponse) ProtoMessage() {}
 
 func (x *AbandonRepositoryResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[200]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[202]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11969,21 +12025,24 @@ func (x *AbandonRepositoryResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AbandonRepositoryResponse.ProtoReflect.Descriptor instead.
 func (*AbandonRepositoryResponse) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{200}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{202}
 }
 
 // Expiry is whether a repository's time is up, and how.
 type Expiry struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	RepositoryId  int64                  `protobuf:"varint,1,opt,name=repository_id,json=repositoryId,proto3" json:"repository_id,omitempty"`
-	Kind          Expiry_Kind            `protobuf:"varint,2,opt,name=kind,proto3,enum=ok.identity.v1.Expiry_Kind" json:"kind,omitempty"`
+	state        protoimpl.MessageState `protogen:"open.v1"`
+	RepositoryId int64                  `protobuf:"varint,1,opt,name=repository_id,json=repositoryId,proto3" json:"repository_id,omitempty"`
+	Kind         Expiry_Kind            `protobuf:"varint,2,opt,name=kind,proto3,enum=ok.identity.v1.Expiry_Kind" json:"kind,omitempty"`
+	// When it expires, by the directory's clock, for one that will and has not yet: deleted, or
+	// still being made.
+	ExpiresAt     *timestamppb.Timestamp `protobuf:"bytes,3,opt,name=expires_at,json=expiresAt,proto3" json:"expires_at,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *Expiry) Reset() {
 	*x = Expiry{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[201]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[203]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11995,7 +12054,7 @@ func (x *Expiry) String() string {
 func (*Expiry) ProtoMessage() {}
 
 func (x *Expiry) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[201]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[203]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12008,7 +12067,7 @@ func (x *Expiry) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Expiry.ProtoReflect.Descriptor instead.
 func (*Expiry) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{201}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{203}
 }
 
 func (x *Expiry) GetRepositoryId() int64 {
@@ -12025,6 +12084,13 @@ func (x *Expiry) GetKind() Expiry_Kind {
 	return Expiry_KIND_UNSPECIFIED
 }
 
+func (x *Expiry) GetExpiresAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.ExpiresAt
+	}
+	return nil
+}
+
 type ListExpiredRepositoriesRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Limit         int32                  `protobuf:"varint,1,opt,name=limit,proto3" json:"limit,omitempty"` // of each kind; 100 when 0
@@ -12034,7 +12100,7 @@ type ListExpiredRepositoriesRequest struct {
 
 func (x *ListExpiredRepositoriesRequest) Reset() {
 	*x = ListExpiredRepositoriesRequest{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[202]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[204]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12046,7 +12112,7 @@ func (x *ListExpiredRepositoriesRequest) String() string {
 func (*ListExpiredRepositoriesRequest) ProtoMessage() {}
 
 func (x *ListExpiredRepositoriesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[202]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[204]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12059,7 +12125,7 @@ func (x *ListExpiredRepositoriesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListExpiredRepositoriesRequest.ProtoReflect.Descriptor instead.
 func (*ListExpiredRepositoriesRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{202}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{204}
 }
 
 func (x *ListExpiredRepositoriesRequest) GetLimit() int32 {
@@ -12078,7 +12144,7 @@ type ListExpiredRepositoriesResponse struct {
 
 func (x *ListExpiredRepositoriesResponse) Reset() {
 	*x = ListExpiredRepositoriesResponse{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[203]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[205]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12090,7 +12156,7 @@ func (x *ListExpiredRepositoriesResponse) String() string {
 func (*ListExpiredRepositoriesResponse) ProtoMessage() {}
 
 func (x *ListExpiredRepositoriesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[203]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[205]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12103,7 +12169,7 @@ func (x *ListExpiredRepositoriesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListExpiredRepositoriesResponse.ProtoReflect.Descriptor instead.
 func (*ListExpiredRepositoriesResponse) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{203}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{205}
 }
 
 func (x *ListExpiredRepositoriesResponse) GetRepositories() []*Expiry {
@@ -12127,7 +12193,7 @@ type ReserveRepositoryRequest struct {
 
 func (x *ReserveRepositoryRequest) Reset() {
 	*x = ReserveRepositoryRequest{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[204]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[206]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12139,7 +12205,7 @@ func (x *ReserveRepositoryRequest) String() string {
 func (*ReserveRepositoryRequest) ProtoMessage() {}
 
 func (x *ReserveRepositoryRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[204]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[206]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12152,7 +12218,7 @@ func (x *ReserveRepositoryRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReserveRepositoryRequest.ProtoReflect.Descriptor instead.
 func (*ReserveRepositoryRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{204}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{206}
 }
 
 func (x *ReserveRepositoryRequest) GetOwner() string {
@@ -12208,7 +12274,7 @@ type ResolveRepositoryRequest struct {
 
 func (x *ResolveRepositoryRequest) Reset() {
 	*x = ResolveRepositoryRequest{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[205]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[207]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12220,7 +12286,7 @@ func (x *ResolveRepositoryRequest) String() string {
 func (*ResolveRepositoryRequest) ProtoMessage() {}
 
 func (x *ResolveRepositoryRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[205]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[207]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12233,7 +12299,7 @@ func (x *ResolveRepositoryRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResolveRepositoryRequest.ProtoReflect.Descriptor instead.
 func (*ResolveRepositoryRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{205}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{207}
 }
 
 func (x *ResolveRepositoryRequest) GetOwner() string {
@@ -12267,7 +12333,7 @@ type ListRepositoryEntriesRequest struct {
 
 func (x *ListRepositoryEntriesRequest) Reset() {
 	*x = ListRepositoryEntriesRequest{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[206]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[208]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12279,7 +12345,7 @@ func (x *ListRepositoryEntriesRequest) String() string {
 func (*ListRepositoryEntriesRequest) ProtoMessage() {}
 
 func (x *ListRepositoryEntriesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[206]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[208]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12292,7 +12358,7 @@ func (x *ListRepositoryEntriesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListRepositoryEntriesRequest.ProtoReflect.Descriptor instead.
 func (*ListRepositoryEntriesRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{206}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{208}
 }
 
 func (x *ListRepositoryEntriesRequest) GetOwner() string {
@@ -12318,7 +12384,7 @@ type ListRepositoryEntriesResponse struct {
 
 func (x *ListRepositoryEntriesResponse) Reset() {
 	*x = ListRepositoryEntriesResponse{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[207]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[209]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12330,7 +12396,7 @@ func (x *ListRepositoryEntriesResponse) String() string {
 func (*ListRepositoryEntriesResponse) ProtoMessage() {}
 
 func (x *ListRepositoryEntriesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[207]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[209]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12343,7 +12409,7 @@ func (x *ListRepositoryEntriesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListRepositoryEntriesResponse.ProtoReflect.Descriptor instead.
 func (*ListRepositoryEntriesResponse) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{207}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{209}
 }
 
 func (x *ListRepositoryEntriesResponse) GetRepositories() []*RepositoryEntry {
@@ -12365,7 +12431,7 @@ type UpdateRepositoryRequest struct {
 
 func (x *UpdateRepositoryRequest) Reset() {
 	*x = UpdateRepositoryRequest{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[208]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[210]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12377,7 +12443,7 @@ func (x *UpdateRepositoryRequest) String() string {
 func (*UpdateRepositoryRequest) ProtoMessage() {}
 
 func (x *UpdateRepositoryRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[208]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[210]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12390,7 +12456,7 @@ func (x *UpdateRepositoryRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UpdateRepositoryRequest.ProtoReflect.Descriptor instead.
 func (*UpdateRepositoryRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{208}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{210}
 }
 
 func (x *UpdateRepositoryRequest) GetId() int64 {
@@ -12432,7 +12498,7 @@ type RenameRepositoryEntryRequest struct {
 
 func (x *RenameRepositoryEntryRequest) Reset() {
 	*x = RenameRepositoryEntryRequest{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[209]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[211]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12444,7 +12510,7 @@ func (x *RenameRepositoryEntryRequest) String() string {
 func (*RenameRepositoryEntryRequest) ProtoMessage() {}
 
 func (x *RenameRepositoryEntryRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[209]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[211]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12457,7 +12523,7 @@ func (x *RenameRepositoryEntryRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RenameRepositoryEntryRequest.ProtoReflect.Descriptor instead.
 func (*RenameRepositoryEntryRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{209}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{211}
 }
 
 func (x *RenameRepositoryEntryRequest) GetId() int64 {
@@ -12492,7 +12558,7 @@ type TransferRepositoryRequest struct {
 
 func (x *TransferRepositoryRequest) Reset() {
 	*x = TransferRepositoryRequest{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[210]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[212]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12504,7 +12570,7 @@ func (x *TransferRepositoryRequest) String() string {
 func (*TransferRepositoryRequest) ProtoMessage() {}
 
 func (x *TransferRepositoryRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[210]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[212]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12517,7 +12583,7 @@ func (x *TransferRepositoryRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TransferRepositoryRequest.ProtoReflect.Descriptor instead.
 func (*TransferRepositoryRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{210}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{212}
 }
 
 func (x *TransferRepositoryRequest) GetId() int64 {
@@ -12551,7 +12617,7 @@ type RepositoryGrant struct {
 
 func (x *RepositoryGrant) Reset() {
 	*x = RepositoryGrant{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[211]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[213]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12563,7 +12629,7 @@ func (x *RepositoryGrant) String() string {
 func (*RepositoryGrant) ProtoMessage() {}
 
 func (x *RepositoryGrant) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[211]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[213]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12576,7 +12642,7 @@ func (x *RepositoryGrant) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RepositoryGrant.ProtoReflect.Descriptor instead.
 func (*RepositoryGrant) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{211}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{213}
 }
 
 func (x *RepositoryGrant) GetSubject() string {
@@ -12602,7 +12668,7 @@ type ListGrantsResponse struct {
 
 func (x *ListGrantsResponse) Reset() {
 	*x = ListGrantsResponse{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[212]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[214]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12614,7 +12680,7 @@ func (x *ListGrantsResponse) String() string {
 func (*ListGrantsResponse) ProtoMessage() {}
 
 func (x *ListGrantsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[212]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[214]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12627,7 +12693,7 @@ func (x *ListGrantsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListGrantsResponse.ProtoReflect.Descriptor instead.
 func (*ListGrantsResponse) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{212}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{214}
 }
 
 func (x *ListGrantsResponse) GetGrants() []*RepositoryGrant {
@@ -12648,7 +12714,7 @@ type SetGrantRequest struct {
 
 func (x *SetGrantRequest) Reset() {
 	*x = SetGrantRequest{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[213]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[215]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12660,7 +12726,7 @@ func (x *SetGrantRequest) String() string {
 func (*SetGrantRequest) ProtoMessage() {}
 
 func (x *SetGrantRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[213]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[215]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12673,7 +12739,7 @@ func (x *SetGrantRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetGrantRequest.ProtoReflect.Descriptor instead.
 func (*SetGrantRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{213}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{215}
 }
 
 func (x *SetGrantRequest) GetId() int64 {
@@ -12705,7 +12771,7 @@ type SetGrantResponse struct {
 
 func (x *SetGrantResponse) Reset() {
 	*x = SetGrantResponse{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[214]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[216]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12717,7 +12783,7 @@ func (x *SetGrantResponse) String() string {
 func (*SetGrantResponse) ProtoMessage() {}
 
 func (x *SetGrantResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[214]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[216]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12730,7 +12796,7 @@ func (x *SetGrantResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetGrantResponse.ProtoReflect.Descriptor instead.
 func (*SetGrantResponse) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{214}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{216}
 }
 
 type RemoveGrantRequest struct {
@@ -12744,7 +12810,7 @@ type RemoveGrantRequest struct {
 
 func (x *RemoveGrantRequest) Reset() {
 	*x = RemoveGrantRequest{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[215]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[217]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12756,7 +12822,7 @@ func (x *RemoveGrantRequest) String() string {
 func (*RemoveGrantRequest) ProtoMessage() {}
 
 func (x *RemoveGrantRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[215]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[217]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12769,7 +12835,7 @@ func (x *RemoveGrantRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RemoveGrantRequest.ProtoReflect.Descriptor instead.
 func (*RemoveGrantRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{215}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{217}
 }
 
 func (x *RemoveGrantRequest) GetId() int64 {
@@ -12802,7 +12868,7 @@ type RemoveGrantResponse struct {
 
 func (x *RemoveGrantResponse) Reset() {
 	*x = RemoveGrantResponse{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[216]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[218]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12814,7 +12880,7 @@ func (x *RemoveGrantResponse) String() string {
 func (*RemoveGrantResponse) ProtoMessage() {}
 
 func (x *RemoveGrantResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[216]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[218]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12827,7 +12893,7 @@ func (x *RemoveGrantResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RemoveGrantResponse.ProtoReflect.Descriptor instead.
 func (*RemoveGrantResponse) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{216}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{218}
 }
 
 func (x *RemoveGrantResponse) GetRemoved() bool {
@@ -12850,7 +12916,7 @@ type StartApprovalRequest struct {
 
 func (x *StartApprovalRequest) Reset() {
 	*x = StartApprovalRequest{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[217]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[219]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12862,7 +12928,7 @@ func (x *StartApprovalRequest) String() string {
 func (*StartApprovalRequest) ProtoMessage() {}
 
 func (x *StartApprovalRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[217]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[219]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12875,7 +12941,7 @@ func (x *StartApprovalRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StartApprovalRequest.ProtoReflect.Descriptor instead.
 func (*StartApprovalRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{217}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{219}
 }
 
 func (x *StartApprovalRequest) GetPrincipalId() string {
@@ -12908,7 +12974,7 @@ type GetApprovalRequest struct {
 
 func (x *GetApprovalRequest) Reset() {
 	*x = GetApprovalRequest{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[218]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[220]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12920,7 +12986,7 @@ func (x *GetApprovalRequest) String() string {
 func (*GetApprovalRequest) ProtoMessage() {}
 
 func (x *GetApprovalRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[218]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[220]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12933,7 +12999,7 @@ func (x *GetApprovalRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetApprovalRequest.ProtoReflect.Descriptor instead.
 func (*GetApprovalRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{218}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{220}
 }
 
 func (x *GetApprovalRequest) GetId() string {
@@ -12957,7 +13023,7 @@ type Approval struct {
 
 func (x *Approval) Reset() {
 	*x = Approval{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[219]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[221]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -12969,7 +13035,7 @@ func (x *Approval) String() string {
 func (*Approval) ProtoMessage() {}
 
 func (x *Approval) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[219]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[221]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -12982,7 +13048,7 @@ func (x *Approval) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Approval.ProtoReflect.Descriptor instead.
 func (*Approval) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{219}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{221}
 }
 
 func (x *Approval) GetId() string {
@@ -13038,7 +13104,7 @@ type SetSecretsRootRequest struct {
 
 func (x *SetSecretsRootRequest) Reset() {
 	*x = SetSecretsRootRequest{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[220]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[222]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -13050,7 +13116,7 @@ func (x *SetSecretsRootRequest) String() string {
 func (*SetSecretsRootRequest) ProtoMessage() {}
 
 func (x *SetSecretsRootRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[220]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[222]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -13063,7 +13129,7 @@ func (x *SetSecretsRootRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetSecretsRootRequest.ProtoReflect.Descriptor instead.
 func (*SetSecretsRootRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{220}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{222}
 }
 
 func (x *SetSecretsRootRequest) GetHandle() string {
@@ -13097,7 +13163,7 @@ type GetSecretsRootRequest struct {
 
 func (x *GetSecretsRootRequest) Reset() {
 	*x = GetSecretsRootRequest{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[221]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[223]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -13109,7 +13175,7 @@ func (x *GetSecretsRootRequest) String() string {
 func (*GetSecretsRootRequest) ProtoMessage() {}
 
 func (x *GetSecretsRootRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[221]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[223]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -13122,7 +13188,7 @@ func (x *GetSecretsRootRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetSecretsRootRequest.ProtoReflect.Descriptor instead.
 func (*GetSecretsRootRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{221}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{223}
 }
 
 func (x *GetSecretsRootRequest) GetHandle() string {
@@ -13149,7 +13215,7 @@ type SecretsRoot struct {
 
 func (x *SecretsRoot) Reset() {
 	*x = SecretsRoot{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[222]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[224]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -13161,7 +13227,7 @@ func (x *SecretsRoot) String() string {
 func (*SecretsRoot) ProtoMessage() {}
 
 func (x *SecretsRoot) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[222]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[224]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -13174,7 +13240,7 @@ func (x *SecretsRoot) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SecretsRoot.ProtoReflect.Descriptor instead.
 func (*SecretsRoot) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{222}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{224}
 }
 
 func (x *SecretsRoot) GetOwner() string {
@@ -13200,7 +13266,7 @@ type GetRepositorySecretsRootRequest struct {
 
 func (x *GetRepositorySecretsRootRequest) Reset() {
 	*x = GetRepositorySecretsRootRequest{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[223]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[225]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -13212,7 +13278,7 @@ func (x *GetRepositorySecretsRootRequest) String() string {
 func (*GetRepositorySecretsRootRequest) ProtoMessage() {}
 
 func (x *GetRepositorySecretsRootRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[223]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[225]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -13225,7 +13291,7 @@ func (x *GetRepositorySecretsRootRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetRepositorySecretsRootRequest.ProtoReflect.Descriptor instead.
 func (*GetRepositorySecretsRootRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{223}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{225}
 }
 
 func (x *GetRepositorySecretsRootRequest) GetRepositoryId() int64 {
@@ -13252,7 +13318,7 @@ type FactsResponse_Repository struct {
 
 func (x *FactsResponse_Repository) Reset() {
 	*x = FactsResponse_Repository{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[224]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[226]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -13264,7 +13330,7 @@ func (x *FactsResponse_Repository) String() string {
 func (*FactsResponse_Repository) ProtoMessage() {}
 
 func (x *FactsResponse_Repository) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[224]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[226]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -13355,7 +13421,7 @@ type FactsResponse_Caller struct {
 
 func (x *FactsResponse_Caller) Reset() {
 	*x = FactsResponse_Caller{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[225]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[227]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -13367,7 +13433,7 @@ func (x *FactsResponse_Caller) String() string {
 func (*FactsResponse_Caller) ProtoMessage() {}
 
 func (x *FactsResponse_Caller) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[225]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[227]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -13421,7 +13487,7 @@ type DirectoryHeadsResponse_Head struct {
 
 func (x *DirectoryHeadsResponse_Head) Reset() {
 	*x = DirectoryHeadsResponse_Head{}
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[226]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[228]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -13433,7 +13499,7 @@ func (x *DirectoryHeadsResponse_Head) String() string {
 func (*DirectoryHeadsResponse_Head) ProtoMessage() {}
 
 func (x *DirectoryHeadsResponse_Head) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[226]
+	mi := &file_proto_ok_identity_v1_identity_proto_msgTypes[228]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -13446,7 +13512,7 @@ func (x *DirectoryHeadsResponse_Head) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DirectoryHeadsResponse_Head.ProtoReflect.Descriptor instead.
 func (*DirectoryHeadsResponse_Head) Descriptor() ([]byte, []int) {
-	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{124, 0}
+	return file_proto_ok_identity_v1_identity_proto_rawDescGZIP(), []int{126, 0}
 }
 
 func (x *DirectoryHeadsResponse_Head) GetRepositoryId() int64 {
@@ -13767,17 +13833,16 @@ const file_proto_ok_identity_v1_identity_proto_rawDesc = "" +
 	"\asubject\x18\x02 \x01(\tR\asubject\"u\n" +
 	"\x05Robot\x127\n" +
 	"\tprincipal\x18\x01 \x01(\v2\x19.ok.identity.v1.PrincipalR\tprincipal\x123\n" +
-	"\bbindings\x18\x02 \x03(\v2\x17.ok.identity.v1.BindingR\bbindings\"\x93\x01\n" +
+	"\bbindings\x18\x02 \x03(\v2\x17.ok.identity.v1.BindingR\bbindings\"\x89\x01\n" +
 	"\x0fSetQuotaRequest\x12\x18\n" +
 	"\aaccount\x18\x01 \x01(\tR\aaccount\x12\x1e\n" +
 	"\n" +
 	"concurrent\x18\x02 \x01(\x05R\n" +
 	"concurrent\x12\x18\n" +
-	"\aminutes\x18\x03 \x01(\x03R\aminutes\x12\x16\n" +
-	"\x06weight\x18\x04 \x01(\x05R\x06weight\x12\x14\n" +
-	"\x05reset\x18\x05 \x01(\bR\x05reset\"+\n" +
+	"\aminutes\x18\x03 \x01(\x03R\aminutes\x12\x14\n" +
+	"\x05reset\x18\x05 \x01(\bR\x05resetJ\x04\b\x04\x10\x05R\x06weight\"+\n" +
 	"\x0fGetQuotaRequest\x12\x18\n" +
-	"\aaccount\x18\x01 \x01(\tR\aaccount\"\x86\x02\n" +
+	"\aaccount\x18\x01 \x01(\tR\aaccount\"\xfc\x01\n" +
 	"\x05Quota\x12\x1d\n" +
 	"\n" +
 	"account_id\x18\x01 \x01(\tR\taccountId\x12\x18\n" +
@@ -13785,11 +13850,10 @@ const file_proto_ok_identity_v1_identity_proto_rawDesc = "" +
 	"\n" +
 	"concurrent\x18\x03 \x01(\x05R\n" +
 	"concurrent\x12\x18\n" +
-	"\aminutes\x18\x04 \x01(\x03R\aminutes\x12\x16\n" +
-	"\x06weight\x18\x05 \x01(\x05R\x06weight\x12\x18\n" +
+	"\aminutes\x18\x04 \x01(\x03R\aminutes\x12\x18\n" +
 	"\adefault\x18\x06 \x01(\bR\adefault\x12+\n" +
 	"\x11running_elsewhere\x18\a \x01(\x03R\x10runningElsewhere\x12+\n" +
-	"\x11seconds_elsewhere\x18\b \x01(\x03R\x10secondsElsewhere\"]\n" +
+	"\x11seconds_elsewhere\x18\b \x01(\x03R\x10secondsElsewhereJ\x04\b\x05\x10\x06R\x06weight\"]\n" +
 	"\x10GetQuotasRequest\x12\x1f\n" +
 	"\vaccount_ids\x18\x01 \x03(\tR\n" +
 	"accountIds\x12\x12\n" +
@@ -13899,7 +13963,9 @@ const file_proto_ok_identity_v1_identity_proto_rawDesc = "" +
 	"\x12GetAppliedResponse\x12\x16\n" +
 	"\x06commit\x18\x01 \x01(\tR\x06commit\x12\x1a\n" +
 	"\bsequence\x18\x02 \x01(\x03R\bsequence\x124\n" +
-	"\aapplied\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\aapplied\"\xa4\x04\n" +
+	"\aapplied\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\aapplied\"\x18\n" +
+	"\x16FollowDirectoryRequest\"\x19\n" +
+	"\x17FollowDirectoryResponse\"\xa4\x04\n" +
 	"\x0eDirectoryEvent\x12#\n" +
 	"\rrepository_id\x18\x01 \x01(\x03R\frepositoryId\x12\x10\n" +
 	"\x03seq\x18\x02 \x01(\x03R\x03seq\x12*\n" +
@@ -14286,10 +14352,12 @@ const file_proto_ok_identity_v1_identity_proto_rawDesc = "" +
 	"\rRepositoryRef\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\x03R\x02id\x12\"\n" +
 	"\rfor_person_id\x18\x02 \x01(\tR\vforPersonId\"\x1b\n" +
-	"\x19AbandonRepositoryResponse\"\xb0\x01\n" +
+	"\x19AbandonRepositoryResponse\"\xeb\x01\n" +
 	"\x06Expiry\x12#\n" +
 	"\rrepository_id\x18\x01 \x01(\x03R\frepositoryId\x12/\n" +
-	"\x04kind\x18\x02 \x01(\x0e2\x1b.ok.identity.v1.Expiry.KindR\x04kind\"P\n" +
+	"\x04kind\x18\x02 \x01(\x0e2\x1b.ok.identity.v1.Expiry.KindR\x04kind\x129\n" +
+	"\n" +
+	"expires_at\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\texpiresAt\"P\n" +
 	"\x04Kind\x12\x14\n" +
 	"\x10KIND_UNSPECIFIED\x10\x00\x12\r\n" +
 	"\tKIND_NONE\x10\x01\x12\x10\n" +
@@ -14487,10 +14555,11 @@ const file_proto_ok_identity_v1_identity_proto_rawDesc = "" +
 	"\x04Plan\x12\x1b.ok.identity.v1.PlanRequest\x1a\x1c.ok.identity.v1.PlanResponse\x12D\n" +
 	"\x05Apply\x12\x1c.ok.identity.v1.ApplyRequest\x1a\x1d.ok.identity.v1.ApplyResponse\x12S\n" +
 	"\n" +
-	"GetApplied\x12!.ok.identity.v1.GetAppliedRequest\x1a\".ok.identity.v1.GetAppliedResponse\x1a\x05\xc2\xf3\x18\x01\x0f2\xd4\x01\n" +
+	"GetApplied\x12!.ok.identity.v1.GetAppliedRequest\x1a\".ok.identity.v1.GetAppliedResponse\x1a\x05\xc2\xf3\x18\x01\x0f2\xaf\x02\n" +
 	"\x0fDirectoryEvents\x12_\n" +
 	"\x04Read\x12*.ok.identity.v1.ReadDirectoryEventsRequest\x1a+.ok.identity.v1.ReadDirectoryEventsResponse\x12V\n" +
-	"\x05Heads\x12%.ok.identity.v1.DirectoryHeadsRequest\x1a&.ok.identity.v1.DirectoryHeadsResponse\x1a\b\xc2\xf3\x18\x04\v\f\r\x0f2\xb7$\n" +
+	"\x05Heads\x12%.ok.identity.v1.DirectoryHeadsRequest\x1a&.ok.identity.v1.DirectoryHeadsResponse\x12Y\n" +
+	"\x06Follow\x12&.ok.identity.v1.FollowDirectoryRequest\x1a'.ok.identity.v1.FollowDirectoryResponse\x1a\b\xc2\xf3\x18\x04\v\f\r\x0f2\xb7$\n" +
 	"\aTenancy\x12]\n" +
 	"\x12CreateOrganization\x12).ok.identity.v1.CreateOrganizationRequest\x1a\x1c.ok.identity.v1.Organization\x12W\n" +
 	"\x0fGetOrganization\x12&.ok.identity.v1.GetOrganizationRequest\x1a\x1c.ok.identity.v1.Organization\x12_\n" +
@@ -14579,7 +14648,7 @@ func file_proto_ok_identity_v1_identity_proto_rawDescGZIP() []byte {
 }
 
 var file_proto_ok_identity_v1_identity_proto_enumTypes = make([]protoimpl.EnumInfo, 10)
-var file_proto_ok_identity_v1_identity_proto_msgTypes = make([]protoimpl.MessageInfo, 227)
+var file_proto_ok_identity_v1_identity_proto_msgTypes = make([]protoimpl.MessageInfo, 229)
 var file_proto_ok_identity_v1_identity_proto_goTypes = []any{
 	(Kind)(0),                                 // 0: ok.identity.v1.Kind
 	(Status)(0),                               // 1: ok.identity.v1.Status
@@ -14711,151 +14780,153 @@ var file_proto_ok_identity_v1_identity_proto_goTypes = []any{
 	(*ApplyResponse)(nil),                     // 127: ok.identity.v1.ApplyResponse
 	(*GetAppliedRequest)(nil),                 // 128: ok.identity.v1.GetAppliedRequest
 	(*GetAppliedResponse)(nil),                // 129: ok.identity.v1.GetAppliedResponse
-	(*DirectoryEvent)(nil),                    // 130: ok.identity.v1.DirectoryEvent
-	(*ReadDirectoryEventsRequest)(nil),        // 131: ok.identity.v1.ReadDirectoryEventsRequest
-	(*ReadDirectoryEventsResponse)(nil),       // 132: ok.identity.v1.ReadDirectoryEventsResponse
-	(*DirectoryHeadsRequest)(nil),             // 133: ok.identity.v1.DirectoryHeadsRequest
-	(*DirectoryHeadsResponse)(nil),            // 134: ok.identity.v1.DirectoryHeadsResponse
-	(*Notification)(nil),                      // 135: ok.identity.v1.Notification
-	(*NotifyRequest)(nil),                     // 136: ok.identity.v1.NotifyRequest
-	(*NotifyResponse)(nil),                    // 137: ok.identity.v1.NotifyResponse
-	(*ListNotificationsRequest)(nil),          // 138: ok.identity.v1.ListNotificationsRequest
-	(*ListNotificationsResponse)(nil),         // 139: ok.identity.v1.ListNotificationsResponse
-	(*MarkReadRequest)(nil),                   // 140: ok.identity.v1.MarkReadRequest
-	(*MarkReadResponse)(nil),                  // 141: ok.identity.v1.MarkReadResponse
-	(*GetNotificationPreferencesRequest)(nil), // 142: ok.identity.v1.GetNotificationPreferencesRequest
-	(*NotificationPreferences)(nil),           // 143: ok.identity.v1.NotificationPreferences
-	(*InboxEntry)(nil),                        // 144: ok.identity.v1.InboxEntry
-	(*SetInboxRequest)(nil),                   // 145: ok.identity.v1.SetInboxRequest
-	(*SetInboxResponse)(nil),                  // 146: ok.identity.v1.SetInboxResponse
-	(*ListInboxRequest)(nil),                  // 147: ok.identity.v1.ListInboxRequest
-	(*ListInboxResponse)(nil),                 // 148: ok.identity.v1.ListInboxResponse
-	(*AgentRepositoryResponse)(nil),           // 149: ok.identity.v1.AgentRepositoryResponse
-	(*SetDeployAgentRequest)(nil),             // 150: ok.identity.v1.SetDeployAgentRequest
-	(*GetDeployAgentRequest)(nil),             // 151: ok.identity.v1.GetDeployAgentRequest
-	(*DeployAgent)(nil),                       // 152: ok.identity.v1.DeployAgent
-	(*DeployCellsRequest)(nil),                // 153: ok.identity.v1.DeployCellsRequest
-	(*DeployCellsResponse)(nil),               // 154: ok.identity.v1.DeployCellsResponse
-	(*SearchRequest)(nil),                     // 155: ok.identity.v1.SearchRequest
-	(*SearchResponse)(nil),                    // 156: ok.identity.v1.SearchResponse
-	(*SearchHit)(nil),                         // 157: ok.identity.v1.SearchHit
-	(*Organization)(nil),                      // 158: ok.identity.v1.Organization
-	(*CreateOrganizationRequest)(nil),         // 159: ok.identity.v1.CreateOrganizationRequest
-	(*GetOrganizationRequest)(nil),            // 160: ok.identity.v1.GetOrganizationRequest
-	(*OrganizationDeletionRequest)(nil),       // 161: ok.identity.v1.OrganizationDeletionRequest
-	(*DeleteAccountRequest)(nil),              // 162: ok.identity.v1.DeleteAccountRequest
-	(*DeletionInfo)(nil),                      // 163: ok.identity.v1.DeletionInfo
-	(*RestoreAccountRequest)(nil),             // 164: ok.identity.v1.RestoreAccountRequest
-	(*RestoreResponse)(nil),                   // 165: ok.identity.v1.RestoreResponse
-	(*SetRegionRequest)(nil),                  // 166: ok.identity.v1.SetRegionRequest
-	(*GetRegionRequest)(nil),                  // 167: ok.identity.v1.GetRegionRequest
-	(*Region)(nil),                            // 168: ok.identity.v1.Region
-	(*UpdateOrganizationRequest)(nil),         // 169: ok.identity.v1.UpdateOrganizationRequest
-	(*Member)(nil),                            // 170: ok.identity.v1.Member
-	(*ListMembersRequest)(nil),                // 171: ok.identity.v1.ListMembersRequest
-	(*ListMembersResponse)(nil),               // 172: ok.identity.v1.ListMembersResponse
-	(*SetMemberRequest)(nil),                  // 173: ok.identity.v1.SetMemberRequest
-	(*SetMemberResponse)(nil),                 // 174: ok.identity.v1.SetMemberResponse
-	(*RemoveMemberRequest)(nil),               // 175: ok.identity.v1.RemoveMemberRequest
-	(*RemoveMemberResponse)(nil),              // 176: ok.identity.v1.RemoveMemberResponse
-	(*Team)(nil),                              // 177: ok.identity.v1.Team
-	(*CreateTeamRequest)(nil),                 // 178: ok.identity.v1.CreateTeamRequest
-	(*ListTeamsRequest)(nil),                  // 179: ok.identity.v1.ListTeamsRequest
-	(*ListTeamsResponse)(nil),                 // 180: ok.identity.v1.ListTeamsResponse
-	(*OrganizationRobot)(nil),                 // 181: ok.identity.v1.OrganizationRobot
-	(*OrganizationIssuerRequest)(nil),         // 182: ok.identity.v1.OrganizationIssuerRequest
-	(*ListIssuersRequest)(nil),                // 183: ok.identity.v1.ListIssuersRequest
-	(*OrganizationIssuers)(nil),               // 184: ok.identity.v1.OrganizationIssuers
-	(*IdentityProviderSettings)(nil),          // 185: ok.identity.v1.IdentityProviderSettings
-	(*GoogleProvider)(nil),                    // 186: ok.identity.v1.GoogleProvider
-	(*EntraProvider)(nil),                     // 187: ok.identity.v1.EntraProvider
-	(*LDAPProvider)(nil),                      // 188: ok.identity.v1.LDAPProvider
-	(*LDAPPeople)(nil),                        // 189: ok.identity.v1.LDAPPeople
-	(*LDAPGroups)(nil),                        // 190: ok.identity.v1.LDAPGroups
-	(*SCIMProvider)(nil),                      // 191: ok.identity.v1.SCIMProvider
-	(*OIDCSignIn)(nil),                        // 192: ok.identity.v1.OIDCSignIn
-	(*SetIdentityProviderRequest)(nil),        // 193: ok.identity.v1.SetIdentityProviderRequest
-	(*IdentityProviderRequest)(nil),           // 194: ok.identity.v1.IdentityProviderRequest
-	(*IdentityProviderInfo)(nil),              // 195: ok.identity.v1.IdentityProviderInfo
-	(*RemoveIdentityProviderResponse)(nil),    // 196: ok.identity.v1.RemoveIdentityProviderResponse
-	(*ResetSCIMTokenResponse)(nil),            // 197: ok.identity.v1.ResetSCIMTokenResponse
-	(*OrganizationRobotBindingRequest)(nil),   // 198: ok.identity.v1.OrganizationRobotBindingRequest
-	(*CreateOrganizationRobotRequest)(nil),    // 199: ok.identity.v1.CreateOrganizationRobotRequest
-	(*ListOrganizationRobotsRequest)(nil),     // 200: ok.identity.v1.ListOrganizationRobotsRequest
-	(*ListOrganizationRobotsResponse)(nil),    // 201: ok.identity.v1.ListOrganizationRobotsResponse
-	(*CertifyOrganizationRobotRequest)(nil),   // 202: ok.identity.v1.CertifyOrganizationRobotRequest
-	(*DeleteOrganizationRobotRequest)(nil),    // 203: ok.identity.v1.DeleteOrganizationRobotRequest
-	(*DeleteOrganizationRobotResponse)(nil),   // 204: ok.identity.v1.DeleteOrganizationRobotResponse
-	(*TeamMemberRequest)(nil),                 // 205: ok.identity.v1.TeamMemberRequest
-	(*DeleteTeamRequest)(nil),                 // 206: ok.identity.v1.DeleteTeamRequest
-	(*DeleteTeamResponse)(nil),                // 207: ok.identity.v1.DeleteTeamResponse
-	(*RepositoryEntry)(nil),                   // 208: ok.identity.v1.RepositoryEntry
-	(*RepositoryRef)(nil),                     // 209: ok.identity.v1.RepositoryRef
-	(*AbandonRepositoryResponse)(nil),         // 210: ok.identity.v1.AbandonRepositoryResponse
-	(*Expiry)(nil),                            // 211: ok.identity.v1.Expiry
-	(*ListExpiredRepositoriesRequest)(nil),    // 212: ok.identity.v1.ListExpiredRepositoriesRequest
-	(*ListExpiredRepositoriesResponse)(nil),   // 213: ok.identity.v1.ListExpiredRepositoriesResponse
-	(*ReserveRepositoryRequest)(nil),          // 214: ok.identity.v1.ReserveRepositoryRequest
-	(*ResolveRepositoryRequest)(nil),          // 215: ok.identity.v1.ResolveRepositoryRequest
-	(*ListRepositoryEntriesRequest)(nil),      // 216: ok.identity.v1.ListRepositoryEntriesRequest
-	(*ListRepositoryEntriesResponse)(nil),     // 217: ok.identity.v1.ListRepositoryEntriesResponse
-	(*UpdateRepositoryRequest)(nil),           // 218: ok.identity.v1.UpdateRepositoryRequest
-	(*RenameRepositoryEntryRequest)(nil),      // 219: ok.identity.v1.RenameRepositoryEntryRequest
-	(*TransferRepositoryRequest)(nil),         // 220: ok.identity.v1.TransferRepositoryRequest
-	(*RepositoryGrant)(nil),                   // 221: ok.identity.v1.RepositoryGrant
-	(*ListGrantsResponse)(nil),                // 222: ok.identity.v1.ListGrantsResponse
-	(*SetGrantRequest)(nil),                   // 223: ok.identity.v1.SetGrantRequest
-	(*SetGrantResponse)(nil),                  // 224: ok.identity.v1.SetGrantResponse
-	(*RemoveGrantRequest)(nil),                // 225: ok.identity.v1.RemoveGrantRequest
-	(*RemoveGrantResponse)(nil),               // 226: ok.identity.v1.RemoveGrantResponse
-	(*StartApprovalRequest)(nil),              // 227: ok.identity.v1.StartApprovalRequest
-	(*GetApprovalRequest)(nil),                // 228: ok.identity.v1.GetApprovalRequest
-	(*Approval)(nil),                          // 229: ok.identity.v1.Approval
-	(*SetSecretsRootRequest)(nil),             // 230: ok.identity.v1.SetSecretsRootRequest
-	(*GetSecretsRootRequest)(nil),             // 231: ok.identity.v1.GetSecretsRootRequest
-	(*SecretsRoot)(nil),                       // 232: ok.identity.v1.SecretsRoot
-	(*GetRepositorySecretsRootRequest)(nil),   // 233: ok.identity.v1.GetRepositorySecretsRootRequest
-	(*FactsResponse_Repository)(nil),          // 234: ok.identity.v1.FactsResponse.Repository
-	(*FactsResponse_Caller)(nil),              // 235: ok.identity.v1.FactsResponse.Caller
-	(*DirectoryHeadsResponse_Head)(nil),       // 236: ok.identity.v1.DirectoryHeadsResponse.Head
-	(*timestamppb.Timestamp)(nil),             // 237: google.protobuf.Timestamp
+	(*FollowDirectoryRequest)(nil),            // 130: ok.identity.v1.FollowDirectoryRequest
+	(*FollowDirectoryResponse)(nil),           // 131: ok.identity.v1.FollowDirectoryResponse
+	(*DirectoryEvent)(nil),                    // 132: ok.identity.v1.DirectoryEvent
+	(*ReadDirectoryEventsRequest)(nil),        // 133: ok.identity.v1.ReadDirectoryEventsRequest
+	(*ReadDirectoryEventsResponse)(nil),       // 134: ok.identity.v1.ReadDirectoryEventsResponse
+	(*DirectoryHeadsRequest)(nil),             // 135: ok.identity.v1.DirectoryHeadsRequest
+	(*DirectoryHeadsResponse)(nil),            // 136: ok.identity.v1.DirectoryHeadsResponse
+	(*Notification)(nil),                      // 137: ok.identity.v1.Notification
+	(*NotifyRequest)(nil),                     // 138: ok.identity.v1.NotifyRequest
+	(*NotifyResponse)(nil),                    // 139: ok.identity.v1.NotifyResponse
+	(*ListNotificationsRequest)(nil),          // 140: ok.identity.v1.ListNotificationsRequest
+	(*ListNotificationsResponse)(nil),         // 141: ok.identity.v1.ListNotificationsResponse
+	(*MarkReadRequest)(nil),                   // 142: ok.identity.v1.MarkReadRequest
+	(*MarkReadResponse)(nil),                  // 143: ok.identity.v1.MarkReadResponse
+	(*GetNotificationPreferencesRequest)(nil), // 144: ok.identity.v1.GetNotificationPreferencesRequest
+	(*NotificationPreferences)(nil),           // 145: ok.identity.v1.NotificationPreferences
+	(*InboxEntry)(nil),                        // 146: ok.identity.v1.InboxEntry
+	(*SetInboxRequest)(nil),                   // 147: ok.identity.v1.SetInboxRequest
+	(*SetInboxResponse)(nil),                  // 148: ok.identity.v1.SetInboxResponse
+	(*ListInboxRequest)(nil),                  // 149: ok.identity.v1.ListInboxRequest
+	(*ListInboxResponse)(nil),                 // 150: ok.identity.v1.ListInboxResponse
+	(*AgentRepositoryResponse)(nil),           // 151: ok.identity.v1.AgentRepositoryResponse
+	(*SetDeployAgentRequest)(nil),             // 152: ok.identity.v1.SetDeployAgentRequest
+	(*GetDeployAgentRequest)(nil),             // 153: ok.identity.v1.GetDeployAgentRequest
+	(*DeployAgent)(nil),                       // 154: ok.identity.v1.DeployAgent
+	(*DeployCellsRequest)(nil),                // 155: ok.identity.v1.DeployCellsRequest
+	(*DeployCellsResponse)(nil),               // 156: ok.identity.v1.DeployCellsResponse
+	(*SearchRequest)(nil),                     // 157: ok.identity.v1.SearchRequest
+	(*SearchResponse)(nil),                    // 158: ok.identity.v1.SearchResponse
+	(*SearchHit)(nil),                         // 159: ok.identity.v1.SearchHit
+	(*Organization)(nil),                      // 160: ok.identity.v1.Organization
+	(*CreateOrganizationRequest)(nil),         // 161: ok.identity.v1.CreateOrganizationRequest
+	(*GetOrganizationRequest)(nil),            // 162: ok.identity.v1.GetOrganizationRequest
+	(*OrganizationDeletionRequest)(nil),       // 163: ok.identity.v1.OrganizationDeletionRequest
+	(*DeleteAccountRequest)(nil),              // 164: ok.identity.v1.DeleteAccountRequest
+	(*DeletionInfo)(nil),                      // 165: ok.identity.v1.DeletionInfo
+	(*RestoreAccountRequest)(nil),             // 166: ok.identity.v1.RestoreAccountRequest
+	(*RestoreResponse)(nil),                   // 167: ok.identity.v1.RestoreResponse
+	(*SetRegionRequest)(nil),                  // 168: ok.identity.v1.SetRegionRequest
+	(*GetRegionRequest)(nil),                  // 169: ok.identity.v1.GetRegionRequest
+	(*Region)(nil),                            // 170: ok.identity.v1.Region
+	(*UpdateOrganizationRequest)(nil),         // 171: ok.identity.v1.UpdateOrganizationRequest
+	(*Member)(nil),                            // 172: ok.identity.v1.Member
+	(*ListMembersRequest)(nil),                // 173: ok.identity.v1.ListMembersRequest
+	(*ListMembersResponse)(nil),               // 174: ok.identity.v1.ListMembersResponse
+	(*SetMemberRequest)(nil),                  // 175: ok.identity.v1.SetMemberRequest
+	(*SetMemberResponse)(nil),                 // 176: ok.identity.v1.SetMemberResponse
+	(*RemoveMemberRequest)(nil),               // 177: ok.identity.v1.RemoveMemberRequest
+	(*RemoveMemberResponse)(nil),              // 178: ok.identity.v1.RemoveMemberResponse
+	(*Team)(nil),                              // 179: ok.identity.v1.Team
+	(*CreateTeamRequest)(nil),                 // 180: ok.identity.v1.CreateTeamRequest
+	(*ListTeamsRequest)(nil),                  // 181: ok.identity.v1.ListTeamsRequest
+	(*ListTeamsResponse)(nil),                 // 182: ok.identity.v1.ListTeamsResponse
+	(*OrganizationRobot)(nil),                 // 183: ok.identity.v1.OrganizationRobot
+	(*OrganizationIssuerRequest)(nil),         // 184: ok.identity.v1.OrganizationIssuerRequest
+	(*ListIssuersRequest)(nil),                // 185: ok.identity.v1.ListIssuersRequest
+	(*OrganizationIssuers)(nil),               // 186: ok.identity.v1.OrganizationIssuers
+	(*IdentityProviderSettings)(nil),          // 187: ok.identity.v1.IdentityProviderSettings
+	(*GoogleProvider)(nil),                    // 188: ok.identity.v1.GoogleProvider
+	(*EntraProvider)(nil),                     // 189: ok.identity.v1.EntraProvider
+	(*LDAPProvider)(nil),                      // 190: ok.identity.v1.LDAPProvider
+	(*LDAPPeople)(nil),                        // 191: ok.identity.v1.LDAPPeople
+	(*LDAPGroups)(nil),                        // 192: ok.identity.v1.LDAPGroups
+	(*SCIMProvider)(nil),                      // 193: ok.identity.v1.SCIMProvider
+	(*OIDCSignIn)(nil),                        // 194: ok.identity.v1.OIDCSignIn
+	(*SetIdentityProviderRequest)(nil),        // 195: ok.identity.v1.SetIdentityProviderRequest
+	(*IdentityProviderRequest)(nil),           // 196: ok.identity.v1.IdentityProviderRequest
+	(*IdentityProviderInfo)(nil),              // 197: ok.identity.v1.IdentityProviderInfo
+	(*RemoveIdentityProviderResponse)(nil),    // 198: ok.identity.v1.RemoveIdentityProviderResponse
+	(*ResetSCIMTokenResponse)(nil),            // 199: ok.identity.v1.ResetSCIMTokenResponse
+	(*OrganizationRobotBindingRequest)(nil),   // 200: ok.identity.v1.OrganizationRobotBindingRequest
+	(*CreateOrganizationRobotRequest)(nil),    // 201: ok.identity.v1.CreateOrganizationRobotRequest
+	(*ListOrganizationRobotsRequest)(nil),     // 202: ok.identity.v1.ListOrganizationRobotsRequest
+	(*ListOrganizationRobotsResponse)(nil),    // 203: ok.identity.v1.ListOrganizationRobotsResponse
+	(*CertifyOrganizationRobotRequest)(nil),   // 204: ok.identity.v1.CertifyOrganizationRobotRequest
+	(*DeleteOrganizationRobotRequest)(nil),    // 205: ok.identity.v1.DeleteOrganizationRobotRequest
+	(*DeleteOrganizationRobotResponse)(nil),   // 206: ok.identity.v1.DeleteOrganizationRobotResponse
+	(*TeamMemberRequest)(nil),                 // 207: ok.identity.v1.TeamMemberRequest
+	(*DeleteTeamRequest)(nil),                 // 208: ok.identity.v1.DeleteTeamRequest
+	(*DeleteTeamResponse)(nil),                // 209: ok.identity.v1.DeleteTeamResponse
+	(*RepositoryEntry)(nil),                   // 210: ok.identity.v1.RepositoryEntry
+	(*RepositoryRef)(nil),                     // 211: ok.identity.v1.RepositoryRef
+	(*AbandonRepositoryResponse)(nil),         // 212: ok.identity.v1.AbandonRepositoryResponse
+	(*Expiry)(nil),                            // 213: ok.identity.v1.Expiry
+	(*ListExpiredRepositoriesRequest)(nil),    // 214: ok.identity.v1.ListExpiredRepositoriesRequest
+	(*ListExpiredRepositoriesResponse)(nil),   // 215: ok.identity.v1.ListExpiredRepositoriesResponse
+	(*ReserveRepositoryRequest)(nil),          // 216: ok.identity.v1.ReserveRepositoryRequest
+	(*ResolveRepositoryRequest)(nil),          // 217: ok.identity.v1.ResolveRepositoryRequest
+	(*ListRepositoryEntriesRequest)(nil),      // 218: ok.identity.v1.ListRepositoryEntriesRequest
+	(*ListRepositoryEntriesResponse)(nil),     // 219: ok.identity.v1.ListRepositoryEntriesResponse
+	(*UpdateRepositoryRequest)(nil),           // 220: ok.identity.v1.UpdateRepositoryRequest
+	(*RenameRepositoryEntryRequest)(nil),      // 221: ok.identity.v1.RenameRepositoryEntryRequest
+	(*TransferRepositoryRequest)(nil),         // 222: ok.identity.v1.TransferRepositoryRequest
+	(*RepositoryGrant)(nil),                   // 223: ok.identity.v1.RepositoryGrant
+	(*ListGrantsResponse)(nil),                // 224: ok.identity.v1.ListGrantsResponse
+	(*SetGrantRequest)(nil),                   // 225: ok.identity.v1.SetGrantRequest
+	(*SetGrantResponse)(nil),                  // 226: ok.identity.v1.SetGrantResponse
+	(*RemoveGrantRequest)(nil),                // 227: ok.identity.v1.RemoveGrantRequest
+	(*RemoveGrantResponse)(nil),               // 228: ok.identity.v1.RemoveGrantResponse
+	(*StartApprovalRequest)(nil),              // 229: ok.identity.v1.StartApprovalRequest
+	(*GetApprovalRequest)(nil),                // 230: ok.identity.v1.GetApprovalRequest
+	(*Approval)(nil),                          // 231: ok.identity.v1.Approval
+	(*SetSecretsRootRequest)(nil),             // 232: ok.identity.v1.SetSecretsRootRequest
+	(*GetSecretsRootRequest)(nil),             // 233: ok.identity.v1.GetSecretsRootRequest
+	(*SecretsRoot)(nil),                       // 234: ok.identity.v1.SecretsRoot
+	(*GetRepositorySecretsRootRequest)(nil),   // 235: ok.identity.v1.GetRepositorySecretsRootRequest
+	(*FactsResponse_Repository)(nil),          // 236: ok.identity.v1.FactsResponse.Repository
+	(*FactsResponse_Caller)(nil),              // 237: ok.identity.v1.FactsResponse.Caller
+	(*DirectoryHeadsResponse_Head)(nil),       // 238: ok.identity.v1.DirectoryHeadsResponse.Head
+	(*timestamppb.Timestamp)(nil),             // 239: google.protobuf.Timestamp
 }
 var file_proto_ok_identity_v1_identity_proto_depIdxs = []int32{
 	0,   // 0: ok.identity.v1.Principal.kind:type_name -> ok.identity.v1.Kind
 	1,   // 1: ok.identity.v1.Principal.status:type_name -> ok.identity.v1.Status
-	237, // 2: ok.identity.v1.Principal.created:type_name -> google.protobuf.Timestamp
+	239, // 2: ok.identity.v1.Principal.created:type_name -> google.protobuf.Timestamp
 	2,   // 3: ok.identity.v1.Set.kind:type_name -> ok.identity.v1.SetKind
 	3,   // 4: ok.identity.v1.Set.source:type_name -> ok.identity.v1.SetSource
-	237, // 5: ok.identity.v1.RetiredName.retired:type_name -> google.protobuf.Timestamp
+	239, // 5: ok.identity.v1.RetiredName.retired:type_name -> google.protobuf.Timestamp
 	10,  // 6: ok.identity.v1.GetPrincipalResponse.principal:type_name -> ok.identity.v1.Principal
 	0,   // 7: ok.identity.v1.ListPrincipalsRequest.kind:type_name -> ok.identity.v1.Kind
 	10,  // 8: ok.identity.v1.ListPrincipalsResponse.principals:type_name -> ok.identity.v1.Principal
 	12,  // 9: ok.identity.v1.ListRetiredNamesResponse.names:type_name -> ok.identity.v1.RetiredName
 	11,  // 10: ok.identity.v1.GetSetResponse.set:type_name -> ok.identity.v1.Set
 	11,  // 11: ok.identity.v1.ListSetsResponse.sets:type_name -> ok.identity.v1.Set
-	234, // 12: ok.identity.v1.FactsResponse.repository:type_name -> ok.identity.v1.FactsResponse.Repository
-	235, // 13: ok.identity.v1.FactsResponse.caller:type_name -> ok.identity.v1.FactsResponse.Caller
+	236, // 12: ok.identity.v1.FactsResponse.repository:type_name -> ok.identity.v1.FactsResponse.Repository
+	237, // 13: ok.identity.v1.FactsResponse.caller:type_name -> ok.identity.v1.FactsResponse.Caller
 	35,  // 14: ok.identity.v1.ListCellsResponse.cells:type_name -> ok.identity.v1.Cell
 	10,  // 15: ok.identity.v1.GetTokenResponse.principal:type_name -> ok.identity.v1.Principal
 	10,  // 16: ok.identity.v1.AppInfo.robot:type_name -> ok.identity.v1.Principal
-	237, // 17: ok.identity.v1.AppInfo.created:type_name -> google.protobuf.Timestamp
+	239, // 17: ok.identity.v1.AppInfo.created:type_name -> google.protobuf.Timestamp
 	42,  // 18: ok.identity.v1.ListAppsResponse.apps:type_name -> ok.identity.v1.AppInfo
-	237, // 19: ok.identity.v1.AppInstallation.created:type_name -> google.protobuf.Timestamp
+	239, // 19: ok.identity.v1.AppInstallation.created:type_name -> google.protobuf.Timestamp
 	49,  // 20: ok.identity.v1.ListInstallationsResponse.installations:type_name -> ok.identity.v1.AppInstallation
-	237, // 21: ok.identity.v1.CreateInstallationTokenResponse.expires:type_name -> google.protobuf.Timestamp
+	239, // 21: ok.identity.v1.CreateInstallationTokenResponse.expires:type_name -> google.protobuf.Timestamp
 	49,  // 22: ok.identity.v1.CreateInstallationTokenResponse.installation:type_name -> ok.identity.v1.AppInstallation
-	237, // 23: ok.identity.v1.PersonalToken.created:type_name -> google.protobuf.Timestamp
-	237, // 24: ok.identity.v1.PersonalToken.expires:type_name -> google.protobuf.Timestamp
-	237, // 25: ok.identity.v1.PersonalToken.last_used:type_name -> google.protobuf.Timestamp
-	237, // 26: ok.identity.v1.PersonalToken.revoked:type_name -> google.protobuf.Timestamp
+	239, // 23: ok.identity.v1.PersonalToken.created:type_name -> google.protobuf.Timestamp
+	239, // 24: ok.identity.v1.PersonalToken.expires:type_name -> google.protobuf.Timestamp
+	239, // 25: ok.identity.v1.PersonalToken.last_used:type_name -> google.protobuf.Timestamp
+	239, // 26: ok.identity.v1.PersonalToken.revoked:type_name -> google.protobuf.Timestamp
 	58,  // 27: ok.identity.v1.CreateTokenResponse.token:type_name -> ok.identity.v1.PersonalToken
 	58,  // 28: ok.identity.v1.ListTokensResponse.tokens:type_name -> ok.identity.v1.PersonalToken
 	10,  // 29: ok.identity.v1.GetCredentialResponse.principal:type_name -> ok.identity.v1.Principal
 	10,  // 30: ok.identity.v1.GetSessionResponse.principal:type_name -> ok.identity.v1.Principal
-	237, // 31: ok.identity.v1.Credential.created:type_name -> google.protobuf.Timestamp
-	237, // 32: ok.identity.v1.Credential.last_issued:type_name -> google.protobuf.Timestamp
-	237, // 33: ok.identity.v1.Credential.revoked:type_name -> google.protobuf.Timestamp
-	237, // 34: ok.identity.v1.Certificate.not_after:type_name -> google.protobuf.Timestamp
+	239, // 31: ok.identity.v1.Credential.created:type_name -> google.protobuf.Timestamp
+	239, // 32: ok.identity.v1.Credential.last_issued:type_name -> google.protobuf.Timestamp
+	239, // 33: ok.identity.v1.Credential.revoked:type_name -> google.protobuf.Timestamp
+	239, // 34: ok.identity.v1.Certificate.not_after:type_name -> google.protobuf.Timestamp
 	4,   // 35: ok.identity.v1.PollResponse.state:type_name -> ok.identity.v1.PollState
 	72,  // 36: ok.identity.v1.PollResponse.certificate:type_name -> ok.identity.v1.Certificate
 	72,  // 37: ok.identity.v1.CertifyResponse.certificate:type_name -> ok.identity.v1.Certificate
@@ -14865,12 +14936,12 @@ var file_proto_ok_identity_v1_identity_proto_depIdxs = []int32{
 	86,  // 41: ok.identity.v1.Robot.bindings:type_name -> ok.identity.v1.Binding
 	93,  // 42: ok.identity.v1.ReportUsageRequest.usage:type_name -> ok.identity.v1.AccountUsage
 	90,  // 43: ok.identity.v1.GetQuotasResponse.quotas:type_name -> ok.identity.v1.Quota
-	237, // 44: ok.identity.v1.Move.asked_at:type_name -> google.protobuf.Timestamp
-	237, // 45: ok.identity.v1.Move.frozen_at:type_name -> google.protobuf.Timestamp
-	237, // 46: ok.identity.v1.Move.updated_at:type_name -> google.protobuf.Timestamp
+	239, // 44: ok.identity.v1.Move.asked_at:type_name -> google.protobuf.Timestamp
+	239, // 45: ok.identity.v1.Move.frozen_at:type_name -> google.protobuf.Timestamp
+	239, // 46: ok.identity.v1.Move.updated_at:type_name -> google.protobuf.Timestamp
 	97,  // 47: ok.identity.v1.ListMovesResponse.moves:type_name -> ok.identity.v1.Move
 	85,  // 48: ok.identity.v1.SyncResponse.waiting:type_name -> ok.identity.v1.Waiting
-	237, // 49: ok.identity.v1.GetSyncStatusResponse.last_run:type_name -> google.protobuf.Timestamp
+	239, // 49: ok.identity.v1.GetSyncStatusResponse.last_run:type_name -> google.protobuf.Timestamp
 	85,  // 50: ok.identity.v1.GetSyncStatusResponse.waiting:type_name -> ok.identity.v1.Waiting
 	10,  // 51: ok.identity.v1.CreateRobotResponse.principal:type_name -> ok.identity.v1.Principal
 	87,  // 52: ok.identity.v1.ListRobotsResponse.robots:type_name -> ok.identity.v1.Robot
@@ -14880,305 +14951,308 @@ var file_proto_ok_identity_v1_identity_proto_depIdxs = []int32{
 	71,  // 56: ok.identity.v1.AdminListCredentialsResponse.credentials:type_name -> ok.identity.v1.Credential
 	123, // 57: ok.identity.v1.PlanRequest.files:type_name -> ok.identity.v1.File
 	123, // 58: ok.identity.v1.ApplyRequest.files:type_name -> ok.identity.v1.File
-	237, // 59: ok.identity.v1.GetAppliedResponse.applied:type_name -> google.protobuf.Timestamp
-	237, // 60: ok.identity.v1.DirectoryEvent.at:type_name -> google.protobuf.Timestamp
+	239, // 59: ok.identity.v1.GetAppliedResponse.applied:type_name -> google.protobuf.Timestamp
+	239, // 60: ok.identity.v1.DirectoryEvent.at:type_name -> google.protobuf.Timestamp
 	5,   // 61: ok.identity.v1.DirectoryEvent.kind:type_name -> ok.identity.v1.DirectoryEvent.Kind
-	208, // 62: ok.identity.v1.DirectoryEvent.repository:type_name -> ok.identity.v1.RepositoryEntry
-	130, // 63: ok.identity.v1.ReadDirectoryEventsResponse.events:type_name -> ok.identity.v1.DirectoryEvent
-	236, // 64: ok.identity.v1.DirectoryHeadsResponse.heads:type_name -> ok.identity.v1.DirectoryHeadsResponse.Head
+	210, // 62: ok.identity.v1.DirectoryEvent.repository:type_name -> ok.identity.v1.RepositoryEntry
+	132, // 63: ok.identity.v1.ReadDirectoryEventsResponse.events:type_name -> ok.identity.v1.DirectoryEvent
+	238, // 64: ok.identity.v1.DirectoryHeadsResponse.heads:type_name -> ok.identity.v1.DirectoryHeadsResponse.Head
 	6,   // 65: ok.identity.v1.Notification.kind:type_name -> ok.identity.v1.Notification.Kind
-	237, // 66: ok.identity.v1.Notification.at:type_name -> google.protobuf.Timestamp
-	135, // 67: ok.identity.v1.NotifyRequest.notifications:type_name -> ok.identity.v1.Notification
-	135, // 68: ok.identity.v1.ListNotificationsResponse.notifications:type_name -> ok.identity.v1.Notification
+	239, // 66: ok.identity.v1.Notification.at:type_name -> google.protobuf.Timestamp
+	137, // 67: ok.identity.v1.NotifyRequest.notifications:type_name -> ok.identity.v1.Notification
+	137, // 68: ok.identity.v1.ListNotificationsResponse.notifications:type_name -> ok.identity.v1.Notification
 	6,   // 69: ok.identity.v1.NotificationPreferences.mailed:type_name -> ok.identity.v1.Notification.Kind
 	7,   // 70: ok.identity.v1.InboxEntry.relation:type_name -> ok.identity.v1.InboxEntry.Relation
-	237, // 71: ok.identity.v1.InboxEntry.updated_at:type_name -> google.protobuf.Timestamp
-	144, // 72: ok.identity.v1.SetInboxRequest.entries:type_name -> ok.identity.v1.InboxEntry
+	239, // 71: ok.identity.v1.InboxEntry.updated_at:type_name -> google.protobuf.Timestamp
+	146, // 72: ok.identity.v1.SetInboxRequest.entries:type_name -> ok.identity.v1.InboxEntry
 	7,   // 73: ok.identity.v1.ListInboxRequest.relation:type_name -> ok.identity.v1.InboxEntry.Relation
-	144, // 74: ok.identity.v1.ListInboxResponse.entries:type_name -> ok.identity.v1.InboxEntry
-	237, // 75: ok.identity.v1.DeployAgent.set_at:type_name -> google.protobuf.Timestamp
-	208, // 76: ok.identity.v1.SearchResponse.repositories:type_name -> ok.identity.v1.RepositoryEntry
-	157, // 77: ok.identity.v1.SearchResponse.people:type_name -> ok.identity.v1.SearchHit
-	157, // 78: ok.identity.v1.SearchResponse.organizations:type_name -> ok.identity.v1.SearchHit
-	237, // 79: ok.identity.v1.DeletionInfo.requested:type_name -> google.protobuf.Timestamp
-	237, // 80: ok.identity.v1.DeletionInfo.final:type_name -> google.protobuf.Timestamp
-	170, // 81: ok.identity.v1.ListMembersResponse.members:type_name -> ok.identity.v1.Member
-	170, // 82: ok.identity.v1.Team.members:type_name -> ok.identity.v1.Member
-	177, // 83: ok.identity.v1.ListTeamsResponse.teams:type_name -> ok.identity.v1.Team
+	146, // 74: ok.identity.v1.ListInboxResponse.entries:type_name -> ok.identity.v1.InboxEntry
+	239, // 75: ok.identity.v1.DeployAgent.set_at:type_name -> google.protobuf.Timestamp
+	210, // 76: ok.identity.v1.SearchResponse.repositories:type_name -> ok.identity.v1.RepositoryEntry
+	159, // 77: ok.identity.v1.SearchResponse.people:type_name -> ok.identity.v1.SearchHit
+	159, // 78: ok.identity.v1.SearchResponse.organizations:type_name -> ok.identity.v1.SearchHit
+	239, // 79: ok.identity.v1.DeletionInfo.requested:type_name -> google.protobuf.Timestamp
+	239, // 80: ok.identity.v1.DeletionInfo.final:type_name -> google.protobuf.Timestamp
+	172, // 81: ok.identity.v1.ListMembersResponse.members:type_name -> ok.identity.v1.Member
+	172, // 82: ok.identity.v1.Team.members:type_name -> ok.identity.v1.Member
+	179, // 83: ok.identity.v1.ListTeamsResponse.teams:type_name -> ok.identity.v1.Team
 	10,  // 84: ok.identity.v1.OrganizationRobot.principal:type_name -> ok.identity.v1.Principal
 	86,  // 85: ok.identity.v1.OrganizationRobot.bindings:type_name -> ok.identity.v1.Binding
-	186, // 86: ok.identity.v1.IdentityProviderSettings.google:type_name -> ok.identity.v1.GoogleProvider
-	187, // 87: ok.identity.v1.IdentityProviderSettings.entra:type_name -> ok.identity.v1.EntraProvider
-	188, // 88: ok.identity.v1.IdentityProviderSettings.ldap:type_name -> ok.identity.v1.LDAPProvider
-	191, // 89: ok.identity.v1.IdentityProviderSettings.scim:type_name -> ok.identity.v1.SCIMProvider
-	192, // 90: ok.identity.v1.IdentityProviderSettings.sign_in:type_name -> ok.identity.v1.OIDCSignIn
-	189, // 91: ok.identity.v1.LDAPProvider.people:type_name -> ok.identity.v1.LDAPPeople
-	190, // 92: ok.identity.v1.LDAPProvider.groups:type_name -> ok.identity.v1.LDAPGroups
-	185, // 93: ok.identity.v1.SetIdentityProviderRequest.settings:type_name -> ok.identity.v1.IdentityProviderSettings
-	185, // 94: ok.identity.v1.IdentityProviderInfo.settings:type_name -> ok.identity.v1.IdentityProviderSettings
-	237, // 95: ok.identity.v1.IdentityProviderInfo.last_run:type_name -> google.protobuf.Timestamp
+	188, // 86: ok.identity.v1.IdentityProviderSettings.google:type_name -> ok.identity.v1.GoogleProvider
+	189, // 87: ok.identity.v1.IdentityProviderSettings.entra:type_name -> ok.identity.v1.EntraProvider
+	190, // 88: ok.identity.v1.IdentityProviderSettings.ldap:type_name -> ok.identity.v1.LDAPProvider
+	193, // 89: ok.identity.v1.IdentityProviderSettings.scim:type_name -> ok.identity.v1.SCIMProvider
+	194, // 90: ok.identity.v1.IdentityProviderSettings.sign_in:type_name -> ok.identity.v1.OIDCSignIn
+	191, // 91: ok.identity.v1.LDAPProvider.people:type_name -> ok.identity.v1.LDAPPeople
+	192, // 92: ok.identity.v1.LDAPProvider.groups:type_name -> ok.identity.v1.LDAPGroups
+	187, // 93: ok.identity.v1.SetIdentityProviderRequest.settings:type_name -> ok.identity.v1.IdentityProviderSettings
+	187, // 94: ok.identity.v1.IdentityProviderInfo.settings:type_name -> ok.identity.v1.IdentityProviderSettings
+	239, // 95: ok.identity.v1.IdentityProviderInfo.last_run:type_name -> google.protobuf.Timestamp
 	86,  // 96: ok.identity.v1.OrganizationRobotBindingRequest.binding:type_name -> ok.identity.v1.Binding
-	181, // 97: ok.identity.v1.ListOrganizationRobotsResponse.robots:type_name -> ok.identity.v1.OrganizationRobot
-	237, // 98: ok.identity.v1.RepositoryEntry.state_at:type_name -> google.protobuf.Timestamp
-	237, // 99: ok.identity.v1.RepositoryEntry.created_at:type_name -> google.protobuf.Timestamp
+	183, // 97: ok.identity.v1.ListOrganizationRobotsResponse.robots:type_name -> ok.identity.v1.OrganizationRobot
+	239, // 98: ok.identity.v1.RepositoryEntry.state_at:type_name -> google.protobuf.Timestamp
+	239, // 99: ok.identity.v1.RepositoryEntry.created_at:type_name -> google.protobuf.Timestamp
 	8,   // 100: ok.identity.v1.Expiry.kind:type_name -> ok.identity.v1.Expiry.Kind
-	211, // 101: ok.identity.v1.ListExpiredRepositoriesResponse.repositories:type_name -> ok.identity.v1.Expiry
-	208, // 102: ok.identity.v1.ListRepositoryEntriesResponse.repositories:type_name -> ok.identity.v1.RepositoryEntry
-	221, // 103: ok.identity.v1.ListGrantsResponse.grants:type_name -> ok.identity.v1.RepositoryGrant
-	221, // 104: ok.identity.v1.SetGrantRequest.grant:type_name -> ok.identity.v1.RepositoryGrant
-	237, // 105: ok.identity.v1.Approval.expires_at:type_name -> google.protobuf.Timestamp
-	9,   // 106: ok.identity.v1.Approval.state:type_name -> ok.identity.v1.Approval.State
-	17,  // 107: ok.identity.v1.Directory.GetPrincipal:input_type -> ok.identity.v1.GetPrincipalRequest
-	19,  // 108: ok.identity.v1.Directory.ListPrincipals:input_type -> ok.identity.v1.ListPrincipalsRequest
-	21,  // 109: ok.identity.v1.Directory.ListRetiredNames:input_type -> ok.identity.v1.ListRetiredNamesRequest
-	23,  // 110: ok.identity.v1.Directory.GetSet:input_type -> ok.identity.v1.GetSetRequest
-	25,  // 111: ok.identity.v1.Directory.ListSets:input_type -> ok.identity.v1.ListSetsRequest
-	27,  // 112: ok.identity.v1.Directory.ExpandSet:input_type -> ok.identity.v1.ExpandSetRequest
-	29,  // 113: ok.identity.v1.Directory.CheckMembership:input_type -> ok.identity.v1.CheckMembershipRequest
-	15,  // 114: ok.identity.v1.Directory.CheckAdmin:input_type -> ok.identity.v1.CheckAdminRequest
-	13,  // 115: ok.identity.v1.Directory.ListAdmins:input_type -> ok.identity.v1.ListAdminsRequest
-	33,  // 116: ok.identity.v1.Authorization.Facts:input_type -> ok.identity.v1.FactsRequest
-	31,  // 117: ok.identity.v1.Authorization.Admins:input_type -> ok.identity.v1.AdminsRequest
-	36,  // 118: ok.identity.v1.Cells.ListCells:input_type -> ok.identity.v1.ListCellsRequest
-	37,  // 119: ok.identity.v1.Cells.Route:input_type -> ok.identity.v1.RouteRequest
-	65,  // 120: ok.identity.v1.Verify.GetCredential:input_type -> ok.identity.v1.GetCredentialRequest
-	67,  // 121: ok.identity.v1.Verify.GetSession:input_type -> ok.identity.v1.GetSessionRequest
-	40,  // 122: ok.identity.v1.Verify.GetToken:input_type -> ok.identity.v1.GetTokenRequest
-	43,  // 123: ok.identity.v1.Apps.CreateApp:input_type -> ok.identity.v1.CreateAppRequest
-	44,  // 124: ok.identity.v1.Apps.ListApps:input_type -> ok.identity.v1.ListAppsRequest
-	46,  // 125: ok.identity.v1.Apps.SetAppKey:input_type -> ok.identity.v1.SetAppKeyRequest
-	47,  // 126: ok.identity.v1.Apps.DeleteApp:input_type -> ok.identity.v1.AppRef
-	50,  // 127: ok.identity.v1.Apps.InstallApp:input_type -> ok.identity.v1.InstallAppRequest
-	51,  // 128: ok.identity.v1.Apps.ListInstallations:input_type -> ok.identity.v1.ListInstallationsRequest
-	53,  // 129: ok.identity.v1.Apps.UninstallApp:input_type -> ok.identity.v1.UninstallAppRequest
-	55,  // 130: ok.identity.v1.AppTokens.ListAppInstallations:input_type -> ok.identity.v1.AppAssertion
-	56,  // 131: ok.identity.v1.AppTokens.CreateInstallationToken:input_type -> ok.identity.v1.CreateInstallationTokenRequest
-	59,  // 132: ok.identity.v1.Tokens.CreateToken:input_type -> ok.identity.v1.CreateTokenRequest
-	61,  // 133: ok.identity.v1.Tokens.ListTokens:input_type -> ok.identity.v1.ListTokensRequest
-	63,  // 134: ok.identity.v1.Tokens.RevokeToken:input_type -> ok.identity.v1.RevokeTokenRequest
-	69,  // 135: ok.identity.v1.CA.GetRoots:input_type -> ok.identity.v1.GetRootsRequest
-	73,  // 136: ok.identity.v1.DeviceLogin.Start:input_type -> ok.identity.v1.StartRequest
-	75,  // 137: ok.identity.v1.DeviceLogin.Poll:input_type -> ok.identity.v1.PollRequest
-	79,  // 138: ok.identity.v1.Credentials.Renew:input_type -> ok.identity.v1.RenewRequest
-	81,  // 139: ok.identity.v1.Credentials.List:input_type -> ok.identity.v1.ListCredentialsRequest
-	83,  // 140: ok.identity.v1.Credentials.Revoke:input_type -> ok.identity.v1.RevokeRequest
-	77,  // 141: ok.identity.v1.Credentials.Certify:input_type -> ok.identity.v1.CertifyRequest
-	101, // 142: ok.identity.v1.Admin.Sync:input_type -> ok.identity.v1.SyncRequest
-	164, // 143: ok.identity.v1.Admin.RestoreAccount:input_type -> ok.identity.v1.RestoreAccountRequest
-	103, // 144: ok.identity.v1.Admin.GetSyncStatus:input_type -> ok.identity.v1.GetSyncStatusRequest
-	105, // 145: ok.identity.v1.Admin.SetName:input_type -> ok.identity.v1.SetNameRequest
-	107, // 146: ok.identity.v1.Admin.CreateRobot:input_type -> ok.identity.v1.CreateRobotRequest
-	109, // 147: ok.identity.v1.Admin.DeleteRobot:input_type -> ok.identity.v1.DeleteRobotRequest
-	111, // 148: ok.identity.v1.Admin.ListRobots:input_type -> ok.identity.v1.ListRobotsRequest
-	113, // 149: ok.identity.v1.Admin.Bind:input_type -> ok.identity.v1.BindRequest
-	115, // 150: ok.identity.v1.Admin.Unbind:input_type -> ok.identity.v1.UnbindRequest
-	117, // 151: ok.identity.v1.Admin.CertifyRobot:input_type -> ok.identity.v1.CertifyRobotRequest
-	119, // 152: ok.identity.v1.Admin.RevokeCredential:input_type -> ok.identity.v1.RevokeCredentialRequest
-	121, // 153: ok.identity.v1.Admin.ListCredentials:input_type -> ok.identity.v1.AdminListCredentialsRequest
-	96,  // 154: ok.identity.v1.Admin.MoveNetwork:input_type -> ok.identity.v1.MoveNetworkRequest
-	98,  // 155: ok.identity.v1.Admin.ListMoves:input_type -> ok.identity.v1.ListMovesRequest
-	100, // 156: ok.identity.v1.Admin.CancelMove:input_type -> ok.identity.v1.CancelMoveRequest
-	88,  // 157: ok.identity.v1.Admin.SetQuota:input_type -> ok.identity.v1.SetQuotaRequest
-	89,  // 158: ok.identity.v1.Admin.GetQuota:input_type -> ok.identity.v1.GetQuotaRequest
-	91,  // 159: ok.identity.v1.Quotas.GetQuotas:input_type -> ok.identity.v1.GetQuotasRequest
-	92,  // 160: ok.identity.v1.Quotas.ReportUsage:input_type -> ok.identity.v1.ReportUsageRequest
-	124, // 161: ok.identity.v1.Tree.Plan:input_type -> ok.identity.v1.PlanRequest
-	126, // 162: ok.identity.v1.Tree.Apply:input_type -> ok.identity.v1.ApplyRequest
-	128, // 163: ok.identity.v1.Tree.GetApplied:input_type -> ok.identity.v1.GetAppliedRequest
-	131, // 164: ok.identity.v1.DirectoryEvents.Read:input_type -> ok.identity.v1.ReadDirectoryEventsRequest
-	133, // 165: ok.identity.v1.DirectoryEvents.Heads:input_type -> ok.identity.v1.DirectoryHeadsRequest
-	159, // 166: ok.identity.v1.Tenancy.CreateOrganization:input_type -> ok.identity.v1.CreateOrganizationRequest
-	160, // 167: ok.identity.v1.Tenancy.GetOrganization:input_type -> ok.identity.v1.GetOrganizationRequest
-	161, // 168: ok.identity.v1.Tenancy.DeleteOrganization:input_type -> ok.identity.v1.OrganizationDeletionRequest
-	161, // 169: ok.identity.v1.Tenancy.RestoreOrganization:input_type -> ok.identity.v1.OrganizationDeletionRequest
-	162, // 170: ok.identity.v1.Tenancy.DeleteAccount:input_type -> ok.identity.v1.DeleteAccountRequest
-	169, // 171: ok.identity.v1.Tenancy.UpdateOrganization:input_type -> ok.identity.v1.UpdateOrganizationRequest
-	166, // 172: ok.identity.v1.Tenancy.SetRegion:input_type -> ok.identity.v1.SetRegionRequest
-	167, // 173: ok.identity.v1.Tenancy.GetRegion:input_type -> ok.identity.v1.GetRegionRequest
-	230, // 174: ok.identity.v1.Tenancy.SetSecretsRoot:input_type -> ok.identity.v1.SetSecretsRootRequest
-	231, // 175: ok.identity.v1.Tenancy.GetSecretsRoot:input_type -> ok.identity.v1.GetSecretsRootRequest
-	171, // 176: ok.identity.v1.Tenancy.ListMembers:input_type -> ok.identity.v1.ListMembersRequest
-	173, // 177: ok.identity.v1.Tenancy.SetMember:input_type -> ok.identity.v1.SetMemberRequest
-	175, // 178: ok.identity.v1.Tenancy.RemoveMember:input_type -> ok.identity.v1.RemoveMemberRequest
-	178, // 179: ok.identity.v1.Tenancy.CreateTeam:input_type -> ok.identity.v1.CreateTeamRequest
-	179, // 180: ok.identity.v1.Tenancy.ListTeams:input_type -> ok.identity.v1.ListTeamsRequest
-	205, // 181: ok.identity.v1.Tenancy.AddTeamMember:input_type -> ok.identity.v1.TeamMemberRequest
-	205, // 182: ok.identity.v1.Tenancy.RemoveTeamMember:input_type -> ok.identity.v1.TeamMemberRequest
-	206, // 183: ok.identity.v1.Tenancy.DeleteTeam:input_type -> ok.identity.v1.DeleteTeamRequest
-	199, // 184: ok.identity.v1.Tenancy.CreateOrganizationRobot:input_type -> ok.identity.v1.CreateOrganizationRobotRequest
-	200, // 185: ok.identity.v1.Tenancy.ListOrganizationRobots:input_type -> ok.identity.v1.ListOrganizationRobotsRequest
-	202, // 186: ok.identity.v1.Tenancy.CertifyOrganizationRobot:input_type -> ok.identity.v1.CertifyOrganizationRobotRequest
-	203, // 187: ok.identity.v1.Tenancy.DeleteOrganizationRobot:input_type -> ok.identity.v1.DeleteOrganizationRobotRequest
-	182, // 188: ok.identity.v1.Tenancy.TrustIssuer:input_type -> ok.identity.v1.OrganizationIssuerRequest
-	182, // 189: ok.identity.v1.Tenancy.DistrustIssuer:input_type -> ok.identity.v1.OrganizationIssuerRequest
-	183, // 190: ok.identity.v1.Tenancy.ListIssuers:input_type -> ok.identity.v1.ListIssuersRequest
-	198, // 191: ok.identity.v1.Tenancy.BindOrganizationRobot:input_type -> ok.identity.v1.OrganizationRobotBindingRequest
-	198, // 192: ok.identity.v1.Tenancy.UnbindOrganizationRobot:input_type -> ok.identity.v1.OrganizationRobotBindingRequest
-	193, // 193: ok.identity.v1.Tenancy.SetIdentityProvider:input_type -> ok.identity.v1.SetIdentityProviderRequest
-	194, // 194: ok.identity.v1.Tenancy.GetIdentityProvider:input_type -> ok.identity.v1.IdentityProviderRequest
-	194, // 195: ok.identity.v1.Tenancy.SyncIdentityProvider:input_type -> ok.identity.v1.IdentityProviderRequest
-	194, // 196: ok.identity.v1.Tenancy.RemoveIdentityProvider:input_type -> ok.identity.v1.IdentityProviderRequest
-	194, // 197: ok.identity.v1.Tenancy.ResetSCIMToken:input_type -> ok.identity.v1.IdentityProviderRequest
-	214, // 198: ok.identity.v1.Tenancy.ReserveRepository:input_type -> ok.identity.v1.ReserveRepositoryRequest
-	209, // 199: ok.identity.v1.Tenancy.ActivateRepository:input_type -> ok.identity.v1.RepositoryRef
-	209, // 200: ok.identity.v1.Tenancy.AbandonRepository:input_type -> ok.identity.v1.RepositoryRef
-	212, // 201: ok.identity.v1.Tenancy.ListExpiredRepositories:input_type -> ok.identity.v1.ListExpiredRepositoriesRequest
-	209, // 202: ok.identity.v1.Tenancy.GetExpiry:input_type -> ok.identity.v1.RepositoryRef
-	209, // 203: ok.identity.v1.Tenancy.PurgeRepository:input_type -> ok.identity.v1.RepositoryRef
-	215, // 204: ok.identity.v1.Tenancy.ResolveRepository:input_type -> ok.identity.v1.ResolveRepositoryRequest
-	209, // 205: ok.identity.v1.Tenancy.GetRepositoryEntry:input_type -> ok.identity.v1.RepositoryRef
-	216, // 206: ok.identity.v1.Tenancy.ListRepositoryEntries:input_type -> ok.identity.v1.ListRepositoryEntriesRequest
-	155, // 207: ok.identity.v1.Tenancy.Search:input_type -> ok.identity.v1.SearchRequest
-	218, // 208: ok.identity.v1.Tenancy.UpdateRepository:input_type -> ok.identity.v1.UpdateRepositoryRequest
-	219, // 209: ok.identity.v1.Tenancy.RenameRepository:input_type -> ok.identity.v1.RenameRepositoryEntryRequest
-	220, // 210: ok.identity.v1.Tenancy.TransferRepository:input_type -> ok.identity.v1.TransferRepositoryRequest
-	209, // 211: ok.identity.v1.Tenancy.DeleteRepository:input_type -> ok.identity.v1.RepositoryRef
-	209, // 212: ok.identity.v1.Tenancy.RestoreRepository:input_type -> ok.identity.v1.RepositoryRef
-	209, // 213: ok.identity.v1.Tenancy.ListGrants:input_type -> ok.identity.v1.RepositoryRef
-	223, // 214: ok.identity.v1.Tenancy.SetGrant:input_type -> ok.identity.v1.SetGrantRequest
-	225, // 215: ok.identity.v1.Tenancy.RemoveGrant:input_type -> ok.identity.v1.RemoveGrantRequest
-	147, // 216: ok.identity.v1.Inbox.ListInbox:input_type -> ok.identity.v1.ListInboxRequest
-	145, // 217: ok.identity.v1.Delivery.SetInbox:input_type -> ok.identity.v1.SetInboxRequest
-	136, // 218: ok.identity.v1.Delivery.Notify:input_type -> ok.identity.v1.NotifyRequest
-	138, // 219: ok.identity.v1.Notifications.ListNotifications:input_type -> ok.identity.v1.ListNotificationsRequest
-	140, // 220: ok.identity.v1.Notifications.MarkRead:input_type -> ok.identity.v1.MarkReadRequest
-	142, // 221: ok.identity.v1.Notifications.GetNotificationPreferences:input_type -> ok.identity.v1.GetNotificationPreferencesRequest
-	143, // 222: ok.identity.v1.Notifications.SetNotificationPreferences:input_type -> ok.identity.v1.NotificationPreferences
-	150, // 223: ok.identity.v1.DeployAgents.SetDeployAgent:input_type -> ok.identity.v1.SetDeployAgentRequest
-	151, // 224: ok.identity.v1.DeployAgents.GetDeployAgent:input_type -> ok.identity.v1.GetDeployAgentRequest
-	153, // 225: ok.identity.v1.DeployAgents.DeployCells:input_type -> ok.identity.v1.DeployCellsRequest
-	209, // 226: ok.identity.v1.DeployAgents.AgentRepository:input_type -> ok.identity.v1.RepositoryRef
-	227, // 227: ok.identity.v1.Approvals.StartApproval:input_type -> ok.identity.v1.StartApprovalRequest
-	228, // 228: ok.identity.v1.Approvals.GetApproval:input_type -> ok.identity.v1.GetApprovalRequest
-	233, // 229: ok.identity.v1.SecretsRoots.GetRepositorySecretsRoot:input_type -> ok.identity.v1.GetRepositorySecretsRootRequest
-	18,  // 230: ok.identity.v1.Directory.GetPrincipal:output_type -> ok.identity.v1.GetPrincipalResponse
-	20,  // 231: ok.identity.v1.Directory.ListPrincipals:output_type -> ok.identity.v1.ListPrincipalsResponse
-	22,  // 232: ok.identity.v1.Directory.ListRetiredNames:output_type -> ok.identity.v1.ListRetiredNamesResponse
-	24,  // 233: ok.identity.v1.Directory.GetSet:output_type -> ok.identity.v1.GetSetResponse
-	26,  // 234: ok.identity.v1.Directory.ListSets:output_type -> ok.identity.v1.ListSetsResponse
-	28,  // 235: ok.identity.v1.Directory.ExpandSet:output_type -> ok.identity.v1.ExpandSetResponse
-	30,  // 236: ok.identity.v1.Directory.CheckMembership:output_type -> ok.identity.v1.CheckMembershipResponse
-	16,  // 237: ok.identity.v1.Directory.CheckAdmin:output_type -> ok.identity.v1.CheckAdminResponse
-	14,  // 238: ok.identity.v1.Directory.ListAdmins:output_type -> ok.identity.v1.ListAdminsResponse
-	34,  // 239: ok.identity.v1.Authorization.Facts:output_type -> ok.identity.v1.FactsResponse
-	32,  // 240: ok.identity.v1.Authorization.Admins:output_type -> ok.identity.v1.AdminsResponse
-	39,  // 241: ok.identity.v1.Cells.ListCells:output_type -> ok.identity.v1.ListCellsResponse
-	38,  // 242: ok.identity.v1.Cells.Route:output_type -> ok.identity.v1.RouteResponse
-	66,  // 243: ok.identity.v1.Verify.GetCredential:output_type -> ok.identity.v1.GetCredentialResponse
-	68,  // 244: ok.identity.v1.Verify.GetSession:output_type -> ok.identity.v1.GetSessionResponse
-	41,  // 245: ok.identity.v1.Verify.GetToken:output_type -> ok.identity.v1.GetTokenResponse
-	42,  // 246: ok.identity.v1.Apps.CreateApp:output_type -> ok.identity.v1.AppInfo
-	45,  // 247: ok.identity.v1.Apps.ListApps:output_type -> ok.identity.v1.ListAppsResponse
-	42,  // 248: ok.identity.v1.Apps.SetAppKey:output_type -> ok.identity.v1.AppInfo
-	48,  // 249: ok.identity.v1.Apps.DeleteApp:output_type -> ok.identity.v1.DeleteAppResponse
-	49,  // 250: ok.identity.v1.Apps.InstallApp:output_type -> ok.identity.v1.AppInstallation
-	52,  // 251: ok.identity.v1.Apps.ListInstallations:output_type -> ok.identity.v1.ListInstallationsResponse
-	54,  // 252: ok.identity.v1.Apps.UninstallApp:output_type -> ok.identity.v1.UninstallAppResponse
-	52,  // 253: ok.identity.v1.AppTokens.ListAppInstallations:output_type -> ok.identity.v1.ListInstallationsResponse
-	57,  // 254: ok.identity.v1.AppTokens.CreateInstallationToken:output_type -> ok.identity.v1.CreateInstallationTokenResponse
-	60,  // 255: ok.identity.v1.Tokens.CreateToken:output_type -> ok.identity.v1.CreateTokenResponse
-	62,  // 256: ok.identity.v1.Tokens.ListTokens:output_type -> ok.identity.v1.ListTokensResponse
-	64,  // 257: ok.identity.v1.Tokens.RevokeToken:output_type -> ok.identity.v1.RevokeTokenResponse
-	70,  // 258: ok.identity.v1.CA.GetRoots:output_type -> ok.identity.v1.GetRootsResponse
-	74,  // 259: ok.identity.v1.DeviceLogin.Start:output_type -> ok.identity.v1.StartResponse
-	76,  // 260: ok.identity.v1.DeviceLogin.Poll:output_type -> ok.identity.v1.PollResponse
-	80,  // 261: ok.identity.v1.Credentials.Renew:output_type -> ok.identity.v1.RenewResponse
-	82,  // 262: ok.identity.v1.Credentials.List:output_type -> ok.identity.v1.ListCredentialsResponse
-	84,  // 263: ok.identity.v1.Credentials.Revoke:output_type -> ok.identity.v1.RevokeResponse
-	78,  // 264: ok.identity.v1.Credentials.Certify:output_type -> ok.identity.v1.CertifyResponse
-	102, // 265: ok.identity.v1.Admin.Sync:output_type -> ok.identity.v1.SyncResponse
-	165, // 266: ok.identity.v1.Admin.RestoreAccount:output_type -> ok.identity.v1.RestoreResponse
-	104, // 267: ok.identity.v1.Admin.GetSyncStatus:output_type -> ok.identity.v1.GetSyncStatusResponse
-	106, // 268: ok.identity.v1.Admin.SetName:output_type -> ok.identity.v1.SetNameResponse
-	108, // 269: ok.identity.v1.Admin.CreateRobot:output_type -> ok.identity.v1.CreateRobotResponse
-	110, // 270: ok.identity.v1.Admin.DeleteRobot:output_type -> ok.identity.v1.DeleteRobotResponse
-	112, // 271: ok.identity.v1.Admin.ListRobots:output_type -> ok.identity.v1.ListRobotsResponse
-	114, // 272: ok.identity.v1.Admin.Bind:output_type -> ok.identity.v1.BindResponse
-	116, // 273: ok.identity.v1.Admin.Unbind:output_type -> ok.identity.v1.UnbindResponse
-	118, // 274: ok.identity.v1.Admin.CertifyRobot:output_type -> ok.identity.v1.CertifyRobotResponse
-	120, // 275: ok.identity.v1.Admin.RevokeCredential:output_type -> ok.identity.v1.RevokeCredentialResponse
-	122, // 276: ok.identity.v1.Admin.ListCredentials:output_type -> ok.identity.v1.AdminListCredentialsResponse
-	97,  // 277: ok.identity.v1.Admin.MoveNetwork:output_type -> ok.identity.v1.Move
-	99,  // 278: ok.identity.v1.Admin.ListMoves:output_type -> ok.identity.v1.ListMovesResponse
-	97,  // 279: ok.identity.v1.Admin.CancelMove:output_type -> ok.identity.v1.Move
-	90,  // 280: ok.identity.v1.Admin.SetQuota:output_type -> ok.identity.v1.Quota
-	90,  // 281: ok.identity.v1.Admin.GetQuota:output_type -> ok.identity.v1.Quota
-	95,  // 282: ok.identity.v1.Quotas.GetQuotas:output_type -> ok.identity.v1.GetQuotasResponse
-	94,  // 283: ok.identity.v1.Quotas.ReportUsage:output_type -> ok.identity.v1.ReportUsageResponse
-	125, // 284: ok.identity.v1.Tree.Plan:output_type -> ok.identity.v1.PlanResponse
-	127, // 285: ok.identity.v1.Tree.Apply:output_type -> ok.identity.v1.ApplyResponse
-	129, // 286: ok.identity.v1.Tree.GetApplied:output_type -> ok.identity.v1.GetAppliedResponse
-	132, // 287: ok.identity.v1.DirectoryEvents.Read:output_type -> ok.identity.v1.ReadDirectoryEventsResponse
-	134, // 288: ok.identity.v1.DirectoryEvents.Heads:output_type -> ok.identity.v1.DirectoryHeadsResponse
-	158, // 289: ok.identity.v1.Tenancy.CreateOrganization:output_type -> ok.identity.v1.Organization
-	158, // 290: ok.identity.v1.Tenancy.GetOrganization:output_type -> ok.identity.v1.Organization
-	163, // 291: ok.identity.v1.Tenancy.DeleteOrganization:output_type -> ok.identity.v1.DeletionInfo
-	165, // 292: ok.identity.v1.Tenancy.RestoreOrganization:output_type -> ok.identity.v1.RestoreResponse
-	163, // 293: ok.identity.v1.Tenancy.DeleteAccount:output_type -> ok.identity.v1.DeletionInfo
-	158, // 294: ok.identity.v1.Tenancy.UpdateOrganization:output_type -> ok.identity.v1.Organization
-	168, // 295: ok.identity.v1.Tenancy.SetRegion:output_type -> ok.identity.v1.Region
-	168, // 296: ok.identity.v1.Tenancy.GetRegion:output_type -> ok.identity.v1.Region
-	232, // 297: ok.identity.v1.Tenancy.SetSecretsRoot:output_type -> ok.identity.v1.SecretsRoot
-	232, // 298: ok.identity.v1.Tenancy.GetSecretsRoot:output_type -> ok.identity.v1.SecretsRoot
-	172, // 299: ok.identity.v1.Tenancy.ListMembers:output_type -> ok.identity.v1.ListMembersResponse
-	174, // 300: ok.identity.v1.Tenancy.SetMember:output_type -> ok.identity.v1.SetMemberResponse
-	176, // 301: ok.identity.v1.Tenancy.RemoveMember:output_type -> ok.identity.v1.RemoveMemberResponse
-	177, // 302: ok.identity.v1.Tenancy.CreateTeam:output_type -> ok.identity.v1.Team
-	180, // 303: ok.identity.v1.Tenancy.ListTeams:output_type -> ok.identity.v1.ListTeamsResponse
-	177, // 304: ok.identity.v1.Tenancy.AddTeamMember:output_type -> ok.identity.v1.Team
-	177, // 305: ok.identity.v1.Tenancy.RemoveTeamMember:output_type -> ok.identity.v1.Team
-	207, // 306: ok.identity.v1.Tenancy.DeleteTeam:output_type -> ok.identity.v1.DeleteTeamResponse
-	181, // 307: ok.identity.v1.Tenancy.CreateOrganizationRobot:output_type -> ok.identity.v1.OrganizationRobot
-	201, // 308: ok.identity.v1.Tenancy.ListOrganizationRobots:output_type -> ok.identity.v1.ListOrganizationRobotsResponse
-	118, // 309: ok.identity.v1.Tenancy.CertifyOrganizationRobot:output_type -> ok.identity.v1.CertifyRobotResponse
-	204, // 310: ok.identity.v1.Tenancy.DeleteOrganizationRobot:output_type -> ok.identity.v1.DeleteOrganizationRobotResponse
-	184, // 311: ok.identity.v1.Tenancy.TrustIssuer:output_type -> ok.identity.v1.OrganizationIssuers
-	184, // 312: ok.identity.v1.Tenancy.DistrustIssuer:output_type -> ok.identity.v1.OrganizationIssuers
-	184, // 313: ok.identity.v1.Tenancy.ListIssuers:output_type -> ok.identity.v1.OrganizationIssuers
-	181, // 314: ok.identity.v1.Tenancy.BindOrganizationRobot:output_type -> ok.identity.v1.OrganizationRobot
-	181, // 315: ok.identity.v1.Tenancy.UnbindOrganizationRobot:output_type -> ok.identity.v1.OrganizationRobot
-	195, // 316: ok.identity.v1.Tenancy.SetIdentityProvider:output_type -> ok.identity.v1.IdentityProviderInfo
-	195, // 317: ok.identity.v1.Tenancy.GetIdentityProvider:output_type -> ok.identity.v1.IdentityProviderInfo
-	195, // 318: ok.identity.v1.Tenancy.SyncIdentityProvider:output_type -> ok.identity.v1.IdentityProviderInfo
-	196, // 319: ok.identity.v1.Tenancy.RemoveIdentityProvider:output_type -> ok.identity.v1.RemoveIdentityProviderResponse
-	197, // 320: ok.identity.v1.Tenancy.ResetSCIMToken:output_type -> ok.identity.v1.ResetSCIMTokenResponse
-	208, // 321: ok.identity.v1.Tenancy.ReserveRepository:output_type -> ok.identity.v1.RepositoryEntry
-	208, // 322: ok.identity.v1.Tenancy.ActivateRepository:output_type -> ok.identity.v1.RepositoryEntry
-	210, // 323: ok.identity.v1.Tenancy.AbandonRepository:output_type -> ok.identity.v1.AbandonRepositoryResponse
-	213, // 324: ok.identity.v1.Tenancy.ListExpiredRepositories:output_type -> ok.identity.v1.ListExpiredRepositoriesResponse
-	211, // 325: ok.identity.v1.Tenancy.GetExpiry:output_type -> ok.identity.v1.Expiry
-	211, // 326: ok.identity.v1.Tenancy.PurgeRepository:output_type -> ok.identity.v1.Expiry
-	208, // 327: ok.identity.v1.Tenancy.ResolveRepository:output_type -> ok.identity.v1.RepositoryEntry
-	208, // 328: ok.identity.v1.Tenancy.GetRepositoryEntry:output_type -> ok.identity.v1.RepositoryEntry
-	217, // 329: ok.identity.v1.Tenancy.ListRepositoryEntries:output_type -> ok.identity.v1.ListRepositoryEntriesResponse
-	156, // 330: ok.identity.v1.Tenancy.Search:output_type -> ok.identity.v1.SearchResponse
-	208, // 331: ok.identity.v1.Tenancy.UpdateRepository:output_type -> ok.identity.v1.RepositoryEntry
-	208, // 332: ok.identity.v1.Tenancy.RenameRepository:output_type -> ok.identity.v1.RepositoryEntry
-	208, // 333: ok.identity.v1.Tenancy.TransferRepository:output_type -> ok.identity.v1.RepositoryEntry
-	208, // 334: ok.identity.v1.Tenancy.DeleteRepository:output_type -> ok.identity.v1.RepositoryEntry
-	208, // 335: ok.identity.v1.Tenancy.RestoreRepository:output_type -> ok.identity.v1.RepositoryEntry
-	222, // 336: ok.identity.v1.Tenancy.ListGrants:output_type -> ok.identity.v1.ListGrantsResponse
-	224, // 337: ok.identity.v1.Tenancy.SetGrant:output_type -> ok.identity.v1.SetGrantResponse
-	226, // 338: ok.identity.v1.Tenancy.RemoveGrant:output_type -> ok.identity.v1.RemoveGrantResponse
-	148, // 339: ok.identity.v1.Inbox.ListInbox:output_type -> ok.identity.v1.ListInboxResponse
-	146, // 340: ok.identity.v1.Delivery.SetInbox:output_type -> ok.identity.v1.SetInboxResponse
-	137, // 341: ok.identity.v1.Delivery.Notify:output_type -> ok.identity.v1.NotifyResponse
-	139, // 342: ok.identity.v1.Notifications.ListNotifications:output_type -> ok.identity.v1.ListNotificationsResponse
-	141, // 343: ok.identity.v1.Notifications.MarkRead:output_type -> ok.identity.v1.MarkReadResponse
-	143, // 344: ok.identity.v1.Notifications.GetNotificationPreferences:output_type -> ok.identity.v1.NotificationPreferences
-	143, // 345: ok.identity.v1.Notifications.SetNotificationPreferences:output_type -> ok.identity.v1.NotificationPreferences
-	152, // 346: ok.identity.v1.DeployAgents.SetDeployAgent:output_type -> ok.identity.v1.DeployAgent
-	152, // 347: ok.identity.v1.DeployAgents.GetDeployAgent:output_type -> ok.identity.v1.DeployAgent
-	154, // 348: ok.identity.v1.DeployAgents.DeployCells:output_type -> ok.identity.v1.DeployCellsResponse
-	149, // 349: ok.identity.v1.DeployAgents.AgentRepository:output_type -> ok.identity.v1.AgentRepositoryResponse
-	229, // 350: ok.identity.v1.Approvals.StartApproval:output_type -> ok.identity.v1.Approval
-	229, // 351: ok.identity.v1.Approvals.GetApproval:output_type -> ok.identity.v1.Approval
-	232, // 352: ok.identity.v1.SecretsRoots.GetRepositorySecretsRoot:output_type -> ok.identity.v1.SecretsRoot
-	230, // [230:353] is the sub-list for method output_type
-	107, // [107:230] is the sub-list for method input_type
-	107, // [107:107] is the sub-list for extension type_name
-	107, // [107:107] is the sub-list for extension extendee
-	0,   // [0:107] is the sub-list for field type_name
+	239, // 101: ok.identity.v1.Expiry.expires_at:type_name -> google.protobuf.Timestamp
+	213, // 102: ok.identity.v1.ListExpiredRepositoriesResponse.repositories:type_name -> ok.identity.v1.Expiry
+	210, // 103: ok.identity.v1.ListRepositoryEntriesResponse.repositories:type_name -> ok.identity.v1.RepositoryEntry
+	223, // 104: ok.identity.v1.ListGrantsResponse.grants:type_name -> ok.identity.v1.RepositoryGrant
+	223, // 105: ok.identity.v1.SetGrantRequest.grant:type_name -> ok.identity.v1.RepositoryGrant
+	239, // 106: ok.identity.v1.Approval.expires_at:type_name -> google.protobuf.Timestamp
+	9,   // 107: ok.identity.v1.Approval.state:type_name -> ok.identity.v1.Approval.State
+	17,  // 108: ok.identity.v1.Directory.GetPrincipal:input_type -> ok.identity.v1.GetPrincipalRequest
+	19,  // 109: ok.identity.v1.Directory.ListPrincipals:input_type -> ok.identity.v1.ListPrincipalsRequest
+	21,  // 110: ok.identity.v1.Directory.ListRetiredNames:input_type -> ok.identity.v1.ListRetiredNamesRequest
+	23,  // 111: ok.identity.v1.Directory.GetSet:input_type -> ok.identity.v1.GetSetRequest
+	25,  // 112: ok.identity.v1.Directory.ListSets:input_type -> ok.identity.v1.ListSetsRequest
+	27,  // 113: ok.identity.v1.Directory.ExpandSet:input_type -> ok.identity.v1.ExpandSetRequest
+	29,  // 114: ok.identity.v1.Directory.CheckMembership:input_type -> ok.identity.v1.CheckMembershipRequest
+	15,  // 115: ok.identity.v1.Directory.CheckAdmin:input_type -> ok.identity.v1.CheckAdminRequest
+	13,  // 116: ok.identity.v1.Directory.ListAdmins:input_type -> ok.identity.v1.ListAdminsRequest
+	33,  // 117: ok.identity.v1.Authorization.Facts:input_type -> ok.identity.v1.FactsRequest
+	31,  // 118: ok.identity.v1.Authorization.Admins:input_type -> ok.identity.v1.AdminsRequest
+	36,  // 119: ok.identity.v1.Cells.ListCells:input_type -> ok.identity.v1.ListCellsRequest
+	37,  // 120: ok.identity.v1.Cells.Route:input_type -> ok.identity.v1.RouteRequest
+	65,  // 121: ok.identity.v1.Verify.GetCredential:input_type -> ok.identity.v1.GetCredentialRequest
+	67,  // 122: ok.identity.v1.Verify.GetSession:input_type -> ok.identity.v1.GetSessionRequest
+	40,  // 123: ok.identity.v1.Verify.GetToken:input_type -> ok.identity.v1.GetTokenRequest
+	43,  // 124: ok.identity.v1.Apps.CreateApp:input_type -> ok.identity.v1.CreateAppRequest
+	44,  // 125: ok.identity.v1.Apps.ListApps:input_type -> ok.identity.v1.ListAppsRequest
+	46,  // 126: ok.identity.v1.Apps.SetAppKey:input_type -> ok.identity.v1.SetAppKeyRequest
+	47,  // 127: ok.identity.v1.Apps.DeleteApp:input_type -> ok.identity.v1.AppRef
+	50,  // 128: ok.identity.v1.Apps.InstallApp:input_type -> ok.identity.v1.InstallAppRequest
+	51,  // 129: ok.identity.v1.Apps.ListInstallations:input_type -> ok.identity.v1.ListInstallationsRequest
+	53,  // 130: ok.identity.v1.Apps.UninstallApp:input_type -> ok.identity.v1.UninstallAppRequest
+	55,  // 131: ok.identity.v1.AppTokens.ListAppInstallations:input_type -> ok.identity.v1.AppAssertion
+	56,  // 132: ok.identity.v1.AppTokens.CreateInstallationToken:input_type -> ok.identity.v1.CreateInstallationTokenRequest
+	59,  // 133: ok.identity.v1.Tokens.CreateToken:input_type -> ok.identity.v1.CreateTokenRequest
+	61,  // 134: ok.identity.v1.Tokens.ListTokens:input_type -> ok.identity.v1.ListTokensRequest
+	63,  // 135: ok.identity.v1.Tokens.RevokeToken:input_type -> ok.identity.v1.RevokeTokenRequest
+	69,  // 136: ok.identity.v1.CA.GetRoots:input_type -> ok.identity.v1.GetRootsRequest
+	73,  // 137: ok.identity.v1.DeviceLogin.Start:input_type -> ok.identity.v1.StartRequest
+	75,  // 138: ok.identity.v1.DeviceLogin.Poll:input_type -> ok.identity.v1.PollRequest
+	79,  // 139: ok.identity.v1.Credentials.Renew:input_type -> ok.identity.v1.RenewRequest
+	81,  // 140: ok.identity.v1.Credentials.List:input_type -> ok.identity.v1.ListCredentialsRequest
+	83,  // 141: ok.identity.v1.Credentials.Revoke:input_type -> ok.identity.v1.RevokeRequest
+	77,  // 142: ok.identity.v1.Credentials.Certify:input_type -> ok.identity.v1.CertifyRequest
+	101, // 143: ok.identity.v1.Admin.Sync:input_type -> ok.identity.v1.SyncRequest
+	166, // 144: ok.identity.v1.Admin.RestoreAccount:input_type -> ok.identity.v1.RestoreAccountRequest
+	103, // 145: ok.identity.v1.Admin.GetSyncStatus:input_type -> ok.identity.v1.GetSyncStatusRequest
+	105, // 146: ok.identity.v1.Admin.SetName:input_type -> ok.identity.v1.SetNameRequest
+	107, // 147: ok.identity.v1.Admin.CreateRobot:input_type -> ok.identity.v1.CreateRobotRequest
+	109, // 148: ok.identity.v1.Admin.DeleteRobot:input_type -> ok.identity.v1.DeleteRobotRequest
+	111, // 149: ok.identity.v1.Admin.ListRobots:input_type -> ok.identity.v1.ListRobotsRequest
+	113, // 150: ok.identity.v1.Admin.Bind:input_type -> ok.identity.v1.BindRequest
+	115, // 151: ok.identity.v1.Admin.Unbind:input_type -> ok.identity.v1.UnbindRequest
+	117, // 152: ok.identity.v1.Admin.CertifyRobot:input_type -> ok.identity.v1.CertifyRobotRequest
+	119, // 153: ok.identity.v1.Admin.RevokeCredential:input_type -> ok.identity.v1.RevokeCredentialRequest
+	121, // 154: ok.identity.v1.Admin.ListCredentials:input_type -> ok.identity.v1.AdminListCredentialsRequest
+	96,  // 155: ok.identity.v1.Admin.MoveNetwork:input_type -> ok.identity.v1.MoveNetworkRequest
+	98,  // 156: ok.identity.v1.Admin.ListMoves:input_type -> ok.identity.v1.ListMovesRequest
+	100, // 157: ok.identity.v1.Admin.CancelMove:input_type -> ok.identity.v1.CancelMoveRequest
+	88,  // 158: ok.identity.v1.Admin.SetQuota:input_type -> ok.identity.v1.SetQuotaRequest
+	89,  // 159: ok.identity.v1.Admin.GetQuota:input_type -> ok.identity.v1.GetQuotaRequest
+	91,  // 160: ok.identity.v1.Quotas.GetQuotas:input_type -> ok.identity.v1.GetQuotasRequest
+	92,  // 161: ok.identity.v1.Quotas.ReportUsage:input_type -> ok.identity.v1.ReportUsageRequest
+	124, // 162: ok.identity.v1.Tree.Plan:input_type -> ok.identity.v1.PlanRequest
+	126, // 163: ok.identity.v1.Tree.Apply:input_type -> ok.identity.v1.ApplyRequest
+	128, // 164: ok.identity.v1.Tree.GetApplied:input_type -> ok.identity.v1.GetAppliedRequest
+	133, // 165: ok.identity.v1.DirectoryEvents.Read:input_type -> ok.identity.v1.ReadDirectoryEventsRequest
+	135, // 166: ok.identity.v1.DirectoryEvents.Heads:input_type -> ok.identity.v1.DirectoryHeadsRequest
+	130, // 167: ok.identity.v1.DirectoryEvents.Follow:input_type -> ok.identity.v1.FollowDirectoryRequest
+	161, // 168: ok.identity.v1.Tenancy.CreateOrganization:input_type -> ok.identity.v1.CreateOrganizationRequest
+	162, // 169: ok.identity.v1.Tenancy.GetOrganization:input_type -> ok.identity.v1.GetOrganizationRequest
+	163, // 170: ok.identity.v1.Tenancy.DeleteOrganization:input_type -> ok.identity.v1.OrganizationDeletionRequest
+	163, // 171: ok.identity.v1.Tenancy.RestoreOrganization:input_type -> ok.identity.v1.OrganizationDeletionRequest
+	164, // 172: ok.identity.v1.Tenancy.DeleteAccount:input_type -> ok.identity.v1.DeleteAccountRequest
+	171, // 173: ok.identity.v1.Tenancy.UpdateOrganization:input_type -> ok.identity.v1.UpdateOrganizationRequest
+	168, // 174: ok.identity.v1.Tenancy.SetRegion:input_type -> ok.identity.v1.SetRegionRequest
+	169, // 175: ok.identity.v1.Tenancy.GetRegion:input_type -> ok.identity.v1.GetRegionRequest
+	232, // 176: ok.identity.v1.Tenancy.SetSecretsRoot:input_type -> ok.identity.v1.SetSecretsRootRequest
+	233, // 177: ok.identity.v1.Tenancy.GetSecretsRoot:input_type -> ok.identity.v1.GetSecretsRootRequest
+	173, // 178: ok.identity.v1.Tenancy.ListMembers:input_type -> ok.identity.v1.ListMembersRequest
+	175, // 179: ok.identity.v1.Tenancy.SetMember:input_type -> ok.identity.v1.SetMemberRequest
+	177, // 180: ok.identity.v1.Tenancy.RemoveMember:input_type -> ok.identity.v1.RemoveMemberRequest
+	180, // 181: ok.identity.v1.Tenancy.CreateTeam:input_type -> ok.identity.v1.CreateTeamRequest
+	181, // 182: ok.identity.v1.Tenancy.ListTeams:input_type -> ok.identity.v1.ListTeamsRequest
+	207, // 183: ok.identity.v1.Tenancy.AddTeamMember:input_type -> ok.identity.v1.TeamMemberRequest
+	207, // 184: ok.identity.v1.Tenancy.RemoveTeamMember:input_type -> ok.identity.v1.TeamMemberRequest
+	208, // 185: ok.identity.v1.Tenancy.DeleteTeam:input_type -> ok.identity.v1.DeleteTeamRequest
+	201, // 186: ok.identity.v1.Tenancy.CreateOrganizationRobot:input_type -> ok.identity.v1.CreateOrganizationRobotRequest
+	202, // 187: ok.identity.v1.Tenancy.ListOrganizationRobots:input_type -> ok.identity.v1.ListOrganizationRobotsRequest
+	204, // 188: ok.identity.v1.Tenancy.CertifyOrganizationRobot:input_type -> ok.identity.v1.CertifyOrganizationRobotRequest
+	205, // 189: ok.identity.v1.Tenancy.DeleteOrganizationRobot:input_type -> ok.identity.v1.DeleteOrganizationRobotRequest
+	184, // 190: ok.identity.v1.Tenancy.TrustIssuer:input_type -> ok.identity.v1.OrganizationIssuerRequest
+	184, // 191: ok.identity.v1.Tenancy.DistrustIssuer:input_type -> ok.identity.v1.OrganizationIssuerRequest
+	185, // 192: ok.identity.v1.Tenancy.ListIssuers:input_type -> ok.identity.v1.ListIssuersRequest
+	200, // 193: ok.identity.v1.Tenancy.BindOrganizationRobot:input_type -> ok.identity.v1.OrganizationRobotBindingRequest
+	200, // 194: ok.identity.v1.Tenancy.UnbindOrganizationRobot:input_type -> ok.identity.v1.OrganizationRobotBindingRequest
+	195, // 195: ok.identity.v1.Tenancy.SetIdentityProvider:input_type -> ok.identity.v1.SetIdentityProviderRequest
+	196, // 196: ok.identity.v1.Tenancy.GetIdentityProvider:input_type -> ok.identity.v1.IdentityProviderRequest
+	196, // 197: ok.identity.v1.Tenancy.SyncIdentityProvider:input_type -> ok.identity.v1.IdentityProviderRequest
+	196, // 198: ok.identity.v1.Tenancy.RemoveIdentityProvider:input_type -> ok.identity.v1.IdentityProviderRequest
+	196, // 199: ok.identity.v1.Tenancy.ResetSCIMToken:input_type -> ok.identity.v1.IdentityProviderRequest
+	216, // 200: ok.identity.v1.Tenancy.ReserveRepository:input_type -> ok.identity.v1.ReserveRepositoryRequest
+	211, // 201: ok.identity.v1.Tenancy.ActivateRepository:input_type -> ok.identity.v1.RepositoryRef
+	211, // 202: ok.identity.v1.Tenancy.AbandonRepository:input_type -> ok.identity.v1.RepositoryRef
+	214, // 203: ok.identity.v1.Tenancy.ListExpiredRepositories:input_type -> ok.identity.v1.ListExpiredRepositoriesRequest
+	211, // 204: ok.identity.v1.Tenancy.GetExpiry:input_type -> ok.identity.v1.RepositoryRef
+	211, // 205: ok.identity.v1.Tenancy.PurgeRepository:input_type -> ok.identity.v1.RepositoryRef
+	217, // 206: ok.identity.v1.Tenancy.ResolveRepository:input_type -> ok.identity.v1.ResolveRepositoryRequest
+	211, // 207: ok.identity.v1.Tenancy.GetRepositoryEntry:input_type -> ok.identity.v1.RepositoryRef
+	218, // 208: ok.identity.v1.Tenancy.ListRepositoryEntries:input_type -> ok.identity.v1.ListRepositoryEntriesRequest
+	157, // 209: ok.identity.v1.Tenancy.Search:input_type -> ok.identity.v1.SearchRequest
+	220, // 210: ok.identity.v1.Tenancy.UpdateRepository:input_type -> ok.identity.v1.UpdateRepositoryRequest
+	221, // 211: ok.identity.v1.Tenancy.RenameRepository:input_type -> ok.identity.v1.RenameRepositoryEntryRequest
+	222, // 212: ok.identity.v1.Tenancy.TransferRepository:input_type -> ok.identity.v1.TransferRepositoryRequest
+	211, // 213: ok.identity.v1.Tenancy.DeleteRepository:input_type -> ok.identity.v1.RepositoryRef
+	211, // 214: ok.identity.v1.Tenancy.RestoreRepository:input_type -> ok.identity.v1.RepositoryRef
+	211, // 215: ok.identity.v1.Tenancy.ListGrants:input_type -> ok.identity.v1.RepositoryRef
+	225, // 216: ok.identity.v1.Tenancy.SetGrant:input_type -> ok.identity.v1.SetGrantRequest
+	227, // 217: ok.identity.v1.Tenancy.RemoveGrant:input_type -> ok.identity.v1.RemoveGrantRequest
+	149, // 218: ok.identity.v1.Inbox.ListInbox:input_type -> ok.identity.v1.ListInboxRequest
+	147, // 219: ok.identity.v1.Delivery.SetInbox:input_type -> ok.identity.v1.SetInboxRequest
+	138, // 220: ok.identity.v1.Delivery.Notify:input_type -> ok.identity.v1.NotifyRequest
+	140, // 221: ok.identity.v1.Notifications.ListNotifications:input_type -> ok.identity.v1.ListNotificationsRequest
+	142, // 222: ok.identity.v1.Notifications.MarkRead:input_type -> ok.identity.v1.MarkReadRequest
+	144, // 223: ok.identity.v1.Notifications.GetNotificationPreferences:input_type -> ok.identity.v1.GetNotificationPreferencesRequest
+	145, // 224: ok.identity.v1.Notifications.SetNotificationPreferences:input_type -> ok.identity.v1.NotificationPreferences
+	152, // 225: ok.identity.v1.DeployAgents.SetDeployAgent:input_type -> ok.identity.v1.SetDeployAgentRequest
+	153, // 226: ok.identity.v1.DeployAgents.GetDeployAgent:input_type -> ok.identity.v1.GetDeployAgentRequest
+	155, // 227: ok.identity.v1.DeployAgents.DeployCells:input_type -> ok.identity.v1.DeployCellsRequest
+	211, // 228: ok.identity.v1.DeployAgents.AgentRepository:input_type -> ok.identity.v1.RepositoryRef
+	229, // 229: ok.identity.v1.Approvals.StartApproval:input_type -> ok.identity.v1.StartApprovalRequest
+	230, // 230: ok.identity.v1.Approvals.GetApproval:input_type -> ok.identity.v1.GetApprovalRequest
+	235, // 231: ok.identity.v1.SecretsRoots.GetRepositorySecretsRoot:input_type -> ok.identity.v1.GetRepositorySecretsRootRequest
+	18,  // 232: ok.identity.v1.Directory.GetPrincipal:output_type -> ok.identity.v1.GetPrincipalResponse
+	20,  // 233: ok.identity.v1.Directory.ListPrincipals:output_type -> ok.identity.v1.ListPrincipalsResponse
+	22,  // 234: ok.identity.v1.Directory.ListRetiredNames:output_type -> ok.identity.v1.ListRetiredNamesResponse
+	24,  // 235: ok.identity.v1.Directory.GetSet:output_type -> ok.identity.v1.GetSetResponse
+	26,  // 236: ok.identity.v1.Directory.ListSets:output_type -> ok.identity.v1.ListSetsResponse
+	28,  // 237: ok.identity.v1.Directory.ExpandSet:output_type -> ok.identity.v1.ExpandSetResponse
+	30,  // 238: ok.identity.v1.Directory.CheckMembership:output_type -> ok.identity.v1.CheckMembershipResponse
+	16,  // 239: ok.identity.v1.Directory.CheckAdmin:output_type -> ok.identity.v1.CheckAdminResponse
+	14,  // 240: ok.identity.v1.Directory.ListAdmins:output_type -> ok.identity.v1.ListAdminsResponse
+	34,  // 241: ok.identity.v1.Authorization.Facts:output_type -> ok.identity.v1.FactsResponse
+	32,  // 242: ok.identity.v1.Authorization.Admins:output_type -> ok.identity.v1.AdminsResponse
+	39,  // 243: ok.identity.v1.Cells.ListCells:output_type -> ok.identity.v1.ListCellsResponse
+	38,  // 244: ok.identity.v1.Cells.Route:output_type -> ok.identity.v1.RouteResponse
+	66,  // 245: ok.identity.v1.Verify.GetCredential:output_type -> ok.identity.v1.GetCredentialResponse
+	68,  // 246: ok.identity.v1.Verify.GetSession:output_type -> ok.identity.v1.GetSessionResponse
+	41,  // 247: ok.identity.v1.Verify.GetToken:output_type -> ok.identity.v1.GetTokenResponse
+	42,  // 248: ok.identity.v1.Apps.CreateApp:output_type -> ok.identity.v1.AppInfo
+	45,  // 249: ok.identity.v1.Apps.ListApps:output_type -> ok.identity.v1.ListAppsResponse
+	42,  // 250: ok.identity.v1.Apps.SetAppKey:output_type -> ok.identity.v1.AppInfo
+	48,  // 251: ok.identity.v1.Apps.DeleteApp:output_type -> ok.identity.v1.DeleteAppResponse
+	49,  // 252: ok.identity.v1.Apps.InstallApp:output_type -> ok.identity.v1.AppInstallation
+	52,  // 253: ok.identity.v1.Apps.ListInstallations:output_type -> ok.identity.v1.ListInstallationsResponse
+	54,  // 254: ok.identity.v1.Apps.UninstallApp:output_type -> ok.identity.v1.UninstallAppResponse
+	52,  // 255: ok.identity.v1.AppTokens.ListAppInstallations:output_type -> ok.identity.v1.ListInstallationsResponse
+	57,  // 256: ok.identity.v1.AppTokens.CreateInstallationToken:output_type -> ok.identity.v1.CreateInstallationTokenResponse
+	60,  // 257: ok.identity.v1.Tokens.CreateToken:output_type -> ok.identity.v1.CreateTokenResponse
+	62,  // 258: ok.identity.v1.Tokens.ListTokens:output_type -> ok.identity.v1.ListTokensResponse
+	64,  // 259: ok.identity.v1.Tokens.RevokeToken:output_type -> ok.identity.v1.RevokeTokenResponse
+	70,  // 260: ok.identity.v1.CA.GetRoots:output_type -> ok.identity.v1.GetRootsResponse
+	74,  // 261: ok.identity.v1.DeviceLogin.Start:output_type -> ok.identity.v1.StartResponse
+	76,  // 262: ok.identity.v1.DeviceLogin.Poll:output_type -> ok.identity.v1.PollResponse
+	80,  // 263: ok.identity.v1.Credentials.Renew:output_type -> ok.identity.v1.RenewResponse
+	82,  // 264: ok.identity.v1.Credentials.List:output_type -> ok.identity.v1.ListCredentialsResponse
+	84,  // 265: ok.identity.v1.Credentials.Revoke:output_type -> ok.identity.v1.RevokeResponse
+	78,  // 266: ok.identity.v1.Credentials.Certify:output_type -> ok.identity.v1.CertifyResponse
+	102, // 267: ok.identity.v1.Admin.Sync:output_type -> ok.identity.v1.SyncResponse
+	167, // 268: ok.identity.v1.Admin.RestoreAccount:output_type -> ok.identity.v1.RestoreResponse
+	104, // 269: ok.identity.v1.Admin.GetSyncStatus:output_type -> ok.identity.v1.GetSyncStatusResponse
+	106, // 270: ok.identity.v1.Admin.SetName:output_type -> ok.identity.v1.SetNameResponse
+	108, // 271: ok.identity.v1.Admin.CreateRobot:output_type -> ok.identity.v1.CreateRobotResponse
+	110, // 272: ok.identity.v1.Admin.DeleteRobot:output_type -> ok.identity.v1.DeleteRobotResponse
+	112, // 273: ok.identity.v1.Admin.ListRobots:output_type -> ok.identity.v1.ListRobotsResponse
+	114, // 274: ok.identity.v1.Admin.Bind:output_type -> ok.identity.v1.BindResponse
+	116, // 275: ok.identity.v1.Admin.Unbind:output_type -> ok.identity.v1.UnbindResponse
+	118, // 276: ok.identity.v1.Admin.CertifyRobot:output_type -> ok.identity.v1.CertifyRobotResponse
+	120, // 277: ok.identity.v1.Admin.RevokeCredential:output_type -> ok.identity.v1.RevokeCredentialResponse
+	122, // 278: ok.identity.v1.Admin.ListCredentials:output_type -> ok.identity.v1.AdminListCredentialsResponse
+	97,  // 279: ok.identity.v1.Admin.MoveNetwork:output_type -> ok.identity.v1.Move
+	99,  // 280: ok.identity.v1.Admin.ListMoves:output_type -> ok.identity.v1.ListMovesResponse
+	97,  // 281: ok.identity.v1.Admin.CancelMove:output_type -> ok.identity.v1.Move
+	90,  // 282: ok.identity.v1.Admin.SetQuota:output_type -> ok.identity.v1.Quota
+	90,  // 283: ok.identity.v1.Admin.GetQuota:output_type -> ok.identity.v1.Quota
+	95,  // 284: ok.identity.v1.Quotas.GetQuotas:output_type -> ok.identity.v1.GetQuotasResponse
+	94,  // 285: ok.identity.v1.Quotas.ReportUsage:output_type -> ok.identity.v1.ReportUsageResponse
+	125, // 286: ok.identity.v1.Tree.Plan:output_type -> ok.identity.v1.PlanResponse
+	127, // 287: ok.identity.v1.Tree.Apply:output_type -> ok.identity.v1.ApplyResponse
+	129, // 288: ok.identity.v1.Tree.GetApplied:output_type -> ok.identity.v1.GetAppliedResponse
+	134, // 289: ok.identity.v1.DirectoryEvents.Read:output_type -> ok.identity.v1.ReadDirectoryEventsResponse
+	136, // 290: ok.identity.v1.DirectoryEvents.Heads:output_type -> ok.identity.v1.DirectoryHeadsResponse
+	131, // 291: ok.identity.v1.DirectoryEvents.Follow:output_type -> ok.identity.v1.FollowDirectoryResponse
+	160, // 292: ok.identity.v1.Tenancy.CreateOrganization:output_type -> ok.identity.v1.Organization
+	160, // 293: ok.identity.v1.Tenancy.GetOrganization:output_type -> ok.identity.v1.Organization
+	165, // 294: ok.identity.v1.Tenancy.DeleteOrganization:output_type -> ok.identity.v1.DeletionInfo
+	167, // 295: ok.identity.v1.Tenancy.RestoreOrganization:output_type -> ok.identity.v1.RestoreResponse
+	165, // 296: ok.identity.v1.Tenancy.DeleteAccount:output_type -> ok.identity.v1.DeletionInfo
+	160, // 297: ok.identity.v1.Tenancy.UpdateOrganization:output_type -> ok.identity.v1.Organization
+	170, // 298: ok.identity.v1.Tenancy.SetRegion:output_type -> ok.identity.v1.Region
+	170, // 299: ok.identity.v1.Tenancy.GetRegion:output_type -> ok.identity.v1.Region
+	234, // 300: ok.identity.v1.Tenancy.SetSecretsRoot:output_type -> ok.identity.v1.SecretsRoot
+	234, // 301: ok.identity.v1.Tenancy.GetSecretsRoot:output_type -> ok.identity.v1.SecretsRoot
+	174, // 302: ok.identity.v1.Tenancy.ListMembers:output_type -> ok.identity.v1.ListMembersResponse
+	176, // 303: ok.identity.v1.Tenancy.SetMember:output_type -> ok.identity.v1.SetMemberResponse
+	178, // 304: ok.identity.v1.Tenancy.RemoveMember:output_type -> ok.identity.v1.RemoveMemberResponse
+	179, // 305: ok.identity.v1.Tenancy.CreateTeam:output_type -> ok.identity.v1.Team
+	182, // 306: ok.identity.v1.Tenancy.ListTeams:output_type -> ok.identity.v1.ListTeamsResponse
+	179, // 307: ok.identity.v1.Tenancy.AddTeamMember:output_type -> ok.identity.v1.Team
+	179, // 308: ok.identity.v1.Tenancy.RemoveTeamMember:output_type -> ok.identity.v1.Team
+	209, // 309: ok.identity.v1.Tenancy.DeleteTeam:output_type -> ok.identity.v1.DeleteTeamResponse
+	183, // 310: ok.identity.v1.Tenancy.CreateOrganizationRobot:output_type -> ok.identity.v1.OrganizationRobot
+	203, // 311: ok.identity.v1.Tenancy.ListOrganizationRobots:output_type -> ok.identity.v1.ListOrganizationRobotsResponse
+	118, // 312: ok.identity.v1.Tenancy.CertifyOrganizationRobot:output_type -> ok.identity.v1.CertifyRobotResponse
+	206, // 313: ok.identity.v1.Tenancy.DeleteOrganizationRobot:output_type -> ok.identity.v1.DeleteOrganizationRobotResponse
+	186, // 314: ok.identity.v1.Tenancy.TrustIssuer:output_type -> ok.identity.v1.OrganizationIssuers
+	186, // 315: ok.identity.v1.Tenancy.DistrustIssuer:output_type -> ok.identity.v1.OrganizationIssuers
+	186, // 316: ok.identity.v1.Tenancy.ListIssuers:output_type -> ok.identity.v1.OrganizationIssuers
+	183, // 317: ok.identity.v1.Tenancy.BindOrganizationRobot:output_type -> ok.identity.v1.OrganizationRobot
+	183, // 318: ok.identity.v1.Tenancy.UnbindOrganizationRobot:output_type -> ok.identity.v1.OrganizationRobot
+	197, // 319: ok.identity.v1.Tenancy.SetIdentityProvider:output_type -> ok.identity.v1.IdentityProviderInfo
+	197, // 320: ok.identity.v1.Tenancy.GetIdentityProvider:output_type -> ok.identity.v1.IdentityProviderInfo
+	197, // 321: ok.identity.v1.Tenancy.SyncIdentityProvider:output_type -> ok.identity.v1.IdentityProviderInfo
+	198, // 322: ok.identity.v1.Tenancy.RemoveIdentityProvider:output_type -> ok.identity.v1.RemoveIdentityProviderResponse
+	199, // 323: ok.identity.v1.Tenancy.ResetSCIMToken:output_type -> ok.identity.v1.ResetSCIMTokenResponse
+	210, // 324: ok.identity.v1.Tenancy.ReserveRepository:output_type -> ok.identity.v1.RepositoryEntry
+	210, // 325: ok.identity.v1.Tenancy.ActivateRepository:output_type -> ok.identity.v1.RepositoryEntry
+	212, // 326: ok.identity.v1.Tenancy.AbandonRepository:output_type -> ok.identity.v1.AbandonRepositoryResponse
+	215, // 327: ok.identity.v1.Tenancy.ListExpiredRepositories:output_type -> ok.identity.v1.ListExpiredRepositoriesResponse
+	213, // 328: ok.identity.v1.Tenancy.GetExpiry:output_type -> ok.identity.v1.Expiry
+	213, // 329: ok.identity.v1.Tenancy.PurgeRepository:output_type -> ok.identity.v1.Expiry
+	210, // 330: ok.identity.v1.Tenancy.ResolveRepository:output_type -> ok.identity.v1.RepositoryEntry
+	210, // 331: ok.identity.v1.Tenancy.GetRepositoryEntry:output_type -> ok.identity.v1.RepositoryEntry
+	219, // 332: ok.identity.v1.Tenancy.ListRepositoryEntries:output_type -> ok.identity.v1.ListRepositoryEntriesResponse
+	158, // 333: ok.identity.v1.Tenancy.Search:output_type -> ok.identity.v1.SearchResponse
+	210, // 334: ok.identity.v1.Tenancy.UpdateRepository:output_type -> ok.identity.v1.RepositoryEntry
+	210, // 335: ok.identity.v1.Tenancy.RenameRepository:output_type -> ok.identity.v1.RepositoryEntry
+	210, // 336: ok.identity.v1.Tenancy.TransferRepository:output_type -> ok.identity.v1.RepositoryEntry
+	210, // 337: ok.identity.v1.Tenancy.DeleteRepository:output_type -> ok.identity.v1.RepositoryEntry
+	210, // 338: ok.identity.v1.Tenancy.RestoreRepository:output_type -> ok.identity.v1.RepositoryEntry
+	224, // 339: ok.identity.v1.Tenancy.ListGrants:output_type -> ok.identity.v1.ListGrantsResponse
+	226, // 340: ok.identity.v1.Tenancy.SetGrant:output_type -> ok.identity.v1.SetGrantResponse
+	228, // 341: ok.identity.v1.Tenancy.RemoveGrant:output_type -> ok.identity.v1.RemoveGrantResponse
+	150, // 342: ok.identity.v1.Inbox.ListInbox:output_type -> ok.identity.v1.ListInboxResponse
+	148, // 343: ok.identity.v1.Delivery.SetInbox:output_type -> ok.identity.v1.SetInboxResponse
+	139, // 344: ok.identity.v1.Delivery.Notify:output_type -> ok.identity.v1.NotifyResponse
+	141, // 345: ok.identity.v1.Notifications.ListNotifications:output_type -> ok.identity.v1.ListNotificationsResponse
+	143, // 346: ok.identity.v1.Notifications.MarkRead:output_type -> ok.identity.v1.MarkReadResponse
+	145, // 347: ok.identity.v1.Notifications.GetNotificationPreferences:output_type -> ok.identity.v1.NotificationPreferences
+	145, // 348: ok.identity.v1.Notifications.SetNotificationPreferences:output_type -> ok.identity.v1.NotificationPreferences
+	154, // 349: ok.identity.v1.DeployAgents.SetDeployAgent:output_type -> ok.identity.v1.DeployAgent
+	154, // 350: ok.identity.v1.DeployAgents.GetDeployAgent:output_type -> ok.identity.v1.DeployAgent
+	156, // 351: ok.identity.v1.DeployAgents.DeployCells:output_type -> ok.identity.v1.DeployCellsResponse
+	151, // 352: ok.identity.v1.DeployAgents.AgentRepository:output_type -> ok.identity.v1.AgentRepositoryResponse
+	231, // 353: ok.identity.v1.Approvals.StartApproval:output_type -> ok.identity.v1.Approval
+	231, // 354: ok.identity.v1.Approvals.GetApproval:output_type -> ok.identity.v1.Approval
+	234, // 355: ok.identity.v1.SecretsRoots.GetRepositorySecretsRoot:output_type -> ok.identity.v1.SecretsRoot
+	232, // [232:356] is the sub-list for method output_type
+	108, // [108:232] is the sub-list for method input_type
+	108, // [108:108] is the sub-list for extension type_name
+	108, // [108:108] is the sub-list for extension extendee
+	0,   // [0:108] is the sub-list for field type_name
 }
 
 func init() { file_proto_ok_identity_v1_identity_proto_init() }
@@ -15198,7 +15272,7 @@ func file_proto_ok_identity_v1_identity_proto_init() {
 		(*CheckMembershipRequest_Principal)(nil),
 		(*CheckMembershipRequest_PrincipalId)(nil),
 	}
-	file_proto_ok_identity_v1_identity_proto_msgTypes[141].OneofWrappers = []any{
+	file_proto_ok_identity_v1_identity_proto_msgTypes[143].OneofWrappers = []any{
 		(*GetDeployAgentRequest_Handle)(nil),
 		(*GetDeployAgentRequest_AccountId)(nil),
 		(*GetDeployAgentRequest_RobotId)(nil),
@@ -15209,7 +15283,7 @@ func file_proto_ok_identity_v1_identity_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_ok_identity_v1_identity_proto_rawDesc), len(file_proto_ok_identity_v1_identity_proto_rawDesc)),
 			NumEnums:      10,
-			NumMessages:   227,
+			NumMessages:   229,
 			NumExtensions: 0,
 			NumServices:   21,
 		},

@@ -20,6 +20,7 @@ import (
 	"github.com/Cidan/ok/internal/automation/store"
 	"github.com/Cidan/ok/internal/blob"
 	"github.com/Cidan/ok/internal/bus"
+	"github.com/Cidan/ok/internal/work/worktest"
 )
 
 // env makes a test's stores, each over a new backend open makes and a bucket of its own, its
@@ -28,11 +29,17 @@ type env struct {
 	open     func(t *testing.T) store.Backend
 	backends map[*store.Store]store.Backend
 	blobs    map[*store.Store]blob.Store
-	// signals are the test's replicas', each store's among them.
-	signals bus.Signals
+	// queue is the test's replicas' bus: their dispatch queue, and their inboxes.
+	queue bus.Queue
 }
 
 func (e *env) newStore(t *testing.T, cfg store.Config) *store.Store {
+	t.Helper()
+	return e.newStoreOver(t, e.open(t), cfg)
+}
+
+// newStoreOver is newStore over b.
+func (e *env) newStoreOver(t *testing.T, b store.Backend, cfg store.Config) *store.Store {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -40,13 +47,27 @@ func (e *env) newStore(t *testing.T, cfg store.Config) *store.Store {
 	if err != nil {
 		t.Fatal(err)
 	}
-	b := e.open(t)
-	cfg.Signals = e.signals
+	if cfg.Dispatch == nil {
+		cfg.Dispatch = e.queue
+	}
 	s := store.New(b, blobs, cfg)
 	e.backends[s] = b
 	e.blobs[s] = blobs
-	go s.Listen(ctx)
+	go s.RunWaits(ctx)
 	return s
+}
+
+// replica is another replica of s: a store over its database and bucket, with the test's signals
+// and queue.
+func (e *env) replica(t *testing.T, s *store.Store, cfg store.Config) *store.Store {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	cfg.Dispatch = e.queue
+	r := store.New(e.backends[s], e.blobs[s], cfg)
+	e.backends[r], e.blobs[r] = e.backends[s], e.blobs[s]
+	go r.RunWaits(ctx)
+	return r
 }
 
 // Run runs the suite, each test with stores over new, empty backends that open makes.
@@ -59,7 +80,11 @@ func Run(t *testing.T, open func(t *testing.T) store.Backend) {
 		{"StartRefuses", testStartRefuses},
 		{"LeaseIsFIFOAndExclusive", testLeaseIsFIFOAndExclusive},
 		{"LeaseWaits", testLeaseWaits},
-		{"LeasesWokenInTurn", testLeasesWokenInTurn},
+		{"LeasesTakeRunsQueuedTogether", testLeasesTakeRunsQueuedTogether},
+		{"DispatchWithTheRun", testDispatchWithTheRun},
+		{"ReleaseDispatches", testReleaseDispatches},
+		{"RequeueJobBeforeItsCommit", testRequeueJobBeforeItsCommit},
+		{"DispatchUndispatched", testDispatchUndispatched},
 		{"Heartbeat", testHeartbeat},
 		{"LeaseKeys", testLeaseKeys},
 		{"LogAndFinish", testLogAndFinish},
@@ -69,7 +94,7 @@ func Run(t *testing.T, open func(t *testing.T) store.Backend) {
 		{"LogLeftSegment", testLogLeftSegment},
 		{"ReadLogFollows", testReadLogFollows},
 		{"Cancel", testCancel},
-		{"SweepLapsedLeases", testSweepLapsedLeases},
+		{"LapsedLeases", testLapsedLeases},
 		{"Rerun", testRerun},
 		{"List", testList},
 		{"Release", testRelease},
@@ -96,14 +121,13 @@ func Run(t *testing.T, open func(t *testing.T) store.Backend) {
 		{"CarryFromPre", testCarryFromPre},
 		{"Purge", testPurge},
 		{"Moves", testMoves},
-		{"FairShare", testFairShare},
+		{"Quotas", testQuotas},
 		{"ConcurrentClaims", testConcurrentClaims},
-		{"Flood", testFlood},
 		{"Pools", testPools},
 		{"Usage", testUsage},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			tc.fn(t, &env{open: open, backends: map[*store.Store]store.Backend{}, blobs: map[*store.Store]blob.Store{}, signals: bus.NewLocal()})
+			tc.fn(t, &env{open: open, backends: map[*store.Store]store.Backend{}, blobs: map[*store.Store]blob.Store{}, queue: &strictQueue{Queue: bus.NewLocalQueue(), seen: map[string]bool{}}})
 		})
 	}
 }
@@ -235,12 +259,9 @@ func testLeaseIsFIFOAndExclusive(t *testing.T, e *env) {
 	}
 }
 
-// A waiting worker is woken by a queued run's notification, well before the poll.
+// A waiting worker takes a run as it is queued: its job reaches the lease waiting on the queue.
 func testLeaseWaits(t *testing.T, e *env) {
-	cfg := store.DefaultConfig
-	cfg.Poll = time.Minute
-	s := e.newStore(t, cfg)
-	time.Sleep(200 * time.Millisecond) // the listener is up
+	s := e.newStore(t, store.DefaultConfig)
 	got := make(chan *store.Run, 1)
 	go func() {
 		r, err := s.Lease(context.Background(), "w", "", 30*time.Second)
@@ -257,7 +278,7 @@ func testLeaseWaits(t *testing.T, e *env) {
 			t.Errorf("leased %+v, want run %d", r, want.ID)
 		}
 	case <-time.After(10 * time.Second):
-		t.Fatal("the waiting worker was not woken")
+		t.Fatal("the waiting worker took no run")
 	}
 	// With nothing queued, a wait ends empty.
 	if r, err := s.Lease(context.Background(), "w", "", 300*time.Millisecond); r != nil || err != nil {
@@ -266,14 +287,10 @@ func testLeaseWaits(t *testing.T, e *env) {
 }
 
 // Runs queued together — a plan's jobs, in the transaction its planning run finishes in — reach
-// every lease waiting for one, though a run queued wakes one lease a pool on a replica: each that
-// claims one wakes the next in line, well before any looks on its own (Config.Poll).
-func testLeasesWokenInTurn(t *testing.T, e *env) {
+// every lease waiting for one: each job goes to one of them.
+func testLeasesTakeRunsQueuedTogether(t *testing.T, e *env) {
 	ctx := context.Background()
-	cfg := store.DefaultConfig
-	cfg.Poll = time.Minute
-	s := e.newStore(t, cfg)
-	time.Sleep(200 * time.Millisecond) // the listener is up
+	s := e.newStore(t, store.DefaultConfig)
 	plan(t, s, 1)
 	planning := lease(t, s, "planner")
 	got := make(chan *store.Run, 3)
@@ -547,15 +564,15 @@ func testLogGatheredAsRead(t *testing.T, e *env) {
 	}
 	hooked := &hookedBlobs{Store: plain}
 	cfg := store.DefaultConfig
-	cfg.Signals = e.signals
+	cfg.Dispatch = e.queue
 	s := store.New(b, hooked, cfg)
 	other := store.New(b, plain, cfg)
-	go s.Listen(ctx)
-	go other.Listen(ctx)
-	// Another replica's sweep gathers every finished run's log.
+	go s.RunWaits(ctx)
+	go other.RunWaits(ctx)
+	// Another replica gathers every finished run's log its job asks for.
 	gatherElsewhere := func() {
-		if err := other.Sweep(ctx); err != nil {
-			t.Errorf("the other replica's sweep: %v", err)
+		if err := other.StoreReadyLogs(ctx); err != nil {
+			t.Errorf("the other replica's log jobs: %v", err)
 		}
 	}
 	logged := func() (int64, string) {
@@ -596,13 +613,17 @@ func testLogGatheredAsRead(t *testing.T, e *env) {
 		t.Errorf("the log gathered twice at once: %q, want %q", got, want)
 	}
 
-	// A reader of a finished log not yet gathered, gathered as it reads.
+	// A reader of a finished log not yet gathered — the bucket refused it as the run finished,
+	// whose outcome is recorded all the same, the log left to its job — gathered as it reads.
 	id, want = logged()
 	hooked.mu.Lock()
 	hooked.failPut = "runs/"
 	hooked.mu.Unlock()
-	if err := s.Finish(ctx, id, "w", store.StatusPassed, 0, "", nil); err == nil {
-		t.Fatal("the gathering the bucket refused succeeded")
+	if err := s.Finish(ctx, id, "w", store.StatusPassed, 0, "", nil); err != nil {
+		t.Fatalf("finishing as the bucket refused the log: %v", err)
+	}
+	if r, _ := s.Get(ctx, id); r.Status != store.StatusPassed || r.LogStored {
+		t.Fatalf("a run whose log the bucket refused: %+v", r)
 	}
 	hooked.mu.Lock()
 	hooked.getPrefix, hooked.beforeGet = "live/", gatherElsewhere
@@ -665,12 +686,11 @@ func testLogLeftSegment(t *testing.T, e *env) {
 	}
 }
 
-// A follower sees what is written as it is written, and the end once the run finishes.
+// A follower sees what is written as it is written, and the end once the run finishes: woken by
+// each change, as it waits on none but them.
 func testReadLogFollows(t *testing.T, e *env) {
 	ctx := context.Background()
-	cfg := store.DefaultConfig
-	cfg.Poll = time.Minute
-	s := e.newStore(t, cfg)
+	s := e.newStore(t, store.DefaultConfig)
 	time.Sleep(200 * time.Millisecond)
 	r := start(t, s, 1, build("//a:b"))
 	lease(t, s, "w")
@@ -756,66 +776,6 @@ func testCancel(t *testing.T, e *env) {
 		return nil
 	}); err != nil || b.Len() != 0 {
 		t.Errorf("a never-run log: %q, %v", b.String(), err)
-	}
-}
-
-// A lapsed lease runs its run again once, with a fresh log; lapsed again, the run errs; a
-// canceled run whose lease lapses ends canceled.
-func testSweepLapsedLeases(t *testing.T, e *env) {
-	ctx := context.Background()
-	// A lease lasts three heartbeats; only Sweep acts on one that lapsed, so waiting past it is
-	// lapsing it.
-	cfg := store.DefaultConfig
-	cfg.Heartbeat = 100 * time.Millisecond
-	s := e.newStore(t, cfg)
-	lapse := func(int64) { time.Sleep(3*cfg.Heartbeat + 200*time.Millisecond) }
-	r := start(t, s, 1, build("//a:b"))
-	lease(t, s, "w1")
-	if _, err := s.AppendLog(ctx, r.ID, "w1", 0, []byte("partial")); err != nil {
-		t.Fatal(err)
-	}
-	lapse(r.ID)
-	if err := s.Sweep(ctx); err != nil {
-		t.Fatal(err)
-	}
-	again, _ := s.Get(ctx, r.ID)
-	if again.Status != store.StatusQueued || again.Attempt != 2 || again.Worker != "" || again.LogSize != 0 ||
-		!strings.Contains(again.Reason, "w1 was lost") {
-		t.Fatalf("after one lapse: %+v", again)
-	}
-	if again2 := lease(t, s, "w2"); again2.ID != r.ID {
-		t.Fatalf("the requeued run was not leased again: %+v", again2)
-	}
-	if size, err := s.AppendLog(ctx, r.ID, "w2", 0, []byte("fresh")); err != nil || size != 5 {
-		t.Errorf("the second attempt's log: %d, %v", size, err)
-	}
-	lapse(r.ID)
-	if err := s.Sweep(ctx); err != nil {
-		t.Fatal(err)
-	}
-	lost, _ := s.Get(ctx, r.ID)
-	if lost.Status != store.StatusError || !strings.Contains(lost.Reason, "last attempt") || !lost.LogStored {
-		t.Errorf("after two lapses: %+v", lost)
-	}
-	// Its log is its last lease's alone, each lease's segments gone with the log stored.
-	var log strings.Builder
-	if err := s.ReadLog(ctx, r.ID, 0, false, func(_ int64, d []byte, _ bool) error { log.Write(d); return nil }); err != nil || log.String() != "fresh" {
-		t.Errorf("the lost run's log: %q, %v", log.String(), err)
-	}
-	if live, err := e.blobs[s].List(ctx, "live/"); err != nil || len(live) != 0 {
-		t.Errorf("segments left behind: %v, %v", live, err)
-	}
-	c := start(t, s, 1, build("//a:c"))
-	lease(t, s, "w3")
-	if _, err := s.Cancel(ctx, c.ID, "stop it", ""); err != nil {
-		t.Fatal(err)
-	}
-	lapse(c.ID)
-	if err := s.Sweep(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if got, _ := s.Get(ctx, c.ID); got.Status != store.StatusCanceled || got.Reason != "stop it" {
-		t.Errorf("a canceled run's lapse: %+v", got)
 	}
 }
 
@@ -1245,25 +1205,21 @@ func testPlanRefuses(t *testing.T, e *env) {
 	}
 }
 
-// A repository's landing queue is keyed work, marked by what the queue acts on — a submission
-// here — taken by one holder at a time with its mark cleared, and let go.
+// A repository's landing queue is keyed work, marked — its job enqueued — by what the queue acts
+// on, a submission here; taken by one holder at a time with its mark cleared, and let go.
 func testQueueWork(t *testing.T, e *env) {
 	ctx := context.Background()
 	s := e.newStore(t, store.DefaultConfig)
 	w := s.Work()
 	submit(t, s, 7, store.SubmittedCL{Number: 1, Patchset: 1})
-	due, err := w.Due(ctx, store.QueueWork, 10)
-	if err != nil || len(due) != 1 || due[0] != 7 {
-		t.Fatalf("due after a submission: %v, %v", due, err)
+	if got := worktest.Ready(t, w, store.QueueWork); !slices.Equal(got, []int64{7}) {
+		t.Fatalf("the queue's jobs after a submission: %v", got)
 	}
-	if ok, err := w.Take(ctx, store.QueueWork, 7, "a", time.Minute); err != nil || !ok {
-		t.Fatalf("taking it: %v, %v", ok, err)
+	if got, err := w.Take(ctx, store.QueueWork, 7, "a", time.Minute); err != nil || !got.Took || !got.Due {
+		t.Fatalf("taking it: %+v, %v", got, err)
 	}
-	if ok, _ := w.Take(ctx, store.QueueWork, 7, "b", time.Minute); ok {
+	if got, _ := w.Take(ctx, store.QueueWork, 7, "b", time.Minute); got.Took {
 		t.Fatal("a second holder took it")
-	}
-	if due, _ := w.Due(ctx, store.QueueWork, 10); len(due) != 0 {
-		t.Errorf("due while held: %v", due)
 	}
 	if again, err := w.Release(ctx, store.QueueWork, 7, "a"); err != nil || again {
 		t.Errorf("releasing it: %v, %v", again, err)
@@ -1289,21 +1245,17 @@ func testPostRunLostMarksTheQueue(t *testing.T, e *env) {
 	}
 	// The queue has acted on everything so far.
 	w := s.Work()
-	if ok, err := w.Take(ctx, store.QueueWork, 7, "queue", time.Minute); err != nil || !ok {
-		t.Fatalf("taking the queue's work: %v, %v", ok, err)
-	}
-	if _, err := w.Release(ctx, store.QueueWork, 7, "queue"); err != nil {
-		t.Fatal(err)
-	}
+	worktest.Ready(t, w, store.QueueWork)
 	time.Sleep(3*cfg.Heartbeat + 200*time.Millisecond)
-	if err := s.Sweep(ctx); err != nil {
-		t.Fatal(err)
+	// The lost run's job, delivered again, ends it: its last attempt.
+	if r, err := s.Lease(ctx, "w2", "", time.Second); err != nil || r != nil {
+		t.Fatalf("a lost post run on its last attempt was leased: %+v, %v", r, err)
 	}
 	if r, _ := s.Get(ctx, plan.ID); r.Status != store.StatusError {
 		t.Fatalf("the lost post run: %+v", r)
 	}
-	if due, err := w.Due(ctx, store.QueueWork, 10); err != nil || !slices.Contains(due, 7) {
-		t.Errorf("the queue's work due after a post run was lost: %v, %v; want repository 7's", due, err)
+	if got := worktest.Ready(t, w, store.QueueWork); !slices.Contains(got, 7) {
+		t.Errorf("the queue's jobs after a post run was lost: %v; want repository 7's", got)
 	}
 }
 
@@ -1470,7 +1422,10 @@ func testAttempts(t *testing.T, e *env) {
 		t.Fatal(err)
 	}
 
-	// Post goes first: its planning run is leased before the older pre run.
+	// Runs are taken in the order they were queued: the pre run, then post's planning run.
+	if r := lease(t, s, "w"); r.ID != pre.ID {
+		t.Fatalf("leased %+v, want the pre run, queued first", r)
+	}
 	plan := lease(t, s, "w")
 	if plan.Job.Kind != store.KindPlan || plan.Origin.Phase != store.PhasePost || plan.Origin.CLNumber != 5 || !bytes.Equal(plan.CommitID, cand) ||
 		plan.RequestedBy != submitter || plan.Why != "CL 5 was submitted" {
@@ -1489,9 +1444,9 @@ func testAttempts(t *testing.T, e *env) {
 	if err := s.Finish(ctx, plan.ID, "w", store.StatusPassed, 0, "", result); err != nil {
 		t.Fatal(err)
 	}
-	// Its jobs wait: the pre run is next.
-	if r := lease(t, s, "w"); r.ID != pre.ID {
-		t.Fatalf("leased %+v, want the pre run", r)
+	// Its jobs wait for the queue to release the attempt.
+	if r, err := s.Lease(ctx, "w", "", 0); err != nil || r != nil {
+		t.Fatalf("an unreleased attempt's job was leased: %+v, %v", r, err)
 	}
 	attempts, err := s.Attempts(ctx, sub.ID)
 	if err != nil || len(attempts) != 1 {
@@ -1505,13 +1460,16 @@ func testAttempts(t *testing.T, e *env) {
 		t.Fatalf("the planned attempt: %+v; %+v", a, own[0])
 	}
 
-	// Released, its jobs run on the candidate, ahead of pre.
-	start(t, s, 1, build("//b:b"))
+	// Released, its jobs run on the candidate, after what was queued before.
+	manual := start(t, s, 1, build("//b:b"))
 	if err := s.ReleaseAttempt(ctx, id); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.ReleaseAttempt(ctx, id); err == nil {
 		t.Error("an attempt was released twice")
+	}
+	if r := lease(t, s, "w"); r.ID != manual.ID {
+		t.Fatalf("leased %+v, want the manual run, queued first", r)
 	}
 	job := lease(t, s, "w")
 	if job.Origin.Phase != store.PhasePost || job.Origin.Job != "build" || !bytes.Equal(job.CommitID, cand) || job.PlanID != own[0].PlanID ||
@@ -1740,63 +1698,210 @@ func testSetNotes(t *testing.T, e *env) {
 	}
 }
 
-// A landing's submissions are recorded in one transaction: each landed, with main's history at
-// the places their CLs took, in the landing's order; one ended meanwhile is skipped, and named.
+// A landing's submissions are recorded in one transaction: each landed, its attempt landed and its
+// other attempts discarded, with main's history at the places their CLs took, in the landing's
+// order; one ended meanwhile is skipped, and named. Recording three costs as many statements of each
+// kind as recording one.
 func testRecordLandings(t *testing.T, e *env) {
 	ctx := context.Background()
-	s := e.newStore(t, store.DefaultConfig)
-	const repo = 3
-	type sub struct {
-		id, attempt int64
-		landed      []byte
-	}
-	var subs []sub
-	for i := range 3 {
-		n := int64(i + 1)
-		sb := submit(t, s, repo, store.SubmittedCL{Number: n, Patchset: 1})
-		id, err := s.CreateAttempt(ctx, store.NewAttempt{SubmissionID: sb.ID, Base: commit(), BaseSeq: 4,
-			Candidates: []store.NewCandidate{{SubmissionID: sb.ID, CLNumber: n, Patchset: 1, Commit: commit(), Base: commit(), Own: true,
-				WorkflowsCommit: commit(), Context: postContext(t, n)}}})
+	calls := map[int]map[string]int{}
+	for _, n := range []int{1, 3} {
+		const repo = 3
+		counted := &countingOps{calls: map[string]int{}}
+		base := e.open(t)
+		s := e.newStoreOver(t, countingBackend{Backend: base, c: counted}, store.DefaultConfig)
+		type sub struct {
+			id, attempt, other int64
+			landed             []byte
+		}
+		var subs []sub
+		for i := range n + 1 {
+			number := int64(i + 1)
+			sb := submit(t, s, repo, store.SubmittedCL{Number: number, Patchset: 1})
+			attempt := func() int64 {
+				id, err := s.CreateAttempt(ctx, store.NewAttempt{SubmissionID: sb.ID, Base: commit(), BaseSeq: 4,
+					Candidates: []store.NewCandidate{{SubmissionID: sb.ID, CLNumber: number, Patchset: 1, Commit: commit(), Base: commit(), Own: true,
+						WorkflowsCommit: commit(), Context: postContext(t, number)}}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				return id
+			}
+			// The attempt that lands was discarded meanwhile, and another made: the landing records
+			// the first landed, and discards the other.
+			first := attempt()
+			if err := s.DiscardAttempt(ctx, first, "its base moved"); err != nil {
+				t.Fatal(err)
+			}
+			subs = append(subs, sub{id: sb.ID, attempt: first, other: attempt(), landed: commit()})
+		}
+		// The second is canceled before it lands.
+		canceled := subs[1]
+		if _, err := s.CancelSubmission(ctx, canceled.id, "canceled as it landed", ""); err != nil {
+			t.Fatal(err)
+		}
+		recs := make([]store.Landing, len(subs))
+		for i, sb := range subs {
+			recs[i] = store.Landing{Submission: sb.id, Attempt: sb.attempt, FromSeq: 4 + int64(i),
+				Landed: []store.LandedCL{{CLNumber: int64(i + 1), Commit: sb.landed}}}
+		}
+		counted.on(true)
+		skipped, err := s.RecordLandings(ctx, recs)
+		counted.on(false)
+		if err != nil || len(skipped) != 1 || skipped[0] != canceled.id {
+			t.Fatalf("recording %d landings: skipped %v, %v; want the canceled submission %d alone", n, skipped, err, canceled.id)
+		}
+		calls[n] = counted.calls
+		st, err := s.QueueState(ctx, repo, 4)
 		if err != nil {
 			t.Fatal(err)
 		}
-		subs = append(subs, sub{sb.ID, id, commit()})
-	}
-	if _, err := s.CancelSubmission(ctx, subs[1].id, "canceled as it landed", ""); err != nil {
-		t.Fatal(err)
-	}
-	recs := make([]store.Landing, len(subs))
-	for i, sb := range subs {
-		recs[i] = store.Landing{Submission: sb.id, Attempt: sb.attempt, FromSeq: 4 + int64(i),
-			Landed: []store.LandedCL{{CLNumber: int64(i + 1), Commit: sb.landed}}}
-	}
-	skipped, err := s.RecordLandings(ctx, recs)
-	if err != nil || len(skipped) != 1 || skipped[0] != subs[1].id {
-		t.Fatalf("recording the landing: skipped %v, %v; want the canceled submission %d alone", skipped, err, subs[1].id)
-	}
-	st, err := s.QueueState(ctx, repo, 4)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(st.Submissions) != 0 {
-		t.Fatalf("%d submissions active after the landing", len(st.Submissions))
-	}
-	want := map[int64]sub{5: subs[0], 7: subs[2]}
-	if len(st.Main) != 2 {
-		t.Fatalf("main's history: %+v, want the two landed at 5 and 7", st.Main)
-	}
-	for _, m := range st.Main {
-		w, ok := want[m.Seq]
-		if !ok || !bytes.Equal(m.Commit, w.landed) || m.SubmissionID != w.id {
-			t.Errorf("main at %d: %+v, want submission %d's commit", m.Seq, m, w.id)
+		if len(st.Submissions) != 0 {
+			t.Fatalf("%d submissions active after the landing", len(st.Submissions))
+		}
+		want := map[int64]sub{}
+		for i, sb := range subs {
+			if sb.id != canceled.id {
+				want[4+int64(i)+1] = sb
+			}
+		}
+		if len(st.Main) != len(want) {
+			t.Fatalf("main's history: %+v, want the %d landed", st.Main, len(want))
+		}
+		for _, m := range st.Main {
+			w, ok := want[m.Seq]
+			if !ok || !bytes.Equal(m.Commit, w.landed) || m.SubmissionID != w.id {
+				t.Errorf("main at %d: %+v, want submission %d's commit", m.Seq, m, w.id)
+			}
+		}
+		for _, sb := range subs {
+			if sb.id == canceled.id {
+				continue
+			}
+			got, err := s.GetSubmission(ctx, sb.id)
+			if err != nil || got.Status != store.SubmissionLanded {
+				t.Errorf("submission %d: %+v, %v; want landed", sb.id, got, err)
+			}
+			as, err := s.Attempts(ctx, sb.id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			attempts := map[int64]store.AttemptStatus{}
+			for _, a := range as {
+				attempts[a.ID] = a.Status
+			}
+			if attempts[sb.attempt] != store.AttemptLanded || attempts[sb.other] != store.AttemptDiscarded {
+				t.Errorf("submission %d's attempts: %v, want %d landed and %d discarded", sb.id, attempts, sb.attempt, sb.other)
+			}
 		}
 	}
-	for _, sb := range []sub{subs[0], subs[2]} {
-		got, err := s.GetSubmission(ctx, sb.id)
-		if err != nil || got.Status != store.SubmissionLanded {
-			t.Errorf("submission %d: %+v, %v; want landed", sb.id, got, err)
+	t.Logf("recording one: %v; three: %v", calls[1], calls[3])
+	for name, one := range calls[1] {
+		if three := calls[3][name]; three != one {
+			t.Errorf("%s: %d calls recording one landing, %d recording three", name, one, three)
 		}
 	}
+}
+
+// countingOps counts, while on, the backend calls of a landing's record, by method.
+type countingOps struct {
+	mu      sync.Mutex
+	enabled bool
+	calls   map[string]int
+}
+
+func (c *countingOps) on(enabled bool) {
+	c.mu.Lock()
+	c.enabled = enabled
+	c.mu.Unlock()
+}
+
+func (c *countingOps) count(name string) {
+	c.mu.Lock()
+	if c.enabled {
+		c.calls[name]++
+	}
+	c.mu.Unlock()
+}
+
+// countingBackend is a backend whose transactions count their landing-record calls.
+type countingBackend struct {
+	store.Backend
+	c *countingOps
+}
+
+func (b countingBackend) Txn(ctx context.Context, fn func(store.Ops) error) error {
+	return b.Backend.Txn(ctx, func(tx store.Ops) error { return fn(countedTx{tx, b.c}) })
+}
+
+type countedTx struct {
+	store.Ops
+	c *countingOps
+}
+
+func (t countedTx) FinishSubmission(ctx context.Context, id int64, status store.SubmissionStatus, reason, by string) (int64, bool, error) {
+	t.c.count("FinishSubmission")
+	return t.Ops.FinishSubmission(ctx, id, status, reason, by)
+}
+
+func (t countedTx) FinishSubmissions(ctx context.Context, ids []int64, status store.SubmissionStatus, reason, by string) (map[int64]int64, error) {
+	t.c.count("FinishSubmissions")
+	return t.Ops.FinishSubmissions(ctx, ids, status, reason, by)
+}
+
+func (t countedTx) LockAttempt(ctx context.Context, id int64) (*store.Attempt, error) {
+	t.c.count("LockAttempt")
+	return t.Ops.LockAttempt(ctx, id)
+}
+
+func (t countedTx) LandAttempts(ctx context.Context, pairs []store.AttemptOf) error {
+	t.c.count("LandAttempts")
+	return t.Ops.LandAttempts(ctx, pairs)
+}
+
+func (t countedTx) EndActiveAttempts(ctx context.Context, sub int64, status store.AttemptStatus, reason string) ([]int64, error) {
+	t.c.count("EndActiveAttempts")
+	return t.Ops.EndActiveAttempts(ctx, sub, status, reason)
+}
+
+func (t countedTx) EndActiveAttemptsOf(ctx context.Context, subs []int64, status store.AttemptStatus, reason string) ([]int64, error) {
+	t.c.count("EndActiveAttemptsOf")
+	return t.Ops.EndActiveAttemptsOf(ctx, subs, status, reason)
+}
+
+func (t countedTx) UnfinishedRunsOfAttempts(ctx context.Context, attempts []int64) ([]int64, error) {
+	t.c.count("UnfinishedRunsOfAttempts")
+	return t.Ops.UnfinishedRunsOfAttempts(ctx, attempts)
+}
+
+func (t countedTx) SetLandedCommit(ctx context.Context, sub, cl int64, commit []byte) error {
+	t.c.count("SetLandedCommit")
+	return t.Ops.SetLandedCommit(ctx, sub, cl, commit)
+}
+
+func (t countedTx) SetLandedCommits(ctx context.Context, rows []store.SubmissionCommit) error {
+	t.c.count("SetLandedCommits")
+	return t.Ops.SetLandedCommits(ctx, rows)
+}
+
+func (t countedTx) InsertLandedChange(ctx context.Context, repo int64, commit []byte, cl int64) error {
+	t.c.count("InsertLandedChange")
+	return t.Ops.InsertLandedChange(ctx, repo, commit, cl)
+}
+
+func (t countedTx) InsertLandedChanges(ctx context.Context, repo int64, rows []store.LandedCL) error {
+	t.c.count("InsertLandedChanges")
+	return t.Ops.InsertLandedChanges(ctx, repo, rows)
+}
+
+func (t countedTx) PutMainCommit(ctx context.Context, repo, seq int64, commit []byte, sub int64) error {
+	t.c.count("PutMainCommit")
+	return t.Ops.PutMainCommit(ctx, repo, seq, commit, sub)
+}
+
+func (t countedTx) PutMainCommits(ctx context.Context, repo int64, rows []store.MainCommit) error {
+	t.c.count("PutMainCommits")
+	return t.Ops.PutMainCommits(ctx, repo, rows)
 }
 
 func testFirstLanding(t *testing.T, e *env) {
@@ -1992,8 +2097,8 @@ func testQueueState(t *testing.T, e *env) {
 		st.Others[one.ID] == nil || st.Others[one.ID].Status != store.SubmissionCanceled || !bytes.Equal(st.LandedCLs[3], c6) {
 		t.Fatalf("the queue: %+v", st)
 	}
-	if due, err := s.Work().Due(ctx, store.QueueWork, 10); err != nil || !slices.Contains(due, 3) {
-		t.Errorf("the queue's work due: %v, %v; want repository 3's", due, err)
+	if got := worktest.Ready(t, s.Work(), store.QueueWork); !slices.Contains(got, 3) {
+		t.Errorf("the queue's jobs: %v; want repository 3's", got)
 	}
 }
 

@@ -3,7 +3,6 @@ package engine
 import (
 	"context"
 	"log/slog"
-	"time"
 
 	"github.com/Cidan/ok/internal/bus"
 	"github.com/Cidan/ok/internal/bus/follow"
@@ -14,21 +13,12 @@ import (
 	scmpb "github.com/Cidan/ok/proto/ok/scm/v1"
 )
 
-// Follow applies the SCM's events to the store until ctx ends, as the bus's stream brings them
-// and each repository's log fills in: each repository's creation, and each move of its main. Every replica follows, sharing the repositories (the stream's group, deploy); an
-// event is applied once, however often it comes.
-func Follow(ctx context.Context, s *store.Store, stream bus.Stream, events scmpb.EventsClient, log *slog.Logger) error {
-	f := &follow.Follower{Stream: stream, Topic: scmfeed.Topic, Group: "deploy", Log: scmfeed.Log{Events: events}, Apply: applier{s}}
-	for {
-		if err := f.Run(ctx); ctx.Err() == nil {
-			log.Warn("deploy: stopped following the SCM's events", "err", err)
-		}
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-time.After(2 * time.Second):
-		}
-	}
+// Follow applies the SCM's events to the store until ctx ends (internal/bus/follow): each
+// repository's creation, and each move of its main. Every replica follows, a repository's events
+// applied by one at a time; an event is applied once, however often its repository is named.
+func Follow(ctx context.Context, s *store.Store, events scmpb.EventsClient, log *slog.Logger) error {
+	return (&follow.Follower{Topic: scmfeed.Topic, Log: scmfeed.Log{Events: events}, Apply: applier{s},
+		Work: s.Work(), Register: scmfeed.Register(events), Logger: log}).Run(ctx)
 }
 
 // applier is the store as a follow.Applier.
@@ -55,20 +45,10 @@ func FeedEvent(ev *scmpb.Event) store.FeedEvent {
 }
 
 // FollowDirectory applies the directory's events to the store until ctx ends (dirfeed): each
-// repository's full name as it is made, renamed, or transferred. Every replica follows, sharing the
-// repositories, as Follow does.
-func FollowDirectory(ctx context.Context, s *store.Store, stream bus.Stream, events dirfeed.Events, log *slog.Logger) error {
-	f := &follow.Follower{Stream: stream, Topic: dirfeed.Topic, Group: "deploy", Log: dirfeed.Log{Events: events}, Apply: directoryApplier{s}}
-	for {
-		if err := f.Run(ctx); ctx.Err() == nil {
-			log.Warn("deploy: stopped following the directory's events", "err", err)
-		}
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-time.After(2 * time.Second):
-		}
-	}
+// repository's full name as it is made, renamed, or transferred, as Follow does.
+func FollowDirectory(ctx context.Context, s *store.Store, events dirfeed.Events, log *slog.Logger) error {
+	return (&follow.Follower{Topic: dirfeed.Topic, Log: dirfeed.Log{Events: events}, Apply: directoryApplier{s},
+		Work: s.Work(), Register: dirfeed.Register(events), Logger: log}).Run(ctx)
 }
 
 // directoryApplier is the store as the directory's follow.Applier.

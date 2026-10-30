@@ -8,6 +8,7 @@ import (
 
 	"github.com/Cidan/ok/internal/control/db"
 	"github.com/Cidan/ok/internal/data/pgdata"
+	"github.com/Cidan/ok/internal/wait"
 	"github.com/Cidan/ok/internal/work"
 )
 
@@ -29,14 +30,6 @@ func (x queries) DoneOutbox(ctx context.Context, repo int64, ids []int64) error 
 	return err
 }
 
-func (x queries) OutboxRepositories(ctx context.Context) ([]int64, error) {
-	rows, err := x.q.Query(ctx, `SELECT DISTINCT repository_id FROM outbox ORDER BY 1`)
-	if err != nil {
-		return nil, err
-	}
-	return pgx.CollectRows(rows, pgx.RowTo[int64])
-}
-
 func (x queries) GetEvent(ctx context.Context, repo, number, id int64) (db.Event, bool, error) {
 	var e db.Event
 	err := x.q.QueryRow(ctx, `SELECT id, at, actor, kind, from_status, to_status, subject, label, patchset, commit_id, message, related
@@ -50,3 +43,5 @@ func (x queries) GetEvent(ctx context.Context, repo, number, id int64) (db.Event
 
 // Work is ok control's keyed work's store.
 func (s *Store) Work() work.Store { return pgdata.Work(s.pool) }
+
+func (s *Store) Waits() wait.Store { return pgdata.Waits(s.pool) }

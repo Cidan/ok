@@ -299,9 +299,9 @@ const adminUsage = `ok admin — administering ok identity, as the signed-in adm
   ok admin move REPOSITORY CELL              move a repository's fork network to another cell
   ok admin moves                             list the moves between cells, and where each is
   ok admin cancel-move NETWORK               abandon a move the directory has not finished naming
-  ok admin quota ACCOUNT [-concurrent N] [-minutes M] [-weight W] [-reset]
+  ok admin quota ACCOUNT [-concurrent N] [-minutes M] [-reset]
                                              show an account's quota of CI, or set it: concurrent
-                                             runs, run minutes a month (0: unlimited), fair-share weight
+                                             runs, run minutes a month (0: unlimited)
 `
 
 func admin(args []string, stdout io.Writer) error {
@@ -514,10 +514,9 @@ func adminQuota(ctx context.Context, client identitypb.AdminClient, args []strin
 	flags := flag.NewFlagSet("admin quota", flag.ContinueOnError)
 	concurrent := flags.Int("concurrent", -1, "concurrent runs (0: unlimited)")
 	minutes := flags.Int64("minutes", -1, "run minutes in a calendar month (0: unlimited)")
-	weight := flags.Int("weight", -1, "weight in fair share")
 	reset := flags.Bool("reset", false, "give the account the default quota again")
 	if len(args) == 0 {
-		return usageError("ok admin quota ACCOUNT [-concurrent N] [-minutes M] [-weight W] [-reset]")
+		return usageError("ok admin quota ACCOUNT [-concurrent N] [-minutes M] [-reset]")
 	}
 	account := args[0]
 	if err := flags.Parse(args[1:]); err != nil {
@@ -528,20 +527,17 @@ func adminQuota(ctx context.Context, client identitypb.AdminClient, args []strin
 	switch {
 	case *reset:
 		q, err = client.SetQuota(ctx, &identitypb.SetQuotaRequest{Account: account, Reset_: true})
-	case *concurrent >= 0 || *minutes >= 0 || *weight >= 0:
+	case *concurrent >= 0 || *minutes >= 0:
 		had, err := client.GetQuota(ctx, &identitypb.GetQuotaRequest{Account: account})
 		if err != nil {
 			return err
 		}
-		req := &identitypb.SetQuotaRequest{Account: account, Concurrent: had.GetConcurrent(), Minutes: had.GetMinutes(), Weight: had.GetWeight()}
+		req := &identitypb.SetQuotaRequest{Account: account, Concurrent: had.GetConcurrent(), Minutes: had.GetMinutes()}
 		if *concurrent >= 0 {
 			req.Concurrent = int32(*concurrent)
 		}
 		if *minutes >= 0 {
 			req.Minutes = *minutes
-		}
-		if *weight >= 0 {
-			req.Weight = int32(*weight)
 		}
 		q, err = client.SetQuota(ctx, req)
 		if err != nil {
@@ -563,7 +559,7 @@ func adminQuota(ctx context.Context, client identitypb.AdminClient, args []strin
 	if q.GetDefault() {
 		kind = " (the default)"
 	}
-	fmt.Fprintf(stdout, "%s: %s, %s a month, weight %d%s\n", account, limit(int64(q.GetConcurrent()), "concurrent runs"),
-		limit(q.GetMinutes(), "minutes"), q.GetWeight(), kind)
+	fmt.Fprintf(stdout, "%s: %s, %s a month%s\n", account, limit(int64(q.GetConcurrent()), "concurrent runs"),
+		limit(q.GetMinutes(), "minutes"), kind)
 	return nil
 }

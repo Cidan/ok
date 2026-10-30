@@ -1,27 +1,22 @@
-// Package awsfake is a fake of Amazon SQS and SNS — as much of each as ok's bus uses
-// (internal/bus/awsbus) — served over HTTP on the test's loopback, speaking what the AWS SDK for Go
-// speaks: SQS's JSON 1.0 protocol and SNS's query protocol, on one endpoint.
+// Package awsfake is a fake of Amazon SQS — as much as ok's bus uses (internal/bus/awsbus) — served
+// over HTTP on the test's loopback, speaking what the AWS SDK for Go speaks: SQS's JSON 1.0
+// protocol.
 //
 // It keeps SQS's semantics where the bus relies on them: a received message is invisible for its
 // visibility timeout, a ReceiveMessage long-polls, messages are delayed, each receive counts, a
 // message received a redrive policy's maxReceiveCount times moves to its dead-letter queue on the
-// next receive, and visibility reaches at most twelve hours past the first receive. SNS delivers a
-// topic's messages to its SQS subscribers raw or in SNS's JSON envelope, and only to a queue whose
-// policy lets SNS send from the topic, as SNS does.
+// next receive, and visibility reaches at most twelve hours past the first receive.
 package awsfake
 
 import (
 	"crypto/md5"
 	"crypto/rand"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
-	"encoding/xml"
 	"fmt"
 	"net"
 	"net/http"
-	"net/url"
-	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -42,7 +37,6 @@ type Server struct {
 
 	mu      sync.Mutex
 	queues  map[string]*queue // by name
-	topics  map[string]*topic // by ARN
 	changed chan struct{}     // closed and replaced when a queue gains a message
 }
 
@@ -52,7 +46,7 @@ func Start() (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &Server{URL: "http://" + ln.Addr().String(), ln: ln, queues: map[string]*queue{}, topics: map[string]*topic{}, changed: make(chan struct{})}
+	s := &Server{URL: "http://" + ln.Addr().String(), ln: ln, queues: map[string]*queue{}, changed: make(chan struct{})}
 	s.srv = &http.Server{Handler: s, ReadHeaderTimeout: 10 * time.Second}
 	go s.srv.Serve(ln)
 	return s, nil
@@ -73,15 +67,12 @@ func (s *Server) Messages(name string) int {
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if target := r.Header.Get("X-Amz-Target"); strings.HasPrefix(target, "AmazonSQS.") {
-		s.serveSQS(w, r, strings.TrimPrefix(target, "AmazonSQS."))
+	target, ok := strings.CutPrefix(r.Header.Get("X-Amz-Target"), "AmazonSQS.")
+	if !ok {
+		http.Error(w, "the fake serves SQS alone", http.StatusBadRequest)
 		return
 	}
-	if err := r.ParseForm(); err != nil {
-		snsError(w, http.StatusBadRequest, "InvalidParameter", err.Error())
-		return
-	}
-	s.serveSNS(w, r.Form)
+	s.serveSQS(w, r, target)
 }
 
 // wake tells long polls a queue gained a message.
@@ -118,6 +109,7 @@ type message struct {
 type queue struct {
 	name, url, arn string
 	attrs          map[string]string
+	tags           map[string]string
 	msgs           []*message
 }
 
@@ -237,6 +229,34 @@ func (s *Server) sqsOp(r *http.Request, op string, in map[string]json.RawMessage
 		}
 		delete(s.queues, q.name)
 		return map[string]string{}, nil
+	case "ListQueues":
+		prefix := field[string](in, "QueueNamePrefix")
+		var urls []string
+		for name, q := range s.queues {
+			if strings.HasPrefix(name, prefix) {
+				urls = append(urls, q.url)
+			}
+		}
+		sort.Strings(urls)
+		return map[string]any{"QueueUrls": urls}, nil
+	case "TagQueue":
+		q, err := s.queueOf(in)
+		if err != nil {
+			return nil, err
+		}
+		if q.tags == nil {
+			q.tags = map[string]string{}
+		}
+		for k, v := range field[map[string]string](in, "Tags") {
+			q.tags[k] = v
+		}
+		return map[string]any{}, nil
+	case "ListQueueTags":
+		q, err := s.queueOf(in)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"Tags": q.tags}, nil
 	case "GetQueueUrl":
 		q := s.queues[field[string](in, "QueueName")]
 		if q == nil {
@@ -456,335 +476,4 @@ func (s *Server) take(q *queue, n int, vis time.Duration) []map[string]any {
 		})
 	}
 	return got
-}
-
-// ─── SNS ───
-
-type subscription struct {
-	arn, endpoint string // the queue's ARN
-	raw           bool
-	// filter is its filter policy, of the plain form alone: each attribute named must be a string
-	// one of the values listed.
-	filter map[string][]string
-}
-
-// admits reports whether a message's attributes pass the subscription's filter policy.
-func (sub *subscription) admits(attrs map[string]attribute) bool {
-	for k, values := range sub.filter {
-		a, ok := attrs[k]
-		if !ok || a.DataType != "String" || !slices.Contains(values, a.StringValue) {
-			return false
-		}
-	}
-	return true
-}
-
-type topic struct {
-	arn  string
-	subs []*subscription
-}
-
-func snsOK(w http.ResponseWriter, action string, result any) {
-	w.Header().Set("Content-Type", "text/xml")
-	fmt.Fprintf(w, `<%sResponse xmlns="http://sns.amazonaws.com/doc/2010-03-31/">`, action)
-	enc := xml.NewEncoder(w)
-	enc.EncodeElement(result, xml.StartElement{Name: xml.Name{Local: action + "Result"}})
-	enc.Flush()
-	fmt.Fprintf(w, `<ResponseMetadata><RequestId>%s</RequestId></ResponseMetadata></%sResponse>`, newID(), action)
-}
-
-func snsError(w http.ResponseWriter, status int, code, msg string) {
-	w.Header().Set("Content-Type", "text/xml")
-	w.WriteHeader(status)
-	fmt.Fprintf(w, `<ErrorResponse xmlns="http://sns.amazonaws.com/doc/2010-03-31/"><Error><Type>Sender</Type><Code>%s</Code><Message>%s</Message></Error><RequestId>%s</RequestId></ErrorResponse>`,
-		code, xmlEscape(msg), newID())
-}
-
-func xmlEscape(s string) string {
-	var b strings.Builder
-	xml.EscapeText(&b, []byte(s))
-	return b.String()
-}
-
-// entries reads a query map — prefix.entry.N.key and prefix.entry.N.value — as names to the keys
-// under each entry's value.
-func entries(form url.Values, prefix, keyName, valueName string) map[string]map[string]string {
-	out := map[string]map[string]string{}
-	for i := 1; ; i++ {
-		base := fmt.Sprintf("%s.entry.%d.", prefix, i)
-		name := form.Get(base + keyName)
-		if name == "" {
-			return out
-		}
-		vals := map[string]string{}
-		for k, v := range form {
-			if strings.HasPrefix(k, base+valueName) {
-				vals[strings.TrimPrefix(strings.TrimPrefix(k, base+valueName), ".")] = v[0]
-			}
-		}
-		out[name] = vals
-	}
-}
-
-// messageAttributes reads a query request's message attributes under prefix.
-func messageAttributes(form url.Values, prefix string) (map[string]attribute, error) {
-	out := map[string]attribute{}
-	for name, v := range entries(form, prefix, "Name", "Value") {
-		a := attribute{DataType: v["DataType"], StringValue: v["StringValue"]}
-		if b, ok := v["BinaryValue"]; ok {
-			bin, err := base64.StdEncoding.DecodeString(b)
-			if err != nil {
-				return nil, err
-			}
-			a.BinaryValue = bin
-		}
-		out[name] = a
-	}
-	return out, nil
-}
-
-func (s *Server) serveSNS(w http.ResponseWriter, form url.Values) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	switch action := form.Get("Action"); action {
-	case "CreateTopic":
-		name := form.Get("Name")
-		if name == "" || len(name) > 256 || strings.Trim(name, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_") != "" {
-			snsError(w, http.StatusBadRequest, "InvalidParameter", "Invalid parameter: Topic Name")
-			return
-		}
-		arn := "arn:aws:sns:" + Region + ":" + Account + ":" + name
-		if s.topics[arn] == nil {
-			s.topics[arn] = &topic{arn: arn}
-		}
-		snsOK(w, action, struct {
-			TopicArn string `xml:"TopicArn"`
-		}{arn})
-	case "Subscribe":
-		t := s.topics[form.Get("TopicArn")]
-		if t == nil {
-			snsError(w, http.StatusNotFound, "NotFound", "Topic does not exist")
-			return
-		}
-		if form.Get("Protocol") != "sqs" {
-			snsError(w, http.StatusBadRequest, "InvalidParameter", "the fake delivers to sqs alone")
-			return
-		}
-		endpoint := form.Get("Endpoint")
-		subAttrs := entries(form, "Attributes", "key", "value")
-		raw := subAttrs["RawMessageDelivery"][""] == "true"
-		var filter map[string][]string
-		if f := subAttrs["FilterPolicy"][""]; f != "" {
-			if err := json.Unmarshal([]byte(f), &filter); err != nil {
-				snsError(w, http.StatusBadRequest, "InvalidParameter", "Invalid parameter: FilterPolicy: the fake takes attribute names and string values alone")
-				return
-			}
-		}
-		var sub *subscription
-		for _, x := range t.subs {
-			if x.endpoint == endpoint {
-				sub = x
-			}
-		}
-		if sub == nil {
-			sub = &subscription{arn: t.arn + ":" + newID(), endpoint: endpoint, raw: raw, filter: filter}
-			t.subs = append(t.subs, sub)
-		}
-		snsOK(w, action, struct {
-			SubscriptionArn string `xml:"SubscriptionArn"`
-		}{sub.arn})
-	case "Unsubscribe":
-		arn := form.Get("SubscriptionArn")
-		for _, t := range s.topics {
-			t.subs = slices.DeleteFunc(t.subs, func(sub *subscription) bool { return sub.arn == arn })
-		}
-		snsOK(w, action, struct{}{})
-	case "Publish":
-		t := s.topics[form.Get("TopicArn")]
-		if t == nil {
-			snsError(w, http.StatusNotFound, "NotFound", "Topic does not exist")
-			return
-		}
-		attrs, err := messageAttributes(form, "MessageAttributes")
-		if err != nil || form.Get("Message") == "" {
-			snsError(w, http.StatusBadRequest, "InvalidParameter", "Invalid parameter: Message")
-			return
-		}
-		id := newID()
-		s.fanOut(t, id, form.Get("Message"), attrs)
-		snsOK(w, action, struct {
-			MessageID string `xml:"MessageId"`
-		}{id})
-	case "PublishBatch":
-		t := s.topics[form.Get("TopicArn")]
-		if t == nil {
-			snsError(w, http.StatusNotFound, "NotFound", "Topic does not exist")
-			return
-		}
-		type ok struct {
-			ID        string `xml:"Id"`
-			MessageID string `xml:"MessageId"`
-		}
-		var done []ok
-		for i := 1; ; i++ {
-			base := fmt.Sprintf("PublishBatchRequestEntries.member.%d", i)
-			entryID := form.Get(base + ".Id")
-			if entryID == "" {
-				break
-			}
-			if i > 10 {
-				snsError(w, http.StatusBadRequest, "TooManyEntriesInBatchRequest", "more than ten entries")
-				return
-			}
-			attrs, err := messageAttributes(form, base+".MessageAttributes")
-			if err != nil || form.Get(base+".Message") == "" {
-				snsError(w, http.StatusBadRequest, "InvalidParameter", "Invalid parameter: Message")
-				return
-			}
-			id := newID()
-			s.fanOut(t, id, form.Get(base+".Message"), attrs)
-			done = append(done, ok{entryID, id})
-		}
-		snsOK(w, action, struct {
-			Successful []ok `xml:"Successful>member"`
-			Failed     struct{}
-		}{Successful: done})
-	default:
-		snsError(w, http.StatusBadRequest, "InvalidAction", "the fake does not do "+action)
-	}
-}
-
-// fanOut delivers a published message to each of a topic's subscribed queues whose policy lets SNS
-// send from it.
-func (s *Server) fanOut(t *topic, id, msg string, attrs map[string]attribute) {
-	for _, sub := range t.subs {
-		var q *queue
-		for _, x := range s.queues {
-			if x.arn == sub.endpoint {
-				q = x
-			}
-		}
-		if q == nil || !allowsSNS(q.attrs["Policy"], q.arn, t.arn) || !sub.admits(attrs) {
-			continue
-		}
-		body, mattrs := msg, attrs
-		if !sub.raw {
-			env, _ := json.Marshal(map[string]any{"Type": "Notification", "MessageId": id, "TopicArn": t.arn,
-				"Message": msg, "Timestamp": time.Now().UTC().Format(time.RFC3339Nano), "MessageAttributes": envelopeAttrs(attrs)})
-			body, mattrs = string(env), nil
-		}
-		s.send(q, body, mattrs, nil)
-	}
-}
-
-func envelopeAttrs(attrs map[string]attribute) map[string]map[string]string {
-	out := map[string]map[string]string{}
-	for k, a := range attrs {
-		v := a.StringValue
-		if a.DataType == "Binary" {
-			v = base64.StdEncoding.EncodeToString(a.BinaryValue)
-		}
-		out[k] = map[string]string{"Type": a.DataType, "Value": v}
-	}
-	return out
-}
-
-// allowsSNS reports whether a queue's policy lets SNS's service principal send to it from topic:
-// a statement allowing sqs:SendMessage (or sqs:*) on the queue to sns.amazonaws.com (or anyone),
-// conditioned, if at all, on aws:SourceArn equal to or like the topic's.
-func allowsSNS(policy, queueArn, topicArn string) bool {
-	var p struct {
-		Statement []struct {
-			Effect    string
-			Principal any
-			Action    any
-			Resource  any
-			Condition map[string]map[string]any
-		}
-	}
-	if json.Unmarshal([]byte(policy), &p) != nil {
-		return false
-	}
-	list := func(v any) []string {
-		switch v := v.(type) {
-		case string:
-			return []string{v}
-		case []any:
-			var out []string
-			for _, x := range v {
-				if s, ok := x.(string); ok {
-					out = append(out, s)
-				}
-			}
-			return out
-		}
-		return nil
-	}
-	has := func(vs []string, want ...string) bool {
-		for _, v := range vs {
-			for _, w := range want {
-				if v == w {
-					return true
-				}
-			}
-		}
-		return false
-	}
-	for _, st := range p.Statement {
-		if st.Effect != "Allow" || !has(list(st.Action), "sqs:SendMessage", "sqs:*", "*") ||
-			(st.Resource != nil && !has(list(st.Resource), queueArn, "*")) {
-			continue
-		}
-		principal := false
-		switch pr := st.Principal.(type) {
-		case string:
-			principal = pr == "*"
-		case map[string]any:
-			principal = has(list(pr["Service"]), "sns.amazonaws.com") || has(list(pr["AWS"]), "*")
-		}
-		if !principal {
-			continue
-		}
-		matched := true
-		for op, conds := range st.Condition {
-			for key, v := range conds {
-				if !strings.EqualFold(key, "aws:SourceArn") {
-					continue
-				}
-				ok := false
-				for _, want := range list(v) {
-					switch op {
-					case "ArnEquals", "StringEquals":
-						ok = ok || want == topicArn
-					case "ArnLike", "StringLike":
-						ok = ok || like(want, topicArn)
-					}
-				}
-				matched = matched && ok
-			}
-		}
-		if matched {
-			return true
-		}
-	}
-	return false
-}
-
-// like matches s against a pattern of '*' and '?' wildcards.
-func like(pattern, s string) bool {
-	if pattern == "" {
-		return s == ""
-	}
-	switch pattern[0] {
-	case '*':
-		for i := 0; i <= len(s); i++ {
-			if like(pattern[1:], s[i:]) {
-				return true
-			}
-		}
-		return false
-	case '?':
-		return s != "" && like(pattern[1:], s[1:])
-	}
-	return s != "" && s[0] == pattern[0] && like(pattern[1:], s[1:])
 }

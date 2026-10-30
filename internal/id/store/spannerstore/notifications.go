@@ -95,10 +95,17 @@ func (x queries) SetNotificationPrefs(ctx context.Context, principal string, mai
 
 var mailColumns = []string{"mail_id", "principal_id", "to_address", "subject", "body", "state", "attempts", "next_try", "last_error", "created_at"}
 
+func (x queries) MarkWorkAt(ctx context.Context, kind string, key int64, at time.Time) error {
+	return x.Write(ctx, func(tx *spanner.ReadWriteTransaction) error { return spannerdata.MarkWorkAt(ctx, tx, kind, key, at) })
+}
+
 func (x queries) QueueMail(ctx context.Context, m store.Mail) error {
 	return x.Write(ctx, func(tx *spanner.ReadWriteTransaction) error {
-		return tx.BufferWrite([]*spanner.Mutation{spanner.Insert("mail_outbox", mailColumns,
-			[]any{m.ID, m.Principal, m.To, m.Subject, m.Body, int64(m.State), int64(m.Attempts), m.NextTry, m.LastError, m.CreatedAt})})
+		if err := tx.BufferWrite([]*spanner.Mutation{spanner.Insert("mail_outbox", mailColumns,
+			[]any{m.ID, m.Principal, m.To, m.Subject, m.Body, int64(m.State), int64(m.Attempts), m.NextTry, m.LastError, m.CreatedAt})}); err != nil {
+			return err
+		}
+		return spannerdata.MarkWork(ctx, tx, store.MailWork, m.ID)
 	})
 }
 
@@ -122,21 +129,4 @@ func (x queries) UpdateMail(ctx context.Context, m store.Mail) error {
 		return tx.BufferWrite([]*spanner.Mutation{spanner.Update("mail_outbox", []string{"mail_id", "state", "attempts", "next_try", "last_error"},
 			[]any{m.ID, int64(m.State), int64(m.Attempts), m.NextTry, m.LastError})})
 	})
-}
-
-func (x queries) DueMails(ctx context.Context, before time.Time, limit int) ([]int64, error) {
-	var out []int64
-	err := x.Read(func(r spannerdata.Reader) error {
-		out = nil
-		return spannerdata.Each(ctx, r, `SELECT mail_id FROM mail_outbox WHERE state = 0 AND next_try <= @before ORDER BY next_try LIMIT @limit`,
-			map[string]any{"before": before, "limit": int64(limit)}, func(row *spanner.Row) error {
-				var id int64
-				if err := row.Columns(&id); err != nil {
-					return err
-				}
-				out = append(out, id)
-				return nil
-			})
-	})
-	return out, err
 }

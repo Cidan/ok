@@ -15,7 +15,9 @@ import (
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"gopkg.in/yaml.v3"
 
+	"github.com/Cidan/ok/internal/bus/bustest"
 	"github.com/Cidan/ok/internal/dial"
 	"github.com/Cidan/ok/internal/id/ca"
 	"github.com/Cidan/ok/internal/id/signin/oidctest"
@@ -30,6 +32,16 @@ import (
 // signed in in a browser sees control's pages, creates a repository through control — which asks
 // the SCM as control's robot — and finds it once control's feed, following the SCM as that robot,
 // brings it; and ok secrets serves its services on the same port.
+// busYAML is a configuration's bus, the test's (bustest.Config), as YAML.
+func busYAML(t testing.TB) string {
+	t.Helper()
+	b, err := yaml.Marshal(map[string]any{"bus": bustest.Config(t)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
 func TestServe(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	dir := t.TempDir()
@@ -71,15 +83,20 @@ scm:
 automation:
   `+bucket("logs")+`
 secrets: {root: `+keystest.Keyring(t, 1)+`}
-`), 0o644)
+`+busYAML(t)), 0o644)
 	done := make(chan error, 1)
 	go func() {
 		done <- serveRolesUntil(ctx, []string{"-config", config, "-roles", "identity,scm,automation,control,secrets"})
 	}()
+	var ended error
+	stopped := false
 	t.Cleanup(func() {
 		cancel()
-		if err := <-done; err != nil {
-			t.Errorf("ok serve: %v", err)
+		if !stopped {
+			ended = <-done
+		}
+		if ended != nil {
+			t.Errorf("ok serve: %v", ended)
 		}
 	})
 	for i := 0; ; i++ {
@@ -94,6 +111,7 @@ secrets: {root: `+keystest.Keyring(t, 1)+`}
 		}
 		select {
 		case err := <-done:
+			stopped = true
 			t.Fatalf("ok serve ended: %v", err)
 		case <-time.After(100 * time.Millisecond):
 		}

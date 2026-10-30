@@ -129,6 +129,31 @@ func (s *Slow) ListPage(ctx context.Context, prefix, after string, limit int) ([
 	return s.Store.ListPage(ctx, prefix, after, limit)
 }
 
+func (s *Slow) Stage(ctx context.Context, tmp string) (blob.Staged, error) {
+	if err := s.wait(ctx, "stage"); err != nil {
+		return nil, err
+	}
+	st, err := s.Store.Stage(ctx, tmp)
+	if err != nil {
+		return nil, err
+	}
+	return &slowStaged{Staged: st, s: s}, nil
+}
+
+// slowStaged is a staged object whose commit waits the latency, as the copy that names it would.
+type slowStaged struct {
+	blob.Staged
+	s *Slow
+}
+
+func (st *slowStaged) Commit(ctx context.Context, key string) error {
+	if err := st.s.wait(ctx, "commit"); err != nil {
+		st.Staged.Abort()
+		return err
+	}
+	return st.Staged.Commit(ctx, key)
+}
+
 func (s *Slow) Copy(ctx context.Context, src, dst string) error {
 	if err := s.wait(ctx, "copy"); err != nil {
 		return err

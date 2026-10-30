@@ -160,7 +160,6 @@ func newEnv(t *testing.T) *env {
 	})
 	e.main.land(8, "plain", map[string]string{".ok/repository.yaml": "build: none\n"})
 	e.policy = service.NewPolicy(e.main, e.members, names)
-	e.policy.SetTTLs(0, 0)
 	cfg := service.Config{Store: st, Policy: e.policy, Approvals: e.approvals}
 	e.secrets, e.versions = service.NewSecrets(cfg), service.NewVersions(cfg)
 	return e

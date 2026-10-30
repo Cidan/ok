@@ -41,14 +41,20 @@ func deployAgent(args []string) error {
 	caFile := flags.String("ca-file", "", "the CA ok's certificate is signed by, when not one the system trusts")
 	plaintext := flags.Bool("insecure", false, "plaintext, to an ok on a network the cluster trusts")
 	kubeconfig := flags.String("kubeconfig", "", "the cluster, from outside it (default: the cluster it runs in)")
-	state := flags.String("state", "", "where it checks migrations out and builds them; unset, it runs none")
+	state := flags.String("state", "", "where it presents migrations' commits through okfs and builds them; unset, it runs none. With it, the agent runs in a user and mount namespace of its own (unshare --map-root-user --mount --propagation private), with /dev/fuse")
 	bazel := flags.String("bazel", "", "the Bazel, or bazelisk, migrations run with (default: bazelisk, else bazel, on PATH)")
+	jjPath := flags.String("jj", "", "ok's jj, the okfs daemon that presents migrations' commits (default: jj on PATH)")
 	devPrincipal := flags.String("dev-principal", "", "the principal to name to a loopback development ok (tests)")
 	if err := flags.Parse(args); err != nil {
 		return flagError(err)
 	}
 	if *addr == "" {
 		return errors.New("ok deploy agent: -address is where ok is reached")
+	}
+	if *state != "" {
+		if err := checkout.RequireIsolated(); err != nil {
+			return err
+		}
 	}
 	base := dial.Options{Insecure: *plaintext}
 	if !*plaintext {
@@ -100,6 +106,8 @@ func deployAgent(args []string) error {
 	if err != nil {
 		return fmt.Errorf("the cluster: %w", err)
 	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 	a := &agent.Agent{Kube: kube, Version: version, Log: slog.Default()}
 	agents := identitypb.NewDeployAgentsClient(conn)
 	if *state != "" {
@@ -107,11 +115,24 @@ func deployAgent(args []string) error {
 		if err != nil {
 			return fmt.Errorf("Bazel, which migrations run with: %w", err)
 		}
+		jj, err := lookPath(*jjPath, "jj")
+		if err != nil {
+			return fmt.Errorf("ok's jj, the okfs daemon: %w", err)
+		}
 		src := checkout.SCM(scmpb.NewStoreClient(conn))
-		co, err := checkout.NewReal(filepath.Join(*state, "repo"), src)
+		vc := checkout.VirtualConfig{Dir: filepath.Join(*state, "repo"), State: filepath.Join(*state, "okfs"), JJ: jj, SCM: *addr, TLS: !*plaintext,
+			CAFile: *caFile, DevPrincipal: *devPrincipal, Log: os.Stderr}
+		if o.Credential != nil {
+			vc.ConfigDir = filepath.Join(*state, "okfs", "config")
+			if err := keepCredential(ctx, o.Credential, filepath.Join(vc.ConfigDir, "credential"), auth.Server{Addr: *addr, TLS: !*plaintext}); err != nil {
+				return fmt.Errorf("the okfs daemon's credential: %w", err)
+			}
+		}
+		co, err := checkout.NewVirtual(vc)
 		if err != nil {
 			return err
 		}
+		defer co.Close()
 		m := &agent.Migrations{Identity: agents, SCM: struct {
 			scmpb.RepositoriesClient
 			scmpb.BrowseClient
@@ -120,8 +141,6 @@ func deployAgent(args []string) error {
 			Bazel: &engine.Bazel{Path: path, Env: os.Environ(), OutputBase: filepath.Join(*state, "bazel"), Checkout: co, Source: src, Log: slog.Default()}}
 		a.Migrate = m.Run
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 	r := &agent.Runner{Agent: a, Log: slog.Default(),
 		Cells: func(ctx context.Context) ([]string, error) {
 			resp, err := agents.DeployCells(ctx, &identitypb.DeployCellsRequest{})

@@ -467,7 +467,19 @@ func (s *Store) newKey(ctx context.Context, repo, version int64) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return s.b.InsertRepositoryKey(move.WithRepository(ctx, repo), RepositoryKey{Repository: repo, Version: version, Root: root.ID(), Wrapped: wrapped})
+	ctx = move.WithRepository(ctx, repo)
+	var made bool
+	err = s.b.Txn(ctx, func(tx Ops) error {
+		var err error
+		made, err = tx.InsertRepositoryKey(ctx, RepositoryKey{Repository: repo, Version: version, Root: root.ID(), Wrapped: wrapped})
+		if err != nil || !made || version != 1 {
+			return err
+		}
+		// Its first key: its collection's first pass, a day on, which books the next
+		// (service.Collector).
+		return tx.MarkWorkAt(ctx, CollectWork, repo, time.Now().Add(24*time.Hour))
+	})
+	return made, err
 }
 
 // root is the root that wraps a repository's new keys: its organization's own, or the
@@ -847,7 +859,7 @@ func (s *Store) Repositories(ctx context.Context, after int64, limit int) ([]int
 // about the repositories — keys, versions, unseals, audit — as they are. Roots are an
 // installation's or an organization's, never a cell's, so the destination opens them alike.
 func (s *Store) Mover() *move.RepositoryRole {
-	return &move.RepositoryRole{RoleName: cells.Secrets, Rows: s.b.Moves(), Arrived: func(_ context.Context, repos []int64) error {
+	return &move.RepositoryRole{RoleName: cells.Secrets, Rows: s.b.Moves(), Work: s.Work(), Arrived: func(_ context.Context, repos []int64) error {
 		for _, r := range repos {
 			s.forget(r)
 		}

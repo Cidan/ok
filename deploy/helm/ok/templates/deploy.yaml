@@ -80,7 +80,7 @@ spec:
             httpGet: {path: /readyz, port: http}
             periodSeconds: 10
           securityContext: {{- toYaml .Values.deploy.securityContext | nindent 12 }}
-          {{- with include "ok.resources" .Values.deploy }}
+          {{- with include "ok.resources" (dict "root" . "v" .Values.deploy) }}
           resources: {{- . | nindent 12 }}
           {{- end }}
           volumeMounts:
@@ -89,7 +89,7 @@ spec:
             - {name: ok-token, mountPath: /var/run/secrets/ok, readOnly: true}
             - {name: state, mountPath: /var/lib/ok}
             - {name: tmp, mountPath: /tmp}
-            {{- if and (eq .Values.deploy.checkout "virtual") (not .Values.deploy.fuseResource) }}
+            {{- if and (eq .Values.deploy.checkout "virtual") (not (include "ok.deviceResource" (dict "root" . "resource" .Values.deploy.fuseResource "device" "fuse"))) }}
             - {name: fuse, mountPath: /dev/fuse}
             {{- end }}
             {{- range $name, $ref := .Values.deploy.migrationEnv }}
@@ -103,7 +103,7 @@ spec:
           emptyDir: {sizeLimit: {{ .Values.deploy.state.sizeLimit }}}
         - name: tmp
           emptyDir: {}
-        {{- if and (eq .Values.deploy.checkout "virtual") (not .Values.deploy.fuseResource) }}
+        {{- if and (eq .Values.deploy.checkout "virtual") (not (include "ok.deviceResource" (dict "root" . "resource" .Values.deploy.fuseResource "device" "fuse"))) }}
         - name: fuse
           hostPath: {path: /dev/fuse, type: CharDevice}
         {{- end }}

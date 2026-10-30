@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"path"
+	"slices"
 	"strings"
 	"time"
 
@@ -27,6 +28,7 @@ const (
 	LandHeadMoved          LandReason = 7
 	LandCandidateMismatch  LandReason = 8
 	LandUnknownBase        LandReason = 9
+	LandTooLarge           LandReason = 10
 )
 
 // LandRejection refuses a landing or a candidate: which CL, why, and every conflicting
@@ -102,13 +104,56 @@ type landCommits struct {
 	s    *Store
 	repo int64
 	new  map[encoding.ID]*encoding.Commit
+	// read are the stored commits it has read, for the request it serves (nil: none kept).
+	read map[encoding.ID]*encoding.Commit
 }
 
 func (lc *landCommits) commit(id encoding.ID) (*encoding.Commit, error) {
 	if c, ok := lc.new[id]; ok {
 		return c, nil
 	}
-	return lc.s.readCommit(lc.ctx, lc.repo, id)
+	if c, ok := lc.read[id]; ok {
+		return c, nil
+	}
+	c, err := lc.s.readCommit(lc.ctx, lc.repo, id)
+	if err == nil && lc.read != nil {
+		lc.read[id] = c
+	}
+	return c, err
+}
+
+// prefetch reads the stored commits of ids, those not read yet, in one read.
+func (lc *landCommits) prefetch(ids []encoding.ID) error {
+	var refs []ObjectRef
+	asked := map[encoding.ID]bool{}
+	for _, id := range ids {
+		if _, ok := lc.read[id]; ok || id == encoding.RootCommitID || asked[id] {
+			continue
+		}
+		if _, ok := lc.new[id]; ok {
+			continue
+		}
+		asked[id] = true
+		refs = append(refs, ObjectRef{Kind: encoding.KindCommit, ID: id})
+	}
+	if len(refs) == 0 {
+		return nil
+	}
+	res, err := lc.s.ReadObjects(lc.ctx, lc.repo, refs)
+	if err != nil {
+		return err
+	}
+	for _, r := range res {
+		if !r.Found {
+			continue // its reader says so, as it asks
+		}
+		o, err := decodeStored(encoding.KindCommit, r.Ref.ID, r.Body)
+		if err != nil {
+			return err
+		}
+		lc.read[r.Ref.ID] = o.(*encoding.Commit)
+	}
+	return nil
 }
 
 // tree is a commit's resolved root tree; the root commit's is the empty tree.
@@ -178,41 +223,46 @@ func (s *Store) landOnto(lc *landCommits, ts treeStore, number int64, ps Patchse
 	return id, landed, nil
 }
 
-// insertCommits stores commits the SCM made (landed commits and candidates), written by
-// actor, each one generation above its parent.
+// insertCommits stores commits the SCM made (landed commits, candidates, rollbacks), each written
+// by its actor, one generation above its parent: one statement for the commits, one for the parent
+// edges of those it recorded.
 func (s *Store) insertCommits(ctx context.Context, tx *txn, repo int64, commits []*encoding.Commit, gens []int64, actors []string) error {
+	if len(commits) == 0 {
+		return nil
+	}
+	rows := make([]backend.Commit, len(commits))
+	parents := map[encoding.ID]encoding.ID{}
 	for i, c := range commits {
 		canonical, err := encoding.Encode(c)
 		if err != nil {
 			return err
 		}
 		id := encoding.Hash(canonical)
-		inserted, err := tx.InsertCommits(ctx, repo, []backend.Commit{{
-			ID: id, ChangeID: c.ChangeID[:], Body: canonical[1:], Generation: gens[i],
-			CommittedAt: time.UnixMilli(c.Committer.Time.Millis),
-		}}, actors[i])
-		if err != nil {
-			return err
-		}
-		if len(inserted) == 0 {
-			continue
-		}
-		if err := tx.InsertCommitParents(ctx, repo, []backend.ParentEdge{{Commit: id, Ord: 0, Parent: c.Parents[0]}}); err != nil {
-			return err
-		}
+		rows[i] = backend.Commit{ID: id, ChangeID: c.ChangeID[:], Body: canonical[1:], Generation: gens[i],
+			CommittedAt: time.UnixMilli(c.Committer.Time.Millis), WrittenBy: actors[i]}
+		parents[id] = c.Parents[0]
 	}
-	return nil
+	inserted, err := tx.InsertCommits(ctx, repo, rows, actors[0])
+	if err != nil || len(inserted) == 0 {
+		return err
+	}
+	edges := make([]backend.ParentEdge, len(inserted))
+	for i, id := range inserted {
+		edges[i] = backend.ParentEdge{Commit: id, Ord: 0, Parent: parents[id]}
+	}
+	return tx.InsertCommitParents(ctx, repo, edges)
 }
 
 // Land lands CLs on main, bottom of a stack first, on behalf of actor, the submitter ok
 // control authorized (docs/scm.md, "Landing"). main must be at expectedHead, the
-// head approval and automation were validated against. One transaction locks the
-// repository and the CLs, checks each CL and computes the commit it lands as against the
-// running head, then — unless dryRun — writes the new commits, advances main, marks the
-// CLs submitted, indexes the landed paths, pins everything, and emits the events. A
-// refusal is a *LandRejection, and nothing is written. It returns each landed commit,
-// main's new head (the would-be head on a dry run), and the last event it emitted (nil on a
-// dry run).
+// head approval and automation were validated against. It plans the landing from a snapshot —
+// checks each CL and computes the commit it lands as against the running head, reading trees a
+// level at a time (planLanding) — then, unless dryRun, one transaction locks the repository and
+// the CLs, checks that neither moved from what the plan read, and writes what it computed: the new
+// commits, main's new head, the CLs submitted, the landed paths, pins, and the events, a statement
+// for each kind of row (writeLanding). A refusal is a *LandRejection, and nothing is written. It
+// returns each landed commit, main's new head (the would-be head on a dry run), and the last event
+// it emitted (nil on a dry run).
 func (s *Store) Land(ctx context.Context, repo int64, items []LandItem, expectedHead encoding.ID, actor string, dryRun bool) ([]Landed, encoding.ID, *scmpb.Event, error) {
 	if len(items) == 0 {
 		return nil, encoding.ID{}, nil, invalid("a landing names at least one CL")
@@ -240,114 +290,302 @@ func (s *Store) Land(ctx context.Context, repo int64, items []LandItem, expected
 		seen[it.Number] = true
 		numbers[i] = it.Number
 	}
-	var landed []Landed
-	var newHead encoding.ID
-	var last *scmpb.Event
-	// A dry run writes nothing: read from a snapshot, it locks nothing a landing waits on.
-	run := s.inTx
-	if dryRun {
-		run = s.inSnapshot
+	for attempt := 1; ; attempt++ {
+		var plan *landPlan
+		// A plan writes nothing: read from a snapshot, it locks nothing a landing waits on.
+		if err := s.inSnapshot(ctx, func(ctx context.Context, tx *txn) error {
+			var err error
+			plan, err = s.planLanding(ctx, tx, repo, items, numbers, expectedHead, actors, committers)
+			return err
+		}); err != nil {
+			return nil, encoding.ID{}, nil, err
+		}
+		landed := make([]Landed, len(plan.steps))
+		for i, st := range plan.steps {
+			landed[i] = Landed{Number: st.cl.Number, Commit: st.id}
+		}
+		if dryRun {
+			return landed, plan.newHead, nil, nil
+		}
+		last, err := s.writeLanding(ctx, repo, numbers, plan)
+		if errors.Is(err, errStaleLanding) && attempt < landPlans {
+			continue // a CL changed since the plan read it: plan again, which says why it does not land
+		}
+		if err != nil {
+			return nil, encoding.ID{}, nil, err
+		}
+		return landed, plan.newHead, last, nil
 	}
-	err := run(ctx, func(ctx context.Context, tx *txn) error {
-		landed, newHead, last = nil, encoding.ID{}, nil
-		head, headSeq, ok, err := tx.Head(ctx, repo, !dryRun)
+}
+
+// landPlans bounds how many times a landing is planned again because a CL changed under it.
+const landPlans = 3
+
+// errStaleLanding is a landing's transaction finding a CL other than its plan read it.
+var errStaleLanding = errors.New("a CL changed since its landing was planned")
+
+// landStep is one CL of a landing, as its plan computed it.
+type landStep struct {
+	cl     *ChangeList
+	ps     Patchset
+	id     encoding.ID
+	commit *encoding.Commit // new: to write
+	gen    int64
+	parent encoding.ID
+	actor  string
+	// paths are its path history (changedPaths), written in the landing's transaction unless
+	// spill, when compaction writes them after it (finishPathIndexes).
+	paths []string
+	spill bool
+}
+
+// landPlan is a landing as computed from one snapshot: main's head then, each CL's step, and the
+// trees the new commits hold.
+type landPlan struct {
+	head    encoding.ID
+	headSeq int64
+	newHead encoding.ID
+	steps   []landStep
+	ts      *pendingTrees
+}
+
+// planLanding checks each CL of a landing and computes the commit it lands as against the running
+// head, as of q's snapshot: main at expectedHead, each CL open at its item's patchset, a stacked CL's
+// parent landed before it. It reads every commit the landing starts from in one read, and every
+// tree its splices read a level of them at a time across all its CLs (prefetchSplices) — before
+// the transaction, which holds main, writes any of it.
+func (s *Store) planLanding(ctx context.Context, q *txn, repo int64, items []LandItem, numbers []int64, expectedHead encoding.ID,
+	actors []string, committers map[string]person) (*landPlan, error) {
+	head, headSeq, ok, err := q.Head(ctx, repo, false)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, notFound("repository %d", repo)
+	}
+	if head != expectedHead {
+		return nil, &LandRejection{Number: items[0].Number, Reason: LandHeadMoved,
+			Message: fmt.Sprintf("main is at %s, not %s (validate against the new head and land again)", head, expectedHead)}
+	}
+	cls, err := s.readChangeLists(ctx, q, repo, numbers, false)
+	if err != nil {
+		return nil, err
+	}
+	// The CLs stacked under them, landed or not, and the candidates the items name.
+	var parents []int64
+	var candIDs []encoding.ID
+	for _, it := range items {
+		if c, ok := cls[it.Number]; ok && c.ParentNumber != 0 && !slices.Contains(parents, c.ParentNumber) {
+			parents = append(parents, c.ParentNumber)
+		}
+		if it.Candidate != nil {
+			candIDs = append(candIDs, *it.Candidate)
+		}
+	}
+	parentCLs, err := s.readChangeLists(ctx, q, repo, parents, false)
+	if err != nil {
+		return nil, err
+	}
+	cands, err := q.CandidatesOf(ctx, repo, candIDs)
+	if err != nil {
+		return nil, err
+	}
+	runningGen, err := s.generation(ctx, repo, head)
+	if err != nil {
+		return nil, err
+	}
+	lc := &landCommits{ctx: ctx, s: s, repo: repo, new: map[encoding.ID]*encoding.Commit{}, read: map[encoding.ID]*encoding.Commit{}}
+	ts := s.pendingTrees(ctx, repo)
+	starts := []encoding.ID{head}
+	for _, it := range items {
+		if c, ok := cls[it.Number]; ok {
+			ps := c.Current()
+			starts = append(starts, ps.Commit, ps.Base)
+		}
+	}
+	starts = append(starts, candIDs...)
+	if err := lc.prefetch(starts); err != nil {
+		return nil, err
+	}
+	hTree, _, err := lc.tree(head)
+	if err != nil {
+		return nil, err
+	}
+	// Each CL's change, whose trees its path history diffs where main has not moved under it, and
+	// its splice onto main.
+	var pairs [][2]encoding.ID
+	var triples [][3]encoding.ID
+	for _, it := range items {
+		c, ok := cls[it.Number]
+		if !ok {
+			continue
+		}
+		ps := c.Current()
+		pTree, _, perr := lc.tree(ps.Base)
+		cc, cerr := lc.commit(ps.Commit)
+		if perr == nil && cerr == nil && len(cc.RootTree) == 1 {
+			pairs = append(pairs, [2]encoding.ID{pTree, cc.RootTree[0]})
+			triples = append(triples, [3]encoding.ID{pTree, cc.RootTree[0], hTree})
+		}
+	}
+	if _, err := prefetchDiffs(ts, pairs); err != nil {
+		return nil, err
+	}
+	if err := ts.prefetchSplices(triples); err != nil {
+		return nil, err
+	}
+
+	plan := &landPlan{head: head, headSeq: headSeq, ts: ts}
+	at := time.Now()
+	running := head
+	inCall := map[int64]bool{}
+	for i, it := range items {
+		c, ok := cls[it.Number]
+		if !ok {
+			return nil, notFound("CL %d", it.Number)
+		}
+		reject := func(reason LandReason, format string, args ...any) error {
+			return &LandRejection{Number: c.Number, Reason: reason, Message: fmt.Sprintf(format, args...)}
+		}
+		switch c.Status {
+		case StatusDraft:
+			return nil, reject(LandNotOpen, "CL %d is a draft (request review first)", c.Number)
+		case StatusOpen:
+		default:
+			return nil, reject(LandNotOpen, "CL %d is %s", c.Number, c.Status)
+		}
+		if c.CurrentPatchset != it.Patchset {
+			return nil, reject(LandStalePatchset, "CL %d is at patchset %d, not %d", c.Number, c.CurrentPatchset, it.Patchset)
+		}
+		if c.ParentNumber != 0 && !inCall[c.ParentNumber] {
+			p, ok := parentCLs[c.ParentNumber]
+			if !ok {
+				return nil, notFound("CL %d", c.ParentNumber)
+			}
+			if p.Status != StatusSubmitted {
+				return nil, reject(LandParentNotSubmitted, "CL %d is stacked on CL %d, which is %s (a stack lands bottom first)", c.Number, c.ParentNumber, p.Status)
+			}
+		}
+		ps := c.Current()
+		var id encoding.ID
+		var commit *encoding.Commit
+		if it.Candidate != nil {
+			cand, ok := cands[*it.Candidate]
+			if !ok || cand.Number != c.Number || cand.Patchset != ps.Number {
+				return nil, reject(LandCandidateMismatch, "%s is not a candidate prepared from CL %d at patchset %d", *it.Candidate, c.Number, ps.Number)
+			}
+			if cand.Base == running {
+				id = cand.Commit
+			}
+		}
+		if id == (encoding.ID{}) {
+			id, commit, err = s.landOnto(lc, ts, c.Number, ps, running, committers[actors[i]], at)
+			if err != nil {
+				return nil, err
+			}
+		}
+		from, _, err := lc.tree(running)
+		if err != nil {
+			return nil, err
+		}
+		to, _, err := lc.tree(id)
+		if err != nil {
+			return nil, err
+		}
+		paths, err := changedPaths(ts, from, to)
+		if err != nil {
+			return nil, err
+		}
+		plan.steps = append(plan.steps, landStep{cl: c, ps: ps, id: id, commit: commit, gen: runningGen + 1, parent: running,
+			actor: actors[i], paths: paths})
+		inCall[c.Number] = true
+		running, runningGen = id, runningGen+1
+	}
+	plan.newHead = running
+	return plan, s.budgetLanding(plan)
+}
+
+// Mutations a landing's rows hold on a backend that bounds them (backend.MutationBudget), each an
+// upper bound: a commit's row, its parent edge, and its pin; a tree's row and its pin; a CL's row
+// of main's history, its update, its candidates' deletion, and its two events; and a row of path
+// history.
+const (
+	commitMutations = 20
+	treeMutations   = 14
+	clMutations     = 50
+	pathMutations   = 4
+	landingOverhead = 200
+)
+
+// budgetLanding spills the path history of the plan's commits past what one transaction holds —
+// Config.LandingPaths rows, and on a backend that bounds a transaction's mutations, what is left of
+// its budget after the landing's other rows — to be written after it (finishPathIndexes), in step
+// order, so the first commits' are written with them. A landing whose other rows alone pass the
+// budget is refused: its CLs land fewer at once.
+func (s *Store) budgetLanding(plan *landPlan) error {
+	left := s.landingPaths
+	if budget := s.b.MutationBudget(); budget > 0 {
+		commits := 0
+		for _, st := range plan.steps {
+			if st.commit != nil {
+				commits++
+			}
+		}
+		rest := landingOverhead + commits*commitMutations + len(plan.ts.new)*treeMutations + len(plan.steps)*clMutations
+		if rest > budget {
+			return &LandRejection{Number: plan.steps[0].cl.Number, Reason: LandTooLarge,
+				Message: fmt.Sprintf("landing %d CLs writes about %d rows' worth of changes, more than one transaction holds (%d): land fewer at once",
+					len(plan.steps), rest, budget)}
+		}
+		left = min(left, (budget-rest)/pathMutations)
+	}
+	for i := range plan.steps {
+		st := &plan.steps[i]
+		if len(st.paths) > left {
+			st.spill = true
+			left = 0
+			continue
+		}
+		left -= len(st.paths)
+	}
+	return nil
+}
+
+// writeLanding writes a plan in one transaction, once main is still at the head the plan read and
+// each CL as the plan read it — errStaleLanding otherwise — every kind of row in a statement of its
+// own, whatever the number of CLs. It returns the last event it emitted.
+func (s *Store) writeLanding(ctx context.Context, repo int64, numbers []int64, plan *landPlan) (*scmpb.Event, error) {
+	var last *scmpb.Event
+	err := s.inTx(ctx, func(ctx context.Context, tx *txn) error {
+		last = nil
+		head, headSeq, ok, err := tx.Head(ctx, repo, true)
 		if err != nil {
 			return err
 		}
 		if !ok {
 			return notFound("repository %d", repo)
 		}
-		if head != expectedHead {
-			return &LandRejection{Number: items[0].Number, Reason: LandHeadMoved,
-				Message: fmt.Sprintf("main is at %s, not %s (validate against the new head and land again)", head, expectedHead)}
+		if head != plan.head || headSeq != plan.headSeq {
+			return &LandRejection{Number: plan.steps[0].cl.Number, Reason: LandHeadMoved,
+				Message: fmt.Sprintf("main is at %s, not %s (validate against the new head and land again)", head, plan.head)}
 		}
-		cls, err := s.readChangeLists(ctx, tx, repo, numbers, !dryRun)
+		cls, err := s.readChangeLists(ctx, tx, repo, numbers, true)
 		if err != nil {
 			return err
 		}
-
-		lc := &landCommits{ctx: ctx, s: s, repo: repo, new: map[encoding.ID]*encoding.Commit{}}
-		ts := s.pendingTrees(ctx, repo)
-		at := time.Now()
-		running := head
-		runningGen, err := s.generation(ctx, repo, head)
-		if err != nil {
-			return err
-		}
-		type step struct {
-			cl     *ChangeList
-			ps     Patchset
-			id     encoding.ID
-			commit *encoding.Commit // new: to write
-			gen    int64
-			parent encoding.ID
-			actor  string
-		}
-		var steps []step
-		inCall := map[int64]bool{}
-		for i, it := range items {
-			c, ok := cls[it.Number]
-			if !ok {
-				return notFound("CL %d", it.Number)
+		for _, st := range plan.steps {
+			c, ok := cls[st.cl.Number]
+			if !ok || c.Status != StatusOpen || c.CurrentPatchset != st.ps.Number || c.ParentNumber != st.cl.ParentNumber ||
+				c.Current().Commit != st.ps.Commit || c.Current().Base != st.ps.Base {
+				return errStaleLanding
 			}
-			reject := func(reason LandReason, format string, args ...any) error {
-				return &LandRejection{Number: c.Number, Reason: reason, Message: fmt.Sprintf(format, args...)}
-			}
-			switch c.Status {
-			case StatusDraft:
-				return reject(LandNotOpen, "CL %d is a draft (request review first)", c.Number)
-			case StatusOpen:
-			default:
-				return reject(LandNotOpen, "CL %d is %s", c.Number, c.Status)
-			}
-			if c.CurrentPatchset != it.Patchset {
-				return reject(LandStalePatchset, "CL %d is at patchset %d, not %d", c.Number, c.CurrentPatchset, it.Patchset)
-			}
-			if c.ParentNumber != 0 && !inCall[c.ParentNumber] {
-				st, err := s.clStatus(ctx, tx, repo, c.ParentNumber)
-				if err != nil {
-					return err
-				}
-				if st != StatusSubmitted {
-					return reject(LandParentNotSubmitted, "CL %d is stacked on CL %d, which is %s (a stack lands bottom first)", c.Number, c.ParentNumber, st)
-				}
-			}
-			ps := c.Current()
-			var id encoding.ID
-			var commit *encoding.Commit
-			if it.Candidate != nil {
-				cand, ok, err := s.candidate(ctx, tx, repo, *it.Candidate)
-				if err != nil {
-					return err
-				}
-				if !ok || cand.Number != c.Number || cand.Patchset != ps.Number {
-					return reject(LandCandidateMismatch, "%s is not a candidate prepared from CL %d at patchset %d", *it.Candidate, c.Number, ps.Number)
-				}
-				if cand.Base == running {
-					id = cand.Commit
-				}
-			}
-			if id == (encoding.ID{}) {
-				id, commit, err = s.landOnto(lc, ts, c.Number, ps, running, committers[actors[i]], at)
-				if err != nil {
-					return err
-				}
-			}
-			steps = append(steps, step{cl: c, ps: ps, id: id, commit: commit, gen: runningGen + 1, parent: running, actor: actors[i]})
-			landed = append(landed, Landed{Number: c.Number, Commit: id})
-			inCall[c.Number] = true
-			running, runningGen = id, runningGen+1
-		}
-		newHead = running
-		if dryRun {
-			return nil
 		}
 
 		var newCommits []*encoding.Commit
 		var newGens []int64
 		var newActors []string
 		var treeRoots []encoding.ID
-		for _, st := range steps {
+		for _, st := range plan.steps {
 			if st.commit != nil {
 				newCommits = append(newCommits, st.commit)
 				newGens = append(newGens, st.gen)
@@ -355,37 +593,47 @@ func (s *Store) Land(ctx context.Context, repo int64, items []LandItem, expected
 				treeRoots = append(treeRoots, st.commit.RootTree[0])
 			}
 		}
-		if err := ts.insert(ctx, tx, treeRoots); err != nil {
+		if err := plan.ts.insert(ctx, tx, treeRoots); err != nil {
 			return err
 		}
 		if err := s.insertCommits(ctx, tx, repo, newCommits, newGens, newActors); err != nil {
 			return err
 		}
-		if err := tx.SetHead(ctx, repo, newHead, headSeq+int64(len(steps))); err != nil {
+		if err := tx.SetHead(ctx, repo, plan.newHead, headSeq+int64(len(plan.steps))); err != nil {
 			return err
 		}
+		moves := make([]backend.HeadMove, len(plan.steps))
+		landedCLs := make([]backend.LandedCL, len(plan.steps))
+		var paths []backend.CommitPaths
 		var roots []ref
-		var events, moves []*scmpb.Event
-		left := s.landingPaths
-		for i, st := range steps {
+		var events, headMoves []*scmpb.Event
+		for i, st := range plan.steps {
 			seq := headSeq + int64(i) + 1
-			if err := tx.InsertHeadLog(ctx, repo, backend.HeadMove{Seq: seq, Old: st.parent, New: st.id, CL: st.cl.Number,
-				Patchset: st.ps.Number, By: st.actor}); err != nil {
-				return err
-			}
-			if err := tx.SetLanded(ctx, repo, st.cl.ID, int16(StatusSubmitted), st.id, st.actor); err != nil {
-				return err
-			}
-			if err := s.indexPaths(ctx, tx, repo, lc, ts, st.parent, st.id, st.gen, &left); err != nil {
-				return err
+			moves[i] = backend.HeadMove{Seq: seq, Old: st.parent, New: st.id, CL: st.cl.Number, Patchset: st.ps.Number, By: st.actor}
+			landedCLs[i] = backend.LandedCL{ID: st.cl.ID, Commit: st.id, By: st.actor}
+			if st.spill {
+				if err := tx.InsertPathIndex(ctx, repo, backend.PathIndex{Generation: st.gen, Commit: st.id, Parent: st.parent}); err != nil {
+					return err
+				}
+			} else {
+				paths = append(paths, backend.CommitPaths{Generation: st.gen, Commit: st.id, Paths: st.paths})
 			}
 			roots = append(roots, ref{table: tCommit, id: st.id})
 			events = append(events, &scmpb.Event{Kind: &scmpb.Event_Landed{Landed: &scmpb.ChangeListLanded{
 				Number: st.cl.Number, Patchset: st.ps.Number, CommitId: st.id[:], SubmitterId: st.actor,
 			}}})
-			moves = append(moves, &scmpb.Event{Kind: &scmpb.Event_HeadMoved{HeadMoved: &scmpb.HeadMoved{
+			headMoves = append(headMoves, &scmpb.Event{Kind: &scmpb.Event_HeadMoved{HeadMoved: &scmpb.HeadMoved{
 				OldHead: st.parent[:], NewHead: st.id[:], HeadSeq: seq,
 			}}})
+		}
+		if err := tx.InsertHeadLogs(ctx, repo, moves); err != nil {
+			return err
+		}
+		if err := tx.SetLanded(ctx, repo, int16(StatusSubmitted), landedCLs); err != nil {
+			return err
+		}
+		if err := tx.InsertCommitPaths(ctx, repo, paths); err != nil {
+			return err
 		}
 		if err := tx.DeleteCandidatesOf(ctx, repo, numbers); err != nil {
 			return err
@@ -398,45 +646,11 @@ func (s *Store) Land(ctx context.Context, repo int64, items []LandItem, expected
 			}
 			return err
 		}
-		all := append(events, moves...)
+		all := append(events, headMoves...)
 		last = all[len(all)-1]
 		return appendEvents(ctx, tx, repo, all)
 	})
-	if err != nil {
-		return nil, encoding.ID{}, nil, err
-	}
-	return landed, newHead, last, nil
-}
-
-// indexPaths records the paths a commit on main changed from its parent, for Log and
-// Browse — while they are no more than left of the landing's Config.LandingPaths, which it
-// takes them from; otherwise it records the commit in path_index, for the compaction its pins
-// mark due to write (finishPathIndexes), and readers to read from its trees until then
-// (pendingPaths): the landing's transaction, and main, wait for neither.
-func (s *Store) indexPaths(ctx context.Context, tx *txn, repo int64, lc *landCommits, ts treeStore, parent, id encoding.ID, gen int64,
-	left *int) error {
-	from, _, err := lc.tree(parent)
-	if err != nil {
-		return err
-	}
-	to, _, err := lc.tree(id)
-	if err != nil {
-		return err
-	}
-	paths, err := changedPaths(ts, from, to)
-	if err != nil {
-		return err
-	}
-	if len(paths) > *left {
-		return tx.InsertPathIndex(ctx, repo, backend.PathIndex{Generation: gen, Commit: id, Parent: parent})
-	}
-	*left -= len(paths)
-	for start := 0; start < len(paths); start += pathBatch {
-		if err := tx.InsertCommitPaths(ctx, repo, gen, id, paths[start:min(start+pathBatch, len(paths))]); err != nil {
-			return err
-		}
-	}
-	return nil
+	return last, err
 }
 
 // pathBatch bounds the paths one InsertCommitPaths, and one transaction of finishPathIndexes, writes.
@@ -473,7 +687,7 @@ func (s *Store) finishPathIndexes(ctx context.Context, repo int64) error {
 		for start := 0; start < len(paths); start += pathBatch {
 			batch := paths[start:min(start+pathBatch, len(paths))]
 			if err := s.inTx(ctx, func(ctx context.Context, tx *txn) error {
-				return tx.InsertCommitPaths(ctx, repo, m.Generation, m.Commit, batch)
+				return tx.InsertCommitPaths(ctx, repo, []backend.CommitPaths{{Generation: m.Generation, Commit: m.Commit, Paths: batch}})
 			}); err != nil {
 				return err
 			}

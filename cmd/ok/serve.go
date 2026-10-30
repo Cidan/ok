@@ -29,6 +29,7 @@ import (
 	scmrole "github.com/Cidan/ok/internal/scm/role"
 	secretsrole "github.com/Cidan/ok/internal/secrets/role"
 	"github.com/Cidan/ok/internal/serve"
+	"github.com/Cidan/ok/internal/serve/inproc"
 	"github.com/Cidan/ok/internal/serve/node"
 )
 
@@ -114,12 +115,26 @@ func serveRolesUntil(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	// A role this process runs is reached within it (inproc), as its robot: no credential is proven
+	// or checked, as nothing leaves the process.
+	self := inproc.Listen()
 	as := func(robot, role, addr string) (grpc.ClientConnInterface, dial.Credential, error) {
 		var o dial.Options
 		cred := dial.Credential(idclient.NewLocal(id.Services, robot))
+		if run[role] {
+			c, err := dial.Dial("", dial.Options{InProcess: self.Dial, InProcessRobot: cfg.RobotName(robot)})
+			if err != nil {
+				return nil, nil, fmt.Errorf("reaching %s within the process for %s: %w", role, robot, err)
+			}
+			conns = append(conns, c)
+			// What reaches the role from outside the process — the deployer's okfs daemon, the SCM's —
+			// proves the robot as before: a development server's names it instead.
+			if *dev {
+				cred = nil
+			}
+			return c, cred, nil
+		}
 		switch {
-		case run[role]:
-			o, addr = dial.Options{TLS: localTLS}, local
 		case addr == "":
 			return nil, cred, nil
 		default:
@@ -162,7 +177,7 @@ func serveRolesUntil(ctx context.Context, args []string) error {
 		if err != nil {
 			return err
 		}
-		scm, err := scmrole.Build(ctx, cfg, scmrole.Options{Dev: *dev, Identity: c["identity"], Secrets: c["secrets"], Roots: idclient.LocalRoots(id.CA, "scm")})
+		scm, err := scmrole.Build(ctx, cfg, scmrole.Options{Dev: *dev, Identity: c["identity"], Secrets: c["secrets"], Roots: idclient.LocalRoots(id.CA)})
 		if err != nil {
 			return fmt.Errorf("the SCM: %w", err)
 		}
@@ -174,7 +189,7 @@ func serveRolesUntil(ctx context.Context, args []string) error {
 		if err != nil {
 			return err
 		}
-		auto, err := autorole.Build(ctx, cfg, autorole.Options{Dev: *dev, Identity: c["identity"], SCM: c["scm"], Roots: idclient.LocalRoots(id.CA, "automation")})
+		auto, err := autorole.Build(ctx, cfg, autorole.Options{Dev: *dev, Identity: c["identity"], SCM: c["scm"], Roots: idclient.LocalRoots(id.CA)})
 		if err != nil {
 			return fmt.Errorf("ok automation: %w", err)
 		}
@@ -206,7 +221,7 @@ func serveRolesUntil(ctx context.Context, args []string) error {
 		closers = append(closers, parts.close)
 		dep, err := deployrole.Build(ctx, cfg, deployrole.Options{Dev: *dev, Color: deployColor(""), Checkout: parts.checkout, Source: parts.source,
 			Bazel: parts.bazel, Env: parts.env, Identity: c["identity"], SCM: scmc, Automation: c["automation"], Secrets: c["secrets"],
-			Roots: idclient.LocalRoots(id.CA, "deploy")})
+			Roots: idclient.LocalRoots(id.CA)})
 		if err != nil {
 			return fmt.Errorf("the deployer: %w", err)
 		}
@@ -219,7 +234,7 @@ func serveRolesUntil(ctx context.Context, args []string) error {
 			return err
 		}
 		sec, err := secretsrole.Build(ctx, cfg, secretsrole.Options{Dev: *dev, Identity: c["identity"], SCM: c["scm"], Automation: c["automation"],
-			Roots: idclient.LocalRoots(id.CA, "secrets")})
+			Roots: idclient.LocalRoots(id.CA)})
 		if err != nil {
 			return fmt.Errorf("ok secrets: %w", err)
 		}
@@ -232,7 +247,7 @@ func serveRolesUntil(ctx context.Context, args []string) error {
 			return err
 		}
 		ctl, err := ctlrole.Build(ctx, cfg, ctlrole.Options{Dev: *dev, Identity: c["identity"], SCM: c["scm"], Automation: c["automation"], Deploy: c["deploy"],
-			Roots: idclient.LocalRoots(id.CA, "control")})
+			Roots: idclient.LocalRoots(id.CA)})
 		if err != nil {
 			return fmt.Errorf("ok control: %w", err)
 		}
@@ -240,7 +255,7 @@ func serveRolesUntil(ctx context.Context, args []string) error {
 		roots = append(roots, ctl.Root)
 	}
 
-	opts := []serve.Option{serve.WithAuthn(id.Resolver), serve.WithListener(lis), serve.WithMetricsAddr(cfg.MetricsListen), serve.WithProfiling(cfg.Profiling),
+	opts := []serve.Option{serve.WithAuthn(id.Resolver), serve.WithListener(lis), serve.WithLocal(self), serve.WithMetricsAddr(cfg.MetricsListen), serve.WithProfiling(cfg.Profiling),
 		serve.WithStopTimeout(workerStopTimeout)}
 	if cfg.TLS != nil {
 		tc, err := serve.LoadTLS(cfg.TLS.Cert, cfg.TLS.Key)

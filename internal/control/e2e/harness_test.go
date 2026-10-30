@@ -280,7 +280,7 @@ func opener(t *testing.T, cfg *config.Config) func(schema string) *pgxpool.Pool 
 // It returns where it serves.
 func startIdentity(t *testing.T, ctx context.Context, cfg *config.Config, open func(string) *pgxpool.Pool) string {
 	t.Helper()
-	id, err := idrole.Build(ctx, cfg, idrole.Options{Dev: true, Pool: open(idrole.Schema), MailLook: 100 * time.Millisecond})
+	id, err := idrole.Build(ctx, cfg, idrole.Options{Dev: true, Pool: open(idrole.Schema)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -389,7 +389,7 @@ func startStack(t *testing.T, ctx context.Context, res *resources, controlLis ne
 			stops[i]()
 		}
 	}
-	id, err := idrole.Build(ctx, cfg, idrole.Options{Dev: true, Pool: open(idrole.Schema), MailLook: 100 * time.Millisecond})
+	id, err := idrole.Build(ctx, cfg, idrole.Options{Dev: true, Pool: open(idrole.Schema)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -422,7 +422,7 @@ func startStack(t *testing.T, ctx context.Context, res *resources, controlLis ne
 
 	// ok control, as its robot, with the deployer's stand-in.
 	ctl, err := role.Build(ctx, cfg, role.Options{Dev: true, Pool: open(role.Schema), Identity: as(t, idAddr, control), SCM: as(t, scmAddr, control),
-		Automation: as(t, autoAddr, control), Deploy: as(t, res.deployAddr, control), Poll: 100 * time.Millisecond})
+		Automation: as(t, autoAddr, control), Deploy: as(t, res.deployAddr, control)})
 	if err != nil {
 		t.Fatal(err)
 	}

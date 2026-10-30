@@ -7,7 +7,9 @@
 //! loopback port, and the object store `OK_TEST_OBJECTS` names (as ok's Go tests take it,
 //! internal/testdb/testobjects): `s3` (the default), the S3 server AWS's tools name
 //! (AWS_ENDPOINT_URL_S3, …); `gcs`, a GCS emulator this process starts on its loopback
-//! (`$OK_GCS_BINARY`, else `ok-test-gcs` on the PATH); or `fs`, a directory. The SCM makes its own
+//! (`$OK_GCS_BINARY`, else `ok-test-gcs` on the PATH); or `fs`, a directory. Its roles keep their
+//! work on a NATS server this process starts on its loopback (`$OK_NATS_BINARY`, else
+//! `ok-test-nats` on the PATH), each SCM under a prefix of its own. The SCM makes its own
 //! schema in the database, and its S3 bucket, [`BUCKET`], if it does not exist. The `ok` binary is
 //! `$OK_BINARY`, else `ok` on the PATH. Its identity knows [`IDENTITY_PEOPLE`] and ok's roles'
 //! robots; being a development server, it trusts the principal a caller names in its
@@ -65,6 +67,10 @@ struct Server {
 
 static SERVER: OnceLock<Server> = OnceLock::new();
 static GCS: OnceLock<Emulator> = OnceLock::new();
+
+/// The NATS server every test SCM of the process keeps its work on, each under a prefix of its own:
+/// ok's roles run on a bus (docs/state.md).
+static NATS: OnceLock<Emulator> = OnceLock::new();
 
 /// The object store the test SCM keeps its packs in.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -197,6 +203,32 @@ fn start_gcs() -> Emulator {
     }
 }
 
+/// Starts the NATS server (ok-test-nats, or OK_NATS_BINARY: internal/bus/bustest/natsserver), and
+/// reads the URL it prints.
+fn start_nats() -> Emulator {
+    let bin = std::env::var("OK_NATS_BINARY").unwrap_or_else(|_| "ok-test-nats".to_owned());
+    let mut cmd = Command::new(bin);
+    cmd.env_clear()
+        .env("PATH", var("PATH"))
+        .env("HOME", var("HOME"))
+        .env("TMPDIR", std::env::temp_dir())
+        .args(["-listen", "127.0.0.1:0"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped());
+    let mut child = spawn_for_process(cmd)
+        .expect("start the NATS server (is ok-test-nats on the PATH, or OK_NATS_BINARY set?)");
+    let mut addr = String::new();
+    std::io::BufReader::new(child.stdout.take().expect("the NATS server's output"))
+        .read_line(&mut addr)
+        .expect("read the NATS server's URL");
+    let addr = addr.trim().to_owned();
+    assert!(!addr.is_empty(), "the NATS server printed no URL");
+    Emulator {
+        addr,
+        _child: child,
+    }
+}
+
 /// The database URL the environment's PGHOST, PGPORT, PGUSER, PGPASSWORD, and PGDATABASE name
 /// (the `postgres` database unless PGDATABASE says otherwise); the SCM keeps its tables in a
 /// schema of its own there.
@@ -284,10 +316,12 @@ fn write_config(port: u16) -> PathBuf {
         "domain: example.com\npublic_url: http://127.0.0.1:{port}\nlisten: 127.0.0.1:{port}\nmetrics_listen: 127.0.0.1:0\n\
          roles: {{identity: identity.ok, scm: scm.ok, control: control.ok, automation: automation.ok, deploy: deploy.ok, secrets: secrets.ok}}\n\
          database: {{url_file: {db:?}}}\n\
+         bus: {{type: nats, nats: {{url: {nats:?}, prefix: \"ok{port}\"}}}}\n\
          identity:\n  ca_dir: {ca:?}\n  system_of_record: {{static: {{file: {people:?}}}}}\n\
          scm:\n  objects: {objects}\n\
          secrets:\n  root: {:?}\n",
-        format!("keyring:{}", keyring.display())
+        format!("keyring:{}", keyring.display()),
+        nats = NATS.get_or_init(start_nats).addr,
     );
     let path = dir.join("ok.yaml");
     std::fs::write(&path, config).expect("write the test SCM's configuration");

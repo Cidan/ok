@@ -79,9 +79,7 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (_ *Role, err 
 	}
 	roots := opts.Roots
 	if roots == nil {
-		if roots, err = idclient.NewRoots(ctx, conn, "edge"); err != nil {
-			return nil, err
-		}
+		roots = idclient.NewRoots(conn)
 	}
 	resolver := authn.NewResolver(authn.Config{
 		Directory:     idclient.NewDirectory(conn),
@@ -92,7 +90,7 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (_ *Role, err 
 	})
 	r.Edge = edge.New(edge.Config{Resolver: resolver, Cells: identitypb.NewCellsClient(conn), Directory: cfg.Services.Identity,
 		UpstreamTLS: base.TLS, Edge: cfg.Edge})
-	r.Root = &assembly{deps: []node.Node{r.Edge, roots}}
+	r.Root = &assembly{deps: []node.Node{r.Edge}}
 	return r, nil
 }
 

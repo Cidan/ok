@@ -178,6 +178,9 @@ type GatedPool struct {
 	Tables map[string]bool
 }
 
+// PgxPool is the pool g gates: what is not about a repository — keyed work's marks — runs there.
+func (g GatedPool) PgxPool() *pgxpool.Pool { return g.Pool }
+
 // strict is whether writes about repositories must name theirs (OK_TEST_MOVE_STRICT): ok's suites
 // run so, to show every write path does.
 var strict = os.Getenv("OK_TEST_MOVE_STRICT") == "1"

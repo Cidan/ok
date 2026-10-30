@@ -11,8 +11,6 @@ import (
 	"slices"
 	"sort"
 	"strings"
-	"sync"
-	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -197,48 +195,25 @@ type DirectoryClient interface {
 	ListSets(ctx context.Context, in *identitypb.ListSetsRequest, opts ...grpc.CallOption) (*identitypb.ListSetsResponse, error)
 }
 
-// Directory lists the active people in ok identity's directory, by stable ID, cached briefly:
-// people join and leave rarely, and the reviewer search asks on every keystroke.
-type Directory struct {
-	client DirectoryClient
-	ttl    time.Duration
-
-	aclMu sync.Mutex
-	acls  map[string]cached // ACL name -> its principals' IDs
-
-	adminMu   sync.Mutex
-	admins    map[string]cached // a principal's ID -> whether they administer ok (one member when so)
-	adminList cached            // every administrator's ID
-
-	setsMu sync.Mutex
-	sets   map[string]reachedSets // the names a tree names, joined -> the sets they reach
-
-	mu      sync.Mutex
-	humans  []person // by name
-	byID    map[string]bool
-	fetched time.Time
-}
+// Directory asks ok identity's directory about people and sets each time: no replica keeps what it
+// says (docs/state.md).
+type Directory struct{ client DirectoryClient }
 
 // person is an active person: their stable ID, and their name now.
 type person struct{ id, name string }
 
 // NewDirectory reads people from ok identity's Directory.
-func NewDirectory(client DirectoryClient) *Directory {
-	return &Directory{client: client, ttl: time.Minute}
-}
+func NewDirectory(client DirectoryClient) *Directory { return &Directory{client: client} }
 
-func (d *Directory) people(ctx context.Context) ([]person, map[string]bool, error) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if d.humans != nil && time.Since(d.fetched) < d.ttl {
-		return d.humans, d.byID, nil
-	}
+// people are the active people the directory lists for query ("" for every one), by name.
+func (d *Directory) people(ctx context.Context, query string) ([]person, error) {
 	var out []person
 	token := ""
 	for {
-		resp, err := d.client.ListPrincipals(ctx, &identitypb.ListPrincipalsRequest{Kind: identitypb.Kind_KIND_HUMAN, PageSize: 500, PageToken: token})
+		resp, err := d.client.ListPrincipals(ctx, &identitypb.ListPrincipalsRequest{Kind: identitypb.Kind_KIND_HUMAN, Query: query,
+			PageSize: 500, PageToken: token})
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 		for _, p := range resp.GetPrincipals() {
 			if p.GetStatus() == identitypb.Status_STATUS_ACTIVE {
@@ -250,17 +225,12 @@ func (d *Directory) people(ctx context.Context) ([]person, map[string]bool, erro
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].name < out[j].name })
-	byID := make(map[string]bool, len(out))
-	for _, p := range out {
-		byID[p.id] = true
-	}
-	d.humans, d.byID, d.fetched = out, byID, time.Now()
-	return out, byID, nil
+	return out, nil
 }
 
 // Humans returns every active person's ID, in their names' order.
 func (d *Directory) Humans(ctx context.Context) ([]string, error) {
-	ps, _, err := d.people(ctx)
+	ps, err := d.people(ctx, "")
 	if err != nil {
 		return nil, err
 	}
@@ -273,23 +243,27 @@ func (d *Directory) Humans(ctx context.Context) ([]string, error) {
 
 // IsActiveHuman reports whether the principal with a stable ID is an active person.
 func (d *Directory) IsActiveHuman(ctx context.Context, id string) (bool, error) {
-	_, byID, err := d.people(ctx)
-	if err != nil {
-		return false, err
+	p, err := d.client.GetPrincipal(ctx, &identitypb.GetPrincipalRequest{Key: &identitypb.GetPrincipalRequest_Id{Id: id}})
+	switch status.Code(err) {
+	case codes.OK:
+		return p.GetPrincipal().GetKind() == identitypb.Kind_KIND_HUMAN && p.GetPrincipal().GetStatus() == identitypb.Status_STATUS_ACTIVE, nil
+	case codes.NotFound:
+		return false, nil
 	}
-	return byID[id], nil
+	return false, err
 }
 
 // Search returns the IDs of up to limit active people whose handle contains keyword, handles that
-// start with it first, skipping the IDs in exclude.
+// start with it first, skipping the IDs in exclude: of those the directory lists for the keyword,
+// whose names, emails, or display names contain it.
 func (d *Directory) Search(ctx context.Context, keyword string, exclude map[string]bool, limit int) ([]string, error) {
-	ps, _, err := d.people(ctx)
-	if err != nil {
-		return nil, err
-	}
 	keyword = strings.ToLower(strings.TrimSpace(keyword))
 	if keyword == "" {
 		return nil, nil
+	}
+	ps, err := d.people(ctx, keyword)
+	if err != nil {
+		return nil, err
 	}
 	var prefix, inside []string
 	for _, p := range ps {
@@ -340,20 +314,9 @@ func (d *Directory) RetiredSetNames(ctx context.Context) (map[string]bool, error
 	return out, nil
 }
 
-type cached struct {
-	members []string // sorted
-	fetched time.Time
-}
-
 // ACLMembers returns the stable ID of every active principal in an ACL, through the sets it
-// holds, sorted, cached as briefly as the people: an ACL that is no ACL has none.
+// holds, sorted: an ACL that is no ACL has none.
 func (d *Directory) ACLMembers(ctx context.Context, acl string) ([]string, error) {
-	d.aclMu.Lock()
-	if e, ok := d.acls[acl]; ok && time.Since(e.fetched) < d.ttl {
-		d.aclMu.Unlock()
-		return e.members, nil
-	}
-	d.aclMu.Unlock()
 	resp, err := d.client.ExpandSet(ctx, &identitypb.ExpandSetRequest{Name: acl})
 	var members []string
 	switch status.Code(err) {
@@ -367,12 +330,6 @@ func (d *Directory) ACLMembers(ctx context.Context, acl string) ([]string, error
 	default:
 		return nil, err
 	}
-	d.aclMu.Lock()
-	if d.acls == nil {
-		d.acls = map[string]cached{}
-	}
-	d.acls[acl] = cached{members: members, fetched: time.Now()}
-	d.aclMu.Unlock()
 	return members, nil
 }
 
@@ -396,76 +353,31 @@ func (d *Directory) InACL(ctx context.Context, acl, id string) (bool, error) {
 
 // IsAdmin reports whether the principal with a stable ID administers ok — every repository among
 // it — as ok identity decides: a member of admins.acl.<domain>, or, before any tree declares it, a
-// bootstrap administrator. Cached as briefly as the people.
+// bootstrap administrator.
 func (d *Directory) IsAdmin(ctx context.Context, id string) (bool, error) {
-	d.adminMu.Lock()
-	if e, ok := d.admins[id]; ok && time.Since(e.fetched) < d.ttl {
-		d.adminMu.Unlock()
-		return len(e.members) > 0, nil
-	}
-	d.adminMu.Unlock()
 	resp, err := d.client.CheckAdmin(ctx, &identitypb.CheckAdminRequest{Key: &identitypb.CheckAdminRequest_PrincipalId{PrincipalId: id}})
 	if err != nil {
 		return false, err
 	}
-	e := cached{fetched: time.Now()}
-	if resp.GetAdmin() {
-		e.members = []string{id}
-	}
-	d.adminMu.Lock()
-	if d.admins == nil {
-		d.admins = map[string]cached{}
-	}
-	d.admins[id] = e
-	d.adminMu.Unlock()
 	return resp.GetAdmin(), nil
 }
 
-// Admins lists the stable IDs of the principals who administer ok, in their names' order, cached
-// as briefly as the people.
+// Admins lists the stable IDs of the principals who administer ok, in their names' order.
 func (d *Directory) Admins(ctx context.Context) ([]string, error) {
-	d.adminMu.Lock()
-	if !d.adminList.fetched.IsZero() && time.Since(d.adminList.fetched) < d.ttl {
-		defer d.adminMu.Unlock()
-		return d.adminList.members, nil
-	}
-	d.adminMu.Unlock()
 	resp, err := d.client.ListAdmins(ctx, &identitypb.ListAdminsRequest{})
 	if err != nil {
 		return nil, err
 	}
-	ids, err := idsOf(resp.GetPrincipals(), resp.GetPrincipalIds())
-	if err != nil {
-		return nil, err
-	}
-	d.adminMu.Lock()
-	d.adminList = cached{members: ids, fetched: time.Now()}
-	d.adminMu.Unlock()
-	return ids, nil
+	return idsOf(resp.GetPrincipals(), resp.GetPrincipalIds())
 }
-
-// reachedSets are the sets a tree's names reach, as fetched.
-type reachedSets struct {
-	sets    map[string][]string
-	fetched time.Time
-}
-
-// maxReached bounds the trees whose sets are kept; past it, expired ones are swept.
-const maxReached = 64
 
 // Sets are the synced groups, teams, and aliases names reach — those they name, and those those
 // hold, through every level — by name, with their members' names as a tree's model holds them:
-// what a groups-and-ACLs tree naming them may hold. Cached as briefly as the people, by names.
+// what a groups-and-ACLs tree naming them may hold.
 func (d *Directory) Sets(ctx context.Context, names []string) (map[string][]string, error) {
 	names = slices.Clone(names)
 	slices.Sort(names)
 	names = slices.Compact(names)
-	key := strings.Join(names, "\n")
-	d.setsMu.Lock()
-	defer d.setsMu.Unlock()
-	if r, ok := d.sets[key]; ok && time.Since(r.fetched) < d.ttl {
-		return r.sets, nil
-	}
 	out := map[string][]string{}
 	if len(names) > 0 {
 		resp, err := d.client.ListSets(ctx, &identitypb.ListSetsRequest{ReachableFrom: names})
@@ -478,16 +390,5 @@ func (d *Directory) Sets(ctx context.Context, names []string) (map[string][]stri
 			}
 		}
 	}
-	if d.sets == nil {
-		d.sets = map[string]reachedSets{}
-	}
-	if len(d.sets) >= maxReached {
-		for k, r := range d.sets {
-			if time.Since(r.fetched) >= d.ttl {
-				delete(d.sets, k)
-			}
-		}
-	}
-	d.sets[key] = reachedSets{sets: out, fetched: time.Now()}
 	return out, nil
 }

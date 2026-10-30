@@ -28,17 +28,17 @@ func testQuotas(t *testing.T, s *store.Store) {
 	}
 	s.SetDefaultQuota(store.Quota{Concurrent: 10, Minutes: 600})
 	got, err := s.QuotasOf(ctx, []string{ada.ID, bea.ID})
-	if err != nil || got[ada.ID] != (store.Quota{Concurrent: 10, Minutes: 600, Weight: 1, Default: true}) {
+	if err != nil || got[ada.ID] != (store.Quota{Concurrent: 10, Minutes: 600, Default: true}) {
 		t.Fatalf("ada's default quota: %+v, %v", got[ada.ID], err)
 	}
 	if err := s.SetQuota(ctx, ada.ID, store.Quota{Concurrent: -1}); !errors.Is(err, store.ErrInvalid) {
 		t.Errorf("a negative quota: %v", err)
 	}
-	if err := s.SetQuota(ctx, ada.ID, store.Quota{Concurrent: 50, Minutes: 0, Weight: 3}); err != nil {
+	if err := s.SetQuota(ctx, ada.ID, store.Quota{Concurrent: 50, Minutes: 0}); err != nil {
 		t.Fatal(err)
 	}
 	got, err = s.QuotasOf(ctx, []string{ada.ID, bea.ID})
-	if err != nil || got[ada.ID] != (store.Quota{Concurrent: 50, Weight: 3}) || !got[bea.ID].Default {
+	if err != nil || got[ada.ID] != (store.Quota{Concurrent: 50}) || !got[bea.ID].Default {
 		t.Errorf("the quotas once ada's is set: %+v, %v", got, err)
 	}
 	if err := s.ResetQuota(ctx, ada.ID); err != nil {

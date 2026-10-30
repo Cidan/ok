@@ -33,7 +33,7 @@ func (f fullOpReads) RepositoryViews(ctx context.Context, repo int64) ([]backend
 func countingFullOpReads(t *testing.T, s *Store) (*Store, *atomic.Int32) {
 	t.Helper()
 	n := &atomic.Int32{}
-	c, err := New(fullOpReads{dbOf(s).open(t), n}, s.blobs, Config{Names: testNames, Signals: s.signals})
+	c, err := New(fullOpReads{dbOf(s).open(t), n}, s.blobs, Config{Names: testNames})
 	if err != nil {
 		t.Fatal(err)
 	}

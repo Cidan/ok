@@ -11,12 +11,15 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	"github.com/Cidan/ok/internal/bus/follow"
 	"github.com/Cidan/ok/internal/identity"
 	"github.com/Cidan/ok/internal/names"
 	"github.com/Cidan/ok/internal/scm/encoding"
 	"github.com/Cidan/ok/internal/scm/store"
+	"github.com/Cidan/ok/internal/serve/authn"
 	identitypb "github.com/Cidan/ok/proto/ok/identity/v1"
 	scmpb "github.com/Cidan/ok/proto/ok/scm/v1"
+	okpb "github.com/Cidan/ok/proto/ok/v1"
 )
 
 // Directory is the part of ok identity's directory the SCM asks whether a handle names a person,
@@ -462,6 +465,18 @@ const (
 type Events struct {
 	scmpb.UnimplementedEventsServer
 	c *core
+}
+
+// Follow records the calling role as one of the events' followers.
+func (s *Events) Follow(ctx context.Context, _ *scmpb.FollowRequest) (*scmpb.FollowResponse, error) {
+	c, ok := authn.FromContext(ctx)
+	if !ok || c.Role == okpb.Caller_CALLER_UNSPECIFIED {
+		return nil, status.Error(codes.PermissionDenied, "only ok's roles follow the SCM's events")
+	}
+	if err := s.c.store.AddFollower(ctx, follow.Name(c.Role)); err != nil {
+		return nil, toStatus(err)
+	}
+	return &scmpb.FollowResponse{}, nil
 }
 
 func (s *Events) Heads(ctx context.Context, req *scmpb.HeadsRequest) (*scmpb.HeadsResponse, error) {

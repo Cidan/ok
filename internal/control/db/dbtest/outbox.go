@@ -8,6 +8,7 @@ import (
 
 	"github.com/Cidan/ok/internal/control/db"
 	"github.com/Cidan/ok/internal/move"
+	"github.com/Cidan/ok/internal/work/worktest"
 )
 
 // Each event recorded and each comment made waits in its repository's outbox, oldest first, its
@@ -49,12 +50,8 @@ func testOutbox(t *testing.T, s db.Store) {
 	if _, ok, err := s.GetEvent(ctx, 1, 2, es[2].EventID); err != nil || ok {
 		t.Errorf("an event of another CL: %v, %v", ok, err)
 	}
-	if repos, err := s.OutboxRepositories(ctx); err != nil || !slices.Equal(repos, []int64{1}) {
-		t.Errorf("repositories with an outbox: %v, %v", repos, err)
-	}
-	due, err := s.Work().Due(ctx, db.OutboxWork, 10)
-	if err != nil || !slices.Equal(due, []int64{1}) {
-		t.Errorf("the outbox's work: %v, %v", due, err)
+	if got := worktest.Ready(t, s.Work(), db.OutboxWork); !slices.Equal(got, []int64{1}) {
+		t.Errorf("the outbox's jobs: %v", got)
 	}
 	if err := s.DoneOutbox(ctx, 1, []int64{es[0].ID, es[1].ID}); err != nil {
 		t.Fatal(err)

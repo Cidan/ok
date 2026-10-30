@@ -118,9 +118,6 @@ func (s *Store) CreatePlan(ctx context.Context, req PlanRequest) (plan *Plan, cr
 		}); err != nil {
 			return err
 		}
-		if err := queued(ctx, tx); err != nil {
-			return err
-		}
 		return s.cancelPre(ctx, tx, req.RepositoryID, req.CLNumber, req.Patchset, fmt.Sprintf("patchset %d superseded it", req.Patchset))
 	})
 	return plan, created, err
@@ -176,9 +173,6 @@ func (s *Store) ResumePre(ctx context.Context, repo, cl int64, patchset int32, r
 				n++
 			}
 		}
-		if n > 0 {
-			return queued(ctx, tx)
-		}
 		return nil
 	})
 	return n, err
@@ -201,7 +195,7 @@ func (s *Store) cancelPre(ctx context.Context, tx Ops, repo, cl int64, below int
 		return err
 	}
 	for _, id := range ended {
-		if err := notify(ctx, tx, chanDone, id); err != nil {
+		if err := changed(ctx, tx, id); err != nil {
 			return err
 		}
 	}
@@ -257,7 +251,7 @@ func (s *Store) queuePlan(ctx context.Context, tx Ops, run *Run, result *PlanRes
 	if run.Origin.Phase == PhasePost {
 		// The landing queue decides when the attempt runs; a released attempt's plans are all
 		// planned, so this plan's is not released yet.
-		return notifyQueue(ctx, tx, run.RepositoryID)
+		return markQueue(ctx, tx, run.RepositoryID)
 	}
 	newer, err := tx.MaxPrePatchset(ctx, run.RepositoryID, run.Origin.CLNumber)
 	if err != nil {
@@ -287,13 +281,8 @@ func (s *Store) insertJobs(ctx context.Context, tx Ops, repo int64, commit []byt
 			Finished: status != StatusQueued, LogStored: status != StatusQueued,
 		})
 	}
-	if err := tx.InsertRuns(ctx, rs); err != nil {
-		return err
-	}
-	if status == StatusQueued {
-		return queued(ctx, tx)
-	}
-	return nil
+	_, err := tx.InsertRuns(ctx, rs)
+	return err
 }
 
 func orEmptyJobs(j []PlannedJob) []PlannedJob {

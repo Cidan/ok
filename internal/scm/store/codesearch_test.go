@@ -10,6 +10,7 @@ import (
 
 	"github.com/Cidan/ok/internal/scm/codesearch"
 	"github.com/Cidan/ok/internal/scm/encoding"
+	"github.com/Cidan/ok/internal/work/worktest"
 )
 
 // Main's moves mark its index's build; a search before it is built asks for it; built, a search
@@ -19,9 +20,8 @@ func TestCodeSearch(t *testing.T) {
 	ctx := context.Background()
 	e := newBrowseEnv(t)
 	e.s.marksMade()
-	due, err := e.s.Work().Due(ctx, CodeSearchWork, 10)
-	if err != nil || !slices.Contains(due, e.repo) {
-		t.Fatalf("main's moves did not mark its indexing: %v, %v", due, err)
+	if got := worktest.Ready(t, e.s.Work(), CodeSearchWork); !slices.Contains(got, e.repo) {
+		t.Fatalf("main's moves did not mark its indexing: %v", got)
 	}
 	if _, _, _, err := e.s.SearchCode(ctx, e.repo, codesearch.Query{Pattern: "four"}); !errors.Is(err, ErrNoCodeIndex) {
 		t.Fatalf("a search before the index: %v", err)

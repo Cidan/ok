@@ -149,11 +149,21 @@ func (x queries) SetChangeListStatus(ctx context.Context, repo, id int64, status
 	return err
 }
 
-func (x queries) SetLanded(ctx context.Context, repo, id int64, status int16, commit encoding.ID, by string) error {
-	_, err := x.exec(ctx, `UPDATE changelist SET status = @status, landed_commit = @commit, submitted_by = @by, updated_at = `+now+`
-		WHERE repository_id = @repo AND id = @id`,
-		map[string]any{"repo": repo, "id": id, "status": int64(status), "commit": commit[:], "by": by})
-	return err
+// SetLanded updates each CL by key, every statement in one request.
+func (x queries) SetLanded(ctx context.Context, repo int64, status int16, cls []backend.LandedCL) error {
+	if len(cls) == 0 {
+		return nil
+	}
+	stmts := make([]spanner.Statement, len(cls))
+	for i, c := range cls {
+		stmts[i] = spanner.Statement{SQL: `UPDATE changelist SET status = @status, landed_commit = @commit, submitted_by = @by, updated_at = ` + now + `
+			WHERE repository_id = @repo AND id = @id`,
+			Params: map[string]any{"repo": repo, "id": c.ID, "status": int64(status), "commit": c.Commit[:], "by": c.By}}
+	}
+	return x.write(ctx, func(tx *spanner.ReadWriteTransaction) error {
+		_, err := spannerdata.BatchUpdate(ctx, tx, stmts)
+		return err
+	})
 }
 
 // UploadChangeLists reads by key alone, through the change and commit indexes, then the CLs of the
@@ -385,6 +395,34 @@ func (x queries) Candidate(ctx context.Context, repo int64, commit encoding.ID) 
 	c.Patchset = int32(patchset)
 	c.Base, err = toID(base)
 	return c, err == nil, err
+}
+
+func (x queries) CandidatesOf(ctx context.Context, repo int64, commits []encoding.ID) (map[encoding.ID]backend.Candidate, error) {
+	out := map[encoding.ID]backend.Candidate{}
+	if len(commits) == 0 {
+		return out, nil
+	}
+	err := x.rows(ctx, `SELECT commit_id, cl_number, patchset, base, prepared_by, created_at FROM candidate
+		WHERE repository_id = @repo AND commit_id IN UNNEST(@commits)`, map[string]any{"repo": repo, "commits": ids(commits)},
+		func() { out = map[encoding.ID]backend.Candidate{} }, func(row *spanner.Row) error {
+			var c backend.Candidate
+			var commit, base []byte
+			var patchset int64
+			if err := row.Columns(&commit, &c.Number, &patchset, &base, &c.PreparedBy, &c.PreparedAt); err != nil {
+				return err
+			}
+			var err error
+			if c.Commit, err = toID(commit); err != nil {
+				return err
+			}
+			if c.Base, err = toID(base); err != nil {
+				return err
+			}
+			c.Patchset = int32(patchset)
+			out[c.Commit] = c
+			return nil
+		}, "commits")
+	return out, err
 }
 
 // PutCandidate records a candidate unless it is recorded, and reads it as recorded.

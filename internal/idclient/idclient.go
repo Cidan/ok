@@ -28,7 +28,6 @@ import (
 	"github.com/Cidan/ok/internal/credential"
 	"github.com/Cidan/ok/internal/dial"
 	"github.com/Cidan/ok/internal/serve/authn"
-	"github.com/Cidan/ok/internal/serve/node"
 	"github.com/Cidan/ok/internal/tenancy"
 	identitypb "github.com/Cidan/ok/proto/ok/identity/v1"
 	okpb "github.com/Cidan/ok/proto/ok/v1"
@@ -145,121 +144,46 @@ func (d Directory) Token(ctx context.Context, secret string) (authn.Principal, e
 	return p, nil
 }
 
-// rootsEvery is how often Roots reads the CA's certificates again: a rotation's new certificate is
-// trusted within it.
-const rootsEvery = 5 * time.Minute
-
-// Roots are the identity CA's certificates, as identity publishes them: read at start, and again
-// every few minutes while the role runs (Start). A read that fails keeps the last ones. A role
-// that cannot reach identity as it starts — identity in the same process, not serving yet — starts
-// without them, verifying no credential, and reads them every few seconds until identity answers.
+// Roots are the identity CA's certificates, as identity publishes them, read at each verification
+// (Pool): a certificate a rotation adds is trusted, and one it removes is not, at once, and no
+// replica keeps them (docs/state.md).
 type Roots struct {
 	ca    identitypb.CAClient
-	local func() *x509.CertPool // identity's own, in the same process
-	owner string
-
-	mu   sync.Mutex
-	pool *x509.CertPool
+	local func(context.Context) (*x509.CertPool, error) // identity's own, in the same process
 }
 
-var _ node.Application = (*Roots)(nil)
+// NewRoots reads the CA's certificates from identity over conn.
+func NewRoots(conn grpc.ClientConnInterface) *Roots {
+	return &Roots{ca: identitypb.NewCAClient(conn)}
+}
 
-// NewRoots reads the CA's certificates from identity over conn, for the role named owner (scm,
-// control, …), whose node it is.
-func NewRoots(ctx context.Context, conn grpc.ClientConnInterface, owner string) (*Roots, error) {
-	r := &Roots{ca: identitypb.NewCAClient(conn), owner: owner}
-	readCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	if err := r.read(readCtx); err != nil {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		slog.Info("identity client: identity's CA certificates are not readable yet; reading them again until they are", "role", owner, "err", err)
+// LocalRoots are the CA's certificates of identity in the same process (ok serve), read from it
+// directly.
+func LocalRoots(ca func(context.Context) (*x509.CertPool, error)) *Roots {
+	return &Roots{local: ca}
+}
+
+// Pool is the CA's certificates now, for a credential.Verifier.
+func (r *Roots) Pool(ctx context.Context) (*x509.CertPool, error) {
+	if r.local != nil {
+		return r.local(ctx)
 	}
-	return r, nil
-}
-
-// LocalRoots are the CA's certificates of identity in the same process (ok serve), for the role
-// named owner: read from identity directly, as they are now.
-func LocalRoots(ca func() *x509.CertPool, owner string) *Roots {
-	return &Roots{local: ca, owner: owner}
-}
-
-// rootsRetry is how often Roots tries again while it has no certificates.
-const rootsRetry = 2 * time.Second
-
-func (r *Roots) read(ctx context.Context) error {
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
 	resp, err := r.ca.GetRoots(ctx, &identitypb.GetRootsRequest{})
 	if err != nil {
-		return err
+		return nil, err
+	}
+	if len(resp.GetCertificates()) == 0 {
+		return nil, errors.New("identity published no CA certificate")
 	}
 	pool := x509.NewCertPool()
 	for _, der := range resp.GetCertificates() {
 		cert, err := x509.ParseCertificate(der)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		pool.AddCert(cert)
 	}
-	if len(resp.GetCertificates()) == 0 {
-		return errors.New("identity published no CA certificate")
-	}
-	r.mu.Lock()
-	r.pool = pool
-	r.mu.Unlock()
-	return nil
-}
-
-// Pool is the certificates now, for a credential.Verifier: empty until they are read.
-func (r *Roots) Pool() *x509.CertPool {
-	if r.local != nil {
-		return r.local()
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.pool == nil {
-		return x509.NewCertPool()
-	}
-	return r.pool
-}
-
-func (r *Roots) has() bool {
-	if r.local != nil {
-		return true
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.pool != nil
-}
-
-func (r *Roots) Name() string                 { return "ok/" + r.owner + "/identity-roots" }
-func (r *Roots) Dependencies() []node.Node    { return nil }
-func (r *Roots) Setup(context.Context) error  { return nil }
-func (r *Roots) Healthy(context.Context) bool { return true }
-
-// Start reads the certificates again every few minutes until ctx ends — every few seconds while it
-// has none.
-func (r *Roots) Start(ctx context.Context) error {
-	if r.local != nil {
-		<-ctx.Done()
-		return nil
-	}
-	for {
-		wait := rootsEvery
-		if !r.has() {
-			wait = rootsRetry
-		}
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-time.After(wait):
-			if err := r.read(ctx); err != nil && ctx.Err() == nil {
-				slog.Warn("identity client: reading the CA's certificates", "role", r.owner, "err", err)
-			}
-		}
-	}
+	return pool, nil
 }
 
 // renewWithin is how near expiry a workload credential is renewed.

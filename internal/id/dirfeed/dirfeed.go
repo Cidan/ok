@@ -6,6 +6,7 @@ package dirfeed
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
@@ -19,10 +20,27 @@ import (
 // numbered by its place in that repository's log, its body an ok.identity.v1.DirectoryEvent.
 const Topic = "directory.repositories"
 
-// Events is the part of identity's DirectoryEvents service a Log reads.
+// RetentionPeriod is how long a deleted repository can be restored, after which its cell purges
+// it; CreatingTimeout how long an entry may wait for its cell to make its storage before it is
+// abandoned, and its storage purged.
+const (
+	RetentionPeriod = 30 * 24 * time.Hour
+	CreatingTimeout = time.Hour
+)
+
+// Events is the part of identity's DirectoryEvents service a follower reads.
 type Events interface {
 	Read(ctx context.Context, in *identitypb.ReadDirectoryEventsRequest, opts ...grpc.CallOption) (*identitypb.ReadDirectoryEventsResponse, error)
 	Heads(ctx context.Context, in *identitypb.DirectoryHeadsRequest, opts ...grpc.CallOption) (*identitypb.DirectoryHeadsResponse, error)
+	Follow(ctx context.Context, in *identitypb.FollowDirectoryRequest, opts ...grpc.CallOption) (*identitypb.FollowDirectoryResponse, error)
+}
+
+// Register is a follower's registration with the directory (follow.Follower.Register).
+func Register(events Events) func(context.Context) error {
+	return func(ctx context.Context) error {
+		_, err := events.Follow(ctx, &identitypb.FollowDirectoryRequest{})
+		return err
+	}
 }
 
 // Log is the directory's events' log, a follow.Log.

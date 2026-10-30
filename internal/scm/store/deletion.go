@@ -3,7 +3,6 @@ package store
 import (
 	"context"
 	"errors"
-	"fmt"
 
 	"github.com/Cidan/ok/internal/blob"
 	"github.com/Cidan/ok/internal/scm/contentindex"
@@ -20,8 +19,16 @@ import (
 // are retired, so an object goes once no other manifest names it; and its content index goes. A
 // network whose last repository goes is deleted whole.
 
-// DeleteRepository deletes a repository and everything only it holds.
+// DeleteRepository deletes a repository and everything only it holds — or finishes its deletion,
+// should it have been stopped short: the transaction that deletes its row marks its purge's work
+// (PurgeWork), whose job finishes it should this one stop. ErrNotFound for none, deleted or not.
 func (s *Store) DeleteRepository(ctx context.Context, repo int64) error {
+	if d, ok, err := s.ops(ctx).PendingDeletion(ctx, repo); err != nil || ok {
+		if err != nil {
+			return err
+		}
+		return s.finishDeletion(ctx, d)
+	}
 	if err := s.deleteTail(ctx, func(ctx context.Context, tx *txn, limit int) (int64, error) {
 		return tx.DeleteRepositoryTail(ctx, repo, limit)
 	}); err != nil {
@@ -37,7 +44,7 @@ func (s *Store) DeleteRepository(ctx context.Context, repo int64) error {
 		if !ok {
 			return notFound("repository %d", repo)
 		}
-		return nil
+		return tx.MarkWork(ctx, PurgeWork, repo)
 	})
 	if err != nil {
 		return err
@@ -46,19 +53,14 @@ func (s *Store) DeleteRepository(ctx context.Context, repo int64) error {
 	return s.finishDeletion(ctx, backend.Deletion{Repo: repo, Net: net})
 }
 
-// FinishDeletions finishes the deletions a replica stopped short of, up to limit: what a deletion
-// does after the transaction that deleted the repository's row. It returns how many it finished.
-func (s *Store) FinishDeletions(ctx context.Context, limit int) (int, error) {
-	pending, err := s.ops(ctx).PendingDeletions(ctx, limit)
-	if err != nil {
-		return 0, err
+// FinishDeletion finishes a repository's deletion, should one have been stopped short; it reports
+// whether there was one.
+func (s *Store) FinishDeletion(ctx context.Context, repo int64) (bool, error) {
+	d, ok, err := s.ops(ctx).PendingDeletion(ctx, repo)
+	if err != nil || !ok {
+		return false, err
 	}
-	for i, d := range pending {
-		if err := s.finishDeletion(ctx, d); err != nil {
-			return i, fmt.Errorf("finishing the deletion of repository %d: %w", d.Repo, err)
-		}
-	}
-	return len(pending), nil
+	return true, s.finishDeletion(ctx, d)
 }
 
 // finishDeletion releases every chunk and tree a deleted repository's content index held, a batch at
@@ -116,8 +118,7 @@ func (s *Store) finishDeletion(ctx context.Context, d backend.Deletion) error {
 	}); err != nil {
 		return err
 	}
-	s.indexChanged(repoScope(d.Repo))
-	s.segmentsChanged(repoScope(d.Repo))
+	s.forgetIndex(repoScope(d.Repo))
 	if len(repos) == 0 {
 		return s.deleteNetwork(ctx, d.Net)
 	}
@@ -149,8 +150,7 @@ func (s *Store) deleteNetwork(ctx context.Context, net backend.Network) error {
 	}); err != nil {
 		return err
 	}
-	s.indexChanged(backend.NetworkScope(net))
-	s.segmentsChanged(backend.NetworkScope(net))
+	s.forgetIndex(backend.NetworkScope(net))
 	return nil
 }
 

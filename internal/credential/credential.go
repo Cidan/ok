@@ -24,6 +24,7 @@
 package credential
 
 import (
+	"context"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -32,6 +33,7 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"sync"
@@ -105,8 +107,14 @@ type Verified struct {
 }
 
 // Verifier checks requests' credentials against the identity CA's certificates.
+//
+// A proof is accepted once by a verifier: it keeps the nonces it accepted while their proofs could
+// be accepted (Skew either way). That is what the verifier has seen, no copy of anything a database
+// holds; a proof replayed to another replica within the window is accepted there. Recording every
+// nonce in the directory's database would put a write on every request; a proof bound to its TLS
+// connection (its exporter) would make a replay fail anywhere, holding nothing at all.
 type Verifier struct {
-	roots func() *x509.CertPool
+	roots func(context.Context) (*x509.CertPool, error)
 	now   func() time.Time
 
 	mu   sync.Mutex
@@ -114,9 +122,9 @@ type Verifier struct {
 	next time.Time            // when expired nonces are next swept
 }
 
-// NewVerifier checks certificates against the CA certificates roots returns: a function, so the
-// pool may change as the CA rotates.
-func NewVerifier(roots func() *x509.CertPool) *Verifier {
+// NewVerifier checks certificates against the CA certificates roots returns as each request is
+// verified: as the CA rotates, a certificate it adds is trusted, and one it removes is not, at once.
+func NewVerifier(roots func(context.Context) (*x509.CertPool, error)) *Verifier {
 	return &Verifier{roots: roots, now: time.Now, seen: map[string]time.Time{}}
 }
 
@@ -128,16 +136,19 @@ var (
 )
 
 // Verify checks a request to method: certDER chains to the CA, is a client certificate, and is
-// current; proof is signed by its key, for method, within Skew of now, with a nonce not seen
-// before. A proof is accepted once.
-func (v *Verifier) Verify(method string, certDER []byte, proof string) (*Verified, error) {
+// current; proof is signed by its key, for method, within Skew of now, with a nonce this verifier
+// has not seen before.
+func (v *Verifier) Verify(ctx context.Context, method string, certDER []byte, proof string) (*Verified, error) {
 	now := v.now()
 	cert, err := x509.ParseCertificate(certDER)
 	if err != nil {
 		return nil, ErrCertificate
 	}
 	// Without the CA's certificates nothing is verified: a nil pool would mean the system's roots.
-	roots := v.roots()
+	roots, err := v.roots(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("reading the identity CA's certificates: %w", err)
+	}
 	if roots == nil {
 		return nil, ErrCertificate
 	}

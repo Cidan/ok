@@ -2,38 +2,15 @@ package store
 
 import (
 	"context"
-	"errors"
-	"strconv"
 	"time"
+
+	"github.com/Cidan/ok/internal/wait"
 )
 
-// Notification channels: a run was queued; a run's log grew (payload: its ID); a run
-// finished (payload: its ID); something the landing queue acts on changed — a submission, a
-// post plan, main's history (payload: the repository's ID).
-const (
-	chanQueue      = "ok_automation_queue"
-	chanLog        = "ok_automation_log"
-	chanDone       = "ok_automation_done"
-	chanSubmission = "ok_automation_submission"
-)
-
-// notify signals a run's or a repository's channel once tx commits.
-func notify(_ context.Context, tx Ops, channel string, id int64) error {
-	return signalOn(tx, channel, strconv.FormatInt(id, 10))
-}
-
-// queued wakes the workers waiting for a run, once tx commits.
-func queued(_ context.Context, tx Ops) error { return signalOn(tx, chanQueue, "") }
-
-// signalOn records a signal to send once tx commits. tx is the store's (Store.txn): a signal
-// recorded anywhere else would never be sent, so it fails the transaction instead.
-func signalOn(tx Ops, channel, payload string) error {
-	t, ok := tx.(txOps)
-	if !ok {
-		return errors.New("automation: a signal outside the store's transaction (Store.txn)")
-	}
-	t.pending.Add(channel, payload)
-	return nil
+// changed says, in tx, that the run of id changed — its log grew, or it ended — for its readers.
+func changed(ctx context.Context, tx Ops, id int64) error {
+	kind, key, body := wait.Changed(wait.RunSubject(id))
+	return tx.PendStep(ctx, kind, key, time.Time{}, body)
 }
 
 // StartRequest is a job to run on a commit.
@@ -83,10 +60,7 @@ func (s *Store) Start(ctx context.Context, req StartRequest) (*Run, error) {
 			RepositoryID: req.RepositoryID, CommitID: req.CommitID, Job: req.Job, Origin: req.Origin,
 			RequestedBy: req.RequestedBy, Status: StatusQueued, TimeoutSeconds: int32(timeout / time.Second),
 		})
-		if err != nil {
-			return err
-		}
-		return queued(ctx, tx)
+		return err
 	})
 	return run, err
 }
@@ -126,7 +100,7 @@ func cancelRun(ctx context.Context, tx Ops, id int64, reason, by string) error {
 		return err
 	}
 	if ended {
-		return notify(ctx, tx, chanDone, id)
+		return changed(ctx, tx, id)
 	}
 	return tx.RequestStop(ctx, id, reason, by)
 }
@@ -169,10 +143,8 @@ func (s *Store) Rerun(ctx context.Context, id int64, requestedBy string) (*Run, 
 				return &ConflictError{Message: "the patchset is planned: run its jobs again instead"}
 			}
 		}
-		if run, err = tx.InsertRun(ctx, rerunOf(prev, requestedBy)); err != nil {
-			return err
-		}
-		return queued(ctx, tx)
+		run, err = tx.InsertRun(ctx, rerunOf(prev, requestedBy))
+		return err
 	})
 	return run, err
 }

@@ -10,6 +10,7 @@ import (
 
 	"github.com/Cidan/ok/internal/data"
 	"github.com/Cidan/ok/internal/directory"
+	"github.com/Cidan/ok/internal/id/dirfeed"
 	"github.com/Cidan/ok/internal/identity"
 	"github.com/Cidan/ok/internal/tenancy"
 	identitypb "github.com/Cidan/ok/proto/ok/identity/v1"
@@ -23,12 +24,12 @@ import (
 // handle no person may hold, nor it a person's. It acts as no one.
 const Org Kind = "org"
 
-// RetentionPeriod is how long a deleted repository can be restored.
-const RetentionPeriod = 30 * 24 * time.Hour
-
-// CreatingTimeout is how long an entry may wait for its cell to make its storage before it is
-// abandoned.
-const CreatingTimeout = time.Hour
+// RetentionPeriod is how long a deleted repository can be restored, and CreatingTimeout how long an
+// entry may wait for its cell to make its storage before it is abandoned: its cell purges each then.
+const (
+	RetentionPeriod = dirfeed.RetentionPeriod
+	CreatingTimeout = dirfeed.CreatingTimeout
+)
 
 // Errors of the tenancy's rules.
 var (
@@ -1040,14 +1041,31 @@ func (s *Store) expiry(r Repository) Expiry {
 
 // ExpiryOf is a repository's expiry by the directory's clock; NotExpired for one there is none of.
 func (s *Store) ExpiryOf(ctx context.Context, id int64) (Expiry, error) {
+	e, _, err := s.Expiration(ctx, id)
+	return e, err
+}
+
+// Expiration is a repository's expiry by the directory's clock, and, for one that will expire and
+// has not yet — deleted, or being made — when it will.
+func (s *Store) Expiration(ctx context.Context, id int64) (Expiry, time.Time, error) {
 	r, err := s.b.Repository(ctx, id)
 	if errors.Is(err, ErrNotFound) {
-		return NotExpired, nil
+		return NotExpired, time.Time{}, nil
 	}
 	if err != nil {
-		return NotExpired, err
+		return NotExpired, time.Time{}, err
 	}
-	return s.expiry(r), nil
+	e := s.expiry(r)
+	if e != NotExpired {
+		return e, time.Time{}, nil
+	}
+	switch r.State {
+	case Deleted:
+		return e, r.StateAt.Add(RetentionPeriod), nil
+	case Creating:
+		return e, r.StateAt.Add(CreatingTimeout), nil
+	}
+	return e, time.Time{}, nil
 }
 
 // RemoveExpired removes an expired repository's entry — a deleted one's purge logged, a Creating

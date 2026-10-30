@@ -71,7 +71,7 @@ func testStoreOf(t *testing.T, conns int32) *Store {
 // hearing s's signals as s hears its.
 func reopen(t *testing.T, s *Store) *Store {
 	t.Helper()
-	return mustOpen(t, dbOf(s), s.blobs, Config{Signals: s.signals})
+	return mustOpen(t, dbOf(s), s.blobs, Config{})
 }
 
 var repoSeq atomic.Int64
@@ -251,7 +251,7 @@ func publish(ctx context.Context, s *Store, repo int64, principal string, b *bui
 		}
 	}
 	for _, c := range chunks {
-		if err := p.AddChunk(c, b.chunk(c)); err != nil {
+		if err := p.AddChunk(ctx, c, b.chunk(c)); err != nil {
 			p.Close()
 			return nil, err
 		}

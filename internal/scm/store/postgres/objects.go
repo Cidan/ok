@@ -1,6 +1,7 @@
 package postgres
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"time"
@@ -46,14 +47,17 @@ func (x queries) InsertCommits(ctx context.Context, repo int64, commits []backen
 	gens := make([]int64, n)
 	conflicted := make([]bool, n)
 	committed := make([]time.Time, n)
+	by := make([]string, n)
 	for i, c := range commits {
 		idCol[i], changes[i], bs[i], gens[i], conflicted[i], committed[i] = c.ID, c.ChangeID, c.Body, c.Generation, c.Conflicted, c.CommittedAt
+		by[i] = cmp.Or(c.WrittenBy, writtenBy)
 	}
 	return idList(x.q.Query(ctx, `INSERT INTO commit (repository_id, id, change_id, body, generation, conflicted, committed_at, written_by)
-		SELECT $1, u.id, u.change, u.body, u.gen, u.conflicted, u.committed, $8
-		FROM unnest($2::bytea[], $3::bytea[], $4::bytea[], $5::bigint[], $6::bool[], $7::timestamptz[]) AS u(id, change, body, gen, conflicted, committed)
+		SELECT $1, u.id, u.change, u.body, u.gen, u.conflicted, u.committed, u.by
+		FROM unnest($2::bytea[], $3::bytea[], $4::bytea[], $5::bigint[], $6::bool[], $7::timestamptz[], $8::text[])
+			AS u(id, change, body, gen, conflicted, committed, by)
 		ORDER BY u.id ON CONFLICT DO NOTHING RETURNING id`,
-		repo, ids(idCol), changes, bs, gens, conflicted, committed, writtenBy))
+		repo, ids(idCol), changes, bs, gens, conflicted, committed, by))
 }
 
 func (x queries) InsertCommitParents(ctx context.Context, repo int64, edges []backend.ParentEdge) error {
@@ -376,9 +380,20 @@ func (x queries) InsertTreeSizes(ctx context.Context, repo int64, trees []encodi
 
 // ─── Main's history ───
 
-func (x queries) InsertHeadLog(ctx context.Context, repo int64, h backend.HeadMove) error {
+func (x queries) InsertHeadLogs(ctx context.Context, repo int64, moves []backend.HeadMove) error {
+	if len(moves) == 0 {
+		return nil
+	}
+	seqs, cls, patchsets := make([]int64, len(moves)), make([]int64, len(moves)), make([]int32, len(moves))
+	olds, news, by := make([][]byte, len(moves)), make([][]byte, len(moves)), make([]string, len(moves))
+	for i, h := range moves {
+		seqs[i], cls[i], patchsets[i] = h.Seq, h.CL, h.Patchset
+		olds[i], news[i], by[i] = h.Old[:], h.New[:], h.By
+	}
 	_, err := x.q.Exec(ctx, `INSERT INTO head_log (repository_id, seq, old_head, new_head, cl_number, patchset, landed_by)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)`, repo, h.Seq, h.Old[:], h.New[:], h.CL, h.Patchset, h.By)
+		SELECT $1, u.seq, u.old, u.new, u.cl, u.patchset, u.by
+		FROM unnest($2::bigint[], $3::bytea[], $4::bytea[], $5::bigint[], $6::int[], $7::text[]) AS u(seq, old, new, cl, patchset, by)`,
+		repo, seqs, olds, news, cls, patchsets, by)
 	return err
 }
 
@@ -458,10 +473,21 @@ func (x queries) DeletePathIndex(ctx context.Context, repo, gen int64) error {
 	return err
 }
 
-func (x queries) InsertCommitPaths(ctx context.Context, repo, gen int64, commit encoding.ID, paths []string) error {
+func (x queries) InsertCommitPaths(ctx context.Context, repo int64, rows []backend.CommitPaths) error {
+	var paths []string
+	var gens []int64
+	var commits [][]byte
+	for _, r := range rows {
+		for _, p := range r.Paths {
+			paths, gens, commits = append(paths, p), append(gens, r.Generation), append(commits, r.Commit[:])
+		}
+	}
+	if len(paths) == 0 {
+		return nil
+	}
 	_, err := x.q.Exec(ctx, `INSERT INTO commit_path (repository_id, path, generation, commit_id)
-		SELECT $1, u.path, $2, $3 FROM unnest($4::text[]) AS u(path) ON CONFLICT DO NOTHING`,
-		repo, gen, commit[:], paths)
+		SELECT DISTINCT $1::bigint, u.path, u.gen, u.commit FROM unnest($2::text[], $3::bigint[], $4::bytea[]) AS u(path, gen, commit)
+		ON CONFLICT DO NOTHING`, repo, paths, gens, commits)
 	return err
 }
 

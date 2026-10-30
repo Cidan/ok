@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"reflect"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -168,7 +170,7 @@ func TestSegmentTreeSizesAfterTheMove(t *testing.T) {
 func TestSegmentMerge(t *testing.T) {
 	ctx := context.Background()
 	e := newCLEnv(t)
-	small := mustOpen(t, dbOf(e.s), e.s.blobs, Config{SegmentBatch: 2, Signals: e.s.signals})
+	small := mustOpen(t, dbOf(e.s), e.s.blobs, Config{SegmentBatch: 2})
 	var all []pinned
 	for i := range 6 {
 		all = append(all, pinContent(t, e, fmt.Sprint("m", i)))
@@ -336,5 +338,201 @@ func TestGCAfterCompaction(t *testing.T) {
 	fr, err := e.s.Fsck(ctx, e.repo, false)
 	if err != nil || len(fr.Problems) != 0 {
 		t.Errorf("fsck after collecting: %v, %v", fr.Problems, err)
+	}
+}
+
+// windowReads records the windows compaction's reads of settled operations look through.
+type windowReads struct {
+	backend.Backend
+	mu    *sync.Mutex
+	scans *[]int
+}
+
+func (w windowReads) SettledOpsIn(ctx context.Context, log int64, kind encoding.Kind, after []byte, before time.Time, scan, limit int) ([]backend.OpRecord, []byte, int, bool, error) {
+	w.mu.Lock()
+	*w.scans = append(*w.scans, scan)
+	w.mu.Unlock()
+	return w.Backend.SettledOpsIn(ctx, log, kind, after, before, scan, limit)
+}
+
+// Compaction looks through a window of the tail's operations and views a pass — at most a batch of
+// them, going on from where the last pass looked — rather than the whole tail each pass: across
+// passes it moves every settled one, and goes past those not settled. Compacting fully looks through
+// the whole tail from its start, and moves every one settled, those behind where the passes were.
+func TestCompactionLooksThroughAWindow(t *testing.T) {
+	ctx := context.Background()
+	e := newCLEnv(t)
+	// Twelve operations, each with its view, in one log, all settled; then half of them fresh.
+	b := newBuilder(t)
+	head := encoding.RootOperationID
+	var ops []encoding.ID
+	for i := range 12 {
+		work := b.commit(b.tree(fileEntry("f", b.file([]byte(fmt.Sprint("work ", i))))), fmt.Sprint("work ", i), encoding.RootCommitID)
+		op := b.operation(b.view(work), fmt.Sprint("snapshot ", i), head)
+		mustPublish(t, e.s, e.repo, alice, b, &OpHeadsUpdate{Old: []encoding.ID{head}, New: op})
+		head, ops = op, append(ops, op)
+	}
+	age(t, e.s, e.repo, 20)
+	db := dbOf(e.s)
+	fresh := func(ids []encoding.ID) {
+		t.Helper()
+		for _, id := range ids {
+			db.exec(t, `UPDATE operation SET touched_at = @now WHERE id = @id`, map[string]any{"now": db.today(t).Add(48 * time.Hour), "id": id[:]})
+		}
+	}
+	// The six first in the log's order: the first windows hold none settled.
+	slices.SortFunc(ops, func(a, b encoding.ID) int { return bytes.Compare(a[:], b[:]) })
+	fresh(ops[:6])
+	before := db.today(t).Add(-opSettled + 24*time.Hour)
+	settled := func() int {
+		return db.count(t, "operation", "touched_at < @before", map[string]any{"before": before}) +
+			db.count(t, "view", "touched_at < @before", map[string]any{"before": before})
+	}
+	if n := settled(); n < 18 {
+		t.Fatalf("%d operations and views settled, want 18 at least", n)
+	}
+	const batch = 3
+	var mu sync.Mutex
+	var scans []int
+	small, err := New(windowReads{dbOf(e.s).open(t), &mu, &scans}, e.s.blobs, Config{Names: testNames,
+		SegmentBatch: batch})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(small.Close)
+	for passes := 0; settled() > 0; passes++ {
+		if passes > 100 {
+			t.Fatalf("%d passes, %d settled operations and views left: the window does not go past those not settled", passes, settled())
+		}
+		if _, err := small.CompactSegments(ctx, e.repo, 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if left := db.count(t, "operation", "TRUE", nil); left != 6 {
+		t.Errorf("%d operations left, want the 6 not settled", left)
+	}
+	for _, s := range scans {
+		if s > batch {
+			t.Fatalf("a pass looked through %d operations, past its batch of %d: %v", s, batch, scans)
+		}
+	}
+	// The rest settled, and the passes' window past the first of them: compacting fully moves them
+	// all, from the tail's start.
+	age(t, e.s, e.repo, 20)
+	logs, err := small.ops(ctx).AllOpLogs(ctx, e.repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, l := range logs {
+		if db.count(t, "operation", "op_log_id = @log", map[string]any{"log": l}) > 0 {
+			if err := small.ops(ctx).SetCompactionCursor(ctx, e.repo, tailCursor{logs: logs, log: i, op: ops[0][:]}.encode()); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := small.compactFully(ctx, e.repo); err != nil {
+		t.Fatal(err)
+	}
+	if n := db.count(t, "operation", "TRUE", nil) + db.count(t, "view", "TRUE", nil); n != 0 {
+		t.Fatalf("compacting fully left %d operations and views in the tail", n)
+	}
+}
+
+// The tail's windows of sizes records and copy edges, looked through a row at a time from the start
+// — each after the last — take what one window over the whole tail takes, in order: those of what is
+// pinned, among those of what is not.
+func TestTailWindows(t *testing.T) {
+	ctx := context.Background()
+	e := newCLEnv(t)
+	pa, pb := pinContent(t, e, "a"), pinContent(t, e, "b")
+	// Not pinned: copies published alone, and trees as rows, with their sizes kept.
+	b := newBuilder(t)
+	var files []encoding.ID
+	for i := range 3 {
+		parent := b.add(&encoding.CopyHistory{CurrentPath: fmt.Sprint("u", i)})
+		b.add(&encoding.CopyHistory{CurrentPath: fmt.Sprint("v", i), Parents: []encoding.ID{parent}})
+		files = append(files, b.file([]byte(fmt.Sprint("unpinned ", i, "\n"))))
+	}
+	mustPublish(t, e.s, e.repo, alice, b, nil)
+	trees := []encoding.ID{pa.root, pa.sub, pb.root, pb.sub}
+	for _, f := range files {
+		tb := newBuilder(t)
+		tree := tb.tree(fileEntry("f", f))
+		if err := e.s.inTx(ctx, func(ctx context.Context, tx *txn) error {
+			_, err := tx.InsertObjects(ctx, e.repo, []backend.Object{{ID: tree, Kind: encoding.KindTree,
+				Body: tb.body(ObjectRef{Kind: encoding.KindTree, ID: tree})}})
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		trees = append(trees, tree)
+	}
+	if sizes, err := e.s.TreeSizes(ctx, e.repo, trees); err != nil || len(sizes) != len(trees) {
+		t.Fatalf("the trees' sizes: %d, %v", len(sizes), err)
+	}
+	ops := e.s.ops(ctx)
+	whole, _, more, err := ops.PinnedTreeSizes(ctx, e.repo, nil, 1000, 1000)
+	if err != nil || more || len(whole) != 4 {
+		t.Fatalf("one window over the whole tail's sizes: %d, more %v, %v; want the 4 pinned trees'", len(whole), more, err)
+	}
+	var walked []backend.Object
+	for after, steps := []byte(nil), 0; ; steps++ {
+		got, last, more, err := ops.PinnedTreeSizes(ctx, e.repo, after, 1, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		walked = append(walked, got...)
+		if !more {
+			break
+		}
+		if steps > 2*len(trees) {
+			t.Fatalf("%d windows of the sizes and no end", steps)
+		}
+		after = last
+	}
+	if !slices.EqualFunc(walked, whole, func(a, b backend.Object) bool { return a.ID == b.ID && bytes.Equal(a.Body, b.Body) }) {
+		t.Errorf("the sizes a row at a time: %d records, want the whole window's %d", len(walked), len(whole))
+	}
+	wholeEdges, _, more, err := ops.PinnedCopyEdges(ctx, e.repo, nil, 1000, 1000)
+	if err != nil || more || len(wholeEdges) != 2 {
+		t.Fatalf("one window over the whole tail's edges: %v, more %v, %v; want the 2 pinned copies'", wholeEdges, more, err)
+	}
+	var walkedEdges [][2]encoding.ID
+	for after, steps := (*[2]encoding.ID)(nil), 0; ; steps++ {
+		got, last, more, err := ops.PinnedCopyEdges(ctx, e.repo, after, 1, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		walkedEdges = append(walkedEdges, got...)
+		if !more {
+			break
+		}
+		if steps > 20 {
+			t.Fatalf("%d windows of the edges and no end", steps)
+		}
+		after = last
+	}
+	if !slices.Equal(walkedEdges, wholeEdges) {
+		t.Errorf("the edges a row at a time: %v, want %v", walkedEdges, wholeEdges)
+	}
+}
+
+// A compaction's cursor reads back from its row as it was written; a row it cannot read, or none,
+// is the tail's start.
+func TestTailCursorEncoding(t *testing.T) {
+	edges := [2]encoding.ID{{1, 2}, {3, 4}}
+	for _, c := range []tailCursor{
+		{},
+		{sizes: []byte("a/b\x00\x01"), edges: &edges, logs: []int64{-5, 7, 1 << 40}, log: 2, views: true, op: []byte{9, 9}},
+		{logs: []int64{3}},
+	} {
+		if got := decodeCursor(c.encode()); !reflect.DeepEqual(got, c) {
+			t.Errorf("%+v read back as %+v", c, got)
+		}
+	}
+	for _, bad := range [][]byte{nil, {}, {2}, {1, 5}, tailCursor{logs: []int64{1, 2}}.encode()[:4]} {
+		if got := decodeCursor(bad); !reflect.DeepEqual(got, tailCursor{}) {
+			t.Errorf("%v read as %+v, want the start", bad, got)
+		}
 	}
 }

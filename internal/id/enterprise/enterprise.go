@@ -22,6 +22,7 @@ import (
 	"github.com/Cidan/ok/internal/id/store"
 	"github.com/Cidan/ok/internal/ldapdial"
 	"github.com/Cidan/ok/internal/netguard"
+	"github.com/Cidan/ok/internal/work"
 )
 
 // Settings are an organization's identity provider's, but its secrets.
@@ -179,29 +180,44 @@ func SourceOf(ctx context.Context, st *store.Store, org string, set Settings, se
 	return nil, errors.New("the provider names no system of record")
 }
 
-// Syncer syncs organizations' providers: each when its interval is up, or when asked.
+// Syncer syncs organizations' providers: each when its interval is up, soon after its provider
+// pushes a change (SCIM), or when asked.
 type Syncer struct {
 	Store  *store.Store
 	Sealer *seal.Sealer
 	// AllowPrivate lets a development server reach an organization's directory anywhere.
 	AllowPrivate bool
-	// Poll is how often it looks for syncs due.
-	Poll time.Duration
 }
 
-// Sync syncs one organization's provider, under the organization's lock, and records how it went.
+// claimWait is how long a sync asked for waits for one under way to finish.
+const claimWait = time.Minute
+
+// Sync syncs one organization's provider now, holding its sync's claim (store.SyncWork) — waiting
+// for one under way to let go, told as it does (store.Claims) — and records how it went.
 func (s *Syncer) Sync(ctx context.Context, org string) (*directory.Plan, error) {
-	var plan *directory.Plan
-	err := s.Store.LockOrganizationSync(ctx, org, time.Minute, func(ctx context.Context) error {
-		var err error
-		plan, err = s.sync(ctx, org)
-		if err != nil {
-			if rerr := s.Store.OrganizationSyncFailed(ctx, org, err); rerr != nil {
-				slog.Error("enterprise: recording a failed sync", "organization", org, "err", rerr)
-			}
+	p, err := s.Store.IdentityProviderOf(ctx, org)
+	if err != nil {
+		return nil, err
+	}
+	held, release, ok, err := s.Store.Claims().Claim(ctx, store.SyncWork, p.Key, work.NewHolder(), time.Minute, claimWait)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, errors.New("the organization's sync under way is still running")
+	}
+	defer release()
+	return s.syncHeld(held, org)
+}
+
+// syncHeld syncs an organization's provider, holding its sync's claim, and records how it went.
+func (s *Syncer) syncHeld(ctx context.Context, org string) (*directory.Plan, error) {
+	plan, err := s.sync(ctx, org)
+	if err != nil {
+		if rerr := s.Store.OrganizationSyncFailed(ctx, org, err); rerr != nil {
+			slog.Error("enterprise: recording a failed sync", "organization", org, "err", rerr)
 		}
-		return err
-	})
+	}
 	return plan, err
 }
 
@@ -232,28 +248,45 @@ func (s *Syncer) sync(ctx context.Context, org string) (*directory.Plan, error) 
 }
 
 // Start syncs every organization's provider as its interval comes up, until ctx ends: a
-// node.Application's.
+// node.Application's. Each organization's sync is keyed work (store.SyncWork), booked as its
+// provider is set and by each sync for the next, whose job brings it to one replica at a time. Once,
+// it books the providers a release before set.
 func (s *Syncer) Start(ctx context.Context) error {
-	poll := s.Poll
-	if poll == 0 {
-		poll = time.Minute
+	w := s.Store.Work()
+	go func() {
+		if err := work.Once(ctx, w, syncUpgrade, s.Store.KeyIdentityProviders, slog.Default()); err != nil && ctx.Err() == nil {
+			slog.Warn("enterprise: booking the syncs of a release before", "err", err)
+		}
+	}()
+	return (&work.Runner{Kind: store.SyncWork, Store: w, Do: s.syncDue, Workers: 2,
+		// A sync asked for waits for this one to let go (Sync).
+		LetGo: s.Store.Claims().LetGo(store.SyncWork)}).Run(ctx)
+}
+
+// syncUpgrade books, once, the syncs of the providers a release before set.
+const syncUpgrade = "sync-upgrade"
+
+// syncDue syncs the organization whose provider's sync key is key, as its job comes — booked for
+// its interval by the sync before, and soon after its provider pushed a change (SCIM) — and books
+// the next.
+func (s *Syncer) syncDue(ctx context.Context, key int64) error {
+	org, err := s.Store.IdentityProviderOrg(ctx, key)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil // its provider was removed
 	}
-	t := time.NewTicker(poll)
-	defer t.Stop()
-	for {
-		due, err := s.Store.DueIdentityProviders(ctx)
-		if err != nil && ctx.Err() == nil {
-			slog.Error("enterprise: finding syncs due", "err", err)
-		}
-		for _, org := range due {
-			if _, err := s.Sync(ctx, org); err != nil && ctx.Err() == nil {
-				slog.Warn("enterprise: an organization's sync", "organization", org, "err", err)
-			}
-		}
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-t.C:
-		}
+	if err != nil {
+		return err
 	}
+	p, err := s.Store.IdentityProviderOf(ctx, org)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if _, err := s.syncHeld(ctx, org); err != nil && ctx.Err() == nil {
+		// Recorded as the sync's last run: tried again when its interval is up.
+		slog.Warn("enterprise: an organization's sync", "organization", org, "err", err)
+	}
+	return s.Store.Work().MarkAt(ctx, store.SyncWork, key, time.Now().Add(p.Interval))
 }

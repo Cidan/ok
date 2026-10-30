@@ -2,6 +2,7 @@ package spannerstore
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -528,6 +529,20 @@ func (x queries) DirectoryEvents(ctx context.Context, repo, after int64, limit i
 	return out, err
 }
 
+func (x queries) AddFollower(ctx context.Context, topic, name string) error {
+	return x.Write(ctx, func(tx *spanner.ReadWriteTransaction) error { return spannerdata.AddFollower(ctx, tx, topic, name) })
+}
+
+func (x queries) Followers(ctx context.Context, topic string) ([]string, error) {
+	var out []string
+	err := x.Read(func(r spannerdata.Reader) error {
+		var err error
+		out, err = spannerdata.Followers(ctx, r, topic)
+		return err
+	})
+	return out, err
+}
+
 func (x queries) DirectoryHeads(ctx context.Context, after int64, limit int) ([]store.DirectoryHead, error) {
 	var out []store.DirectoryHead
 	err := x.readAll(ctx, `SELECT repository_id, seq FROM directory_event_head WHERE repository_id > @after ORDER BY repository_id LIMIT @limit`,
@@ -542,6 +557,22 @@ func (x queries) DirectoryHeads(ctx context.Context, after int64, limit int) ([]
 	return out, err
 }
 
+// DirectoryEventRelayed reads the repository's head, which the transaction that takes a place
+// holds until it commits, and its pending events, at one moment.
+func (b *Backend) DirectoryEventRelayed(ctx context.Context, repo, seq int64) (written, relayed bool, err error) {
+	err = spannerdata.Each(ctx, b.Client.Single(), `SELECT IFNULL((SELECT seq FROM directory_event_head WHERE repository_id = @repo), 0) >= @seq,
+			NOT EXISTS (SELECT 1 FROM directory_event_pending WHERE repository_id = @repo AND (@seq = 0 OR seq = @seq))`,
+		map[string]any{"repo": repo, "seq": seq}, func(row *spanner.Row) error { return row.Columns(&written, &relayed) })
+	return written, relayed, err
+}
+
+func (x queries) PendStep(_ context.Context, kind string, key int64, at time.Time, body []byte) error {
+	if x.Tx == nil {
+		return errors.New("spannerstore: a step is pended in a transaction, whose commit it follows")
+	}
+	return spannerdata.PendStep(x.Tx, kind, key, at, body)
+}
+
 // relayLease is how long a relay holds the pending events it took before another may take them:
 // publishing a page takes far less, and a relay that died has its events taken again once it
 // lapses.
@@ -553,15 +584,15 @@ const relayLease = time.Minute
 // if publishing failed, lets them go for another to take. A relay that dies after publishing has
 // its events published again once its lease lapses, as on PostgreSQL a relay that publishes and
 // dies before committing does.
-func (b *Backend) RelayDirectoryEvents(ctx context.Context, limit int, publish func([]store.DirectoryEventRow) error) (int, error) {
+func (b *Backend) RelayDirectoryEvents(ctx context.Context, repo int64, limit int, publish func([]store.DirectoryEventRow) error) (int, error) {
 	holder := fmt.Sprintf("relay-%d", data.NewID())
 	var evs []store.DirectoryEventRow
 	_, err := spannertxn.ReadWrite(ctx, b.Client, func(ctx context.Context, tx *spanner.ReadWriteTransaction) error {
 		evs = nil
 		if err := spannerdata.Each(ctx, tx, `SELECT e.repository_id, e.seq, e.body
 			FROM directory_event_pending p JOIN directory_event e ON e.repository_id = p.repository_id AND e.seq = p.seq
-			WHERE p.lease_until IS NULL OR p.lease_until < CURRENT_TIMESTAMP()
-			ORDER BY p.repository_id, p.seq LIMIT @limit`, map[string]any{"limit": int64(limit)}, func(row *spanner.Row) error {
+			WHERE (@repo = 0 OR p.repository_id = @repo) AND (p.lease_until IS NULL OR p.lease_until < CURRENT_TIMESTAMP())
+			ORDER BY p.repository_id, p.seq LIMIT @limit`, map[string]any{"repo": repo, "limit": int64(limit)}, func(row *spanner.Row) error {
 			var e store.DirectoryEventRow
 			if err := row.Columns(&e.Repository, &e.Seq, &e.Body); err != nil {
 				return err

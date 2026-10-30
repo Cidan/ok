@@ -51,19 +51,36 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- end -}}
 {{- end -}}
 
-{{/* A worker's or the deployer's resources: its own, and, for a virtual checkout, the FUSE device
-     resource its node's device plugin offers (fuseResource), which lets it open /dev/fuse. */}}
+{{/* The resource a device plugin offers a device as, for a worker or the deployer (dict "root" .
+     "resource" its own setting "device" fuse|kvm): its own setting, else the chart's device
+     plugin's; "" for none, where the chart binds the device in from the node instead. */}}
+{{- define "ok.deviceResource" -}}
+{{- if .resource -}}
+{{- .resource -}}
+{{- else if .root.Values.devicePlugin.enabled -}}
+{{- printf "%s/%s" .root.Values.devicePlugin.domain .device -}}
+{{- end -}}
+{{- end -}}
+
+{{/* A worker's or the deployer's resources (dict "root" . "v" its values): its own, and, for a
+     virtual checkout, the FUSE device resource (ok.deviceResource) that lets it open /dev/fuse,
+     and, for runs in microVMs, the KVM one. */}}
 {{- define "ok.resources" -}}
-{{- $r := deepCopy (default dict .resources) -}}
-{{- if and (eq .checkout "virtual") .fuseResource -}}
+{{- $v := .v -}}
+{{- $r := deepCopy (default dict $v.resources) -}}
+{{- $fuse := include "ok.deviceResource" (dict "root" .root "resource" $v.fuseResource "device" "fuse") -}}
+{{- if and (eq $v.checkout "virtual") $fuse -}}
 {{- $limits := deepCopy (default dict $r.limits) -}}
-{{- $_ := set $limits .fuseResource 1 -}}
+{{- $_ := set $limits $fuse 1 -}}
 {{- $_ := set $r "limits" $limits -}}
 {{- end -}}
-{{- if and .microvm .microvm.enabled .microvm.kvmResource -}}
+{{- if and $v.microvm $v.microvm.enabled -}}
+{{- $kvm := include "ok.deviceResource" (dict "root" .root "resource" $v.microvm.kvmResource "device" "kvm") -}}
+{{- if $kvm -}}
 {{- $limits := deepCopy (default dict $r.limits) -}}
-{{- $_ := set $limits .microvm.kvmResource 1 -}}
+{{- $_ := set $limits $kvm 1 -}}
 {{- $_ := set $r "limits" $limits -}}
+{{- end -}}
 {{- end -}}
 {{- if $r }}{{ toYaml $r }}{{ end -}}
 {{- end -}}

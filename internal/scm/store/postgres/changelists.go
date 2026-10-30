@@ -115,9 +115,17 @@ func (x queries) SetChangeListStatus(ctx context.Context, repo, id int64, status
 	return err
 }
 
-func (x queries) SetLanded(ctx context.Context, repo, id int64, status int16, commit encoding.ID, by string) error {
-	_, err := x.q.Exec(ctx, `UPDATE changelist SET status = $3, landed_commit = $4, submitted_by = $5, updated_at = now()
-		WHERE repository_id = $1 AND id = $2`, repo, id, status, commit[:], by)
+func (x queries) SetLanded(ctx context.Context, repo int64, status int16, cls []backend.LandedCL) error {
+	if len(cls) == 0 {
+		return nil
+	}
+	idCol, commits, by := make([]int64, len(cls)), make([][]byte, len(cls)), make([]string, len(cls))
+	for i, c := range cls {
+		idCol[i], commits[i], by[i] = c.ID, c.Commit[:], c.By
+	}
+	_, err := x.q.Exec(ctx, `UPDATE changelist c SET status = $2, landed_commit = u.commit, submitted_by = u.by, updated_at = now()
+		FROM unnest($3::bigint[], $4::bytea[], $5::text[]) AS u(id, commit, by)
+		WHERE c.repository_id = $1 AND c.id = u.id`, repo, status, idCol, commits, by)
 	return err
 }
 
@@ -301,6 +309,34 @@ func (x queries) Candidate(ctx context.Context, repo int64, commit encoding.ID) 
 	}
 	c.Base, err = toID(base)
 	return c, err == nil, err
+}
+
+func (x queries) CandidatesOf(ctx context.Context, repo int64, commits []encoding.ID) (map[encoding.ID]backend.Candidate, error) {
+	out := map[encoding.ID]backend.Candidate{}
+	if len(commits) == 0 {
+		return out, nil
+	}
+	rows, err := x.q.Query(ctx, `SELECT commit_id, cl_number, patchset, base, prepared_by, created_at FROM candidate
+		WHERE repository_id = $1 AND commit_id = ANY($2)`, repo, ids(commits))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var c backend.Candidate
+		var commit, base []byte
+		if err := rows.Scan(&commit, &c.Number, &c.Patchset, &base, &c.PreparedBy, &c.PreparedAt); err != nil {
+			return nil, err
+		}
+		if c.Commit, err = toID(commit); err != nil {
+			return nil, err
+		}
+		if c.Base, err = toID(base); err != nil {
+			return nil, err
+		}
+		out[c.Commit] = c
+	}
+	return out, rows.Err()
 }
 
 func (x queries) PutCandidate(ctx context.Context, repo int64, c backend.Candidate) (backend.Candidate, error) {

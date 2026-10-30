@@ -837,6 +837,7 @@ message LandRejection {
     REASON_HEAD_MOVED = 7;
     REASON_CANDIDATE_MISMATCH = 8;
     REASON_UNKNOWN_BASE = 9;  // a candidate's base is neither on main nor a pending candidate
+    REASON_TOO_LARGE = 10;    // more than one transaction holds: land fewer CLs at once
   }
   int64 number = 1;
   Reason reason = 2;
@@ -1122,20 +1123,26 @@ message ExportEntry {
 
 // ─── Events ───
 
-// Each repository's log of events, which the SCM's relay publishes on the bus's stream (topic
-// scm.events) and its followers read from here what the stream has not brought them.
+// Each repository's log of events (topic scm.events), which its followers read from here: the SCM's
+// relay enqueues, on each follower's queue, a job naming each repository whose log grew
+// (internal/bus/follow; docs/state.md, "Events between services").
 service Events {
   // ok control, ok automation, and ok's deployer follow the SCM's events.
   option (ok.v1.callers) = CALLER_CONTROL;
   option (ok.v1.callers) = CALLER_AUTOMATION;
   option (ok.v1.callers) = CALLER_DEPLOY;
-  // Read returns up to limit of a repository's events after a place in its log, in order: a
-  // follower of the bus's stream fills what the stream has not yet brought it from here.
+  // Read returns up to limit of a repository's events after a place in its log, in order.
   rpc Read(ReadEventsRequest) returns (ReadEventsResponse);
-  // Heads lists how far each repository's log reaches, a page at a time by repository. A follower
-  // of the stream catches up from them as it starts.
+  // Heads lists how far each repository's log reaches, a page at a time by repository: a follower
+  // catches up from them the first time it follows.
   rpc Heads(HeadsRequest) returns (HeadsResponse);
+  // Follow records the caller's role as one of the log's followers: from then on the relay
+  // enqueues, on its queue, a job naming each repository whose log grows.
+  rpc Follow(FollowRequest) returns (FollowResponse);
 }
+
+message FollowRequest {}
+message FollowResponse {}
 
 message HeadsRequest {
   int64 after_repository_id = 1;  // the page after this repository (0: from the first)

@@ -2,6 +2,7 @@ package storetest
 
 import (
 	"context"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -104,8 +105,12 @@ func testMoves(t *testing.T, e *env) {
 	}
 
 	// A day later, the source drops it, logs and all.
-	if due, err := e.backends[src].Moves().MovedBefore(ctx, time.Now().Add(move.Kept+time.Minute)); err != nil || len(due) != 1 {
+	if due, err := e.backends[src].Moves().MovedBefore(ctx, time.Now().Add(move.Kept+time.Minute), math.MinInt64, 10); err != nil || len(due) != 1 {
 		t.Fatalf("moved away: %v, %v", due, err)
+	}
+	if booked, err := src.Work().Marked(ctx, move.MovedWork, math.MinInt64, 10); err != nil || len(booked) != 1 ||
+		time.Until(booked[0].At) < move.Kept-time.Hour {
+		t.Fatalf("the purge booked as the move finished: %+v, %v; want it a day on", booked, err)
 	}
 	if _, err := srcMoves.Drop(ctx, scope); err != nil {
 		t.Fatal(err)

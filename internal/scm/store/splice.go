@@ -44,10 +44,13 @@ type pendingTrees struct {
 	new   map[encoding.ID]*encoding.Tree
 	order []encoding.ID
 	body  map[encoding.ID][]byte
+	// read are the stored trees it has read, for the request it serves: trees never change.
+	read map[encoding.ID]*encoding.Tree
 }
 
 func (s *Store) pendingTrees(ctx context.Context, repo int64) *pendingTrees {
-	return &pendingTrees{ctx: ctx, s: s, repo: repo, new: map[encoding.ID]*encoding.Tree{}, body: map[encoding.ID][]byte{}}
+	return &pendingTrees{ctx: ctx, s: s, repo: repo, new: map[encoding.ID]*encoding.Tree{}, body: map[encoding.ID][]byte{},
+		read: map[encoding.ID]*encoding.Tree{}}
 }
 
 func (p *pendingTrees) readTree(id encoding.ID) (*encoding.Tree, error) {
@@ -57,7 +60,14 @@ func (p *pendingTrees) readTree(id encoding.ID) (*encoding.Tree, error) {
 	if t, ok := p.new[id]; ok {
 		return t, nil
 	}
-	return p.s.readTree(p.ctx, p.repo, id)
+	if t, ok := p.read[id]; ok {
+		return t, nil
+	}
+	t, err := p.s.readTree(p.ctx, p.repo, id)
+	if err == nil {
+		p.read[id] = t
+	}
+	return t, err
 }
 
 func (p *pendingTrees) readTrees(ids []encoding.ID) (map[encoding.ID]*encoding.Tree, error) {
@@ -68,6 +78,14 @@ func (p *pendingTrees) readTrees(ids []encoding.ID) (map[encoding.ID]*encoding.T
 			out[id] = t
 			continue
 		}
+		if t, ok := p.read[id]; ok {
+			out[id] = t
+			continue
+		}
+		if id == encoding.EmptyTreeID {
+			out[id] = &encoding.Tree{}
+			continue
+		}
 		stored = append(stored, id)
 	}
 	read, err := p.s.readTrees(p.ctx, p.repo, stored)
@@ -75,7 +93,7 @@ func (p *pendingTrees) readTrees(ids []encoding.ID) (map[encoding.ID]*encoding.T
 		return nil, err
 	}
 	for id, t := range read {
-		out[id] = t
+		out[id], p.read[id] = t, t
 	}
 	return out, nil
 }
@@ -231,8 +249,12 @@ func diffTrees(ts treeStore, a, b encoding.ID, dir string, emit func(leafChange)
 // prefetchDiff reads every tree a diff from a to b reads: the two roots, then both sides of
 // each directory that differs, a level of the trees to one read.
 func prefetchDiff(bt treeBatcher, a, b encoding.ID) (map[encoding.ID]*encoding.Tree, error) {
+	return prefetchDiffs(bt, [][2]encoding.ID{{a, b}})
+}
+
+// prefetchDiffs is prefetchDiff for several diffs at once, a level of all of them to one read.
+func prefetchDiffs(bt treeBatcher, pairs [][2]encoding.ID) (map[encoding.ID]*encoding.Tree, error) {
 	trees := map[encoding.ID]*encoding.Tree{encoding.EmptyTreeID: {}}
-	pairs := [][2]encoding.ID{{a, b}}
 	for len(pairs) > 0 {
 		var want []encoding.ID
 		asked := map[encoding.ID]bool{}
@@ -303,6 +325,49 @@ func walkDiff(ts treeStore, a, b encoding.ID, dir string, emit func(leafChange) 
 		if err := walkDiff(ts, sa, sb, p, emit); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// prefetchSplices reads, a level of the trees to one read, every tree the splices of triples read
+// — each a CL's base P, its commit C, and main's head H (splicer.splice): both sides and main's
+// where the CL changed something and main has something else, as splice descends. A landing of a
+// batch prefetches its CLs' splices onto main's head at once; one landing on another CL's result
+// reads, besides, only the trees that result made, which it holds.
+func (p *pendingTrees) prefetchSplices(triples [][3]encoding.ID) error {
+	for len(triples) > 0 {
+		var want []encoding.ID
+		asked := map[encoding.ID]bool{}
+		for _, t := range triples {
+			for _, id := range t {
+				if !asked[id] {
+					asked[id] = true
+					want = append(want, id)
+				}
+			}
+		}
+		trees, err := p.readTrees(want)
+		if err != nil {
+			return err
+		}
+		var next [][3]encoding.ID
+		for _, t := range triples {
+			tp, tc, th := trees[t[0]], trees[t[1]], trees[t[2]]
+			ep, ec, eh := entries(tp), entries(tc), entries(th)
+			for _, name := range names(tp, tc, th) {
+				vp, vc, vh := ep[name], ec[name], eh[name]
+				if sameValue(vp, vc) || sameValue(vh, vp) || sameValue(vh, vc) {
+					continue
+				}
+				_, sp := split(vp)
+				_, sc := split(vc)
+				_, sh := split(vh)
+				if sp != sc && sh != sp && sh != sc {
+					next = append(next, [3]encoding.ID{sp, sc, sh})
+				}
+			}
+		}
+		triples = next
 	}
 	return nil
 }

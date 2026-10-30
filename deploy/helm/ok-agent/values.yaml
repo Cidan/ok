@@ -30,7 +30,26 @@ migrations:
   # The environment migrations run with: name to a Secret's key.
   env: {}
   #   APP_DATABASE_URL: {secret: shop-db, key: url}
-  storage: 20Gi
+  # okfs presents each migration's commit — Bazel reads what it builds, nothing is written out —
+  # in a user namespace of the agent's own, with /dev/fuse: as the chart's device plugin offers it
+  # (devicePlugin), or as one of your own does, its resource named here. Without either, /dev/fuse
+  # is bound in from the node, which works only where the runtime applies no device allowlist.
+  fuseResource: ""
+  storage: 20Gi                 # okfs's caches and Bazel's output base
+
+# /dev/fuse as a resource a pod requests, offered by generic-device-plugin on every node as
+# <domain>/fuse (docs/install.md, "Workers' nodes"). Disable it where the cluster runs a device
+# plugin offering it already — ok's own chart's, say — and name its resource in
+# migrations.fuseResource.
+devicePlugin:
+  enabled: true
+  image: squat/generic-device-plugin@sha256:5c48f7a16cfb37c4e07731bfa384b9dba6e12d2b0fb4350d8a321d49f12ac494
+  domain: devic.es
+  count: 16                     # pods on a node that may hold the device at once
+  nodeSelector: {}
+  tolerations:
+    - {operator: Exists, effect: NoSchedule}
+    - {operator: Exists, effect: NoExecute}
 
 resources:
   requests: {cpu: 250m, memory: 512Mi}

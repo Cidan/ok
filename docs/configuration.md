@@ -31,66 +31,42 @@ database:
   #     ca_file: /etc/ok/tls/omni-ca.crt  # or plain_text: true, for one server on its loopback
   #     username: ok                    # when it asks for a password
   #     password_file: /etc/ok/secrets/omni-password
-bus:                                    # how the roles hear of events and hand out work
-  stream: {type: postgres}              # the default: in the database above, schema bus
-  queue: {type: postgres}
-  # or NATS JetStream, for either or both (the two share a connection to the same servers):
-  # stream:
-  #   type: nats
-  #   nats:
-  #     url: nats://nats-0:4222,nats://nats-1:4222,nats://nats-2:4222
-  #     credentials_file: /etc/ok/secrets/nats.creds   # the user's JWT and seed, when asked
-  #     ca_file: /etc/ok/tls/nats-ca.crt              # servers under your own CA
-  #     prefix: ok                      # subjects and streams; installations sharing an account
-  #     replicas: 3                     # each stream on three servers
-  #     retention: 168h                 # events, jobs, and dead letters kept
-  #     ack_wait: 30s                   # the floor of a job's lease
-  #     max_attempts: 10                # deliveries before a job is a dead letter
-  #     concurrency: 16                 # events a role's replica handles at once
+bus:                                    # where ok keeps its work (docs/state.md)
+  # NATS JetStream, 2.12 or later:
+  type: nats
+  nats:
+    url: nats://nats-0:4222,nats://nats-1:4222,nats://nats-2:4222
+    # credentials_file: /etc/ok/secrets/nats.creds  # the user's JWT and seed, when asked
+    # ca_file: /etc/ok/tls/nats-ca.crt             # servers under your own CA
+    prefix: ok                          # subjects and streams; installations sharing an account
+    replicas: 3                         # each stream on three servers
+    retention: 168h                     # jobs and dead letters kept
+    ack_wait: 30s                       # the floor of a job's lease
+    max_attempts: 10                    # deliveries before a job is a dead letter
   # or Google Pub/Sub; its service agent publishes to the queues' dead-letter topics and acknowledges
   # on their subscriptions (roles/pubsub.publisher and roles/pubsub.subscriber), as Pub/Sub's own
   # dead lettering asks:
-  # queue:
-  #   type: pubsub
-  #   pubsub:
-  #     project: example-ok
-  #     # credentials_file: /etc/ok/secrets/pubsub.json   # unset: the workload's own identity
-  #     # endpoint: pubsub.us-east1.rep.googleapis.com:443  # a regional endpoint
-  #     prefix: ok
-  #     retention: 168h                 # at most seven days
-  #     max_attempts: 10                # at most 100
-  #     concurrency: 32                 # events a role's replica handles, and holds, at once
-  # or Amazon SNS (the stream) and SQS. The role's identity creates the topics and queues it names
-  # (sns:CreateTopic, sns:Subscribe, sns:PublishBatch; sqs:CreateQueue, sqs:GetQueueUrl,
-  # sqs:GetQueueAttributes, sqs:SetQueueAttributes, sqs:SendMessage, sqs:ReceiveMessage,
-  # sqs:DeleteMessage, sqs:ChangeMessageVisibility, on arn:aws:sns:*:*:ok-* and arn:aws:sqs:*:*:ok-*),
-  # and sets each group's queue policy to let its topic send to it:
-  # queue:
-  #   type: aws
-  #   aws:
-  #     region: us-east-1
-  #     # access_key_file: /etc/ok/secrets/aws-access-key   # unset: AWS's chain (the pod's role)
-  #     # secret_key_file: /etc/ok/secrets/aws-secret-key
-  #     # endpoint: http://localstack:4566                # not AWS's own
-  #     prefix: ok
-  #     retention: 168h                 # at most 336h
-  #     max_attempts: 10
-  #     concurrency: 32                 # events a role's replica handles at once
-  # or Kafka, for the stream alone (it acknowledges no single message; the queue comes from
-  # another backend):
-  # stream:
-  #   type: kafka
-  #   kafka:
-  #     brokers: [b-1.ok.kafka.us-east-1.amazonaws.com:9098, b-2.ok.kafka.us-east-1.amazonaws.com:9098]
-  #     tls: true
-  #     # ca_file: /etc/ok/tls/kafka-ca.crt  # brokers under your own CA
-  #     sasl: {mechanism: aws-msk-iam}     # or plain, scram-sha-256, scram-sha-512:
-  #     # sasl: {mechanism: scram-sha-512, username: ok, password_file: /etc/ok/secrets/kafka-password}
-  #     prefix: ok
-  #     partitions: 12
-  #     replication_factor: 3
-  #     retention: 168h
-  #     concurrency: 32                 # events a role's replica handles at once, and fetches at most
+  # type: pubsub
+  # pubsub:
+  #   project: example-ok
+  #   # credentials_file: /etc/ok/secrets/pubsub.json   # unset: the workload's own identity
+  #   # endpoint: pubsub.us-east1.rep.googleapis.com:443  # a regional endpoint
+  #   prefix: ok
+  #   retention: 168h                   # at most seven days
+  #   max_attempts: 10                  # at most 100
+  # or Amazon SQS. The role's identity creates, and removes, the queues it names (sqs:CreateQueue,
+  # sqs:DeleteQueue, sqs:GetQueueUrl, sqs:GetQueueAttributes, sqs:SetQueueAttributes, sqs:TagQueue,
+  # sqs:ListQueueTags, sqs:ListQueues, sqs:SendMessage, sqs:ReceiveMessage, sqs:DeleteMessage,
+  # sqs:ChangeMessageVisibility, on arn:aws:sqs:*:*:ok-*):
+  # type: aws
+  # aws:
+  #   region: us-east-1
+  #   # access_key_file: /etc/ok/secrets/aws-access-key   # unset: AWS's chain (the pod's role)
+  #   # secret_key_file: /etc/ok/secrets/aws-secret-key
+  #   # endpoint: http://localstack:4566                # not AWS's own
+  #   prefix: ok
+  #   retention: 168h                   # at most 336h
+  #   max_attempts: 10
 roles:                                  # the robots ok's roles run as: <name>.robot.<domain>
   identity: identity.ok
   scm: scm.ok
@@ -155,6 +131,7 @@ automation:
   logs: {endpoint: https://s3.us-east-1.amazonaws.com, bucket: example-ok-logs, region: us-east-1}
   speculation_depth: 8                  # how many submissions ahead the landing queue speculates on
   landing_batch: 32                     # how many submissions the landing queue lands at once
+  queue_parallel: 128                   # how many submissions the landing queue acts on at once
 worker:
   state: /var/lib/ok-worker             # slots' checkouts, Bazel's output bases, kept graphs
   slots: 4                              # runs at once
@@ -180,8 +157,8 @@ secrets:
 | `listen`, `metrics_listen` | Each role's serving and metrics addresses. Defaults `:8472` and `:8473`. |
 | `profiling` | Serve Go's profiles (`/debug/pprof/`) on the metrics address — CPU, heap, goroutines — for what a role spends under load. The metrics address is the cluster's alone; leave it off where it is not. |
 | `tls` | The certificate a role serves with, re-read as it is renewed. Without it, roles serve cleartext HTTP/2, for a TLS proxy or service mesh in front. |
-| `database` | Where the roles keep their tables, by `type`. **`postgres`** (the default): `url_file` holds the URL, with its password. Each role keeps its tables in a PostgreSQL schema of its own (`identity`, `scm`, …) and makes it when it first starts, which needs the `CREATE` privilege on the database; without that, make the schemas beforehand and grant the role's user their use. **`spanner`**: `spanner.instance` (`projects/P/instances/I`), each role's tables in a database of its own there, `<prefix>-<role>` (`prefix` is `ok` unless set; at most 19 characters), which the role makes when it first starts, with the workload's Google credentials — `roles/spanner.databaseAdmin` on the instance, for the database and its schema; or, with `spanner.omni`, a Spanner Omni deployment's (`address`, and `plain_text`, or `ca_file`, and `username` and `password_file` when it asks for a password), its instance `projects/default/instances/default`. `spanner.channels` are each role's gRPC connections to Spanner (16 unless set): a replica serving thousands of requests at once makes as many calls, which Spanner's client's four by default would queue. The bus is then another backend's: `bus.stream` and `bus.queue` of type `postgres` are refused. The admin commands that work on identity's tables (`ok identity`'s, `ok move-in`, and the SCM's that name a repository) open them where the configuration says. |
-| `bus` | How the roles hear of what happened — `stream`, which carries the SCM's events to their followers — and hand out work — `queue` (`hosted.md`, "Events and the bus"). Each names its backend's `type`: `postgres`, the default and for now the only one, keeps it in the database above, in a schema of its own (`bus`). |
+| `database` | Where the roles keep their tables, by `type`. **`postgres`** (the default): `url_file` holds the URL, with its password. Each role keeps its tables in a PostgreSQL schema of its own (`identity`, `scm`, …) and makes it when it first starts, which needs the `CREATE` privilege on the database; without that, make the schemas beforehand and grant the role's user their use. **`spanner`**: `spanner.instance` (`projects/P/instances/I`), each role's tables in a database of its own there, `<prefix>-<role>` (`prefix` is `ok` unless set; at most 19 characters), which the role makes when it first starts, with the workload's Google credentials — `roles/spanner.databaseAdmin` on the instance, for the database and its schema; or, with `spanner.omni`, a Spanner Omni deployment's (`address`, and `plain_text`, or `ca_file`, and `username` and `password_file` when it asks for a password), its instance `projects/default/instances/default`. `spanner.channels` are each role's gRPC connections to Spanner (16 unless set): a replica serving thousands of requests at once makes as many calls, which Spanner's client's four by default would queue. The admin commands that work on identity's tables (`ok identity`'s, `ok move-in`, and the SCM's that name a repository) open them where the configuration says. |
+| `bus` | Where ok keeps its work (state.md): every piece of it — each queued run for its pool's workers, each repository's keyed work, the relays of the SCM's and the directory's logs to their followers — and the replies to the live requests waiting on a change (`hosted.md`, "Events and the bus"). Its `type` names its backend, as the example above shows: `nats` (NATS JetStream, 2.12 or later), `pubsub`, or `aws` (SQS). Every role but the worker runs on it, so every installation names one; there is no default. |
 | `roles` | The robot each of ok's roles runs as, by what precedes `.robot.<domain>`. ok identity makes them when it starts. A service that admits a role admits that robot. |
 | `tenancy` | Who owns what (`hosted.md`, "Tenancy, as built"). `mode` is `installation`, the default, or `hosted`. An installation has one organization, named by `organization` — by default the domain's first label, `example` for `example.com` — which ok identity makes when it first starts: its members are the installation's people and robots, its owners ok's administrators, each member makes and lands on its repositories, and they are internal to it. People also own repositories of their own, private unless they say. A hosted service has any number of organizations, which people make and own. |
 
@@ -234,7 +211,7 @@ front of them ([hosted.md](hosted.md), "Cells, as built"). Leave these keys unse
 | `cell.name`, `cell.region` | The cell a role serves: every role's but identity's, which serves them all. Default `default`, in no region. A role refuses a request about a repository another cell holds, naming that cell (`ok.v1.Moved`; a page answers 421 with an `Ok-Cell` header). |
 | `identity.cells` | The cells ok identity places repositories in, each a `name`, a `region`, whether it is `closed` to new repositories, and where its roles are reached — `scm` (required), `control`, `automation`, `deploy`, `host:port` each — and `secrets`, where ok secrets runs. A new repository goes to the open cell holding the fewest, a fork to its upstream's; the first cell holds the repositories made before there were cells. ok identity moves fork networks between cells (`ok admin move REPOSITORY CELL`; [hosted.md](hosted.md), "Moving"), reaching each cell's roles at these addresses as its own robot: a cell names every role another cell runs, or no network moves into or out of it. Unset, the one cell `default`, its roles at `services`'. |
 | `identity.default_region` | Where an owner's new repositories are placed when it names no region of its own (identity's `Tenancy.SetRegion`, a person's own or an organization's by its owners): an open cell of that region, any open cell when none is open there. One of `identity.cells`' regions; unset, any open cell's. |
-| `identity.default_quota` | An account's quota of CI when an administrator set it none (`ok admin quota ACCOUNT`; [hosted.md](hosted.md), "Hosted automation, as built"): `concurrent` runs, run `minutes` in a calendar month (UTC), each 0 for unlimited (the default), and `weight` in fair share, 1 unless set. A quota holds across the cells an account's repositories are in. |
+| `identity.default_quota` | An account's quota of CI when an administrator set it none (`ok admin quota ACCOUNT`; [hosted.md](hosted.md), "Hosted automation, as built"): `concurrent` runs and run `minutes` in a calendar month (UTC), each 0 for unlimited (the default). A quota holds across the cells an account's repositories are in. |
 | `identity.mail.smtp` | The mail server people's notifications are mailed through ([hosted.md](hosted.md), "ok control at scale, as built"), as `identity.sign_up.email.smtp` names one: `address`, `username`, `password_file`, `from`, `ca_file`. Unset, notifications are kept but none is mailed. |
 | `roles.edge` | The robot the edge runs as (`ok edge serve -config ok.yaml`, alone in its process, at the deployment's public address): it reaches ok identity at `services.identity`, as the other roles do, and the cells' roles where `identity.cells` says. |
 | `edge.region` | The edge's region: a request that names no repository goes to an open cell there. |
@@ -259,6 +236,7 @@ it to ok identity once it lands. Other repositories' `acl:` owners are ok identi
 | `scm.email_domain` | What a person's handle is an address at in the commits ok writes for them — landings and rollbacks — and what reviewers may be named by (`<handle>@<email_domain>`). Default: `domain`. |
 | `scm.gc_hour` | The hour (UTC) each repository's daily garbage collection is due from. Default 9. |
 | `scm.cache` | The SCM's in-memory caches, in bytes: `objects` (default 256 MiB), `chunks` (512 MiB), `diffs` (64 MiB), `path_commits` (32 MiB: the newest commits of main that changed paths, which a tree's listing with its entries' last commits reads), `code_indexes` (256 MiB: the code search indexes a replica holds, [hosted.md](hosted.md), "ok control at scale, as built"), `deltas` (64 MiB: files' deltas against the versions clients hold, [scm.md](scm.md), "Deltas"), `checkouts` (512 MiB: commits' checkouts' layers, [scm.md](scm.md), "Checkouts"). |
+| `scm.publish_memory` | The memory, in bytes, every publish at once holds its packs in before they go to the object store (default 512 MiB): a publish sends a pack once it holds 64 MiB, or when this is all held, and waits only when what it then needs is held by others. |
 
 The SCM's design is [scm.md](scm.md). `ok scm fsck REPOSITORY` verifies a repository against its
 invariants, and `ok scm gc REPOSITORY` runs its garbage collection now; both read the same file.
@@ -280,6 +258,7 @@ ok automation reads `database`, `roles`, `services` (identity and the SCM), `wor
 | `automation.logs` | The object store finished runs' logs are kept in, as `scm.objects` names one. |
 | `automation.speculation_depth` | How many earlier submissions the landing queue speculates a submission lands after, at most. Default 8. |
 | `automation.landing_batch` | How many submissions the landing queue lands in one landing — one transaction that moves main once — at most: those it would land one after another, each on the queue as the ones before leave it. Default 32; 1 lands each alone. |
+| `automation.queue_parallel` | How many submissions the landing queue acts on at once — preparing their attempts, releasing them, discarding — in each step, beside its landing; the rest wait for the next step. Each preparation is a few of the SCM's calls, spread over its replicas. Default 128. |
 | `automation.plan_pool` | The pool of workers planning runs run in. Default `default`. |
 | `control.sealing_key_file` | The key repositories' webhooks' secrets are sealed under ([hosted.md](hosted.md), "ok control at scale, as built"): 32 bytes, base64, on a line — the same file in every cell, so a moved repository keeps its webhooks. Unset, repositories have no webhooks. |
 | `control.webhooks.allow_private_networks` | Webhooks may reach private, loopback, and link-local addresses, and over http: an installation whose endpoints are its own. Unset, a webhook is https to a public address, checked as each connection is made. |
@@ -302,7 +281,7 @@ A worker (`ok worker run`) reads `services` (automation and the SCM), `workload`
 | `worker.name` | Its name among the workers. Default: the host's (its pod's). |
 | `worker.slots` | How many runs it runs at once, each in a checkout and Bazel output base of its own. Default 1. |
 | `worker.run_memory_gib` | The memory it keeps free under its cgroup's limit for each run it starts beside the others. Default 4. |
-| `worker.checkout` | `virtual` — each commit presented through okfs, which needs `/dev/fuse` and user namespaces, and runs ok's jj as the worker's daemon — or `real`, each commit written to disk. Default `virtual` (the Helm chart's: `real`; [install.md](install.md), "Workers' nodes"). |
+| `worker.checkout` | `virtual` — each commit presented through okfs, which needs `/dev/fuse` and user namespaces, and runs ok's jj as the worker's daemon ([install.md](install.md), "Workers' nodes") — or `real`, every file of each commit written to disk, only for a legacy use that needs a commit's whole source on disk. Default `virtual`. |
 | `worker.jj` | ok's jj, for virtual checkouts. Default: `jj` on the `PATH`. |
 | `worker.bazel` | Bazel, or bazelisk, which runs the version a repository's `.bazelversion` names. Default: `bazelisk`, else `bazel`, on the `PATH`. |
 | `worker.bazel_flags` | Flags every Bazel command gets before the repository's own: a remote cache, a disk cache, `--jobs`. |
@@ -363,6 +342,10 @@ names it.
 deployer, and ok secrets where `secrets.root` names a root) runs those roles in one process, on one port (`listen`): a small installation's whole ok,
 as the Helm chart runs it ([install.md](install.md)). ok identity is always among them: it certifies
 each other role's key in process, as that role's robot, so the process needs no token
-(`workload`) and no CA certificates read over the network. The roles reach each other on the
-process's own port, and any role not among them at its `services` address. With `tls`, the process
-calls itself over TLS, checking its certificate as its `public_url`'s host.
+(`workload`) and no CA certificates read over the network. The roles reach each other within the
+process — a listener only its own code can dial, each call naming the role's robot it is, which
+no other peer may name (`internal/serve/inproc`): no credential is proven or checked against the
+directory, and no TLS, as nothing leaves the process — and any role not among them at its
+`services` address. What reaches a role from outside the process, as the deployer's okfs daemon
+reaches the SCM, does so on its port, with a credential, over TLS with `tls`, checking its
+certificate as its `public_url`'s host.

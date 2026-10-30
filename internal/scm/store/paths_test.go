@@ -160,7 +160,7 @@ func TestPathHistoryInSegments(t *testing.T) {
 	}
 	check("wholly in the tail", mains, plainMains)
 
-	small := mustOpen(t, dbOf(e.s), e.s.blobs, Config{SegmentBatch: 5, Signals: e.s.signals})
+	small := mustOpen(t, dbOf(e.s), e.s.blobs, Config{SegmentBatch: 5})
 	if r, err := small.CompactSegments(ctx, e.repo, 1); err != nil || r.Paths != 5 || !r.More {
 		t.Fatalf("a compaction of 5 path rows: %+v, %v", r, err)
 	}
@@ -226,7 +226,7 @@ func TestPathHistoryAfterLanding(t *testing.T) {
 	e := newCLEnv(t)
 	plain := &clEnv{t: t, s: e.s, repo: newRepo(t, e.s).ID}
 	var marks atomic.Int32
-	small, err := New(pathIndexCounter{dbOf(e.s).open(t), &marks}, e.s.blobs, Config{Names: testNames, LandingPaths: 1, Signals: e.s.signals})
+	small, err := New(pathIndexCounter{dbOf(e.s).open(t), &marks}, e.s.blobs, Config{Names: testNames, LandingPaths: 1})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -144,10 +144,10 @@ func TestPublishRefusesBadObjects(t *testing.T) {
 	if err := p.AddObject(EncodedObject{Kind: encoding.KindTree, ID: tr, Body: tampered}); !errors.Is(err, ErrInvalid) {
 		t.Errorf("body hashing to another ID: %v", err)
 	}
-	if err := p.AddChunk(pack.ChunkID(contents), []byte("other bytes")); !errors.Is(err, ErrInvalid) {
+	if err := p.AddChunk(ctx, pack.ChunkID(contents), []byte("other bytes")); !errors.Is(err, ErrInvalid) {
 		t.Errorf("chunk of the wrong length: %v", err)
 	}
-	if err := p.AddChunk(pack.ChunkID(contents), []byte("CONTENTS\n")); !errors.Is(err, ErrInvalid) {
+	if err := p.AddChunk(ctx, pack.ChunkID(contents), []byte("CONTENTS\n")); !errors.Is(err, ErrInvalid) {
 		t.Errorf("chunk hashing to another ID: %v", err)
 	}
 	if _, err := p.Commit(ctx, nil); !errors.Is(err, ErrInvalid) {
@@ -160,7 +160,7 @@ func TestPublishRefusesBadObjects(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := p.AddChunk(pack.ChunkID(contents), contents); err != nil {
+	if err := p.AddChunk(ctx, pack.ChunkID(contents), contents); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := p.Commit(ctx, nil); !errors.Is(err, ErrInvalid) {

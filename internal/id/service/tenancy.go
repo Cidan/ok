@@ -6,6 +6,7 @@ import (
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/Cidan/ok/internal/authz"
 	"github.com/Cidan/ok/internal/id/store"
@@ -592,11 +593,15 @@ func (s *Server) GetExpiry(ctx context.Context, req *identitypb.RepositoryRef) (
 	if err := s.requireRole(ctx, okpb.Caller_CALLER_SCM, "reading a repository's expiry"); err != nil {
 		return nil, err
 	}
-	e, err := s.cfg.Store.ExpiryOf(ctx, req.GetId())
+	e, at, err := s.cfg.Store.Expiration(ctx, req.GetId())
 	if err != nil {
 		return nil, grpcError(err)
 	}
-	return expiryPB(req.GetId(), e), nil
+	out := expiryPB(req.GetId(), e)
+	if !at.IsZero() {
+		out.ExpiresAt = timestamppb.New(at)
+	}
+	return out, nil
 }
 
 func (s *Server) PurgeRepository(ctx context.Context, req *identitypb.RepositoryRef) (*identitypb.Expiry, error) {

@@ -25,14 +25,8 @@ type upstreams struct {
 
 type upstreamHost struct {
 	rt   *http.Transport
-	addr sync.Mutex
-	ips  []string
-	at   time.Time
 	next atomic.Uint64 // round robin, for requests about no known repository
 }
-
-// resolveTTL is how long a host's addresses are kept before they are looked up again.
-const resolveTTL = 10 * time.Second
 
 func newUpstreams(tc *tls.Config) *upstreams {
 	return &upstreams{tls: tc, hosts: map[string]*upstreamHost{}}
@@ -85,23 +79,16 @@ func (u *upstreams) host(host string) *upstreamHost {
 	return h
 }
 
+// resolve is a host's addresses as the resolver answers now: a replica added or gone takes its
+// repositories at once, and the edge keeps no answer (docs/state.md).
 func (h *upstreamHost) resolve(ctx context.Context, host string) ([]string, error) {
 	if net.ParseIP(host) != nil {
 		return []string{host}, nil
 	}
-	h.addr.Lock()
-	defer h.addr.Unlock()
-	if len(h.ips) > 0 && time.Since(h.at) < resolveTTL {
-		return h.ips, nil
-	}
 	ips, err := net.DefaultResolver.LookupHost(ctx, host)
 	if err != nil || len(ips) == 0 {
-		if len(h.ips) > 0 {
-			return h.ips, nil // the last addresses, while the resolver does not answer
-		}
 		return nil, fmt.Errorf("resolving %s: %v", host, err)
 	}
-	h.ips, h.at = ips, time.Now()
 	return ips, nil
 }
 

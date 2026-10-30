@@ -1,10 +1,12 @@
 package blob
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"strings"
 	"time"
@@ -22,6 +24,8 @@ type Config struct {
 	AccessKey string
 	SecretKey string
 	Region    string
+	// Transport makes the client's requests: minio's own unless set (a test's).
+	Transport http.RoundTripper
 }
 
 // S3 is a Store over an S3-compatible bucket.
@@ -56,6 +60,7 @@ func NewS3(cfg Config) (*S3, error) {
 		// AWS's virtual-hosted buckets where the endpoint is AWS's, paths elsewhere (MinIO, Ceph,
 		// a bucket behind one host).
 		BucketLookup: minio.BucketLookupAuto,
+		Transport:    cfg.Transport,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("blob: %w", err)
@@ -104,11 +109,26 @@ func (s *S3) Put(ctx context.Context, key string, r io.Reader, size int64, opts 
 	if o.ifAbsent {
 		po.SetMatchETagExcept("*")
 	}
+	// minio makes a request that fails for a moment again only with a body it can rewind; one it
+	// sends whole (to s3PutWhole) it holds from a reader that cannot be rewound only if it is given
+	// so — larger, it sends parts, each held. Read so, a reader's failure at its last byte (Put's
+	// contract) fails the put before anything is sent.
+	if _, ok := r.(io.Seeker); !ok && size >= 0 && size <= s3PutWhole {
+		body := make([]byte, size)
+		if _, err := io.ReadFull(r, body); err != nil {
+			return s.wrap("put", key, err)
+		}
+		r = bytes.NewReader(body)
+	}
 	if _, err = s.client.PutObject(ctx, s.bucket, key, r, size, po); err != nil {
 		return s.wrap("put", key, err)
 	}
 	return nil
 }
+
+// s3PutWhole is the largest object minio puts in one request (its minimum part size): larger, it
+// sends parts.
+const s3PutWhole = 16 << 20
 
 func (s *S3) GetRange(ctx context.Context, key string, offset, length int64) (_ []byte, err error) {
 	if length == 0 {
@@ -249,4 +269,63 @@ func (s *S3) SignGet(ctx context.Context, key string, ttl time.Duration) (_ stri
 		return "", s.wrap("sign", key, err)
 	}
 	return u.String(), nil
+}
+
+// stagePartSize is a staged upload's part: the most it holds in memory at once. Its size unknown,
+// minio's own choice would be a part of over 500 MiB.
+const stagePartSize = 16 << 20
+
+// Stage uploads the object at tmp as it is written, a multipart upload of stagePartSize parts, and
+// Commit copies it to its key within the bucket, then deletes tmp.
+func (s *S3) Stage(ctx context.Context, tmp string) (Staged, error) {
+	pr, pw := io.Pipe()
+	st := &s3Staged{s: s, tmp: tmp, pw: pw, uploaded: make(chan error, 1)}
+	go func() {
+		_, err := s.client.PutObject(ctx, s.bucket, tmp, pr, -1, minio.PutObjectOptions{
+			ContentType: "application/octet-stream", PartSize: stagePartSize})
+		// A writer still writing learns why it cannot.
+		pr.CloseWithError(err)
+		st.uploaded <- err
+	}()
+	return st, nil
+}
+
+type s3Staged struct {
+	s        *S3
+	tmp      string
+	pw       *io.PipeWriter
+	uploaded chan error
+	n        int64
+	done     bool
+}
+
+func (st *s3Staged) Write(p []byte) (int, error) {
+	n, err := st.pw.Write(p)
+	st.n += int64(n)
+	return n, err
+}
+
+func (st *s3Staged) Commit(ctx context.Context, key string) (err error) {
+	defer func(start time.Time) { observe(st.s.bucket, "put", start, st.n, err) }(time.Now())
+	if st.done {
+		return errors.New("blob: a staged object committed after it ended")
+	}
+	st.done = true
+	st.pw.Close()
+	if err := <-st.uploaded; err != nil {
+		return st.s.wrap("put", st.tmp, err)
+	}
+	// tmp goes whether the copy succeeds or not; one this delete misses, the caller's sweep takes.
+	defer st.s.client.RemoveObject(context.WithoutCancel(ctx), st.s.bucket, st.tmp, minio.RemoveObjectOptions{})
+	return st.s.Copy(ctx, st.tmp, key)
+}
+
+func (st *s3Staged) Abort() {
+	if st.done {
+		return
+	}
+	st.done = true
+	// The upload fails reading its body, and minio aborts its multipart upload.
+	st.pw.CloseWithError(errAborted)
+	<-st.uploaded
 }

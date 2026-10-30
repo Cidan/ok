@@ -9,7 +9,6 @@ import (
 	"context"
 	"errors"
 	"log/slog"
-	"sync"
 	"time"
 
 	"k8s.io/client-go/kubernetes"
@@ -39,9 +38,6 @@ type Observer struct {
 	Period  time.Duration // 0: Period
 	// Holder names this replica's leases (internal/work). Default work.NewHolder.
 	Holder string
-
-	mu        sync.Mutex
-	lastSweep time.Time
 }
 
 func (o *Observer) period() time.Duration {
@@ -51,44 +47,17 @@ func (o *Observer) period() time.Duration {
 	return o.Period
 }
 
-// Run observes until ctx ends: each service as it comes due, and one first planned within a
-// Period of it.
+// Run observes until ctx ends: each service as it comes due — first when a plan declares it, then
+// a Period after each read. A reader that dies reading brings nothing back of its own: its job
+// does, once its lease lapses.
 func (o *Observer) Run(ctx context.Context) error {
-	period := o.period()
 	return (&work.Runner{
 		Kind:   store.ObserveWork,
 		Store:  o.Store.Work(),
 		Do:     o.observe,
-		Sweep:  o.sweep,
-		Idle:   min(period/4, time.Second),
 		Holder: o.Holder,
 		Log:    o.Log,
 	}).Run(ctx)
-}
-
-// sweep marks, once a Period, each service that nothing marks and no one reads due now: one new,
-// or one whose reader died reading, before it marked it due again. One being read, or marked by
-// its last read, is left as it is: marking it would have it read again the moment its read ends.
-func (o *Observer) sweep(ctx context.Context) error {
-	period := o.period()
-	o.mu.Lock()
-	if time.Since(o.lastSweep) < period {
-		o.mu.Unlock()
-		return nil
-	}
-	o.lastSweep = time.Now()
-	o.mu.Unlock()
-	svs, err := o.Store.Services(ctx, 0)
-	if err != nil {
-		return err
-	}
-	var errs []error
-	for _, sv := range svs {
-		if err := o.Store.MarkIdle(ctx, store.ObserveWork, sv.ID); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	return errors.Join(errs...)
 }
 
 // Round reads every service's workload now, and records it, each under its lease: one another

@@ -13,14 +13,12 @@ import (
 	"github.com/Cidan/ok/internal/cells"
 	"github.com/Cidan/ok/internal/config"
 	"github.com/Cidan/ok/internal/id/store"
-	"github.com/Cidan/ok/internal/lock"
 	"github.com/Cidan/ok/internal/serve/node"
+	"github.com/Cidan/ok/internal/work"
 	okpb "github.com/Cidan/ok/proto/ok/v1"
 )
 
 const (
-	// every is how often the runner looks for moves due a step.
-	every = 10 * time.Second
 	// retry is how long after a failed step it is tried again.
 	retry = 30 * time.Second
 	// frozenLimit is how long a network stays frozen, its rows not yet copied, before its move is
@@ -43,9 +41,7 @@ type Runner struct {
 	Cells []config.IdentityCell
 	// Moves reaches a role's Moves service at an address, as ok identity.
 	Moves func(addr string) (okpb.MovesClient, error)
-	// Wake, when it receives, has the runner look at once: a move asked, or canceled.
-	Wake <-chan struct{}
-	Log  *slog.Logger
+	Log   *slog.Logger
 }
 
 var _ node.Application = (*Runner)(nil)
@@ -55,34 +51,37 @@ func (*Runner) Dependencies() []node.Node    { return nil }
 func (*Runner) Setup(context.Context) error  { return nil }
 func (*Runner) Healthy(context.Context) bool { return true }
 
+// Start drives each move as its next step comes due, until ctx ends: every write of a move books
+// its next step (store.MoveWork), whose job brings it to one replica at a time. Once, it books the
+// moves a release before left unbooked.
 func (r *Runner) Start(ctx context.Context) error {
-	for {
-		r.Pass(ctx)
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-r.Wake:
-		case <-time.After(every):
+	go func() {
+		if err := work.Once(ctx, r.Store.Work(), moveUpgrade, r.bookUnfinished, r.Log); err != nil && ctx.Err() == nil {
+			r.Log.Warn("mover: booking the moves a release before left", slog.Any("err", err))
 		}
-	}
+	}()
+	return (&work.Runner{Kind: store.MoveWork, Store: r.Store.Work(), Do: r.step, Workers: 2, Log: r.Log}).Run(ctx)
 }
 
-// Pass drives each move due a step as far as it goes now.
-func (r *Runner) Pass(ctx context.Context) {
-	due, err := r.Store.DueMoves(ctx, 100)
+// moveUpgrade books, once, the next steps of the moves a release before drove by looking for them.
+const moveUpgrade = "move-upgrade"
+
+func (r *Runner) bookUnfinished(ctx context.Context) error {
+	ms, err := r.Store.UnfinishedMoves(ctx, 10000)
 	if err != nil {
-		if ctx.Err() == nil {
-			r.Log.Warn("mover: finding moves due", slog.Any("err", err))
-		}
-		return
+		return err
 	}
-	for _, network := range due {
-		err := r.Store.LockMove(ctx, network, func(ctx context.Context) error { return r.drive(ctx, network) })
-		if err != nil && !errors.Is(err, lock.ErrNotAcquired) && ctx.Err() == nil {
-			r.Log.Warn("mover: driving a move", slog.Int64("network", network), slog.Any("err", err))
+	for _, m := range ms {
+		if err := r.Store.Work().MarkAt(ctx, store.MoveWork, m.Network, m.NextAt); err != nil {
+			return err
 		}
 	}
+	return nil
 }
+
+// step drives a network's move as far as it goes now, holding its keyed work's claim, which one
+// replica holds at a time — of this release and of the one before, whose runners hold it too.
+func (r *Runner) step(ctx context.Context, network int64) error { return r.drive(ctx, network) }
 
 // drive takes a move through its phases until it finishes, a step fails — when it is tried again
 // a while later — or its lock is lost.

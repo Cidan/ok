@@ -71,7 +71,7 @@ type Role struct {
 	Services *service.Server
 	// CA is the identity CA's certificates, which credentials are checked against: for roles in
 	// the same process (ok serve).
-	CA func() *x509.CertPool
+	CA func(context.Context) (*x509.CertPool, error)
 	// Mover runs the directory's moves of fork networks between cells.
 	Mover   *mover.Runner
 	pool    *pgxpool.Pool
@@ -96,20 +96,43 @@ type Options struct {
 	Pool *pgxpool.Pool
 	// Source, when set, is the system of record instead of the configuration's: tests.
 	Source directory.Source
-	// Stream, when set, is the bus's stream the directory's events are published on instead of
-	// the configuration's: tests, and roles sharing one.
-	Stream bus.Stream
 	// Peers, when set, connects to a cell's role at an address, as ok identity: tests.
 	Peers func(addr string) grpc.ClientConnInterface
-	// MailLook, when set, is how often marked mail is looked for: tests.
-	MailLook time.Duration
 }
 
 // OpenBackend opens identity's store backend in the database the configuration names, with what
 // closes it: on PostgreSQL its pool, returned too for a bus kept beside it; on Spanner a database
-// of identity's own, and no pool. The admin commands that work on identity's tables beside the
-// role open it so.
+// of identity's own, and no pool. Its keyed work's jobs go on the configuration's bus, which it
+// opens too. The admin commands that work on identity's tables beside the role open it so.
 func OpenBackend(ctx context.Context, cfg *config.Config, maxConns int32) (store.Backend, *pgxpool.Pool, func(), error) {
+	b, pool, done, err := openDB(ctx, cfg, maxConns)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	bb, err := openBus(ctx, cfg, b, pool)
+	if err != nil {
+		done()
+		return nil, nil, nil, err
+	}
+	return b, pool, func() { bb.Close(); done() }, nil
+}
+
+// openBus opens the configuration's bus — over pool, on PostgreSQL — which b's keyed work's jobs go
+// on (docs/hosted.md, "Work without leaders").
+func openBus(ctx context.Context, cfg *config.Config, b store.Backend, pool *pgxpool.Pool) (*busconfig.Bus, error) {
+	bb, err := busconfig.Open(ctx, cfg.Bus)
+	if err != nil {
+		return nil, err
+	}
+	if err := bb.RegisterWork(b.Work(), "identity"); err != nil {
+		bb.Close()
+		return nil, err
+	}
+	return bb, nil
+}
+
+// openDB opens the identity store's database as the configuration says.
+func openDB(ctx context.Context, cfg *config.Config, maxConns int32) (store.Backend, *pgxpool.Pool, func(), error) {
 	if cfg.Database.Type == "spanner" {
 		db, err := spannerdb.Open(ctx, cfg.Database.Spanner, "identity")
 		if err != nil {
@@ -150,7 +173,7 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (*Role, error)
 	if pool == nil {
 		var closeDB func()
 		var err error
-		if b, pool, closeDB, err = OpenBackend(ctx, cfg, cfg.Database.MaxConnections); err != nil {
+		if b, pool, closeDB, err = openDB(ctx, cfg, cfg.Database.MaxConnections); err != nil {
 			return nil, err
 		}
 		r.closers = append(r.closers, closeDB)
@@ -161,6 +184,15 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (*Role, error)
 		}
 		b = pb
 	}
+	// The directory's events are relayed, and its keyed work's jobs go, on the bus.
+	bb, err := openBus(ctx, cfg, b, pool)
+	if err != nil {
+		for i := len(r.closers) - 1; i >= 0; i-- {
+			r.closers[i]()
+		}
+		return nil, err
+	}
+	r.closers = append(r.closers, bb.Close)
 	ok := false
 	defer func() {
 		if ok {
@@ -175,7 +207,6 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (*Role, error)
 	// An installation's one organization (docs/hosted.md, "Tenancy, as built"): its members are its
 	// people and robots, its owners its administrators, and every person may make and land.
 	var installation string
-	moveWake := make(chan struct{}, 1)
 	movedIn, err := st.CheckMode(ctx, cfg.Tenancy.Hosted())
 	if err != nil {
 		return nil, fmt.Errorf("tenancy.mode: %w", err)
@@ -187,7 +218,7 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (*Role, error)
 	}
 	st.SetCells(cells, cfg.Identity.DefaultRegion)
 	dq := cfg.Identity.DefaultQuota
-	st.SetDefaultQuota(store.Quota{Concurrent: dq.Concurrent, Minutes: dq.Minutes, Weight: dq.Weight})
+	st.SetDefaultQuota(store.Quota{Concurrent: dq.Concurrent, Minutes: dq.Minutes})
 	if !cfg.Tenancy.Hosted() {
 		o, err := st.EnsureOrganization(ctx, cfg.Tenancy.Organization, store.OrganizationSettings{BaseRole: tenancy.Write, MembersCreate: true})
 		if err != nil {
@@ -201,14 +232,18 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (*Role, error)
 		return nil, fmt.Errorf("identity.ca_dir: %w (make one with: ok identity ca init)", err)
 	}
 
-	// The robots the installation names.
+	// The robots the installation names: its roles', whose calls within the process are theirs
+	// (authn.Config.InProcess).
 	roles := authn.Roles{}
+	inProcess := map[string]authn.Principal{}
 	for role, short := range cfg.Roles.All() {
 		name := names.Robot(short)
-		if _, err := st.EnsureRobot(ctx, name); err != nil {
+		p, err := st.EnsureRobot(ctx, name)
+		if err != nil {
 			return nil, fmt.Errorf("roles.%s: %w", role, err)
 		}
 		roles[idclient.Callers[role]] = name
+		inProcess[name] = authn.Principal{Name: p.Name, ID: p.ID, Active: true}
 	}
 	for _, rb := range cfg.Identity.Robots {
 		name := names.Robot(rb.Name)
@@ -252,18 +287,9 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (*Role, error)
 			nodes = append(nodes, scimNode)
 		}
 	}
-	nodes = append(nodes, syncer.Housekeeper{Store: st})
+	nodes = append(nodes, syncer.Housekeeper{Store: st}, waits{store: st, q: bb.Queue})
 	// The directory's events, published for ok's roles to follow.
-	stream := opts.Stream
-	if stream == nil {
-		b, err := busconfig.Open(ctx, cfg.Bus, pool)
-		if err != nil {
-			return nil, err
-		}
-		r.closers = append(r.closers, b.Close)
-		stream = b.Stream
-	}
-	nodes = append(nodes, relay{store: st, stream: stream})
+	nodes = append(nodes, relay{store: st, q: bb.Queue})
 
 	var syncerFor service.Syncer
 	if sync != nil {
@@ -277,7 +303,7 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (*Role, error)
 			return nil, fmt.Errorf("identity.sealing_key_file: %w", err)
 		}
 		ent = &enterprise.Syncer{Store: st, Sealer: sealer, AllowPrivate: opts.Dev}
-		nodes = append(nodes, enterpriseSync{ent}, &orgSCIM{st: st, sync: ent, base: strings.TrimSuffix(cfg.PublicURL, "/"), pending: map[string]bool{}})
+		nodes = append(nodes, enterpriseSync{ent}, &orgSCIM{st: st, base: strings.TrimSuffix(cfg.PublicURL, "/")})
 	}
 	// Notifications' mail, sent as keyed work (docs/hosted.md, "ok control at scale, as built").
 	if m := cfg.Identity.Mail; m != nil {
@@ -285,7 +311,7 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (*Role, error)
 		if err != nil {
 			return nil, err
 		}
-		nodes = append(nodes, &mailer{store: st, send: sender.Send, look: opts.MailLook})
+		nodes = append(nodes, &mailer{store: st, send: sender.Send})
 	}
 	// WebAuthn binds a passkey to a domain: ok reached at an IP address — in development — has none.
 	publicURL, err := url.Parse(cfg.PublicURL)
@@ -297,12 +323,7 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (*Role, error)
 		Enterprise:      ent,
 		BootstrapAdmins: cfg.Identity.BootstrapAdmins, SessionIdle: cfg.Identity.Session.Idle,
 		Hosted: cfg.Tenancy.Hosted(), Installation: installation, Roles: idclient.Roles(cfg), PlaintextIssuers: opts.Dev,
-		Cells: cfg.Cells(), MoveAsked: func() {
-			select {
-			case moveWake <- struct{}{}:
-			default:
-			}
-		}})
+		Cells: cfg.Cells()})
 	r.Services = svc
 	nodes = append(nodes, services{s: svc, ca: authority})
 
@@ -329,7 +350,7 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (*Role, error)
 		r.closers = append(r.closers, func() { c.Close() })
 		return c, nil
 	}}
-	r.Mover = &mover.Runner{Store: st, Cells: cfg.Cells(), Wake: moveWake, Log: slog.Default(), Moves: dialer.moves}
+	r.Mover = &mover.Runner{Store: st, Cells: cfg.Cells(), Log: slog.Default(), Moves: dialer.moves}
 	nodes = append(nodes, r.Mover)
 
 	wc := web.Config{Store: st, Services: svc, Installation: cfg.Installation, PublicURL: cfg.PublicURL,
@@ -403,6 +424,7 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (*Role, error)
 		TrustedHeader: cfg.Identity.TrustedHeader,
 		Dev:           opts.Dev,
 		Roles:         roles,
+		InProcess:     inProcess,
 	})
 	r.Root = &assembly{deps: nodes}
 	ok = true
@@ -494,11 +516,10 @@ func (s scimWeb) Mount(r *chi.Mux) (string, error) {
 // relay publishes the directory's events: every replica runs one, each publishing pending events
 // beside the others (store.Relay).
 // mailer sends the notifications' mail, each message on one replica at a time, as it is queued and
-// as its retries fall due; a message whose mark was lost is marked again each minute.
+// as its retries fall due: its work marked by the transaction that queues it, and by each try.
 type mailer struct {
 	store *store.Store
 	send  store.Sender
-	look  time.Duration
 }
 
 var _ node.Application = (*mailer)(nil)
@@ -509,30 +530,32 @@ func (mailer) Setup(context.Context) error  { return nil }
 func (mailer) Healthy(context.Context) bool { return true }
 
 func (m mailer) Start(ctx context.Context) error {
-	look := m.look
-	if look <= 0 {
-		look = 2 * time.Second
-	}
-	var swept time.Time
 	return (&work.Runner{
 		Kind:  store.MailWork,
 		Store: m.store.Work(),
 		Do:    func(ctx context.Context, id int64) error { return m.store.SendMail(ctx, id, m.send) },
-		Sweep: func(ctx context.Context) error {
-			if time.Since(swept) < time.Minute {
-				return nil
-			}
-			swept = time.Now()
-			return m.store.MarkDueMail(ctx)
-		},
-		Idle: look,
-		Log:  slog.Default(),
+		Log:   slog.Default(),
 	}).Run(ctx)
 }
 
+// waits removes the lapsed registrations of the live requests waiting on identity's claims, on
+// every replica (store.RunWaits).
+type waits struct {
+	store *store.Store
+	q     bus.Queue
+}
+
+var _ node.Application = waits{}
+
+func (waits) Name() string                      { return "ok/identity/waits" }
+func (waits) Dependencies() []node.Node         { return nil }
+func (waits) Setup(context.Context) error       { return nil }
+func (waits) Healthy(context.Context) bool      { return true }
+func (w waits) Start(ctx context.Context) error { w.store.RunWaits(ctx, w.q); return nil }
+
 type relay struct {
-	store  *store.Store
-	stream bus.Stream
+	store *store.Store
+	q     bus.Queue
 }
 
 var _ node.Application = relay{}
@@ -543,7 +566,7 @@ func (relay) Setup(context.Context) error  { return nil }
 func (relay) Healthy(context.Context) bool { return true }
 
 func (n relay) Start(ctx context.Context) error {
-	if err := n.store.Relay(ctx, n.stream); ctx.Err() == nil {
+	if err := n.store.Relay(ctx, n.q); ctx.Err() == nil {
 		return err
 	}
 	return nil

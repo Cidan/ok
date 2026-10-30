@@ -18,8 +18,8 @@ func TestQuotas(t *testing.T) {
 	if _, err := identitypb.NewAdminClient(e.as(bea)).SetQuota(ctx, &identitypb.SetQuotaRequest{Account: "bea", Concurrent: 100}); code(err) != codes.PermissionDenied {
 		t.Errorf("a person setting their own quota: %v", err)
 	}
-	q, err := admin.SetQuota(ctx, &identitypb.SetQuotaRequest{Account: "bea", Concurrent: 2, Minutes: 60, Weight: 3})
-	if err != nil || q.GetConcurrent() != 2 || q.GetMinutes() != 60 || q.GetWeight() != 3 || q.GetDefault() {
+	q, err := admin.SetQuota(ctx, &identitypb.SetQuotaRequest{Account: "bea", Concurrent: 2, Minutes: 60})
+	if err != nil || q.GetConcurrent() != 2 || q.GetMinutes() != 60 || q.GetDefault() {
 		t.Fatalf("SetQuota = %v, %v", q, err)
 	}
 	if q, err := admin.GetQuota(ctx, &identitypb.GetQuotaRequest{Account: "nobody"}); code(err) != codes.NotFound {

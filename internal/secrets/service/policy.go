@@ -12,7 +12,6 @@ import (
 	"path"
 	"slices"
 	"sync"
-	"time"
 
 	"github.com/Cidan/ok/internal/identity"
 	"github.com/Cidan/ok/internal/secrets"
@@ -93,14 +92,10 @@ func (d Directory) Member(ctx context.Context, principalID, set string) (bool, e
 	return r.GetMember(), err
 }
 
-// How long the policy keeps what it read: main's head briefly, so a change landing takes effect
-// within seconds; what a commit holds for as long as it likes, as nothing changes it; and a
-// membership as long as the design says a removal may take.
-const (
-	headTTL   = 2 * time.Second
-	memberTTL = 10 * time.Second
-	keptFiles = 4096
-)
+// keptFiles bounds the files of commits the policy keeps: what a commit holds never changes, so it
+// is kept as long as there is room; main's head and memberships, which change, are read each time
+// (docs/state.md).
+const keptFiles = 4096
 
 // Policy decides from main who may use a folder's secrets.
 type Policy struct {
@@ -108,17 +103,8 @@ type Policy struct {
 	members Members
 	names   identity.Names
 
-	headTTL, memberTTL time.Duration
-
-	mu          sync.Mutex
-	heads       map[int64]cachedHead
-	files       map[fileKey]cachedFile
-	memberships map[memberKey]cachedMember
-}
-
-type cachedHead struct {
-	head  []byte
-	until time.Time
+	mu    sync.Mutex
+	files map[fileKey]cachedFile
 }
 
 type fileKey struct {
@@ -132,17 +118,9 @@ type cachedFile struct {
 	present bool
 }
 
-type memberKey struct{ principal, set string }
-
-type cachedMember struct {
-	member bool
-	until  time.Time
-}
-
 // NewPolicy decides from main, read through m, and memberships, asked of members.
 func NewPolicy(m Main, members Members, names identity.Names) *Policy {
-	return &Policy{main: m, members: members, names: names, headTTL: headTTL, memberTTL: memberTTL, heads: map[int64]cachedHead{},
-		files: map[fileKey]cachedFile{}, memberships: map[memberKey]cachedMember{}}
+	return &Policy{main: m, members: members, names: names, files: map[fileKey]cachedFile{}}
 }
 
 // Folder is what main says of a folder.
@@ -228,45 +206,14 @@ func (p *Policy) anyMember(ctx context.Context, principal string, sets []string)
 	return false, nil
 }
 
+// member is the directory's answer now: a removal takes effect at once.
 func (p *Policy) member(ctx context.Context, principal, set string) (bool, error) {
-	k := memberKey{principal, set}
-	p.mu.Lock()
-	c, ok := p.memberships[k]
-	p.mu.Unlock()
-	if ok && time.Now().Before(c.until) {
-		return c.member, nil
-	}
-	member, err := p.members.Member(ctx, principal, set)
-	if err != nil {
-		return false, err
-	}
-	p.mu.Lock()
-	if len(p.memberships) > keptFiles {
-		clear(p.memberships)
-	}
-	p.memberships[k] = cachedMember{member: member, until: time.Now().Add(p.memberTTL)}
-	p.mu.Unlock()
-	return member, nil
+	return p.members.Member(ctx, principal, set)
 }
 
+// head is main's head now: a change landing takes effect at once.
 func (p *Policy) head(ctx context.Context, repo int64) ([]byte, error) {
-	p.mu.Lock()
-	c, ok := p.heads[repo]
-	p.mu.Unlock()
-	if ok && time.Now().Before(c.until) {
-		return c.head, nil
-	}
-	head, err := p.main.Head(ctx, repo)
-	if err != nil {
-		return nil, err
-	}
-	p.mu.Lock()
-	if len(p.heads) > keptFiles {
-		clear(p.heads)
-	}
-	p.heads[repo] = cachedHead{head: head, until: time.Now().Add(p.headTTL)}
-	p.mu.Unlock()
-	return head, nil
+	return p.main.Head(ctx, repo)
 }
 
 // read reads paths of a commit, each kept once read: a commit's files never change.

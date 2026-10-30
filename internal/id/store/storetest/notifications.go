@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/Cidan/ok/internal/id/store"
+	"github.com/Cidan/ok/internal/work/worktest"
 )
 
 // A notification is recorded once by recipient and source, its mail queued with it only then; a
@@ -88,8 +89,9 @@ func testNotifications(t *testing.T, s *store.Store) {
 	if err := s.SendMail(ctx, id, failing); err != nil || tries != 1 {
 		t.Errorf("a retry before its time sent it: %d tries, %v", tries, err)
 	}
-	if err := s.MarkDueMail(ctx); err != nil {
-		t.Errorf("marking due mail: %v", err)
+	// Its sending is keyed work, its job enqueued with the message.
+	if got := worktest.Ready(t, s.Work(), store.MailWork); !slices.Contains(got, id) {
+		t.Errorf("the mail's jobs: %v; want %d's", got, id)
 	}
 	now = now.Add(30 * time.Second)
 	if err := s.SendMail(ctx, id, failing); err != nil {

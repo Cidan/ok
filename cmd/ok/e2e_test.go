@@ -16,6 +16,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/Cidan/ok/internal/bus/bustest"
 	"github.com/Cidan/ok/internal/client/auth"
 	"github.com/Cidan/ok/internal/config"
 	"github.com/Cidan/ok/internal/dial"
@@ -75,6 +76,7 @@ identity:
 	if err != nil {
 		t.Fatal(err)
 	}
+	cfg.Bus = bustest.Config(t)
 	pool, err := pgxpool.New(ctx, testdb.Postgres(t))
 	if err != nil {
 		t.Fatal(err)
@@ -253,7 +255,7 @@ database: {url_file: `+filepath.Join(dir, "database-url")+`}
 roles: {identity: identity.ok, worker: worker.ok}
 services: {identity: `+lis.Addr().String()+`}
 identity: {ca_dir: `+filepath.Join(dir, "ca")+`}
-`), 0o644)
+`+busYAML(t)), 0o644)
 	credDir := filepath.Join(dir, "worker-credential")
 	cmd := func(args ...string) (string, error) {
 		var out bytes.Buffer

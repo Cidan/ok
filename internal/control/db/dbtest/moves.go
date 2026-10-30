@@ -3,6 +3,7 @@ package dbtest
 import (
 	"context"
 	"fmt"
+	"math"
 	"testing"
 	"time"
 
@@ -88,8 +89,8 @@ func testMoves(t *testing.T, src, dst db.Store) {
 	want := map[int64]string{repo: read(src, repo), fork: read(src, fork)}
 
 	scope := &okpb.MoveScope{NetworkId: repo, Repositories: []int64{repo, fork}, Role: cells.Control}
-	srcMover := &move.RepositoryRole{RoleName: cells.Control, Rows: src.Moves()}
-	dstMover := &move.RepositoryRole{RoleName: cells.Control, Rows: dst.Moves()}
+	srcMover := &move.RepositoryRole{RoleName: cells.Control, Rows: src.Moves(), Work: src.Work()}
+	dstMover := &move.RepositoryRole{RoleName: cells.Control, Rows: dst.Moves(), Work: dst.Work()}
 	srcMoves, dstMoves := movetest.Pair(t, srcMover, dstMover, okpb.Caller_CALLER_CONTROL)
 	write := func(s db.Store, r int64) error {
 		_, err := s.AddReviewer(move.WithRepository(context.Background(), r), r, 1, "carol.human.example.com", alice)
@@ -137,8 +138,12 @@ func testMoves(t *testing.T, src, dst db.Store) {
 	}
 
 	// A day later, the source drops it, its entry and favorites staying.
-	if due, err := src.Moves().MovedBefore(ctx, time.Now().Add(move.Kept+time.Minute)); err != nil || len(due) != 2 {
+	if due, err := src.Moves().MovedBefore(ctx, time.Now().Add(move.Kept+time.Minute), math.MinInt64, 10); err != nil || len(due) != 2 {
 		t.Fatalf("moved away: %v, %v", due, err)
+	}
+	if booked, err := src.Work().Marked(ctx, move.MovedWork, math.MinInt64, 10); err != nil || len(booked) != 2 ||
+		time.Until(booked[0].At) < move.Kept-time.Hour {
+		t.Fatalf("the purges booked as the move finished: %+v, %v; want each a day on", booked, err)
 	}
 	if _, err := srcMoves.Drop(ctx, scope); err != nil {
 		t.Fatal(err)

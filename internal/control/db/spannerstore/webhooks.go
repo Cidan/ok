@@ -170,20 +170,3 @@ func (x queries) PruneDeliveries(ctx context.Context, repo, webhook int64, keep 
 		map[string]any{"repo": repo, "webhook": webhook, "keep": int64(keep)})
 	return err
 }
-
-func (x queries) WaitingDeliveries(ctx context.Context) ([]int64, error) {
-	var out []int64
-	err := x.Read(func(r spannerdata.Reader) error {
-		out = nil
-		return spannerdata.Each(ctx, r, `SELECT DISTINCT repository_id FROM webhook_delivery WHERE state = 0 ORDER BY 1`, nil,
-			func(row *spanner.Row) error {
-				var id int64
-				if err := row.Columns(&id); err != nil {
-					return err
-				}
-				out = append(out, id)
-				return nil
-			})
-	})
-	return out, err
-}

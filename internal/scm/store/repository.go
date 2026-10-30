@@ -3,12 +3,12 @@ package store
 import (
 	"context"
 	"errors"
-	"fmt"
 	"time"
 
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	"github.com/Cidan/ok/internal/id/dirfeed"
 	"github.com/Cidan/ok/internal/scm/encoding"
 	"github.com/Cidan/ok/internal/scm/store/backend"
 	scmpb "github.com/Cidan/ok/proto/ok/scm/v1"
@@ -44,6 +44,9 @@ func (s *Store) CreateRepository(ctx context.Context, id, network int64, created
 		if err := tx.InsertContentIndex(ctx, backend.NetworkScope(net), 1); err != nil {
 			return err
 		}
+		if err := made(ctx, tx, r.ID); err != nil {
+			return err
+		}
 		return appendEvent(ctx, tx, r.ID, &scmpb.Event{Kind: &scmpb.Event_RepositoryCreated{
 			RepositoryCreated: &scmpb.RepositoryCreated{CreatedById: createdBy},
 		}})
@@ -75,9 +78,6 @@ func (s *Store) repositoryExists(ctx context.Context, q backend.Ops, id int64) e
 func appendEvent(ctx context.Context, tx *txn, repositoryID int64, ev *scmpb.Event) error {
 	return appendEvents(ctx, tx, repositoryID, []*scmpb.Event{ev})
 }
-
-// eventChannel is the notification channel an event's commit signals, with its repository.
-const eventChannel = "ok_scm_events"
 
 // appendEvents records evs at the next places in their repository's log, in order, for the relay
 // to publish: in commit order. On a backend that sequences after commit they are left pending for
@@ -118,5 +118,16 @@ func appendEvents(ctx context.Context, tx *txn, repositoryID int64, evs []*scmpb
 	if err := tx.InsertEvents(ctx, repositoryID, out); err != nil {
 		return err
 	}
-	return tx.Notify(ctx, eventChannel, fmt.Sprint(repositoryID))
+	return pendRelay(ctx, tx, repositoryID, last-int64(len(evs))+1, last)
+}
+
+// made books a repository's keyed work as it is made, in the transaction that makes it: its first
+// collection, a day on, which books the next (server.GC); and its purge, should the directory
+// abandon its making (dirfeed.CreatingTimeout) — a look then, which does nothing for one made.
+func made(ctx context.Context, tx *txn, repo int64) error {
+	now := time.Now()
+	if err := tx.MarkWorkAt(ctx, GCWork, repo, now.Add(24*time.Hour)); err != nil {
+		return err
+	}
+	return tx.MarkWorkAt(ctx, PurgeWork, repo, now.Add(dirfeed.CreatingTimeout+time.Minute))
 }

@@ -11,7 +11,6 @@ import (
 	"google.golang.org/grpc"
 
 	"github.com/Cidan/ok/internal/blob"
-	"github.com/Cidan/ok/internal/bus"
 	"github.com/Cidan/ok/internal/bus/busconfig"
 	"github.com/Cidan/ok/internal/cells"
 	"github.com/Cidan/ok/internal/config"
@@ -64,9 +63,6 @@ type Options struct {
 	// Pool and Blobs, when set, are the database and bucket instead of the configuration's: tests.
 	Pool  *pgxpool.Pool
 	Blobs blob.Store
-	// Stream, when set, is the bus's stream the relay publishes the SCM's events on, instead of
-	// the configuration's: tests.
-	Stream bus.Stream
 	// Identity, when set, is ok identity, dialed as the role: tests.
 	Identity grpc.ClientConnInterface
 	// Secrets, when set, is ok secrets, dialed as the role: tests, and ok serve.
@@ -85,9 +81,9 @@ func OpenStore(ctx context.Context, cfg *config.Config, opts Options) (*store.St
 	return st, done, err
 }
 
-// open is OpenStore, with the pool the store is over: none on Spanner, where the SCM's database is
-// its own and the bus another backend's (config).
-func open(ctx context.Context, cfg *config.Config, opts Options) (*store.Store, *pgxpool.Pool, func(), error) {
+// open is OpenStore, with the bus its keyed work's jobs go on (docs/hosted.md, "Work without
+// leaders"): the configuration's.
+func open(ctx context.Context, cfg *config.Config, opts Options) (*store.Store, *busconfig.Bus, func(), error) {
 	done := func() {}
 	var b backend.Backend
 	pool := opts.Pool
@@ -135,13 +131,24 @@ func open(ctx context.Context, cfg *config.Config, opts Options) (*store.Store, 
 		Names: cfg.Names(), EmailDomain: cfg.SCM.EmailDomain,
 		ObjectCacheBytes: cfg.SCM.Cache.Objects, ChunkCacheBytes: cfg.SCM.Cache.Chunks, DiffCacheBytes: cfg.SCM.Cache.Diffs,
 		PathCommitCacheBytes: cfg.SCM.Cache.PathCommits, CodeIndexCacheBytes: cfg.SCM.Cache.CodeIndexes,
-		DeltaCacheBytes: cfg.SCM.Cache.Deltas, CheckoutCacheBytes: cfg.SCM.Cache.Checkouts,
+		DeltaCacheBytes: cfg.SCM.Cache.Deltas, CheckoutCacheBytes: cfg.SCM.Cache.Checkouts, PublishMemoryBytes: cfg.SCM.PublishMemory,
 	})
 	if err != nil {
 		done()
 		return nil, nil, nil, fmt.Errorf("the SCM's store: %w", err)
 	}
-	return st, pool, func() { st.Close(); done() }, nil
+	closeStore := func() { st.Close(); done() }
+	bb, err := busconfig.Open(ctx, cfg.Bus)
+	if err != nil {
+		closeStore()
+		return nil, nil, nil, err
+	}
+	if err := bb.RegisterWork(st.Work(), "scm"); err != nil {
+		bb.Close()
+		closeStore()
+		return nil, nil, nil, err
+	}
+	return st, bb, func() { bb.Close(); closeStore() }, nil
 }
 
 // Build assembles the SCM role from its configuration.
@@ -153,25 +160,12 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (*Role, error)
 			r.Close()
 		}
 	}()
-	st, pool, done, err := open(ctx, cfg, opts)
+	st, bb, done, err := open(ctx, cfg, opts)
 	if err != nil {
 		return nil, err
 	}
 	r.Store = st
 	r.closers = append(r.closers, done)
-	stream := opts.Stream
-	if stream == nil {
-		b, err := busconfig.Open(ctx, cfg.Bus, pool)
-		if err != nil {
-			return nil, err
-		}
-		r.closers = append(r.closers, b.Close)
-		stream = b.Stream
-	}
-	// The stream's backend carries the signals (docs/hosted.md, "Signals").
-	if sig, ok := stream.(bus.Signals); ok {
-		st.SetSignals(sig)
-	}
 
 	hour := DefaultGCHour
 	if cfg.SCM.GCHour != nil {
@@ -211,9 +205,7 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (*Role, error)
 	}
 	roots := opts.Roots
 	if roots == nil {
-		if roots, err = idclient.NewRoots(ctx, conn, "scm"); err != nil {
-			return nil, err
-		}
+		roots = idclient.NewRoots(conn)
 	}
 	r.Resolver = authn.NewResolver(authn.Config{
 		Directory:     idclient.NewDirectory(conn),
@@ -260,9 +252,9 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (*Role, error)
 		return c, func() { c.Close() }, nil
 	})
 	r.closers = append(r.closers, peers.Close)
-	svc.InCell(cfg.Cell.Name, peerSCMs{peers})
-	r.Root = &assembly{deps: []node.Node{svc, server.NewGC(svc, hour), server.NewPurge(svc), server.NewSegments(svc, 0), server.NewFolds(svc), server.NewRelay(svc, stream),
-		server.NewMovePurge(svc), server.NewCodeSearch(svc), server.NewCheckouts(svc), roots}}
+	svc.InCell(cfg.Cell.Name, peerSCMs{peers}, identitypb.NewCellsClient(conn))
+	r.Root = &assembly{deps: []node.Node{svc, server.NewGC(svc, hour), server.NewPurge(svc, identitypb.NewDirectoryEventsClient(conn)), server.NewSegments(svc, 0), server.NewFolds(svc), server.NewRelay(svc, bb.Queue),
+		server.NewMovePurge(svc), server.NewCodeSearch(svc), server.NewCheckouts(svc)}}
 	ok = true
 	return r, nil
 }

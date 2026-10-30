@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/Cidan/ok/internal/bus/busconfig"
 	idrole "github.com/Cidan/ok/internal/id/role"
 	idstore "github.com/Cidan/ok/internal/id/store"
 	idpostgres "github.com/Cidan/ok/internal/id/store/postgres"
@@ -107,6 +108,16 @@ func mustIdentity(t *testing.T, ctx context.Context, res *resources) idstore.Bac
 	if p := res.open(idrole.Schema); p != nil {
 		b, err := idpostgres.Open(ctx, p)
 		if err != nil {
+			t.Fatal(err)
+		}
+		// As ok identity move-in opens it (idrole.OpenBackend): its keyed work's jobs, the directory's
+		// relays among them, on the configuration's bus.
+		bb, err := busconfig.Open(ctx, res.cfg.Bus)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(bb.Close)
+		if err := bb.RegisterWork(b.Work(), "identity"); err != nil {
 			t.Fatal(err)
 		}
 		return b

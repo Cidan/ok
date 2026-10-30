@@ -9,13 +9,16 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
+	"github.com/Cidan/ok/internal/bus"
 	"github.com/Cidan/ok/internal/data"
 	"github.com/Cidan/ok/internal/id/dirfeed"
 	"github.com/Cidan/ok/internal/move"
 	"github.com/Cidan/ok/internal/scm/scmfeed"
+	"github.com/Cidan/ok/internal/wait"
 	"github.com/Cidan/ok/internal/work"
 	"github.com/Cidan/ok/internal/workflow"
 )
@@ -180,56 +183,85 @@ func New(b Backend) *Store { return &Store{b: b} }
 // each deployment is stepped by whoever takes its lock; and which deployments start is decided by
 // one transaction at a time (StartTurns). Whatever a lease's holder writes is fenced by it.
 
-// Kinds of the deployer's keyed work.
+// Kinds of the deployer's keyed work (internal/work), each marked by the transaction that changes
+// what it acts on — its job enqueued as it commits — so no replica looks for any of it.
 const (
-	// PlanWork plans a repository whose main moved.
+	// PlanWork plans a repository whose main moved: marked as the feed records main's move, and as
+	// the directory names the repository, which its plan reads.
 	PlanWork = "plan"
 	// ObserveWork reads a service's workload, due ObservePeriod after the last read.
 	ObserveWork = "observe"
+	// TurnsWork starts the waiting deployments whose turn has come (StartTurns), the cell's one
+	// piece of it, key 0: marked as a deployment is queued, ends, or its repository's gate opens.
+	TurnsWork = "turns"
+	// StepWork steps a running deployment (StepKind), keyed by it: marked as it starts, as a person
+	// halts it or allows its hazards, and as its migration ends; booked by each step that waits on
+	// something outside the database for its next look.
+	StepWork = "step"
+	// RetireWork retires the old copy of the deployer a deployment of it replaced, keyed by the
+	// deployment: marked as it succeeds, before its driver retires it, should the driver be the
+	// copy retired.
+	RetireWork = "retire"
 )
 
+// StepKind is the kind of keyed work that steps d: StepWork, or, for a deployment of the deployer
+// itself, step-<driver> — stepped by the copy of the deployer that started it alone.
+func StepKind(d *Deployment) string {
+	if d.Self {
+		return StepWork + "-" + d.Driver
+	}
+	return StepWork
+}
+
+// UnplannedRepository is a repository whose main moved past its latest plan, once the directory
+// has named it — false for one planned at its head, or not named.
+func (s *Store) UnplannedRepository(ctx context.Context, id int64) (Repository, bool, error) {
+	return s.b.UnplannedRepository(ctx, id)
+}
+
 // Work is the deployer's keyed work's store (internal/work).
-func (s *Store) Work() work.Store { return workStore{s.b} }
+func (s *Store) Work() work.Store { return s.b.Work() }
 
-type workStore struct{ b Backend }
+// Waits are the store's registrations of live requests (wait.Server serves them to ok control).
+func (s *Store) Waits() wait.Store { return s.b.Waits() }
 
-func (w workStore) Mark(ctx context.Context, kind string, key int64) error {
-	return w.b.MarkWork(ctx, kind, key)
-}
-func (w workStore) MarkAt(ctx context.Context, kind string, key int64, at time.Time) error {
-	return w.b.MarkWorkAt(ctx, kind, key, at)
-}
-func (w workStore) Take(ctx context.Context, kind string, key int64, holder string, ttl time.Duration) (bool, error) {
-	return w.b.TakeWork(ctx, kind, key, holder, ttl)
-}
-func (w workStore) Renew(ctx context.Context, kind string, key int64, holder string, ttl time.Duration) (bool, error) {
-	return w.b.RenewWork(ctx, kind, key, holder, ttl)
-}
-func (w workStore) Release(ctx context.Context, kind string, key int64, holder string) (bool, error) {
-	return w.b.ReleaseWork(ctx, kind, key, holder)
-}
-func (w workStore) Let(ctx context.Context, kind string, key int64, holder string) error {
-	return w.b.LetWork(ctx, kind, key, holder)
-}
-func (w workStore) Due(ctx context.Context, kind string, limit int) ([]int64, error) {
-	return w.b.DueWork(ctx, kind, limit)
+// RunWaits replies to ok control's watchers of the commits whose deployments a transaction
+// changed, on q — this replica's bus — as their steps come, until ctx ends (wait.Run): every
+// replica runs it.
+func (s *Store) RunWaits(ctx context.Context, q bus.Queue) {
+	wait.Run(ctx, s.b.Waits(), q, slog.Default())
 }
 
-// MarkIdle marks key's work of kind due now if nothing marks it and no one holds it: what a sweep
-// marks — work that is new, or whose holder died before marking it again — leaving work its
-// holder is doing, or marked to do later, as it is.
-func (s *Store) MarkIdle(ctx context.Context, kind string, key int64) error {
-	return s.b.MarkWorkIdle(ctx, kind, key)
-}
+// DeploymentClaim is a deployment's claim (internal/work), keyed by its ID: whoever steps a
+// deployment holds it.
+const DeploymentClaim = "deployment"
 
-// LockDeployment takes a deployment's lock, if no one holds it, until release: whoever steps a
+// deploymentTTL is a deployment's claim's lease, renewed every third of it until released: a holder
+// that dies lets it go this long after its last renewal.
+const deploymentTTL = 30 * time.Second
+
+// LockDeployment takes a deployment's claim, if no one holds it, until release: whoever steps a
 // deployment holds it, and hands it on to a migration that outlives the pass that started it,
-// so it is held past ctx — refreshed until released, or until this process dies. held is ctx
-// carrying the lock's fence: what is written with it is written only while the lock is held.
+// so it is held past ctx — renewed until released, or until this process dies. Each take is a
+// holder of its own. held is ctx carrying the claim's fence: what is written with it is written
+// only while the claim is held.
+//
+// For this release, the lock the release before took is taken too: its replicas, which take only
+// the lock, are kept from a deployment this one's steps — the deployer's own among them, as it
+// deploys itself — and this one's from theirs.
 func (s *Store) LockDeployment(ctx context.Context, id int64) (held context.Context, release func(), ok bool, err error) {
-	fence, release, ok, err := s.b.TryLockDeployment(ctx, id)
+	claimed, releaseClaim, ok, err := work.Claim(context.WithoutCancel(ctx), s.b.Work(), DeploymentClaim, id, work.NewHolder(), deploymentTTL)
 	if err != nil || !ok {
 		return nil, nil, ok, err
+	}
+	_, releaseLock, ok, err := s.b.TryLockDeployment(ctx, id)
+	if err != nil || !ok {
+		releaseClaim()
+		return nil, nil, ok, err
+	}
+	release = func() {
+		releaseLock()
+		releaseClaim()
 	}
 	// What is written with it is about its repository, through its move gate
 	// (docs/hosted.md, "Cells, as built").
@@ -238,6 +270,7 @@ func (s *Store) LockDeployment(ctx context.Context, id int64) (held context.Cont
 		release()
 		return nil, nil, false, err
 	}
+	fence, _ := data.FenceOf(claimed)
 	held = data.WithFence(ctx, fence)
 	if len(ds) > 0 {
 		held = move.WithRepository(held, ds[0].Repository)
@@ -261,13 +294,10 @@ func (s *Store) aboutDeployment(ctx context.Context, id int64) (context.Context,
 	return move.WithRepository(ctx, ds[0].Repository), nil
 }
 
-// write runs fn on the database: in a transaction of its own when ctx carries a fence, so that
-// the write is fenced (data.Fence), and as one statement otherwise.
+// write runs fn on the database in a transaction of its own (txn): fenced when ctx carries a fence
+// (data.Fence), and saying which commits' deployments it changed.
 func (s *Store) write(ctx context.Context, fn func(Ops) error) error {
-	if _, ok := data.FenceOf(ctx); ok {
-		return s.b.Txn(ctx, fn)
-	}
-	return fn(s.b)
+	return s.txn(ctx, fn)
 }
 
 // ─── The feed ───
@@ -298,7 +328,7 @@ type FeedEvent struct {
 // cursor is skipped.
 func (s *Store) Apply(ctx context.Context, ev FeedEvent) error {
 	ctx = move.WithRepository(ctx, ev.Repository)
-	return s.b.Txn(ctx, func(tx Ops) error {
+	return s.txn(ctx, func(tx Ops) error {
 		cursor, err := tx.LockFollowCursor(ctx, scmfeed.Topic, ev.Repository)
 		if err != nil {
 			return err
@@ -319,6 +349,9 @@ func (s *Store) Apply(ctx context.Context, ev FeedEvent) error {
 				return err
 			}
 			if err := tx.AddMainCommit(ctx, ev.Repository, ev.HeadSeq, ev.Head); err != nil {
+				return err
+			}
+			if err := tx.MarkWork(ctx, PlanWork, ev.Repository); err != nil {
 				return err
 			}
 		}
@@ -349,7 +382,7 @@ func (s *Store) DirectoryCursors(ctx context.Context, repos []int64) (map[int64]
 func (s *Store) ApplyDirectory(ctx context.Context, ev DirectoryEvent) error {
 	// The directory's events are every repository's, wherever it is or moves: no move gates them.
 	ctx = move.Untagged(ctx)
-	return s.b.Txn(ctx, func(tx Ops) error {
+	return s.txn(ctx, func(tx Ops) error {
 		cursor, err := tx.LockFollowCursor(ctx, dirfeed.Topic, ev.Repository)
 		if err != nil {
 			return err
@@ -364,6 +397,10 @@ func (s *Store) ApplyDirectory(ctx context.Context, ev DirectoryEvent) error {
 			}
 		case ev.FullName != "":
 			if err := tx.NameRepository(ctx, ev.Repository, ev.FullName, ev.Owner); err != nil {
+				return err
+			}
+			// Its plan waited for its name, which says whether it applies the groups-and-ACLs tree.
+			if err := tx.MarkWork(ctx, PlanWork, ev.Repository); err != nil {
 				return err
 			}
 		}
@@ -407,7 +444,7 @@ type PlanResult struct {
 func (s *Store) RecordPlan(ctx context.Context, p PlanResult) (int64, error) {
 	var id int64
 	ctx = move.WithRepository(ctx, p.Repository)
-	err := s.b.Txn(ctx, func(tx Ops) error {
+	err := s.txn(ctx, func(tx Ops) error {
 		planned, err := tx.LockPlannedSeq(ctx, p.Repository)
 		if err != nil {
 			return err
@@ -458,6 +495,25 @@ func (s *Store) RecordPlan(ctx context.Context, p PlanResult) (int64, error) {
 		}
 		if err := tx.RecordServices(ctx, p.Repository, p.HeadSeq, p.Services); err != nil {
 			return err
+		}
+		// Every service the plan declares is read now — a new one for the first time — and then a
+		// Period after each read (observe): its first read's mark, whose job brings it.
+		svs, err := tx.Services(ctx, p.Repository)
+		if err != nil {
+			return err
+		}
+		for _, sv := range svs {
+			if sv.Declared {
+				if err := tx.MarkWork(ctx, ObserveWork, sv.ID); err != nil {
+					return err
+				}
+			}
+		}
+		// Its waiting deployments start as their turns come.
+		if len(p.Deployments) > 0 {
+			if err := tx.MarkWork(ctx, TurnsWork, 0); err != nil {
+				return err
+			}
 		}
 		return tx.SetPlanned(ctx, p.Repository, p.Head, p.HeadSeq)
 	})
@@ -591,7 +647,17 @@ func (s *Store) RecordObservation(ctx context.Context, service int64, o Observat
 		return err
 	}
 	ctx = move.WithRepository(ctx, sv.Repository)
-	return s.write(ctx, func(tx Ops) error { return tx.RecordObservation(ctx, service, o) })
+	return s.write(ctx, func(tx Ops) error {
+		if err := tx.RecordObservation(ctx, service, o); err != nil {
+			return err
+		}
+		// The Services pages hear of what the cluster runs only as it changes: the observer reads
+		// every service every period.
+		if sv.Observation != nil && sameObservation(*sv.Observation, o) {
+			return nil
+		}
+		return pendChanged(ctx, tx, wait.ServicesSubject)
+	})
 }
 
 func describeGates(gates []Gate) string {
@@ -766,7 +832,11 @@ func (s *Store) Finish(ctx context.Context, id int64, status Status, reason stri
 		if reason != "" {
 			msg += ": " + reason
 		}
-		return tx.AppendEvent(ctx, id, msg)
+		if err := tx.AppendEvent(ctx, id, msg); err != nil {
+			return err
+		}
+		// What it held, the deployments waiting for it may take.
+		return tx.MarkWork(ctx, TurnsWork, 0)
 	})
 }
 
@@ -790,7 +860,16 @@ func (s *Store) StopPlan(ctx context.Context, plan, failed int64) error {
 				return err
 			}
 		}
-		return tx.HaltRunningIn(ctx, plan, failed, f.Wave, reason)
+		halted, err := tx.HaltRunningIn(ctx, plan, failed, f.Wave, reason)
+		if err != nil {
+			return err
+		}
+		for _, d := range halted {
+			if err := tx.MarkWork(ctx, StepKind(d), d.ID); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 }
 
@@ -800,7 +879,7 @@ func (s *Store) StopPlan(ctx context.Context, plan, failed int64) error {
 // halted, or was canceled, and is its deploy's latest.
 func (s *Store) Retry(ctx context.Context, id int64, by string) (*Deployment, error) {
 	var nid int64
-	err := s.b.Txn(ctx, func(tx Ops) error {
+	err := s.txn(ctx, func(tx Ops) error {
 		d, err := tx.LockDeployment(ctx, id)
 		if err != nil {
 			return err
@@ -835,7 +914,10 @@ func (s *Store) Retry(ctx context.Context, id int64, by string) (*Deployment, er
 			Repository: d.Repository, RetryOf: id, Deploy: spec, Commit: d.Commit, FromSeq: d.FromSeq, ToSeq: d.ToSeq,
 			Why: fmt.Sprintf("a retry of deployment %d", id), Wave: 1, RequestedBy: by, Self: d.Self, Status: Waiting, Stage: Queued,
 		})
-		return err
+		if err != nil {
+			return err
+		}
+		return tx.MarkWork(ctx, TurnsWork, 0)
 	})
 	if err != nil {
 		return nil, err
@@ -862,17 +944,21 @@ func (s *Store) Halt(ctx context.Context, id int64, by string) (*Deployment, err
 	ctx = move.WithRepository(ctx, d.Repository)
 	switch d.Status {
 	case Waiting:
-		if err := s.b.SetHaltBy(ctx, id, by); err != nil {
+		if err := s.write(ctx, func(tx Ops) error { return tx.SetHaltBy(ctx, id, by) }); err != nil {
 			return nil, err
 		}
 		if err := s.Finish(ctx, id, Canceled, "halted before it started"); err != nil {
 			return nil, err
 		}
 	case Running:
-		if err := s.b.SetHaltBy(ctx, id, by); err != nil {
+		if err := s.write(ctx, func(tx Ops) error { return tx.SetHaltBy(ctx, id, by) }); err != nil {
 			return nil, err
 		}
 		if err := s.Log(ctx, id, "asked to halt"); err != nil {
+			return nil, err
+		}
+		// Its driver rolls it back as its next step comes, now.
+		if err := s.b.MarkWork(ctx, StepKind(d), id); err != nil {
 			return nil, err
 		}
 	default:
@@ -884,7 +970,7 @@ func (s *Store) Halt(ctx context.Context, id int64, by string) (*Deployment, err
 // Allow allows the refused hazards of a deployment's waiting migration, recording who did; the
 // driver applies it again with them.
 func (s *Store) Allow(ctx context.Context, id int64, by string) (*Deployment, error) {
-	err := s.b.Txn(ctx, func(tx Ops) error {
+	err := s.txn(ctx, func(tx Ops) error {
 		d, err := tx.LockDeployment(ctx, id)
 		if err != nil {
 			return err
@@ -909,6 +995,9 @@ func (s *Store) Allow(ctx context.Context, id int64, by string) (*Deployment, er
 			return err
 		}
 		if err := tx.SetStage(ctx, id, Migrate); err != nil {
+			return err
+		}
+		if err := tx.MarkWork(ctx, StepKind(d), id); err != nil {
 			return err
 		}
 		return tx.AppendEvent(ctx, id, fmt.Sprintf("%s allowed %v", by, refused))
@@ -938,7 +1027,45 @@ func (s *Store) RepositoryOwner(ctx context.Context, repo int64) (string, error)
 
 // ClaimAgentSession records an agent's connection as a replica's, replacing any other's.
 func (s *Store) ClaimAgentSession(ctx context.Context, a AgentSession) error {
-	return s.b.ClaimAgentSession(move.Untagged(ctx), a)
+	ctx = move.Untagged(ctx)
+	if err := s.b.ClaimAgentSession(ctx, a); err != nil {
+		return err
+	}
+	// What waited for the agent goes on: its account's repositories' plans and running
+	// deployments' steps, marked now.
+	if err := s.agentConnected(ctx, a.Account); err != nil {
+		slog.Warn("deploy: marking what waited for an agent", "account", a.Account, "err", err)
+	}
+	return nil
+}
+
+// agentConnected marks the planning of an account's repositories and the steps of their running
+// deployments.
+func (s *Store) agentConnected(ctx context.Context, account string) error {
+	repos, err := s.b.OwnedRepositories(ctx, account)
+	if err != nil || len(repos) == 0 {
+		return err
+	}
+	w := s.Work()
+	for _, r := range repos {
+		if err := w.Mark(ctx, PlanWork, r); err != nil {
+			return err
+		}
+	}
+	running, err := s.b.RunningDeployments(ctx, repos)
+	if err != nil {
+		return err
+	}
+	ds, err := s.b.Deployments(ctx, running)
+	if err != nil {
+		return err
+	}
+	for _, d := range ds {
+		if err := w.Mark(ctx, StepKind(d), d.ID); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // RenewAgentSession extends a replica's lease on a session, reporting false once it is another's.

@@ -95,12 +95,35 @@ func putOpts(opts []PutOption) putOptions {
 	return o
 }
 
+// Staged is an object being written before its key is known (Store.Stage).
+type Staged interface {
+	io.Writer
+	// Commit stores what was written at key, replacing what is there: a key named by a hash over
+	// a random nonce, which names nothing else. Staging ends with it, whether it succeeds or not.
+	Commit(ctx context.Context, key string) error
+	// Abort discards what was written. After Commit it does nothing.
+	Abort()
+}
+
+// errAborted ends a staged upload that was aborted.
+var errAborted = errors.New("blob: the staged object was aborted")
+
 // Store is the object storage ok's roles need. Every implementation passes blobtest's suite.
 type Store interface {
 	// Name is the bucket's name (a directory's path), for errors and metrics.
 	Name() string
-	// Put stores size bytes from r at key, replacing what is there unless IfAbsent.
+	// Put stores size bytes from r at key, replacing what is there unless IfAbsent. It stores
+	// nothing unless it read all size bytes: a reader that fails before its last byte — or in place
+	// of it, as one that checks what it read does — leaves key as it was. A put that fails for a
+	// moment — the store's 429 or 5xx, a dropped connection — is made again, so a key's writers
+	// each write what any of them may: the same bytes, as at a key named by its content, or bytes
+	// any of which is right, as a cache's entries are.
 	Put(ctx context.Context, key string, r io.Reader, size int64, opts ...PutOption) error
+	// Stage starts an object whose key is known only once it is written — a pack or a segment,
+	// named by the hash of its bytes — uploaded as it is written, under tmp until Commit names it.
+	// tmp is a key the caller's sweep of what no row names deletes, should the process stop before
+	// it commits or aborts; a directory keeps it in its own temporary space instead.
+	Stage(ctx context.Context, tmp string) (Staged, error)
 	// GetRange returns length bytes of key starting at offset; a range past the object's end is
 	// an error.
 	GetRange(ctx context.Context, key string, offset, length int64) ([]byte, error)

@@ -4,13 +4,14 @@
 // groups-and-ACLs tree it applies to ok identity), and the watched roll — rolling back what
 // fails.
 //
-// Everything it decides is taken again from its database and the cluster on each pass, so a
+// Everything it decides is taken again from its database and the cluster on each step, so a
 // deployer that restarts, or another replica that takes over, resumes every deployment where
-// it stands. No replica leads (docs/hosted.md, "Work without leaders"): each repository is planned
-// under its planning's lease, which deployments start is decided by one transaction at a time,
-// each deployment is stepped under a lock of its own — whose holder alone writes it — and a
-// deployment of the deployer itself is driven only by the copy that started it (docs/deploy.md,
-// "Resuming, and deploying the deployer").
+// it stands. No replica leads, and none looks for work (docs/hosted.md, "Work without leaders"):
+// each repository is planned as its planning's job comes, which deployments start is decided by
+// one transaction at a time as the cell's turns' jobs come, each deployment is stepped as its
+// step's jobs come, under a lock of its own — whose holder alone writes it — and a deployment of
+// the deployer itself is driven only by the copy that started it (docs/deploy.md, "Resuming, and
+// deploying the deployer").
 package engine
 
 import (
@@ -134,7 +135,25 @@ type Config struct {
 	Secrets        DeploySecrets
 	TreeRepository string
 	Now            func() time.Time // the clock; time.Now when nil
-	Log            *slog.Logger
+	// Look is how long a step that waits on something outside the database waits before it looks
+	// again: Look when unset.
+	Look time.Duration
+	Log  *slog.Logger
+}
+
+// Look is how long a deployment's step that waits on something outside the database — its pushes
+// on ok automation's workers, its roll's pods — waits before it looks again.
+const Look = 5 * time.Second
+
+// agentWait is how long a plan or a step that waits for its owner's deploy agent waits before it
+// looks again.
+const agentWait = 30 * time.Second
+
+func (e *Engine) look() time.Duration {
+	if e.cfg.Look > 0 {
+		return e.cfg.Look
+	}
+	return Look
 }
 
 // Engine is the deployer.
@@ -180,78 +199,144 @@ func (e *Engine) rollerFor(ctx context.Context, repo int64) (*roll.Roller, error
 	return &roll.Roller{Kube: c.Kube, Timing: e.cfg.Timing, Labels: e.cfg.Labels}, nil
 }
 
-// Run plans and drives until ctx ends, a pass (Tick) every interval. Every replica runs it.
-func (e *Engine) Run(ctx context.Context, interval time.Duration) error {
-	for {
-		if err := e.Tick(ctx); err != nil && ctx.Err() == nil {
-			e.cfg.Log.Warn("deploy: a pass", "err", err)
+// Run plans and drives until ctx ends, as the jobs of its keyed work come (Runners): every replica
+// runs it. Once, it books what a release before looked for.
+func (e *Engine) Run(ctx context.Context) error {
+	go func() {
+		if err := work.Once(ctx, e.cfg.Store.Work(), engineUpgrade, e.bookLeftovers, e.cfg.Log); err != nil && ctx.Err() == nil {
+			e.cfg.Log.Warn("deploy: booking what a release before left", "err", err)
 		}
-		select {
-		case <-ctx.Done():
-			e.wg.Wait()
-			return nil
-		case <-time.After(interval):
-		}
+	}()
+	var wg sync.WaitGroup
+	for _, r := range e.Runners() {
+		wg.Go(func() { r.Run(ctx) })
+	}
+	wg.Wait()
+	e.wg.Wait()
+	return nil
+}
+
+// Runners are the engine's keyed work, in the order a pass over all of it takes them: each
+// repository's planning, each retirement, the cell's turns, and each deployment's steps — this
+// copy's own deployments of the deployer's among them.
+func (e *Engine) Runners() []*work.Runner {
+	w := e.cfg.Store.Work()
+	runner := func(kind string, do func(context.Context, int64) error, workers int) *work.Runner {
+		return &work.Runner{Kind: kind, Store: w, Do: do, Workers: workers, Log: e.cfg.Log}
+	}
+	return []*work.Runner{
+		runner(store.PlanWork, e.plan, 1), // a plan takes the one checkout
+		runner(store.RetireWork, e.retireLocked, 1),
+		runner(store.TurnsWork, e.turns, 1),
+		runner(store.StepWork, e.step, 4),
+		runner(store.StepKind(&store.Deployment{Self: true, Driver: e.cfg.Self.Color}), e.step, 1),
 	}
 }
 
-// Tick is one pass: it plans each repository whose main moved and no other replica is planning,
-// starts the waiting deployments whose turn has come, and retires and steps each deployment no
-// other replica holds — one of the deployer itself only in the copy that started it.
-func (e *Engine) Tick(ctx context.Context) error {
-	var errs []error
-	repos, err := e.cfg.Store.Unplanned(ctx)
+// engineUpgrade books, once, what a release before looked for each pass: the repositories it had
+// not planned, the deployments it had not started, stepped, or retired.
+const engineUpgrade = "deploy-upgrade"
+
+func (e *Engine) bookLeftovers(ctx context.Context) error {
+	w, st := e.cfg.Store.Work(), e.cfg.Store
+	repos, err := st.Unplanned(ctx)
 	if err != nil {
 		return err
 	}
 	for _, r := range repos {
-		err := e.planHeld(ctx, r.ID)
-		e.mu.Lock()
-		said := e.unplannable[r.ID]
-		if errors.Is(err, tunnel.ErrNoAgent) {
-			// Its plan waits for its owner's deploy agent.
-			e.unplannable[r.ID] = true
-			e.mu.Unlock()
-			if !said {
-				e.cfg.Log.Info("deploy: a plan waits for its repository's deploy agent", "repository", r.ID, "err", err)
+		if err := w.Mark(ctx, store.PlanWork, r.ID); err != nil {
+			return err
+		}
+	}
+	if err := w.Mark(ctx, store.TurnsWork, 0); err != nil {
+		return err
+	}
+	ds, err := st.Unfinished(ctx)
+	if err != nil {
+		return err
+	}
+	for _, d := range ds {
+		if d.Status == store.Running {
+			if err := w.Mark(ctx, store.StepKind(d), d.ID); err != nil {
+				return err
 			}
-			continue
-		}
-		delete(e.unplannable, r.ID)
-		e.mu.Unlock()
-		if err != nil {
-			errs = append(errs, fmt.Errorf("planning repository %d at %d: %w", r.ID, r.HeadSeq, err))
 		}
 	}
-	if err := e.drive(ctx); err != nil {
-		errs = append(errs, err)
-	}
-	return errors.Join(errs...)
-}
-
-// planLease is how long a replica's lease on a repository's planning lasts unrenewed; it is
-// renewed every third of it while the replica plans.
-const planLease = 30 * time.Second
-
-// planHeld plans a repository holding its planning's lease (store.PlanWork) — its plan recorded
-// only while the lease holds — if no other replica holds it, and if its main is still unplanned
-// once the lease is taken: another replica may have planned it since this pass looked.
-func (e *Engine) planHeld(ctx context.Context, repo int64) error {
-	held, release, ok, err := work.Claim(ctx, e.cfg.Store.Work(), store.PlanWork, repo, e.holder, planLease)
-	if err != nil || !ok {
-		return err
-	}
-	defer release()
-	repos, err := e.cfg.Store.Unplanned(held)
+	retiring, err := st.Retiring(ctx)
 	if err != nil {
 		return err
 	}
-	for _, r := range repos {
-		if r.ID == repo {
-			return e.planRepository(held, r)
+	for _, d := range retiring {
+		if err := w.Mark(ctx, store.RetireWork, d.ID); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+// plan plans a repository whose main moved past its latest plan, if it still has: its plan
+// recorded only while its planning's lease holds (the runner's fence). One that waits for its
+// owner's deploy agent is looked at again a while later.
+func (e *Engine) plan(ctx context.Context, repo int64) error {
+	r, ok, err := e.cfg.Store.UnplannedRepository(ctx, repo)
+	if err != nil || !ok {
+		return err
+	}
+	err = e.planRepository(ctx, r)
+	e.mu.Lock()
+	said := e.unplannable[repo]
+	if errors.Is(err, tunnel.ErrNoAgent) {
+		e.unplannable[repo] = true
+		e.mu.Unlock()
+		if !said {
+			e.cfg.Log.Info("deploy: a plan waits for its repository's deploy agent", "repository", repo, "err", err)
+		}
+		return e.cfg.Store.Work().MarkAt(ctx, store.PlanWork, repo, time.Now().Add(agentWait))
+	}
+	delete(e.unplannable, repo)
+	e.mu.Unlock()
+	if err != nil {
+		return fmt.Errorf("planning repository %d at %d: %w", repo, r.HeadSeq, err)
+	}
+	return nil
+}
+
+// turns starts the waiting deployments whose turn has come, a deployment of the deployer itself
+// driven by this copy (store.StartTurns, which marks each one's steps).
+func (e *Engine) turns(ctx context.Context, _ int64) error {
+	_, err := e.cfg.Store.StartTurns(ctx, e.cfg.Self.Color)
+	return err
+}
+
+// step steps a running deployment, and books its next look: Look on for a stage that waits on
+// something outside the database, agentWait on for one that waits for its owner's deploy agent,
+// none for a migration under way here — whose end marks it — nor for a hazard, which waits for a
+// person, whose allowing or halting marks it. One whose lock another holds is looked at again Look
+// on.
+func (e *Engine) step(ctx context.Context, id int64) error {
+	held, err := e.stepLocked(ctx, id)
+	if err != nil {
+		return err
+	}
+	d, err := e.cfg.Store.Get(ctx, id)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil
+	}
+	if err != nil || d.Status != store.Running {
+		return err
+	}
+	e.mu.Lock()
+	migrating, waiting := e.migrating[id], e.waiting[id]
+	e.mu.Unlock()
+	switch {
+	case migrating:
+		return nil
+	case held && d.Stage == store.Hazard && d.HaltBy == "" && d.HaltReason == "":
+		return nil
+	case waiting:
+		return e.cfg.Store.Work().MarkAt(ctx, store.StepKind(d), id, time.Now().Add(agentWait))
+	}
+	return e.cfg.Store.Work().MarkAt(ctx, store.StepKind(d), id, time.Now().Add(e.look()))
 }
 
 // Wait waits for the migrations running in the background.
@@ -431,41 +516,6 @@ func (e *Engine) liveReplicas(ctx context.Context, kube kubernetes.Interface, w 
 
 // ─── Driving ───
 
-// drive retires what a finished deployment of the deployer leaves behind, starts the waiting
-// deployments whose turn it is, and steps every running one — a deployment of the deployer itself
-// only in the copy that started it — each under its lock, skipping one another replica holds.
-func (e *Engine) drive(ctx context.Context) error {
-	var errs []error
-	retiring, err := e.cfg.Store.Retiring(ctx)
-	if err != nil {
-		return err
-	}
-	for _, d := range retiring {
-		if err := e.retireLocked(ctx, d.ID); err != nil {
-			errs = append(errs, fmt.Errorf("deployment %d: %w", d.ID, err))
-		}
-	}
-	if _, err := e.cfg.Store.StartTurns(ctx, e.cfg.Self.Color); err != nil {
-		errs = append(errs, fmt.Errorf("starting deployments: %w", err))
-	}
-	ds, err := e.cfg.Store.Unfinished(ctx)
-	if err != nil {
-		return errors.Join(append(errs, err)...)
-	}
-	for _, d := range ds {
-		if d.Status != store.Running {
-			continue
-		}
-		if d.Self && d.Driver != e.cfg.Self.Color {
-			continue // the copy that started it drives it
-		}
-		if err := e.stepLocked(ctx, d.ID); err != nil {
-			errs = append(errs, fmt.Errorf("deployment %d: %w", d.ID, err))
-		}
-	}
-	return errors.Join(errs...)
-}
-
 // retireLocked retires, under the deployment's lock, what a finished deployment of the deployer
 // leaves behind: whoever finds the success finishes it.
 func (e *Engine) retireLocked(ctx context.Context, id int64) error {
@@ -485,11 +535,12 @@ func (e *Engine) retireLocked(ctx context.Context, id int64) error {
 	return e.retire(held, d, &st)
 }
 
-// stepLocked steps a deployment under its lock; a deployment someone else steps is skipped.
-func (e *Engine) stepLocked(ctx context.Context, id int64) error {
+// stepLocked steps a deployment under its lock, and reports whether it held it; a deployment
+// someone else steps is skipped.
+func (e *Engine) stepLocked(ctx context.Context, id int64) (bool, error) {
 	held, release, ok, err := e.cfg.Store.LockDeployment(ctx, id)
 	if err != nil || !ok {
-		return err
+		return false, err
 	}
 	// What the step writes, it writes while it holds the lock (data.Fence).
 	ctx = held
@@ -501,30 +552,34 @@ func (e *Engine) stepLocked(ctx context.Context, id int64) error {
 	}()
 	d, err := e.cfg.Store.Get(ctx, id)
 	if err != nil {
-		return err
+		return true, err
 	}
 	if !d.Status.Open() || d.Status != store.Running {
-		return nil
+		return true, nil
 	}
 	if d.HaltBy != "" || d.HaltReason != "" {
-		return e.halt(ctx, d)
+		return true, e.halt(ctx, d)
 	}
 	switch d.Stage {
 	case store.Push:
-		return e.push(ctx, d)
+		return true, e.push(ctx, d)
 	case store.Migrate:
 		kept, err = e.migrate(ctx, d, release)
-		return e.waitingFor(ctx, d, err)
+		return true, e.waitingFor(ctx, d, err)
 	case store.Roll:
-		return e.waitingFor(ctx, d, e.roll(ctx, d))
+		return true, e.waitingFor(ctx, d, e.roll(ctx, d))
 	}
-	return nil // a hazard waits for a person
+	return true, nil // a hazard waits for a person
 }
 
 // waitingFor says once, in a deployment's log, that it waits for its owner's deploy agent, when
-// err is that: the next pass tries again.
+// err is that: its next step tries again (agentWait), or the agent's connecting marks it. A step
+// that got past the agent ends the wait.
 func (e *Engine) waitingFor(ctx context.Context, d *store.Deployment, err error) error {
 	if !errors.Is(err, tunnel.ErrNoAgent) {
+		e.mu.Lock()
+		delete(e.waiting, d.ID)
+		e.mu.Unlock()
 		return err
 	}
 	e.mu.Lock()
@@ -676,6 +731,12 @@ func (e *Engine) migrate(ctx context.Context, d *store.Deployment, release func(
 		e.wg.Add(1)
 		go func() {
 			defer e.wg.Done()
+			// Its next step, once the lock is let go and it is no longer under way here.
+			defer func() {
+				if err := e.cfg.Store.Work().Mark(context.WithoutCancel(ctx), store.StepKind(d), d.ID); err != nil {
+					e.cfg.Log.Warn("deploy: marking a deployment's step after its migration", "deployment", d.ID, "err", err)
+				}
+			}()
 			defer release()
 			defer func() {
 				e.mu.Lock()
@@ -943,6 +1004,12 @@ func (e *Engine) roll(ctx context.Context, d *store.Deployment) error {
 	case roll.Unchanged:
 		return e.end(ctx, d, store.Succeeded, "the workload already runs these images")
 	case roll.Rolled:
+		if st.Retire {
+			// Retired by whichever copy takes it, should its driver be the copy retired.
+			if err := e.cfg.Store.Work().Mark(ctx, store.RetireWork, d.ID); err != nil {
+				return err
+			}
+		}
 		if err := e.end(ctx, d, store.Succeeded, ""); err != nil {
 			return err
 		}

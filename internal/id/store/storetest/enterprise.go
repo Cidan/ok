@@ -44,8 +44,29 @@ func testEnterprise(t *testing.T, s *store.Store) {
 	if err := s.SetIdentityProvider(ctx, store.IdentityProvider{Organization: acme.ID, Source: "scim", Settings: settings, Sealed: []byte("sealed"), Interval: time.Second}); err != nil {
 		t.Fatal(err)
 	}
-	if p, err := s.IdentityProviderOf(ctx, acme.ID); err != nil || p.Interval != store.MinSyncInterval || string(p.Sealed) != "sealed" || p.Source != "scim" {
+	p, err := s.IdentityProviderOf(ctx, acme.ID)
+	if err != nil || p.Interval != store.MinSyncInterval || string(p.Sealed) != "sealed" || p.Source != "scim" {
 		t.Errorf("IdentityProviderOf = %+v, %v", p, err)
+	}
+	// Its sync is keyed work under a key of its own, booked as it is set; set again, it keeps the
+	// key, and booking a release before's providers keys none twice.
+	if org, err := s.IdentityProviderOrg(ctx, p.Key); err != nil || org != acme.ID || p.Key == 0 {
+		t.Errorf("the provider's sync key %d names %q, %v", p.Key, org, err)
+	}
+	if peek, err := s.Work().Peek(ctx, store.SyncWork, p.Key); err != nil || !peek.Marked {
+		t.Errorf("the provider's sync, as it is set: %+v, %v; want it booked", peek, err)
+	}
+	if err := s.SetIdentityProvider(ctx, store.IdentityProvider{Organization: acme.ID, Source: "scim", Settings: settings, Sealed: []byte("sealed"), Interval: time.Second}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.KeyIdentityProviders(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if again, err := s.IdentityProviderOf(ctx, acme.ID); err != nil || again.Key != p.Key {
+		t.Errorf("the provider's key after it was set again, and providers booked: %d, %v; want %d", again.Key, err, p.Key)
+	}
+	if _, err := s.IdentityProviderOrg(ctx, p.Key+1); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("a key no provider holds: %v", err)
 	}
 	if due, err := s.DueIdentityProviders(ctx); err != nil || !slices.Contains(due, acme.ID) {
 		t.Errorf("a provider never synced is due: %v, %v", due, err)

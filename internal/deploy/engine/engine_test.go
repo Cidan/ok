@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"log/slog"
 	"maps"
 	"os"
 	"path/filepath"
@@ -279,6 +280,39 @@ type env struct {
 	headSeq        int64
 	// secrets is ok secrets, when the test gives the deployer one.
 	secrets DeploySecrets
+	// failures are the engine's keyed work's failures logged since the last pass.
+	failures failureLog
+}
+
+// failureLog records the failures the engine's runners log: what a pass returned before its work
+// came by jobs, which the runner logs and tries again.
+type failureLog struct {
+	mu   sync.Mutex
+	errs []string
+}
+
+func (f *failureLog) Enabled(context.Context, slog.Level) bool { return true }
+func (f *failureLog) WithAttrs([]slog.Attr) slog.Handler       { return f }
+func (f *failureLog) WithGroup(string) slog.Handler            { return f }
+
+func (f *failureLog) Handle(_ context.Context, r slog.Record) error {
+	if r.Message != "work: doing" {
+		return nil
+	}
+	msg := r.Message
+	r.Attrs(func(a slog.Attr) bool { msg += " " + a.String(); return true })
+	f.mu.Lock()
+	f.errs = append(f.errs, msg)
+	f.mu.Unlock()
+	return nil
+}
+
+func (f *failureLog) take() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	errs := f.errs
+	f.errs = nil
+	return errs
 }
 
 func newEnv(t *testing.T, objs ...runtime.Object) *env {
@@ -345,22 +379,33 @@ func (t *tree) Apply(_ context.Context, in *identitypb.ApplyRequest, _ ...grpc.C
 	return &identitypb.ApplyResponse{Changes: []string{fmt.Sprintf("%d files", len(in.GetFiles()))}}, nil
 }
 
-// engine is a deployer running in its blue or green copy.
+// look is how long a test's engine's waiting steps wait before they look again: past the moments
+// a step takes to let go of its work, so a pass steps each deployment once; and each pass waits it
+// out, so the next looks again.
+const look = 20 * time.Millisecond
+
+// engine is a deployer running in its blue or green copy, whose waiting steps look again on the
+// next pass.
 func (e *env) engine(color string) *Engine {
 	return New(Config{Store: e.store, Kube: e.cluster.Kube, Runs: e.runs, Build: e.build, Main: e.repo, Source: e.repo,
 		Tree: e.tree, TreeRepository: e.treeRepository, Labels: roll.LabelsFor("example.com"), Secrets: e.secrets,
 		Checkout: e.repo, Timing: roll.DefaultTiming, Self: Self{Namespace: "ok-deploy", Name: "ok-deploy", Color: color},
-		Principal: principal, Now: func() time.Time { return e.cluster.Now }})
+		Principal: principal, Now: func() time.Time { return e.cluster.Now }, Look: look, Log: slog.New(&e.failures)})
 }
 
-// tick is one pass of the engine, its migrations waited for, and five seconds on.
+// tick is one pass over the engine's keyed work — the jobs ready of each kind, once each, as it
+// plans, retires, starts, and steps — its migrations waited for, and five seconds on.
 func (e *env) tick(en *Engine) {
 	e.t.Helper()
-	if err := en.Tick(context.Background()); err != nil {
-		e.t.Fatalf("a pass: %v", err)
+	for _, r := range en.Runners() {
+		r.RunReady(context.Background())
 	}
 	en.Wait()
+	if errs := e.failures.take(); len(errs) > 0 {
+		e.t.Fatalf("a pass: %s", strings.Join(errs, "; "))
+	}
 	e.cluster.Advance(5 * time.Second)
+	time.Sleep(look)
 }
 
 // until ticks the engine until cond holds.

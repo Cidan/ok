@@ -8,6 +8,7 @@ import (
 
 	"github.com/Cidan/ok/internal/control/db"
 	"github.com/Cidan/ok/internal/move"
+	"github.com/Cidan/ok/internal/work/worktest"
 )
 
 // A repository's webhooks and their deliveries: queued once however often, due by their next try,
@@ -61,11 +62,8 @@ func testWebhooks(t *testing.T, s db.Store) {
 	if next, err := s.NextDelivery(ctx, 1); err != nil || !next.Equal(at) {
 		t.Errorf("the next due: %v, %v", next, err)
 	}
-	if repos, err := s.WaitingDeliveries(ctx); err != nil || !slices.Equal(repos, []int64{1}) {
-		t.Errorf("repositories with deliveries waiting: %v, %v", repos, err)
-	}
-	if work, err := s.Work().Due(ctx, db.WebhookWork, 10); err != nil || !slices.Equal(work, []int64{1}) {
-		t.Errorf("the webhooks' work: %v, %v", work, err)
+	if got := worktest.Ready(t, s.Work(), db.WebhookWork); !slices.Equal(got, []int64{1}) {
+		t.Errorf("the webhooks' jobs: %v", got)
 	}
 	ds, err := s.Deliveries(ctx, 1, 10, 10)
 	if err != nil || len(ds) != 3 || ds[0].ID != 3 || ds[2].ID != 1 {

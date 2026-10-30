@@ -11,17 +11,19 @@
 //
 // Every replica follows the SCM's events, as the bus's stream brings them and each repository's
 // log fills in, sharing the repositories (the stream's group, automation; internal/bus/follow).
-// A replica applies a repository's event only holding the repository's claim (feedClaim), so its
-// events are applied one at a time, in order; an event's plan is recorded once however often it is
-// seen, and each repository's cursor never moves back.
+// A replica applies a repository's events only holding the repository's claim (feedClaim), a page
+// of its log at a time: each CL's events in order, the page's CLs beside each other. An event's
+// plan is recorded once however often it is seen, and each repository's cursor never moves back.
 package feed
 
 import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -47,17 +49,18 @@ type SCM struct {
 
 // Follower plans the patchsets the SCM's change feed announces.
 type Follower struct {
-	store  *store.Store
-	stream bus.Stream
-	scm    SCM
-	log    *slog.Logger
+	store *store.Store
+	scm   SCM
+	log   *slog.Logger
 	// holder names this replica's claims on repositories (feedClaim).
 	holder string
+	// applying is called as each event of a page begins and ends being applied (tests).
+	applying func(ev *scmpb.Event, enter bool)
 }
 
-// New builds a follower of the SCM's events on stream.
-func New(s *store.Store, stream bus.Stream, scm SCM, log *slog.Logger) *Follower {
-	return &Follower{store: s, stream: stream, scm: scm, log: log, holder: work.NewHolder()}
+// New builds a follower of the SCM's events.
+func New(s *store.Store, scm SCM, log *slog.Logger) *Follower {
+	return &Follower{store: s, scm: scm, log: log, holder: work.NewHolder()}
 }
 
 // feedClaim is a repository's events being applied, as keyed work (internal/work): applying one is
@@ -70,23 +73,14 @@ const feedClaim = "feed"
 // repository this long.
 const feedLease = 30 * time.Second
 
-// Run follows the SCM's events until ctx ends, starting again after a failure.
+// Run follows the SCM's events until ctx ends.
 func (f *Follower) Run(ctx context.Context) error {
-	fl := &follow.Follower{Stream: f.stream, Topic: scmfeed.Topic, Group: "automation", Log: scmfeed.Log{Events: f.scm.Events}, Apply: applier{f}}
-	for {
-		if err := fl.Run(ctx); ctx.Err() == nil {
-			f.log.Warn("feed: stopped following", "err", err)
-		}
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-time.After(2 * time.Second):
-		}
-	}
+	return (&follow.Follower{Topic: scmfeed.Topic, Log: scmfeed.Log{Events: f.scm.Events}, Apply: applier{f},
+		Work: f.store.Work(), Register: scmfeed.Register(f.scm.Events), Logger: f.log}).Run(ctx)
 }
 
-// applier is the follower as a follow.Applier: the repository claimed, an event applied, then its
-// cursor moved past it.
+// applier is the follower as a follow.BatchApplier: the repository claimed, a page of its events
+// applied, then its cursor moved past them.
 type applier struct{ *Follower }
 
 func (a applier) Cursors(ctx context.Context, repos []int64) (map[int64]int64, error) {
@@ -94,7 +88,28 @@ func (a applier) Cursors(ctx context.Context, repos []int64) (map[int64]int64, e
 }
 
 func (a applier) Apply(ctx context.Context, e bus.Event) error {
-	held, release, ok, err := work.Claim(ctx, a.store.Work(), feedClaim, e.Key, a.holder, feedLease)
+	return a.ApplyBatch(ctx, []bus.Event{e})
+}
+
+// clsAtOnce bounds how many of a page's CLs a replica applies events of at once.
+const clsAtOnce = 32
+
+// ApplyBatch applies a page of a repository's events: each CL's in order, and the page's CLs beside
+// each other, between the events that name no CL, which are applied in their place. One at a time, a repository's events were applied at about five a second — a claim,
+// the SCM asked about the CL and its stack, a plan, a cursor — and a herd of 3,000 CLs waited
+// eleven minutes for pre. An event's effects are its CL's and its stack's, each a transaction
+// under the CL's lock (store.LockCL) acting on what the SCM says is the case now, not on what was
+// as the event was written (settle): so CLs' events commute, and a page applied again — as part
+// of one is after a failure — applies each CL's events in order again, to where they were. The
+// cursor moves past the events applied, to the first that failed.
+func (a applier) ApplyBatch(ctx context.Context, evs []bus.Event) error {
+	repo := evs[0].Key
+	// Applied already — by another replica: nothing to claim.
+	cursors, err := a.store.Cursors(ctx, []int64{repo})
+	if err != nil || cursors[repo] >= evs[len(evs)-1].Seq {
+		return err
+	}
+	held, release, ok, err := work.Claim(ctx, a.store.Work(), feedClaim, repo, a.holder, feedLease)
 	if err != nil {
 		return err
 	}
@@ -102,22 +117,112 @@ func (a applier) Apply(ctx context.Context, e bus.Event) error {
 		return follow.ErrBusy
 	}
 	defer release()
-	cursor, err := a.store.Cursor(held, e.Key)
-	if err != nil || e.Seq <= cursor {
-		return err
-	}
-	ev, err := scmfeed.Decode(e)
+	cursor, err := a.store.Cursor(held, repo)
 	if err != nil {
 		return err
 	}
-	if err := a.Follower.Apply(held, ev); err != nil {
-		return fmt.Errorf("event %d of repository %d: %w", e.Seq, e.Key, err)
+	var page []*scmpb.Event
+	var seqs []int64
+	for _, e := range evs {
+		if e.Seq <= cursor {
+			continue
+		}
+		ev, err := scmfeed.Decode(e)
+		if err != nil {
+			return err
+		}
+		page, seqs = append(page, ev), append(seqs, e.Seq)
 	}
-	if err := a.store.SetCursor(held, e.Key, e.Seq); err != nil {
-		return err
+	if len(page) == 0 {
+		return nil
 	}
-	feedLag.With(scmfeed.Kind(ev)).Observe(time.Since(ev.GetAt().AsTime()).Seconds())
-	return nil
+	// Runs of the page between the events that name no CL — main moving, whose recording reads what
+	// the landings before it recorded — each applied whole, its CLs' events beside each other, before
+	// the event after it, alone, and the run after that.
+	applied := make([]bool, len(page))
+	for start := 0; start < len(page); {
+		end := start
+		for end < len(page) && clOf(page[end]) != 0 {
+			end++
+		}
+		if end == start {
+			end++ // an event of no CL, alone
+		}
+		if err := a.applyRun(held, repo, page, seqs, start, end, applied); err != nil {
+			return errors.Join(err, a.moveCursor(held, repo, seqs, applied))
+		}
+		start = end
+	}
+	return a.moveCursor(held, repo, seqs, applied)
+}
+
+// applyRun applies page[start:end], each CL's events in order and the CLs beside each other,
+// marking each event applied.
+func (a applier) applyRun(ctx context.Context, repo int64, page []*scmpb.Event, seqs []int64, start, end int, applied []bool) error {
+	var order [][]int
+	byCL := map[int64]int{}
+	for i := start; i < end; i++ {
+		cl := clOf(page[i])
+		g, ok := byCL[cl]
+		if !ok || cl == 0 {
+			g = len(order)
+			byCL[cl] = g
+			order = append(order, nil)
+		}
+		order[g] = append(order[g], i)
+	}
+	errs := make([]error, len(order))
+	sem := make(chan struct{}, clsAtOnce)
+	var wg sync.WaitGroup
+	for g, idx := range order {
+		sem <- struct{}{}
+		wg.Go(func() {
+			defer func() { <-sem }()
+			for _, i := range idx {
+				if a.applying != nil {
+					a.applying(page[i], true)
+				}
+				err := a.Follower.Apply(ctx, page[i])
+				if a.applying != nil {
+					a.applying(page[i], false)
+				}
+				if err != nil {
+					errs[g] = fmt.Errorf("event %d of repository %d: %w", seqs[i], repo, err)
+					return
+				}
+				applied[i] = true
+				feedLag.With(scmfeed.Kind(page[i])).Observe(time.Since(page[i].GetAt().AsTime()).Seconds())
+			}
+		})
+	}
+	wg.Wait()
+	return errors.Join(errs...)
+}
+
+// moveCursor moves the repository's cursor past the page's events applied, to the first that was
+// not.
+func (a applier) moveCursor(ctx context.Context, repo int64, seqs []int64, applied []bool) error {
+	done := 0
+	for done < len(applied) && applied[done] {
+		done++
+	}
+	if done == 0 {
+		return nil
+	}
+	return a.store.SetCursor(ctx, repo, seqs[done-1])
+}
+
+// clOf is the CL an event is of: 0 for none.
+func clOf(ev *scmpb.Event) int64 {
+	switch k := ev.GetKind().(type) {
+	case *scmpb.Event_Uploaded:
+		return k.Uploaded.GetNumber()
+	case *scmpb.Event_Transitioned:
+		return k.Transitioned.GetNumber()
+	case *scmpb.Event_Landed:
+		return k.Landed.GetNumber()
+	}
+	return 0
 }
 
 var feedLag = metrics.NewHistogram("ok_automation_feed_lag_seconds",

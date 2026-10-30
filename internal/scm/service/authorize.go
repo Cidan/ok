@@ -2,7 +2,7 @@ package service
 
 import (
 	"context"
-	"errors"
+	"strconv"
 	"strings"
 
 	"google.golang.org/grpc"
@@ -15,6 +15,7 @@ import (
 	"github.com/Cidan/ok/internal/cells"
 	"github.com/Cidan/ok/internal/move"
 	"github.com/Cidan/ok/internal/serve/authn"
+	identitypb "github.com/Cidan/ok/proto/ok/identity/v1"
 	scmpb "github.com/Cidan/ok/proto/ok/scm/v1"
 )
 
@@ -76,8 +77,10 @@ var actions = map[string]authz.Action{
 type access struct {
 	checker *authz.Checker
 	// cell is the cell the SCM serves (InCell): it refuses repositories other cells hold. "" serves
-	// every repository, as a single installation's does.
-	cell string
+	// every repository, as a single installation's does. routes say where the directory has a
+	// repository, for a role's request, which no person's facts are read for.
+	cell   string
+	routes Router
 }
 
 // repositoryOf is the repository a request names: its repository_id, or that of the message it
@@ -139,11 +142,6 @@ func (a *access) check(ctx context.Context, method string, req any) error {
 		return status.Errorf(codes.InvalidArgument, "%s names no repository", method)
 	}
 	d, err := a.checker.Decide(ctx, c.ID, c.Token, repo, action)
-	if err == nil && a.elsewhere(d.Cell) {
-		// A refusal is decided on fresh facts: those kept may predate a move here.
-		a.checker.Forget(repo)
-		d, err = a.checker.Decide(ctx, c.ID, c.Token, repo, action)
-	}
 	if err != nil {
 		return status.Errorf(codes.Unavailable, "deciding who may %s repository %d: %v", action, repo, err)
 	}
@@ -159,8 +157,8 @@ func (a *access) check(ctx context.Context, method string, req any) error {
 }
 
 // inCell refuses a request of ok's roles about a repository another cell holds, which the
-// directory says (the facts Authorize decides from, kept a few seconds); one the directory does not
-// know, or is still making, is the method's to answer.
+// directory's route says — one read of the repository's entry, not the facts a person's request is
+// decided from; one the directory does not know, or is still making, is the method's to answer.
 func (a *access) inCell(ctx context.Context, req any) error {
 	if a.cell == "" {
 		return nil
@@ -176,20 +174,15 @@ func (a *access) inCell(ctx context.Context, req any) error {
 	if !ok || repo == 0 {
 		return nil
 	}
-	f, err := a.checker.Facts(ctx, "", repo)
-	if err == nil && a.elsewhere(f.Repository.Cell) {
-		// A refusal is decided on fresh facts: those kept may predate a move here.
-		a.checker.Forget(repo)
-		f, err = a.checker.Facts(ctx, "", repo)
-	}
-	if errors.Is(err, authz.ErrNotFound) {
+	r, err := a.routes.Route(ctx, &identitypb.RouteRequest{Repository: strconv.FormatInt(repo, 10)})
+	if status.Code(err) == codes.NotFound {
 		return nil
 	}
 	if err != nil {
 		return status.Errorf(codes.Unavailable, "finding repository %d's cell: %v", repo, err)
 	}
-	if a.elsewhere(f.Repository.Cell) {
-		return cells.Moved(repo, f.Repository.Cell)
+	if a.elsewhere(r.GetCell()) {
+		return cells.Moved(repo, r.GetCell())
 	}
 	return nil
 }

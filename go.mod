@@ -17,7 +17,6 @@ require (
 	github.com/aws/aws-sdk-go-v2/credentials v1.20.9
 	github.com/aws/aws-sdk-go-v2/service/kms v1.61.5
 	github.com/aws/aws-sdk-go-v2/service/secretsmanager v1.50.5
-	github.com/aws/aws-sdk-go-v2/service/sns v1.47.5
 	github.com/aws/aws-sdk-go-v2/service/sqs v1.52.4
 	github.com/bazelbuild/remote-apis v0.0.0-20261007114328-6def1c5d27a5
 	github.com/cespare/xxhash/v2 v2.3.0
@@ -38,9 +37,6 @@ require (
 	github.com/nats-io/nuid v1.0.1
 	github.com/sergi/go-diff v1.4.0
 	github.com/thejerf/suture/v4 v4.0.6
-	github.com/twmb/franz-go v1.22.2
-	github.com/twmb/franz-go/pkg/kadm v1.19.0
-	github.com/twmb/franz-go/pkg/kfake v0.0.0-20261013022759-7b6cac30a57a
 	github.com/yuin/goldmark v1.8.6
 	github.com/yuin/goldmark-highlighting/v2 v2.0.0-20230729083705-37449abec8cc
 	github.com/zeebo/blake3 v0.2.4
@@ -151,14 +147,12 @@ require (
 	github.com/nats-io/jwt/v2 v2.8.2 // indirect
 	github.com/nats-io/nkeys v0.4.16 // indirect
 	github.com/philhofer/fwd v1.2.0 // indirect
-	github.com/pierrec/lz4/v4 v4.1.33 // indirect
 	github.com/pkg/xattr v0.4.12 // indirect
 	github.com/planetscale/vtprotobuf v0.6.1-0.20240319094008-0393e58bdf10 // indirect
 	github.com/rs/xid v1.6.0 // indirect
 	github.com/spf13/pflag v1.0.10 // indirect
 	github.com/spiffe/go-spiffe/v2 v2.7.0 // indirect
 	github.com/tinylib/msgp v1.6.4 // indirect
-	github.com/twmb/franz-go/pkg/kmsg v1.15.0 // indirect
 	github.com/valyala/fastrand v1.1.0 // indirect
 	github.com/valyala/histogram v1.2.0 // indirect
 	github.com/x448/float16 v0.8.4 // indirect

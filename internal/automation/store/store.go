@@ -13,11 +13,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"maps"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/Cidan/ok/internal/blob"
 	"github.com/Cidan/ok/internal/bus"
+	"github.com/Cidan/ok/internal/wait"
 	"github.com/Cidan/ok/internal/workflow"
 )
 
@@ -111,6 +115,10 @@ type Run struct {
 	// LeaseKey is the key the claim that leased it minted, for its worker alone (docs/secrets.md,
 	// "Readers that are not people"): set by Lease, never stored — the run holds its hash.
 	LeaseKey []byte
+	// DispatchJob is the bus job that dispatches it, and LeaseHandle the handle of that job's
+	// delivery while it runs (dispatch.go): ok automation's own, never a worker's.
+	DispatchJob string
+	LeaseHandle []byte
 }
 
 // Pushed is an image a push run pushed: where it went, under which tags, and its manifest's
@@ -147,16 +155,17 @@ type Config struct {
 	Attempts int32
 	// MaxLog is the most log a run keeps; a longer log ends with a note saying so.
 	MaxLog int64
-	// Poll bounds every wait on a signal, so a missed one delays and never strands.
-	Poll time.Duration
-	// Signals carry the store's wake-ups between replicas (docs/hosted.md, "Signals"): the bus's.
-	// Nil is within the process (bus.NewLocal).
-	Signals bus.Signals
+	// Dispatch is the bus's queue: queued runs are dispatched on it to workers (dispatch.go), and
+	// readers waiting on a run's log have their inboxes there (ReadLog). Nil is within the process
+	// (bus.NewLocalQueue): tests.
+	Dispatch bus.Queue
 	// PlanPool is the pool of workers planning runs run in: "" for the default one.
 	PlanPool string
-	// Quotas reads accounts' quotas of CI, for admission; nil admits every account, each of
-	// weight 1.
-	Quotas Quotas
+	// Quotas reads accounts' quotas of CI, for admission; nil admits every account. QuotaWait is
+	// how long a run of an account at its concurrent quota waits before its job is delivered again,
+	// and MonthWait one of an account past its month's minutes.
+	Quotas               Quotas
+	QuotaWait, MonthWait time.Duration
 }
 
 // DefaultConfig is the service's configuration.
@@ -166,7 +175,8 @@ var DefaultConfig = Config{
 	MaxTimeout:     24 * time.Hour,
 	Attempts:       2,
 	MaxLog:         64 << 20,
-	Poll:           2 * time.Second,
+	QuotaWait:      5 * time.Second,
+	MonthWait:      time.Minute,
 }
 
 // Errors, which the service maps onto gRPC codes.
@@ -193,27 +203,128 @@ func (e *ConflictError) Error() string { return e.Message }
 
 // Store is ok automation's storage core.
 type Store struct {
-	b      Backend
-	blobs  blob.Store
-	cfg    Config
-	notify *notifier
-	leases *leaseLines
+	b     Backend
+	blobs blob.Store
+	cfg   Config
+	queue bus.Queue
 }
 
-// New builds a store over a backend and the logs' bucket. Run Listen for prompt wake-ups;
-// without it every wait polls.
+// New builds a store over a backend and the logs' bucket. Run RunWaits beside it, so the readers of
+// a run's log hear it grow.
 func New(b Backend, blobs blob.Store, cfg Config) *Store {
-	if cfg.Signals == nil {
-		cfg.Signals = bus.NewLocal()
+	if cfg.Dispatch == nil {
+		cfg.Dispatch = bus.NewLocalQueue()
 	}
-	return &Store{b: b, blobs: blobs, cfg: cfg, notify: newNotifier(), leases: newLeaseLines()}
+	return &Store{b: b, blobs: blobs, cfg: cfg, queue: cfg.Dispatch}
 }
 
-// txOps are a transaction's operations as the store hands them on: the backend's, and the signals
-// to send once it commits.
+// RunWaits replies to the live requests waiting on what a transaction changed — readers of a run's
+// log, ok control's watchers of a CL — as their steps come, until ctx ends (wait.Run): every replica
+// runs it.
+func (s *Store) RunWaits(ctx context.Context) {
+	wait.Run(ctx, s.b.Waits(), s.queue, slog.Default())
+}
+
+// Waits are the store's registrations of live requests (wait.Server serves them to ok control).
+func (s *Store) Waits() wait.Store { return s.b.Waits() }
+
+// txOps are a transaction's operations as the store hands them on: the backend's, the signals to
+// send once it commits, the jobs dispatching the runs it queued, enqueued before it commits, and the
+// deliveries it ended, acknowledged once it has.
 type txOps struct {
 	Ops
-	pending *bus.Pending
+	dispatch *[]dispatchJob
+	ended    *[][]byte
+	logs     *[]int64
+	touched  *touches
+}
+
+// touches are what a transaction changed of what CLs' statuses show — runs, plans, submissions —
+// whose CLs it says changed before it commits (wait.CLSubject), for ok control's watchers of them.
+type touches struct {
+	runs, plans map[int64]bool
+	cls         map[[2]int64]bool
+}
+
+func newTouches() *touches {
+	return &touches{runs: map[int64]bool{}, plans: map[int64]bool{}, cls: map[[2]int64]bool{}}
+}
+
+func (t *touches) submission(s *Submission) {
+	for _, c := range s.CLs {
+		t.cls[[2]int64{s.RepositoryID, c.Number}] = true
+	}
+}
+
+// changed pends the steps saying each run, and each CL, the transaction touched changed: the CLs
+// of its runs and plans read in one read.
+func (t txOps) changed(ctx context.Context) error {
+	for id := range t.touched.runs {
+		kind, key, body := wait.Changed(wait.RunSubject(id))
+		if err := t.Ops.PendStep(ctx, kind, key, time.Time{}, body); err != nil {
+			return err
+		}
+	}
+	cls := t.touched.cls
+	if len(t.touched.runs)+len(t.touched.plans) > 0 {
+		got, err := t.Ops.CLsOf(ctx, slices.Collect(maps.Keys(t.touched.runs)), slices.Collect(maps.Keys(t.touched.plans)))
+		if err != nil {
+			return err
+		}
+		for _, c := range got {
+			cls[c] = true
+		}
+	}
+	for c := range cls {
+		kind, key, body := wait.Changed(wait.CLSubject(c[0], c[1]))
+		if err := t.Ops.PendStep(ctx, kind, key, time.Time{}, body); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (t txOps) ClaimRun(ctx context.Context, id int64, job, pool, worker string, ttl time.Duration, account string, slot int64, keyHash, handle []byte) (*Run, error) {
+	r, err := t.Ops.ClaimRun(ctx, id, job, pool, worker, ttl, account, slot, keyHash, handle)
+	if r != nil {
+		t.touched.runs[r.ID] = true
+	}
+	return r, err
+}
+
+func (t txOps) RequeueRun(ctx context.Context, id int64, job, reason string, nextAttempt bool) error {
+	t.touched.runs[id] = true
+	return t.Ops.RequeueRun(ctx, id, job, reason, nextAttempt)
+}
+
+func (t txOps) CancelQueuedRun(ctx context.Context, id int64, reason, by string) (bool, error) {
+	t.touched.runs[id] = true
+	return t.Ops.CancelQueuedRun(ctx, id, reason, by)
+}
+
+func (t txOps) InsertPlan(ctx context.Context, p NewPlan) (*Plan, error) {
+	if p.CLNumber != 0 {
+		t.touched.cls[[2]int64{p.RepositoryID, p.CLNumber}] = true
+	}
+	return t.Ops.InsertPlan(ctx, p)
+}
+
+func (t txOps) InsertSubmission(ctx context.Context, repo int64, by string, cls []SubmittedCL) (int64, error) {
+	for _, c := range cls {
+		t.touched.cls[[2]int64{repo, c.Number}] = true
+	}
+	return t.Ops.InsertSubmission(ctx, repo, by, cls)
+}
+
+// FinishRun ends a run, its log stored by a job of its own (logJobs), enqueued before the
+// transaction commits.
+func (t txOps) FinishRun(ctx context.Context, id int64, status Status, exitCode int32, reason string) error {
+	if err := t.Ops.FinishRun(ctx, id, status, exitCode, reason); err != nil {
+		return err
+	}
+	*t.logs = append(*t.logs, id)
+	t.touched.runs[id] = true
+	return nil
 }
 
 // A transaction's locks of rows about a repository read the repository's move gate (Ops.Gate)
@@ -233,6 +344,7 @@ func (t txOps) LockPlan(ctx context.Context, id int64) (*Plan, error) {
 	if err != nil {
 		return p, err
 	}
+	t.touched.plans[id] = true
 	return p, t.Gate(ctx, p.RepositoryID)
 }
 
@@ -241,6 +353,7 @@ func (t txOps) LockSubmission(ctx context.Context, id int64) (*Submission, error
 	if err != nil {
 		return s, err
 	}
+	t.touched.submission(s)
 	return s, t.Gate(ctx, s.RepositoryID)
 }
 
@@ -256,6 +369,7 @@ func (t txOps) LockAttempt(ctx context.Context, id int64) (*Attempt, error) {
 	if len(subs) == 0 {
 		return a, fmt.Errorf("attempt %d's submission %d: %w", id, a.SubmissionID, ErrNotFound)
 	}
+	t.touched.submission(subs[0])
 	return a, t.Gate(ctx, subs[0].RepositoryID)
 }
 
@@ -266,34 +380,85 @@ func (t txOps) LockCL(ctx context.Context, repo, cl int64) error {
 	return t.Ops.LockCL(ctx, repo, cl)
 }
 
-// Every run is queued here, at its phase's priority (priorityOf), in its job's pool or the default.
+// Every run is queued here, at its phase's priority (priorityOf), in its job's pool or the default,
+// with the job that dispatches it, enqueued before the transaction commits.
 func (t txOps) InsertRun(ctx context.Context, r NewRun) (*Run, error) {
 	if err := t.Gate(ctx, r.RepositoryID); err != nil {
 		return nil, err
 	}
-	return t.Ops.InsertRun(ctx, queuedAs(r))
+	r = t.queuedAs(r)
+	if r.PlanID != 0 {
+		t.touched.plans[r.PlanID] = true
+	}
+	run, err := t.Ops.InsertRun(ctx, r)
+	if err == nil && r.Status == StatusQueued {
+		t.queued(run.ID, r)
+	}
+	return run, err
 }
 
-func (t txOps) InsertRuns(ctx context.Context, rs []NewRun) error {
+func (t txOps) InsertRuns(ctx context.Context, rs []NewRun) ([]int64, error) {
 	gated := map[int64]bool{}
 	out := make([]NewRun, len(rs))
 	for i, r := range rs {
 		if !gated[r.RepositoryID] {
 			if err := t.Gate(ctx, r.RepositoryID); err != nil {
-				return err
+				return nil, err
 			}
 			gated[r.RepositoryID] = true
 		}
-		out[i] = queuedAs(r)
+		out[i] = t.queuedAs(r)
 	}
-	return t.Ops.InsertRuns(ctx, out)
+	ids, err := t.Ops.InsertRuns(ctx, out)
+	if err != nil {
+		return nil, err
+	}
+	for _, r := range out {
+		if r.PlanID != 0 {
+			t.touched.plans[r.PlanID] = true
+		}
+	}
+	for i, r := range out {
+		if r.Status == StatusQueued {
+			t.queued(ids[i], r)
+		}
+	}
+	return ids, nil
 }
 
-// queuedAs is a run as it is queued: its phase's priority, and its pool named.
-func queuedAs(r NewRun) NewRun {
+// requeue queues a running run again with a job of its own, enqueued before the transaction
+// commits, and acknowledges the delivery it ran under once it has.
+func (t txOps) requeue(ctx context.Context, run *Run, reason string, nextAttempt bool) error {
+	job := newDispatchJob()
+	if err := t.Ops.RequeueRun(ctx, run.ID, job, reason, nextAttempt); err != nil {
+		return err
+	}
+	*t.dispatch = append(*t.dispatch, dispatchJob{id: job, run: run.ID, repo: run.RepositoryID, pool: run.Job.Pool})
+	t.end(run.LeaseHandle)
+	return nil
+}
+
+// end acknowledges a run's delivery once the transaction commits: the run no longer runs under it.
+func (t txOps) end(handle []byte) {
+	if len(handle) > 0 {
+		*t.ended = append(*t.ended, handle)
+	}
+}
+
+// queued records a run the transaction queued, its job to enqueue before it commits.
+func (t txOps) queued(id int64, r NewRun) {
+	*t.dispatch = append(*t.dispatch, dispatchJob{id: r.DispatchJob, run: id, repo: r.RepositoryID, pool: r.Job.Pool})
+}
+
+// queuedAs is a run as it is queued: its phase's priority, its pool named, and, queued, the job
+// that dispatches it.
+func (t txOps) queuedAs(r NewRun) NewRun {
 	r.Priority = priorityOf(r.Origin.Phase)
 	if r.Job.Pool == "" {
 		r.Job.Pool = workflow.DefaultPool
+	}
+	if r.Status == StatusQueued {
+		r.DispatchJob = newDispatchJob()
 	}
 	return r
 }
@@ -307,6 +472,24 @@ func (t txOps) FinishSubmission(ctx context.Context, id int64, status Submission
 	return t.Ops.FinishSubmission(ctx, id, status, reason, by)
 }
 
+// FinishSubmissions gates each repository of the submissions it ended, as LockSubmission gates one.
+func (t txOps) FinishSubmissions(ctx context.Context, ids []int64, status SubmissionStatus, reason, by string) (map[int64]int64, error) {
+	ended, err := t.Ops.FinishSubmissions(ctx, ids, status, reason, by)
+	if err != nil {
+		return ended, err
+	}
+	gated := map[int64]bool{}
+	for _, repo := range ended {
+		if !gated[repo] {
+			gated[repo] = true
+			if err := t.Gate(ctx, repo); err != nil {
+				return ended, err
+			}
+		}
+	}
+	return ended, nil
+}
+
 func (t txOps) LockMain(ctx context.Context, repo int64) error {
 	if err := t.Gate(ctx, repo); err != nil {
 		return err
@@ -314,16 +497,30 @@ func (t txOps) LockMain(ctx context.Context, repo int64) error {
 	return t.Ops.LockMain(ctx, repo)
 }
 
-// txn runs fn in a read-write transaction (Backend.Txn), and sends the signals its committed
-// attempt recorded once it has committed.
+// txn runs fn in a read-write transaction (Backend.Txn), and ends the leases of the runs its
+// committed attempt finished once it has committed.
 func (s *Store) txn(ctx context.Context, fn func(tx Ops) error) error {
-	var p bus.Pending
+	var ds []dispatchJob
+	var ended [][]byte
+	var logs []int64
 	err := s.b.Txn(ctx, func(tx Ops) error {
-		p.Reset()
-		return fn(txOps{Ops: tx, pending: &p})
+		ds, ended, logs = ds[:0], ended[:0], logs[:0]
+		t := txOps{Ops: tx, dispatch: &ds, ended: &ended, logs: &logs, touched: newTouches()}
+		if err := fn(t); err != nil {
+			return err
+		}
+		if err := t.changed(ctx); err != nil {
+			return err
+		}
+		// Before it commits: a run queued is never without its job, nor a run finished without its
+		// log's. A job of an attempt that does not commit is dropped where it is leased.
+		if err := s.enqueue(ctx, ds); err != nil {
+			return err
+		}
+		return s.enqueueLogs(ctx, logs)
 	})
 	if err == nil {
-		p.Send(ctx, s.cfg.Signals)
+		s.acknowledge(ctx, ended)
 	}
 	return err
 }

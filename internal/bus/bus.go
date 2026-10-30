@@ -1,17 +1,12 @@
-// Package bus is how ok's roles hear of what happened and hand out work (docs/hosted.md, "Events
-// and the bus"), behind two interfaces with an implementation for each environment ok runs in:
+// Package bus is how ok's roles hand out work (docs/hosted.md, "Events and the bus"; docs/state.md),
+// behind one interface with an implementation for each environment ok runs in: a Queue carries
+// work — each job leased to one worker at a time, invisible to the others until its lease ends,
+// and redelivered until acknowledged, up to the queue's attempts, after which it is a dead letter.
+// A job names work; the worker takes the work's lease in the database before doing it, so a lost
+// or duplicated job costs a retry, never a double execution. Its inboxes carry the replies to the
+// live requests waiting on a change (Inbox).
 //
-//   - A Stream carries events: every event of a topic reaches one subscriber of each group, at
-//     least once, in no promised order. Events are first rows of their repository's log in the
-//     database that caused them; the stream only delivers them, and a consumer applies each once
-//     by comparing its sequence with its cursor.
-//   - A Queue carries work: each job is leased to one worker at a time, invisible to the others
-//     until its lease ends, and redelivered until acknowledged — up to the queue's attempts, after
-//     which it is a dead letter. A job names work; the worker takes the work's lease in the
-//     database before doing it, so a lost or duplicated job costs a retry, never a double
-//     execution.
-//
-// Every implementation passes bustest's suites.
+// Every implementation passes bustest's suite.
 package bus
 
 import (
@@ -20,32 +15,15 @@ import (
 	"time"
 )
 
-// Event is one event of a topic.
+// Event is one event of a log another service writes, as its followers read it (internal/bus/follow).
 type Event struct {
-	// Topic is the stream it is on: "scm.events", "directory.events".
+	// Topic is the log it is of: "scm.events", "directory.repositories".
 	Topic string
 	// Key is what it is about — a repository, an account — and Seq its place in that key's log.
 	Key int64
 	Seq int64
-	// Body is the event, encoded by whoever published it.
+	// Body is the event, encoded by the log's source.
 	Body []byte
-}
-
-// Handler handles one delivered event. Returning nil acknowledges it; an error has it delivered
-// again later.
-type Handler func(ctx context.Context, e Event) error
-
-// Stream carries events from publishers to every group of subscribers.
-type Stream interface {
-	// Publish sends events; it returns once the stream holds them all.
-	Publish(ctx context.Context, events ...Event) error
-	// CreateGroup makes group on topic, if it does not exist: a group receives the events
-	// published after it was made.
-	CreateGroup(ctx context.Context, topic, group string) error
-	// Subscribe delivers topic's events to h as a member of group (made if it does not exist)
-	// until ctx ends, sharing them with the group's other members. It returns ctx's error, or the
-	// error that stopped it.
-	Subscribe(ctx context.Context, topic, group string, h Handler) error
 }
 
 // Job is one piece of work.
@@ -79,11 +57,26 @@ type Queue interface {
 	// Lease takes up to o.Max ready jobs of queue, each invisible to other workers until its
 	// lease ends; none is not an error.
 	Lease(ctx context.Context, queue string, o LeaseOptions) ([]Leased, error)
+	// Resume is the lease a handle names (Leased.Handle), as any process may hold it: its Extend,
+	// Ack, and Nack act on the lease as its holder's would, though the holder may be another
+	// process, or gone. Its Job names only the job's queue and ID, and its Attempt is 0. A lease
+	// that ended may not report ErrLeaseLost to one resumed: whatever the job names keeps its own
+	// record of who holds it.
+	Resume(handle []byte) (Leased, error)
+	// Inbox opens an inbox for a live request: a queue its replies are enqueued on, by address,
+	// until it closes (Inbox).
+	Inbox(ctx context.Context) (Inbox, error)
+	// CloseInboxes closes the process's inboxes, and removes the queue that carried them: as the
+	// process stops.
+	CloseInboxes(ctx context.Context) error
 }
 
 // Leased is a job a worker holds.
 type Leased interface {
 	Job() Job
+	// Handle names the lease for Queue.Resume: a job held as long as the work it names runs, kept
+	// by whichever process that work reports to.
+	Handle() []byte
 	// Attempt counts the leases the job has had, this one included.
 	Attempt() int
 	// Extend keeps the job invisible for d more from now.

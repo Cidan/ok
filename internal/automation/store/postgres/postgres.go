@@ -22,6 +22,8 @@ import (
 	"github.com/Cidan/ok/internal/migrate"
 	"github.com/Cidan/ok/internal/move"
 	"github.com/Cidan/ok/internal/scm/scmfeed"
+	"github.com/Cidan/ok/internal/wait"
+	"github.com/Cidan/ok/internal/work"
 )
 
 //go:embed migrations/*.sql
@@ -38,6 +40,11 @@ type Backend struct {
 }
 
 var _ store.Backend = (*Backend)(nil)
+
+// Work is the backend's keyed work's store.
+func (b *Backend) Work() work.Store { return pgdata.Work(b.pool) }
+
+func (b *Backend) Waits() wait.Store { return pgdata.Waits(b.pool) }
 
 // Open brings the database behind pool to automation's schema and returns a backend over it.
 func Open(ctx context.Context, pool *pgxpool.Pool) (*Backend, error) {
@@ -173,7 +180,7 @@ func commitsByRepository(rows pgx.Rows, err error) (map[int64][][]byte, error) {
 const runColumns = `id, repository_id, commit_id, kind, targets, args, phase, cl_number, patchset, job,
 	requested_by, rerun_of, status, attempt, coalesce(worker, ''), coalesce(exit_code, 0), reason, log_size,
 	log_stored, timeout_seconds, coalesce(plan_id, 0), why, queued_at, started_at, finished_at, coalesce(carried_from, 0),
-	coalesce(canceled_by, ''), pool`
+	coalesce(canceled_by, ''), pool, coalesce(dispatch_job, ''), lease_handle`
 
 func scanRun(row pgx.Row) (*store.Run, error) {
 	var r store.Run
@@ -183,7 +190,7 @@ func scanRun(row pgx.Row) (*store.Run, error) {
 	err := row.Scan(&r.ID, &r.RepositoryID, &r.CommitID, &r.Job.Kind, &r.Job.Targets, &r.Job.Args,
 		&r.Origin.Phase, &cl, &patchset, &r.Origin.Job, &r.RequestedBy, &rerun, &r.Status, &r.Attempt, &r.Worker,
 		&r.ExitCode, &r.Reason, &r.LogSize, &r.LogStored, &r.TimeoutSeconds, &r.PlanID, &r.Why, &r.QueuedAt, &started, &finished,
-		&r.CarriedFrom, &r.CanceledBy, &r.Job.Pool)
+		&r.CarriedFrom, &r.CanceledBy, &r.Job.Pool, &r.DispatchJob, &r.LeaseHandle)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, store.ErrNotFound
 	}
@@ -228,30 +235,34 @@ func collectRuns(rows pgx.Rows, err error) ([]*store.Run, error) {
 // transaction's start, so the runs one transaction queues keep their order.
 const insertRun = `INSERT INTO run (repository_id, commit_id, kind, targets, args, phase, cl_number, patchset, job,
 		plan_id, why, requested_by, rerun_of, status, reason, timeout_seconds, priority,
-		started_at, finished_at, log_stored, carried_from, log_size, id, queued_at, pool)
+		started_at, finished_at, log_stored, carried_from, log_size, id, queued_at, pool, dispatch_job)
 	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
-		CASE WHEN $18::boolean THEN now() END, CASE WHEN $19::boolean THEN now() END, $20, $21, $22, $23, clock_timestamp(), coalesce(nullif($24, ''), 'default'))`
+		CASE WHEN $18::boolean THEN now() END, CASE WHEN $19::boolean THEN now() END, $20, $21, $22, $23, clock_timestamp(), coalesce(nullif($24, ''), 'default'),
+		nullif($25, ''))`
 
-func runArgs(r store.NewRun) []any {
+// runArgs are a run's insertRun arguments, under the ID id.
+func runArgs(r store.NewRun, id int64) []any {
 	return []any{r.RepositoryID, r.CommitID, r.Job.Kind, orEmpty(r.Job.Targets), orEmpty(r.Job.Args), r.Origin.Phase,
 		nullable(r.Origin.CLNumber), nullable(r.Origin.Patchset), r.Origin.Job, nullable(r.PlanID), r.Why, r.RequestedBy,
 		nullable(r.RerunOf), r.Status, r.Reason, r.TimeoutSeconds, r.Priority, r.Started, r.Finished, r.LogStored,
-		nullable(r.CarriedFrom), r.LogSize, data.NewID(), r.Job.Pool}
+		nullable(r.CarriedFrom), r.LogSize, id, r.Job.Pool, r.DispatchJob}
 }
 
 func (x queries) InsertRun(ctx context.Context, r store.NewRun) (*store.Run, error) {
-	return scanRun(x.q.QueryRow(ctx, insertRun+` RETURNING `+runColumns, runArgs(r)...))
+	return scanRun(x.q.QueryRow(ctx, insertRun+` RETURNING `+runColumns, runArgs(r, data.NewID())...))
 }
 
-func (x queries) InsertRuns(ctx context.Context, rs []store.NewRun) error {
+func (x queries) InsertRuns(ctx context.Context, rs []store.NewRun) ([]int64, error) {
 	if len(rs) == 0 {
-		return nil
+		return nil, nil
 	}
+	ids := make([]int64, len(rs))
 	batch := &pgx.Batch{}
-	for _, r := range rs {
-		batch.Queue(insertRun, runArgs(r)...)
+	for i, r := range rs {
+		ids[i] = data.NewID()
+		batch.Queue(insertRun, runArgs(r, ids[i])...)
 	}
-	return x.q.SendBatch(ctx, batch).Close()
+	return ids, x.q.SendBatch(ctx, batch).Close()
 }
 
 func (x queries) Run(ctx context.Context, id int64) (*store.Run, error) {
@@ -312,42 +323,13 @@ func (x queries) RenewLease(ctx context.Context, id int64, worker string, ttl ti
 	var stop *string
 	err := x.q.QueryRow(ctx, `UPDATE run SET lease_expires = now() + make_interval(secs => $3)
 		WHERE id = $1 AND status = $4 AND worker = $2
-		RETURNING stop_reason, now() > started_at + make_interval(secs => timeout_seconds), timeout_seconds`,
-		id, worker, ttl.Seconds(), store.StatusRunning).Scan(&stop, &l.Overdue, &l.TimeoutSeconds)
+		RETURNING stop_reason, now() > started_at + make_interval(secs => timeout_seconds), timeout_seconds, lease_handle`,
+		id, worker, ttl.Seconds(), store.StatusRunning).Scan(&stop, &l.Overdue, &l.TimeoutSeconds, &l.Handle)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return store.Lease{}, false, nil
 	}
 	if err != nil {
 		return store.Lease{}, false, err
-	}
-	if stop != nil {
-		l.Stopping, l.StopReason = true, *stop
-	}
-	return l, true, nil
-}
-
-func (x queries) LapsedRunIDs(ctx context.Context) ([]int64, error) {
-	rows, err := x.q.Query(ctx, `SELECT id FROM run WHERE status = $1 AND lease_expires < now()
-			AND NOT EXISTS (SELECT 1 FROM move_gate g WHERE g.repository_id = run.repository_id AND g.move_state <> '')
-		ORDER BY id`, store.StatusRunning)
-	if err != nil {
-		return nil, err
-	}
-	return pgx.CollectRows(rows, pgx.RowTo[int64])
-}
-
-// LapsedRun locks the run if it is still lapsed; one another sweep holds is left to it.
-func (x queries) LapsedRun(ctx context.Context, id int64) (store.Lapsed, bool, error) {
-	l := store.Lapsed{ID: id}
-	var stop *string
-	err := x.q.QueryRow(ctx, `SELECT repository_id, phase, attempt, coalesce(worker, ''), stop_reason FROM run
-		WHERE id = $1 AND status = $2 AND lease_expires < now() FOR UPDATE SKIP LOCKED`, id, store.StatusRunning).
-		Scan(&l.RepositoryID, &l.Phase, &l.Attempt, &l.Worker, &stop)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return l, false, nil
-	}
-	if err != nil {
-		return l, false, err
 	}
 	if stop != nil {
 		l.Stopping, l.StopReason = true, *stop
@@ -370,17 +352,17 @@ const stopRunning = `WITH ran AS (
 		ON CONFLICT (account_id, month) DO UPDATE SET seconds = account_usage.seconds + EXCLUDED.seconds
 	) `
 
-func (x queries) RequeueRun(ctx context.Context, id int64, reason string, nextAttempt bool) error {
+func (x queries) RequeueRun(ctx context.Context, id int64, job, reason string, nextAttempt bool) error {
 	_, err := x.q.Exec(ctx, stopRunning+`UPDATE run SET status = $2, reason = $3, attempt = attempt + CASE WHEN $4::boolean THEN 1 ELSE 0 END,
 			worker = NULL, lease_expires = NULL, started_at = NULL, finished_at = NULL, stop_reason = NULL, log_size = 0,
-			slot_account = NULL, slot = NULL
-		WHERE id = $1`, id, store.StatusQueued, reason, nextAttempt)
+			slot_account = NULL, slot = NULL, dispatch_job = nullif($5, ''), lease_handle = NULL
+		WHERE id = $1`, id, store.StatusQueued, reason, nextAttempt, job)
 	return err
 }
 
 func (x queries) FinishRun(ctx context.Context, id int64, status store.Status, exitCode int32, reason string) error {
 	_, err := x.q.Exec(ctx, stopRunning+`UPDATE run SET status = $2, exit_code = $3, reason = $4, finished_at = now(),
-		lease_expires = NULL, stop_reason = NULL, slot_account = NULL, slot = NULL WHERE id = $1`, id, status, exitCode, reason)
+		lease_expires = NULL, stop_reason = NULL, slot_account = NULL, slot = NULL, lease_handle = NULL WHERE id = $1`, id, status, exitCode, reason)
 	return err
 }
 
@@ -422,10 +404,14 @@ func (x queries) MarkLogStored(ctx context.Context, id int64) error {
 	return err
 }
 
-func (x queries) UnstoredLogs(ctx context.Context, limit int) ([]int64, error) {
+func (x queries) UnstoredLogs(ctx context.Context, repos []int64, limit int) ([]int64, error) {
+	if repos == nil {
+		repos = []int64{}
+	}
 	return ids(x.q.Query(ctx, `SELECT id FROM run WHERE status >= $1 AND NOT log_stored
+		AND (cardinality($3::bigint[]) = 0 OR repository_id = ANY($3))
 		AND NOT EXISTS (SELECT 1 FROM move_gate g WHERE g.repository_id = run.repository_id AND g.move_state <> '')
-		ORDER BY id LIMIT $2`, store.StatusPassed, limit))
+		ORDER BY id LIMIT $2`, store.StatusPassed, limit, repos))
 }
 
 // ─── The feed, and the build cache's commits ───
@@ -438,24 +424,26 @@ func (x queries) MarkWorkAt(ctx context.Context, kind string, key int64, at time
 	return pgdata.MarkWorkAt(ctx, x.q, kind, key, at)
 }
 
-func (x queries) TakeWork(ctx context.Context, kind string, key int64, holder string, ttl time.Duration) (bool, error) {
-	return pgdata.TakeWork(ctx, x.q, kind, key, holder, ttl)
+func (x queries) CLsOf(ctx context.Context, runs, plans []int64) ([][2]int64, error) {
+	rows, err := x.q.Query(ctx, `SELECT DISTINCT p.repository_id, p.cl_number FROM plan p
+		WHERE p.cl_number > 0 AND (p.id = ANY($2) OR p.id IN (SELECT r.plan_id FROM run r WHERE r.id = ANY($1)))`, runs, plans)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out [][2]int64
+	for rows.Next() {
+		var c [2]int64
+		if err := rows.Scan(&c[0], &c[1]); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
 }
 
-func (x queries) RenewWork(ctx context.Context, kind string, key int64, holder string, ttl time.Duration) (bool, error) {
-	return pgdata.RenewWork(ctx, x.q, kind, key, holder, ttl)
-}
-
-func (x queries) ReleaseWork(ctx context.Context, kind string, key int64, holder string) (bool, error) {
-	return pgdata.ReleaseWork(ctx, x.q, kind, key, holder)
-}
-
-func (x queries) LetWork(ctx context.Context, kind string, key int64, holder string) error {
-	return pgdata.LetWork(ctx, x.q, kind, key, holder)
-}
-
-func (x queries) DueWork(ctx context.Context, kind string, limit int) ([]int64, error) {
-	return pgdata.DueWork(ctx, x.q, kind, limit)
+func (x queries) PendStep(_ context.Context, kind string, key int64, at time.Time, body []byte) error {
+	return pgdata.PendStep(x.q, kind, key, at, body)
 }
 
 func (x queries) FollowCursors(ctx context.Context, topic string, keys []int64) (map[int64]int64, error) {

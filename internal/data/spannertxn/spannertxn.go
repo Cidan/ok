@@ -17,6 +17,7 @@ import (
 	"google.golang.org/grpc/codes"
 
 	"github.com/Cidan/ok/internal/serve/metrics"
+	"github.com/Cidan/ok/internal/work"
 )
 
 var (
@@ -46,7 +47,8 @@ func Counted(r any) {
 }
 
 // ReadWrite runs fn in a read-write transaction on c — again, each time Spanner aborts it —
-// measuring it: every read-write transaction of ok's begins here.
+// measuring it, and enqueueing the jobs of the work each attempt marks before it commits
+// (work.Flush): every read-write transaction of ok's begins here.
 func ReadWrite(ctx context.Context, c *spanner.Client, fn func(context.Context, *spanner.ReadWriteTransaction) error) (time.Time, error) {
 	site := callSite()
 	began := time.Now()
@@ -59,7 +61,12 @@ func ReadWrite(ctx context.Context, c *spanner.Client, fn func(context.Context, 
 			statements += n.Load()
 			counting.Delete(tx)
 		}()
-		return fn(ctx, tx)
+		work.Begin(c, tx)
+		defer work.End(tx)
+		if err := fn(ctx, tx); err != nil {
+			return err
+		}
+		return work.Flush(ctx, tx)
 	})
 	record(site, time.Since(began), attempts, statements, err)
 	return at, err

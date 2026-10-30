@@ -1,0 +1,55 @@
+{{- if and .Values.migrations.enabled .Values.devicePlugin.enabled }}
+# /dev/fuse, which okfs presents migrations' commits with, offered as a resource a pod requests —
+# a container runtime lets a pod open a device only as a device plugin offers it:
+# generic-device-plugin, on every node (docs/install.md, "Workers' nodes").
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "agent.name" . }}-devices
+  labels:
+    app.kubernetes.io/name: ok-agent-devices
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ok-agent-devices
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  updateStrategy: {type: RollingUpdate}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ok-agent-devices
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      {{- with .Values.devicePlugin.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.devicePlugin.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: devices
+          image: {{ .Values.devicePlugin.image }}
+          args:
+            - --domain
+            - {{ .Values.devicePlugin.domain | quote }}
+            - --device
+            - '{"name": "fuse", "groups": [{"count": {{ .Values.devicePlugin.count }}, "paths": [{"path": "/dev/fuse"}]}]}'
+          ports:
+            - {name: metrics, containerPort: 8080}
+          resources:
+            requests: {cpu: 50m, memory: 16Mi}
+            limits: {memory: 64Mi}
+          # It registers with the kubelet and hands it the node's devices: both need the host.
+          securityContext: {privileged: true}
+          volumeMounts:
+            - {name: plugins, mountPath: /var/lib/kubelet/device-plugins}
+            - {name: dev, mountPath: /dev}
+      volumes:
+        - name: plugins
+          hostPath: {path: /var/lib/kubelet/device-plugins}
+        - name: dev
+          hostPath: {path: /dev}
+{{- end }}

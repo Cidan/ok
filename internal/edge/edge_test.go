@@ -15,6 +15,7 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
+	"github.com/Cidan/ok/internal/bus/bustest"
 	"github.com/Cidan/ok/internal/cells"
 	"github.com/Cidan/ok/internal/config"
 	"github.com/Cidan/ok/internal/dial"
@@ -72,6 +73,7 @@ func startSCM(t *testing.T, ctx context.Context, id *idtest.Identity, cell strin
 	if err != nil {
 		t.Fatal(err)
 	}
+	cfg.Bus = bustest.Config(t)
 	pool, err := pgdb.Open(ctx, testdb.Postgres(t), scmrole.Schema, 0)
 	if err != nil {
 		t.Fatal(err)

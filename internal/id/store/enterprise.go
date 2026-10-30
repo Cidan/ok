@@ -3,10 +3,12 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 	"time"
 
+	"github.com/Cidan/ok/internal/data"
 	"github.com/Cidan/ok/internal/directory"
 	"github.com/Cidan/ok/internal/tenancy"
 )
@@ -20,10 +22,12 @@ import (
 // IdentityProvider is an organization's identity provider, and how its sync last went.
 type IdentityProvider struct {
 	Organization string
-	Source       string          // google, entra, ldap, or scim
-	Settings     json.RawMessage // no secret
-	Sealed       []byte          // the secrets, sealed
-	Interval     time.Duration
+	// Key keys its sync's keyed work (SyncWork): given as it is first set, and kept.
+	Key      int64
+	Source   string          // google, entra, ldap, or scim
+	Settings json.RawMessage // no secret
+	Sealed   []byte          // the secrets, sealed
+	Interval time.Duration
 	// PlainHandles: the people it makes are named by their handles alone — an organization moved
 	// in, whose people the installation named so — not <handle>-<org>.
 	PlainHandles bool
@@ -57,7 +61,52 @@ func (s *Store) SetIdentityProvider(ctx context.Context, p IdentityProvider) err
 		return err
 	}
 	p.Updated = s.now()
-	return s.b.PutIdentityProvider(ctx, p)
+	// Set, and its sync booked now, in one transaction: each sync books the next (SyncWork).
+	return s.txn(ctx, func(tx Ops) error {
+		p.Key = data.NewID()
+		if err := tx.PutIdentityProvider(ctx, p); err != nil {
+			return err
+		}
+		set, err := tx.IdentityProviderOf(ctx, p.Organization)
+		if err != nil {
+			return err
+		}
+		return tx.MarkWorkAt(ctx, SyncWork, set.Key, s.now())
+	})
+}
+
+// SyncWork is an organization's sync of its identity provider, as keyed work (internal/work)
+// keyed by the provider's sync key.
+const SyncWork = "sync"
+
+// IdentityProviderOrg is the organization whose provider's sync key is key; ErrNotFound for none.
+func (s *Store) IdentityProviderOrg(ctx context.Context, key int64) (string, error) {
+	return s.b.IdentityProviderOrg(ctx, key)
+}
+
+// KeyIdentityProviders gives every provider a release before set a sync key, and books each one's
+// sync for when it is due (SyncWork).
+func (s *Store) KeyIdentityProviders(ctx context.Context) error {
+	orgs, err := s.b.DueIdentityProviders(ctx, time.Date(9999, 1, 1, 0, 0, 0, 0, time.UTC))
+	if err != nil {
+		return err
+	}
+	for _, org := range orgs {
+		if err := s.b.SetIdentityProviderKey(ctx, org, data.NewID()); err != nil {
+			return err
+		}
+		p, err := s.b.IdentityProviderOf(ctx, org)
+		if errors.Is(err, ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if err := s.b.Work().MarkAt(ctx, SyncWork, p.Key, p.LastRun.Add(p.Interval)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // IdentityProviderOf is an organization's identity provider; ErrNotFound for none.

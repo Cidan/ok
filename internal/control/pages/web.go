@@ -19,13 +19,14 @@ import (
 
 // ok's head assets, served by Assets() at /assets. layout.Shell is app-neutral, so ok
 // lists exactly what its pages need: htmx (SPA content swaps), the hydration runtime, nav.js
-// (the rail drawer), infinite.js (the repository list), livefilter.js (the search box),
+// (the rail drawer), infinite.js (the repository list), livefilter.js (the search box), live.js
+// (the live regions, refreshed as the server says what they show changed),
 // clipboard.js (the clone-URL copy buttons), and tree.js (the browser's file tree), plus its
 // fonts and Tailwind output. No
 // chat/figure/markdown/api.js — ok renders markup server-side.
 var styles = []string{"/assets/fonts.css", "/assets/app.css"}
 
-var scripts = []string{"/assets/htmx.min.js", "/assets/hydrate.js", "/assets/nav.js", "/assets/infinite.js", "/assets/livefilter.js", "/assets/stars.js", "/assets/clcomments.js", "/assets/clipboard.js", "/assets/tree.js"}
+var scripts = []string{"/assets/htmx.min.js", "/assets/hydrate.js", "/assets/nav.js", "/assets/infinite.js", "/assets/livefilter.js", "/assets/live.js", "/assets/stars.js", "/assets/clcomments.js", "/assets/clipboard.js", "/assets/tree.js"}
 
 func shell(title string, variant layout.Variant, n nav.Model) layout.Props {
 	return layout.Props{
@@ -794,30 +795,31 @@ type CLDeployment struct {
 // DeploymentView is a deployment's page: what it deploys, where it stands, what it pushed and
 // migrated, its roll, its log, and the actions the viewer may take.
 type DeploymentView struct {
-	Chrome      RepoChrome
-	CLNumber    int64  // the CL the viewer came from (0: none)
-	CLHref      string // its page
-	ID          int64
-	Name        string
-	Deploy      string // its identity, //<file>:deploy:<name>
-	Commit      string // short
-	CommitHref  string
-	Why         string
-	Wave        string // "1 of plan 12", "a retry of deployment 9"
-	Workload    string
-	RequestedBy string
-	StatusLabel string
-	StatusKind  string
-	Stage       string
-	Reason      string
-	Roll        string // "Canary · green beside 3 blue", "" before it rolls
-	Started     string
-	Finished    string
-	Live        bool   // it has not finished: its status refreshes itself
-	StatusHref  string // the status panel's fragment
-	Images      []DeploymentImage
-	Migrations  []DeploymentMigration
-	Events      []DeploymentEvent
+	Chrome       RepoChrome
+	CLNumber     int64  // the CL the viewer came from (0: none)
+	CLHref       string // its page
+	ID           int64
+	Name         string
+	Deploy       string // its identity, //<file>:deploy:<name>
+	Commit       string // short
+	CommitHref   string
+	Why          string
+	Wave         string // "1 of plan 12", "a retry of deployment 9"
+	Workload     string
+	RequestedBy  string
+	StatusLabel  string
+	StatusKind   string
+	Stage        string
+	Reason       string
+	Roll         string // "Canary · green beside 3 blue", "" before it rolls
+	Started      string
+	Finished     string
+	Live         bool   // it has not finished: its status refreshes itself
+	StatusHref   string // the status panel's fragment
+	ChangeEvents string // the deployment's change events, which refresh it (live.js)
+	Images       []DeploymentImage
+	Migrations   []DeploymentMigration
+	Events       []DeploymentEvent
 	// Actions ("" when the viewer may not take them in its state).
 	RetryHref string
 	HaltHref  string
@@ -1114,13 +1116,14 @@ type CLReplyLabel struct {
 // the CL's post, from its latest submission. While either runs, the tab refreshes itself from
 // Href.
 type CLChecks struct {
-	Patchset    int64
-	Verdict     string // "Passed" | "Failed" | "Running" | "Not Planned" | "Unavailable"
-	VerdictKind string // style key: "passed" | "failed" | "running" | "none" | "unavailable"
-	Live        bool   // pre is still running
-	Planned     bool   // its plan has run: the unaffected workflow jobs are known
-	Href        string // the tab's own fragment
-	Unavailable string // why automation could not be read ("" when it could)
+	Patchset     int64
+	Verdict      string // "Passed" | "Failed" | "Running" | "Not Planned" | "Unavailable"
+	VerdictKind  string // style key: "passed" | "failed" | "running" | "none" | "unavailable"
+	Live         bool   // pre is still running
+	Planned      bool   // its plan has run: the unaffected workflow jobs are known
+	Href         string // the tab's own fragment
+	ChangeEvents string // the CL's change events, which refresh it (live.js)
+	Unavailable  string // why automation could not be read ("" when it could)
 	// NotRun says why the current patchset runs no pre of its own — a draft, or a CL under its
 	// stack's top — and RunPreHref runs it by hand ("" when the viewer may not).
 	NotRun     string
@@ -1186,29 +1189,31 @@ type CLSkippedCheck struct {
 
 // RunView is one run's page: what it runs and why, where it stands, and its log.
 type RunView struct {
-	Chrome     RepoChrome
-	CLNumber   int64
-	CLHref     string
-	ID         int64
-	Check      CLCheck
-	Patchset   int64
-	Commit     string // short
-	Worker     string // "w1 (attempt 2)", "" before it starts
-	Queued     string
-	Started    string
-	Finished   string
-	Live       bool   // it has not finished: the page refreshes itself
-	StatusHref string // the status panel's fragment
-	Log        RunLog
-	RawHref    string
+	Chrome       RepoChrome
+	CLNumber     int64
+	CLHref       string
+	ID           int64
+	Check        CLCheck
+	Patchset     int64
+	Commit       string // short
+	Worker       string // "w1 (attempt 2)", "" before it starts
+	Queued       string
+	Started      string
+	Finished     string
+	Live         bool   // it has not finished: the page refreshes itself
+	StatusHref   string // the status panel's fragment
+	ChangeEvents string // the run's change events, which refresh it (live.js)
+	Log          RunLog
+	RawHref      string
 }
 
 // RunLog is a run's log from an offset: its text, and — while the run goes on — where to read
 // the rest from.
 type RunLog struct {
-	Text      string
-	Truncated bool   // the page shows the log's tail; Raw has all of it
-	NextHref  string // "" once the run has finished and the log is whole
+	Text         string
+	Truncated    bool   // the page shows the log's tail; Raw has all of it
+	NextHref     string // "" once the run has finished and the log is whole
+	ChangeEvents string // the run's change events, which fetch the rest (live.js)
 }
 
 // CLView is a single ChangeList in the Gerrit/Critique style: the status+number+subject header,
@@ -1332,11 +1337,12 @@ func ServeCLChecks(w http.ResponseWriter, r *http.Request, c CLChecks) {
 // deployer could not be asked. Href is the tab's own fragment, which refreshes itself while its
 // deployments are yet to be planned or are under way.
 type CLDeploys struct {
-	Landed  bool
-	Planned bool
-	Items   []CLDeployment
-	Error   string
-	Href    string
+	Landed       bool
+	Planned      bool
+	Items        []CLDeployment
+	Error        string
+	Href         string
+	ChangeEvents string // the CL's change events, which refresh it (live.js)
 }
 
 // Live reports whether the tab refreshes itself: the CL has landed, and its deployments are yet

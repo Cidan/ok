@@ -141,6 +141,46 @@ func TestMerge(t *testing.T) {
 	}
 }
 
+// Operations' latencies by the minute they began survive a merge of the pods' reports, minute by
+// minute, and the summary shows them; an operation begun before the run's offering counts in no
+// minute.
+func TestMinutes(t *testing.T) {
+	report := func(fast, slow time.Duration) *Report {
+		st := newStat()
+		st.begin(time.Now())
+		st.done(5*time.Second, nil) // began five seconds before the stat's start: no minute
+		// A publish begun in minute 0, and one in minute 1, each finishing now.
+		st.mu.Lock()
+		st.start = time.Now().Add(-90 * time.Second)
+		st.mu.Unlock()
+		st.done(fast, nil)
+		st.done(slow, nil)
+		return &Report{Offered: 60_000, Operations: map[string]Result{"publish": st.result(time.Minute)}}
+	}
+	// In each pod: one publish of 85 s (begun 5 s after the start, minute 0), one of 10 ms (minute 1).
+	m, err := Merge([]*Report{report(10*time.Millisecond, 85*time.Second), report(10*time.Millisecond, 85*time.Second)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mins := m.Operations["publish"].Minutes
+	if len(mins) != 2 || mins[0].Minute != 0 || mins[0].OK != 2 || mins[1].Minute != 1 || mins[1].OK != 2 {
+		t.Fatalf("merged minutes %+v; want two in minute 0 and two in minute 1", mins)
+	}
+	if mins[0].P50 < 80_000 || mins[1].P99 > 11 {
+		t.Errorf("minute 0's p50 %v, minute 1's p99 %v", mins[0].P50, mins[1].P99)
+	}
+	var table []string
+	for _, l := range m.Summary() {
+		if strings.HasPrefix(strings.TrimSpace(l), "minute ") {
+			table = append(table, l)
+		}
+	}
+	// 85 s, as its histogram bucket's bound, within 5%.
+	if len(table) != 2 || !strings.Contains(table[0], "89.1/89.1 2") {
+		t.Errorf("the summary's minutes: %q", table)
+	}
+}
+
 // The people files name the same people, by handle and address, in the system of record and Dex.
 func TestPeopleFiles(t *testing.T) {
 	people, dex := PeopleFiles(3, "$2a$10$x")

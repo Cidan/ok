@@ -6,6 +6,7 @@ public_url: http://localhost:8080
 listen: ":8472"
 metrics_listen: ":8473"
 database: {url_file: /etc/ok/secrets/database-url}
+bus: {type: nats, nats: {url: "nats://nats:4222"}}
 roles: {identity: identity.ok, scm: scm.ok, control: control.ok, automation: automation.ok, worker: worker.ok}
 services: {identity: "ok:8472", scm: "ok:8472", automation: "ok:8472"}
 # The worker's credential, which setup certifies (ok identity certify) and the worker renews.
@@ -31,4 +32,3 @@ worker:
   state: /var/lib/ok/state
   slots: 2
   run_memory_gib: 2
-  checkout: real

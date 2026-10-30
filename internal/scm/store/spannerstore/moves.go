@@ -21,7 +21,7 @@ var moveTables = []string{
 	"network", "repository", "head_log", "object", "tree_sizes", "commit", "commit_parent", "copy_parent", "commit_path", "path_index",
 	"pack", "content_index", "content_log", "dictionary", "dictionary_grant", "op_log", "operation", "view", "op_head",
 	"op_tombstone", "changelist", "patchset", "candidate", "changelist_counter", "event", "event_pending", "repository_event_counter",
-	"gc_pass", "workspace", "checkpoint", "segment", "chunk_release",
+	"gc_pass", "workspace", "checkpoint", "segment", "chunk_release", "compaction_cursor",
 }
 
 // moveRenames are the columns this schema names otherwise than PostgreSQL's.
@@ -178,8 +178,10 @@ func (b *Backend) FinishImport(ctx context.Context, m backend.Moving) error {
 	return nil
 }
 
-// DropNetworkRows deletes a network's rows, children first, then its counters, staged batches, and
-// pending sequences (none, once its freeze sequenced it, but for a writer's that failed).
+// DropNetworkRows deletes a network's rows, children first, then its counters, staged batches,
+// pending sequences (none, once its freeze sequenced it, but for a writer's that failed), and its
+// repositories' sequencing passes' records — Spanner's alone, which no move carries: a destination's
+// writers wait for its own passes.
 func (b *Backend) DropNetworkRows(ctx context.Context, m backend.Moving, limit int) (int64, error) {
 	tables, order, err := b.catalog(ctx)
 	if err != nil {
@@ -206,6 +208,7 @@ func (b *Backend) DropNetworkRows(ctx context.Context, m backend.Moving, limit i
 		for _, t := range []tableRows{
 			{"content_log_batch", `(scope = 1 AND owner_id = @net) OR (scope = 0 AND owner_id IN UNNEST(@repos))`},
 			{"sequence_pending", `repository_id IN UNNEST(@repos)`},
+			{"sequence_pass", `repository_id IN UNNEST(@repos)`},
 			{"counter", `(name = @repoLogs AND scope_id IN UNNEST(@repos))
 				OR ((name = @netLogs OR name = @packs OR name = @ages OR name = @dictionaries) AND scope_id = @net)`},
 		} {

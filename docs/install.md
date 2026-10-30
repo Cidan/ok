@@ -100,8 +100,9 @@ both make **user namespaces**. The chart runs workers and the deployer with the 
 failing with what to change on the node if it cannot.
 
 - **GKE** (Container-Optimized OS) confines containers with an AppArmor profile that refuses the
-  mount the sandbox makes in its user namespace. Run workers and the deployer unconfined by it —
-  `securityContext.appArmorProfile: {type: Unconfined}`, beside the chart's seccomp `Unconfined`.
+  mounts the sandbox and okfs make in their user namespace: the chart runs workers and the
+  deployer unconfined by it (`securityContext.appArmorProfile: {type: Unconfined}`), beside its
+  seccomp `Unconfined`.
 - **Ubuntu 23.10 and later** restrict unprivileged user namespaces through AppArmor
   (`kernel.apparmor_restrict_unprivileged_userns = 1`). Either load the `ok-sandbox` profile
   ([deploy/apparmor/ok-sandbox](../deploy/apparmor/ok-sandbox)) on each node and give workers and
@@ -121,20 +122,24 @@ failing with what to change on the node if it cannot.
   its own `/dev/pts`. Run workers and the deployer as `spc_t` —
   `securityContext.seLinuxOptions: {type: spc_t}`; under podman or Docker, `--security-opt
   label=disable` — as compose.yaml's worker does.
-- **A virtual checkout** (`worker.checkout: virtual`) also opens `/dev/fuse`, which a container
-  runtime allows a pod only as a device plugin offers it. Run one that offers `/dev/fuse` —
-  [generic-device-plugin](https://github.com/squat/generic-device-plugin), with a `fuse` device —
-  and name the resource it offers: `worker.fuseResource: devic.es/fuse`. Without a device plugin,
-  check out real (the default), which needs no FUSE. The chart starts a virtual checkout's worker
-  and deployer under `unshare --map-root-user --mount --propagation private`, from the runner
-  image's util-linux, which makes the user and mount namespace okfs mounts in (ok checks it is in
-  one as it starts, and refuses otherwise); outside the chart, start them the same way.
+- **Presentations.** Workers, the deployer, and deploy agents present each commit through okfs,
+  which opens `/dev/fuse` — a container runtime allows a pod that only as a device plugin offers
+  it. The chart runs [generic-device-plugin](https://github.com/squat/generic-device-plugin) on
+  every node (`devicePlugin`), offering `devic.es/fuse` and `devic.es/kvm`, and gives workers and
+  the deployer the FUSE device; where the cluster runs a device plugin of its own, disable the
+  chart's and name its resources (`worker.fuseResource`, `deploy.fuseResource`,
+  `worker.microvm.kvmResource`). The chart starts them under `unshare --map-root-user --mount
+  --propagation private`, from the runner image's util-linux, which makes the user and mount
+  namespace okfs mounts in (ok checks it is in one as it starts, and refuses otherwise), with
+  seccomp and AppArmor unconfined; outside the chart, start them the same way. A real checkout
+  (`worker.checkout: real`), every file of each commit written to disk, needs neither, and is only
+  for a legacy use that needs a commit's whole source on disk.
 - **Runs in microVMs** (`worker.microvm.enabled`; [hosted.md](hosted.md), "Hosted automation, as
   built") need KVM: nodes with hardware virtualization — bare metal, or VMs with nested
   virtualization (on GKE, an N2 or C2 node pool with `--enable-nested-virtualization`) — and
-  `/dev/kvm` in the worker's pod, which a device plugin offers as a resource
-  (`worker.microvm.kvmResource: devic.es/kvm`, generic-device-plugin's with a `kvm` device), else
-  the chart binds it in from the node where the runtime allows it. The runner image carries Cloud
+  `/dev/kvm` in the worker's pod, which the chart's device plugin offers as `devic.es/kvm` on the
+  nodes that have it (a plugin of your own: `worker.microvm.kvmResource`), else the chart binds it
+  in from the node where the runtime allows it. The runner image carries Cloud
   Hypervisor, virtiofsd, and the guests' kernel. Each run's guest sees its trust domain's checkouts
   and output bases and the image's `/usr`, never the worker's credentials, and reaches out only
   through the worker's proxy, to the hosts `worker.microvm.egress` allows; give the pods room for

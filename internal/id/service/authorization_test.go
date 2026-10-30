@@ -112,7 +112,6 @@ func TestAuthorization(t *testing.T) {
 	if _, err := e.store.DeleteRepository(ctx, app.ID); err != nil {
 		t.Fatal(err)
 	}
-	checker.Forget(app.ID)
 	if d, err := checker.Decide(ctx, adaID, nil, app.ID, authz.Restore); err != nil || !d.Allowed {
 		t.Errorf("the owner restoring a deleted repository: %+v, %v", d, err)
 	}

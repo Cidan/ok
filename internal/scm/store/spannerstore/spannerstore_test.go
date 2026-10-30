@@ -77,7 +77,7 @@ func TestManyRows(t *testing.T) {
 		}},
 		{"InsertCommitParents", func(tx backend.Ops) (int, error) { return n, tx.InsertCommitParents(ctx, repo, edges) }},
 		{"InsertCommitPaths", func(tx backend.Ops) (int, error) {
-			return n, tx.InsertCommitPaths(ctx, repo, 1, idOf("commit", 0), paths)
+			return n, tx.InsertCommitPaths(ctx, repo, []backend.CommitPaths{{Generation: 1, Commit: idOf("commit", 0), Paths: paths}})
 		}},
 		{"pinning", func(tx backend.Ops) (int, error) {
 			pinned, _, err := tx.WalkObjects(ctx, repo, encoding.KindTree, trees, backend.PinWalk)
@@ -237,11 +237,30 @@ func TestStagedContentLog(t *testing.T) {
 		t.Errorf("from the place: %q, want the fourth alone", got)
 	}
 
-	// A fold's deletion: what committed by its place, the folded batch's marker, and — once old
-	// enough — the staged rows of no committed batch.
-	defer spannerstore.SetStagedOrphanAge(0)()
-	if _, err := b.DeleteFoldedContentLogs(ctx, sc, folded, 1000); err != nil {
+	// A row from before commit timestamps, as a release before them left it: no timestamp, shard 0.
+	if _, err := client.ReadWriteTransaction(ctx, func(ctx context.Context, tx *spanner.ReadWriteTransaction) error {
+		_, err := tx.Update(ctx, spanner.Statement{SQL: `INSERT INTO content_log (scope, owner_id, id, created_at, body, logged_at, shard)
+			SELECT scope, owner_id, 999999, CURRENT_TIMESTAMP(), b'legacy', NULL, 0 FROM content_index`})
+		return err
+	}); err != nil {
 		t.Fatal(err)
+	}
+
+	// A fold's deletion: what committed by its place, the folded batch's marker, the rows from before
+	// commit timestamps, and — once old enough — the staged rows of no committed batch. A row a
+	// round, as a fold of many deletes them: the marker goes with the last of its rows.
+	defer spannerstore.SetStagedOrphanAge(0)()
+	for round := 0; ; round++ {
+		n, err := b.DeleteFoldedContentLogs(ctx, sc, folded, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n == 0 {
+			break
+		}
+		if round == 20 {
+			t.Fatal("the deletion never ended")
+		}
 	}
 	if n, m := rows("content_log"), rows("content_log_batch"); n != 0 || m != 0 {
 		t.Errorf("after the fold: %d log rows and %d batch markers left", n, m)

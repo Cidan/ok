@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -105,6 +106,7 @@ func Merge(reps []*Report) (*Report, error) {
 	out := &Report{Shape: fmt.Sprintf("%d pods: %s", len(reps), reps[0].Shape), Started: reps[0].Started, Operations: map[string]Result{},
 		Bytes: reps[0].Bytes, CLs: CLOutcomes{Failed: map[string]int{}}}
 	hists := map[string]*histogram{}
+	minutes := map[string]map[int]*histogram{}
 	for _, r := range reps {
 		out.CellFraction += r.CellFraction
 		out.Rates.Publishes += r.Rates.Publishes
@@ -140,6 +142,22 @@ func Merge(reps []*Report) (*Report, error) {
 			for i, n := range o.Buckets {
 				h.counts[i] += n
 			}
+			for _, mi := range o.Minutes {
+				if minutes[name] == nil {
+					minutes[name] = map[int]*histogram{}
+				}
+				mh := minutes[name][mi.Minute]
+				if mh == nil {
+					mh = newHistogram()
+					minutes[name][mi.Minute] = mh
+				}
+				if len(mi.Buckets) != len(mh.counts) {
+					return nil, fmt.Errorf("load: %s's minute %d has %d buckets, not %d", name, mi.Minute, len(mi.Buckets), len(mh.counts))
+				}
+				for i, n := range mi.Buckets {
+					mh.counts[i] += n
+				}
+			}
 			out.Operations[name] = m
 		}
 		out.CLs.Submitted += r.CLs.Submitted
@@ -158,6 +176,7 @@ func Merge(reps []*Report) (*Report, error) {
 		m.OfferedRate, m.AchievedRate = float64(m.Offered)/over, float64(m.OK)/over
 		m.P50, m.P90, m.P99, m.P999 = ms(h.quantile(0.5)), ms(h.quantile(0.9)), ms(h.quantile(0.99)), ms(h.quantile(0.999))
 		m.Buckets = h.counts
+		m.Minutes = minutesOf(minutes[name])
 		out.Operations[name] = m
 	}
 	if len(out.CLs.Failed) == 0 {
@@ -191,6 +210,9 @@ func (rep *Report) Summary() []string {
 	sort.Strings(names)
 	for _, n := range names {
 		o := rep.Operations[n]
+		if strings.HasPrefix(n, "burst.") && o.Offered == 0 {
+			continue // no burst
+		}
 		var errs int64
 		for _, e := range o.Errors {
 			errs += e
@@ -200,12 +222,56 @@ func (rep *Report) Summary() []string {
 	}
 	out = append(out, fmt.Sprintf("  CLs: %d submitted, %d landed, %v failed, %d stuck; runs: %d plans, %d jobs", rep.CLs.Submitted, rep.CLs.Landed,
 		rep.CLs.Failed, len(rep.CLs.Stuck), rep.Runs.Plans, rep.Runs.Jobs))
+	out = append(out, rep.byMinute()...)
 	for _, c := range rep.Checks {
 		mark := "ok  "
 		if !c.OK {
 			mark = "FAIL"
 		}
 		out = append(out, fmt.Sprintf("  %s %s %s", mark, c.Name, c.Detail))
+	}
+	return out
+}
+
+// minuteOps are the operations a report's by-minute table shows.
+var minuteOps = []string{"publish", "checkpoint", "cl.upload", "cl.pre", "cl.post", "cl.landed", "worker.present", "worker.files"}
+
+// byMinute is a table of the operations' p50 and p99, in seconds, and their count, by the minute of
+// the run they began in.
+func (rep *Report) byMinute() []string {
+	rows := map[int]map[string]Minute{}
+	for _, name := range minuteOps {
+		for _, m := range rep.Operations[name].Minutes {
+			if rows[m.Minute] == nil {
+				rows[m.Minute] = map[string]Minute{}
+			}
+			rows[m.Minute][name] = m
+		}
+	}
+	if len(rows) == 0 {
+		return nil
+	}
+	head := "  by the minute begun (p50/p99 s, n):"
+	for _, name := range minuteOps {
+		head += fmt.Sprintf(" %-22s", name)
+	}
+	out := []string{head}
+	keys := make([]int, 0, len(rows))
+	for m := range rows {
+		keys = append(keys, m)
+	}
+	sort.Ints(keys)
+	for _, k := range keys {
+		line := fmt.Sprintf("    minute %3d                       ", k)
+		for _, name := range minuteOps {
+			m, ok := rows[k][name]
+			if !ok {
+				line += fmt.Sprintf(" %-22s", "-")
+				continue
+			}
+			line += fmt.Sprintf(" %-22s", fmt.Sprintf("%.1f/%.1f %d", float64(m.P50)/1000, float64(m.P99)/1000, m.OK))
+		}
+		out = append(out, line)
 	}
 	return out
 }

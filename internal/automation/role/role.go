@@ -1,7 +1,7 @@
 // Package role assembles ok automation: its database (schema automation) and logs' bucket, the
-// Runs, Pushes, and Work services on the role's one port, the sweep of lapsed leases and stranded
-// logs, the follower of the SCM's change feed that plans each patchset's pre, and the landing
-// queue — each of the last two on one replica at a time. It reaches the SCM and identity as its
+// Runs, Pushes, and Work services on the role's one port, the consumer of the jobs that store
+// finished runs' logs, the follower of the SCM's change feed that plans each patchset's pre, and
+// the landing queue — each of the last two on one replica at a time. It reaches the SCM and identity as its
 // own robot.
 package role
 
@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"google.golang.org/grpc"
@@ -29,7 +28,6 @@ import (
 	autopostgres "github.com/Cidan/ok/internal/automation/store/postgres"
 	"github.com/Cidan/ok/internal/automation/store/spannerstore"
 	"github.com/Cidan/ok/internal/blob"
-	"github.com/Cidan/ok/internal/bus"
 	"github.com/Cidan/ok/internal/bus/busconfig"
 	"github.com/Cidan/ok/internal/cells"
 	"github.com/Cidan/ok/internal/config"
@@ -41,6 +39,8 @@ import (
 	"github.com/Cidan/ok/internal/serve/authn"
 	"github.com/Cidan/ok/internal/serve/node"
 	"github.com/Cidan/ok/internal/spannerdb"
+	"github.com/Cidan/ok/internal/wait"
+	"github.com/Cidan/ok/internal/work"
 	automationpb "github.com/Cidan/ok/proto/ok/automation/v1"
 	identitypb "github.com/Cidan/ok/proto/ok/identity/v1"
 	scmpb "github.com/Cidan/ok/proto/ok/scm/v1"
@@ -49,9 +49,6 @@ import (
 
 // Schema is the PostgreSQL schema ok automation keeps its tables in.
 const Schema = "automation"
-
-// sweepInterval is how often the sweep acts on lapsed leases and stranded logs.
-const sweepInterval = 15 * time.Second
 
 // Role is ok automation, assembled.
 type Role struct {
@@ -72,11 +69,9 @@ func (r *Role) Close() {
 type Options struct {
 	// Dev accepts development principals, and makes the logs' bucket: a role on loopback.
 	Dev bool
-	// Pool, Logs, and Stream, when set, are the database, bucket, and bus's stream instead of the
-	// configuration's: tests.
-	Pool   *pgxpool.Pool
-	Logs   blob.Store
-	Stream bus.Stream
+	// Pool and Logs, when set, are the database and bucket instead of the configuration's: tests.
+	Pool *pgxpool.Pool
+	Logs blob.Store
 	// Identity and SCM, when set, are dialed as ok automation already: tests.
 	Identity, SCM grpc.ClientConnInterface
 	// Deployments, when set, sizes the pools' worker Deployments instead of the cluster's: tests.
@@ -138,15 +133,11 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (*Role, error)
 		}
 		logs = s3
 	}
-	stream := opts.Stream
-	if stream == nil {
-		bb, err := busconfig.Open(ctx, cfg.Bus, pool)
-		if err != nil {
-			return nil, err
-		}
-		r.closers = append(r.closers, bb.Close)
-		stream = bb.Stream
+	bb, err := busconfig.Open(ctx, cfg.Bus)
+	if err != nil {
+		return nil, err
 	}
+	r.closers = append(r.closers, bb.Close)
 
 	idConn, scmConn := opts.Identity, opts.SCM
 	if idConn == nil || scmConn == nil {
@@ -180,9 +171,7 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (*Role, error)
 	}
 	roots := opts.Roots
 	if roots == nil {
-		if roots, err = idclient.NewRoots(ctx, idConn, "automation"); err != nil {
-			return nil, err
-		}
+		roots = idclient.NewRoots(idConn)
 	}
 	r.Resolver = authn.NewResolver(authn.Config{
 		Directory:     idclient.NewDirectory(idConn),
@@ -192,13 +181,19 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (*Role, error)
 		Roles:         idclient.Roles(cfg),
 	})
 	scfg := store.DefaultConfig
-	// The stream's backend carries the signals (docs/hosted.md, "Signals").
-	scfg.Signals, _ = stream.(bus.Signals)
+	// The bus's queue dispatches runs to workers (docs/hosted.md, "Hosted automation, as built"),
+	// and carries the inboxes of the readers following runs' logs.
+	scfg.Dispatch = bb.Queue
 	// Admission by the directory's quotas, with the other cells' use (docs/hosted.md, "Hosted
 	// automation, as built").
 	quotas := identitypb.NewQuotasClient(idConn)
-	scfg.PlanPool, scfg.Quotas = cfg.Automation.PlanPool, quota.NewCache(quotas, cfg.Cell.Name).Get
+	scfg.PlanPool, scfg.Quotas = cfg.Automation.PlanPool, quota.Reader{Quotas: quotas, Cell: cfg.Cell.Name}.Get
 	st := store.New(b, logs, scfg)
+	// Its keyed work's jobs go on the bus's queue, as its runs do (docs/hosted.md, "Work without
+	// leaders").
+	if err := bb.RegisterWork(st.Work(), "automation"); err != nil {
+		return nil, err
+	}
 	r.Store = st
 	report := &app{name: "ok/automation/usage", run: (&quota.Reporter{Store: st, Quotas: quotas, Cell: cfg.Cell.Name, Log: slog.Default()}).Run}
 	qcfg := queue.DefaultConfig
@@ -208,14 +203,17 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (*Role, error)
 	if b := cfg.Automation.LandingBatch; b != nil {
 		qcfg.Batch = *b
 	}
+	if p := cfg.Automation.QueueParallel; p != nil {
+		qcfg.Parallel = *p
+	}
 	// Runs.StartPre plans pre as the feed does, reading the SCM.
-	follow := &follower{f: feed.New(st, stream, feed.SCM{
+	follow := &follower{f: feed.New(st, feed.SCM{
 		Events:       scmpb.NewEventsClient(scmConn),
 		ChangeLists:  scmpb.NewChangeListsClient(scmConn),
 		Repositories: scmpb.NewRepositoriesClient(scmConn),
 		Browse:       scmpb.NewBrowseClient(scmConn),
 	}, slog.Default())}
-	svc := &services{svc: service.New(st, store.DefaultConfig.Heartbeat, cfg.Automation.Cache != nil, follow.f)}
+	svc := &services{svc: service.New(st, store.DefaultConfig.Heartbeat, cfg.Automation.Cache != nil, follow.f), waits: st.Waits()}
 	// The remote cache its workers' Bazel reaches, in the logs' bucket (docs/hosted.md, "Hosted
 	// automation, as built").
 	if ac := cfg.Automation.Cache; ac != nil {
@@ -225,14 +223,14 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (*Role, error)
 			return cache.Expire(ctx, svc.cache, st.Work(), ac.TTL, slog.Default())
 		}}
 	}
-	sweep := &sweeper{store: st}
+	storer := &logStorer{store: st}
 	lander := &lander{q: queue.New(st, queue.SCM{
 		ChangeLists:  scmpb.NewChangeListsClient(scmConn),
 		Landing:      scmpb.NewLandingClient(scmConn),
 		Repositories: scmpb.NewRepositoriesClient(scmConn),
 		Browse:       scmpb.NewBrowseClient(scmConn),
 	}, qcfg, slog.Default())}
-	directory := &dirFollower{d: feed.NewDirectory(st, stream, identitypb.NewDirectoryEventsClient(idConn), slog.Default())}
+	directory := &dirFollower{d: feed.NewDirectory(st, identitypb.NewDirectoryEventsClient(idConn), slog.Default())}
 	// Moves of its repositories' rows and logs between cells, from the same role of the source
 	// cell (docs/hosted.md, "Cells, as built").
 	peers := cells.NewPeers(identitypb.NewCellsClient(idConn), func(addr string) (grpc.ClientConnInterface, func(), error) {
@@ -265,7 +263,7 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (*Role, error)
 			}
 			return okpb.NewMovesClient(c), nil
 		}), mover.Purge)
-	deps := []node.Node{svc, sweep, follow, directory, lander, moves, report, roots}
+	deps := []node.Node{svc, storer, follow, directory, lander, moves, report}
 	// The pools of workers, sized to what they are asked for (docs/hosted.md, "Hosted automation,
 	// as built").
 	if len(cfg.Automation.Pools) > 0 {
@@ -307,6 +305,7 @@ type services struct {
 	svc   service.Services
 	cache *cache.Server
 	sweep node.Node
+	waits wait.Store
 }
 
 var _ node.Service = (*services)(nil)
@@ -321,35 +320,33 @@ func (s *services) RegisterRPC(_ context.Context, reg grpc.ServiceRegistrar) err
 	automationpb.RegisterPushesServer(reg, s.svc.Pushes)
 	automationpb.RegisterWorkServer(reg, s.svc.Work)
 	automationpb.RegisterSecretRunsServer(reg, s.svc.SecretRuns)
+	okpb.RegisterWaitsServer(reg, &wait.Server{Store: s.waits})
 	if s.cache != nil {
 		s.cache.Register(reg)
 	}
 	return nil
 }
 
-// sweeper requeues runs whose leases lapsed and moves finished runs' logs, on every replica, and
-// listens for the database's notifications.
-type sweeper struct{ store *store.Store }
+// logStorer stores finished runs' logs as their jobs come, on every replica, and listens for the
+// bus's signals. Once, once the release before has stopped (work.Once), it takes up what that
+// release left: its queued runs dispatched, its logs stored.
+type logStorer struct{ store *store.Store }
 
-var _ node.Application = (*sweeper)(nil)
+var _ node.Application = (*logStorer)(nil)
 
-func (*sweeper) Name() string                 { return "ok/automation/sweep" }
-func (*sweeper) Dependencies() []node.Node    { return nil }
-func (*sweeper) Setup(context.Context) error  { return nil }
-func (*sweeper) Healthy(context.Context) bool { return true }
+func (*logStorer) Name() string                 { return "ok/automation/logs" }
+func (*logStorer) Dependencies() []node.Node    { return nil }
+func (*logStorer) Setup(context.Context) error  { return nil }
+func (*logStorer) Healthy(context.Context) bool { return true }
 
-func (s *sweeper) Start(ctx context.Context) error {
-	go s.store.Listen(ctx)
-	for {
-		if err := s.store.Sweep(ctx); err != nil && ctx.Err() == nil {
-			slog.Warn("automation: sweep", "err", err)
+func (s *logStorer) Start(ctx context.Context) error {
+	go s.store.RunWaits(ctx)
+	go func() {
+		if err := work.Once(ctx, s.store.Work(), "automation-upgrade", s.store.Started, slog.Default()); err != nil && ctx.Err() == nil {
+			slog.Warn("automation: taking up what an older release left", "err", err)
 		}
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-time.After(sweepInterval):
-		}
-	}
+	}()
+	return s.store.StoreLogs(ctx)
 }
 
 // follower plans each patchset the SCM's change feed announces.

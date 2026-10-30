@@ -18,11 +18,14 @@ import (
 
 	"github.com/Cidan/ok/internal/data"
 	"github.com/Cidan/ok/internal/data/spannerdata"
+	"github.com/Cidan/ok/internal/data/spannertxn"
 	"github.com/Cidan/ok/internal/deploy/store"
 	"github.com/Cidan/ok/internal/lock"
 	"github.com/Cidan/ok/internal/lock/spannerlock"
 	"github.com/Cidan/ok/internal/migrate"
 	"github.com/Cidan/ok/internal/move"
+	"github.com/Cidan/ok/internal/wait"
+	"github.com/Cidan/ok/internal/work"
 	"github.com/Cidan/ok/internal/workflow"
 )
 
@@ -40,6 +43,11 @@ type Backend struct {
 }
 
 var _ store.Backend = (*Backend)(nil)
+
+// Work is the backend's keyed work's store.
+func (b *Backend) Work() work.Store { return spannerdata.Work(b.Client) }
+
+func (b *Backend) Waits() wait.Store { return spannerdata.Waits(b.Client) }
 
 // Open brings the database client reaches to the deployer's schema, through admin, and returns a
 // backend over it.
@@ -132,6 +140,10 @@ func (x queries) LockFollowCursor(ctx context.Context, topic string, key int64) 
 
 func (x queries) SetFollowCursor(ctx context.Context, topic string, key, seq int64) error {
 	return x.Write(ctx, func(tx *spanner.ReadWriteTransaction) error { return spannerdata.SetCursor(ctx, tx, topic, key, seq) })
+}
+
+func (x queries) PendStep(ctx context.Context, kind string, key int64, at time.Time, body []byte) error {
+	return x.Write(ctx, func(tx *spanner.ReadWriteTransaction) error { return spannerdata.PendStep(tx, kind, key, at, body) })
 }
 
 // DropRepository deletes a repository's rows by partitioned DML, each statement apart from any
@@ -229,6 +241,20 @@ func (x queries) Unplanned(ctx context.Context) ([]store.Repository, error) {
 		})
 	})
 	return out, err
+}
+
+func (x queries) UnplannedRepository(ctx context.Context, id int64) (store.Repository, bool, error) {
+	var rp store.Repository
+	var ok bool
+	err := x.Read(func(r spannerdata.Reader) error {
+		ok = false
+		return spannerdata.Each(ctx, r, `SELECT repository_id, name, head, head_seq, planned_head, planned_seq FROM repository
+			WHERE repository_id = @id AND head_seq > planned_seq AND name != ''`, map[string]any{"id": id}, func(row *spanner.Row) error {
+			ok = true
+			return row.Columns(&rp.ID, &rp.Name, &rp.Head, &rp.HeadSeq, &rp.PlannedHead, &rp.PlannedSeq)
+		})
+	})
+	return rp, ok, err
 }
 
 // ─── Plans ───
@@ -384,7 +410,7 @@ func (x queries) CancelWaitingOf(ctx context.Context, repo int64, deploy, reason
 	var out []store.Replaced
 	err := x.Returning(ctx, `UPDATE deployment SET status = @canceled, stage = @done, reason = @reason, finished_at = CURRENT_TIMESTAMP()
 		WHERE repository_id = @repo AND deploy = @deploy AND status = @waiting
-		THEN RETURN IFNULL(plan_id, 0), wave, gate_plans, gate_waves`,
+		THEN RETURN deployment_id, IFNULL(plan_id, 0), wave, gate_plans, gate_waves`,
 		map[string]any{"repo": repo, "deploy": deploy, "reason": reason, "canceled": int64(store.Canceled), "done": int64(store.Done),
 			"waiting": int64(store.Waiting)},
 		func() { out = nil },
@@ -392,7 +418,7 @@ func (x queries) CancelWaitingOf(ctx context.Context, repo int64, deploy, reason
 			var c store.Replaced
 			var wave int64
 			var gp, gw []int64
-			if err := row.Columns(&c.Plan, &wave, &gp, &gw); err != nil {
+			if err := row.Columns(&c.ID, &c.Plan, &wave, &gp, &gw); err != nil {
 				return err
 			}
 			c.Wave, c.Gates = int(wave), gatesOf(gp, gw)
@@ -421,12 +447,26 @@ func (x queries) CancelWaitingIn(ctx context.Context, plan, except int64, reason
 	return ids, err
 }
 
-func (x queries) HaltRunningIn(ctx context.Context, plan, except int64, wave int, reason string) error {
-	_, err := x.Exec(ctx, `UPDATE deployment SET halt_reason = @reason
-		WHERE deployment_id != @except AND status = @running AND halt_by IS NULL AND halt_reason IS NULL
-		AND (plan_id = @plan OR EXISTS (SELECT 1 FROM UNNEST(gate_plans) AS p WITH OFFSET o WHERE p = @plan AND gate_waves[OFFSET(o)] >= @wave))`,
-		map[string]any{"plan": plan, "except": except, "reason": reason, "running": int64(store.Running), "wave": int64(wave)})
-	return err
+func (x queries) HaltRunningIn(ctx context.Context, plan, except int64, wave int, reason string) ([]*store.Deployment, error) {
+	var out []*store.Deployment
+	err := x.Write(ctx, func(tx *spanner.ReadWriteTransaction) error {
+		out = nil
+		spannertxn.Counted(tx)
+		return tx.Query(ctx, spanner.Statement{SQL: `UPDATE deployment SET halt_reason = @reason
+			WHERE deployment_id != @except AND status = @running AND halt_by IS NULL AND halt_reason IS NULL
+			AND (plan_id = @plan OR EXISTS (SELECT 1 FROM UNNEST(gate_plans) AS p WITH OFFSET o WHERE p = @plan AND gate_waves[OFFSET(o)] >= @wave))
+			THEN RETURN deployment_id, self, IFNULL(driver, '')`,
+			Params: map[string]any{"plan": plan, "except": except, "reason": reason, "running": int64(store.Running), "wave": int64(wave)}}).
+			Do(func(row *spanner.Row) error {
+				var d store.Deployment
+				if err := row.Columns(&d.ID, &d.Self, &d.Driver); err != nil {
+					return err
+				}
+				out = append(out, &d)
+				return nil
+			})
+	})
+	return out, err
 }
 
 var deploymentColumns = `deployment_id, repository_id, IFNULL(plan_id, 0), IFNULL(retry_of, 0), deploy, name, commit_id, from_seq, to_seq,
@@ -780,54 +820,4 @@ func (x queries) MarkWork(ctx context.Context, kind string, key int64) error {
 
 func (x queries) MarkWorkAt(ctx context.Context, kind string, key int64, at time.Time) error {
 	return x.Write(ctx, func(tx *spanner.ReadWriteTransaction) error { return spannerdata.MarkWorkAt(ctx, tx, kind, key, at) })
-}
-
-func (x queries) MarkWorkIdle(ctx context.Context, kind string, key int64) error {
-	return x.Write(ctx, func(tx *spanner.ReadWriteTransaction) error { return spannerdata.MarkWorkIdle(ctx, tx, kind, key) })
-}
-
-func (x queries) TakeWork(ctx context.Context, kind string, key int64, holder string, ttl time.Duration) (bool, error) {
-	var ok bool
-	err := x.Write(ctx, func(tx *spanner.ReadWriteTransaction) error {
-		var err error
-		ok, err = spannerdata.TakeWork(ctx, tx, kind, key, holder, ttl)
-		return err
-	})
-	return ok, err
-}
-
-func (x queries) RenewWork(ctx context.Context, kind string, key int64, holder string, ttl time.Duration) (bool, error) {
-	var ok bool
-	err := x.Write(ctx, func(tx *spanner.ReadWriteTransaction) error {
-		var err error
-		ok, err = spannerdata.RenewWork(ctx, tx, kind, key, holder, ttl)
-		return err
-	})
-	return ok, err
-}
-
-func (x queries) ReleaseWork(ctx context.Context, kind string, key int64, holder string) (bool, error) {
-	var again bool
-	err := x.Write(ctx, func(tx *spanner.ReadWriteTransaction) error {
-		var err error
-		again, err = spannerdata.ReleaseWork(ctx, tx, kind, key, holder)
-		return err
-	})
-	return again, err
-}
-
-func (x queries) LetWork(ctx context.Context, kind string, key int64, holder string) error {
-	return x.Write(ctx, func(tx *spanner.ReadWriteTransaction) error {
-		return spannerdata.LetWork(ctx, tx, kind, key, holder)
-	})
-}
-
-func (x queries) DueWork(ctx context.Context, kind string, limit int) ([]int64, error) {
-	var keys []int64
-	err := x.Read(func(r spannerdata.Reader) error {
-		var err error
-		keys, err = spannerdata.DueWork(ctx, r, kind, limit)
-		return err
-	})
-	return keys, err
 }

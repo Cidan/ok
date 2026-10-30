@@ -4,10 +4,10 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"os"
 	"sort"
 	"strings"
 
+	"github.com/Cidan/ok/internal/membuf"
 	"github.com/Cidan/ok/internal/scm/contentindex"
 	"github.com/Cidan/ok/internal/scm/encoding"
 	"github.com/Cidan/ok/internal/scm/pack"
@@ -247,13 +247,8 @@ func (s *Store) fsckPacks(ctx context.Context, repo int64, repair bool, r *FsckR
 // decoding canonically — and the files whose first chunk it holds, and returns its records no entry
 // points at.
 func (s *Store) fsckPack(ctx context.Context, repo int64, net backend.Network, here []contentindex.Keyed, files []fsckFile, pr packRow, r *FsckReport) ([]orphan, error) {
-	f, err := os.CreateTemp("", "ok scm-fsck-*")
-	if err != nil {
-		return nil, err
-	}
-	defer os.Remove(f.Name())
-	defer f.Close()
-	size, err := s.blobs.Download(ctx, packKey(net, pr.id), f)
+	var f membuf.Buffer
+	size, err := s.blobs.Download(ctx, packKey(net, pr.id), &f)
 	if err != nil {
 		r.problem("pack %s: %v", pr.id, err)
 		return nil, nil
@@ -261,7 +256,7 @@ func (s *Store) fsckPack(ctx context.Context, repo int64, net backend.Network, h
 	if size != pr.size {
 		r.problem("pack %s: %d bytes stored, row says %d", pr.id, size, pr.size)
 	}
-	records, err := pack.Verify(f, size, pr.id, s.dicts.of(net))
+	records, err := pack.Verify(&f, size, pr.id, s.dicts.of(net))
 	if err != nil {
 		r.problem("pack %s: %v", pr.id, err)
 		return nil, nil

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/Cidan/ok/internal/secrets/secretstore/storetest"
@@ -120,6 +121,23 @@ func newStore(t *testing.T, addr string) *Store {
 
 func TestConformance(t *testing.T) {
 	_, s := newFake(t)
+	storetest.Run(t, newStore(t, s.URL))
+}
+
+// Through a Vault that fails every other request for a moment (503) — a login, a write, a read —
+// every request is made again, and the store holds to its contract: a write whose answer was lost
+// found held, the same.
+func TestConformanceThroughFailures(t *testing.T) {
+	f := &fake{t: t, kv: map[string]map[string]any{}, tokens: map[string]bool{}}
+	var n atomic.Int64
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if n.Add(1)%2 == 1 {
+			f.fail(w, http.StatusServiceUnavailable, "Vault is sealed for a moment")
+			return
+		}
+		f.ServeHTTP(w, r)
+	}))
+	t.Cleanup(s.Close)
 	storetest.Run(t, newStore(t, s.URL))
 }
 

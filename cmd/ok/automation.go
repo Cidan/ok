@@ -232,6 +232,7 @@ func workerRun(args []string) error {
 			}
 		}
 	case "real":
+		slog.Warn("worker.checkout is real: every file of each run's commit is written to disk; present it through okfs (virtual) unless a legacy use needs its whole source on disk")
 		newCheckout = func(dir string) (checkout.Checkout, error) { return checkout.NewReal(dir, src) }
 		for i := 1; i <= w.Slots && w.MicroVM == nil; i++ {
 			co, err := checkout.NewReal(slotDir(i, false), src)

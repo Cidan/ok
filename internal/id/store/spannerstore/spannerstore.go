@@ -24,9 +24,9 @@ import (
 	"github.com/Cidan/ok/internal/directory"
 	"github.com/Cidan/ok/internal/directory/scim"
 	"github.com/Cidan/ok/internal/id/store"
-	"github.com/Cidan/ok/internal/lock"
 	"github.com/Cidan/ok/internal/lock/spannerlock"
 	"github.com/Cidan/ok/internal/migrate"
+	"github.com/Cidan/ok/internal/wait"
 )
 
 //go:embed migrations/*.sql
@@ -38,7 +38,6 @@ var Migrations = migrate.MustLoad(migrations, "migrations")
 // Backend is identity's store backend on Spanner.
 type Backend struct {
 	queries
-	locks *lock.Lock
 }
 
 var _ store.Backend = (*Backend)(nil)
@@ -49,7 +48,7 @@ func Open(ctx context.Context, admin *database.DatabaseAdminClient, client *span
 	if _, err := spannerdata.Migrate(ctx, admin, client, Migrations); err != nil {
 		return nil, err
 	}
-	return &Backend{queries: queries{spannerdata.Ops{Client: client}}, locks: lock.NewOn(spannerlock.DB(client))}, nil
+	return &Backend{queries: queries{spannerdata.Ops{Client: client}}}, nil
 }
 
 func (b *Backend) Txn(ctx context.Context, fn func(store.Ops) error) error {
@@ -58,9 +57,7 @@ func (b *Backend) Txn(ctx context.Context, fn func(store.Ops) error) error {
 	})
 }
 
-func (b *Backend) Lock(ctx context.Context, bucket, id string, wait time.Duration, fn lock.LockFn) error {
-	return b.locks.LockFn(ctx, bucket, id, wait, fn)
-}
+func (b *Backend) Waits() wait.Store { return spannerdata.Waits(b.Client) }
 
 func (b *Backend) Ping(ctx context.Context) error {
 	return b.Client.Single().Query(ctx, spanner.Statement{SQL: `SELECT 1`}).Do(func(*spanner.Row) error { return nil })

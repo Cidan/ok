@@ -21,6 +21,14 @@ const Topic = "scm.events"
 // Log is the SCM's events' log, a follow.Log.
 type Log struct{ Events scmpb.EventsClient }
 
+// Register is a follower's registration with the SCM (follow.Follower.Register).
+func Register(events scmpb.EventsClient) func(context.Context) error {
+	return func(ctx context.Context) error {
+		_, err := events.Follow(ctx, &scmpb.FollowRequest{})
+		return err
+	}
+}
+
 // Read returns a page of a repository's events after a place in its log.
 func (l Log) Read(ctx context.Context, repo, after int64) ([]bus.Event, error) {
 	resp, err := l.Events.Read(ctx, &scmpb.ReadEventsRequest{RepositoryId: repo, AfterSeq: after})

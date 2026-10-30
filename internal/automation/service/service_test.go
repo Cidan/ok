@@ -63,7 +63,7 @@ func newClients(t *testing.T) clients {
 		t.Fatal(err)
 	}
 	st := store.New(b, blobs, store.DefaultConfig)
-	go st.Listen(ctx)
+	go st.RunWaits(ctx)
 	svc := New(st, 10*time.Second, false, nil)
 	srv := grpc.NewServer(
 		grpc.UnaryInterceptor(func(ctx context.Context, req any, _ *grpc.UnaryServerInfo, h grpc.UnaryHandler) (any, error) {

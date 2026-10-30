@@ -157,16 +157,21 @@ func (s Snapshot) AfterLanding(submission, attempt int64) Snapshot {
 
 // Batch is the landings to make at once: the first Decide says, then each next that deciding on
 // the queue after the ones before it says, until one says anything but a landing, or max are
-// taken.
+// taken. It decides once, in queue order, going on after each landing from the submission behind
+// it, on the queue after the landing: a landing moves main and ends its submission, which changes
+// nothing ahead of it that a decision behind it reads, and lands nothing ahead of it — what waited
+// there for something ahead of it still does, and main moving only adds to what an attempt there
+// is checked against.
 func Batch(s Snapshot, max int) []Action {
+	d := newDecider(s)
 	var out []Action
 	for len(out) < max {
-		acts := Decide(s)
-		if len(acts) == 0 || acts[0].Kind != Land {
+		a, ok := d.nextLanding()
+		if !ok || a.Kind != Land {
 			break
 		}
-		out = append(out, acts[0])
-		s = s.AfterLanding(acts[0].Submission, acts[0].Attempt)
+		out = append(out, a)
+		d.landed(a.Submission, a.Attempt)
 	}
 	return out
 }
@@ -192,19 +197,10 @@ func LandingStep(s Snapshot, acts []Action, max int) (batch, rest []Action) {
 // queue order, then everything else. Landing moves main, so a caller acts on the first landing
 // and asks again.
 func Decide(s Snapshot) []Action {
-	d := &decider{s: s, active: map[int64]*Submission{}, leaving: map[int64]Outcome{}, pos: map[int64]int{},
-		wanted: map[int64][]int64{}, known: map[int64]bool{}, ref: map[int64]*Footprint{}}
-	if d.s.Depth <= 0 {
-		d.s.Depth = DefaultDepth
-	}
-	for i := range s.Submissions {
-		e := &s.Submissions[i]
-		d.active[e.ID], d.pos[e.ID] = e, i
-		d.ref[e.ID] = reference(e)
-	}
+	d := newDecider(s)
 	var lands, rest []Action
-	for i := range s.Submissions {
-		for _, a := range d.decide(i) {
+	for d.next < len(d.order) {
+		for _, a := range d.decideNext() {
 			if a.Kind == Land || a.Kind == Adopt {
 				lands = append(lands, a)
 			} else {
@@ -216,8 +212,13 @@ func Decide(s Snapshot) []Action {
 }
 
 type decider struct {
-	s      Snapshot
-	active map[int64]*Submission
+	s Snapshot
+	// order is the queue's submissions as the decider was made on it, next the place of the next
+	// to decide, and removed those a batch landed since (Batch).
+	order   []*Submission
+	next    int
+	removed map[int64]bool
+	active  map[int64]*Submission
 	// leaving are the active submissions this decision ends: failed or canceled (Ended), or
 	// adopted (Landed). Later submissions see them as ended already.
 	leaving map[int64]Outcome
@@ -227,6 +228,68 @@ type decider struct {
 	wanted map[int64][]int64
 	known  map[int64]bool // wanted is decided
 	ref    map[int64]*Footprint
+	// unplanned is the first submission decided that is neither known nor leaving, if any: every
+	// one behind it waits for it.
+	unplanned    int64
+	hasUnplanned bool
+	// conflicts are each submission's conflicts with those ahead of it (conflictGraph), and main
+	// the history passed attempts are checked against, read the first time one is.
+	conflicts [][]edge
+	main      *mainHistory
+}
+
+func newDecider(s Snapshot) *decider {
+	d := &decider{s: s, active: map[int64]*Submission{}, leaving: map[int64]Outcome{}, pos: map[int64]int{},
+		wanted: map[int64][]int64{}, known: map[int64]bool{}, ref: map[int64]*Footprint{}, removed: map[int64]bool{}}
+	if d.s.Depth <= 0 {
+		d.s.Depth = DefaultDepth
+	}
+	refs := make([]*Footprint, len(s.Submissions))
+	for i := range s.Submissions {
+		e := &s.Submissions[i]
+		d.order = append(d.order, e)
+		d.active[e.ID], d.pos[e.ID] = e, i
+		d.ref[e.ID] = reference(e)
+		refs[i] = d.ref[e.ID]
+	}
+	d.conflicts = conflictGraph(d.order, refs)
+	return d
+}
+
+// decideNext decides the next submission in queue order.
+func (d *decider) decideNext() []Action {
+	i := d.next
+	d.next++
+	e := d.order[i]
+	acts := d.decide(i)
+	if _, gone := d.leaving[e.ID]; !gone && !d.known[e.ID] && !d.hasUnplanned {
+		d.unplanned, d.hasUnplanned = e.ID, true
+	}
+	return acts
+}
+
+// nextLanding decides on, in queue order from where it stopped, until a submission lands or is
+// adopted, and returns that action; false when none is.
+func (d *decider) nextLanding() (Action, bool) {
+	for d.next < len(d.order) {
+		for _, a := range d.decideNext() {
+			if a.Kind == Land || a.Kind == Adopt {
+				return a, true
+			}
+		}
+	}
+	return Action{}, false
+}
+
+// landed has the decider go on deciding on the queue after a submission lands on an attempt
+// (Snapshot.AfterLanding).
+func (d *decider) landed(submission, attempt int64) {
+	d.s = d.s.AfterLanding(submission, attempt)
+	d.removed[submission] = true
+	delete(d.active, submission)
+	if d.main != nil {
+		d.main.extend(d.s)
+	}
 }
 
 // reference is the footprint the queue groups a submission by: its latest attempt prepared on
@@ -252,7 +315,7 @@ func current(e *Submission) *Attempt {
 }
 
 func (d *decider) decide(i int) []Action {
-	e := &d.s.Submissions[i]
+	e := d.order[i]
 	cur := current(e)
 	note := func(format string, args ...any) Action {
 		return Action{Kind: Note, Submission: e.ID, Reason: fmt.Sprintf(format, args...)}
@@ -280,16 +343,8 @@ func (d *decider) decide(i int) []Action {
 	if ref == nil {
 		return []Action{note("planning post")}
 	}
-	var earlier []*Submission
-	for j := range d.s.Submissions[:i] {
-		s := &d.s.Submissions[j]
-		if _, gone := d.leaving[s.ID]; gone {
-			continue
-		}
-		if !d.known[s.ID] {
-			return []Action{note("waiting for %s ahead of it to be planned", d.name(s.ID))}
-		}
-		earlier = append(earlier, s)
+	if d.hasUnplanned {
+		return []Action{note("waiting for %s ahead of it to be planned", d.name(d.unplanned))}
 	}
 
 	// Its chain: the earlier submissions it conflicts with, and theirs, but those that change
@@ -297,15 +352,17 @@ func (d *decider) decide(i int) []Action {
 	// to) and any that change a path an earlier chain member changes.
 	var blockers []int64
 	chain := map[int64]bool{}
-	for _, s := range earlier {
-		switch {
-		case PathConflict(d.ref[s.ID], ref):
-			blockers = append(blockers, s.ID)
-		case Conflict(d.ref[s.ID], ref):
-			chain[s.ID] = true
-			for _, t := range d.wanted[s.ID] {
-				chain[t] = true
-			}
+	for _, c := range d.conflicts[i] {
+		if _, gone := d.leaving[c.id]; gone || d.removed[c.id] {
+			continue
+		}
+		if c.path {
+			blockers = append(blockers, c.id)
+			continue
+		}
+		chain[c.id] = true
+		for _, t := range d.wanted[c.id] {
+			chain[t] = true
 		}
 	}
 	for _, b := range blockers {
@@ -357,31 +414,26 @@ func (d *decider) decide(i int) []Action {
 		return []Action{note("passed; waiting for %s, which %s the same files, to finish", d.names(blockers),
 			d.verb(blockers, "changes", "change"))}
 	}
-	have := map[int64]MainCommit{}
-	for _, m := range d.s.Main {
-		have[m.Seq] = m
+	// What landed on main since it was tested: the first commit it meets, in main's order, that it
+	// cannot land after — one not read yet, one landed outside the queue, or one whose change
+	// interacts with its own — but its chain's.
+	if d.main == nil {
+		d.main = newMainHistory(d.s)
 	}
-	for seq := cur.BaseSeq + 1; seq <= d.s.HeadSeq; seq++ {
-		m, ok := have[seq]
-		if !ok || seq <= d.s.From {
-			return []Action{note("passed; reading what landed on main since it was tested")}
-		}
-		if slices.Contains(cur.Chain, m.Submission) && m.Submission != 0 {
-			continue
-		}
+	seq, met := d.main.meets(cur, d.s.HeadSeq)
+	switch met {
+	case unread:
+		return []Action{note("passed; reading what landed on main since it was tested")}
+	case foreign, interacting:
 		landed := "a commit"
-		if m.CL > 0 {
+		if m := d.main.bySeq[seq]; m.CL > 0 {
 			landed = fmt.Sprintf("CL %d", m.CL)
 		}
-		fp := d.s.Landings[m.Submission]
-		switch {
-		case m.Submission == 0 || fp == nil:
-			return create([]Action{{Kind: Discard, Submission: e.ID, Attempt: cur.ID,
-				Reason: fmt.Sprintf("%s landed on main without the landing queue since it was tested", landed)}})
-		case Conflict(fp, cur.Footprint):
-			return create([]Action{{Kind: Discard, Submission: e.ID, Attempt: cur.ID,
-				Reason: fmt.Sprintf("%s landed on main since it was tested, and their changes interact", landed)}})
+		reason := fmt.Sprintf("%s landed on main without the landing queue since it was tested", landed)
+		if met == interacting {
+			reason = fmt.Sprintf("%s landed on main since it was tested, and their changes interact", landed)
 		}
+		return create([]Action{{Kind: Discard, Submission: e.ID, Attempt: cur.ID, Reason: reason}})
 	}
 	return []Action{{Kind: Land, Submission: e.ID, Attempt: cur.ID}}
 }

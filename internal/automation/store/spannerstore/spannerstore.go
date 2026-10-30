@@ -25,6 +25,8 @@ import (
 	"github.com/Cidan/ok/internal/migrate"
 	"github.com/Cidan/ok/internal/move"
 	"github.com/Cidan/ok/internal/scm/scmfeed"
+	"github.com/Cidan/ok/internal/wait"
+	"github.com/Cidan/ok/internal/work"
 )
 
 //go:embed migrations/*.sql
@@ -40,6 +42,11 @@ type Backend struct {
 }
 
 var _ store.Backend = (*Backend)(nil)
+
+// Work is the backend's keyed work's store.
+func (b *Backend) Work() work.Store { return spannerdata.Work(b.Client) }
+
+func (b *Backend) Waits() wait.Store { return spannerdata.Waits(b.Client) }
 
 // Open brings the database client reaches to automation's schema, through admin, and returns a
 // backend over it.
@@ -230,7 +237,7 @@ func (x queries) DeleteRepository(ctx context.Context, repo int64) error {
 const runColumns = `run_id, repository_id, commit_id, kind, targets, args, phase, IFNULL(cl_number, 0), IFNULL(patchset, 0), job,
 	requested_by, IFNULL(rerun_of, 0), status, attempt, IFNULL(worker, ''), IFNULL(exit_code, 0), reason, log_size,
 	log_stored, timeout_seconds, IFNULL(plan_id, 0), why, queued_at, started_at, finished_at, IFNULL(carried_from, 0),
-	IFNULL(canceled_by, ''), pool`
+	IFNULL(canceled_by, ''), pool, IFNULL(dispatch_job, ''), lease_handle`
 
 func scanRun(row *spanner.Row) (*store.Run, error) {
 	var r store.Run
@@ -239,7 +246,7 @@ func scanRun(row *spanner.Row) (*store.Run, error) {
 	if err := row.Columns(&r.ID, &r.RepositoryID, &r.CommitID, &kind, &r.Job.Targets, &r.Job.Args,
 		&phase, &r.Origin.CLNumber, &patchset, &r.Origin.Job, &r.RequestedBy, &r.RerunOf, &status, &attempt, &r.Worker,
 		&exitCode, &r.Reason, &r.LogSize, &r.LogStored, &timeout, &r.PlanID, &r.Why, &r.QueuedAt, &started, &finished,
-		&r.CarriedFrom, &r.CanceledBy, &r.Job.Pool); err != nil {
+		&r.CarriedFrom, &r.CanceledBy, &r.Job.Pool, &r.DispatchJob, &r.LeaseHandle); err != nil {
 		return nil, err
 	}
 	r.Job.Kind, r.Origin.Phase, r.Origin.Patchset, r.Status, r.Attempt = store.Kind(kind), store.Phase(phase), int32(patchset), store.Status(status), int32(attempt)
@@ -292,16 +299,16 @@ func insertRun(ctx context.Context, tx *spanner.ReadWriteTransaction, r store.Ne
 	id := data.NewID()
 	_, err := spannerdata.Update(ctx, tx, `INSERT INTO run (run_id, repository_id, commit_id, kind, targets, args, phase, cl_number, patchset, job,
 			plan_id, why, requested_by, rerun_of, status, attempt, reason, timeout_seconds, priority,
-			started_at, finished_at, log_stored, carried_from, log_size, queued_at, pool)
+			started_at, finished_at, log_stored, carried_from, log_size, queued_at, pool, dispatch_job)
 		VALUES (@id, @repo, @commit, @kind, @targets, @args, @phase, @cl, @patchset, @job, @plan, @why, @by, @rerun, @status, 1, @reason,
 			@timeout, @priority, IF(@started, CURRENT_TIMESTAMP(), NULL), IF(@finished, CURRENT_TIMESTAMP(), NULL), @stored, @carried, @logSize,
-			CURRENT_TIMESTAMP(), @pool)`,
+			CURRENT_TIMESTAMP(), @pool, @dispatch)`,
 		map[string]any{"id": id, "repo": r.RepositoryID, "commit": r.CommitID, "kind": int64(r.Job.Kind), "targets": orEmpty(r.Job.Targets),
 			"args": orEmpty(r.Job.Args), "phase": int64(r.Origin.Phase), "cl": nullable(r.Origin.CLNumber), "patchset": nullable(r.Origin.Patchset),
 			"job": r.Origin.Job, "plan": nullable(r.PlanID), "why": r.Why, "by": r.RequestedBy, "rerun": nullable(r.RerunOf),
 			"status": int64(r.Status), "reason": r.Reason, "timeout": int64(r.TimeoutSeconds), "priority": int64(r.Priority),
 			"started": r.Started, "finished": r.Finished, "stored": r.LogStored, "carried": nullable(r.CarriedFrom), "logSize": r.LogSize,
-			"pool": poolOf(r.Job.Pool)})
+			"pool": poolOf(r.Job.Pool), "dispatch": spanner.NullString{StringVal: r.DispatchJob, Valid: r.DispatchJob != ""}})
 	return id, err
 }
 
@@ -318,18 +325,23 @@ func (x queries) InsertRun(ctx context.Context, r store.NewRun) (*store.Run, err
 	return out, err
 }
 
-func (x queries) InsertRuns(ctx context.Context, rs []store.NewRun) error {
+func (x queries) InsertRuns(ctx context.Context, rs []store.NewRun) ([]int64, error) {
 	if len(rs) == 0 {
-		return nil
+		return nil, nil
 	}
-	return x.Write(ctx, func(tx *spanner.ReadWriteTransaction) error {
-		for _, r := range rs {
-			if _, err := insertRun(ctx, tx, r); err != nil {
+	var ids []int64
+	err := x.Write(ctx, func(tx *spanner.ReadWriteTransaction) error {
+		ids = make([]int64, len(rs))
+		for i, r := range rs {
+			id, err := insertRun(ctx, tx, r)
+			if err != nil {
 				return err
 			}
+			ids[i] = id
 		}
 		return nil
 	})
+	return ids, err
 }
 
 func (x queries) Run(ctx context.Context, id int64) (*store.Run, error) {
@@ -414,13 +426,13 @@ func (x queries) RenewLease(ctx context.Context, id int64, worker string, ttl ti
 	var ok bool
 	err := x.Returning(ctx, `UPDATE run SET lease_expires = TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL @ttl MICROSECOND)
 		WHERE run_id = @id AND status = @running AND worker = @worker
-		THEN RETURN stop_reason, CURRENT_TIMESTAMP() > TIMESTAMP_ADD(started_at, INTERVAL timeout_seconds SECOND), timeout_seconds`,
+		THEN RETURN stop_reason, CURRENT_TIMESTAMP() > TIMESTAMP_ADD(started_at, INTERVAL timeout_seconds SECOND), timeout_seconds, lease_handle`,
 		map[string]any{"id": id, "worker": worker, "ttl": micros(ttl), "running": int64(store.StatusRunning)},
 		func() { l, ok = store.Lease{}, false },
 		func(row *spanner.Row) error {
 			var stop spanner.NullString
 			var timeout int64
-			if err := row.Columns(&stop, &l.Overdue, &timeout); err != nil {
+			if err := row.Columns(&stop, &l.Overdue, &timeout, &l.Handle); err != nil {
 				return err
 			}
 			l.Stopping, l.StopReason, l.TimeoutSeconds, ok = stop.Valid, stop.StringVal, int32(timeout), true
@@ -429,52 +441,16 @@ func (x queries) RenewLease(ctx context.Context, id int64, worker string, ttl ti
 	return l, ok, err
 }
 
-func (x queries) LapsedRunIDs(ctx context.Context) ([]int64, error) {
-	var out []int64
-	err := x.Read(func(r spannerdata.Reader) error {
-		out = nil
-		return spannerdata.Each(ctx, r, `SELECT run_id FROM run WHERE status = @running AND lease_expires < CURRENT_TIMESTAMP()
-				AND NOT EXISTS (SELECT 1 FROM move_gate g WHERE g.repository_id = run.repository_id AND g.move_state != '')
-			ORDER BY run_id`, map[string]any{"running": int64(store.StatusRunning)}, func(row *spanner.Row) error {
-			var id int64
-			if err := row.Columns(&id); err != nil {
-				return err
-			}
-			out = append(out, id)
-			return nil
-		})
-	})
-	return out, err
-}
-
-// LapsedRun reads the run by its key, which holds it in the transaction: a sweep beside this one
-// meets it there, and Spanner runs one after the other, which finds it lapsed no more.
-func (x queries) LapsedRun(ctx context.Context, id int64) (store.Lapsed, bool, error) {
-	var l store.Lapsed
-	var ok bool
-	err := x.Write(ctx, func(tx *spanner.ReadWriteTransaction) error {
-		var phase, attempt int64
-		var stop spanner.NullString
-		var err error
-		l = store.Lapsed{ID: id}
-		ok, err = spannerdata.First(ctx, tx, `SELECT repository_id, phase, attempt, IFNULL(worker, ''), stop_reason FROM run
-			WHERE run_id = @id AND status = @running AND lease_expires < CURRENT_TIMESTAMP()`,
-			map[string]any{"id": id, "running": int64(store.StatusRunning)}, &l.RepositoryID, &phase, &attempt, &l.Worker, &stop)
-		l.Phase, l.Attempt, l.Stopping, l.StopReason = store.Phase(phase), int32(attempt), stop.Valid, stop.StringVal
-		return err
-	})
-	return l, ok, err
-}
-
-func (x queries) RequeueRun(ctx context.Context, id int64, reason string, nextAttempt bool) error {
+func (x queries) RequeueRun(ctx context.Context, id int64, job, reason string, nextAttempt bool) error {
 	return x.Write(ctx, func(tx *spanner.ReadWriteTransaction) error {
 		if err := stopRunning(ctx, tx, id); err != nil {
 			return err
 		}
 		_, err := spannerdata.Update(ctx, tx, `UPDATE run SET status = @queued, reason = @reason, attempt = attempt + IF(@next, 1, 0),
 				worker = NULL, lease_expires = NULL, started_at = NULL, finished_at = NULL, stop_reason = NULL, log_size = 0,
-				slot_account = NULL, slot = NULL
-			WHERE run_id = @id`, map[string]any{"id": id, "queued": int64(store.StatusQueued), "reason": reason, "next": nextAttempt})
+				slot_account = NULL, slot = NULL, dispatch_job = @job, lease_handle = NULL
+			WHERE run_id = @id`, map[string]any{"id": id, "queued": int64(store.StatusQueued), "reason": reason, "next": nextAttempt,
+			"job": spanner.NullString{StringVal: job, Valid: job != ""}})
 		return err
 	})
 }
@@ -485,7 +461,7 @@ func (x queries) FinishRun(ctx context.Context, id int64, status store.Status, e
 			return err
 		}
 		_, err := spannerdata.Update(ctx, tx, `UPDATE run SET status = @status, exit_code = @exit, reason = @reason, finished_at = CURRENT_TIMESTAMP(),
-			lease_expires = NULL, stop_reason = NULL, slot_account = NULL, slot = NULL WHERE run_id = @id`,
+			lease_expires = NULL, stop_reason = NULL, slot_account = NULL, slot = NULL, lease_handle = NULL WHERE run_id = @id`,
 			map[string]any{"id": id, "status": int64(status), "exit": int64(exitCode), "reason": reason})
 		return err
 	})
@@ -536,11 +512,15 @@ func (x queries) MarkLogStored(ctx context.Context, id int64) error {
 	return err
 }
 
-func (x queries) UnstoredLogs(ctx context.Context, limit int) ([]int64, error) {
+func (x queries) UnstoredLogs(ctx context.Context, repos []int64, limit int) ([]int64, error) {
+	if repos == nil {
+		repos = []int64{}
+	}
 	return x.ids(ctx, `SELECT run_id FROM run WHERE NOT log_stored AND status >= @passed
+		AND (ARRAY_LENGTH(@repos) = 0 OR repository_id IN UNNEST(@repos))
 		AND NOT EXISTS (SELECT 1 FROM move_gate g WHERE g.repository_id = run.repository_id AND g.move_state != '')
 		ORDER BY run_id LIMIT @limit`,
-		map[string]any{"passed": int64(store.StatusPassed), "limit": int64(limit)})
+		map[string]any{"passed": int64(store.StatusPassed), "repos": repos, "limit": int64(limit)})
 }
 
 // ─── Keyed work ───
@@ -553,50 +533,40 @@ func (x queries) MarkWorkAt(ctx context.Context, kind string, key int64, at time
 	return x.Write(ctx, func(tx *spanner.ReadWriteTransaction) error { return spannerdata.MarkWorkAt(ctx, tx, kind, key, at) })
 }
 
-func (x queries) TakeWork(ctx context.Context, kind string, key int64, holder string, ttl time.Duration) (bool, error) {
-	var ok bool
-	err := x.Write(ctx, func(tx *spanner.ReadWriteTransaction) error {
-		var err error
-		ok, err = spannerdata.TakeWork(ctx, tx, kind, key, holder, ttl)
-		return err
-	})
-	return ok, err
-}
-
-func (x queries) RenewWork(ctx context.Context, kind string, key int64, holder string, ttl time.Duration) (bool, error) {
-	var ok bool
-	err := x.Write(ctx, func(tx *spanner.ReadWriteTransaction) error {
-		var err error
-		ok, err = spannerdata.RenewWork(ctx, tx, kind, key, holder, ttl)
-		return err
-	})
-	return ok, err
-}
-
-func (x queries) ReleaseWork(ctx context.Context, kind string, key int64, holder string) (bool, error) {
-	var again bool
-	err := x.Write(ctx, func(tx *spanner.ReadWriteTransaction) error {
-		var err error
-		again, err = spannerdata.ReleaseWork(ctx, tx, kind, key, holder)
-		return err
-	})
-	return again, err
-}
-
-func (x queries) LetWork(ctx context.Context, kind string, key int64, holder string) error {
-	return x.Write(ctx, func(tx *spanner.ReadWriteTransaction) error {
-		return spannerdata.LetWork(ctx, tx, kind, key, holder)
-	})
-}
-
-func (x queries) DueWork(ctx context.Context, kind string, limit int) ([]int64, error) {
-	var keys []int64
+// CLsOf reads the runs' plans by key, then the plans by key.
+func (x queries) CLsOf(ctx context.Context, runs, plans []int64) ([][2]int64, error) {
+	ids := slices.Clone(plans)
+	if len(runs) > 0 {
+		got, err := x.ids(ctx, `SELECT plan_id FROM run WHERE run_id IN UNNEST(@runs) AND plan_id IS NOT NULL`, map[string]any{"runs": runs})
+		if err != nil {
+			return nil, err
+		}
+		ids = append(ids, got...)
+	}
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	seen := map[[2]int64]bool{}
+	var out [][2]int64
 	err := x.Read(func(r spannerdata.Reader) error {
-		var err error
-		keys, err = spannerdata.DueWork(ctx, r, kind, limit)
-		return err
+		return spannerdata.Each(ctx, r, `SELECT repository_id, cl_number FROM plan WHERE plan_id IN UNNEST(@ids) AND cl_number > 0`,
+			map[string]any{"ids": ids}, func(row *spanner.Row) error {
+				var c [2]int64
+				if err := row.Columns(&c[0], &c[1]); err != nil {
+					return err
+				}
+				if !seen[c] {
+					seen[c] = true
+					out = append(out, c)
+				}
+				return nil
+			})
 	})
-	return keys, err
+	return out, err
+}
+
+func (x queries) PendStep(ctx context.Context, kind string, key int64, at time.Time, body []byte) error {
+	return x.Write(ctx, func(tx *spanner.ReadWriteTransaction) error { return spannerdata.PendStep(tx, kind, key, at, body) })
 }
 
 // ─── The feed, and the build cache's commits ───

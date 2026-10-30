@@ -7,6 +7,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/Cidan/ok/internal/data/pgdata"
 	"github.com/Cidan/ok/internal/id/store"
 	"github.com/Cidan/ok/internal/tenancy"
 )
@@ -351,6 +352,10 @@ func (x queries) InsertDirectoryEvent(ctx context.Context, e store.DirectoryEven
 	return err
 }
 
+func (x queries) PendStep(_ context.Context, kind string, key int64, at time.Time, body []byte) error {
+	return pgdata.PendStep(x.q, kind, key, at, body)
+}
+
 func directoryEvents(rows pgx.Rows, err error) ([]store.DirectoryEventRow, error) {
 	if err != nil {
 		return nil, err
@@ -365,6 +370,14 @@ func directoryEvents(rows pgx.Rows, err error) ([]store.DirectoryEventRow, error
 func (x queries) DirectoryEvents(ctx context.Context, repo, after int64, limit int) ([]store.DirectoryEventRow, error) {
 	return directoryEvents(x.q.Query(ctx, `SELECT repository_id, seq, body FROM directory_event
 		WHERE repository_id = $1 AND seq > $2 ORDER BY seq LIMIT $3`, repo, after, limit))
+}
+
+func (x queries) AddFollower(ctx context.Context, topic, name string) error {
+	return pgdata.AddFollower(ctx, x.q, topic, name)
+}
+
+func (x queries) Followers(ctx context.Context, topic string) ([]string, error) {
+	return pgdata.Followers(ctx, x.q, topic)
 }
 
 func (x queries) DirectoryHeads(ctx context.Context, after int64, limit int) ([]store.DirectoryHead, error) {
@@ -382,15 +395,15 @@ func (x queries) DirectoryHeads(ctx context.Context, after int64, limit int) ([]
 
 // RelayDirectoryEvents takes a page of pending events in its own transaction, skipping those
 // another relay holds, and deletes them from pending once publish succeeds.
-func (b *Backend) RelayDirectoryEvents(ctx context.Context, limit int, publish func([]store.DirectoryEventRow) error) (int, error) {
+func (b *Backend) RelayDirectoryEvents(ctx context.Context, repo int64, limit int, publish func([]store.DirectoryEventRow) error) (int, error) {
 	var n int
 	err := pgx.BeginFunc(ctx, b.pool, func(tx pgx.Tx) error {
 		evs, err := directoryEvents(tx.Query(ctx, `WITH taken AS (
-				SELECT repository_id, seq FROM directory_event_pending
+				SELECT repository_id, seq FROM directory_event_pending WHERE $2::bigint = 0 OR repository_id = $2
 				ORDER BY repository_id, seq LIMIT $1 FOR UPDATE SKIP LOCKED)
 			SELECT e.repository_id, e.seq, e.body
 			FROM taken t JOIN directory_event e ON e.repository_id = t.repository_id AND e.seq = t.seq
-			ORDER BY e.repository_id, e.seq`, limit))
+			ORDER BY e.repository_id, e.seq`, limit, repo))
 		if err != nil || len(evs) == 0 {
 			return err
 		}
@@ -409,6 +422,15 @@ func (b *Backend) RelayDirectoryEvents(ctx context.Context, limit int, publish f
 		return nil
 	})
 	return n, err
+}
+
+// DirectoryEventRelayed reads the repository's head, which the transaction that takes a place
+// holds until it commits: no later one takes a place past it.
+func (b *Backend) DirectoryEventRelayed(ctx context.Context, repo, seq int64) (written, relayed bool, err error) {
+	err = b.pool.QueryRow(ctx, `SELECT coalesce((SELECT seq FROM directory_event_head WHERE repository_id = $1), 0) >= $2,
+			NOT EXISTS (SELECT 1 FROM directory_event_pending WHERE repository_id = $1 AND ($2 = 0 OR seq = $2))`,
+		repo, seq).Scan(&written, &relayed)
+	return written, relayed, err
 }
 
 func (x queries) Grants(ctx context.Context, repo int64) ([]store.Grant, error) {

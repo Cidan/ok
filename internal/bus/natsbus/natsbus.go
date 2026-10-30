@@ -1,8 +1,5 @@
 // Package natsbus is the bus (internal/bus) on NATS JetStream (docs/hosted.md, "Backends").
 //
-// A topic is a stream of its own, and a group a durable pull consumer on it that starts with what is
-// published after it was made; a handler's error has its event delivered again after a backoff.
-//
 // The queues share one work-queue stream, a subject and a pull consumer each, the consumer's
 // MaxDeliver the queue's attempts and job IDs dropped within the stream's duplicate window. A job not
 // due yet is a message schedule, which the server publishes when it is due, so waiting costs no
@@ -26,9 +23,9 @@ import (
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	"github.com/nats-io/nuid"
+	"golang.org/x/sync/singleflight"
 
 	"github.com/Cidan/ok/internal/bus"
-	"github.com/Cidan/ok/internal/bus/inflight"
 )
 
 // Options shape a Bus.
@@ -38,7 +35,7 @@ type Options struct {
 	Prefix string
 	// Replicas is how many servers keep each stream: 3 in a cluster. Default 1.
 	Replicas int
-	// Retention is how long a topic keeps its events, and the queues their jobs and dead letters.
+	// Retention is how long the queues keep their jobs and dead letters.
 	// Default seven days.
 	Retention time.Duration
 	// MaxAttempts is how many deliveries a job gets before it is a dead letter. Default 10.
@@ -49,8 +46,6 @@ type Options struct {
 	// Dedupe is how long a job's ID is remembered, so a job enqueued again with it is dropped.
 	// Default two minutes.
 	Dedupe time.Duration
-	// Concurrency is how many of a group's deliveries a member handles at once. Default 16.
-	Concurrency int
 }
 
 func (o *Options) defaults() {
@@ -72,19 +67,15 @@ func (o *Options) defaults() {
 	if o.Dedupe <= 0 {
 		o.Dedupe = 2 * time.Minute
 	}
-	if o.Concurrency <= 0 {
-		o.Concurrency = 16
-	}
 }
 
 // Headers a message carries.
 const (
 	hdrKey = "Ok-Key"
-	hdrSeq = "Ok-Seq"
 	hdrID  = "Ok-Id"
 )
 
-// Bus is a bus.Stream and a bus.Queue on one NATS connection.
+// Bus is a bus.Queue on one NATS connection.
 type Bus struct {
 	nc   *nats.Conn
 	js   jetstream.JetStream
@@ -93,22 +84,85 @@ type Bus struct {
 	mu        sync.Mutex
 	streams   map[string]bool // the streams made
 	consumers map[string]jetstream.Consumer
+	// making is a stream's or a consumer's lookup or creation under way: the leases and
+	// publishes that need one before it is known wait for the one request, rather than each
+	// asking the server, which the first moments of a replica's many leases would swamp.
+	making singleflight.Group
+	// renewing are the resumed leases this process keeps for longer than an ack wait, by their
+	// deliveries' reply subjects.
+	renewing map[string]*renewal
+	// inboxes are this process's inboxes, on a queue of its own (bus.Inboxes).
+	inboxes *bus.Inboxes
 }
 
-var (
-	_ bus.Stream  = (*Bus)(nil)
-	_ bus.Queue   = (*Bus)(nil)
-	_ bus.Signals = (*Bus)(nil)
-)
+var _ bus.Queue = (*Bus)(nil)
+
+// publishTimeout bounds the wait for a job's acknowledgement from the server: the client fails no
+// pending acknowledgement when its connection closes, so an enqueue — made in a transaction,
+// holding a database connection — would otherwise wait for one forever.
+const publishTimeout = 30 * time.Second
 
 // Open is a bus on nc's JetStream.
 func Open(nc *nats.Conn, opts Options) (*Bus, error) {
 	opts.defaults()
-	js, err := jetstream.New(nc)
+	js, err := jetstream.New(nc, jetstream.WithPublishAsyncTimeout(publishTimeout))
 	if err != nil {
 		return nil, fmt.Errorf("natsbus: %w", err)
 	}
-	return &Bus{nc: nc, js: js, opts: opts, streams: map[string]bool{}, consumers: map[string]jetstream.Consumer{}}, nil
+	b := &Bus{nc: nc, js: js, opts: opts, streams: map[string]bool{}, consumers: map[string]jetstream.Consumer{}, renewing: map[string]*renewal{}}
+	b.inboxes = bus.NewInboxes(b, b.prepareInboxes, b.dropQueue)
+	return b, nil
+}
+
+// Inbox opens an inbox, on this process's queue of inboxes: a consumer the server removes once no
+// one has leased from it for inboxIdle, should the process stop before it closes its inboxes.
+func (b *Bus) Inbox(ctx context.Context) (bus.Inbox, error) { return b.inboxes.Open(ctx) }
+
+// CloseInboxes closes the process's inboxes and removes their queue.
+func (b *Bus) CloseInboxes(ctx context.Context) error { return b.inboxes.Close(ctx) }
+
+// inboxIdle is how long a process's queue of inboxes lasts unleased.
+const inboxIdle = time.Hour
+
+// dropQueue removes a queue's consumer and its jobs.
+func (b *Bus) dropQueue(ctx context.Context, queue string) error {
+	key := b.queueStream() + "/" + token(queue)
+	b.mu.Lock()
+	delete(b.consumers, key)
+	made := b.streams[b.queueStream()]
+	b.mu.Unlock()
+	if !made {
+		return nil // nothing was ever enqueued or leased here
+	}
+	if err := b.js.DeleteConsumer(ctx, b.queueStream(), token(queue)); err != nil && !errors.Is(err, jetstream.ErrConsumerNotFound) {
+		return fmt.Errorf("natsbus: removing %s: %w", queue, err)
+	}
+	s, err := b.js.Stream(ctx, b.queueStream())
+	if err != nil {
+		return fmt.Errorf("natsbus: removing %s: %w", queue, err)
+	}
+	if err := s.Purge(ctx, jetstream.WithPurgeSubject(b.readySubject(queue))); err != nil {
+		return fmt.Errorf("natsbus: removing %s's jobs: %w", queue, err)
+	}
+	return nil
+}
+
+// prepareInboxes makes the process's queue of inboxes: its consumer, looked up anew, which the
+// server removes once unleased for inboxIdle. A job enqueued on it before then waits in the stream.
+func (b *Bus) prepareInboxes(ctx context.Context, queue string) error {
+	if err := b.ensureQueues(ctx); err != nil {
+		return err
+	}
+	b.forgetConsumer(b.queueStream(), token(queue))
+	_, err := b.consumer(ctx, b.queueStream(), b.queueConsumer(queue))
+	return err
+}
+
+// forgetConsumer drops a consumer this bus holds, to look it up anew: the server removed it.
+func (b *Bus) forgetConsumer(stream, durable string) {
+	b.mu.Lock()
+	delete(b.consumers, stream+"/"+durable)
+	b.mu.Unlock()
 }
 
 // token is name as one subject token, and a valid stream or consumer name: letters, digits, '_', and
@@ -137,17 +191,20 @@ func (b *Bus) ensureStream(ctx context.Context, cfg jetstream.StreamConfig) erro
 	if done {
 		return nil
 	}
-	if _, err := b.js.Stream(ctx, cfg.Name); errors.Is(err, jetstream.ErrStreamNotFound) {
-		if _, err := b.js.CreateStream(ctx, cfg); err != nil && !errors.Is(err, jetstream.ErrStreamNameAlreadyInUse) {
-			return fmt.Errorf("natsbus: stream %s: %w", cfg.Name, err)
+	_, err, _ := b.making.Do("stream/"+cfg.Name, func() (any, error) {
+		if _, err := b.js.Stream(ctx, cfg.Name); errors.Is(err, jetstream.ErrStreamNotFound) {
+			if _, err := b.js.CreateStream(ctx, cfg); err != nil && !errors.Is(err, jetstream.ErrStreamNameAlreadyInUse) {
+				return nil, fmt.Errorf("natsbus: stream %s: %w", cfg.Name, err)
+			}
+		} else if err != nil {
+			return nil, fmt.Errorf("natsbus: stream %s: %w", cfg.Name, err)
 		}
-	} else if err != nil {
-		return fmt.Errorf("natsbus: stream %s: %w", cfg.Name, err)
-	}
-	b.mu.Lock()
-	b.streams[cfg.Name] = true
-	b.mu.Unlock()
-	return nil
+		b.mu.Lock()
+		b.streams[cfg.Name] = true
+		b.mu.Unlock()
+		return nil, nil
+	})
+	return err
 }
 
 // consumer is a stream's durable consumer of cfg, made unless it exists; one that exists is taken as
@@ -160,170 +217,26 @@ func (b *Bus) consumer(ctx context.Context, stream string, cfg jetstream.Consume
 	if c != nil {
 		return c, nil
 	}
-	c, err := b.js.Consumer(ctx, stream, cfg.Durable)
-	if errors.Is(err, jetstream.ErrConsumerNotFound) {
-		c, err = b.js.CreateConsumer(ctx, stream, cfg)
-		if errors.Is(err, jetstream.ErrConsumerExists) {
-			c, err = b.js.Consumer(ctx, stream, cfg.Durable)
+	made, err, _ := b.making.Do("consumer/"+key, func() (any, error) {
+		c, err := b.js.Consumer(ctx, stream, cfg.Durable)
+		if errors.Is(err, jetstream.ErrConsumerNotFound) {
+			c, err = b.js.CreateConsumer(ctx, stream, cfg)
+			if errors.Is(err, jetstream.ErrConsumerExists) {
+				c, err = b.js.Consumer(ctx, stream, cfg.Durable)
+			}
 		}
-	}
-	if err != nil {
-		return nil, fmt.Errorf("natsbus: consumer %s: %w", key, err)
-	}
-	b.mu.Lock()
-	b.consumers[key] = c
-	b.mu.Unlock()
-	return c, nil
-}
-
-// ─── The stream ───
-
-func (b *Bus) topicStream(topic string) (name, subject string) {
-	return b.opts.Prefix + "-ev-" + token(topic), b.opts.Prefix + ".ev." + token(topic)
-}
-
-func (b *Bus) ensureTopic(ctx context.Context, topic string) (stream, subject string, err error) {
-	stream, subject = b.topicStream(topic)
-	return stream, subject, b.ensureStream(ctx, jetstream.StreamConfig{
-		Name: stream, Subjects: []string{subject}, Retention: jetstream.LimitsPolicy,
-		MaxAge: b.opts.Retention, Replicas: b.opts.Replicas, Storage: jetstream.FileStorage,
+		if err != nil {
+			return nil, fmt.Errorf("natsbus: consumer %s: %w", key, err)
+		}
+		b.mu.Lock()
+		b.consumers[key] = c
+		b.mu.Unlock()
+		return c, nil
 	})
-}
-
-// Publish publishes events, waiting until the server holds each.
-func (b *Bus) Publish(ctx context.Context, events ...bus.Event) error {
-	futures := make([]jetstream.PubAckFuture, 0, len(events))
-	for _, e := range events {
-		_, subject, err := b.ensureTopic(ctx, e.Topic)
-		if err != nil {
-			return err
-		}
-		m := nats.NewMsg(subject)
-		m.Data = e.Body
-		m.Header.Set(hdrKey, strconv.FormatInt(e.Key, 10))
-		m.Header.Set(hdrSeq, strconv.FormatInt(e.Seq, 10))
-		f, err := b.js.PublishMsgAsync(m)
-		if err != nil {
-			return fmt.Errorf("natsbus: publishing to %s: %w", e.Topic, err)
-		}
-		futures = append(futures, f)
-	}
-	for _, f := range futures {
-		select {
-		case <-f.Ok():
-		case err := <-f.Err():
-			return fmt.Errorf("natsbus: publishing: %w", err)
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
-	return nil
-}
-
-// CreateGroup makes group's consumer on topic, delivering what is published from now on.
-func (b *Bus) CreateGroup(ctx context.Context, topic, group string) error {
-	_, err := b.group(ctx, topic, group)
-	return err
-}
-
-func (b *Bus) group(ctx context.Context, topic, group string) (jetstream.Consumer, error) {
-	stream, _, err := b.ensureTopic(ctx, topic)
 	if err != nil {
 		return nil, err
 	}
-	return b.consumer(ctx, stream, jetstream.ConsumerConfig{
-		Durable: token(group), DeliverPolicy: jetstream.DeliverNewPolicy, AckPolicy: jetstream.AckExplicitPolicy,
-		AckWait: b.opts.AckWait, MaxDeliver: -1, MaxAckPending: -1,
-	})
-}
-
-// backoff is how long an event a handler refused waits, by its deliveries so far.
-func backoff(delivered uint64) time.Duration {
-	return min(time.Second<<min(delivered-1, 6), time.Minute)
-}
-
-// Subscribe handles topic's events as a member of group until ctx ends.
-func (b *Bus) Subscribe(ctx context.Context, topic, group string, h bus.Handler) error {
-	c, err := b.group(ctx, topic, group)
-	if err != nil {
-		return err
-	}
-	// Deliveries are handled up to Concurrency at once: the stream promises no order, and a
-	// consumer applies each by its key's cursor. A fetch takes only as many as there are free
-	// slots, so none waits for one unrenewed.
-	slots := inflight.New(b.opts.Concurrency)
-	defer slots.Wait()
-	for ctx.Err() == nil {
-		reserved, err := slots.Reserve(ctx, b.opts.Concurrency)
-		if err != nil {
-			break
-		}
-		fctx, cancel := context.WithTimeout(ctx, time.Second)
-		batch, err := c.Fetch(reserved, jetstream.FetchContext(fctx))
-		if err != nil {
-			cancel()
-			slots.Release(reserved)
-			if ctx.Err() != nil {
-				break
-			}
-			return fmt.Errorf("natsbus: fetching %s/%s: %w", topic, group, err)
-		}
-		for m := range batch.Messages() {
-			reserved--
-			slots.Run(func() error { return b.handle(ctx, topic, m, h) })
-		}
-		slots.Release(reserved)
-		cancel()
-		if err := batch.Error(); err != nil && ctx.Err() == nil && !errors.Is(err, nats.ErrTimeout) && !errors.Is(err, context.DeadlineExceeded) {
-			return fmt.Errorf("natsbus: fetching %s/%s: %w", topic, group, err)
-		}
-		if err := slots.Err(); err != nil && ctx.Err() == nil {
-			return err
-		}
-	}
-	return ctx.Err()
-}
-
-// handle hands one delivery to h, renewing it while h works, and acknowledges it or has it
-// delivered again after a backoff.
-func (b *Bus) handle(ctx context.Context, topic string, m jetstream.Msg, h bus.Handler) error {
-	key, kerr := strconv.ParseInt(m.Headers().Get(hdrKey), 10, 64)
-	seq, serr := strconv.ParseInt(m.Headers().Get(hdrSeq), 10, 64)
-	if kerr != nil || serr != nil {
-		// Not an event of this package's: nothing a retry would change.
-		return m.Term()
-	}
-	stop := renew(m, b.opts.AckWait)
-	err := h(ctx, bus.Event{Topic: topic, Key: key, Seq: seq, Body: m.Data()})
-	stop()
-	if err == nil {
-		return m.Ack()
-	}
-	delivered := uint64(1)
-	if md, merr := m.Metadata(); merr == nil {
-		delivered = md.NumDelivered
-	}
-	return m.NakWithDelay(backoff(delivered))
-}
-
-// renew keeps m invisible with an in-progress ack a third of every ack wait, until stop is called.
-func renew(m jetstream.Msg, ackWait time.Duration) (stop func()) {
-	done := make(chan struct{})
-	finished := make(chan struct{})
-	go func() {
-		defer close(finished)
-		t := time.NewTicker(ackWait / 3)
-		defer t.Stop()
-		for {
-			select {
-			case <-done:
-				return
-			case <-t.C:
-				_ = m.InProgress()
-			}
-		}
-	}()
-	return func() { close(done); <-finished }
+	return made.(jetstream.Consumer), nil
 }
 
 // ─── The queue ───
@@ -356,6 +269,7 @@ func (b *Bus) Enqueue(ctx context.Context, jobs ...bus.Job) error {
 	}
 	futures := make([]jetstream.PubAckFuture, 0, len(jobs))
 	for _, j := range jobs {
+		j, _ = bus.InboxJob(j)
 		ready := b.readySubject(j.Queue)
 		m := nats.NewMsg(ready)
 		m.Data = j.Body
@@ -387,32 +301,34 @@ func (b *Bus) Enqueue(ctx context.Context, jobs ...bus.Job) error {
 	return nil
 }
 
+// queueConsumer is a queue's consumer: a process's queue of inboxes' lasting while it is leased.
+func (b *Bus) queueConsumer(queue string) jetstream.ConsumerConfig {
+	cfg := jetstream.ConsumerConfig{
+		Durable: token(queue), FilterSubject: b.readySubject(queue), AckPolicy: jetstream.AckExplicitPolicy,
+		AckWait: b.opts.AckWait, MaxDeliver: b.opts.MaxAttempts, MaxAckPending: -1,
+	}
+	if bus.IsInboxQueue(queue) {
+		cfg.InactiveThreshold = inboxIdle
+	}
+	return cfg
+}
+
 // Lease takes up to o.Max ready jobs of queue.
 func (b *Bus) Lease(ctx context.Context, queue string, o bus.LeaseOptions) ([]bus.Leased, error) {
 	if err := b.ensureQueues(ctx); err != nil {
 		return nil, err
 	}
-	c, err := b.consumer(ctx, b.queueStream(), jetstream.ConsumerConfig{
-		Durable: token(queue), FilterSubject: b.readySubject(queue), AckPolicy: jetstream.AckExplicitPolicy,
-		AckWait: b.opts.AckWait, MaxDeliver: b.opts.MaxAttempts, MaxAckPending: -1,
-	})
+	cfg := b.queueConsumer(queue)
+	c, err := b.consumer(ctx, b.queueStream(), cfg)
 	if err != nil {
 		return nil, err
 	}
-	n := max(o.Max, 1)
-	var batch jetstream.MessageBatch
-	if o.Wait <= 0 {
-		batch, err = c.FetchNoWait(n)
-	} else {
-		fctx, cancel := context.WithTimeout(ctx, o.Wait)
-		defer cancel()
-		batch, err = c.Fetch(n, jetstream.FetchContext(fctx))
-	}
-	if err != nil {
-		return nil, fmt.Errorf("natsbus: leasing from %s: %w", queue, err)
+	msgs, err := b.fetch(ctx, c, max(o.Max, 1), o.Wait)
+	if errors.Is(err, jetstream.ErrConsumerNotFound) || errors.Is(err, jetstream.ErrConsumerDeleted) {
+		b.forgetConsumer(b.queueStream(), cfg.Durable) // the server removed it: the next lease makes it anew
 	}
 	var out []bus.Leased
-	for m := range batch.Messages() {
+	for _, m := range msgs {
 		key, _ := strconv.ParseInt(m.Headers().Get(hdrKey), 10, 64)
 		attempt := 1
 		if md, err := m.Metadata(); err == nil {
@@ -423,10 +339,42 @@ func (b *Bus) Lease(ctx context.Context, queue string, o bus.LeaseOptions) ([]bu
 		l.start()
 		out = append(out, l)
 	}
-	if err := batch.Error(); err != nil && !errors.Is(err, nats.ErrTimeout) && !errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+	if err != nil {
 		return out, fmt.Errorf("natsbus: leasing from %s: %w", queue, err)
 	}
 	return out, ctx.Err()
+}
+
+// fetch takes up to n of a consumer's messages: those ready at once, or — waiting up to wait for
+// the first — the first, and those ready by the time it came. One pull request of n waits until n
+// arrive or its wait ends, which kept a lease of many as long as its wait for one job.
+func (b *Bus) fetch(ctx context.Context, c jetstream.Consumer, n int, wait time.Duration) ([]jetstream.Msg, error) {
+	collect := func(batch jetstream.MessageBatch, err error, into []jetstream.Msg) ([]jetstream.Msg, error) {
+		if err != nil {
+			return into, err
+		}
+		for m := range batch.Messages() {
+			into = append(into, m)
+		}
+		if err := batch.Error(); err != nil && !errors.Is(err, nats.ErrTimeout) && !errors.Is(err, context.DeadlineExceeded) &&
+			!errors.Is(err, context.Canceled) {
+			return into, err
+		}
+		return into, nil
+	}
+	batch, err := c.FetchNoWait(n)
+	msgs, err := collect(batch, err, nil)
+	if err != nil || len(msgs) > 0 || wait <= 0 {
+		return msgs, err
+	}
+	fctx, cancel := context.WithTimeout(ctx, wait)
+	defer cancel()
+	batch, err = c.Fetch(1, jetstream.FetchContext(fctx))
+	if msgs, err = collect(batch, err, nil); err != nil || len(msgs) == 0 || n == 1 {
+		return msgs, err
+	}
+	batch, err = c.FetchNoWait(n - 1)
+	return collect(batch, err, msgs)
 }
 
 // leased is a job a worker holds until its deadline.
@@ -445,6 +393,114 @@ type leased struct {
 
 func (l *leased) Job() bus.Job { return l.job }
 func (l *leased) Attempt() int { return l.attempt }
+
+// Handle names the delivery by its reply subject, which acknowledges it from any connection.
+func (l *leased) Handle() []byte { return bus.EncodeHandle(l.job.Queue, l.job.ID, l.m.Reply()) }
+
+// Resume is the lease of the delivery whose reply subject the handle names: acknowledged, returned,
+// and kept in progress by publishing to it, as the holder's connection would.
+func (b *Bus) Resume(handle []byte) (bus.Leased, error) {
+	parts, err := bus.DecodeHandle(handle, 3)
+	if err != nil {
+		return nil, err
+	}
+	return &resumed{b: b, job: bus.Job{Queue: parts[0], ID: parts[1]}, reply: parts[2], handle: handle}, nil
+}
+
+// resumed is a delivery leased by another process, or by this one before.
+type resumed struct {
+	b      *Bus
+	job    bus.Job
+	reply  string
+	handle []byte
+}
+
+func (r *resumed) Job() bus.Job   { return r.job }
+func (r *resumed) Attempt() int   { return 0 }
+func (r *resumed) Handle() []byte { return r.handle }
+
+// Extend keeps the delivery in progress: once, which keeps it an ack wait, and past that by
+// renewing it here a third of each ack wait until d has passed.
+func (r *resumed) Extend(ctx context.Context, d time.Duration) error {
+	if err := r.b.nc.Publish(r.reply, []byte("+WPI")); err != nil {
+		return fmt.Errorf("natsbus: extending: %w", err)
+	}
+	if d > r.b.opts.AckWait {
+		r.b.renew(r.reply, time.Now().Add(d))
+	} else {
+		r.b.stopRenewing(r.reply)
+	}
+	return nil
+}
+
+func (r *resumed) Ack(ctx context.Context) error {
+	r.b.stopRenewing(r.reply)
+	if _, err := r.b.nc.RequestWithContext(ctx, r.reply, []byte("+ACK")); err != nil {
+		return fmt.Errorf("natsbus: acknowledging: %w", err)
+	}
+	return nil
+}
+
+func (r *resumed) Nack(ctx context.Context, delay time.Duration) error {
+	r.b.stopRenewing(r.reply)
+	body := []byte("-NAK")
+	if delay > 0 {
+		body = fmt.Appendf(nil, "-NAK {\"delay\": %d}", delay.Nanoseconds())
+	}
+	if err := r.b.nc.Publish(r.reply, body); err != nil {
+		return fmt.Errorf("natsbus: returning a job: %w", err)
+	}
+	return nil
+}
+
+// renewal keeps a resumed delivery in progress until its deadline.
+type renewal struct {
+	mu       sync.Mutex
+	deadline time.Time
+	stop     chan struct{}
+}
+
+// renew keeps reply's delivery in progress until deadline, from this process.
+func (b *Bus) renew(reply string, deadline time.Time) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if r := b.renewing[reply]; r != nil {
+		r.mu.Lock()
+		r.deadline = deadline
+		r.mu.Unlock()
+		return
+	}
+	r := &renewal{deadline: deadline, stop: make(chan struct{})}
+	b.renewing[reply] = r
+	go func() {
+		t := time.NewTicker(b.opts.AckWait / 3)
+		defer t.Stop()
+		for {
+			select {
+			case <-r.stop:
+				return
+			case <-t.C:
+			}
+			r.mu.Lock()
+			left := time.Until(r.deadline)
+			r.mu.Unlock()
+			if left < 0 {
+				b.stopRenewing(reply)
+				return
+			}
+			_ = b.nc.Publish(reply, []byte("+WPI"))
+		}
+	}()
+}
+
+func (b *Bus) stopRenewing(reply string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if r := b.renewing[reply]; r != nil {
+		close(r.stop)
+		delete(b.renewing, reply)
+	}
+}
 
 // start renews the delivery a third of every ack wait until its deadline passes, ending the lease,
 // or the lease is finished: the server delivers it again only after the deadline, so an ended

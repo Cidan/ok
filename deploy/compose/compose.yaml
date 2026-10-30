@@ -15,6 +15,13 @@ services:
     healthcheck: {test: [CMD, pg_isready, -U, ok, -d, ok], interval: 2s, timeout: 5s, retries: 60}
     restart: unless-stopped
 
+  # The bus (docs/state.md): NATS with JetStream, keeping its streams on a volume.
+  nats:
+    image: docker.io/library/nats:2.12
+    command: [--jetstream, --store_dir, /data]
+    volumes: [nats:/data]
+    restart: unless-stopped
+
   # S3 for file contents and logs: versitygw over a directory, each bucket one of its folders.
   s3:
     image: docker.io/versity/versitygw:v1.8.0
@@ -56,6 +63,7 @@ services:
     depends_on:
       setup: {condition: service_completed_successfully}
       s3: {condition: service_started}
+      nats: {condition: service_started}
     restart: unless-stopped
 
   # Sign-in: Dex with one user, in ok's own network, so that its address, http://localhost:5556,
@@ -69,12 +77,15 @@ services:
     depends_on: [ok]
     restart: unless-stopped
 
-  # A worker: Bazel on each run's commit, each run's programs in a sandbox (bubblewrap), which
-  # makes user namespaces and mounts — hence seccomp, AppArmor, and SELinux unconfined
-  # (README.md, "The worker").
+  # A worker: Bazel on each run's commit, which okfs presents, each run's programs in a sandbox
+  # (bubblewrap). Both make user namespaces and mount in them — hence seccomp, AppArmor, and
+  # SELinux unconfined, the host's /dev/fuse, and unshare, which makes the namespace okfs mounts in
+  # before ok starts (README.md, "The worker").
   worker:
     image: *runner-image
+    entrypoint: [/usr/bin/unshare, --map-root-user, --mount, --propagation, private, --, /usr/local/bin/ok]
     command: [worker, run, -config, /etc/ok/ok.yaml]
+    devices: [/dev/fuse]
     security_opt: [seccomp=unconfined, apparmor=unconfined, label=disable]
     volumes:
       - ./ok.yaml:/etc/ok/ok.yaml:ro,z
@@ -87,6 +98,7 @@ services:
 
 volumes:
   postgres:
+  nats:
   s3:
   ca:
   worker-credential:

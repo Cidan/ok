@@ -3,9 +3,9 @@ package role
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -31,11 +31,7 @@ func (e enterpriseSync) Start(ctx context.Context) error { return e.s.Start(ctx)
 // organization's, and what is provisioned is the organization's alone.
 type orgSCIM struct {
 	st   *store.Store
-	sync *enterprise.Syncer
 	base string // ok's public URL
-
-	mu      sync.Mutex
-	pending map[string]bool // organizations whose sync a provisioning has asked for
 }
 
 var _ node.SelfAuthenticated = (*orgSCIM)(nil)
@@ -79,22 +75,19 @@ func (o *orgSCIM) serve(w http.ResponseWriter, r *http.Request) {
 	h.ServeHTTP(w, r2)
 }
 
-// changed syncs an organization soon after what its provider pushed, once for a burst of pushes.
+// settle is how long after what an organization's provider pushed its sync is due: the pushes of
+// a burst share it (work.Store.MarkAt keeps the sooner).
+const settle = 2 * time.Second
+
+// changed books an organization's sync soon after what its provider pushed (store.SyncWork).
 func (o *orgSCIM) changed(org string) {
-	o.mu.Lock()
-	if o.pending[org] {
-		o.mu.Unlock()
-		return
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	p, err := o.st.IdentityProviderOf(ctx, org)
+	if err == nil {
+		err = o.st.Work().MarkAt(ctx, store.SyncWork, p.Key, time.Now().Add(settle))
 	}
-	o.pending[org] = true
-	o.mu.Unlock()
-	go func() {
-		time.Sleep(2 * time.Second)
-		o.mu.Lock()
-		delete(o.pending, org)
-		o.mu.Unlock()
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-		defer cancel()
-		o.sync.Sync(ctx, org)
-	}()
+	if err != nil {
+		slog.Error("enterprise: booking a sync after a SCIM change", "organization", org, "err", err)
+	}
 }

@@ -79,8 +79,7 @@ func (s *Store) Notify(ctx context.Context, n Notification, mail *Mail) (bool, i
 	if err != nil || id == 0 {
 		return added, 0, err
 	}
-	// Marked once it is queued; a mark lost here, the sweep makes (DueMails).
-	return added, id, s.b.Work().Mark(ctx, MailWork, id)
+	return added, id, nil
 }
 
 // Notifications are up to limit of a person's latest, and how many are unread.
@@ -143,20 +142,6 @@ func (s *Store) SendMail(ctx context.Context, id int64, send Sender) error {
 	}
 	if m.State == MailWaiting {
 		return s.b.Work().MarkAt(ctx, MailWork, id, m.NextTry)
-	}
-	return nil
-}
-
-// MarkDueMail marks every waiting message due now, for one whose mark was lost.
-func (s *Store) MarkDueMail(ctx context.Context) error {
-	ids, err := s.b.DueMails(ctx, s.now(), 1000)
-	if err != nil {
-		return err
-	}
-	for _, id := range ids {
-		if err := s.b.Work().Mark(ctx, MailWork, id); err != nil {
-			return err
-		}
 	}
 	return nil
 }

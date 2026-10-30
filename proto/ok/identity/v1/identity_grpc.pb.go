@@ -3213,8 +3213,9 @@ var Tree_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
-	DirectoryEvents_Read_FullMethodName  = "/ok.identity.v1.DirectoryEvents/Read"
-	DirectoryEvents_Heads_FullMethodName = "/ok.identity.v1.DirectoryEvents/Heads"
+	DirectoryEvents_Read_FullMethodName   = "/ok.identity.v1.DirectoryEvents/Read"
+	DirectoryEvents_Heads_FullMethodName  = "/ok.identity.v1.DirectoryEvents/Heads"
+	DirectoryEvents_Follow_FullMethodName = "/ok.identity.v1.DirectoryEvents/Follow"
 )
 
 // DirectoryEventsClient is the client API for DirectoryEvents service.
@@ -3222,14 +3223,17 @@ const (
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
 // DirectoryEvents serves the directory's log of repositories' entries to ok's roles, which follow
-// it (internal/bus/follow) on the bus's topic directory.repositories: each repository's changes,
-// numbered by their place in its log (docs/hosted.md, "Tenancy, as built").
+// it (internal/bus/follow), topic directory.repositories: each repository's changes, numbered by
+// their place in its log (docs/hosted.md, "Tenancy, as built").
 type DirectoryEventsClient interface {
 	// Read returns up to a page of a repository's events after a place in its log.
 	Read(ctx context.Context, in *ReadDirectoryEventsRequest, opts ...grpc.CallOption) (*ReadDirectoryEventsResponse, error)
 	// Heads returns how far each repository's log reaches, a page of repositories at a time, by
 	// repository.
 	Heads(ctx context.Context, in *DirectoryHeadsRequest, opts ...grpc.CallOption) (*DirectoryHeadsResponse, error)
+	// Follow records the caller's role as one of the log's followers: from then on the relay
+	// enqueues, on its queue, a job naming each repository whose log grows (docs/state.md).
+	Follow(ctx context.Context, in *FollowDirectoryRequest, opts ...grpc.CallOption) (*FollowDirectoryResponse, error)
 }
 
 type directoryEventsClient struct {
@@ -3260,19 +3264,32 @@ func (c *directoryEventsClient) Heads(ctx context.Context, in *DirectoryHeadsReq
 	return out, nil
 }
 
+func (c *directoryEventsClient) Follow(ctx context.Context, in *FollowDirectoryRequest, opts ...grpc.CallOption) (*FollowDirectoryResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(FollowDirectoryResponse)
+	err := c.cc.Invoke(ctx, DirectoryEvents_Follow_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // DirectoryEventsServer is the server API for DirectoryEvents service.
 // All implementations must embed UnimplementedDirectoryEventsServer
 // for forward compatibility.
 //
 // DirectoryEvents serves the directory's log of repositories' entries to ok's roles, which follow
-// it (internal/bus/follow) on the bus's topic directory.repositories: each repository's changes,
-// numbered by their place in its log (docs/hosted.md, "Tenancy, as built").
+// it (internal/bus/follow), topic directory.repositories: each repository's changes, numbered by
+// their place in its log (docs/hosted.md, "Tenancy, as built").
 type DirectoryEventsServer interface {
 	// Read returns up to a page of a repository's events after a place in its log.
 	Read(context.Context, *ReadDirectoryEventsRequest) (*ReadDirectoryEventsResponse, error)
 	// Heads returns how far each repository's log reaches, a page of repositories at a time, by
 	// repository.
 	Heads(context.Context, *DirectoryHeadsRequest) (*DirectoryHeadsResponse, error)
+	// Follow records the caller's role as one of the log's followers: from then on the relay
+	// enqueues, on its queue, a job naming each repository whose log grows (docs/state.md).
+	Follow(context.Context, *FollowDirectoryRequest) (*FollowDirectoryResponse, error)
 	mustEmbedUnimplementedDirectoryEventsServer()
 }
 
@@ -3288,6 +3305,9 @@ func (UnimplementedDirectoryEventsServer) Read(context.Context, *ReadDirectoryEv
 }
 func (UnimplementedDirectoryEventsServer) Heads(context.Context, *DirectoryHeadsRequest) (*DirectoryHeadsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Heads not implemented")
+}
+func (UnimplementedDirectoryEventsServer) Follow(context.Context, *FollowDirectoryRequest) (*FollowDirectoryResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Follow not implemented")
 }
 func (UnimplementedDirectoryEventsServer) mustEmbedUnimplementedDirectoryEventsServer() {}
 func (UnimplementedDirectoryEventsServer) testEmbeddedByValue()                         {}
@@ -3346,6 +3366,24 @@ func _DirectoryEvents_Heads_Handler(srv interface{}, ctx context.Context, dec fu
 	return interceptor(ctx, in, info, handler)
 }
 
+func _DirectoryEvents_Follow_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(FollowDirectoryRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(DirectoryEventsServer).Follow(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: DirectoryEvents_Follow_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(DirectoryEventsServer).Follow(ctx, req.(*FollowDirectoryRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // DirectoryEvents_ServiceDesc is the grpc.ServiceDesc for DirectoryEvents service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -3360,6 +3398,10 @@ var DirectoryEvents_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Heads",
 			Handler:    _DirectoryEvents_Heads_Handler,
+		},
+		{
+			MethodName: "Follow",
+			Handler:    _DirectoryEvents_Follow_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

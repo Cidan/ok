@@ -111,6 +111,8 @@ func (x queries) SetParentSeq(ctx context.Context, id, seq int64) error {
 // rows, and a workspace's checkpoints go before them, a page at a time like the rest: deleted with
 // them, they would count in their statements.
 var repositoryTail = []tableRows{
+	{"compaction_cursor", "repository_id = @id"},
+	{"sequence_pass", "repository_id = @id"},
 	{"tree_sizes", "repository_id = @id"},
 	{"copy_parent", "repository_id = @id"},
 	{"sequence_pending", "repository_id = @id"},
@@ -222,20 +224,78 @@ func (x queries) DeleteNetworkTail(ctx context.Context, net backend.Network, lim
 	return n, err
 }
 
-func (x queries) PendingDeletions(ctx context.Context, limit int) ([]backend.Deletion, error) {
-	var out []backend.Deletion
-	err := x.rows(ctx, `SELECT repository_id, network_id FROM repository_deletion ORDER BY deleted_at LIMIT @limit`,
-		map[string]any{"limit": int64(limit)}, func() { out = nil }, func(row *spanner.Row) error {
-			var d backend.Deletion
+func (x queries) PendingDeletion(ctx context.Context, repo int64) (backend.Deletion, bool, error) {
+	var d backend.Deletion
+	var ok bool
+	err := x.rows(ctx, `SELECT repository_id, network_id FROM repository_deletion WHERE repository_id = @repo`,
+		map[string]any{"repo": repo}, func() { ok = false }, func(row *spanner.Row) error {
 			var net int64
 			if err := row.Columns(&d.Repo, &net); err != nil {
 				return err
 			}
-			d.Net = backend.Network(net)
-			out = append(out, d)
+			d.Net, ok = backend.Network(net), true
 			return nil
 		})
+	return d, ok, err
+}
+
+func (x queries) RepositoryIDs(ctx context.Context, after int64, limit int) ([]int64, error) {
+	return x.int64s(ctx, `SELECT repository_id FROM repository WHERE repository_id > @after ORDER BY repository_id LIMIT @limit`,
+		map[string]any{"after": after, "limit": int64(limit)})
+}
+
+func (x queries) RetiredOf(ctx context.Context, net backend.Network) (packs, segments time.Time, err error) {
+	err = x.rows(ctx, `SELECT (SELECT MIN(retired_at) FROM pack WHERE network_id = @net AND retired_at IS NOT NULL),
+		(SELECT MIN(retired_at) FROM segment WHERE network_id = @net AND retired_at IS NOT NULL)`,
+		map[string]any{"net": int64(net)}, func() { packs, segments = time.Time{}, time.Time{} }, func(row *spanner.Row) error {
+			var p, s spanner.NullTime
+			if err := row.Columns(&p, &s); err != nil {
+				return err
+			}
+			packs, segments = p.Time, s.Time
+			return nil
+		})
+	return packs, segments, err
+}
+
+func (x queries) FollowCursors(ctx context.Context, topic string, keys []int64) (map[int64]int64, error) {
+	var out map[int64]int64
+	err := x.read(func(r spannerdata.Reader) error {
+		var err error
+		out, err = spannerdata.Cursors(ctx, r, topic, keys)
+		return err
+	})
 	return out, err
+}
+
+func (x queries) AddFollower(ctx context.Context, topic, name string) error {
+	return x.write(ctx, func(tx *spanner.ReadWriteTransaction) error { return spannerdata.AddFollower(ctx, tx, topic, name) })
+}
+
+func (x queries) Followers(ctx context.Context, topic string) ([]string, error) {
+	var out []string
+	err := x.read(func(r spannerdata.Reader) error {
+		var err error
+		out, err = spannerdata.Followers(ctx, r, topic)
+		return err
+	})
+	return out, err
+}
+
+func (x queries) FollowCursor(ctx context.Context, topic string, key int64) (int64, error) {
+	var seq int64
+	err := x.read(func(r spannerdata.Reader) error {
+		var err error
+		seq, err = spannerdata.Cursor(ctx, r, topic, key)
+		return err
+	})
+	return seq, err
+}
+
+func (x queries) AdvanceFollowCursor(ctx context.Context, topic string, key, seq int64) error {
+	return x.write(ctx, func(tx *spanner.ReadWriteTransaction) error {
+		return spannerdata.AdvanceCursor(ctx, tx, topic, key, seq)
+	})
 }
 
 func (x queries) FinishDeletion(ctx context.Context, id int64) error {
@@ -411,6 +471,13 @@ func (x queries) InsertEvents(ctx context.Context, repo int64, evs []backend.Log
 	return x.write(ctx, func(tx *spanner.ReadWriteTransaction) error { return tx.BufferWrite(muts) })
 }
 
+func (x queries) PendStep(_ context.Context, kind string, key int64, at time.Time, body []byte) error {
+	if x.tx == nil {
+		return errors.New("spannerstore: a step is pended in a transaction, whose commit it follows")
+	}
+	return spannerdata.PendStep(x.tx.tx, kind, key, at, body)
+}
+
 func (x queries) events(ctx context.Context, sql string, params map[string]any) ([]backend.Event, error) {
 	var out []backend.Event
 	err := x.rows(ctx, sql, params, func() { out = nil }, func(row *spanner.Row) error {
@@ -557,6 +624,43 @@ func (x queries) SetContentIndexSwept(ctx context.Context, sc backend.Scope, bef
 // commits after it. A row from before commit timestamps (logged_at NULL) is read only from the
 // start.
 func (x queries) ContentLogSince(ctx context.Context, sc backend.Scope, since backend.LogPlace) ([]backend.ContentLog, backend.LogPlace, error) {
+	var logs []backend.ContentLog
+	var place backend.LogPlace
+	err := x.unlocked(func(r spannerdata.Reader) error {
+		var err error
+		logs, place, err = contentLogIn(ctx, r, sc, since)
+		return err
+	})
+	return logs, place, err
+}
+
+// ContentLogCurrent is ContentLogSince, the day and the generation read in its read-only
+// transaction: one timestamp, and no lock of the read-write transaction it is in.
+func (x queries) ContentLogCurrent(ctx context.Context, sc backend.Scope, gen int64, since backend.LogPlace) (time.Time, bool, []backend.ContentLog, backend.LogPlace, error) {
+	var today civil.Date
+	var current bool
+	var logs []backend.ContentLog
+	var place backend.LogPlace
+	err := x.unlocked(func(r spannerdata.Reader) error {
+		var have int64
+		ok, err := spannerdata.First(ctx, r, `SELECT CURRENT_DATE('UTC'), generation FROM content_index WHERE scope = @scope AND owner_id = @owner`,
+			scopeParams(sc), &today, &have)
+		if err != nil || !ok || have != gen {
+			return err
+		}
+		current = true
+		logs, place, err = contentLogIn(ctx, r, sc, since)
+		return err
+	})
+	if err != nil || !current {
+		return day(today), false, nil, nil, err
+	}
+	return day(today), true, logs, place, nil
+}
+
+// contentLogIn is ContentLogSince's read, in r: a read-only transaction, whose timestamp is the
+// place.
+func contentLogIn(ctx context.Context, r spannerdata.Reader, sc backend.Scope, since backend.LogPlace) ([]backend.ContentLog, backend.LogPlace, error) {
 	after, have, err := placeTime(since)
 	if err != nil {
 		return nil, nil, err
@@ -584,26 +688,21 @@ func (x queries) ContentLogSince(ctx context.Context, sc backend.Scope, since ba
 			JOIN content_log@{FORCE_INDEX=content_log_batched} l ON l.scope = b.scope AND l.owner_id = b.owner_id AND l.batch_id = b.batch_id
 			WHERE b.scope = @scope AND b.owner_id = @owner AND b.logged_at > @after`
 	}
-	var read time.Time
-	if err := x.unlocked(func(r spannerdata.Reader) error {
-		rows = nil
-		// One statement, one round trip: every replica reads this each time a write stales its view.
-		if err := spannerdata.Each(ctx, r, direct+" UNION ALL "+staged, p, func(row *spanner.Row) error {
-			var at spanner.NullTime
-			var l logRow
-			if err := row.Columns(&at, &l.id, &l.body); err != nil {
-				return err
-			}
-			l.at = at.Time
-			rows = append(rows, l)
-			return nil
-		}); err != nil {
+	// One statement, one round trip: every replica reads this each time a write stales its view.
+	if err := spannerdata.Each(ctx, r, direct+" UNION ALL "+staged, p, func(row *spanner.Row) error {
+		var at spanner.NullTime
+		var l logRow
+		if err := row.Columns(&at, &l.id, &l.body); err != nil {
 			return err
 		}
-		var err error
-		read, err = r.(*spanner.ReadOnlyTransaction).Timestamp()
-		return err
+		l.at = at.Time
+		rows = append(rows, l)
+		return nil
 	}); err != nil {
+		return nil, nil, err
+	}
+	read, err := r.(*spanner.ReadOnlyTransaction).Timestamp()
+	if err != nil {
 		return nil, nil, err
 	}
 	slices.SortFunc(rows, func(a, b logRow) int {
@@ -699,37 +798,113 @@ func (x queries) InsertContentLog(ctx context.Context, sc backend.Scope, body []
 // a transaction that never committed: one that stages its log runs far shorter.
 var stagedOrphanAge = time.Hour
 
+// foldedDeletes bounds the log rows one transaction deletes: each is a mutation of the row and one
+// of each of its two indexes, of the 80,000 Spanner takes in one commit.
+const foldedDeletes = 15_000
+
 // DeleteFoldedContentLogs deletes, up to limit, the rows committed by folded — which the fold that
 // read to it holds in its generation — the staged ones of batches whose markers committed by then
-// and the markers left with no rows, and the staged rows of batches that never committed.
+// and the markers left with no rows, and the staged rows of batches that never committed. It finds
+// them in a read-only transaction and deletes them by key: a folded row changes no more, and only
+// the fold that read it, which holds the index's fold claim, deletes it. A delete that read the
+// log's ranges in a read-write transaction held them, and every writer appending a row to them —
+// at its pending commit timestamp, which the read's range takes in — waited for it: a fold every
+// few seconds, at a monorepo's rate, held its writers back that long. A marker goes with the last
+// of its rows: the read counts each marker's rows, and the deletes, buffered in the transaction, are
+// seen by no read before it commits.
 func (x queries) DeleteFoldedContentLogs(ctx context.Context, sc backend.Scope, folded backend.LogPlace, limit int) (int64, error) {
 	t, ok, err := placeTime(folded)
 	if err != nil || !ok {
 		return 0, err
 	}
+	scope, owner := scopeOf(sc)
 	p := scopeParams(sc)
-	p["t"], p["orphan"] = t, t.Add(-stagedOrphanAge)
-	var n int64
-	err = x.write(ctx, func(tx *spanner.ReadWriteTransaction) error {
-		n = 0
-		for _, d := range []struct{ table, cond string }{
-			{"content_log", `d.scope = @scope AND d.owner_id = @owner AND d.batch_id IS NULL AND (d.logged_at <= @t OR d.logged_at IS NULL)`},
-			{"content_log", `d.scope = @scope AND d.owner_id = @owner AND d.batch_id IN (SELECT b.batch_id FROM content_log_batch b
-				WHERE b.scope = @scope AND b.owner_id = @owner AND (b.logged_at <= @t OR b.logged_at IS NULL))`},
-			{"content_log_batch", `d.scope = @scope AND d.owner_id = @owner AND (d.logged_at <= @t OR d.logged_at IS NULL)
-				AND NOT EXISTS (SELECT 1 FROM content_log l WHERE l.scope = d.scope AND l.owner_id = d.owner_id AND l.batch_id = d.batch_id)`},
-			{"content_log", `d.scope = @scope AND d.owner_id = @owner AND d.batch_id IS NOT NULL AND d.logged_at <= @orphan
-				AND NOT EXISTS (SELECT 1 FROM content_log_batch b WHERE b.scope = d.scope AND b.owner_id = d.owner_id AND b.batch_id = d.batch_id)`},
+	p["t"], p["orphan"], p["shards"] = t, t.Add(-stagedOrphanAge), logShardList
+	limit = min(limit, foldedDeletes)
+	var rows, markers []int64
+	err = x.unlocked(func(r spannerdata.Reader) error {
+		rows, markers = nil, nil
+		taken := map[int64]int64{} // a marker's rows this round takes
+		for _, q := range []string{
+			// Logged directly: a seek per shard of the commit-timestamp index.
+			`SELECT l.id, l.batch_id FROM UNNEST(@shards) AS s
+				JOIN@{JOIN_METHOD=APPLY_JOIN} content_log@{FORCE_INDEX=content_log_logged} l
+					ON l.scope = @scope AND l.owner_id = @owner AND l.shard = s AND l.logged_at <= @t
+				WHERE l.batch_id IS NULL LIMIT @page`,
+			// From before commit timestamps: a seek per shard, the index holding them first.
+			`SELECT l.id, l.batch_id FROM UNNEST(@shards) AS s
+				JOIN@{JOIN_METHOD=APPLY_JOIN} content_log@{FORCE_INDEX=content_log_logged} l
+					ON l.scope = @scope AND l.owner_id = @owner AND l.shard = s AND l.logged_at IS NULL
+				LIMIT @page`,
+			// Staged, under markers committed by then.
+			`SELECT l.id, l.batch_id FROM content_log_batch@{FORCE_INDEX=content_log_batch_logged} b
+				JOIN content_log@{FORCE_INDEX=content_log_batched} l ON l.scope = b.scope AND l.owner_id = b.owner_id AND l.batch_id = b.batch_id
+				WHERE b.scope = @scope AND b.owner_id = @owner AND b.logged_at <= @t LIMIT @page`,
+			// Staged by transactions that never committed: no marker, and older than any that stages.
+			`SELECT l.id, CAST(NULL AS INT64) FROM content_log@{FORCE_INDEX=content_log_batched} l
+				WHERE l.scope = @scope AND l.owner_id = @owner AND l.batch_id IS NOT NULL AND l.logged_at <= @orphan
+				AND NOT EXISTS (SELECT 1 FROM content_log_batch b WHERE b.scope = l.scope AND b.owner_id = l.owner_id AND b.batch_id = l.batch_id)
+				LIMIT @page`,
 		} {
-			got, err := deleteUpTo(ctx, tx, d.table, d.cond, p, int64(limit)-n)
-			n += got
-			if err != nil || n >= int64(limit) {
+			if len(rows) >= limit {
+				break
+			}
+			p["page"] = int64(limit - len(rows))
+			if err := spannerdata.Each(ctx, r, q, p, func(row *spanner.Row) error {
+				var id int64
+				var batch spanner.NullInt64
+				if err := row.Columns(&id, &batch); err != nil {
+					return err
+				}
+				rows = append(rows, id)
+				if batch.Valid {
+					taken[batch.Int64]++
+				}
+				return nil
+			}); err != nil {
 				return err
 			}
 		}
-		return nil
+		// Markers by then whose every row this round takes, or none is left.
+		p["page"] = int64(limit)
+		return spannerdata.Each(ctx, r, `SELECT b.batch_id, (SELECT COUNT(*) FROM content_log@{FORCE_INDEX=content_log_batched} l
+				WHERE l.scope = b.scope AND l.owner_id = b.owner_id AND l.batch_id = b.batch_id)
+			FROM content_log_batch@{FORCE_INDEX=content_log_batch_logged} b
+			WHERE b.scope = @scope AND b.owner_id = @owner AND (b.logged_at <= @t OR b.logged_at IS NULL)
+			LIMIT @page`, p, func(row *spanner.Row) error {
+			var id, n int64
+			if err := row.Columns(&id, &n); err != nil {
+				return err
+			}
+			if n == taken[id] {
+				markers = append(markers, id)
+			}
+			return nil
+		})
 	})
-	return n, err
+	if err != nil {
+		return 0, err
+	}
+	if err := x.deleteKeys(ctx, "content_log", scope, owner, rows); err != nil {
+		return 0, err
+	}
+	if err := x.deleteKeys(ctx, "content_log_batch", scope, owner, markers); err != nil {
+		return 0, err
+	}
+	return int64(len(rows) + len(markers)), nil
+}
+
+// deleteKeys deletes a content index's rows of table by their last key column, ids, in the
+// operation's transaction: by key, reading nothing, so it holds no range a writer appends to.
+func (x queries) deleteKeys(ctx context.Context, table string, scope, owner int64, ids []int64) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	muts := make([]*spanner.Mutation, len(ids))
+	for i, id := range ids {
+		muts[i] = spanner.Delete(table, spanner.Key{scope, owner, id})
+	}
+	return x.write(ctx, func(tx *spanner.ReadWriteTransaction) error { return tx.BufferWrite(muts) })
 }
 
 // ─── Packs ───
@@ -975,15 +1150,6 @@ func (x queries) RetirePacks(ctx context.Context, net backend.Network, packIDs [
 			return nil
 		}, nil, "ids")
 	return n, bytes, err
-}
-
-func (x queries) RepositoriesRetiringBefore(ctx context.Context, packs, segments time.Time) ([]int64, error) {
-	// A network's are its first repository's to delete.
-	return x.int64s(ctx, `SELECT m FROM (SELECT (SELECT MIN(r.repository_id) FROM repository r WHERE r.network_id = n.network_id) AS m
-			FROM network n
-			WHERE EXISTS (SELECT 1 FROM pack p WHERE p.network_id = n.network_id AND p.retired_at < @packs)
-			   OR EXISTS (SELECT 1 FROM segment g WHERE g.network_id = n.network_id AND g.retired_at < @segments))
-		WHERE m IS NOT NULL ORDER BY m`, map[string]any{"packs": packs, "segments": segments})
 }
 
 // optionalNetwork is a network as a parameter, NULL for every one.

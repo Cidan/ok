@@ -64,7 +64,6 @@ func TestForkRulesAccess(t *testing.T) {
 	checker := authz.NewChecker(identitypb.NewAuthorizationClient(e.as(scm)))
 	reads := func(who string, repo int64) bool {
 		t.Helper()
-		checker.Forget(repo)
 		d, err := checker.Decide(ctx, who, nil, repo, authz.ReadCode)
 		if err != nil {
 			t.Fatal(err)

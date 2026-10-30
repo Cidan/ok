@@ -258,7 +258,7 @@ deploy:
 	d, err := role.Build(ctx, cfg, role.Options{Dev: true, Color: roll.Blue, Checkout: co, Source: src, Bazel: bazel,
 		Env:  []string{"PATH=" + os.Getenv("PATH"), "HOME=" + filepath.Join(state, "home"), "APP_DATABASE_URL=postgres://app.example.com/app"},
 		Pool: open(role.Schema), Kube: cluster.Kube, Identity: as(t, idAddr, deployer), SCM: deployerSCM, Automation: as(t, autoAddr, deployer),
-		Interval: 200 * time.Millisecond})
+		Look: 200 * time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
 	}

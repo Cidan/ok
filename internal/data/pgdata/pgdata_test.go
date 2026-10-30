@@ -3,7 +3,6 @@ package pgdata_test
 import (
 	"context"
 	"errors"
-	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -17,6 +16,7 @@ import (
 	"github.com/Cidan/ok/internal/data/pgdata"
 	"github.com/Cidan/ok/internal/lock"
 	"github.com/Cidan/ok/internal/testdb"
+	"github.com/Cidan/ok/internal/work/worktest"
 )
 
 func pool(t *testing.T) *pgxpool.Pool {
@@ -102,50 +102,6 @@ func TestSnapshot(t *testing.T) {
 	}
 }
 
-// Listen hands over what is notified on its channels after it is ready, and returns when its
-// context ends.
-func TestListen(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	p := pool(t)
-	ready := make(chan struct{})
-	got := make(chan [2]string, 4)
-	done := make(chan error, 1)
-	go func() {
-		done <- pgdata.Listen(ctx, p, []string{"ok_a", "ok-b"}, func() { close(ready) },
-			func(channel, payload string) { got <- [2]string{channel, payload} })
-	}()
-	select {
-	case <-ready:
-	case <-time.After(10 * time.Second):
-		t.Fatal("Listen was never ready")
-	}
-	for _, n := range [][2]string{{"ok_a", "1"}, {"ok-b", "2"}, {"ok_c", "3"}, {"ok_a", "4"}} {
-		if _, err := p.Exec(ctx, `SELECT pg_notify($1, $2)`, n[0], n[1]); err != nil {
-			t.Fatal(err)
-		}
-	}
-	for _, want := range [][2]string{{"ok_a", "1"}, {"ok-b", "2"}, {"ok_a", "4"}} {
-		select {
-		case n := <-got:
-			if n != want {
-				t.Errorf("notification %v, want %v", n, want)
-			}
-		case <-time.After(10 * time.Second):
-			t.Fatalf("no notification; want %v", want)
-		}
-	}
-	cancel()
-	select {
-	case err := <-done:
-		if !errors.Is(err, context.Canceled) {
-			t.Errorf("Listen ended with %v, want context.Canceled", err)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("Listen outlived its context")
-	}
-}
-
 // A key's cursor starts at 0; locking makes its row and holds it; setting and advancing (never
 // back) move it.
 func TestCursors(t *testing.T) {
@@ -217,141 +173,30 @@ func TestCursors(t *testing.T) {
 	}
 }
 
-// Work is marked, taken by one holder at a time with its mark cleared, released unless marked
-// again meanwhile — when its holder keeps it to do it again — and due when marked and unheld, or
-// when its holder's lease lapsed.
+// The work table on PostgreSQL passes the keyed work stores' suite.
 func TestWork(t *testing.T) {
-	ctx := context.Background()
-	p := pool(t)
-	if _, err := p.Exec(ctx, pgdata.WorkSchema); err != nil {
-		t.Fatal(err)
-	}
-	due := func() []int64 {
-		t.Helper()
-		keys, err := pgdata.DueWork(ctx, p, "q", 10)
-		if err != nil {
+	worktest.Run(t, func(t *testing.T) worktest.Subject {
+		p := testdb.Pool(t)
+		if _, err := p.Exec(context.Background(), pgdata.WorkSchema); err != nil {
 			t.Fatal(err)
 		}
-		return keys
-	}
-	take := func(key int64, holder string, ttl time.Duration) bool {
-		t.Helper()
-		ok, err := pgdata.TakeWork(ctx, p, "q", key, holder, ttl)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return ok
-	}
-	if got := due(); len(got) != 0 {
-		t.Fatalf("due before any mark: %v", got)
-	}
-	for _, k := range []int64{2, 1, 2} {
-		if err := pgdata.MarkWork(ctx, p, "q", k); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := pgdata.MarkWork(ctx, p, "other", 3); err != nil {
-		t.Fatal(err)
-	}
-	if got := due(); !slices.Equal(got, []int64{1, 2}) {
-		t.Fatalf("due: %v, want 1 and 2", got)
-	}
-	if !take(1, "a", time.Minute) || take(1, "b", time.Minute) {
-		t.Fatal("work taken by two holders, or by none")
-	}
-	if got := due(); !slices.Equal(got, []int64{2}) {
-		t.Fatalf("due with 1 held: %v", got)
-	}
-	// Marked while held: the holder keeps it, to do it again, and then lets it go.
-	if err := pgdata.MarkWork(ctx, p, "q", 1); err != nil {
-		t.Fatal(err)
-	}
-	if got := due(); !slices.Equal(got, []int64{2}) {
-		t.Fatalf("due with 1 held and marked: %v", got)
-	}
-	if again, err := pgdata.ReleaseWork(ctx, p, "q", 1, "a"); err != nil || !again {
-		t.Fatalf("releasing work marked meanwhile: %v, %v", again, err)
-	}
-	if again, err := pgdata.ReleaseWork(ctx, p, "q", 1, "b"); err != nil || again {
-		t.Fatalf("another releasing it: %v, %v", again, err)
-	}
-	if ok, err := pgdata.RenewWork(ctx, p, "q", 1, "b", time.Minute); err != nil || ok {
-		t.Fatalf("another renewing it: %v, %v", ok, err)
-	}
-	if ok, err := pgdata.RenewWork(ctx, p, "q", 1, "a", time.Minute); err != nil || !ok {
-		t.Fatalf("its holder renewing it: %v, %v", ok, err)
-	}
-	if again, err := pgdata.ReleaseWork(ctx, p, "q", 1, "a"); err != nil || again {
-		t.Fatalf("releasing clean work: %v, %v", again, err)
-	}
-	if !take(2, "a", time.Millisecond) {
-		t.Fatal("taking 2")
-	}
-	time.Sleep(20 * time.Millisecond)
-	// Its holder's lease lapsed: it is due, and another takes it.
-	if got := due(); !slices.Equal(got, []int64{2}) {
-		t.Fatalf("due with 2's lease lapsed: %v", got)
-	}
-	if !take(2, "b", time.Minute) {
-		t.Fatal("taking work whose holder's lease lapsed")
-	}
-	if ok, _ := pgdata.RenewWork(ctx, p, "q", 2, "a", time.Minute); ok {
-		t.Error("the lapsed holder renewed work another took")
-	}
-	if got := due(); len(got) != 0 {
-		t.Errorf("due at the end: %v", got)
-	}
-	// Marked for later: not due until then; marked again sooner, due sooner; a plain mark is due now.
-	later := time.Now().Add(time.Hour)
-	if err := pgdata.MarkWorkAt(ctx, p, "q", 3, later); err != nil {
-		t.Fatal(err)
-	}
-	if got := due(); len(got) != 0 {
-		t.Errorf("due with 3 marked for an hour on: %v", got)
-	}
-	if err := pgdata.MarkWorkAt(ctx, p, "q", 3, time.Now().Add(-time.Second)); err != nil {
-		t.Fatal(err)
-	}
-	if got := due(); !slices.Equal(got, []int64{3}) {
-		t.Errorf("due once 3 was marked for a second ago: %v", got)
-	}
-	if err := pgdata.MarkWorkAt(ctx, p, "q", 3, later); err != nil {
-		t.Fatal(err)
-	}
-	if got := due(); !slices.Equal(got, []int64{3}) {
-		t.Errorf("a later mark put off what was due: %v", got)
-	}
-	// Held, marked for later: let go, still marked; due when its time comes.
-	if !take(3, "a", time.Minute) {
-		t.Fatal("taking 3")
-	}
-	if err := pgdata.MarkWorkAt(ctx, p, "q", 3, time.Now().Add(50*time.Millisecond)); err != nil {
-		t.Fatal(err)
-	}
-	if again, err := pgdata.ReleaseWork(ctx, p, "q", 3, "a"); err != nil || again {
-		t.Fatalf("releasing work marked for later: %v, %v", again, err)
-	}
-	if got := due(); len(got) != 0 {
-		t.Errorf("due before the later mark's time: %v", got)
-	}
-	time.Sleep(100 * time.Millisecond)
-	if got := due(); !slices.Equal(got, []int64{3}) {
-		t.Errorf("due once the later mark's time came: %v", got)
-	}
-	if !take(3, "b", time.Minute) {
-		t.Fatal("taking 3 when due")
-	}
-	if again, err := pgdata.ReleaseWork(ctx, p, "q", 3, "b"); err != nil || again {
-		t.Fatalf("releasing it: %v, %v", again, err)
-	}
-
-	// A key with no row: taking it makes its row, held.
-	if !take(9, "a", time.Minute) || take(9, "b", time.Minute) {
-		t.Error("taking a key with no row: not taken, or taken twice")
-	}
-	if again, err := pgdata.ReleaseWork(ctx, p, "q", 9, "a"); err != nil || again || !take(9, "b", time.Minute) {
-		t.Errorf("releasing it for another: %v, %v", again, err)
-	}
+		return worktest.Subject{Store: pgdata.Work(p),
+			MarkOpen: func(ctx context.Context, kind string, key int64, commit <-chan struct{}) (<-chan struct{}, <-chan error) {
+				written, done := make(chan struct{}), make(chan error, 1)
+				go func() {
+					var once sync.Once
+					done <- pgdata.Txn(ctx, p, func(tx pgx.Tx) error {
+						if err := pgdata.MarkWork(ctx, tx, kind, key); err != nil {
+							return err
+						}
+						once.Do(func() { close(written) })
+						<-commit
+						return nil
+					})
+				}()
+				return written, done
+			}}
+	})
 }
 
 // A transaction under keyed work's fence commits while its holder holds the work, and is refused
@@ -369,8 +214,8 @@ func TestCheckFence(t *testing.T) {
 	if err := in(ctx); err != nil {
 		t.Errorf("no fence: %v", err)
 	}
-	if ok, err := pgdata.TakeWork(ctx, p, "k", 1, "a", time.Second); err != nil || !ok {
-		t.Fatalf("taking the work: %v %v", ok, err)
+	if got, err := pgdata.TakeWork(ctx, p, "k", 1, "a", time.Second); err != nil || !got.Took {
+		t.Fatalf("taking the work: %v %v", got, err)
 	}
 	fa := data.WithFence(ctx, data.Fence{Kind: "k", Key: 1, Holder: "a"})
 	if err := in(fa); err != nil {
@@ -383,8 +228,8 @@ func TestCheckFence(t *testing.T) {
 	if err := in(fa); !errors.Is(err, data.ErrFenced) {
 		t.Errorf("its holder, past its lease: %v", err)
 	}
-	if ok, err := pgdata.TakeWork(ctx, p, "k", 1, "b", time.Minute); err != nil || !ok {
-		t.Fatalf("another taking it: %v %v", ok, err)
+	if got, err := pgdata.TakeWork(ctx, p, "k", 1, "b", time.Minute); err != nil || !got.Took {
+		t.Fatalf("another taking it: %v %v", got, err)
 	}
 	if err := in(fa); !errors.Is(err, data.ErrFenced) {
 		t.Errorf("its first holder, once another holds it: %v", err)
@@ -395,44 +240,4 @@ func TestCheckFence(t *testing.T) {
 	if err := in(data.WithFence(ctx, data.Fence{Kind: "k", Key: 1, Holder: "b"})); err != nil {
 		t.Errorf("the new holder: %v", err)
 	}
-}
-
-// An idle mark marks work that is new, or whose holder's lease lapsed unmarked, due now; work held,
-// or marked to be done later, it leaves as it is.
-func TestMarkWorkIdle(t *testing.T) {
-	ctx := context.Background()
-	p := testdb.Pool(t)
-	if _, err := p.Exec(ctx, pgdata.WorkSchema); err != nil {
-		t.Fatal(err)
-	}
-	due := func(want ...int64) {
-		t.Helper()
-		got, err := pgdata.DueWork(ctx, p, "k", 10)
-		slices.Sort(got)
-		if err != nil || !slices.Equal(got, want) {
-			t.Errorf("due = %v, %v; want %v", got, err, want)
-		}
-	}
-	// 1 is new; 2 is held; 3 is marked for later; 4's holder's lease lapsed, unmarked.
-	if ok, err := pgdata.TakeWork(ctx, p, "k", 2, "a", time.Minute); err != nil || !ok {
-		t.Fatal(ok, err)
-	}
-	if err := pgdata.MarkWorkAt(ctx, p, "k", 3, time.Now().Add(time.Hour)); err != nil {
-		t.Fatal(err)
-	}
-	if ok, err := pgdata.TakeWork(ctx, p, "k", 4, "a", time.Millisecond); err != nil || !ok {
-		t.Fatal(ok, err)
-	}
-	time.Sleep(10 * time.Millisecond)
-	for key := int64(1); key <= 4; key++ {
-		if err := pgdata.MarkWorkIdle(ctx, p, "k", key); err != nil {
-			t.Fatal(err)
-		}
-	}
-	due(1, 4)
-	// 2's holder lets go with nothing marked meanwhile: the idle mark left it alone.
-	if again, err := pgdata.ReleaseWork(ctx, p, "k", 2, "a"); err != nil || again {
-		t.Errorf("releasing the held work: again %v, %v; an idle mark marked it", again, err)
-	}
-	due(1, 4)
 }

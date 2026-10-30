@@ -21,8 +21,10 @@ import (
 	"github.com/Cidan/ok/internal/control/review"
 	"github.com/Cidan/ok/internal/control/scm"
 	"github.com/Cidan/ok/internal/move"
+	"github.com/Cidan/ok/internal/names"
 	"github.com/Cidan/ok/internal/owners"
 	"github.com/Cidan/ok/internal/tenancy"
+	"github.com/Cidan/ok/internal/wait"
 	automationpb "github.com/Cidan/ok/proto/ok/automation/v1"
 	controlpb "github.com/Cidan/ok/proto/ok/control/v1"
 	deploypb "github.com/Cidan/ok/proto/ok/deploy/v1"
@@ -93,6 +95,8 @@ const readAttempts = 3
 func (a *API) statusOf(ctx context.Context, ref *controlpb.CLRef, bc *blockedCache) (*controlpb.CLStatus, error) {
 	var st *controlpb.CLStatus
 	for attempt := 0; attempt < readAttempts; attempt++ {
+		// Each person the status names — its author, reviewers, approvers — resolved once for it.
+		ctx := names.WithScope(ctx)
 		t, err := a.loadIn(ctx, ref, bc)
 		if err != nil {
 			return nil, err
@@ -124,13 +128,64 @@ func settled(st *controlpb.CLStatus, headBefore, headAfter []byte) bool {
 	return st.GetPost().GetStatus() != controlpb.Post_STATUS_LANDED || st.GetCl().GetStatus() == controlpb.CL_STATUS_SUBMITTED
 }
 
-// blockedCache remembers, across a watch's reads, what keeps a CL from submitting, per patchset and
-// main's head — the dry run behind it is the SCM's work, and a watch asks every few seconds — and
-// the repository it found by name, read by ID from then on: the name is the directory's to resolve,
-// every read again otherwise.
+// blockedCache remembers, across the reads of one wake of a watch, what keeps a CL from submitting,
+// per patchset and main's head — the dry run behind it is the SCM's work, and a read that finds main
+// moved under it reads again — and, across the watch, the repository it found by name, read by ID
+// from then on: the name is the directory's to resolve, every read again otherwise.
 type blockedCache struct {
 	key, reason string
 	repo        int64
+	// What the last read found of what the CL's status depends on, for the watch to register on
+	// (watched): whether it is active, the files its current patchset changes and adds, and the
+	// unlanded CLs of its stack below it.
+	active       bool
+	files, added []string
+	ancestors    []int64
+}
+
+// maxStack bounds the stack below a CL a watch registers on.
+const maxStack = 64
+
+// maxWatchedPaths bounds the paths a watch registers on: a CL that changes more is told of every
+// move of main.
+const maxWatchedPaths = 256
+
+// stackOf are the subjects of a CL and of the unlanded CLs of its stack below it, as a watch's last
+// read found them (bc): what a watch registers on with ok automation, whose submissions of them
+// change what keeps the CL from submitting, and with ok control.
+func stackOf(bc *blockedCache, number int64) []string {
+	out := []string{wait.CLSubject(bc.repo, number)}
+	for _, n := range bc.ancestors {
+		out = append(out, wait.CLSubject(bc.repo, n))
+	}
+	return out
+}
+
+// watched are the subjects a watch of a CL registers on with ok control, as its last read found
+// them (bc): the CL and the unlanded CLs of its stack below it (stackOf); and, while it is active, what of
+// main's head decides whether it lands — what governs every CL, each path it changes, and each
+// directory it adds a file to (a move of main that makes a file there, or adds under a file it
+// makes, conflicts) — or every move of main, for a CL that changes more than maxWatchedPaths.
+func watched(bc *blockedCache, number int64) []string {
+	out := stackOf(bc, number)
+	if !bc.active {
+		return out
+	}
+	paths := map[string]bool{}
+	for _, f := range bc.files {
+		paths[f] = true
+	}
+	for _, f := range bc.added {
+		paths[review.DirOf(f)] = true
+	}
+	if len(paths) > maxWatchedPaths {
+		return append(out, wait.HeadSubject(bc.repo))
+	}
+	out = append(out, wait.GoverningSubject(bc.repo))
+	for p := range paths {
+		out = append(out, wait.PathSubject(bc.repo, p))
+	}
+	return out
 }
 
 // status reads where t stands. bc, when not nil, carries the submit gates' answer across a
@@ -144,6 +199,11 @@ func (a *API) status(ctx context.Context, t *target, bc *blockedCache) (*control
 		return nil, err
 	}
 	st.Review = rv
+	if bc != nil {
+		if err := a.dependsOn(ctx, t, ev, bc); err != nil {
+			return nil, err
+		}
+	}
 
 	pre, err := a.runs.GetPre(ctx, &automationpb.GetPreRequest{RepositoryId: t.repo.GetId(), ClNumber: t.cl.Number, Patchset: t.cl.CurrentPatchset})
 	if err != nil {
@@ -537,4 +597,25 @@ func (a *API) runURL(repo string, number, run int64) string {
 
 func (a *API) deploymentURL(repo string, id, number int64) string {
 	return a.base + tenancy.URLPath(repo, a.installation) + "/deploy/" + strconv.FormatInt(id, 10) + "?cl=" + strconv.FormatInt(number, 10)
+}
+
+// dependsOn records in bc what a watch of t registers on (watched): its files, as ev found them, and
+// the unlanded CLs of its stack below it.
+func (a *API) dependsOn(ctx context.Context, t *target, ev *review.Evaluation, bc *blockedCache) error {
+	bc.active, bc.files, bc.added, bc.ancestors = t.cl.Status.Active(), nil, nil, nil
+	if ev != nil {
+		bc.files, bc.added = ev.Files, ev.Added
+	}
+	for n, depth := t.cl.ParentNumber, 0; n != 0 && depth < maxStack; depth++ {
+		bc.ancestors = append(bc.ancestors, n)
+		parent, ok, err := a.db.GetChangeList(ctx, t.repo.GetId(), n)
+		if err != nil {
+			return err
+		}
+		if !ok || parent.Status == db.StatusSubmitted {
+			break
+		}
+		n = parent.ParentNumber
+	}
+	return nil
 }

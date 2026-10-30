@@ -154,6 +154,7 @@ func deployParts(ctx context.Context, cfg *config.Config, scm grpc.ClientConnInt
 		}
 		out.checkout, out.close = v, func() { v.Close() }
 	case "real":
+		slog.Warn("deploy.checkout is real: every file of each commit is written to disk; present it through okfs (virtual) unless a legacy use needs its whole source on disk")
 		if out.checkout, err = checkout.NewReal(dir, out.source); err != nil {
 			return nil, err
 		}

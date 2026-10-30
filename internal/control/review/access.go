@@ -3,8 +3,6 @@ package review
 import (
 	"context"
 	"log/slog"
-	"sync"
-	"time"
 
 	"github.com/Cidan/ok/internal/authz"
 	"github.com/Cidan/ok/internal/control/db"
@@ -23,65 +21,25 @@ type Access interface {
 	Decide(ctx context.Context, caller string, token *authz.Token, repo int64, a authz.Action) (authz.Decision, error)
 	// Admins are the active people who administer a repository, by stable ID.
 	Admins(ctx context.Context, repo int64) ([]string, error)
-	// Forget drops what is kept of a repository: the directory says it changed.
-	Forget(repo int64)
 }
 
-// NewAccess is Access over ok identity's Authorization: Authorize's facts kept a few seconds
-// (authz.Checker), and who administers each repository, kept as long.
+// NewAccess is Access over ok identity's Authorization, asked each time (authz.Checker).
 func NewAccess(client identitypb.AuthorizationClient) Access {
-	return &access{Checker: authz.NewChecker(client), client: client, admins: map[int64]keptAdmins{}}
+	return &access{Checker: authz.NewChecker(client), client: client}
 }
 
 type access struct {
 	*authz.Checker
 	client identitypb.AuthorizationClient
-
-	mu     sync.Mutex
-	admins map[int64]keptAdmins
 }
 
-type keptAdmins struct {
-	ids []string
-	at  time.Time
-}
-
-// Admins are kept authz.TTL, as facts are, and forgotten with them: every status names them, and
-// every watcher of a monorepo's CLs watches one repository, each asking every few seconds.
+// Admins are ok identity's answer now.
 func (a *access) Admins(ctx context.Context, repo int64) ([]string, error) {
-	a.mu.Lock()
-	k, ok := a.admins[repo]
-	a.mu.Unlock()
-	if ok && time.Since(k.at) < authz.TTL {
-		return k.ids, nil
-	}
 	resp, err := a.client.Admins(ctx, &identitypb.AdminsRequest{RepositoryId: repo})
 	if err != nil {
 		return nil, err
 	}
-	now := time.Now()
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if len(a.admins) >= maxKeptAdmins {
-		for r, k := range a.admins {
-			if now.Sub(k.at) >= authz.TTL {
-				delete(a.admins, r)
-			}
-		}
-	}
-	a.admins[repo] = keptAdmins{ids: resp.GetPrincipalIds(), at: now}
 	return resp.GetPrincipalIds(), nil
-}
-
-// maxKeptAdmins bounds the repositories whose admins are kept; past it, expired ones are swept.
-const maxKeptAdmins = 10_000
-
-// Forget drops what is kept of a repository: its facts, and its admins.
-func (a *access) Forget(repo int64) {
-	a.Checker.Forget(repo)
-	a.mu.Lock()
-	delete(a.admins, repo)
-	a.mu.Unlock()
 }
 
 // Decide is Authorize's decision on principal (by stable ID; "" for no one signed in) doing an

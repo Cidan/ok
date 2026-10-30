@@ -293,18 +293,29 @@ func (x queries) opRecords(ctx context.Context, kind encoding.Kind, sql string, 
 	return out, err
 }
 
-func (x queries) SettledOps(ctx context.Context, repo int64, before time.Time, limit int) ([]backend.OpRecord, error) {
-	p := map[string]any{"repo": repo, "before": before, "limit": int64(limit)}
-	ops, err := x.opRecords(ctx, encoding.KindOperation, `SELECT o.op_log_id, o.id, o.view_id, o.body, o.touched_at
-		FROM operation o JOIN op_log l ON l.op_log_id = o.op_log_id
-		WHERE l.repository_id = @repo AND o.touched_at < @before ORDER BY o.op_log_id, o.id LIMIT @limit`, p)
-	if err != nil {
-		return nil, err
+// SettledOpsIn reads the window's IDs, each with whether it is settled, then the records it takes.
+func (x queries) SettledOpsIn(ctx context.Context, log int64, kind encoding.Kind, after []byte, before time.Time, scan, limit int) ([]backend.OpRecord, []byte, int, bool, error) {
+	table, record := "operation", `SELECT op_log_id, id, view_id, body, touched_at FROM operation`
+	if kind == encoding.KindView {
+		table, record = "view", `SELECT op_log_id, id, CAST(NULL AS BYTES), body, touched_at FROM view`
 	}
-	views, err := x.opRecords(ctx, encoding.KindView, `SELECT v.op_log_id, v.id, CAST(NULL AS BYTES), v.body, v.touched_at
-		FROM view v JOIN op_log l ON l.op_log_id = v.op_log_id
-		WHERE l.repository_id = @repo AND v.touched_at < @before ORDER BY v.op_log_id, v.id LIMIT @limit`, p)
-	return append(ops, views...), err
+	p := map[string]any{"log": log, "scan": int64(scan), "before": before}
+	window := `SELECT id, touched_at < @before FROM ` + table + ` WHERE op_log_id = @log ORDER BY id LIMIT @scan`
+	if after != nil {
+		p["after"] = after
+		window = `SELECT id, touched_at < @before FROM ` + table + ` WHERE op_log_id = @log AND id > @after ORDER BY id LIMIT @scan`
+	}
+	keys, take, err := x.window(ctx, window, p, oneKey)
+	if err != nil {
+		return nil, nil, 0, false, err
+	}
+	taken, last, looked, more := backend.Window(keys, take, scan, limit)
+	if len(taken) == 0 {
+		return nil, last, looked, more, nil
+	}
+	ops, err := x.opRecords(ctx, kind, record+` WHERE op_log_id = @log AND id IN UNNEST(@ids) ORDER BY id`,
+		map[string]any{"log": log, "ids": taken})
+	return ops, last, looked, more, err
 }
 
 func (x queries) OpTombstones(ctx context.Context, repo int64, limit int) ([]backend.OpKey, error) {

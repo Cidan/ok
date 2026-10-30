@@ -79,17 +79,33 @@ ingress:
   host: ok.example.com
   tls: []                       # [{secretName, hosts}]
 
+# The devices workers and the deployer open, as resources a pod requests: /dev/fuse (okfs) and
+# /dev/kvm (runs in microVMs), offered by generic-device-plugin on every node, as
+# <domain>/fuse and <domain>/kvm (docs/install.md, "Workers' nodes"). Disable it where the cluster
+# runs a device plugin offering them already, and name its resources in worker.fuseResource,
+# worker.microvm.kvmResource, and deploy.fuseResource.
+devicePlugin:
+  enabled: true
+  image: squat/generic-device-plugin@sha256:5c48f7a16cfb37c4e07731bfa384b9dba6e12d2b0fb4350d8a321d49f12ac494
+  domain: devic.es
+  count: 128                    # pods on a node that may hold each device at once
+  nodeSelector: {}
+  tolerations:
+    - {operator: Exists, effect: NoSchedule}
+    - {operator: Exists, effect: NoExecute}
+
 worker:
   enabled: true
   replicas: 2
   slots: 2
   runMemoryGiB: 4
-  # real writes each commit to disk; virtual presents it through okfs, which needs user namespaces
-  # and /dev/fuse. A node's container runtime lets a pod open /dev/fuse only as a device plugin
-  # offers it: name the resource it offers in fuseResource (devic.es/fuse, generic-device-plugin's;
-  # docs/install.md, "Workers' nodes"). Without one, /dev/fuse is bound in from the node, which
-  # works only where the runtime applies no device allowlist (an unprivileged LXC node's).
-  checkout: real
+  # virtual presents each run's commit through okfs (docs/okfs.md, "ok's roles"): files are read
+  # as the build reads them, never written out. It needs user namespaces and /dev/fuse, which the
+  # chart's device plugin offers (devicePlugin); with one of your own, name the resource it offers
+  # in fuseResource. Without either, /dev/fuse is bound in from the node, which works only where
+  # the runtime applies no device allowlist (an unprivileged LXC node's). real writes every file of
+  # each commit to disk: only for a legacy use that needs a commit's whole source on disk.
+  checkout: virtual
   fuseResource: ""
   # The pool of workers they serve (docs/hosted.md, "Hosted automation, as built"): jobs name it
   # with pool:, in a workflow job or .ok/repository.yaml.
@@ -102,9 +118,9 @@ worker:
     min: 1
     max: 10
   # Each run in a microVM of its own: Cloud Hypervisor on KVM, with the kernel the runner image
-  # carries. The node offers /dev/kvm through a device plugin's resource (kvmResource: devic.es/kvm,
-  # generic-device-plugin's), else it is bound in from the node. egress unset is ok's default list
-  # of where Bazel downloads from (docs/configuration.md, worker.microvm.egress).
+  # carries. The node offers /dev/kvm through the chart's device plugin (devicePlugin), or one of
+  # your own whose resource kvmResource names, else it is bound in from the node. egress unset is
+  # ok's default list of where Bazel downloads from (docs/configuration.md, worker.microvm.egress).
   microvm:
     enabled: false
     kvmResource: ""
@@ -115,12 +131,14 @@ worker:
   dockerConfigSecret: ""
   state: {sizeLimit: 100Gi}     # an emptyDir: its checkouts, Bazel's output bases, kept graphs
   resources: {}
-  # Workers make user namespaces (bubblewrap, and a virtual checkout's mount): a seccomp profile
-  # that allows it. On nodes that restrict them through AppArmor (Ubuntu 23.10 and later), add
-  # appArmorProfile: {type: Localhost, localhostProfile: ok-sandbox}, the profile in
-  # deploy/apparmor loaded on each node (docs/install.md, "Workers' nodes").
+  # Workers make user namespaces and mount in them (bubblewrap, and okfs): seccomp and AppArmor
+  # profiles that allow it — the container runtime's defaults refuse both. On nodes that restrict
+  # user namespaces through AppArmor (Ubuntu 23.10 and later), give appArmorProfile: {type:
+  # Localhost, localhostProfile: ok-sandbox} instead, the profile in deploy/apparmor loaded on
+  # each node (docs/install.md, "Workers' nodes").
   securityContext:
     seccompProfile: {type: Unconfined}
+    appArmorProfile: {type: Unconfined}
     allowPrivilegeEscalation: false
   nodeSelector: {}
   tolerations: []
@@ -154,7 +172,7 @@ secrets:
 
 deploy:
   enabled: false
-  checkout: real
+  checkout: virtual             # as a worker's: planning and migrations read what they need
   fuseResource: ""              # as a worker's
   bazelFlags: []
   # What the migrations it runs get: {NAME: {secretName, key}}, mounted and read as files.
@@ -164,9 +182,10 @@ deploy:
   serviceAccountAnnotations: {}
   state: {sizeLimit: 50Gi}
   resources: {}
-  # As a worker's: a virtual checkout makes user namespaces.
+  # As a worker's: a virtual checkout makes user namespaces and mounts in them.
   securityContext:
     seccompProfile: {type: Unconfined}
+    appArmorProfile: {type: Unconfined}
     allowPrivilegeEscalation: false
   # The workloads it rolls, each granted it in its namespace (docs/deploy.md, "Grants"):
   # [{namespace, deployment | statefulset, accounts: [the ServiceAccounts its pods run as]}].

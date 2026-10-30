@@ -64,10 +64,11 @@ kubectl -n ok logs -f job/ok-load > load.log   # the summary, then the report's 
 # 6b. Or as PEOPLE people at once — each signed in through the device flow and on a connection of
 #     their own, reviewing each other's CLs — from PODS pods: the system of record's people and
 #     Dex's users first (one password, its bcrypt hash), then the indexed Job, then its pods'
-#     reports added up. REPOSITORIES 1 is everyone's monorepo. Each synthetic worker keeps a real
-#     checkout in its pod's scratch volume. A fresh installation imports its people over a minute
-#     or so: start the Job once it has them all (ok load signs in again a person it lacks, a few
-#     times, ten seconds apart).
+#     reports added up. REPOSITORIES 1 is everyone's monorepo. Each synthetic worker presents its
+#     jobs' commits through okfs, as a worker does — a daemon a pod, from the runner image, with
+#     the FUSE device the chart's device plugin offers — and reads files of each. A fresh
+#     installation imports its people over a minute or so: start the Job once it has them all (ok
+#     load signs in again a person it lacks, a few times, ten seconds apart).
 ok load people -n 2000 -hash-file <bcrypt hash file> -dir people
 kubectl -n ok create secret generic ok-people --from-file=people/people.yaml --dry-run=client -o yaml | kubectl apply -f -
 helm upgrade dex dex/dex -n dex -f /tmp/dex-values.yaml -f people/dex-people.yaml
@@ -76,6 +77,9 @@ sed "s/PROJECT/<project>/; s/TAG/$tag/; s/\"PEOPLE\"/\"2000\"/; s/PODS/4/g; s/\"
   people-job.yaml | kubectl apply -f -
 for p in $(kubectl -n ok get pods -l job-name=ok-people -o name); do kubectl -n ok logs $p > $(basename $p).log; done
 ok load merge -report merged.json ok-people-*.log
+#     Everyone at once: add `-burst-at 4m, -burst-submit-after 8m` to the Job's args, and every
+#     person starts a CL four minutes in — beside the shape's — and submits it eight minutes after,
+#     its pre passed, all at once: the landing queue's herd. Its CLs are measured apart (burst.*).
 
 # 7. Or real CI: a real worker (worker-values.yaml) and people's jj, through the port-forward.
 sed "s/PROJECT/<project>/g; s/TAG/$tag/" worker-values.yaml > /tmp/worker-values.yaml

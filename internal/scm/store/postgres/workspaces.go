@@ -102,13 +102,6 @@ func (x queries) DeleteDictionary(ctx context.Context, net backend.Network, id i
 
 // ─── Garbage collection ───
 
-func (x queries) DueForGC(ctx context.Context, scheduled, retry time.Time) ([]int64, error) {
-	return int64s(x.q.Query(ctx, `SELECT r.id FROM repository r
-		WHERE NOT EXISTS (SELECT 1 FROM gc_pass g WHERE g.repository_id = r.id AND g.started_at >= $1 AND g.error IS NULL)
-		  AND NOT EXISTS (SELECT 1 FROM gc_pass g WHERE g.repository_id = r.id AND g.error IS NOT NULL AND g.started_at > $2)
-		ORDER BY r.id`, scheduled, retry))
-}
-
 func (x queries) RepositoryDueForGC(ctx context.Context, repo int64, scheduled, retry time.Time) (bool, error) {
 	var due bool
 	err := x.q.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM repository r WHERE r.id = $1
@@ -126,26 +119,6 @@ func (x queries) MarkWork(ctx context.Context, kind string, key int64) error {
 
 func (x queries) MarkWorkAt(ctx context.Context, kind string, key int64, at time.Time) error {
 	return pgdata.MarkWorkAt(ctx, x.q, kind, key, at)
-}
-
-func (x queries) TakeWork(ctx context.Context, kind string, key int64, holder string, ttl time.Duration) (bool, error) {
-	return pgdata.TakeWork(ctx, x.q, kind, key, holder, ttl)
-}
-
-func (x queries) RenewWork(ctx context.Context, kind string, key int64, holder string, ttl time.Duration) (bool, error) {
-	return pgdata.RenewWork(ctx, x.q, kind, key, holder, ttl)
-}
-
-func (x queries) ReleaseWork(ctx context.Context, kind string, key int64, holder string) (bool, error) {
-	return pgdata.ReleaseWork(ctx, x.q, kind, key, holder)
-}
-
-func (x queries) LetWork(ctx context.Context, kind string, key int64, holder string) error {
-	return pgdata.LetWork(ctx, x.q, kind, key, holder)
-}
-
-func (x queries) DueWork(ctx context.Context, kind string, limit int) ([]int64, error) {
-	return pgdata.DueWork(ctx, x.q, kind, limit)
 }
 
 func (x queries) InsertGCPass(ctx context.Context, p backend.GCPass) error {

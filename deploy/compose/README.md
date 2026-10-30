@@ -68,9 +68,10 @@ in each with the same email, a bcrypt hash of their password in `dex.yaml` —
 
 ## The worker
 
-The worker runs each run job's program in a sandbox (bubblewrap), which makes user namespaces and
-mounts: compose.yaml runs it with seccomp, AppArmor, and SELinux unconfined. On Ubuntu 23.10 and
-later, which restrict user namespaces, also run
+The worker presents each run's commit through okfs, reading files as the build reads them, and runs
+each run job's program in a sandbox (bubblewrap); both make user namespaces and mount in them:
+compose.yaml starts it under unshare, with the host's `/dev/fuse` and seccomp, AppArmor, and
+SELinux unconfined. On Ubuntu 23.10 and later, which restrict user namespaces, also run
 
 ```bash
 sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0

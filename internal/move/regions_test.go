@@ -200,8 +200,8 @@ func TestCellsUnderLoad(t *testing.T) {
 		networks = append(networks, m.Network)
 	}
 	deadline := time.Now().Add(3 * time.Minute)
+	// Identity's mover drives each, its first step booked as it was asked.
 	for {
-		id.Mover.Pass(ctx)
 		done := 0
 		for _, n := range networks {
 			m, err := id.Store.GetMove(ctx, n)

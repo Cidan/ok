@@ -407,8 +407,18 @@ automation (`internal/automation/queue`):
   submissions it would land one after another: the first that may land, then each next that the
   queue, decided again as it would stand once the ones before had landed (`Snapshot.AfterLanding`),
   would land next — so a landing whose footprint interacts with the next ends the batch, and the
-  next is tested again on top of it as it would be anyway. Each CL is committed for its own
-  submitter (`LandRequest.Item.actor_id`). `automation.landing_batch` bounds a batch (32), and
+  next is tested again on top of it as it would be anyway. A batch is decided in one pass over
+  the queue, going on after each landing from the submission behind it: a landing changes nothing
+  ahead of it that a decision behind it reads, and lands nothing ahead of it. Each CL is committed for its own
+  submitter (`LandRequest.Item.actor_id`).
+- **Deciding at scale.** A decision costs about what the queue's footprints hold, not the square
+  of the queue: each submission's conflicts with those ahead of it are found through an inverted
+  index of every footprint's paths, packages, and targets (`queue/index.go`) and decided by the
+  pairwise checks, once a decision; a passed attempt is checked through one of what landed on
+  main, and against the first place main has that the queue has not read, or the first commit
+  landed outside it. Checking every pair, a herd of 2,000 submissions held each batch of 32 for
+  five minutes; 3,000 are decided in some 20 milliseconds. A randomized test holds the decision to
+  the pairwise one it replaced (`TestDecisionMatchesTheReference`). `automation.landing_batch` bounds a batch (32), and
   the SCM's 1,000 CLs a landing do too. A batch the SCM refuses lands its first submission alone,
   which says whose the refusal is. `ok_automation_landings_total` and
   `ok_automation_landed_submissions_total` count landings and what they landed.
@@ -432,25 +442,31 @@ marked, in the same transaction, by everything that changes what it acts on — 
 attempt made, released, or discarded, a post plan, a post run's end however it ends (finished,
 released canceled, or lost with its worker), a commit on main — and done by one replica at a time,
 whichever takes it first, and by every replica between them. The one thing time decides, a
-candidate no attempt holds coming of age to be discarded, is a mark for that time. Every replica
-looks for marked work as each mark's signal arrives (the bus's, sent once the mark commits), and at
-least every ten seconds. A submission has one active attempt at a time:
+candidate no attempt holds coming of age to be discarded, is a mark for that time. Each mark's job,
+enqueued in the mark's transaction, brings the queue to a replica; none looks for marked work. A submission has one active attempt at a time:
 the store refuses another while one is active, so its post never runs twice. Each submission
 says what it waits for (its note: testing on top of which CLs, waiting for which to land), written
 only when it changes.
 
 A pass lands as soon as anything has passed: each landing lands a batch of the passed submissions in
 queue order, up to 32, in one transaction of the SCM's, then records them all in one of its own
-(`RecordLandings`), and the queue is read and decided again. Beside each landing, and once nothing
+(`RecordLandings`) — each kind of row for every submission in a statement of its own, so a batch
+of 32 is as few round trips as one — and the queue is read and decided again. Beside each landing, and once nothing
 is left to land, it does everything else that reading said — preparing attempts, releasing them,
 discarding, failing, canceling: with a landing every second at a busy monorepo's peak, doing them
 only once landings stopped left attempts unprepared for up to a minute. An attempt prepared on main
 as it lands is checked against what landed, as one another replica's landing raced is. Each
-submission's actions are done in order, up to 16 submissions at once: preparing an attempt is a few
-of the SCM's calls and a transaction, and one submission after another made a busy monorepo's pass
-minutes long.
+submission's actions are done in order, and a step acts on the first 128 submissions with anything to
+do, in queue order, all at once (`automation.queue_parallel`), then decides again: preparing an
+attempt is a few of the SCM's calls and a transaction, which its replicas share. One submission after
+another made a busy monorepo's pass minutes long; and a step that did every submission's actions
+waited, its landing done, for the slowest of a herd's thousands of preparations — 3,000 submissions
+landed a batch every few minutes, 16 prepared at once.
 Attempts prepared at once that need one candidate (a chain's CL on one base) share its
-preparation. Candidates no attempt holds are collected at most once a minute. Where each landed
+preparation. Candidates no attempt holds are collected a minute after a pass finds nothing left to
+do — at most that often, booked as keyed work of its own (`collect`) — holding the queue's claim,
+so no pass decides on a candidate as it is discarded; one that finds a pass under way is put off a
+moment. Where each landed
 submission's time went is a metric (`ok_automation_landing_stage_seconds`, by stage: queued,
 plan_wait, planning, release, job_wait, job_run, land, total), as are each pass's and each action's
 (`ok_automation_queue_pass_seconds`, `ok_automation_queue_action_seconds`).
@@ -470,16 +486,13 @@ A path conflict with main is refused, as in landing: `jj sync`, resolve, and upl
 - **Workers** (`ok worker run`) take runs, each in a **slot**: a checkout of its own, and Bazel
   output bases of its own outside it, kept from run to run so each slot builds incrementally. A
   worker runs as many runs at once as it has slots, while its cgroup has the memory for another.
-  The run's commit is checked out one of two ways (`worker.checkout`):
-  - **virtual** (the default): presented read-only through okfs ([okfs.md](okfs.md), "ok's
-    roles"), each file read from the SCM when something first reads it — ok's jj runs as the
-    worker's daemon, in a user and mount namespace the worker makes for itself, and needs
-    `/dev/fuse`;
-  - **real**: written to disk from the SCM, only what differs from the slot's last commit, every
-    file read-only — for a node without `/dev/fuse`. What changed comes from comparing the commit's
-    tree with the slot's, both from the checkouts' layers, the files planning reads with them, and
-    each file that replaces another at its path as a delta against the one on disk where that is
-    smaller ([scm.md](scm.md), "Checkouts", "Deltas").
+  The run's commit is **presented** read-only through okfs ([okfs.md](okfs.md), "ok's roles"):
+  its checkout's layers taken in as it mounts ([scm.md](scm.md), "Checkouts"), each file read
+  from the SCM when the build first reads it, nothing written out. ok's jj runs as the worker's
+  daemon, in a user and mount namespace the worker makes for itself, and needs `/dev/fuse`, which
+  the chart's device plugin offers ([install.md](install.md), "Workers' nodes"). A real checkout
+  (`worker.checkout: real`), every file of each commit written to disk, is only for a legacy use
+  that needs a commit's whole source on disk.
 - **Every Bazel command** a worker runs gets `--symlink_prefix=/` (no convenience symlinks in a
   read-only checkout), `--sandbox_default_allow_network=false` (actions and tests without network),
   the lockfile honored (`--lockfile_mode=error` when `MODULE.bazel.lock` exists), the installation's

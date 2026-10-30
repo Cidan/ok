@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"hash"
 	"io"
-	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -452,44 +451,97 @@ func (s *Server) Write(stream grpc.ClientStreamingServer[bspb.WriteRequest, bspb
 	if _, ok, err := s.find(ctx, []string{ns.Write}, d); err == nil && ok {
 		return stream.SendAndClose(&bspb.WriteResponse{CommittedSize: d.GetSizeBytes()})
 	}
-	f, err := os.CreateTemp("", "okcache")
-	if err != nil {
-		return status.Error(codes.Internal, err.Error())
+	size := d.GetSizeBytes()
+	if size == 0 {
+		if err := matches(sha256.New(), 0, d); err != nil {
+			return err
+		}
 	}
-	defer os.Remove(f.Name())
-	defer f.Close()
-	h := sha256.New()
-	w := io.MultiWriter(f, h)
+	// The blob goes to its key as it arrives, through a reader that gives its last byte only once
+	// every byte hashes to the digest: a Put stores nothing it did not read whole.
+	pr, pw := io.Pipe()
+	put := make(chan error, 1)
+	go func() {
+		err := s.blobs.Put(ctx, casKey(ns.Write, d.GetHash()), &verified{r: pr, h: sha256.New(), left: size, want: d.GetHash()}, size)
+		pr.CloseWithError(err)
+		put <- err
+	}()
+	fail := func(err error) error {
+		pw.CloseWithError(err)
+		<-put
+		return err
+	}
 	var n int64
 	req := first
 	for {
 		if req.GetWriteOffset() != n {
-			return status.Errorf(codes.InvalidArgument, "a write at %d, where %d were written", req.GetWriteOffset(), n)
+			return fail(status.Errorf(codes.InvalidArgument, "a write at %d, where %d were written", req.GetWriteOffset(), n))
 		}
-		if n+int64(len(req.GetData())) > d.GetSizeBytes() {
-			return status.Error(codes.InvalidArgument, "a write past the blob's size")
+		if n+int64(len(req.GetData())) > size {
+			return fail(status.Error(codes.InvalidArgument, "a write past the blob's size"))
 		}
-		if _, err := w.Write(req.GetData()); err != nil {
-			return status.Error(codes.Internal, err.Error())
+		if _, err := pw.Write(req.GetData()); err != nil {
+			return fail(putError(<-put))
 		}
 		n += int64(len(req.GetData()))
 		if req.GetFinishWrite() {
 			break
 		}
 		if req, err = stream.Recv(); err != nil {
-			return err
+			return fail(err)
 		}
 	}
-	if err := matches(h, n, d); err != nil {
-		return err
+	if n != size {
+		return fail(status.Errorf(codes.InvalidArgument, "a blob of %d bytes named %d", n, size))
 	}
-	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		return status.Error(codes.Internal, err.Error())
-	}
-	if err := s.blobs.Put(ctx, casKey(ns.Write, d.GetHash()), f, n); err != nil {
-		return status.Error(codes.Unavailable, err.Error())
+	pw.Close()
+	if err := <-put; err != nil {
+		return putError(err)
 	}
 	return stream.SendAndClose(&bspb.WriteResponse{CommittedSize: n})
+}
+
+// putError is a written blob's failed Put as the client is told it: bytes that are not the blob's
+// digest are the client's to fix; anything else, the bucket's, to try again.
+func putError(err error) error {
+	if errors.Is(err, errNotDigest) {
+		return status.Errorf(codes.InvalidArgument, "a blob whose bytes are not its digest's")
+	}
+	return status.Error(codes.Unavailable, err.Error())
+}
+
+// errNotDigest refuses a written blob whose bytes do not hash to its digest.
+var errNotDigest = errors.New("the blob's bytes do not hash to its digest")
+
+// verified reads a blob of left bytes from r, holding back the read that holds its last byte until
+// every byte hashes, through h, to want; then it fails instead.
+type verified struct {
+	r    io.Reader
+	h    hash.Hash
+	left int64
+	want string
+}
+
+func (v *verified) Read(p []byte) (int, error) {
+	if v.left == 0 {
+		return 0, io.EOF
+	}
+	if int64(len(p)) > v.left {
+		p = p[:v.left]
+	}
+	n, err := v.r.Read(p)
+	v.h.Write(p[:n])
+	v.left -= int64(n)
+	if v.left == 0 {
+		if hex.EncodeToString(v.h.Sum(nil)) != v.want {
+			return 0, errNotDigest
+		}
+		return n, nil
+	}
+	if errors.Is(err, io.EOF) {
+		err = io.ErrUnexpectedEOF
+	}
+	return n, err
 }
 
 func matches(h hash.Hash, n int64, d *repb.Digest) error {
