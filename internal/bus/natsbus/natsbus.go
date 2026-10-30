@@ -111,7 +111,22 @@ func Open(nc *nats.Conn, opts Options) (*Bus, error) {
 	}
 	b := &Bus{nc: nc, js: js, opts: opts, streams: map[string]bool{}, consumers: map[string]jetstream.Consumer{}, renewing: map[string]*renewal{}}
 	b.inboxes = bus.NewInboxes(b, b.prepareInboxes, b.dropQueue)
+	before := nc.Opts.ReconnectedCB
+	nc.SetReconnectHandler(func(c *nats.Conn) {
+		b.forgetStreams()
+		if before != nil {
+			before(c)
+		}
+	})
 	return b, nil
+}
+
+// forgetStreams has every stream and consumer looked for anew: a server that came back may have lost them, and until they are made again
+// it answers "stream not found" to every enqueue and lease.
+func (b *Bus) forgetStreams() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.streams, b.consumers = map[string]bool{}, map[string]jetstream.Consumer{}
 }
 
 // Inbox opens an inbox, on this process's queue of inboxes: a consumer the server removes once no
