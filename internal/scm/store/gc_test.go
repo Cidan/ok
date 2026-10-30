@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Cidan/ok/internal/blob"
 	"github.com/Cidan/ok/internal/scm/contentindex"
 	"github.com/Cidan/ok/internal/scm/encoding"
 	"github.com/Cidan/ok/internal/scm/pack"
@@ -1096,6 +1097,69 @@ func TestGCReadsItsWindowAndRetiresTheDaysBefore(t *testing.T) {
 	again, err := e.s.GC(ctx, e.repo, time.Now(), GCOptions{})
 	if err != nil || again.FilesSwept+again.ChunksSwept != 0 || again.ContentKept != 0 || again.IndexRunsRetired != 0 || len(scanned) != 0 {
 		t.Fatalf("a second pass: %s, %v, scanning %+v; want nothing to read or do", again, err, scanned)
+	}
+	clean(t, e.s, e.repo)
+}
+
+// corruptingStages changes a byte of everything staged, and says it stored it.
+type corruptingStages struct{ blob.Store }
+
+func (c corruptingStages) Stage(ctx context.Context, tmp string) (blob.Staged, error) {
+	st, err := c.Store.Stage(ctx, tmp)
+	if err != nil {
+		return nil, err
+	}
+	return &corruptingStage{Staged: st}, nil
+}
+
+type corruptingStage struct {
+	blob.Staged
+	done bool
+}
+
+func (c *corruptingStage) Write(p []byte) (int, error) {
+	if !c.done && len(p) > 0 {
+		c.done = true
+		q := bytes.Clone(p)
+		q[len(q)-1] ^= 0xff
+		return c.Staged.Write(q)
+	}
+	return c.Staged.Write(p)
+}
+
+// What compaction writes replaces the only other copy, which goes an hour later: a pack that does
+// not read back as written moves no chunk, and the pass fails with every file where it was.
+func TestCompactionChecksWhatItWrote(t *testing.T) {
+	ctx := context.Background()
+	e := newCLEnv(t)
+	contents := map[encoding.ID][]byte{}
+	for i := range 3 {
+		b := newBuilder(t)
+		c := bytesOf(100_000, byte(60+i))
+		f := b.file(c)
+		contents[f] = c
+		b.commit(b.tree(fileEntry("f", f)), fmt.Sprintf("kept %d", i), encoding.RootCommitID)
+		mustPublish(t, e.s, e.repo, alice, b, nil)
+	}
+	stored := e.s.blobs
+	e.s.blobs = corruptingStages{stored}
+	if _, err := e.s.GC(ctx, e.repo, time.Now(), GCOptions{}); err == nil {
+		t.Fatal("a pass whose compacted pack reads back wrong succeeded")
+	}
+	e.s.blobs = stored
+	for f, c := range contents {
+		if !bytes.Equal(readAll(t, e.s, e.repo, f), c) {
+			t.Errorf("file %s read wrong after the failed pass", f)
+		}
+	}
+	clean(t, e.s, e.repo)
+	if _, err := e.s.GC(ctx, e.repo, time.Now(), GCOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	for f, c := range contents {
+		if !bytes.Equal(readAll(t, e.s, e.repo, f), c) {
+			t.Errorf("file %s read wrong after the next pass", f)
+		}
 	}
 	clean(t, e.s, e.repo)
 }

@@ -1,9 +1,12 @@
 package store
 
 import (
+	"bytes"
 	"cmp"
 	"context"
+	"crypto/sha256"
 	"fmt"
+	"io"
 	"slices"
 	"sort"
 	"sync/atomic"
@@ -375,7 +378,8 @@ func (s *Store) writeCompacted(ctx context.Context, net backend.Network, chunks 
 		return 0, err
 	}
 	defer st.Abort()
-	pw := pack.NewWriter(st)
+	written := sha256.New()
+	pw := pack.NewWriter(io.MultiWriter(st, written))
 	locs := make([]pack.Location, len(chunks))
 	for start := 0; start < len(chunks); {
 		end, window := start, int64(0)
@@ -419,6 +423,9 @@ func (s *Store) writeCompacted(ctx context.Context, net backend.Network, chunks 
 		return 0, err
 	}
 	if err := st.Commit(ctx, packKey(net, packID)); err != nil {
+		return 0, err
+	}
+	if err := s.checkStored(ctx, packKey(net, packID), written.Sum(nil), size); err != nil {
 		return 0, err
 	}
 
@@ -581,4 +588,18 @@ func (s *Store) readCompactSources(ctx context.Context, net backend.Network, chu
 		return nil, 0, err
 	}
 	return out, read.Load(), nil
+}
+
+// checkStored reads back the object at key and holds it to the size bytes whose hash is sum: what
+// compaction moves chunks onto replaces the only other copy, which is deleted an hour after.
+func (s *Store) checkStored(ctx context.Context, key string, sum []byte, size int64) error {
+	read := sha256.New()
+	n, err := s.blobs.Download(ctx, key, read)
+	if err != nil {
+		return fmt.Errorf("reading back %s: %w", key, err)
+	}
+	if n != size || !bytes.Equal(read.Sum(nil), sum) {
+		return fmt.Errorf("%s reads back as %d bytes other than the %d written", key, n, size)
+	}
+	return nil
 }
