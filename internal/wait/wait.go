@@ -71,16 +71,27 @@ func Run(ctx context.Context, s Store, q bus.Queue, log *slog.Logger) {
 			return s.Lapse(ctx, string(body), time.Now())
 		}, log)
 	}()
-	work.Consume(ctx, s, ChangedKind, 8, time.Second, func(ctx context.Context, _ int64, body []byte, _ time.Duration) error {
+	work.Consume(ctx, s, ChangedKind, 8, time.Second, func(ctx context.Context, _ int64, body []byte, age time.Duration) error {
 		subject := string(body)
 		inboxes, err := s.Waiting(ctx, []string{subject}, time.Now())
 		if err != nil {
 			return err
 		}
-		return bus.Reply(ctx, q, inboxes, "", body)
+		if err := bus.Reply(ctx, q, inboxes, "", body); err != nil {
+			return err
+		}
+		if age < Settle {
+			return work.Later{After: Settle - age}
+		}
+		return nil
 	}, log)
 	<-done
 }
+
+// Settle is how long after a change's step was made it is replied to again. Its job is enqueued just
+// before its transaction commits, so the first reply can beat the commit: a waiter it wakes reads what
+// was there before, and waits on with nothing left to wake it.
+var Settle = 2 * time.Second
 
 // Lease is how long a registration lasts unrenewed; a waiter renews it every third of it.
 var Lease = 2 * time.Minute

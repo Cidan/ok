@@ -126,6 +126,11 @@ each one's inbox. The request takes the job from its inbox, reads what it waits 
 database, and answers or waits again; as it ends it deletes its registration. A registration whose
 request died lapses: a job due when it lapses deletes it.
 
+That item is enqueued just before its transaction commits, so its reply can beat the commit: the
+request it wakes reads what was there before, and waits on with nothing left to wake it. So a change is
+replied to twice, as its item comes and again `wait.Settle` later. A request wakes once more than it
+needs to, for one read that finds nothing new; never waiting on what already happened is worth that.
+
 A request reads what it waits for after it registers, so a change between the two is read, not
 missed. A change no one waits for costs one item and one read of no registrations.
 

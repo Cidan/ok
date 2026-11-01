@@ -15,10 +15,13 @@ while getopts n:d:i:b: o; do
   esac
 done
 log() { echo "$(date -u +%FT%TZ) chaos: $*"; }
+# One of its input's lines, at random: shuf is not on every machine this runs from.
+pick() { awk -v seed="$RANDOM" 'BEGIN { srand(seed) } { line[NR] = $0 } END { if (NR) print line[int(rand() * NR) + 1] }'; }
 selectors=(app.kubernetes.io/component=server app.kubernetes.io/component=deploy)
 drained=() zone="" restarted=""
 uncordon() {
-  for n in "${drained[@]}"; do
+  # macOS's bash 3.2 calls an empty array unbound, under set -u.
+  for n in ${drained[@]+"${drained[@]}"}; do
     log "uncordoning $n"
     $kubectl uncordon "$n" || log "uncordoning $n failed"
   done
@@ -30,13 +33,13 @@ while :; do
   t=$(( $(date +%s) - start ))
   (( t >= duration )) && break
   sel=${selectors[RANDOM % ${#selectors[@]}]}
-  pod=$($kubectl -n "$ns" get pods -l "$sel" --field-selector=status.phase=Running -o name | shuf -n1 || true)
+  pod=$($kubectl -n "$ns" get pods -l "$sel" --field-selector=status.phase=Running -o name | pick || true)
   if [[ -n $pod ]]; then
     log "deleting $pod"
     $kubectl -n "$ns" delete "$pod" --wait=false || log "deleting $pod failed"
   fi
   if [[ -z $zone ]] && (( t >= duration / 3 )); then
-    zone=$($kubectl get nodes -o jsonpath='{.items[*].metadata.labels.topology\.kubernetes\.io/zone}' | tr ' ' '\n' | sort -u | shuf -n1)
+    zone=$($kubectl get nodes -o jsonpath='{.items[*].metadata.labels.topology\.kubernetes\.io/zone}' | tr ' ' '\n' | sort -u | pick)
     log "draining zone $zone"
     for n in $($kubectl get nodes -l "topology.kubernetes.io/zone=$zone" -o name); do
       drained+=("$n")

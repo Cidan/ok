@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -172,9 +173,16 @@ echo '{"database":"app","steps":[{"description":"0002_drop"}],"executed":true}'
 		!strings.Contains(refused.Output, "migrating") || !strings.Contains(string(refused.Report), `"0002_drop"`) {
 		t.Errorf("refused: %+v", refused)
 	}
-	// Its secrets are files for it alone, and nothing it printed holds them.
+	// Its secrets are files for it alone, and nothing it printed holds them. They go on a memory file
+	// system, so with none, as off Linux, the migration is refused, not given them on a disk.
 	values := map[string][]byte{"secret/prod/db": []byte("hunter2-correct")}
 	applied, err := b.Migrate(ctx, "//db:migrate", []string{migrate.DeletesData}, values)
+	if runtime.GOOS != "linux" {
+		if err == nil || !strings.Contains(err.Error(), "memory file system") {
+			t.Errorf("secrets with no memory file system: %+v (%v)", applied, err)
+		}
+		return
+	}
 	if err != nil || applied.Failed != "" || len(applied.Refused) != 0 || !strings.Contains(string(applied.Report), `"executed":true`) {
 		t.Errorf("applied: %+v (%v)", applied, err)
 	}
