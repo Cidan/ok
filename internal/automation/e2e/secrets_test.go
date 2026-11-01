@@ -2,13 +2,12 @@ package e2e
 
 import (
 	"fmt"
-	"path/filepath"
-	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/Cidan/ok/internal/secrets"
+	"github.com/Cidan/ok/internal/secrets/secretstest"
 	automationpb "github.com/Cidan/ok/proto/ok/automation/v1"
 	secretspb "github.com/Cidan/ok/proto/ok/secrets/v1"
 )
@@ -89,7 +88,7 @@ func postSecrets(t *testing.T, startWorker func(e *env)) {
 	e.land(repo, uploadedOn(t, a, "add the token", map[string]*string{"secret/token": ptr(string(w.GetPointer())), ".ok/workflow/ci.yaml": ciWith("push")}), 1)
 	a.jj("keeps", "sync")
 	startWorker(e)
-	before, _ := filepath.Glob("/dev/shm/ok-secrets-*")
+	before := secretstest.Dirs()
 
 	submit := func(msg string, files map[string]*string) *automationpb.Submission {
 		t.Helper()
@@ -150,8 +149,7 @@ func postSecrets(t *testing.T, startWorker func(e *env)) {
 		!strings.Contains(log, "pushed with the token [secret //secret/token]") || strings.Contains(log, "hunter2") {
 		t.Errorf("push's log:\n%s", log)
 	}
-	after, _ := filepath.Glob("/dev/shm/ok-secrets-*")
-	if left := slices.DeleteFunc(after, func(d string) bool { return slices.Contains(before, d) }); len(left) != 0 {
+	if left := secretstest.Left(before, time.Minute); len(left) != 0 {
 		t.Errorf("the worker left its secrets in %v", left)
 	}
 

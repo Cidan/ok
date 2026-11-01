@@ -12,9 +12,11 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Cidan/ok/internal/buildsys/bazel"
 	"github.com/Cidan/ok/internal/checkout"
+	"github.com/Cidan/ok/internal/secrets/secretstest"
 	"github.com/Cidan/ok/internal/testbazel"
 	"github.com/Cidan/ok/migrate"
 )
@@ -176,6 +178,7 @@ echo '{"database":"app","steps":[{"description":"0002_drop"}],"executed":true}'
 	// Its secrets are files for it alone, and nothing it printed holds them. They go on a memory file
 	// system, so with none, as off Linux, the migration is refused, not given them on a disk.
 	values := map[string][]byte{"secret/prod/db": []byte("hunter2-correct")}
+	before := secretstest.Dirs()
 	applied, err := b.Migrate(ctx, "//db:migrate", []string{migrate.DeletesData}, values)
 	if runtime.GOOS != "linux" {
 		if err == nil || !strings.Contains(err.Error(), "memory file system") {
@@ -189,7 +192,7 @@ echo '{"database":"app","steps":[{"description":"0002_drop"}],"executed":true}'
 	if !strings.Contains(applied.Output, "the password is [secret //secret/prod/db]") || strings.Contains(applied.Output, "hunter2") {
 		t.Errorf("the migration's output: %q", applied.Output)
 	}
-	if left, _ := filepath.Glob("/dev/shm/ok-secrets-*"); len(left) != 0 {
+	if left := secretstest.Left(before, time.Minute); len(left) != 0 {
 		t.Errorf("secrets left behind: %v", left)
 	}
 }
