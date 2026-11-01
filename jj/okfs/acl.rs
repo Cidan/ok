@@ -223,7 +223,7 @@ pub fn set_access(
     }
     let mut mode = (mode & !0o777) | bits;
     if kill_sgid {
-        mode &= !libc::S_ISGID;
+        mode &= !okfs_fuse::abi::S_ISGID;
     }
     Ok(mode)
 }

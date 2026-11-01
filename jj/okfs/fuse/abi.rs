@@ -19,6 +19,7 @@ pub const S_IFLNK: u32 = 0o120000;
 pub const S_IFREG: u32 = 0o100000;
 pub const S_IFDIR: u32 = 0o040000;
 pub const S_IFIFO: u32 = 0o010000;
+pub const S_ISGID: u32 = 0o2000;
 
 // Opcodes.
 pub const LOOKUP: u32 = 1;

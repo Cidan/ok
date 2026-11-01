@@ -37,6 +37,7 @@ jobs:
       OK_TEST_JJ: require
       USE_BAZEL_VERSION: 9.3.0
       OK_BINARY: /tmp/ok
+      OK_NATS_BINARY: /tmp/ok-test-nats
       OK_JJ: ${{ github.workspace }}/target/debug/jj
     steps:
       - uses: actions/checkout@v7
@@ -54,6 +55,7 @@ jobs:
       - name: Build
         run: |
           go build -o /tmp/ok ./cmd/ok
+          go build -o /tmp/ok-test-nats ./internal/bus/bustest/natsserver
           cargo build --locked -p ok-jj
       - name: Lint
         run: |
@@ -64,7 +66,7 @@ jobs:
       - name: Go tests
         run: go test -timeout 25m ./...
       - name: Rust tests
-        run: cargo test --locked --workspace
+        run: cargo test --locked --workspace --no-fail-fast
 
   macos:
     runs-on: macos-15

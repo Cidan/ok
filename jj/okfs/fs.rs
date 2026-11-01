@@ -1010,8 +1010,8 @@ impl Mount {
                     kind: l.kind.mode_bits(),
                     name: l.name.clone(),
                 };
-                let secret =
-                    attr.mode & libc::S_IFMT == libc::S_IFREG && self.secret_path(child).is_some();
+                let secret = attr.mode & fuse::abi::S_IFMT == fuse::abi::S_IFREG
+                    && self.secret_path(child).is_some();
                 let lookup = (!dot).then_some(fuse::Entry {
                     attr,
                     generation: 0,
@@ -1205,7 +1205,9 @@ impl Mount {
     /// handle read, else 0 — and `0600`. Returns how long the kernel may keep the attributes: not
     /// at all for a secret, whose size changes without the kernel seeing a write.
     fn secret_attr(&self, attr: &mut fuse::Attr) -> Duration {
-        if attr.mode & libc::S_IFMT != libc::S_IFREG || self.secret_path(attr.ino).is_none() {
+        if attr.mode & fuse::abi::S_IFMT != fuse::abi::S_IFREG
+            || self.secret_path(attr.ino).is_none()
+        {
             return TTL;
         }
         let held = self
@@ -1228,7 +1230,7 @@ impl Mount {
                 })
                 .unwrap_or(0)
         });
-        attr.mode = (attr.mode & libc::S_IFMT) | 0o600;
+        attr.mode = (attr.mode & fuse::abi::S_IFMT) | 0o600;
         Duration::ZERO
     }
 
