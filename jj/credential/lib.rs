@@ -74,10 +74,21 @@ pub enum Error {
     Renew(tonic::Status),
     #[error("{0} is not ok's address: {1}")]
     Endpoint(String, String),
+    #[error("setting up TLS for {0}: {1}")]
+    Tls(String, tonic::transport::Error),
+    /// The server could not be reached: no network, a name that does not resolve, nothing listening.
     #[error("connecting to {0}: {1}")]
     Transport(String, tonic::transport::Error),
     #[error("signing in: {0}")]
     Login(String),
+}
+
+impl Error {
+    /// Whether this is a server that could not be reached, which another try may get past, rather
+    /// than a credential that is missing, unreadable, or refused.
+    pub fn is_unreachable(&self) -> bool {
+        matches!(self, Error::Transport(..))
+    }
 }
 
 /// Where ok is (`server.json`), as `ok auth login` writes it.
@@ -438,9 +449,7 @@ async fn dial(uri: &str) -> Result<Channel, Error> {
             }
             None => tls.with_native_roots(),
         };
-        ep = ep
-            .tls_config(tls)
-            .map_err(|e| Error::Transport(uri.into(), e))?;
+        ep = ep.tls_config(tls).map_err(|e| Error::Tls(uri.into(), e))?;
     }
     ep.connect()
         .await

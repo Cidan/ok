@@ -669,7 +669,8 @@ impl Daemon {
 
     /// Takes a workspace's lease; with takeover, waits for the holder to hand over (or its lease
     /// to lapse). Ok(None) when ok cannot be reached: the workspace mounts, and the lease is
-    /// taken later.
+    /// taken later. Only an answer from ok is an error, since one while the lease is being
+    /// acquired makes the workspace read-only (`lease_tick`).
     async fn attach(
         &self,
         shared: &Arc<Shared>,
@@ -708,12 +709,15 @@ impl Daemon {
                     }
                     tokio::time::sleep(Duration::from_secs(1)).await;
                 }
+                // Cancelled: the connection ended under the request (hyper's `is_canceled`), as it
+                // does on a network coming up or going down; nothing here cancels one.
                 Err(s)
                     if matches!(
                         s.code(),
                         tonic::Code::Unavailable
                             | tonic::Code::DeadlineExceeded
                             | tonic::Code::Unknown
+                            | tonic::Code::Cancelled
                     ) =>
                 {
                     return Ok(None);

@@ -172,3 +172,17 @@ async fn a_newer_certificate_on_disk_is_taken_up() {
         (renewed.not_after, "crd_fixture")
     );
 }
+
+// A server that cannot be reached is a failure to try again; TLS that cannot be set up is not.
+#[tokio::test]
+async fn an_unreachable_server_is_told_apart() {
+    match dial("http://127.0.0.1:1").await {
+        Err(e @ Error::Transport(..)) => assert!(e.is_unreachable()),
+        other => panic!("nothing listening: {:?}", other.err()),
+    }
+    // A name TLS cannot verify a certificate for: a label may not start with a hyphen.
+    match dial("https://-not-a-name-:1").await {
+        Err(e @ Error::Tls(..)) => assert!(!e.is_unreachable()),
+        other => panic!("TLS that cannot be set up: {:?}", other.err()),
+    }
+}

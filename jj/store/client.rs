@@ -204,9 +204,15 @@ pub async fn connect(endpoint: &str, dev: Option<&str>) -> Result<(Conn, Headers
         .map_err(|e| Status::invalid_argument(format!("endpoint {endpoint}: {e}")))?;
     match uri.scheme_str() {
         Some("https") => {
-            let channel = ok_credential::channel(endpoint)
-                .await
-                .map_err(|e| Status::unauthenticated(e.to_string()))?;
+            let channel = ok_credential::channel(endpoint).await.map_err(|e| {
+                // Not reaching the server is not being refused by it: callers retry the one, and
+                // send the person to `jj auth login` for the other.
+                if e.is_unreachable() {
+                    Status::unavailable(e.to_string())
+                } else {
+                    Status::unauthenticated(e.to_string())
+                }
+            })?;
             Ok((Measured::new(channel), Headers::default()))
         }
         Some("http") => {

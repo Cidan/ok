@@ -1013,6 +1013,59 @@ pub fn checkpoint_after_restart() {
     println!("checkpoint_after_restart_run: scenario done");
 }
 
+/// A daemon that starts while ok is out of reach, as one does at login before the network is up,
+/// mounts its workspaces from what it has and says it is acquiring their leases; once ok answers
+/// it takes them, and what was written meanwhile is checkpointed.
+pub fn start_offline() {
+    if !ok_testscm::available() {
+        return;
+    }
+    let name = format!("start-offline-{}", std::process::id());
+    let proxy = Proxy::new(ok_testscm::endpoint());
+    let mut desk = Person::new(ALICE, Mode::Virtual);
+    desk.endpoint = proxy.endpoint();
+    desk.ok(".", &["create", &name, "w"]);
+    let start = desk.latest_checkpoint("w");
+    desk.write("w/before.txt", "written before the restart\n");
+    let before = desk.checkpoint_after("w", start);
+
+    proxy.cut();
+    desk.crash_daemon();
+    // The daemon serves its socket before it has mounted anything: the mount is back once a file
+    // written before reads again.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while std::fs::read_to_string(desk.home.path().join("w/before.txt"))
+        .ok()
+        .as_deref()
+        != Some("written before the restart\n")
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the workspace did not mount while ok was out of reach:\n{}",
+            desk.daemon_log()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let out = desk.ok(".", &["fs", "status"]);
+    assert!(
+        out.contains("acquiring: ok is not reachable") && !out.contains("not mounted"),
+        "{out}\n{}",
+        desk.daemon_log()
+    );
+    desk.write("w/offline.txt", "written before ok answered\n");
+
+    proxy.restore();
+    desk.checkpoint_after("w", before);
+    let out = desk.ok("w", &["st"]);
+    assert!(out.contains("A offline.txt"), "{out}");
+    let out = desk.ok(".", &["fs", "status"]);
+    assert!(
+        out.contains("lease: held") && !out.contains("unreachable"),
+        "{out}"
+    );
+    println!("start_offline_run: scenario done");
+}
+
 /// Offline (docs/okfs.md, "Lifecycle and recovery"): with ok unreachable, what was read
 /// before reads, what was never read fails, writes work, and `jj fs status` says what is wrong;
 /// once ok is back, what was written meanwhile is checkpointed and the rest reads.

@@ -431,7 +431,14 @@ One machine writes to a workspace at a time, so two never silently diverge:
   than hung. Every reply follows its journal entry and overlay write, so the on-disk state is
   never behind what a process was told.
 - **Rebooting.** Mounts are gone; the service mounts every workspace again from its persistent
-  state. Nothing written is lost: the overlay and journal are on disk, and in a checkpoint.
+  state. Nothing written is lost: the overlay and journal are on disk, and in a checkpoint. The
+  service starts at login, which is often before the network is up: a workspace whose lease
+  cannot be taken because ok is out of reach mounts anyway, its lease shown as `acquiring`, and
+  the first renewal that reaches ok takes it. Out of reach means `Unavailable`,
+  `DeadlineExceeded`, `Unknown`, or `Cancelled` (a connection that ended under the request), and
+  a connection that failed is `Unavailable`, not `Unauthenticated` (`Error::is_unreachable` in
+  `jj/credential`). Anything else is ok's answer: a workspace refused its lease does not mount,
+  and one refused while acquiring it turns read-only.
 - **Offline.** Reads of what was read before are local. A read that needs ok fails with `EIO`
   — at once when ok refuses the connection, after 30 seconds when it does not answer — and `jj
   fs status` says the daemon is offline and why (a renewal that could not reach ok, a

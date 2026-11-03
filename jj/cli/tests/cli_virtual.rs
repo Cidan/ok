@@ -69,6 +69,7 @@ fn main() {
         ("virtual_workspaces", virtual_workspaces),
         ("checkpoint_after_restart", checkpoint_after_restart),
         ("offline", offline),
+        ("start_offline", start_offline),
         ("watching", watching),
         ("redirections", redirections),
     ]);
