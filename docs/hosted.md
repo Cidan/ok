@@ -2256,11 +2256,166 @@ trees, a row each: 63% of it on the touch walk's and publishes' reads and writes
 - **Quotas and abuse.** Storage, CI minutes, and request rates are metered per account and limited
   at the edge (per principal and address) and in cells (per organization, for expensive work).
 - **Metering.** Usage — bytes stored per repository from manifests, CI minutes, egress — goes out as
-  events, for billing outside ok.
+  events, for billing outside ok (*Plans, standing, and staff*, "Metering").
 - **Observability.** Every metric is labeled by cell; the expensive ones also by organization,
   within a cardinality budget.
 - **Backups.** Point-in-time recovery for every database; object storage versioned for the window in
   which GC could err, and replicated across regions.
+
+## Plans, standing, and staff
+
+A hosted service charges for some of what it offers — on the service this plan targets, public
+repositories are free and private ones are paid — and its staff support its customers, act on
+abuse, and keep its accounts in good standing. ok carries the **mechanisms** all of that needs, in
+the open, because every operator needs them, and a single installation uses them too (an
+organization's limits, its administrators' console). It carries no **policy**: no prices, no
+payment, no plan's name, no classifier of abuse. Those are the operator's, outside ok, and reach it
+through its APIs as a robot with a staff role.
+
+### The boundary
+
+| ok (open) | The operator's (outside ok) |
+|---|---|
+| Entitlements: what an account may have, and its limits | Plans, prices, and which entitlements a plan grants |
+| Standing: good, past due, restricted, suspended — and what each allows | Payment, invoices, tax, dunning, and when an account's standing changes |
+| Metering: usage events, exactly once per account, meter, and period | Turning usage into money, and the warehouse it is analysed in |
+| Reports, content events, and the staff actions abuse needs | Classifiers, review queues' policy, legal process |
+| The staff console and its audit | The help desk, and who its staff are |
+| Operator dashboards and alerts | Business dashboards |
+
+ok never asks whether an account has paid. It asks what the account is entitled to and how it
+stands, and the operator's billing keeps both true.
+
+### Entitlements
+
+An **entitlement** is what an account — a person or an organization — may have, and how much. The
+directory keeps them (`account_entitlements`), beside the CI quota they absorb:
+
+| Entitlement | Means | A single installation's default |
+|---|---|---|
+| `private_repositories` | how many private or internal repositories it may own (0: none) | unlimited |
+| `storage_bytes` | the bytes its repositories may hold (*Metering*'s attribution) | unlimited |
+| `ci_concurrent`, `ci_minutes` | today's quota (*Hosted automation, as built*, "Quotas") | unlimited |
+| `members` | the people an organization may have, outside collaborators counted | unlimited |
+| `egress_bytes` | the bytes it may serve in a month, clones and raw files | unlimited |
+
+An account with none set has `identity.default_entitlements`: on the hosted service, public
+repositories without limit and no private ones. Setting them is `Admin.SetEntitlements` (by a
+person with the staff role *operations*, or the operator's billing as a robot granted it), each
+change recorded with who made it and why, and published on the directory's stream, so cells'
+projections and the edge learn it within the stream's lag; a cell reads its projection, as
+`Authorize` reads grants, never calling out.
+
+Each is enforced where what it limits is made:
+
+- **Private repositories** at `Tenancy.CreateRepository` and `TransferRepository` (to the new
+  owner), at a change of visibility to private or internal, and at a fork that would be private: an
+  account at its limit is refused `RESOURCE_EXHAUSTED`, with a message the web UI shows beside an
+  upgrade link the operator configures (`identity.upgrade_url`).
+- **Storage** at publish and upload, against the account's attributed bytes as last metered: over
+  it, a grace (`identity.storage_grace`, a week by default) in which writes are accepted and the
+  owners are told; past it, publishes to its private repositories are refused until it is under
+  again. Public repositories are never refused writes for storage on a plan that offers them free;
+  they are held to the edge's abuse limits instead.
+- **CI** as today: runs past the concurrent limit wait, past the minutes are set aside.
+- **Members** at adding a member or collaborator to a private repository.
+- **Egress** at the edge, per owner, with the same grace as storage.
+
+Lowering an entitlement never deletes anything: what exceeds it stays, readable, and only what would
+grow it further is refused. *Done when:* the entitlement matrix — each entitlement at none, under,
+at, and over its limit, against each operation that grows it — is a test (`internal/authz/authztest`
+extended), and a change of entitlements reaches every cell's projection within the stream's lag
+under `TestScale`'s chaos.
+
+### Standing
+
+An account's **standing** is the directory's, beside its status:
+
+| Standing | Its private and internal repositories | Its public repositories | Signing in |
+|---|---|---|---|
+| **good** | as its roles allow | as its roles allow | yes |
+| **past due** | as good; the owners are told, each day, until it is good or restricted | as good | yes |
+| **restricted** | read-only: read, clone, and export, for those granted; no publish, upload, landing, CI, or new grants | as good | yes |
+| **suspended** | none, but by staff | hidden from all but staff; its pages answer as though it did not exist | no (today's `Suspended`) |
+
+`authz.Repository` gains a third state, `Locked`, which an owner in restricted standing gives its
+private and internal repositories: `Decide` allows `ReadCode` and `Fork` (into a repository of an
+account in good standing) and nothing that writes. Restriction is how a lapsed payment ends: nobody
+loses their code, and paying again restores everything at once. Suspension is for abuse, by trust
+and safety alone.
+
+`Admin.SetStanding(account, standing, reason, ticket)` changes it, by a person with the staff role
+the change needs or the operator's billing (good, past due, restricted only); each change is
+audited, published on the directory's stream, and mailed to the account's owners with the reason.
+*Done when:* the permission matrix gains each standing, every action, at each visibility; a
+restricted account's owner clones and exports a private repository and is refused a publish, and an
+account restored to good publishes at once.
+
+### Metering
+
+ok publishes **usage events** on the bus, on the directory's topic `usage`: one per account, meter,
+and period (an hour), carrying the period's total and an idempotency key of the three, so a consumer
+that sees one twice counts it once. Each cell's replicas report their cell's totals to the directory
+as automation's already do (`Quotas.ReportUsage`), and the directory publishes once all of a
+period's cells have reported or the period is a day old, whichever is first, with what it has.
+
+| Meter | Measured | Attributed to |
+|---|---|---|
+| `storage_byte_hours` | each repository's live bytes, from its manifests, sampled each hour | its owner, for the bytes its presence set holds that its fork network's root does not: a fork of a public repository costs its owner only what it adds (*Packs and fork networks*) |
+| `ci_seconds` | each run's seconds, by machine class | the repository's owner |
+| `egress_bytes` | bytes the edge served for clones, fetches, and raw files | the repository's owner |
+| `private_repositories`, `members` | counted each hour | the account |
+
+`Usage.ListUsage(account, from, to)` answers the same totals, for an operator to reconcile against
+what it billed. *Done when:* under `TestScale`'s chaos across two cells, each (account, meter,
+period) is published, and every replay of the topic sums to what the cells measured.
+
+### Reports and content events
+
+Anyone signed in reports a repository, a CL, a comment, or an account (ok control's **Report**,
+`Reports.File`: what, why, from a short list, and words of their own). Reports wait in the staff
+console's queue. For classifiers the operator runs, the directory publishes **content events** —
+an account made, a repository made public, a publish to a public repository, a comment on one — on
+the topic `content`, each naming what changed and where to read it; a classifier reads through the
+APIs as its robot and acts through `Admin` (`SetStanding`, `HideContent`). ok ships no classifier.
+`HideContent` hides a repository, a CL, or a comment from all but staff and its owner, reversibly,
+with a reason its owner is shown.
+
+### Staff
+
+**Staff** are people the installation names, in roles of its own (`identity.staff`, each role an
+ACL of the groups-and-ACLs tree, so staff are granted and revoked as any group is):
+
+| Role | May |
+|---|---|
+| `support` | see an account's settings, standing, entitlements, usage, and audit; never repository content |
+| `trust` | what support may; act on reports; hide content; suspend and restore accounts |
+| `operations` | what support may; set entitlements and standing; move networks; run the sync |
+| `content` | read a private repository's content, through a grant of an hour, with a reason and a ticket, which its owners are shown and which expires on its own |
+
+Every staff action — each read of an account's private settings, each change — is written to the
+directory's **staff audit** (`staff_audit`: who, what, which account or repository, the reason, the
+ticket, when), append-only, kept for seven years by default, and shown to the account's owners for
+what concerns them (a content grant, a hidden comment, a change of standing). No staff role reads
+repository content without `content`, and no one may grant it to themselves.
+
+**The staff console** is ok control's `/staff` pages, in the same design as every other page:
+search for accounts, organizations, and repositories; an account's standing, entitlements, usage by
+meter and period, members, repositories, and audit; the reports queue; and each action above, each
+asking for its reason. *Done when:* each action is refused to every role but its own (the matrix
+again), each is audited with its reason, an owner sees a content grant on their repository while it
+lasts, and a report flows from **Report** to the queue to an action.
+
+### Operator dashboards
+
+ok ships its dashboards and alerts beside its charts (`deploy/dashboards`: Grafana JSON over
+Prometheus, and Prometheus rules): for each cell, the publish and checkpoint rates and latencies,
+the landing queue's depth and wait, CI's queue and wait by pool, the bus's backlog by topic, the
+database's latency, and errors by role; for the directory, sign-in, search, inbox, and notification
+latencies; for the edge, requests and refusals by reason. Each alert names the runbook section of
+install.md that says what to do. They are an operator's tools whatever it charges: business
+dashboards — sign-ups, conversion, revenue — are the operator's, built on the metering and content
+events.
 
 ## A single installation
 
@@ -2359,6 +2514,12 @@ with a test that proves it.
     publishes, checkpoints, CLs, landings, and CI reads, at the rates in *The target* — against a
     staging deployment, with chaos (replicas, zones, the bus); and a cost model from what it
     measures.
+12. **Plans, standing, and staff.** Entitlements and their enforcement, standing and the `Locked`
+    state, usage events, reports and content events, staff roles, the staff audit, the staff
+    console, and the operator dashboards (*Plans, standing, and staff*).
+    *Done when:* each of that section's tests passes, and an operator's billing, as a robot, takes an
+    account from free to five private repositories, through past due and restricted, and back to
+    good, without a byte lost or a request refused that its standing allows.
 
 ## Testing
 
@@ -2396,3 +2557,6 @@ with a test that proves it.
 12. **Hosted CI stays Bazel-only**, as automation.md's principles make it.
 13. **Fork networks share storage copy-on-write**; no repository reads what its own presence set
     does not hold.
+14. **Mechanism in ok, policy outside it.** ok enforces entitlements and standing and publishes
+    usage; prices, payment, and who is staff are the operator's. ok never asks whether an account
+    has paid, and lowering what an account is entitled to never deletes its data.
