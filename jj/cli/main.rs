@@ -5,6 +5,7 @@ mod auth;
 mod changelists;
 mod commands;
 mod fs;
+mod git;
 mod lifecycle;
 mod secrets;
 
@@ -100,7 +101,11 @@ async fn isolated_workspaces(
 }
 
 fn main() -> ExitCode {
-    let code = CliRunner::init()
+    // Run as `git`: ok's git commands in ok workspaces, git's everywhere else (docs/git.md).
+    if let Some(code) = git::front::main() {
+        return code;
+    }
+    let code: u8 = CliRunner::init()
         .version(env!("CARGO_PKG_VERSION"))
         .add_store_factories(ok_store::factories())
         .add_working_copy_factories(working_copy_factories())
@@ -108,8 +113,9 @@ fn main() -> ExitCode {
         .add_extra_config(defaults())
         .add_subcommand(commands::run)
         .add_dispatch_hook(isolated_workspaces)
-        .run()
-        .into();
+        .run();
+    // A git command chooses its own exit status: git's, not jj's.
+    let code = ExitCode::from(git::exit_code().unwrap_or(code));
     // What the command asked ok, when OK_STATS names a file (jj/store/calls.rs).
     if let Err(e) = ok_store::calls::write_report() {
         eprintln!("Warning: writing OK_STATS: {e}");

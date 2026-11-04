@@ -56,6 +56,15 @@ async fn secrets_in_real_checkouts() {
     secrets(Mode::Real).await;
 }
 
+/// git's commands in ok workspaces (docs/git.md): `git` is this binary by that name.
+#[tokio::test(flavor = "multi_thread")]
+async fn git_in_real_checkouts() {
+    if !ok_testscm::available() {
+        return;
+    }
+    git_workflow(Mode::Real).await;
+}
+
 /// Forks: `jj fork`, and `jj sync --upstream`.
 #[tokio::test(flavor = "multi_thread")]
 async fn fork() {

@@ -32,6 +32,10 @@ create` clones what it makes. In a fork's clone, `jj sync --upstream` first has 
 its upstream's newer work (its main moving to the upstream's if it has landed nothing of its own
 since), then syncs as always.
 
+Run by the name `git` (`ln -s "$(command -v jj)" ~/.local/bin/git`), the same binary answers git's
+commands in ok workspaces — `git clone`, `git commit`, `git push` as `jj cl`, `git pull` as `jj
+sync` — and hands every other repository to git: [git.md](git.md).
+
 `jj auth login` signs the machine in with ok identity's device login, as `ok auth login` does —
 the same credential, in the same place, so either one signs the machine in for both
 ([identity.md](identity.md), "Signing in"). `jj auth status` says who it is signed in as; `jj auth
@@ -158,7 +162,7 @@ The Cargo workspace at the repository's root; every crate is under `jj/`.
 
 | Crate | What it is |
 |---|---|
-| `jj/cli` (`ok-jj`, the `jj` binary) | `main.rs` (`CliRunner` with ok's stores, working copy, commands, and configuration), `auth.rs` (`jj auth`), `commands.rs` (`jj clone`, `jj create`, `jj fork`), `changelists.rs` (`jj cl`, `jj cl get`, `jj sync`), `lifecycle.rs` (`jj cl status` and the rest of a CL's lifecycle), and `fs.rs` (`jj fs`) |
+| `jj/cli` (`ok-jj`, the `jj` binary) | `main.rs` (`CliRunner` with ok's stores, working copy, commands, and configuration), `auth.rs` (`jj auth`), `commands.rs` (`jj clone`, `jj create`, `jj fork`), `changelists.rs` (`jj cl`, `jj cl get`, `jj sync`), `lifecycle.rs` (`jj cl status` and the rest of a CL's lifecycle), `fs.rs` (`jj fs`), and `git.rs` with `git/` (git's commands, when the binary runs as `git`: [git.md](git.md)) |
 | `jj/workingcopy` (`ok-working-copy`) | jj's local working copy honoring `.ignore` files, and the workspace loader that gives every ok workspace it |
 | `jj/cl` (`ok-cl`) | The ChangeList workflow over jj-lib — what `jj cl` refuses before asking the SCM, the upload (publishing first), `jj cl get`, and `jj sync` — so tests drive it without the command line |
 | `jj/store` (`ok-store`) | jj's `Backend`, `OpStore`, and `OpHeadsStore` over the SCM, with the cache, the outbox, publishing, prefetch, and laying out `.jj/repo` for a clone; `changelists` holds the SCM calls behind the CL commands |
@@ -242,7 +246,8 @@ anyone its identity knows — ada, alice, bob, e2e, or ok control. Each test mak
   resolution, a moved head refused and re-validated, a stack landing bottom-up with a dry run that
   agrees, and `jj sync` retiring landed changes without divergence while keeping later edits.
 - **The binary** (`cli/tests/cli.rs`): as two people — `jj create`, `jj clone`, `jj cl`, `jj cl
-  get`, stacking, and `jj sync` after landings; files up to 50 MiB; and ignore files. Each runs
+  get`, stacking, and `jj sync` after landings; files up to 50 MiB; ignore files; and git's
+  commands, run as `git` ([git.md](git.md), "Tests"). Each runs
   twice: real (`--real`), and virtual (`cli/tests/cli_virtual.rs`, a binary that enters a user and
   mount namespace of its own first thing in `main`, each person running a daemon,
   `OKFS_DAEMON=external`). And, there, what only virtual workspaces do: checkpoints with no jj

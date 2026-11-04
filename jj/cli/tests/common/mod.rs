@@ -1471,3 +1471,354 @@ pub async fn secrets(mode: Mode) {
         "{out}"
     );
 }
+
+/// What a `git` run printed, and how it exited.
+pub struct GitRun {
+    pub code: i32,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+impl GitRun {
+    fn all(&self) -> String {
+        format!("{}{}", self.stdout, self.stderr)
+    }
+}
+
+impl Person {
+    /// The directory holding this person's `git`: this binary by that name, ahead of a `real-git`
+    /// that only says what it was asked (the sandbox has no git), which `OK_REAL_GIT` names.
+    fn git_bin(&self) -> std::path::PathBuf {
+        let bin = self.home.path().join("bin");
+        if !bin.join("git").exists() {
+            std::fs::create_dir_all(&bin).unwrap();
+            std::os::unix::fs::symlink(jj_bin(), bin.join("git")).unwrap();
+            let real = bin.join("real-git");
+            std::fs::write(&real, "#!/bin/sh\necho \"real git: $*\"\n").unwrap();
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::write(
+                self.home.path().join("git-jj.toml"),
+                format!("[ok]\nendpoint = {:?}\n", self.endpoint),
+            )
+            .unwrap();
+        }
+        bin
+    }
+
+    /// `git clone <name> <dir>` of a repository on ok, real in a real run.
+    pub fn git_clone(&self, name: &str, dir: &str) -> GitRun {
+        let mut args = vec!["clone", name, dir];
+        if self.mode == Mode::Real {
+            args.push("--real");
+        }
+        self.git_ok(".", &args)
+    }
+
+    /// Runs `git args…` in `dir` (relative to the person's home), as this person.
+    pub fn git(&self, dir: &str, args: &[&str]) -> GitRun {
+        let bin = self.git_bin();
+        let cwd = self.home.path().join(dir);
+        std::fs::create_dir_all(&cwd).unwrap();
+        eprintln!(
+            "[{}] git {}",
+            self.principal.split('.').next().unwrap(),
+            args.join(" ")
+        );
+        let env = self.command(&[]);
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+        let mut git = Command::new(bin.join("git"));
+        git.args(args).env_clear();
+        for (k, v) in env.get_envs() {
+            if let Some(v) = v {
+                git.env(k, v);
+            }
+        }
+        git.env("PATH", path)
+            .env("OK_REAL_GIT", bin.join("real-git"))
+            .env("JJ_CONFIG", self.home.path().join("git-jj.toml"))
+            .current_dir(&cwd)
+            .stdin(Stdio::null());
+        let out = git.output().expect("run git");
+        GitRun {
+            code: out.status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        }
+    }
+
+    /// Runs git and requires it to succeed.
+    pub fn git_ok(&self, dir: &str, args: &[&str]) -> GitRun {
+        let run = self.git(dir, args);
+        assert_eq!(
+            run.code,
+            0,
+            "git {args:?} exited {}:\n{}\n--- daemon log ---\n{}",
+            run.code,
+            run.all(),
+            self.daemon_log()
+        );
+        run
+    }
+
+    /// Runs git and requires it to exit with `code`.
+    pub fn git_exits(&self, dir: &str, args: &[&str], code: i32) -> GitRun {
+        let run = self.git(dir, args);
+        assert_eq!(run.code, code, "git {args:?}:\n{}", run.all());
+        run
+    }
+}
+
+/// git's commands in ok workspaces (docs/git.md), run as `git` — this binary by that name — by
+/// two people: git's everywhere else; a clone, commits with nothing to add, branches, diffs,
+/// stashes, restores and resets; pushes that upload ChangeLists, a pull after one lands; a CL
+/// brought in by fetch, cherry-picked and reverted; a rebase's conflict and its abort; and what ok
+/// refuses, saying what to use instead.
+pub async fn git_workflow(mode: Mode) {
+    let name = format!("git-{}-{mode:?}", std::process::id()).to_lowercase();
+    let alice = Person::new(ALICE, mode);
+    let bob = Person::new(BOB, mode);
+
+    // Outside an ok workspace, git is git.
+    let run = alice.git_ok(".", &["--version"]);
+    assert_eq!(run.stdout, "real git: --version\n");
+    let run = alice.git_ok(".", &["status", "-s"]);
+    assert_eq!(run.stdout, "real git: status -s\n");
+    let run = alice.git_ok(".", &["clone", "https://github.com/acme/app", "elsewhere"]);
+    assert_eq!(
+        run.stdout,
+        "real git: clone https://github.com/acme/app elsewhere\n"
+    );
+
+    // A repository on ok, cloned with git. Empty, its HEAD is unborn, on main.
+    alice.ok(".", &["create", &name, "made"]);
+    let run = alice.git_clone(&name, "repo");
+    assert!(run.all().contains("as workspace"), "{}", run.all());
+    let run = alice.git_ok("repo", &["status"]);
+    assert!(
+        run.stdout.contains("On branch main") && run.stdout.contains("No commits yet"),
+        "{}",
+        run.all()
+    );
+    alice.git_exits("repo", &["rev-parse", "--verify", "-q", "HEAD"], 1);
+    // What needs no repository is git's here too: a patch applies to the working tree, the
+    // index.
+    let run = alice.git_ok("repo", &["apply", "--index", "fix.diff"]);
+    assert_eq!(run.stdout, "real git: apply fix.diff\n");
+    let run = alice.git_ok("repo", &["init", "nested"]);
+    assert_eq!(run.stdout, "real git: init nested\n");
+    let run = alice.git_ok(
+        "repo",
+        &["rev-parse", "--show-toplevel", "--is-inside-work-tree"],
+    );
+    assert!(run.stdout.ends_with("/repo\ntrue\n"), "{}", run.all());
+
+    // Every file is tracked: `add` has nothing to do, and `commit` commits it all.
+    alice.write("repo/a.txt", "one\n");
+    let run = alice.git_ok("repo", &["status", "--porcelain"]);
+    assert_eq!(run.stdout, "A  a.txt\n");
+    let run = alice.git_ok("repo", &["add", "-A"]);
+    assert!(run.stderr.contains("nothing to add"), "{}", run.all());
+    let run = alice.git_ok("repo", &["commit", "-m", "add a"]);
+    assert!(
+        run.stdout.starts_with("[main (root-commit) ")
+            && run.stdout.contains("] add a\n")
+            && run.stdout.contains(" 1 file changed, 1 insertion(+)")
+            && run.stdout.contains(" create mode 100644 a.txt"),
+        "{}",
+        run.all()
+    );
+    assert_eq!(alice.git_ok("repo", &["status", "--porcelain"]).stdout, "");
+    alice.git_exits("repo", &["commit", "-m", "nothing"], 1);
+    let head = alice.git_ok("repo", &["rev-parse", "HEAD"]).stdout;
+    let head = head.trim().to_owned();
+    assert_eq!(head.len(), 64, "a BLAKE3 commit ID: {head}");
+    let run = alice.git_ok("repo", &["log", "--format=%H%x09%s"]);
+    assert_eq!(run.stdout, format!("{head}\tadd a\n"));
+    let out = alice.ok(
+        "repo",
+        &["log", "-r", "@-", "--no-graph", "-T", "commit_id"],
+    );
+    assert_eq!(out.trim(), head, "git's HEAD is jj's @-");
+
+    // A push uploads HEAD as a ChangeList; again, there is nothing new.
+    let run = alice.git_ok("repo", &["push"]);
+    assert!(run.all().contains("CL 1 created"), "{}", run.all());
+    let run = alice.git_ok("repo", &["push", "origin", "HEAD:refs/for/main"]);
+    assert!(
+        run.stderr.contains("Everything up-to-date"),
+        "{}",
+        run.all()
+    );
+
+    // A branch, a second commit, and its diffs.
+    let run = alice.git_ok("repo", &["checkout", "-b", "feature"]);
+    assert!(
+        run.stderr.contains("Switched to a new branch 'feature'"),
+        "{}",
+        run.all()
+    );
+    alice.write("repo/b.txt", "two\n");
+    alice.write("repo/a.txt", "one\nmore\n");
+    let run = alice.git_ok("repo", &["diff", "--name-status"]);
+    assert_eq!(run.stdout, "M\ta.txt\nA\tb.txt\n");
+    let run = alice.git_ok("repo", &["diff", "--", "a.txt"]);
+    assert!(
+        run.stdout.contains("diff --git a/a.txt b/a.txt") && run.stdout.contains("\n+more\n"),
+        "{}",
+        run.all()
+    );
+    alice.git_exits("repo", &["diff", "--quiet"], 1);
+    let run = alice.git_ok("repo", &["commit", "-am", "add b"]);
+    assert!(run.stdout.starts_with("[feature "), "{}", run.all());
+    let run = alice.git_ok("repo", &["branch"]);
+    assert_eq!(run.stdout, "* feature\n  main\n");
+    let run = alice.git_ok("repo", &["log", "--format=%s"]);
+    assert_eq!(run.stdout, "add b\nadd a\n");
+    let run = alice.git_ok("repo", &["show", "--name-only", "--format=%s", "HEAD"]);
+    assert!(
+        run.stdout.contains("add b") && run.stdout.contains("a.txt\nb.txt\n"),
+        "{}",
+        run.all()
+    );
+    let run = alice.git_ok("repo", &["diff", "--shortstat", "HEAD~1", "HEAD"]);
+    assert_eq!(run.stdout, " 2 files changed, 2 insertions(+)\n");
+    let run = alice.git_ok("repo", &["show", "HEAD~1:a.txt"]);
+    assert_eq!(run.stdout, "one\n");
+    let run = alice.git_ok("repo", &["commit", "--amend", "-m", "add b and more"]);
+    assert!(run.stdout.contains("] add b and more"), "{}", run.all());
+    assert_eq!(
+        alice.git_ok("repo", &["log", "-1", "--format=%s"]).stdout,
+        "add b and more\n"
+    );
+    assert_eq!(
+        alice
+            .git_ok("repo", &["rev-parse", "--abbrev-ref", "HEAD"])
+            .stdout,
+        "feature\n"
+    );
+    assert_eq!(
+        alice
+            .git_ok("repo", &["rev-parse", "--abbrev-ref", "@{u}"])
+            .stdout,
+        "origin/main\n"
+    );
+    assert_eq!(
+        alice
+            .git_ok("repo", &["symbolic-ref", "--short", "HEAD"])
+            .stdout,
+        "feature\n"
+    );
+
+    // A stash: set aside, listed, and popped back.
+    alice.write("repo/c.txt", "wip\n");
+    let run = alice.git_ok("repo", &["stash"]);
+    assert!(
+        run.stdout
+            .contains("Saved working directory and index state WIP on feature:"),
+        "{}",
+        run.all()
+    );
+    assert!(!alice.exists("repo/c.txt"));
+    assert_eq!(alice.git_ok("repo", &["status", "--porcelain"]).stdout, "");
+    let run = alice.git_ok("repo", &["stash", "list"]);
+    assert!(
+        run.stdout.starts_with("stash@{0}: WIP on feature: "),
+        "{}",
+        run.all()
+    );
+    alice.git_ok("repo", &["stash", "pop"]);
+    assert!(alice.exists("repo/c.txt"));
+    assert_eq!(alice.git_ok("repo", &["stash", "list"]).stdout, "");
+
+    // A restore, and a hard reset.
+    alice.write("repo/a.txt", "changed\n");
+    alice.git_ok("repo", &["restore", "a.txt"]);
+    assert_eq!(alice.read("repo/a.txt").unwrap(), b"one\nmore\n");
+    let run = alice.git_ok("repo", &["reset", "--hard"]);
+    assert!(run.stdout.starts_with("HEAD is now at "), "{}", run.all());
+    assert!(!alice.exists("repo/c.txt"));
+
+    // CL 1 lands; a pull brings main, retires it, and rebases the branch onto it.
+    land_cl(&name, 1, ALICE).await;
+    let run = alice.git_ok("repo", &["pull"]);
+    assert!(run.all().contains("main is at"), "{}", run.all());
+    let run = alice.git_ok("repo", &["status", "-sb"]);
+    assert_eq!(run.stdout, "## feature...origin/main [ahead 1]\n");
+    assert_eq!(
+        alice
+            .git_ok("repo", &["log", "origin/main", "--format=%s"])
+            .stdout,
+        "add a\n"
+    );
+    let run = alice.git_ok("repo", &["switch", "main"]);
+    assert!(
+        run.stderr.contains("Switched to branch 'main'"),
+        "{}",
+        run.all()
+    );
+    assert_eq!(
+        alice.git_ok("repo", &["rev-parse", "main"]).stdout,
+        alice.git_ok("repo", &["rev-parse", "origin/main"]).stdout
+    );
+    alice.git_ok("repo", &["switch", "feature"]);
+    let run = alice.git_ok("repo", &["push"]);
+    assert!(run.all().contains("CL 2 created"), "{}", run.all());
+
+    // bob clones with git and brings alice's CL in with a fetch, then picks it and reverts it.
+    bob.git_clone(&name, "repo");
+    let run = bob.git_ok("repo", &["fetch", "origin", "cl/2"]);
+    assert!(run.stderr.contains("cl/2"), "{}", run.all());
+    assert_eq!(
+        bob.git_ok("repo", &["log", "-1", "--format=%s", "origin/cl/2"])
+            .stdout,
+        "add b and more\n"
+    );
+    bob.git_ok("repo", &["checkout", "-b", "picked"]);
+    let run = bob.git_ok("repo", &["cherry-pick", "origin/cl/2"]);
+    assert!(run.stdout.contains("] add b and more"), "{}", run.all());
+    bob.git_ok("repo", &["revert", "HEAD"]);
+    assert_eq!(
+        bob.git_ok("repo", &["log", "--format=%s"]).stdout,
+        "Revert \"add b and more\"\nadd b and more\nadd a\n"
+    );
+    assert!(!bob.exists("repo/b.txt"));
+
+    // A rebase whose conflict is kept in the commit; --abort undoes it.
+    bob.git_ok("repo", &["switch", "main"]);
+    bob.write("repo/a.txt", "bob's\n");
+    bob.git_ok("repo", &["commit", "-am", "bob changes a"]);
+    bob.git_ok("repo", &["switch", "-c", "other", "origin/main"]);
+    bob.write("repo/a.txt", "other\n");
+    bob.git_ok("repo", &["commit", "-am", "other changes a"]);
+    let before = bob.git_ok("repo", &["rev-parse", "HEAD"]).stdout;
+    let run = bob.git_exits("repo", &["rebase", "main"], 1);
+    assert!(
+        run.stdout
+            .contains("CONFLICT (content): Merge conflict in a.txt"),
+        "{}",
+        run.all()
+    );
+    bob.git_ok("repo", &["rebase", "--abort"]);
+    assert_eq!(bob.git_ok("repo", &["rev-parse", "HEAD"]).stdout, before);
+
+    // What ok has no use for says so, and what to use instead.
+    let run = bob.git_exits("repo", &["rebase", "-i", "main"], 128);
+    assert!(run.stderr.contains("jj squash"), "{}", run.all());
+    let run = bob.git_exits("repo", &["reflog"], 128);
+    assert!(run.stderr.contains("jj op log"), "{}", run.all());
+    let run = bob.git_ok("repo", &["remote", "-v"]);
+    assert!(
+        run.stdout
+            .starts_with(&format!("origin\t{}/{name} (fetch)\n", bob.endpoint)),
+        "{}",
+        run.all()
+    );
+    assert!(
+        bob.git_ok("repo", &["help", "ok"])
+            .stdout
+            .contains("git in an ok workspace")
+    );
+    bob.git_exits("repo", &["frobnicate"], 1);
+    println!("git_workflow: scenario done");
+}

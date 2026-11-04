@@ -106,8 +106,19 @@ pub struct SyncArgs {
     upstream: bool,
 }
 
+impl SyncArgs {
+    /// A sync as `git pull` asks for one.
+    pub fn new(upstream: bool) -> Self {
+        Self { upstream }
+    }
+}
+
 /// The web page of CL `number` in the repository of `repo`.
-fn cl_url(command: &CommandHelper, repo: &dyn Repo, number: i64) -> Result<String, CommandError> {
+pub fn cl_url(
+    command: &CommandHelper,
+    repo: &dyn Repo,
+    number: i64,
+) -> Result<String, CommandError> {
     let shared = ok_cl::shared(repo).map_err(cl_error)?;
     let web = crate::commands::web_url(command, &shared.config.endpoint);
     Ok(format!(
@@ -118,7 +129,7 @@ fn cl_url(command: &CommandHelper, repo: &dyn Repo, number: i64) -> Result<Strin
 }
 
 /// A workflow failure, as the user should see it.
-fn cl_error(e: ClError) -> CommandError {
+pub fn cl_error(e: ClError) -> CommandError {
     match e {
         ClError::NotOk => user_error(e.to_string())
             .hinted("ok's commands work in a repository made by jj clone or jj create"),
@@ -207,6 +218,60 @@ pub async fn run_cl(
             .try_collect()
             .await?
     };
+    let readiness = match (args.ready, args.wip) {
+        (true, _) => pb::upload_request::Readiness::Ready,
+        (_, true) => pb::upload_request::Readiness::Wip,
+        _ => pb::upload_request::Readiness::Unchanged,
+    };
+    match upload_changes(
+        ui,
+        command,
+        &workspace_command,
+        revisions,
+        readiness,
+        args.reviewer,
+        false,
+    )
+    .await?
+    {
+        Upload::Nothing => {
+            writeln!(
+                ui.status(),
+                "Nothing to upload: those changes are already on main (or immutable)"
+            )?;
+            Ok(())
+        }
+        Upload::NoNewChanges => Err(no_new_changes()),
+        Upload::Done => Ok(()),
+    }
+}
+
+/// What an upload came to.
+pub enum Upload {
+    /// The changes named are all on main, or immutable: nothing to upload.
+    Nothing,
+    /// Every change is already its CL's current patchset.
+    NoNewChanges,
+    Done,
+}
+
+fn no_new_changes() -> CommandError {
+    user_error("Nothing new to upload: every change is already its CL's current patchset")
+        .hinted("To send a CL for review without uploading, jj cl ready; to assign reviewers, jj cl reviewers --add")
+}
+
+/// Uploads `revisions` and their mutable ancestors as CLs, bottom first, refusing before ok is
+/// asked what ok would refuse, and prints each CL; with `dry_run`, only says what it would
+/// upload. `jj cl` and `git push` both upload through here.
+pub async fn upload_changes(
+    ui: &mut Ui,
+    command: &CommandHelper,
+    workspace_command: &jj_cli::cli_util::WorkspaceCommandHelper,
+    revisions: Vec<CommitId>,
+    readiness: pb::upload_request::Readiness,
+    reviewers: Vec<String>,
+    dry_run: bool,
+) -> Result<Upload, CommandError> {
     let mut to_upload: Vec<Commit> = workspace_command
         .attach_revset_evaluator(
             workspace_command
@@ -219,11 +284,7 @@ pub async fn run_cl(
         .await?;
     to_upload.reverse();
     if to_upload.is_empty() {
-        writeln!(
-            ui.status(),
-            "Nothing to upload: those changes are already on main (or immutable)"
-        )?;
-        return Ok(());
+        return Ok(Upload::Nothing);
     }
     let repo = workspace_command.repo().as_ref();
     if let Some((c, why)) = ok_cl::check_uploadable(repo, &to_upload)
@@ -249,14 +310,25 @@ pub async fn run_cl(
             ),
         });
     }
-    let readiness = match (args.ready, args.wip) {
-        (true, _) => pb::upload_request::Readiness::Ready,
-        (_, true) => pb::upload_request::Readiness::Wip,
-        _ => pb::upload_request::Readiness::Unchanged,
-    };
-    let response = match ok_cl::upload(repo, &to_upload, readiness, args.reviewer).await {
+    if dry_run {
+        let mut formatter = ui.stdout_formatter();
+        for commit in &to_upload {
+            write!(formatter, "Would upload ")?;
+            workspace_command.write_commit_summary(formatter.as_mut(), commit)?;
+            writeln!(formatter)?;
+        }
+        return Ok(Upload::Done);
+    }
+    let response = match ok_cl::upload(repo, &to_upload, readiness, reviewers).await {
         Ok(r) => r,
-        Err(ClError::Scm(s)) => return Err(upload_error(&to_upload, s)),
+        Err(ClError::Scm(s)) => {
+            if ok_store::changelists::upload_rejection(&s)
+                .is_some_and(|r| r.reason == pb::upload_rejection::Reason::NoNewChanges as i32)
+            {
+                return Ok(Upload::NoNewChanges);
+            }
+            return Err(upload_error(&to_upload, s));
+        }
         Err(e) => return Err(cl_error(e)),
     };
     let mut formatter = ui.stdout_formatter();
@@ -275,7 +347,7 @@ pub async fn run_cl(
         workspace_command.write_commit_summary(formatter.as_mut(), commit)?;
         writeln!(formatter)?;
     }
-    Ok(())
+    Ok(Upload::Done)
 }
 
 /// An upload the SCM refused, naming the change as the user knows it.
@@ -284,10 +356,7 @@ fn upload_error(commits: &[Commit], s: Status) -> CommandError {
         return scm_error(s);
     };
     if rej.reason == pb::upload_rejection::Reason::NoNewChanges as i32 {
-        return user_error(
-            "Nothing new to upload: every change is already its CL's current patchset",
-        )
-        .hinted("To send a CL for review without uploading, jj cl ready; to assign reviewers, jj cl reviewers --add");
+        return no_new_changes();
     }
     let change = commits
         .iter()
@@ -306,7 +375,7 @@ fn upload_error(commits: &[Commit], s: Status) -> CommandError {
 
 /// The user's immutable set (`::immutable_heads()`), resolvable against any repository
 /// state of a transaction.
-fn immutable_resolver(
+pub fn immutable_resolver(
     command: &CommandHelper,
     workspace_command: &jj_cli::cli_util::WorkspaceCommandHelper,
 ) -> impl Fn(&dyn Repo) -> Result<Arc<ResolvedRevsetExpression>, ClError> + use<> {
@@ -364,16 +433,32 @@ pub async fn run_sync(
     command: &CommandHelper,
     args: SyncArgs,
 ) -> Result<(), CommandError> {
+    sync(ui, command, args, false).await
+}
+
+/// `jj sync`, its report on stderr unless the command is quiet — or, `always`, even then: `git
+/// pull` runs quiet of jj's own chatter, and reports the sync all the same.
+pub async fn sync(
+    ui: &mut Ui,
+    command: &CommandHelper,
+    args: SyncArgs,
+    always: bool,
+) -> Result<(), CommandError> {
     let mut workspace_command = command.workspace_helper(ui).await?;
     if args.upstream {
         let moved = ok_cl::sync_fork(workspace_command.repo().as_ref())
             .await
             .map_err(cl_error)?;
+        let mut out = if always {
+            Box::new(ui.stderr()) as Box<dyn std::io::Write>
+        } else {
+            ui.status()
+        };
         if moved {
-            writeln!(ui.status(), "The fork's main moved to its upstream's")?;
+            writeln!(out, "The fork's main moved to its upstream's")?;
         } else {
             writeln!(
-                ui.status(),
+                out,
                 "The fork holds its upstream's work; its main stays where it is"
             )?;
         }
@@ -383,7 +468,12 @@ pub async fn run_sync(
     let report = ok_cl::sync(tx.repo_mut(), &immutable)
         .await
         .map_err(cl_error)?;
-    if let Some(mut formatter) = ui.status_formatter() {
+    let formatter = if always {
+        Some(ui.stderr_formatter())
+    } else {
+        ui.status_formatter()
+    };
+    if let Some(mut formatter) = formatter {
         if let Some(main) = &report.main
             && report.old_main.as_ref() != Some(main)
         {

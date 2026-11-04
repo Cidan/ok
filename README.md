@@ -17,8 +17,9 @@ ok is being built in the open from a working system, part by part. What runs tod
   [docs/scm.md](docs/scm.md).
 - **ok's jj**: upstream jj with ok's stores and commands — `jj auth login`, `jj clone`, `jj cl`,
   `jj sync` — and **okfs**, virtual workspaces: a clone ready at once, files read from ok as they
-  are used, every write kept in ok within a second. See [docs/jj.md](docs/jj.md) and
-  [docs/okfs.md](docs/okfs.md).
+  are used, every write kept in ok within a second. Run as `git`, it answers git's commands in ok
+  workspaces (`git push` uploads ChangeLists) and leaves every other repository to git. See
+  [docs/jj.md](docs/jj.md), [docs/okfs.md](docs/okfs.md), and [docs/git.md](docs/git.md).
 - **ok control**: the web UI and review — the repository browser, ChangeLists with LGTM and
   Approval over OWNERS and the groups-and-ACLs tree, inline comments that follow the code across
   patchsets, and submit. See [docs/changelists.md](docs/changelists.md),
@@ -120,6 +121,10 @@ jj auth login https://ok.example.com                     # sign this machine in,
 jj clone app ~/src/app                                   # a virtual workspace
 jj new 'trunk()' -m 'add rate limiter' && jj cl          # upload a change as a ChangeList
 jj sync                                                  # follow main
+
+ln -s "$(command -v jj)" ~/.local/bin/git                # git's commands in ok workspaces
+git clone app ~/src/app && cd ~/src/app                  # a virtual workspace
+git commit -am 'add rate limiter' && git push            # a ChangeList
 ```
 
 ## Repository settings

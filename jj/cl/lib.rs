@@ -276,9 +276,47 @@ pub async fn sync_fork(repo: &dyn Repo) -> Result<bool, ClError> {
     Ok(changelists::sync_fork(&shared(repo)?).await?)
 }
 
+/// What a fetch of main did.
+#[derive(Debug)]
+pub struct Fetched {
+    /// main before, and now.
+    pub old_main: Option<CommitId>,
+    pub main: CommitId,
+    /// Commits of main newly fetched.
+    pub fetched: usize,
+}
+
+/// Moves `main@ok` to the SCM's head, with main's new commits fetched, and nothing else: no
+/// change of the caller's moves (`git fetch`; the first step of `jj sync`).
+pub async fn fetch(repo: &mut MutableRepo) -> Result<Fetched, ClError> {
+    let shared = shared(repo)?;
+    let store = repo.store().clone();
+    let remote = changelists::repository(&shared).await?;
+    let head = remote.head.clone();
+    let old_main = main_target(repo);
+    let have: Vec<CommitId> = old_main.iter().cloned().collect();
+    let fetched = changelists::prefetch(&shared, std::slice::from_ref(&head), &have).await?;
+    if head != *store.root_commit_id() {
+        let commit = store.get_commit_async(&head).await?;
+        repo.add_head(&commit).await?;
+    }
+    repo.set_remote_bookmark(
+        remote_symbol("main"),
+        RemoteRef {
+            target: RefTarget::normal(head.clone()),
+            state: RemoteRefState::New,
+        },
+    );
+    Ok(Fetched {
+        old_main,
+        main: head,
+        fetched,
+    })
+}
+
 /// `jj sync` (docs/scm.md, "Commands"), in the caller's transaction:
 ///
-/// 1. `main@ok` moves to the SCM's head, with main's new commits fetched.
+/// 1. `main@ok` moves to the SCM's head, with main's new commits fetched ([`fetch`]).
 /// 2. The CLs of every mutable change and every `cl/<n>@ok` are looked up.
 /// 3. A local change whose CL landed is retired onto the landed commit when it adds nothing
 ///    beyond what landed; otherwise a new change carrying its later edits replaces it.
@@ -298,22 +336,10 @@ pub async fn sync(
     let mut report = SyncReport::default();
 
     // 1. main.
-    let remote = changelists::repository(&shared).await?;
-    let head = remote.head.clone();
-    report.old_main = main_target(repo);
-    let have: Vec<CommitId> = report.old_main.iter().cloned().collect();
-    report.fetched = changelists::prefetch(&shared, std::slice::from_ref(&head), &have).await?;
-    if head != *store.root_commit_id() {
-        let commit = store.get_commit_async(&head).await?;
-        repo.add_head(&commit).await?;
-    }
-    repo.set_remote_bookmark(
-        remote_symbol("main"),
-        RemoteRef {
-            target: RefTarget::normal(head.clone()),
-            state: RemoteRefState::New,
-        },
-    );
+    let fetched = fetch(repo).await?;
+    let head = fetched.main.clone();
+    report.old_main = fetched.old_main;
+    report.fetched = fetched.fetched;
     report.main = Some(head.clone());
 
     // 2. The CLs of the mutable changes, and of the cl/<n>@ok bookmarks.

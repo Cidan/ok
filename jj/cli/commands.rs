@@ -46,6 +46,8 @@ pub enum Command {
     Fork(ForkArgs),
     #[command(subcommand)]
     Fs(crate::fs::FsCommand),
+    #[command(name = "git-compat", hide = true)]
+    GitCompat(crate::git::GitCompatArgs),
     #[command(subcommand)]
     Secret(crate::secrets::SecretCommand),
     Sync(crate::changelists::SyncArgs),
@@ -79,6 +81,25 @@ pub struct CloneArgs {
     /// machine that holds it
     #[arg(long, value_name = "WORKSPACE")]
     attach: Option<WorkspaceNameBuf>,
+}
+
+impl CloneArgs {
+    /// A clone as `git clone` asks for one.
+    pub fn new(
+        name: String,
+        destination: Option<String>,
+        workspace: Option<WorkspaceNameBuf>,
+        real: bool,
+        attach: Option<WorkspaceNameBuf>,
+    ) -> Self {
+        Self {
+            name,
+            destination,
+            workspace,
+            real,
+            attach,
+        }
+    }
 }
 
 /// Create a repository on ok and clone it
@@ -142,6 +163,7 @@ pub async fn run(ui: &mut Ui, command: &CommandHelper, cmd: Command) -> Result<(
         Command::Cl(args) => crate::changelists::run_cl(ui, command, args).await,
         Command::Sync(args) => crate::changelists::run_sync(ui, command, args).await,
         Command::Fs(cmd) => crate::fs::run(ui, command, cmd).await,
+        Command::GitCompat(args) => crate::git::run(ui, command, args).await,
         Command::Secret(cmd) => crate::secrets::run(ui, command, cmd).await,
         Command::Clone(args) => {
             let endpoint = scm_endpoint(command)?;

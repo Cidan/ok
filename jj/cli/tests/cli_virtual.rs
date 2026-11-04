@@ -37,6 +37,18 @@ fn secrets_in_virtual_workspaces() {
 }
 
 #[cfg(target_os = "linux")]
+fn git_in_virtual_workspaces() {
+    if !ok_testscm::available() {
+        return;
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(git_workflow(Mode::Virtual));
+}
+
+#[cfg(target_os = "linux")]
 fn files_up_to_fifty_mebibytes() {
     if !ok_testscm::available() {
         return;
@@ -61,6 +73,7 @@ fn main() {
             create_upload_stack_on_someone_else_and_sync,
         ),
         ("files_up_to_fifty_mebibytes", files_up_to_fifty_mebibytes),
+        ("git_in_virtual_workspaces", git_in_virtual_workspaces),
         (
             "secrets_in_virtual_workspaces",
             secrets_in_virtual_workspaces,
