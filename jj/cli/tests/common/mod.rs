@@ -953,6 +953,41 @@ pub fn virtual_workspaces() {
     }
     let out = desk.ok("w", &["st"]);
     assert!(!out.contains("second.txt"), "{out}");
+    // A checkout that brings back a file of the checked-out tree that this workspace moved away
+    // lists it: the kernel keeps a directory's listing whole (FOPEN_CACHE_DIR), so the checkout
+    // must drop that listing, not only the file's name. The file is in the base tree, so moving
+    // it leaves a whiteout, which the checkout drops. Moved, not deleted: a deletion leaves the
+    // kernel a negative entry for the name, and invalidating that entry drops the listing too,
+    // while a move takes the entry along, so only the listing's own invalidation brings it back.
+    desk.ok(".", &["clone", &name, "w3"]);
+    desk.write("w3/dir/kept.rs", "tracked\n");
+    desk.ok("w3", &["commit", "-m", "a file in a directory"]);
+    desk.ok("w3", &["new", "@-"]);
+    let names = |desk: &Person| -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(desk.home.path().join("w3/dir"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    };
+    assert_eq!(names(&desk), ["kept.rs"]);
+    std::fs::rename(
+        desk.home.path().join("w3/dir/kept.rs"),
+        desk.home.path().join("w3/moved.rs"),
+    )
+    .unwrap();
+    assert!(names(&desk).is_empty());
+    let out = desk.ok("w3", &["st"]);
+    assert!(out.contains("dir/kept.rs"), "{out}");
+    desk.ok("w3", &["new", "@-"]);
+    assert_eq!(names(&desk), ["kept.rs"], "listed again after the checkout");
+    assert_eq!(
+        std::fs::read_to_string(desk.home.path().join("w3/dir/kept.rs")).unwrap(),
+        "tracked\n"
+    );
+    desk.ok("w3", &["fs", "forget"]);
+
     // A stale working copy — moved to another tree by a command that left the files alone — is
     // forgotten without being brought up to date first.
     desk.ok("w2", &["new", "@-", "--ignore-working-copy"]);

@@ -312,7 +312,11 @@ operation it was last updated to, the commit it was checked out at, and the spar
   directories the kernel has looked up, reading only those whose old and new trees differ
   (`FUSE_NOTIFY_INVAL_ENTRY` per changed name, `FUSE_NOTIFY_INVAL_INODE` per changed directory and
   file); a looked-up file whose content changed keeps its inode number with the checkout's time as
-  its `mtime`. Its cost is what the workspace holds — its overlay and what the kernel has looked
+  its `mtime`. Every written name the checkout drops — a whiteout included — invalidates its
+  directory too: the kernel keeps a directory's listing whole (`FOPEN_CACHE_DIR`), and invalidating
+  a name drops that listing only while the kernel holds an entry for the name, which a file moved
+  away no longer has. (Over NFS, a changed name already refreshes its directory.) Its cost is what
+  the workspace holds — its overlay and what the kernel has looked
   at — not the size of the change: a fresh clone of the large repository checks out reading one tree. All
   trees it needs are gathered first, together, so nothing changes while one is missing.
 - **reset(commit)**, **recover(commit).** Point the workspace at the commit's tree without touching

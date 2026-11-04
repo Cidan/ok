@@ -284,8 +284,9 @@ pub struct Listed {
     pub kind: Kind,
 }
 
-/// A kernel cache entry a change made stale: an entry (parent, name), or an inode's data.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// A kernel cache entry a change made stale: an entry (parent, name), or an inode's data (for a
+/// directory, its cached listing).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Stale {
     Entry(Ino, OsString),
     Inode(Ino),
@@ -2676,6 +2677,10 @@ impl Model {
                 name: os_bytes(name),
             })),
         });
+        // The name now stands for something else in the directory's listing, which the kernel
+        // keeps whole (FOPEN_CACHE_DIR): dropping only the entry left a listing without a file a
+        // lookup by name found.
+        stale.push(Stale::Inode(dir));
         stale.push(Stale::Entry(dir, name.to_owned()));
         if let Some(ino) = ino {
             stale.push(Stale::Inode(ino));

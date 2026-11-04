@@ -479,7 +479,12 @@ impl Mount {
         let Some(n) = self.notifier.lock().unwrap().clone() else {
             return Vec::new();
         };
+        // Each once: a checkout names a directory for every slot it drops there.
+        let mut sent = std::collections::HashSet::new();
         for s in stale {
+            if !sent.insert(s) {
+                continue;
+            }
             let _ = match s {
                 Stale::Entry(parent, name) => n.inval_entry(*parent, name),
                 Stale::Inode(ino) => n.inval_inode(*ino, 0, 0),

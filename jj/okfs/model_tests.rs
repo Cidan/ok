@@ -344,6 +344,48 @@ fn checks_out() {
     assert_eq!(m.base(), &resolved_terms(new));
 }
 
+// A file deleted and snapshotted, then checked out again (a change that removed it, left for one
+// that has it): it is listed, and the kernel is told to drop the directory's listing, which it
+// keeps for as long as the directory's inode lives (FOPEN_CACHE_DIR). Telling it only of the name
+// left the cached listing without the file while a lookup by name found it.
+#[test]
+fn checkout_restoring_a_deleted_file_relists_its_directory() {
+    let mut fx = Fixture::new();
+    let base = base_tree(&mut fx);
+    let (mut m, _) = fx.model(&base);
+    let src = fx.at(&mut m, "src").unwrap();
+    fx.run(&mut m, |m| m.unlink(src, name("b.rs"))).unwrap();
+    assert_eq!(fx.names(&mut m, "src"), ["a.rs", "deep"]);
+    let recorded = fx.tree(vec![
+        ("README", Entry::File(b"readme\n")),
+        ("run.sh", Entry::Exec(b"#!/bin/sh\n")),
+        ("link", Entry::Link("README")),
+        (
+            "src",
+            Entry::Dir(vec![
+                ("a.rs", Entry::File(b"fn a() {}\n")),
+                (
+                    "deep",
+                    Entry::Dir(vec![("c.rs", Entry::File(b"fn c() {}\n"))]),
+                ),
+            ]),
+        ),
+        (
+            "docs",
+            Entry::Dir(vec![("guide.md", Entry::File(b"# guide\n"))]),
+        ),
+    ]);
+    let (skipped, stale) = checkout(&fx, &mut m, &recorded, &base);
+    assert!(skipped.is_empty());
+    assert_eq!(fx.names(&mut m, "src"), ["a.rs", "b.rs", "deep"]);
+    assert_eq!(fx.read(&mut m, "src/b.rs").unwrap(), b"fn b() {}\n");
+    assert!(stale.contains(&Stale::Entry(src, "b.rs".into())));
+    assert!(
+        stale.contains(&Stale::Inode(src)),
+        "the directory's cached listing must be dropped"
+    );
+}
+
 // A directory moved by a rename and snapshotted: a later checkout that changes a file under its
 // new path shows the new tree's file there, not the moved tree's.
 #[test]
