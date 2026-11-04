@@ -514,7 +514,7 @@ func excerpt(body string) string {
 
 // notice is the notice banner a CL action answered with ("" when none).
 func notice(p page) string {
-	m := regexp.MustCompile(`(?s)<div class="mb-4 rounded-lg border border-amber-700/50[^"]*">(.*?)</div>`).FindStringSubmatch(p.body)
+	m := regexp.MustCompile(`(?s)<div data-notice[^>]*>.*?<span>(.*?)</span>\s*</div>`).FindStringSubmatch(p.body)
 	if m == nil {
 		return ""
 	}

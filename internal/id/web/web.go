@@ -95,7 +95,13 @@ func (w *Web) Mount(r *chi.Mux) (string, error) {
 		return "", err
 	}
 	r.Use(sameSite)
-	r.Handle("/assets/favicon.svg", http.StripPrefix("/id/assets/", static.Handler()))
+	// The shared assets the pages name — ok's mark, the theme's choice and switch, the fonts — are
+	// internal/web/static's; the rest are the pages' own.
+	shared := http.StripPrefix("/id/assets/", static.Handler())
+	r.Handle("/assets/favicon.svg", shared)
+	r.Handle("/assets/theme-init.js", shared)
+	r.Handle("/assets/theme.js", shared)
+	r.Handle("/assets/fonts/*", shared)
 	r.Handle("/assets/*", http.StripPrefix("/id/assets/", http.FileServer(http.FS(sub))))
 	r.Get("/login", w.login)
 	r.Get("/login/oidc/callback", w.oidcCallback)

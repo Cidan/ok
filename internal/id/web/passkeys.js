@@ -24,10 +24,10 @@
     if (!el) return;
     const skin =
       kind === 'error'
-        ? 'bg-rose-500/15 text-rose-200 ring-1 ring-rose-500/30'
+        ? 'bg-danger-soft text-danger ring-1 ring-danger-line'
         : kind === 'ok'
-          ? 'bg-emerald-500/15 text-emerald-200 ring-1 ring-emerald-500/30'
-          : 'bg-slate-700/40 text-slate-200 ring-1 ring-white/10';
+          ? 'bg-success-soft text-success ring-1 ring-success-line'
+          : 'bg-neutral-soft text-body ring-1 ring-line';
     el.className = 'mt-6 rounded-lg px-4 py-3 text-sm ' + skin;
     el.textContent = msg;
   };

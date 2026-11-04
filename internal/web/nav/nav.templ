@@ -1,7 +1,7 @@
 package nav
 
 // LeftRail renders the collapsible left navigation drawer: a 64px icon rail that
-// expands to a 288px panel (zinc palette, 300ms transitions, a mobile overlay). Open/closed state lives as data-open on the
+// expands to a 288px panel (the app's theme tokens, 300ms transitions, a mobile overlay). Open/closed state lives as data-open on the
 // enclosing [data-nav] shell (rendered by the layout); every collapse-reactive class
 // keys off the group-data-[open=true]/nav: variant, so the only JS needed is flipping
 // that one attribute (see nav.js). The rail itself always lays out at w-72 inside an
@@ -10,10 +10,17 @@ package nav
 // The rail lives in the persistent htmx shell and is NOT re-rendered by a content swap —
 // it is rendered once (on the full/deep-link load) and then stays put, so its collapse
 // transition (the aside's transition-all) plays uninterrupted when the drawer opens/closes.
-// The active highlight is server-computed for the initial render (sectionRowClass/
-// footerClass) and thereafter refreshed CLIENT-SIDE by nav.js (updateActive) on
+// The active destination is marked aria-current="page", server-computed for the initial render
+// (Model.IsActive) and thereafter refreshed CLIENT-SIDE by nav.js (updateActive) on
 // htmx:after:swap, keyed off the pushed URL — so navigation never has to replace the rail.
-// Active-eligible links carry data-nav-link so nav.js knows which to toggle.
+// Active-eligible links carry data-nav-link (and their pattern, data-nav-match) so nav.js knows
+// which to mark.
+//
+// Its colours are the theme tokens every page set defines (docs/web.md, "Theme tokens").
+// Its geometry has app-tunable custom properties, each defaulting to the plain rail: --nav-inset
+// (a row's inset from the rail's edges, 0), --nav-radius (a row's corner radius, 0), and the
+// optional colours --color-rail-line (the rail's right hairline) and --color-nav-mark (the bar
+// beside the active row), both transparent unless the app sets them.
 templ LeftRail(m Model) {
 	<div id="nav-rail" class="contents">
 		@leftRailBody(m)
@@ -30,20 +37,26 @@ templ leftRailBody(m Model) {
 	<div data-nav-backdrop class="fixed inset-0 bg-black/50 z-40 hidden group-data-[open=true]/nav:max-md:block"></div>
 	<aside
 		data-nav-surface
-		class="absolute left-0 top-0 bottom-0 z-50 flex flex-col transition-all duration-300 overflow-hidden w-16 bg-transparent md:bg-zinc-950 pointer-events-none md:pointer-events-auto group-data-[open=true]/nav:w-72 group-data-[open=true]/nav:bg-zinc-900 group-data-[open=true]/nav:shadow-2xl group-data-[open=true]/nav:pointer-events-auto"
+		data-nav-group
+		class="absolute left-0 top-0 bottom-0 z-50 flex flex-col transition-all duration-300 overflow-hidden w-16 bg-transparent md:bg-canvas pointer-events-none md:pointer-events-auto group-data-[open=true]/nav:w-72 group-data-[open=true]/nav:bg-raised group-data-[open=true]/nav:shadow-2xl group-data-[open=true]/nav:pointer-events-auto"
 	>
+		<div aria-hidden="true" class="pointer-events-none absolute inset-y-0 right-0 hidden w-px bg-[var(--color-rail-line,transparent)] md:block"></div>
 		<div class="w-72 flex-1 min-h-0 flex flex-col">
-			<div class="flex flex-col mt-4">
-				<button data-nav-toggle type="button" class="w-16 h-12 flex items-center justify-center shrink-0 hover:text-zinc-100 text-zinc-400 pointer-events-auto">
-					@icon(m.Brand.Icon, "w-6 h-6 shrink-0")
+			<div class="flex flex-col mt-4 gap-[calc(var(--nav-inset,0px)/2)]">
+				<button data-nav-toggle type="button" aria-label={ m.Brand.Label } class="w-16 h-12 flex items-center justify-center shrink-0 hover:text-fg text-muted pointer-events-auto">
+					if m.Logo != nil {
+						@m.Logo
+					} else {
+						@icon(m.Brand.Icon, "w-6 h-6 shrink-0")
+					}
 				</button>
 				for _, it := range m.Actions {
 					if it.isAction() {
-						<button type="button" class={ railItemBase + " h-12" }>
+						<button type="button" title={ it.Label } class={ railItemBase + " h-12" }>
 							@railItemInner(it)
 						</button>
 					} else {
-						<a href={ it.url() } hx-get={ it.Href } hx-target="#content" hx-swap="innerHTML swap:70ms settle:1ms" hx-push-url="true" data-nav-link?={ m.HighlightActions } class={ m.actionRowClass(it) }>
+						<a href={ it.url() } hx-get={ it.Href } hx-target="#content" hx-swap="innerHTML swap:70ms settle:1ms" hx-push-url="true" title={ it.Label } data-nav-link?={ m.HighlightActions } data-nav-match={ it.pattern() } { m.actionCurrent(it)... } class={ railItemBase + " h-12" }>
 							@railItemInner(it)
 						</a>
 					}
@@ -51,10 +64,10 @@ templ leftRailBody(m Model) {
 			</div>
 			<div class="flex-1 overflow-y-auto min-h-0 mt-6 mb-4 justify-start space-y-1 w-full opacity-0 hidden md:flex md:flex-col group-data-[open=true]/nav:opacity-100 group-data-[open=true]/nav:flex group-data-[open=true]/nav:flex-col">
 				for _, sec := range m.Sections {
-					<div class="px-5 pb-2 shrink-0 text-xs font-semibold text-zinc-500 uppercase tracking-wider hidden group-data-[open=true]/nav:block">{ sec.Title }</div>
+					<div class="px-5 pb-2 shrink-0 text-xs font-semibold text-subtle uppercase tracking-wider hidden group-data-[open=true]/nav:block">{ sec.Title }</div>
 					for _, it := range sec.Items {
 						<div class="relative group w-full flex items-center shrink-0">
-							<a href={ it.url() } hx-get={ it.Href } hx-target="#content" hx-swap="innerHTML swap:70ms settle:1ms" hx-push-url="true" data-nav-link class={ m.sectionRowClass(it) }>
+							<a href={ it.url() } hx-get={ it.Href } hx-target="#content" hx-swap="innerHTML swap:70ms settle:1ms" hx-push-url="true" data-nav-link data-nav-match={ it.pattern() } { m.current(it)... } class={ sectionRowClass }>
 								<span class="relative truncate text-sm pl-1">
 									if it.Unread {
 										<div class="absolute left-0 bottom-px w-2 h-2 rounded-full bg-green-500"></div>
@@ -65,10 +78,10 @@ templ leftRailBody(m Model) {
 							if len(it.Menu) > 0 {
 								<div data-nav-kebab-wrap class="absolute right-2 opacity-0 group-hover:opacity-100 transition-opacity items-center hidden group-data-[open=true]/nav:flex">
 									<div class="relative">
-										<button type="button" data-nav-kebab class="p-1 rounded text-zinc-400 hover:text-zinc-100 hover:bg-zinc-700">
+										<button type="button" data-nav-kebab class="p-1 rounded text-muted hover:text-fg hover:bg-hover-strong">
 											@icon("kebab", "w-4 h-4")
 										</button>
-										<div data-nav-menu class="hidden absolute right-0 top-full mt-1 w-32 bg-zinc-800 rounded shadow-lg border border-zinc-700 z-50 py-1 overflow-hidden">
+										<div data-nav-menu class="hidden absolute right-0 top-full mt-1 w-32 bg-overlay rounded shadow-lg border border-line-strong z-50 py-1 overflow-hidden">
 											for _, a := range it.Menu {
 												<button type="button" { a.Attrs... } class={ a.class() }>{ a.Label }</button>
 											}
@@ -81,12 +94,15 @@ templ leftRailBody(m Model) {
 				}
 			</div>
 			for i, it := range m.Footer {
-				<a href={ it.url() } hx-get={ it.Href } hx-target="#content" hx-swap="innerHTML swap:70ms settle:1ms" hx-push-url="true" data-nav-link class={ m.footerClass(it, i == 0) }>
-					<div class="w-16 flex items-center justify-center shrink-0">
+				<a href={ it.url() } hx-get={ it.Href } hx-target="#content" hx-swap="innerHTML swap:70ms settle:1ms" hx-push-url="true" title={ it.Label } data-nav-link data-nav-match={ it.pattern() } { m.current(it)... } class={ footerClass(i == 0) }>
+					<div class={ railIconBox }>
 						@icon(it.Icon, "w-5 h-5 shrink-0")
 					</div>
 					<span class={ railLabelBase }>{ it.Label }</span>
 				</a>
+			}
+			if m.ThemeToggle {
+				@themeToggle(len(m.Footer) == 0)
 			}
 		</div>
 	</aside>
@@ -95,39 +111,118 @@ templ leftRailBody(m Model) {
 // railItemInner is the shared icon + sliding label body of a rail action/footer row, used
 // by both the <a> (destination) and <button> (no-op action) wrappers.
 templ railItemInner(it Item) {
-	<div class="w-16 flex items-center justify-center shrink-0">
+	<div class={ railIconBox }>
 		@icon(it.Icon, "w-5 h-5 shrink-0")
 	</div>
 	<span class={ railLabelBase }>{ it.Label }</span>
 }
 
-// TopBar renders the same model as a horizontal top navigation, for the TopNav layout.
+// themeToggle is the rail's theme control: it cycles the reader's choice — the system's theme,
+// light, dark — which static/theme.js applies and remembers. It shows the current
+// choice, read from <html data-theme-pref> (the system's until a script sets it).
+templ themeToggle(first bool) {
+	<button type="button" data-theme-toggle title="Theme" aria-label="Switch Theme" class={ themeToggleClass(first) }>
+		<div class={ railIconBox }>
+			<span class="block [[data-theme-pref=light]_&]:hidden [[data-theme-pref=dark]_&]:hidden">
+				@icon("monitor", "w-5 h-5 shrink-0")
+			</span>
+			<span class="hidden [[data-theme-pref=light]_&]:block">
+				@icon("sun", "w-5 h-5 shrink-0")
+			</span>
+			<span class="hidden [[data-theme-pref=dark]_&]:block">
+				@icon("moon", "w-5 h-5 shrink-0")
+			</span>
+		</div>
+		<span class={ railLabelBase }>
+			<span class="[[data-theme-pref=light]_&]:hidden [[data-theme-pref=dark]_&]:hidden">System Theme</span>
+			<span class="hidden [[data-theme-pref=light]_&]:inline">Light Theme</span>
+			<span class="hidden [[data-theme-pref=dark]_&]:inline">Dark Theme</span>
+		</span>
+	</button>
+}
+
+// TopBar renders the same model as a horizontal top navigation, for the TopNav layout: the
+// app's mark and name (Brand, a link home), its destinations (Actions, then Footer) as pills —
+// labelled from md up, icons alone below — the app's Center control (a search box) in the middle,
+// and at the end the theme control (ThemeToggle) and the app's End control. A destination with a
+// Shortcut carries it (data-shortcut) for the app's script to bind.
 templ TopBar(m Model) {
-	<header class="h-14 shrink-0 border-b border-zinc-900 bg-zinc-950 flex items-center px-3 gap-1">
-		<a href={ m.Brand.url() } class="w-10 h-10 flex items-center justify-center text-zinc-300 hover:text-zinc-100 shrink-0">
-			@icon(m.Brand.Icon, "w-6 h-6")
-		</a>
-		<nav class="flex items-center gap-1">
-			for _, it := range append(append([]Item{}, m.Actions...), m.Footer...) {
-				if it.isAction() {
-					<button type="button" class={ topItemClass(m, it) }>
-						@icon(it.Icon, "w-4 h-4")
-						<span>{ it.Label }</span>
-					</button>
+	<header data-nav-group class="relative z-40 shrink-0 border-b border-line bg-canvas">
+		<div class="flex h-14 items-center gap-1 px-3 sm:px-5">
+			<a href={ m.Brand.url() } hx-get={ m.Brand.Href } hx-target="#content" hx-swap="innerHTML swap:70ms settle:1ms" hx-push-url="true" class="mr-2 flex shrink-0 items-center gap-2.5 rounded-lg py-1 pr-2 text-fg sm:mr-4">
+				if m.Logo != nil {
+					@m.Logo
 				} else {
-					<a href={ it.url() } hx-get={ it.Href } hx-target="#content" hx-swap="innerHTML swap:70ms settle:1ms" hx-push-url="true" data-nav-link class={ topItemClass(m, it) }>
-						@icon(it.Icon, "w-4 h-4")
-						<span>{ it.Label }</span>
-					</a>
+					@icon(m.Brand.Icon, "w-6 h-6")
 				}
-			}
-		</nav>
+				<span class="hidden text-base font-semibold tracking-tight sm:inline">{ m.Brand.Label }</span>
+			</a>
+			<nav class="flex min-w-0 items-center gap-0.5">
+				for _, it := range append(append([]Item{}, m.Actions...), m.Footer...) {
+					if it.isAction() {
+						<button type="button" title={ it.Label } class={ topItemClass }>
+							@icon(it.Icon, "w-4 h-4 shrink-0")
+							<span class="hidden md:inline">{ it.Label }</span>
+						</button>
+					} else {
+						<a
+							href={ it.url() }
+							hx-get={ it.Href }
+							hx-target="#content"
+							hx-swap="innerHTML swap:70ms settle:1ms"
+							hx-push-url="true"
+							title={ it.Label }
+							data-nav-link
+							data-nav-match={ it.pattern() }
+							if it.Shortcut != "" {
+								data-shortcut={ it.Shortcut }
+							}
+							{ m.current(it)... }
+							class={ topItemClass }
+						>
+							@icon(it.Icon, "w-4 h-4 shrink-0")
+							<span class="hidden md:inline">{ it.Label }</span>
+						</a>
+					}
+				}
+			</nav>
+			<div class="flex min-w-0 flex-1 justify-center px-2 sm:px-6">
+				if m.Center != nil {
+					@m.Center
+				}
+			</div>
+			<div class="flex shrink-0 items-center gap-1">
+				if m.ThemeToggle {
+					@themeToggleIcon()
+				}
+				if m.End != nil {
+					@m.End
+				}
+			</div>
+		</div>
 	</header>
 }
 
+// themeToggleIcon is the theme control as an icon button, for the top bar: the same choice, cycled
+// the same way (static/theme.js), showing the current one.
+templ themeToggleIcon() {
+	<button type="button" data-theme-toggle title="Theme" aria-label="Switch Theme" class="flex h-9 w-9 shrink-0 cursor-pointer items-center justify-center rounded-lg text-muted transition-colors hover:bg-hover hover:text-fg">
+		<span class="block [[data-theme-pref=light]_&]:hidden [[data-theme-pref=dark]_&]:hidden">
+			@icon("monitor", "w-[18px] h-[18px]")
+		</span>
+		<span class="hidden [[data-theme-pref=light]_&]:block">
+			@icon("sun", "w-[18px] h-[18px]")
+		</span>
+		<span class="hidden [[data-theme-pref=dark]_&]:block">
+			@icon("moon", "w-[18px] h-[18px]")
+		</span>
+	</button>
+}
+
 // icon renders a named SVG icon at the given Tailwind size classes. A small shared set of
-// common nav glyphs (logo/new/search/home/repo/org/notes/tasks/server/settings/kebab); an unknown
-// name renders nothing. Consumers pick the names that fit their app.
+// common nav glyphs (bolt/new/search/home/bell/repo/org/code/notes/tasks/server/settings/kebab, and
+// the theme control's sun/moon/monitor); an unknown name renders nothing. Consumers pick the
+// names that fit their app.
 templ icon(name, cls string) {
 	switch name {
 		case "bolt":
@@ -137,6 +232,10 @@ templ icon(name, cls string) {
 		case "home":
 			<svg class={ cls } fill="none" stroke="currentColor" viewBox="0 0 24 24">
 				<path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M2.25 12l8.954-8.955c.44-.439 1.152-.439 1.591 0L21.75 12M4.5 9.75v10.125c0 .621.504 1.125 1.125 1.125H9.75v-4.875c0-.621.504-1.125 1.125-1.125h2.25c.621 0 1.125.504 1.125 1.125V21h4.125c.621 0 1.125-.504 1.125-1.125V9.75"></path>
+			</svg>
+		case "bell":
+			<svg class={ cls } fill="none" stroke="currentColor" viewBox="0 0 24 24">
+				<path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M14.857 17.082a23.848 23.848 0 0 0 5.454-1.31A8.967 8.967 0 0 1 18 9.75V9A6 6 0 0 0 6 9v.75a8.967 8.967 0 0 1-2.312 6.022c1.733.64 3.56 1.085 5.455 1.31m5.714 0a24.255 24.255 0 0 1-5.714 0m5.714 0a3 3 0 1 1-5.714 0"></path>
 			</svg>
 		case "repo":
 			<svg class={ cls } fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -174,6 +273,18 @@ templ icon(name, cls string) {
 		case "kebab":
 			<svg class={ cls } fill="none" stroke="currentColor" viewBox="0 0 24 24">
 				<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6a1 1 0 110-2 1 1 0 010 2zm0 7a1 1 0 110-2 1 1 0 010 2zm0 7a1 1 0 110-2 1 1 0 010 2z"></path>
+			</svg>
+		case "sun":
+			<svg class={ cls } fill="none" stroke="currentColor" viewBox="0 0 24 24">
+				<path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M12 3v2.25m6.364.386-1.591 1.591M21 12h-2.25m-.386 6.364-1.591-1.591M12 18.75V21m-4.773-4.227-1.591 1.591M5.25 12H3m4.227-4.773L5.636 5.636M15.75 12a3.75 3.75 0 1 1-7.5 0 3.75 3.75 0 0 1 7.5 0Z"></path>
+			</svg>
+		case "moon":
+			<svg class={ cls } fill="none" stroke="currentColor" viewBox="0 0 24 24">
+				<path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M21.752 15.002A9.72 9.72 0 0 1 18 15.75c-5.385 0-9.75-4.365-9.75-9.75 0-1.33.266-2.597.748-3.752A9.753 9.753 0 0 0 3 11.25C3 16.635 7.365 21 12.75 21a9.753 9.753 0 0 0 9.002-5.998Z"></path>
+			</svg>
+		case "monitor":
+			<svg class={ cls } fill="none" stroke="currentColor" viewBox="0 0 24 24">
+				<path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9 17.25v1.007a3 3 0 0 1-.879 2.122L7.5 21h9l-.621-.621A3 3 0 0 1 15 18.257V17.25m6-12V15a2.25 2.25 0 0 1-2.25 2.25H5.25A2.25 2.25 0 0 1 3 15V5.25m18 0A2.25 2.25 0 0 0 18.75 3H5.25A2.25 2.25 0 0 0 3 5.25m18 0V12a2.25 2.25 0 0 1-2.25 2.25H5.25A2.25 2.25 0 0 1 3 12V5.25"></path>
 			</svg>
 	}
 }

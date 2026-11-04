@@ -8,58 +8,88 @@ import (
 )
 
 // SearchPage is a repository's code search (docs/hosted.md, "ok control at scale, as built"): main's
-// files, as their latest index says.
+// files, as their latest index says. It is the repository header's Search tab; SearchContent is
+// the swappable region, and SearchMain what a search swaps into #repo-main.
 templ SearchPage(n nav.Model, v SearchView) {
-	@layout.Shell(shell("Search · "+v.Chrome.Name+" · "+Brand, layout.LeftNav, n)) {
+	@layout.Shell(shell("Search · "+v.Chrome.Name+" · "+Brand, layout.TopNav, n)) {
 		@SearchContent(v)
 	}
 }
 
 templ SearchContent(v SearchView) {
-	<div class="flex h-full flex-1 flex-col overflow-hidden">
-		<div class="shrink-0">
-			@PageHead(v.Chrome.Name, v.Chrome.Subtitle, "") {
-				@changesLink(v.Chrome.ChangesHref, "#repo-main")
-				@codeButton(v.Chrome.Clone)
-			}
+	<div class="group/repo flex h-full flex-1 flex-col overflow-hidden">
+		@repoHead(v.Chrome, tabSearch, "#repo-main", false)
+		<div id="repo-main" data-hydrate class="hydrating flex-1 overflow-y-auto">
+			@SearchMain(v)
 		</div>
-		<div id="repo-main" class="flex-1 overflow-y-auto">
-			<div class="mx-auto w-full max-w-5xl space-y-6 px-6 pb-16 sm:px-10">
-				<form method="get" action={ templ.SafeURL(v.Action) } class="space-y-3">
-					<div class="flex gap-3">
-						<input name="q" type="text" value={ v.Query } required autofocus autocomplete="off" spellcheck="false" placeholder="Search main's code…" class="min-w-0 flex-1 rounded-lg border border-zinc-800 bg-zinc-900/50 px-3.5 py-2.5 font-mono text-sm text-zinc-100 placeholder:text-zinc-600 transition-colors focus:border-zinc-600 focus:outline-none"/>
-						<input name="path" type="text" value={ v.Path } autocomplete="off" spellcheck="false" placeholder="Path: *.go, api/" class="w-48 rounded-lg border border-zinc-800 bg-zinc-900/50 px-3.5 py-2.5 font-mono text-sm text-zinc-100 placeholder:text-zinc-600 transition-colors focus:border-zinc-600 focus:outline-none"/>
-						<button type="submit" class={ btnClass(btnInverse) }>Search</button>
-					</div>
-					<div class="flex gap-5 text-sm text-zinc-400">
-						<label class="flex items-center gap-2"><input type="checkbox" name="regexp" value="1" checked?={ v.Regexp } class="accent-zinc-300"/> Regular expression</label>
-						<label class="flex items-center gap-2"><input type="checkbox" name="case" value="1" checked?={ v.CaseSensitive } class="accent-zinc-300"/> Match case</label>
-					</div>
-				</form>
-				if v.Notice != "" {
-					<div id="search-notice" class="rounded-lg border border-zinc-800 bg-zinc-900/30 px-4 py-3 text-sm text-zinc-400">{ v.Notice }</div>
-				}
-				if v.Error != "" {
-					<div class="rounded-lg border border-red-900/50 bg-red-950/20 px-4 py-3 text-sm text-red-400">{ v.Error }</div>
-				}
-				if v.Query != "" && v.Error == "" && v.Notice == "" && len(v.Files) == 0 {
-					<div class="py-10 text-center text-sm text-zinc-500">Nothing in main matches.</div>
-				}
-				for _, f := range v.Files {
-					<section data-search-file class="overflow-hidden rounded-lg border border-zinc-800 bg-zinc-900/40">
-						<a href={ templ.SafeURL(f.Href) } class="block border-b border-zinc-800/70 px-4 py-2 font-mono text-sm text-sky-400 hover:text-sky-300">{ f.Path }</a>
-						for _, l := range f.Lines {
-							<a href={ templ.SafeURL(l.Href) } data-search-line class="flex gap-4 px-4 py-1 font-mono text-xs hover:bg-zinc-800/40">
-								<span class="w-10 shrink-0 text-right text-zinc-600">{ strconv.Itoa(l.Number) }</span>
-								<span class="min-w-0 flex-1 truncate whitespace-pre text-zinc-300">{ l.Before }<mark class="rounded-sm bg-amber-400/25 text-amber-200">{ l.Match }</mark>{ l.After }</span>
-							</a>
-						}
-					</section>
-				}
-				if v.Truncated {
-					<div class="text-center text-xs text-zinc-500">The first { strconv.Itoa(v.Shown) } lines: narrow the search for the rest.</div>
-				}
+	</div>
+}
+
+// SearchMain is the search form, what the index says of itself, and the lines it found, a panel to
+// each file.
+templ SearchMain(v SearchView) {
+	<div class="mx-auto w-full max-w-5xl space-y-5 px-6 pt-6 pb-16 sm:px-10">
+		<form method="get" action={ templ.SafeURL(v.Action) } hx-get={ v.Action } hx-target="#repo-main" hx-swap={ swapNav } hx-push-url="true" class="space-y-3">
+			<div class="flex flex-wrap gap-3">
+				<div class="relative min-w-0 flex-1">
+					<span class="pointer-events-none absolute top-1/2 left-3.5 -translate-y-1/2 text-faint">
+						@iconSearch()
+					</span>
+					<input name="q" type="text" value={ v.Query } required autofocus autocomplete="off" spellcheck="false" placeholder="Search main's code…" aria-label="Search main's code" class="w-full rounded-xl border border-line bg-surface py-2.5 pr-4 pl-10 font-mono text-sm text-fg shadow-panel placeholder:text-faint transition-[border-color,box-shadow] focus:border-accent-line focus:ring-4 focus:ring-accent-soft focus:outline-none"/>
+				</div>
+				<input name="path" type="text" value={ v.Path } autocomplete="off" spellcheck="false" placeholder="Path: *.go, api/" aria-label="Path" class={ inputClass, "w-48 font-mono sm:w-56" }/>
+				<button type="submit" class={ btnClass(btnPrimary) }>Search</button>
 			</div>
-		</div>
+			<div class="flex gap-5 text-sm text-muted">
+				<label class="flex cursor-pointer items-center gap-2"><input type="checkbox" name="regexp" value="1" checked?={ v.Regexp } class="accent-accent"/> Regular Expression</label>
+				<label class="flex cursor-pointer items-center gap-2"><input type="checkbox" name="case" value="1" checked?={ v.CaseSensitive } class="accent-accent"/> Match Case</label>
+			</div>
+		</form>
+		if v.Notice != "" {
+			<div id="search-notice" class="flex items-start gap-2.5 rounded-xl border border-info-line bg-info-soft px-4 py-3 text-sm text-info">
+				@iconInfo()
+				<span>{ v.Notice }</span>
+			</div>
+		}
+		if v.Error != "" {
+			<div class="flex items-start gap-2.5 rounded-xl border border-danger-line bg-danger-soft px-4 py-3 text-sm text-danger">
+				@iconAlert()
+				<span>{ v.Error }</span>
+			</div>
+		}
+		if v.Query != "" && v.Error == "" && v.Notice == "" && len(v.Files) == 0 {
+			@panel() {
+				@panelTitle("Results")
+				@panelEmpty() {
+					Nothing in main matches.
+				}
+			}
+		}
+		if len(v.Files) > 0 {
+			<div class="text-sm text-subtle"><span class="font-medium text-body">{ strconv.Itoa(searchLines(v)) }</span> { pluralize(int64(searchLines(v)), "line", "lines") } in <span class="font-medium text-body">{ strconv.Itoa(len(v.Files)) }</span> { pluralize(int64(len(v.Files)), "file", "files") }</div>
+		}
+		for _, f := range v.Files {
+			<section data-search-file class="overflow-hidden rounded-2xl border border-line bg-surface shadow-panel">
+				@panelHead() {
+					<span class="text-subtle">
+						@iconFile()
+					</span>
+					<a href={ templ.SafeURL(f.Href) } hx-get={ f.Href } hx-target="#content" hx-swap={ swapNav } hx-push-url="true" class="min-w-0 truncate font-mono font-normal text-accent-fg transition-colors hover:text-fg">{ f.Path }</a>
+					<span class="flex-1"></span>
+					<span class="shrink-0 font-normal tabular-nums">{ strconv.Itoa(len(f.Lines)) }</span>
+				}
+				<div class="py-1">
+					for _, l := range f.Lines {
+						<a href={ templ.SafeURL(l.Href) } hx-get={ l.Href } hx-target="#content" hx-swap={ swapNav } hx-push-url="true" data-search-line class="flex gap-4 px-4 py-1 font-mono text-[12.5px] leading-[1.6] transition-colors hover:bg-hover">
+							<span class="w-10 shrink-0 text-right text-faint">{ strconv.Itoa(l.Number) }</span>
+							<span class="min-w-0 flex-1 truncate whitespace-pre text-body">{ l.Before }<mark class="rounded-sm bg-accent-soft text-accent-fg ring-1 ring-accent-line">{ l.Match }</mark>{ l.After }</span>
+						</a>
+					}
+				</div>
+			</section>
+		}
+		if v.Truncated {
+			<div class="text-center text-sm text-subtle">The first { strconv.Itoa(v.Shown) } lines: narrow the search for the rest.</div>
+		}
 	</div>
 }

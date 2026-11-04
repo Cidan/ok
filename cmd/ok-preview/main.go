@@ -682,6 +682,69 @@ func mockDeployment(name string, id int64) pages.DeploymentView {
 	return v
 }
 
+// mockCLsAcross are the preview's inbox, from every cell, as the dashboard and the palette list it:
+// a review and a reply waiting on ada, her own in flight, those she reviews, and her landed.
+var mockCLsAcross = []pages.CLItem{
+	{Repository: "acme/api", Number: 412, Title: "Rate-limit the search endpoint", StatusLabel: "Open", StatusKind: "open", Age: "12 minutes ago", Waiting: pages.WaitingFor(false)},
+	{Repository: "acme/web", Number: 97, Title: "Show inboxes on the home page", StatusLabel: "Open", StatusKind: "open", Age: "1 hour ago", Waiting: pages.WaitingFor(true)},
+	{Repository: "ada/notes", Number: 3, Title: "Draft: notes on cells", StatusLabel: "Draft", StatusKind: "draft", Age: "2 days ago"},
+	{Repository: "acme/api", Number: 405, Title: "Split the planner from the runner", StatusLabel: "Open", StatusKind: "open", Age: "5 hours ago"},
+	{Repository: "acme/infra", Number: 61, Title: "Roll back CL 58: cache the tree listings", StatusLabel: "Open", StatusKind: "open", Age: "yesterday", Rollback: true},
+	{Repository: "acme/web", Number: 90, Title: "Serve the web node over HTTP/2", StatusLabel: "Merged", StatusKind: "merged", Age: "2 days ago"},
+	{Repository: "ada/notes", Number: 1, Title: "Document the boot order", StatusLabel: "Merged", StatusKind: "merged", Age: "4 days ago"},
+}
+
+// mockReviewing is which of mockCLsAcross ada reviews (the rest in flight are hers).
+var mockReviewing = map[int64]bool{405: true, 61: true}
+
+func mockCLItem(c pages.CLItem) pages.CLItem {
+	c.Href = fmt.Sprintf("/%s/cl/%d", c.Repository, c.Number)
+	c.AgeTitle = "Oct 19, 2026"
+	return c
+}
+
+// mockDashboard is the dashboard over the preview's data.
+func mockDashboard(repos []pages.RepoItem) pages.DashboardView {
+	v := pages.DashboardView{User: "ada", Repos: repos[:min(len(repos), 8)], Services: servicegroup.Of(mockSummaries()),
+		Unread: previewNotifications.Unread, Notifications: previewNotifications.Items[:min(len(previewNotifications.Items), 5)]}
+	for _, c := range mockCLsAcross {
+		switch {
+		case c.Waiting != "":
+			v.Waiting = append(v.Waiting, mockCLItem(c))
+		case c.StatusKind == "merged":
+			v.Landed = append(v.Landed, mockCLItem(c))
+		case mockReviewing[c.Number]:
+			v.Reviewing = append(v.Reviewing, mockCLItem(c))
+		default:
+			v.Yours = append(v.Yours, mockCLItem(c))
+		}
+	}
+	return v
+}
+
+// mockPalette is the palette's results over the preview's data: without a query, ada's CLs in
+// flight; with one, those its number or title matches.
+func mockPalette(q, repo string, repos func(string) []pages.RepoItem) pages.PaletteView {
+	q = strings.TrimSpace(q)
+	v := pages.PaletteView{Query: q, Repo: repo}
+	found := repos(q)
+	v.Repos = found[:min(len(found), 6)]
+	for _, c := range mockCLsAcross {
+		hay := strings.ToLower(fmt.Sprintf("#%d %s", c.Number, c.Title))
+		if (q == "" && c.StatusKind != "merged") || (q != "" && strings.Contains(hay, strings.ToLower(q))) {
+			v.CLs = append(v.CLs, mockCLItem(c))
+		}
+	}
+	if q != "" {
+		for _, g := range servicegroup.Of(mockSummaries()) {
+			if strings.Contains(strings.ToLower(g.Name), strings.ToLower(q)) {
+				v.Services = append(v.Services, g)
+			}
+		}
+	}
+	return v
+}
+
 // mockServices are the Services page's rows: one of each status.
 // mockSummaries are the preview's services: ok's roles in one group, one of them deploying
 // through its stages as time passes (to watch the pages refresh themselves); identity's two, one
@@ -1212,7 +1275,10 @@ func main() {
 	mux.HandleFunc("/repositories/list", func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query().Get("q")
 		items := filtered(q)
-		pages.ServeHomeList(w, r, q, pageOf(items, 1), rowsURL(q), pageSize, len(items) > pageSize)
+		pages.ServeRepositoryList(w, r, q, pageOf(items, 1), rowsURL(q), pageSize, len(items) > pageSize)
+	})
+	mux.HandleFunc("/repositories/palette", func(w http.ResponseWriter, r *http.Request) {
+		pages.ServePalette(w, r, mockPalette(r.URL.Query().Get("q"), r.URL.Query().Get("repo"), filtered))
 	})
 	mux.HandleFunc("/acme/api/search", func(w http.ResponseWriter, r *http.Request) {
 		pages.ServeSearch(w, r, previewSearch)
@@ -1224,10 +1290,12 @@ func main() {
 		pages.ServeNotifications(w, r, previewNotifications)
 	})
 	mux.HandleFunc("/repositories/new", func(w http.ResponseWriter, r *http.Request) {
-		pages.ServeNewRepo(w, r, pages.NewRepoForm{}, "")
+		pages.ServeNewRepo(w, r, pages.NewRepoForm{Owners: []string{"acme", "ada"}, Owner: "acme", Organization: "acme"}, "")
 	})
 	mux.HandleFunc("/repositories", func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, "/", http.StatusFound)
+		q := r.URL.Query().Get("q")
+		items := filtered(q)
+		pages.ServeRepositories(w, r, "ada", q, pageOf(items, 1), rowsURL(q), pageSize, len(items) > pageSize)
 	})
 	// Repo view preview: /<repo>, /<repo>/tree/main/<file>, and /empty-repo for the
 	// quick-start state.
@@ -1236,25 +1304,13 @@ func main() {
 			mockRepoRouter(w, r)
 			return
 		}
-		q := r.URL.Query().Get("q")
-		items := filtered(q)
-		pages.ServeHome(w, r, "ada", 3, previewInbox, q, pageOf(items, 1), rowsURL(q), pageSize, len(items) > pageSize)
+		pages.ServeDashboard(w, r, mockDashboard(filtered("")))
 	})
 
 	log.Printf("ok-preview listening on %s", addr)
 	if err := http.ListenAndServe(addr, mux); err != nil {
 		log.Fatal(err)
 	}
-}
-
-// previewInbox is the home's inbox in the preview: a review waiting on ada, and her own CLs.
-var previewInbox = []pages.InboxItem{
-	{Repository: "acme/api", Number: 412, Title: "Rate-limit the search endpoint", Role: "reviewer", Attention: true, Status: "open",
-		Link: "/acme/api/cl/412", UpdatedAgo: "12m", UpdatedTitle: "2026-10-19 16:48 UTC"},
-	{Repository: "acme/web", Number: 97, Title: "Show inboxes on the home page", Role: "author", Attention: true, Status: "open",
-		Link: "/acme/web/cl/97", UpdatedAgo: "1h", UpdatedTitle: "2026-10-19 16:00 UTC"},
-	{Repository: "ada/notes", Number: 3, Title: "Draft: notes on cells", Role: "author", Status: "draft", Link: "/ada/notes/cl/3",
-		UpdatedAgo: "2d", UpdatedTitle: "2026-10-17 09:12 UTC"},
 }
 
 // previewNotifications are the notifications page in the preview.
@@ -1280,7 +1336,7 @@ var previewNotifications = pages.NotificationsView{
 
 // previewWebhooks are a repository's webhooks page in the preview, a webhook just added.
 var previewWebhooks = pages.WebhooksView{
-	Chrome: pages.RepoChrome{Name: "acme/api", Subtitle: "Created by ada", Link: "/acme/api", ChangesHref: "/acme/api/cls",
+	Chrome: pages.RepoChrome{Name: "acme/api", Subtitle: "Created by ada", Link: "/acme/api", ChangesHref: "/acme/api/cls", WebhooksHref: "/acme/api/webhooks",
 		Clone: pages.CloneURLs{Command: "jj clone acme/api"}},
 	Enabled:    true,
 	Created:    &pages.NewWebhook{URL: "https://ci.example.com/ok", Secret: "4f1c9d0b7e2a6c58d3b1f0e9a7c4d2b6e8f1a3c5d7e9b2f4a6c8e0d1b3f5a7c9"},

@@ -13,9 +13,9 @@ import (
 
 var (
 	fileRowRe = regexp.MustCompile(`<details id="diff-[0-9a-f]+" class="[^"]*"( open)?>`)
-	rowNameRe = regexp.MustCompile(`<span class="min-w-0 truncate text-zinc-200">([^<]+)</span>`)
+	rowNameRe = regexp.MustCompile(`<span data-file-name[^>]*>([^<]+)</span>`)
 	nextRe    = regexp.MustCompile(`hx-get="([^"]*/files\?[^"]*)"`)
-	totalsRe  = regexp.MustCompile(`files? changed</span>\s*<span class="text-emerald-400">\+(\d+)</span>`)
+	totalsRe  = regexp.MustCompile(`files? changed</span>\s*<span[^>]*>\s*<span data-added[^>]*>\+(\d+)</span>\s*<span data-removed[^>]*>−(\d+)</span>`)
 )
 
 // fileRows are a file list page's rows, in order, and whether each starts open.
@@ -159,7 +159,7 @@ func TestFileLists(t *testing.T) {
 	if fmt.Sprint(names) != "[pkg/f000.txt]" || fmt.Sprint(open) != "[true]" {
 		t.Errorf("a small change's rows: %v %v", names, open)
 	}
-	if m := totalsRe.FindStringSubmatch(p.body); m == nil || m[1] != "1" || !p.has(`<span class="text-red-400">−1</span>`) {
+	if m := totalsRe.FindStringSubmatch(p.body); m == nil || m[1] != "1" || m[2] != "1" {
 		t.Errorf("a small change's totals: %s", excerpt(p.body))
 	}
 }

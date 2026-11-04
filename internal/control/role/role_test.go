@@ -169,11 +169,11 @@ identity:
 		return resp.StatusCode, string(b), resp.Header
 	}
 
-	// No one is sent to sign in; a person sees the finder, under the installation's name.
+	// No one is sent to sign in; a person sees their dashboard, under the installation's name.
 	if code, _, h := get("/", ""); code != http.StatusSeeOther || h.Get("Location") != "/id/login?next=%2F" {
 		t.Errorf("no one: %d, %s", code, h.Get("Location"))
 	}
-	if code, body, _ := get("/", ada); code != http.StatusOK || !strings.Contains(body, "<title>Repositories · Example ok</title>") {
+	if code, body, _ := get("/", ada); code != http.StatusOK || !strings.Contains(body, "<title>Home · Example ok</title>") {
 		t.Fatalf("ada's home: %d\n%.400s", code, body)
 	}
 

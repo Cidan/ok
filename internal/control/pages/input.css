@@ -14,16 +14,299 @@
 @source "webhooks.templ";
 @source "search.templ";
 @source "ui.templ";
+@source "palette.templ";
+@source "dashboard.templ";
 @source "web.go";
 @source "clcomments.js";
 @source "stars.js";
 @source "tree.js";
+@source "ok.js";
 @source "../../web/nav/nav.templ";
 @source "../../web/nav/nav.go";
 @source "../../web/layout/layout.templ";
 @source "../../web/infinitelist/infinitelist.templ";
 @source "../../web/breadcrumb/breadcrumb.templ";
 @source "../../web/clipboard/clipboard.templ";
+
+/* --- Theme tokens ---------------------------------------------------------------------------
+   ok's two themes (docs/web.md, "Theme tokens"). Every colour a page draws with is one of
+   these roles, never a palette shade: utilities name the role (bg-surface, text-muted,
+   border-line, text-success, bg-accent-soft, …) and the theme decides its colour. Dark — warm
+   blacks lit with gold and ember — is the default; light — warm paper and ink, bronze for the
+   accent — overrides it on <html data-theme="light">, which the shell sets before the first
+   paint (layout.Props.Themes) and static/theme.js switches.
+
+     canvas      the page behind everything          surface   a panel
+     raised      the open drawer, a code popover      overlay   a floating popover or menu
+     sunken      inputs, code blocks, hunk headers    hover / hover-strong / selected   row states
+     line / line-soft / line-strong                   borders, dividers inside panels, controls
+     fg > body > muted > subtle > faint > ghost       text, strongest to weakest
+     accent (+ accent-hi, ember for its gradient), accent-fg (accent text and links),
+     accent-soft / accent-line (tinted fills and borders), on-accent (text on the accent)
+     success / danger / info / warn (+ -soft, -line), neutral-soft / neutral-line: the tones
+     diff-add / diff-del (+ -word), hunk: diffs                                                  */
+@theme static {
+  --font-sans: 'Geist', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-mono: 'Geist Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+  --color-canvas: #0b0a09;
+  --color-surface: #12100e;
+  --color-raised: #171411;
+  --color-overlay: #1a1714;
+  --color-sunken: #0e0d0b;
+  --color-hover: #1a1714;
+  --color-hover-strong: #25211c;
+  --color-selected: #231f1a;
+  --color-line: #28231e;
+  --color-line-soft: #1f1c18;
+  --color-line-strong: #3b352d;
+
+  --color-fg: #f7f2ea;
+  --color-body: #ded6ca;
+  --color-muted: #aaa093;
+  --color-subtle: #887e71;
+  --color-faint: #675e53;
+  --color-ghost: #413a33;
+
+  --color-accent: #eeb043;
+  --color-accent-hi: #f8cd6e;
+  --color-ember: #ea7a2c;
+  --color-accent-fg: #f2c063;
+  --color-accent-soft: rgb(238 176 67 / 0.11);
+  --color-accent-line: rgb(238 176 67 / 0.36);
+  --color-on-accent: #1d1305;
+
+  --color-success: #6fd39a;
+  --color-success-soft: rgb(111 211 154 / 0.09);
+  --color-success-line: rgb(111 211 154 / 0.26);
+  --color-success-solid: #3fae6c;
+  --color-on-success: #04140a;
+  --color-danger: #ff8a7a;
+  --color-danger-soft: rgb(255 138 122 / 0.09);
+  --color-danger-line: rgb(255 138 122 / 0.28);
+  --color-info: #95b9ff;
+  --color-info-soft: rgb(149 185 255 / 0.09);
+  --color-info-line: rgb(149 185 255 / 0.27);
+  --color-warn: #f89d4c;
+  --color-warn-soft: rgb(248 157 76 / 0.1);
+  --color-warn-line: rgb(248 157 76 / 0.3);
+  --color-neutral-soft: rgb(255 238 214 / 0.045);
+  --color-neutral-line: #37312a;
+
+  --color-diff-add: rgb(111 211 154 / 0.075);
+  --color-diff-del: rgb(255 138 122 / 0.075);
+  --color-diff-add-word: rgb(111 211 154 / 0.26);
+  --color-diff-del-word: rgb(255 138 122 / 0.26);
+  --color-hunk: rgb(149 185 255 / 0.055);
+
+  --shadow-panel: var(--q-shadow-panel);
+  --shadow-pop: var(--q-shadow-pop);
+  --shadow-mark: var(--q-shadow-mark);
+}
+
+:root {
+  color-scheme: dark;
+  /* The rail's geometry and colours (internal/web/nav): rows inset from its edges and
+     rounded, a gold mark beside the active one, a hairline down its edge. */
+  --nav-inset: 10px;
+  --nav-radius: 12px;
+  --color-nav-mark: var(--color-accent);
+  --color-rail-line: var(--color-line-soft);
+
+  --q-shadow-panel: inset 0 1px 0 rgb(255 236 210 / 0.035), 0 1px 2px rgb(0 0 0 / 0.4);
+  --q-shadow-pop: 0 0 0 1px rgb(255 236 210 / 0.04), 0 28px 60px -18px rgb(0 0 0 / 0.8), 0 10px 24px -10px rgb(0 0 0 / 0.55);
+  --q-shadow-mark: inset 0 1px 0 rgb(255 255 255 / 0.3), 0 1px 2px rgb(0 0 0 / 0.4);
+  --q-canvas-glow: radial-gradient(1100px 460px at 55% -220px, rgb(238 176 67 / 0.075), transparent 70%);
+
+  /* Syntax colours for highlighted code (.chroma). */
+  --syn-text: #e9e1d4;
+  --syn-comment: #7a7063;
+  --syn-keyword: #ff9757;
+  --syn-type: #82c4e0;
+  --syn-operator: #e2a77f;
+  --syn-punct: #9d9283;
+  --syn-attr: #e8c07a;
+  --syn-builtin: #79c8bf;
+  --syn-func: #ffcb6b;
+  --syn-tag: #ff9757;
+  --syn-var: #f28b82;
+  --syn-const: #dca5f2;
+  --syn-string: #b8d47c;
+  --syn-number: #f2a477;
+  --syn-error: #ff6b6b;
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+
+  --color-canvas: #f6f3ed;
+  --color-surface: #fffdf9;
+  --color-raised: #fffdf9;
+  --color-overlay: #ffffff;
+  --color-sunken: #f4f0e8;
+  --color-hover: #f6f1e9;
+  --color-hover-strong: #ede6da;
+  --color-selected: #f0e8db;
+  --color-line: #e5ddd0;
+  --color-line-soft: #efe9df;
+  --color-line-strong: #d5cab9;
+
+  --color-fg: #1b1713;
+  --color-body: #3a332b;
+  --color-muted: #6b6155;
+  --color-subtle: #84796b;
+  --color-faint: #a2978a;
+  --color-ghost: #cdc3b5;
+
+  --color-accent: #eca83b;
+  --color-accent-hi: #f6c565;
+  --color-ember: #e2741f;
+  --color-accent-fg: #9b5a07;
+  --color-accent-soft: rgb(226 152 38 / 0.12);
+  --color-accent-line: rgb(205 130 22 / 0.4);
+  --color-on-accent: #1d1305;
+
+  --color-success: #19794a;
+  --color-success-soft: #e8f4ec;
+  --color-success-line: #bfe2cc;
+  --color-success-solid: #1f8a52;
+  --color-on-success: #ffffff;
+  --color-danger: #b8352a;
+  --color-danger-soft: #fcece9;
+  --color-danger-line: #f1c4bc;
+  --color-info: #2c5aa8;
+  --color-info-soft: #ebf0fa;
+  --color-info-line: #c8d6ef;
+  --color-warn: #a24e00;
+  --color-warn-soft: #fcf0df;
+  --color-warn-line: #f0d0a2;
+  --color-neutral-soft: #f3eee6;
+  --color-neutral-line: #e2d9cb;
+
+  --color-diff-add: #eaf6ee;
+  --color-diff-del: #fcedeb;
+  --color-diff-add-word: #bfe5cc;
+  --color-diff-del-word: #f6c9c1;
+  --color-hunk: #eef2fa;
+
+  --q-shadow-panel: 0 1px 2px rgb(70 48 20 / 0.05), 0 1px 1px rgb(70 48 20 / 0.03);
+  --q-shadow-pop: 0 0 0 1px rgb(70 48 20 / 0.07), 0 28px 56px -20px rgb(70 48 20 / 0.3), 0 8px 18px -10px rgb(70 48 20 / 0.16);
+  --q-shadow-mark: inset 0 1px 0 rgb(255 255 255 / 0.5), 0 1px 2px rgb(110 64 8 / 0.2);
+  --q-canvas-glow: radial-gradient(1100px 460px at 55% -220px, rgb(236 168 59 / 0.14), transparent 70%);
+
+  --syn-text: #2b241d;
+  --syn-comment: #998e80;
+  --syn-keyword: #c24f0a;
+  --syn-type: #1d6c94;
+  --syn-operator: #9f582a;
+  --syn-punct: #6b6155;
+  --syn-attr: #8a6100;
+  --syn-builtin: #11766e;
+  --syn-func: #8f5d00;
+  --syn-tag: #c24f0a;
+  --syn-var: #b8352a;
+  --syn-const: #8a3fb0;
+  --syn-string: #4c7810;
+  --syn-number: #b0500f;
+  --syn-error: #c62828;
+}
+
+/* --- Base ------------------------------------------------------------------------------------ */
+@layer base {
+  body {
+    background-image: var(--q-canvas-glow);
+    background-repeat: no-repeat;
+    font-feature-settings: 'ss01', 'cv11';
+  }
+  ::selection { background: color-mix(in oklab, var(--color-accent) 32%, transparent); }
+  * { scrollbar-width: thin; scrollbar-color: var(--color-line-strong) transparent; }
+  :focus-visible { outline: 2px solid color-mix(in oklab, var(--color-accent) 75%, transparent); outline-offset: 2px; }
+  input, textarea { caret-color: var(--color-accent); }
+}
+
+/* A person's badge colour (web.go's avatarClass): seven warm-harmonious gradients, the same in
+   both themes, each dark-lettered. Identity, not status: no tone means anything here. */
+.q-person-0, .q-person-1, .q-person-2, .q-person-3, .q-person-4, .q-person-5, .q-person-6 { color: #1d1305; }
+.q-person-0 { background: linear-gradient(135deg, #f8cd6e, #e8902f); }
+.q-person-1 { background: linear-gradient(135deg, #f6a66b, #d9572a); }
+.q-person-2 { background: linear-gradient(135deg, #9fd7b4, #3e9f6a); }
+.q-person-3 { background: linear-gradient(135deg, #a9c4ff, #5b7fd6); }
+.q-person-4 { background: linear-gradient(135deg, #e2b6f5, #a565c9); }
+.q-person-5 { background: linear-gradient(135deg, #f3b0a6, #cc5a50); }
+.q-person-6 { background: linear-gradient(135deg, #9ad8d1, #2f9488); }
+
+/* A scroll region beneath a header reserves its scrollbar's room whether or not it scrolls, and
+   the header above it reserves the same room (overflow-hidden [scrollbar-gutter:stable]), so the
+   two share one axis: a page's edges line up with its header's, scrolling or not. */
+#repo-main, #services, #browse-main, #service-main, [data-infinite] { scrollbar-gutter: stable; }
+
+/* The rail's active destination draws its icon in the accent. */
+[data-nav-surface] a[aria-current="page"] svg { color: var(--color-accent-fg); }
+
+/* --- Motion -----------------------------------------------------------------------------------
+   A region the shell reveals (static/hydrate.js) rises a few pixels as it fades in; the
+   region a navigation will replace dims while its answer is on the way (aria-busy, set by
+   static/progress.js) — after a beat, so a quick page never flickers. These outrank the
+   shell's own reveal styles by specificity. */
+:root [data-hydrate] { transition: opacity 170ms ease-out, translate 280ms cubic-bezier(0.22, 1, 0.36, 1); }
+:root [data-hydrate].hydrating { opacity: 0; translate: 0 5px; transition: none; }
+:root [data-hydrate][aria-busy="true"]:not(.hydrating) { opacity: 0.5; transition: opacity 220ms ease 140ms; }
+
+/* The progress bar across the top of the window (static/progress.js). */
+#page-progress {
+  height: 2px !important;
+  background: linear-gradient(90deg, var(--color-accent-hi), var(--color-accent) 45%, var(--color-ember)) !important;
+  box-shadow: 0 0 12px color-mix(in oklab, var(--color-accent) 70%, transparent), 0 0 3px var(--color-accent);
+}
+
+/* A popover or menu opening (ui.templ's popover class): a quick drop and fade. */
+@keyframes q-pop-in {
+  from { opacity: 0; transform: translateY(-4px) scale(0.985); }
+  to { opacity: 1; transform: none; }
+}
+.q-pop { animation: q-pop-in 170ms cubic-bezier(0.22, 1, 0.36, 1) both; }
+
+/* A button whose request is in flight (htmx's htmx-request, on it or on its form) shows a spinner
+   in place of its label and takes no more clicks. --btn-spin is the variant's text colour. */
+@keyframes q-spin { to { transform: rotate(360deg); } }
+.q-btn.htmx-request, form.htmx-request .q-btn[type="submit"] { color: transparent !important; pointer-events: none; }
+.q-btn.htmx-request::after, form.htmx-request .q-btn[type="submit"]::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  width: 0.95rem;
+  height: 0.95rem;
+  border-radius: 9999px;
+  border: 2px solid var(--btn-spin, var(--color-fg));
+  border-right-color: transparent;
+  animation: q-spin 0.6s linear infinite;
+}
+
+/* A placeholder for content on its way (a diff, the next page of files): a shimmering bar. */
+@keyframes q-shimmer {
+  from { background-position: 100% 0; }
+  to { background-position: -100% 0; }
+}
+.q-shimmer {
+  border-radius: 6px;
+  background: linear-gradient(90deg, var(--color-hover) 30%, var(--color-hover-strong) 50%, var(--color-hover) 70%);
+  background-size: 300% 100%;
+  animation: q-shimmer 1.5s ease-in-out infinite;
+}
+
+/* A live dot: a status that is still moving (running, deploying) pulses. */
+@keyframes q-pulse {
+  0% { box-shadow: 0 0 0 0 color-mix(in oklab, currentColor 55%, transparent); }
+  70% { box-shadow: 0 0 0 6px transparent; }
+  100% { box-shadow: 0 0 0 0 transparent; }
+}
+.q-pulse { animation: q-pulse 1.8s ease-out infinite; }
+
+@media (prefers-reduced-motion: reduce) {
+  :root [data-hydrate], :root [data-hydrate].hydrating { transition: none !important; translate: none !important; }
+  .q-pop, .q-shimmer, .q-pulse { animation: none !important; }
+}
 
 /* The browser's tree (browse.templ): a folder's chevron points down only while its own
    <details> is open. A Tailwind group variant would follow any open folder above it. */
@@ -33,121 +316,132 @@
 /* --- Rendered markup prose (`.markup`) ----------------------------------------------------
    Styles for server-rendered, sanitized README/markdown HTML (ok renders markup on the
    server; there is no client markdown lib). These target the element tree the markup service
-   emits, so they are plain CSS (not Tailwind utilities) and must not be purged. Dark zinc, as every page. */
+   emits, so they are plain CSS (not Tailwind utilities) and must not be purged. In the theme
+   tokens, so a README reads as the page around it does in either theme. */
 .markup {
-	color: #d4d4d8; /* zinc-300 */
-	font-size: 0.9375rem;
-	line-height: 1.7;
-	word-wrap: break-word;
+  color: var(--color-body);
+  font-size: 0.9375rem;
+  line-height: 1.75;
+  word-wrap: break-word;
 }
 .markup > *:first-child { margin-top: 0 !important; }
 .markup > *:last-child { margin-bottom: 0 !important; }
 .markup h1, .markup h2, .markup h3, .markup h4, .markup h5, .markup h6 {
-	margin-top: 1.75rem;
-	margin-bottom: 1rem;
-	font-weight: 600;
-	line-height: 1.3;
-	color: #fafafa; /* zinc-50 */
-	letter-spacing: -0.01em;
+  margin-top: 1.9rem;
+  margin-bottom: 0.9rem;
+  font-weight: 600;
+  line-height: 1.3;
+  color: var(--color-fg);
+  letter-spacing: -0.015em;
 }
-.markup h1 { font-size: 1.75rem; padding-bottom: 0.4em; border-bottom: 1px solid #27272a; }
-.markup h2 { font-size: 1.375rem; padding-bottom: 0.35em; border-bottom: 1px solid #27272a; }
+.markup h1 { font-size: 1.85rem; padding-bottom: 0.4em; border-bottom: 1px solid var(--color-line); letter-spacing: -0.025em; }
+.markup h2 { font-size: 1.4rem; padding-bottom: 0.35em; border-bottom: 1px solid var(--color-line); }
 .markup h3 { font-size: 1.15rem; }
 .markup h4 { font-size: 1rem; }
 .markup h5 { font-size: 0.9rem; }
-.markup h6 { font-size: 0.85rem; color: #a1a1aa; }
+.markup h6 { font-size: 0.85rem; color: var(--color-muted); }
 .markup p, .markup blockquote, .markup ul, .markup ol, .markup dl, .markup table, .markup pre, .markup details {
-	margin-top: 0; margin-bottom: 1rem;
+  margin-top: 0; margin-bottom: 1rem;
 }
-.markup a { color: #7dd3fc; text-decoration: none; } /* sky-300 */
-.markup a:hover { text-decoration: underline; }
-.markup strong { color: #f4f4f5; font-weight: 600; }
+.markup a {
+  color: var(--color-accent-fg);
+  text-decoration: underline;
+  text-decoration-color: color-mix(in oklab, var(--color-accent-fg) 35%, transparent);
+  text-underline-offset: 3px;
+  transition: text-decoration-color 0.15s;
+}
+.markup a:hover { text-decoration-color: var(--color-accent-fg); }
+.markup strong { color: var(--color-fg); font-weight: 600; }
 .markup ul, .markup ol { padding-left: 1.6em; }
 .markup ul { list-style: disc; }
 .markup ol { list-style: decimal; }
-.markup li { margin: 0.25em 0; }
+.markup li { margin: 0.3em 0; }
+.markup li::marker { color: var(--color-subtle); }
 .markup li > ul, .markup li > ol { margin-top: 0.25em; margin-bottom: 0.25em; }
 .markup li.task-list-item { list-style: none; }
-.markup li.task-list-item input { margin: 0 0.4em 0 -1.4em; vertical-align: middle; }
+.markup li.task-list-item input { margin: 0 0.4em 0 -1.4em; vertical-align: middle; accent-color: var(--color-accent); }
 .markup blockquote {
-	padding: 0 1em;
-	color: #a1a1aa;
-	border-left: 0.25em solid #3f3f46;
+  padding: 0.15em 1em;
+  color: var(--color-muted);
+  border-left: 3px solid var(--color-accent-line);
+  background: var(--color-neutral-soft);
+  border-radius: 0 8px 8px 0;
 }
-.markup hr { height: 1px; margin: 1.75rem 0; background: #27272a; border: 0; }
+.markup hr { height: 1px; margin: 2rem 0; background: var(--color-line); border: 0; }
 .markup code {
-	padding: 0.2em 0.4em;
-	margin: 0;
-	font-family: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
-	font-size: 0.85em;
-	background: #27272a;
-	color: #e4e4e7;
-	border-radius: 6px;
+  padding: 0.15em 0.4em;
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 0.85em;
+  background: var(--color-hover-strong);
+  color: var(--color-fg);
+  border-radius: 6px;
 }
 .markup pre {
-	padding: 1rem 1.15rem;
-	overflow: auto;
-	font-size: 0.82rem;
-	line-height: 1.55;
-	background: #0c0c0f;
-	border: 1px solid #27272a;
-	border-radius: 10px;
+  padding: 1rem 1.15rem;
+  overflow: auto;
+  font-size: 0.82rem;
+  line-height: 1.6;
+  background: var(--color-sunken);
+  border: 1px solid var(--color-line);
+  border-radius: 12px;
 }
 .markup pre code {
-	display: inline;
-	padding: 0;
-	margin: 0;
-	font-size: inherit;
-	background: transparent;
-	border: 0;
-	border-radius: 0;
-	white-space: pre;
+  display: inline;
+  padding: 0;
+  margin: 0;
+  font-size: inherit;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  white-space: pre;
 }
 .markup table { display: block; width: max-content; max-width: 100%; overflow: auto; border-collapse: collapse; }
-.markup table th, .markup table td { padding: 0.5em 0.9em; border: 1px solid #27272a; }
-.markup table th { font-weight: 600; color: #f4f4f5; background: #18181b; }
-.markup table tr:nth-child(2n) td { background: #131316; }
-.markup img { max-width: 100%; border-radius: 8px; }
+.markup table th, .markup table td { padding: 0.5em 0.9em; border: 1px solid var(--color-line); }
+.markup table th { font-weight: 600; color: var(--color-fg); background: var(--color-sunken); }
+.markup table tr:nth-child(2n) td { background: var(--color-neutral-soft); }
+.markup img { max-width: 100%; border-radius: 10px; }
 .markup kbd {
-	padding: 0.15em 0.45em;
-	font-family: 'IBM Plex Mono', ui-monospace, monospace;
-	font-size: 0.78em;
-	color: #e4e4e7;
-	background: #27272a;
-	border: 1px solid #3f3f46;
-	border-radius: 6px;
-	box-shadow: inset 0 -1px 0 #3f3f46;
+  padding: 0.15em 0.45em;
+  font-family: var(--font-mono);
+  font-size: 0.78em;
+  color: var(--color-fg);
+  background: var(--color-raised);
+  border: 1px solid var(--color-line-strong);
+  border-radius: 6px;
+  box-shadow: inset 0 -1px 0 var(--color-line-strong);
 }
 .markup .anchor { display: none; }
 
-/* --- Chroma dark syntax theme (`.chroma`) -------------------------------------------------
+/* --- Syntax highlighting (`.chroma`) ------------------------------------------------------
    Token colors for server-highlighted code — both the standalone source file view (the
    line-numbered table carries `.chroma`) and fenced code blocks inside rendered markup
-   (`.markup pre .chroma`, goldmark+chroma). One compact dark palette, purge-safe plain CSS. */
-.chroma { color: #e4e4e7; }
-.chroma .err { color: #f87171; }              /* error */
-.chroma .lntd, .chroma .ln { color: #52525b; }
-.chroma .c, .chroma .ch, .chroma .cm, .chroma .c1, .chroma .cs, .chroma .cp, .chroma .cpf { color: #6b7280; font-style: italic; } /* comment */
-.chroma .k, .chroma .kc, .chroma .kd, .chroma .kn, .chroma .kp, .chroma .kr { color: #c084fc; }  /* keyword — purple */
-.chroma .kt { color: #f0abfc; }               /* keyword.type */
-.chroma .o, .chroma .ow { color: #67e8f9; }   /* operator — cyan */
-.chroma .p { color: #a1a1aa; }                /* punctuation */
-.chroma .n, .chroma .nx { color: #e4e4e7; }   /* name */
-.chroma .na { color: #93c5fd; }               /* name.attribute */
-.chroma .nb, .chroma .bp { color: #5eead4; }  /* name.builtin */
-.chroma .nc, .chroma .nn { color: #fcd34d; }  /* class / namespace — amber */
-.chroma .nf, .chroma .fm { color: #60a5fa; }  /* function — blue */
-.chroma .nt { color: #f472b6; }               /* html/xml tag */
-.chroma .nd { color: #fcd34d; }               /* decorator */
-.chroma .nv, .chroma .vc, .chroma .vg, .chroma .vi { color: #fca5a5; } /* variable */
-.chroma .no { color: #fca5a5; }               /* constant */
-.chroma .s, .chroma .sa, .chroma .sb, .chroma .sc, .chroma .dl, .chroma .sd, .chroma .s2, .chroma .se, .chroma .sh, .chroma .si, .chroma .sx, .chroma .sr, .chroma .s1, .chroma .ss { color: #86efac; } /* string — green */
-.chroma .m, .chroma .mb, .chroma .mf, .chroma .mh, .chroma .mi, .chroma .il, .chroma .mo { color: #fdba74; } /* number — orange */
-.chroma .gd { color: #f87171; background: #2a1416; } /* diff delete */
-.chroma .gi { color: #86efac; background: #10231a; } /* diff insert */
-.chroma .gu { color: #c084fc; }
-.chroma .gh { color: #60a5fa; font-weight: 600; }
-.chroma .gp { color: #6b7280; }
+   (`.markup pre .chroma`, goldmark+chroma). The --syn-* colours are each theme's; purge-safe
+   plain CSS. */
+.chroma { color: var(--syn-text); }
+.chroma .err { color: var(--syn-error); }
+.chroma .lntd, .chroma .ln { color: var(--color-faint); }
+.chroma .c, .chroma .ch, .chroma .cm, .chroma .c1, .chroma .cs, .chroma .cp, .chroma .cpf { color: var(--syn-comment); font-style: italic; }
+.chroma .k, .chroma .kc, .chroma .kd, .chroma .kn, .chroma .kp, .chroma .kr { color: var(--syn-keyword); }
+.chroma .kt { color: var(--syn-type); }
+.chroma .o, .chroma .ow { color: var(--syn-operator); }
+.chroma .p { color: var(--syn-punct); }
+.chroma .n, .chroma .nx { color: var(--syn-text); }
+.chroma .na { color: var(--syn-attr); }
+.chroma .nb, .chroma .bp { color: var(--syn-builtin); }
+.chroma .nc, .chroma .nn { color: var(--syn-type); }
+.chroma .nf, .chroma .fm { color: var(--syn-func); }
+.chroma .nt { color: var(--syn-tag); }
+.chroma .nd { color: var(--syn-attr); }
+.chroma .nv, .chroma .vc, .chroma .vg, .chroma .vi { color: var(--syn-var); }
+.chroma .no { color: var(--syn-const); }
+.chroma .s, .chroma .sa, .chroma .sb, .chroma .sc, .chroma .dl, .chroma .sd, .chroma .s2, .chroma .se, .chroma .sh, .chroma .si, .chroma .sx, .chroma .sr, .chroma .s1, .chroma .ss { color: var(--syn-string); }
+.chroma .m, .chroma .mb, .chroma .mf, .chroma .mh, .chroma .mi, .chroma .il, .chroma .mo { color: var(--syn-number); }
+.chroma .gd { color: var(--color-danger); background: var(--color-diff-del); }
+.chroma .gi { color: var(--color-success); background: var(--color-diff-add); }
+.chroma .gu { color: var(--syn-const); }
+.chroma .gh { color: var(--syn-type); font-weight: 600; }
+.chroma .gp { color: var(--syn-comment); }
 .chroma .ge { font-style: italic; }
 .chroma .gs { font-weight: 600; }
 
@@ -155,21 +449,56 @@
    The single-commit diff renders each line via gitdiff's server-side highlighter, which wraps
    the changed spans within an add/del line in these two classes. The whole-line background is a
    Tailwind utility on the row; these emphasize the exact bytes that changed. Purge-safe. */
-.chroma .added-code { background: rgba(34, 197, 94, 0.28); border-radius: 2px; }
-.chroma .removed-code { background: rgba(239, 68, 68, 0.28); border-radius: 2px; }
+.chroma .added-code { background: var(--color-diff-add-word); border-radius: 3px; }
+.chroma .removed-code { background: var(--color-diff-del-word); border-radius: 3px; }
 
 /* --- ChangeList review tabs (`.cl-tab`) ---------------------------------------------------
    The Files / Comments / Checks tab bar switches panels client-side (clcomments.js toggles the
    active button + the matching [data-tab-panel]); the active state is a JS-set class, so it is
-   defined here as plain purge-safe CSS rather than a Tailwind variant. */
-.cl-tab { cursor: pointer; margin-bottom: -1px; border-bottom: 2px solid transparent; padding-bottom: 0.5rem; color: #71717a; font-weight: 500; transition: color .12s ease; }
-.cl-tab:hover { color: #d4d4d8; }
-.cl-tab-active { border-bottom-color: #fafafa; color: #fafafa; }
+   defined here as plain purge-safe CSS rather than a Tailwind variant. The active tab's
+   underline is the accent, drawn out from its centre. */
+.cl-tab {
+  position: relative;
+  flex-shrink: 0;
+  white-space: nowrap;
+  cursor: pointer;
+  margin-bottom: -1px;
+  padding: 0.25rem 0.125rem 0.75rem;
+  color: var(--color-subtle);
+  font-weight: 500;
+  transition: color 0.15s ease;
+}
+.cl-tab:hover { color: var(--color-body); }
+.cl-tab::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 2px;
+  border-radius: 2px;
+  background: linear-gradient(90deg, var(--color-accent-hi), var(--color-accent) 50%, var(--color-ember));
+  transform: scaleX(0);
+  transition: transform 0.28s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.cl-tab-active { color: var(--color-fg); }
+.cl-tab-active::after { transform: scaleX(1); }
 
 /* The Checks tab's groups (cl.templ): a group's chevron points down only while its own
    <details> is open. */
 [data-check-group] > summary > [data-check-chevron] { rotate: -90deg; }
 [data-check-group][open] > summary > [data-check-chevron] { rotate: 0deg; }
+
+/* A diff is unified or split, as the reader chose (<html data-diff>, ok.js): both are rendered,
+   one shown. */
+.q-diff-split { display: none; }
+:root[data-diff="split"] .q-diff-split { display: table; }
+:root[data-diff="split"] .q-diff-unified { display: none; }
+
+/* On a CL, a file brought into view (j, k, the files' list) stops below the pinned header, and the
+   one the reader is at is marked. */
+[data-wide] details[id^="diff-"] { scroll-margin-top: 7rem; }
+details[id^="diff-"][data-current] > summary { box-shadow: inset 3px 0 0 var(--color-accent); }
 
 /* The inline-comment "+" gutter affordance on a diff line: hidden until the row is hovered, so
    the diff stays clean. clcomments.js injects the composer row on click. */

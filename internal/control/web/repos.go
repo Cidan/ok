@@ -3,7 +3,6 @@ package web
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -34,50 +33,6 @@ func rowsURL(keyword string) string {
 // repoPage is one page of the finder, of the repositories the principal may read: their favorites
 // first, then the most recently updated, and whether another page follows. It walks the
 // projection a batch at a time, past the earlier pages' readable repositories.
-// unread is how many of the signed-in person's notifications are unread; 0 when the directory
-// cannot say, which the home does without.
-func (s *Server) unread(r *http.Request) int64 {
-	who := principal(r)
-	if who == "" {
-		return 0
-	}
-	resp, err := s.notify.ListNotifications(r.Context(), &identitypb.ListNotificationsRequest{ForPersonId: who, Unread: true, Limit: 1})
-	if err != nil {
-		slog.Warn("control: the unread notifications", "err", err)
-		return 0
-	}
-	return resp.GetUnread()
-}
-
-// inboxShown is how many of a person's CLs under way the home shows.
-const inboxShown = 10
-
-// inbox is the signed-in person's CLs under way, from the directory, whichever cell holds each; none
-// when the directory cannot say, which the home does without.
-func (s *Server) inbox(r *http.Request) []pages.InboxItem {
-	who := principal(r)
-	if who == "" {
-		return nil
-	}
-	resp, err := s.inboxes.ListInbox(r.Context(), &identitypb.ListInboxRequest{ForPersonId: who, Limit: inboxShown})
-	if err != nil {
-		slog.Warn("control: the inbox", "err", err)
-		return nil
-	}
-	out := make([]pages.InboxItem, 0, len(resp.GetEntries()))
-	for _, e := range resp.GetEntries() {
-		role := "author"
-		if e.GetRelation() == identitypb.InboxEntry_RELATION_REVIEWING {
-			role = "reviewer"
-		}
-		ago, title := age(e.GetUpdatedAt().AsTime())
-		out = append(out, pages.InboxItem{Repository: e.GetRepository(), Number: e.GetNumber(), Title: e.GetTitle(), Role: role,
-			Attention: e.GetAttention(), Status: e.GetStatus(), Link: repoLink(e.GetRepository()) + "/cl/" + strconv.FormatInt(e.GetNumber(), 10),
-			UpdatedAgo: ago, UpdatedTitle: title})
-	}
-	return out
-}
-
 // searchLimit is how many repositories a search through the directory lists: one page of them.
 const searchLimit = 50
 
@@ -186,17 +141,6 @@ func plural(n int64, one, many string) string {
 	return many
 }
 
-// home is the repository finder.
-func (s *Server) home(w http.ResponseWriter, r *http.Request) {
-	keyword := strings.TrimSpace(r.URL.Query().Get("q"))
-	items, more, err := s.findRepositories(r, keyword, 1)
-	if err != nil {
-		fail(w, r, err)
-		return
-	}
-	pages.ServeHome(w, r, people.Handle(r.Context(), principal(r)), s.unread(r), s.inbox(r), keyword, items, rowsURL(keyword), repoPageSize, more)
-}
-
 // homeList is the finder's list region for a search, which the search box swaps in.
 func (s *Server) homeList(w http.ResponseWriter, r *http.Request) {
 	keyword := strings.TrimSpace(r.URL.Query().Get("q"))
@@ -205,7 +149,7 @@ func (s *Server) homeList(w http.ResponseWriter, r *http.Request) {
 		fail(w, r, err)
 		return
 	}
-	pages.ServeHomeList(w, r, keyword, items, rowsURL(keyword), repoPageSize, more)
+	pages.ServeRepositoryList(w, r, keyword, items, rowsURL(keyword), repoPageSize, more)
 }
 
 // homeRows is one more page of the finder's rows.

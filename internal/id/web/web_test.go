@@ -291,8 +291,10 @@ func TestAdminAndPasskeyBegin(t *testing.T) {
 	if resp.StatusCode != 200 || !strings.Contains(string(b), `"residentKey":"required"`) {
 		t.Errorf("passkey registration begin: %d %s", resp.StatusCode, b)
 	}
-	if code, _, _ := e.get(t, "/id/assets/app.css"); code != 200 {
-		t.Errorf("app.css: %d", code)
+	for _, a := range []string{"app.css", "passkeys.js", "favicon.svg", "theme-init.js", "theme.js", "fonts/geist/geist-latin-wght-normal.woff2", "fonts/geist-mono/geist-mono-latin-wght-normal.woff2"} {
+		if code, _, _ := e.get(t, "/id/assets/"+a); code != 200 {
+			t.Errorf("%s: %d", a, code)
+		}
 	}
 }
 

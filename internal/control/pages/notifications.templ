@@ -10,69 +10,97 @@ import (
 // NotificationsPage is the full document of a person's notifications (docs/hosted.md, "ok control at
 // scale, as built"): what asks something of them, from every cell, and which kinds they are mailed.
 templ NotificationsPage(n nav.Model, v NotificationsView) {
-	@layout.Shell(shell("Notifications · "+Brand, layout.LeftNav, n)) {
+	@layout.Shell(shell("Notifications · "+Brand, layout.TopNav, n)) {
 		@NotificationsContent(v)
 	}
 }
 
 templ NotificationsContent(v NotificationsView) {
 	<div class="flex h-full flex-1 flex-col overflow-hidden">
-		<div class="shrink-0">
+		<div class="shrink-0 overflow-hidden [scrollbar-gutter:stable]">
 			@PageHead("Notifications", notificationsSubtitle(v.Unread), "") {
 				if v.Unread > 0 {
 					<form method="post" action="/notifications/read">
-						<button type="submit" class={ btnClass(btnInverse) }>Mark all read</button>
+						<button type="submit" class={ btnClass(btnSecondary) }>
+							@iconCheck()
+							Mark All Read
+						</button>
 					</form>
 				}
 			}
 		</div>
-		<div class="flex-1 overflow-y-auto">
-			<div class="mx-auto w-full max-w-5xl space-y-8 px-6 pb-12 sm:px-10">
-				if len(v.Items) == 0 {
-					<div class="py-16 text-center text-sm">
-						<div class="font-medium text-zinc-200">Nothing Yet</div>
-						<div class="mt-1.5 text-zinc-500">Reviews asked of you, replies to your changes, and comments in your threads show here.</div>
-					</div>
-				} else {
-					<div id="notifications" class="rounded-lg border border-zinc-800 bg-zinc-900/40">
-						for _, it := range v.Items {
-							<a
-								href={ templ.SafeURL(it.Link) }
-								data-notification
-								data-read={ boolAttr(it.Read) }
-								class="flex items-start gap-3 border-b border-zinc-800/70 px-4 py-3 text-sm last:border-b-0 hover:bg-zinc-800/40"
-							>
-								if it.Read {
-									<span class="mt-1.5 h-2 w-2 shrink-0 rounded-full bg-zinc-700"></span>
-								} else {
-									<span class="mt-1.5 h-2 w-2 shrink-0 rounded-full bg-sky-400" title="Unread"></span>
-								}
-								<span class="min-w-0 flex-1">
-									<span class={ "block truncate", templ.KV("text-zinc-200", !it.Read), templ.KV("text-zinc-400", it.Read) }>
-										<span class="font-medium">{ it.Who }</span> { it.Text }
-									</span>
-									<span class="mt-0.5 block truncate text-xs text-zinc-500">
-										<span class="font-mono">{ it.Repository } #{ strconv.FormatInt(it.Number, 10) }</span> · { it.Title }
-									</span>
-								</span>
-								<span class="shrink-0 text-xs text-zinc-600" title={ it.AgoTitle }>{ it.Ago }</span>
-							</a>
+		<div class="flex-1 overflow-y-auto [scrollbar-gutter:stable]">
+			<div class="mx-auto grid w-full max-w-5xl items-start gap-6 px-6 pb-12 sm:px-10 lg:grid-cols-[minmax(0,1fr)_18rem]">
+				@panel() {
+					@panelHead() {
+						<h3>Latest</h3>
+						<span class="flex-1"></span>
+						if v.Unread > 0 {
+							<span class="rounded-full bg-accent-soft px-2 text-xs leading-5 font-medium text-accent-fg tabular-nums">{ strconv.FormatInt(v.Unread, 10) } unread</span>
 						}
-					</div>
-				}
-				<form method="post" action="/notifications/preferences" class="max-w-xl space-y-3">
-					<h2 class="text-xs font-medium uppercase tracking-wide text-zinc-500">Mailed to you</h2>
-					for _, k := range v.Kinds {
-						<label class="flex items-center gap-2.5 text-sm text-zinc-300">
-							<input type="checkbox" name="mail" value={ k.Value } checked?={ k.Mailed } class="accent-zinc-300"/>
-							{ k.Label }
-						</label>
 					}
-					<button type="submit" class={ btnClass(btnInverse) }>Save</button>
-				</form>
+					if len(v.Items) == 0 {
+						<div class="flex flex-col items-center px-6 py-14 text-center text-sm">
+							<span class="mb-4 flex h-12 w-12 items-center justify-center rounded-2xl bg-accent-soft text-accent-fg ring-1 ring-inset ring-accent-line">
+								@iconBell()
+							</span>
+							<div class="font-medium text-fg">Nothing Yet</div>
+							<div class="mt-1.5 text-subtle">Reviews asked of you, replies to your changes, and comments in your threads show here.</div>
+						</div>
+					} else {
+						<div id="notifications" class="divide-y divide-line-soft">
+							for _, it := range v.Items {
+								@notificationRow(it)
+							}
+						</div>
+					}
+				}
+				@panel() {
+					@panelTitle("Mailed to You")
+					<form method="post" action="/notifications/preferences" class="space-y-3 px-4 py-4">
+						for _, k := range v.Kinds {
+							<label class="flex cursor-pointer items-start gap-2.5 text-sm text-body">
+								<input type="checkbox" name="mail" value={ k.Value } checked?={ k.Mailed } class="mt-0.5 accent-accent"/>
+								{ k.Label }
+							</label>
+						}
+						<div class="border-t border-line-soft pt-4">
+							<button type="submit" class={ btnClass(btnPrimary) }>Save</button>
+						</div>
+					</form>
+				}
 			</div>
 		</div>
 	</div>
+}
+
+// notificationRow is a notification: who did what, on which CL, and when; an unread one is lit in
+// the accent.
+templ notificationRow(it NotificationItem) {
+	<a
+		href={ templ.SafeURL(it.Link) }
+		data-notification
+		data-read={ boolAttr(it.Read) }
+		class={ "group flex items-start gap-3 px-4 py-3 text-sm transition-colors hover:bg-hover", templ.KV("bg-accent-soft/40", !it.Read) }
+	>
+		<span class="relative shrink-0">
+			@avatar(it.Who)
+			if !it.Read {
+				<span class="absolute -top-0.5 -right-0.5 h-2.5 w-2.5 rounded-full bg-accent ring-2 ring-surface" title="Unread"></span>
+			}
+		</span>
+		<span class="min-w-0 flex-1">
+			<span class={ "block truncate", templ.KV("text-fg", !it.Read), templ.KV("text-muted", it.Read) }>
+				<span class="font-medium">{ it.Who }</span> { it.Text }
+			</span>
+			<span class="mt-0.5 flex min-w-0 items-center gap-1.5 text-xs text-subtle">
+				<span class="shrink-0 font-medium text-muted">{ it.Repository }</span>
+				<span class="shrink-0 font-mono">#{ strconv.FormatInt(it.Number, 10) }</span>
+				<span class="truncate">· { it.Title }</span>
+			</span>
+		</span>
+		<span class="shrink-0 text-xs whitespace-nowrap text-faint" title={ it.AgoTitle }>{ it.Ago }</span>
+	</a>
 }
 
 func notificationsSubtitle(unread int64) string {
@@ -83,4 +111,8 @@ func notificationsSubtitle(unread int64) string {
 		return "1 unread."
 	}
 	return strconv.FormatInt(unread, 10) + " unread."
+}
+
+templ iconBell() {
+	<svg class="h-5 w-5" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 16a2 2 0 0 0 1.985-1.75c.017-.137-.097-.25-.235-.25h-3.5c-.138 0-.252.113-.235.25A2 2 0 0 0 8 16ZM3 5a5 5 0 0 1 10 0v2.947c0 .05.015.098.042.139l1.703 2.555A1.519 1.519 0 0 1 13.482 13H2.518a1.516 1.516 0 0 1-1.263-2.36l1.703-2.554A.255.255 0 0 0 3 7.947Zm5-3.5A3.5 3.5 0 0 0 4.5 5v2.947c0 .346-.102.683-.294.97l-1.703 2.556a.017.017 0 0 0-.003.01l.001.006c0 .002.002.004.004.006l.006.004.007.001h10.964l.007-.001.006-.004.004-.006.001-.007a.017.017 0 0 0-.003-.01l-1.703-2.554a1.745 1.745 0 0 1-.294-.97V5A3.5 3.5 0 0 0 8 1.5Z"></path></svg>
 }

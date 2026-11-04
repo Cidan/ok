@@ -3,15 +3,16 @@ package layout
 import "github.com/Cidan/ok/internal/web/nav"
 
 // Shell renders a full HTML document for one view: head (the caller-supplied stylesheets +
-// deferred scripts, served by the consumer at /assets), the full-viewport dark body (h-dvh
-// overflow-hidden bg-zinc-950 text-zinc-100), and the chrome for the chosen Variant around
-// the page content (children). It is application-neutral — every /assets reference comes from
-// Props (Favicon/Styles/Scripts), so a consumer ships only the assets its pages need. It is
-// the persistent htmx SPA shell: in-app navigation htmx-GETs a route and swaps ONLY the
-// returned content fragment into <main id="content"> (see the consumer's fragment handler),
-// while the head assets and the nav rail persist across swaps; a direct/deep-link GET renders
-// this whole document. The LeftNav shell carries data-nav/data-open and the group/nav marker
-// that nav.LeftRail's collapse variants key off; nav.js flips data-open.
+// deferred scripts, served by the consumer at /assets), the full-viewport body in the app's
+// theme tokens (h-dvh overflow-hidden bg-canvas text-fg font-sans; docs/web.md, "Theme
+// tokens"), and the chrome for the chosen Variant around the page content (children). It is
+// application-neutral — every /assets reference comes from Props (Favicon/Styles/Scripts), so a
+// consumer ships only the assets its pages need. It is the persistent htmx SPA shell: in-app
+// navigation htmx-GETs a route and swaps ONLY the returned content fragment into
+// <main id="content"> (see the consumer's fragment handler), while the head assets and the nav
+// rail persist across swaps; a direct/deep-link GET renders this whole document. The LeftNav
+// shell carries data-nav/data-open and the group/nav marker that nav.LeftRail's collapse
+// variants key off; nav.js flips data-open.
 templ Shell(p Props) {
 	<!DOCTYPE html>
 	<html lang="en" class="h-full">
@@ -26,6 +27,15 @@ templ Shell(p Props) {
 			for _, href := range p.Styles {
 				<link rel="stylesheet" href={ templ.SafeURL(href) }/>
 			}
+			if p.Themes {
+				<!-- The theme is chosen before the first paint, so a page never flashes in the other
+				     one: static/theme-init.js, loaded synchronously after the stylesheets (the pages'
+				     policy refuses an inline script), picks the reader's choice (localStorage "theme":
+				     light, dark, or system), or the system's when it is system or unset, and gives the
+				     browser chrome (theme-color) the chosen theme's canvas. static/theme.js switches it
+				     afterwards. -->
+				<script src="/assets/theme-init.js"></script>
+			}
 			<!-- Reveal is gated on hydration, not on a timer (see static/hydrate.js). Every
 			     [data-hydrate] boundary ships hidden (`hydrating` → opacity:0) so server-rendered
 			     inert markup is never shown before the client libraries process it; the runtime
@@ -33,8 +43,9 @@ templ Shell(p Props) {
 			     load and every htmx swap. Boundaries nest: a partial swap (e.g. #repo-main inside
 			     #content) fades ONLY that region. A no-JS override keeps content visible when
 			     scripts are off. The <body> keyframe fades the shell chrome in on a full load; the
-			     dark <html> bg + color-scheme avoid a white/grey flash. These are static/shell.css:
-			     render-blocking as an inline <style> was, which the pages' policy refuses. -->
+			     canvas-coloured <html> bg + color-scheme avoid a white/grey flash. These are
+			     static/shell.css: render-blocking as an inline <style> was, which the pages' policy
+			     refuses. -->
 			<link rel="stylesheet" href="/assets/shell.css"/>
 			<noscript>
 				<link rel="stylesheet" href="/assets/noscript.css"/>
@@ -43,7 +54,7 @@ templ Shell(p Props) {
 				<script src={ templ.SafeURL(src) } defer></script>
 			}
 		</head>
-		<body class="preload h-dvh overflow-hidden bg-zinc-950 text-zinc-100 antialiased flex flex-col font-['IBM_Plex_Sans',sans-serif]">
+		<body class="preload h-dvh overflow-hidden bg-canvas text-fg font-sans antialiased flex flex-col">
 			<script src="/assets/preload.js"></script>
 			if p.Variant == Navless {
 				<div class="flex-1 flex items-center justify-center p-6 overflow-y-auto">
@@ -63,6 +74,9 @@ templ Shell(p Props) {
 						{ children... }
 					</main>
 				</div>
+			}
+			if p.Overlay != nil {
+				@p.Overlay
 			}
 		</body>
 	</html>

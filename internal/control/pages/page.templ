@@ -8,40 +8,34 @@ import (
 	"github.com/Cidan/ok/internal/web/nav"
 )
 
-// HomePage is the full document for ok's home — the repo finder: every repository you can
-// access, searchable, in a windowed infinite-scroll card. Rendered on a direct/deep-link GET;
-// an htmx navigation gets HomeContent alone.
-templ HomePage(n nav.Model, user string, unread int64, inbox []InboxItem, keyword string, page1 []RepoItem, url string, pageSize int, hasMore bool) {
-	@layout.Shell(shell("Repositories · "+Brand, layout.LeftNav, n)) {
-		@HomeContent(user, unread, inbox, keyword, page1, url, pageSize, hasMore)
+// RepositoriesPage is the full document for the repository finder (/repositories): every
+// repository you can access, searchable, in a windowed infinite-scroll list. Rendered on a
+// direct/deep-link GET; an htmx navigation gets RepositoriesContent alone.
+templ RepositoriesPage(n nav.Model, user, keyword string, page1 []RepoItem, url string, pageSize int, hasMore bool) {
+	@layout.Shell(shell("Repositories · "+Brand, layout.TopNav, n)) {
+		@RepositoriesContent(user, keyword, page1, url, pageSize, hasMore)
 	}
 }
 
-// HomeContent is the swappable region: the shared PageHead, a search box + New repository
+// RepositoriesContent is the swappable region: the shared PageHead, a search box + New Repository
 // button, and the repository list region (#repo-list). The search box is a livefilter input —
-// it raw-fetches HomeList for the keyword and swaps it into #repo-list (no htmx, so the shell
-// never fades and the input keeps focus while typing).
-templ HomeContent(user string, unread int64, inbox []InboxItem, keyword string, page1 []RepoItem, url string, pageSize int, hasMore bool) {
+// it raw-fetches RepositoryList for the keyword and swaps it into #repo-list (no htmx, so the
+// shell never fades and the input keeps focus while typing).
+templ RepositoriesContent(user, keyword string, page1 []RepoItem, url string, pageSize int, hasMore bool) {
 	<div class="flex h-full flex-1 flex-col overflow-hidden">
-		<div class="shrink-0">
+		<div class="shrink-0 overflow-hidden [scrollbar-gutter:stable]">
 			@PageHead("Repositories", "Every repository you can access.", "") {
 				if user != "" {
-					<a id="notifications-link" href="/notifications" hx-get="/notifications" hx-target="#content" hx-swap="innerHTML swap:70ms settle:1ms" hx-push-url="true" class="text-sm text-zinc-400 hover:text-zinc-200">
-						Notifications
-						if unread > 0 {
-							<span class="ml-1 rounded-full bg-sky-500/20 px-1.5 py-0.5 text-xs font-medium text-sky-300">{ strconv.FormatInt(unread, 10) }</span>
-						}
-					</a>
-					<span class="hidden text-sm text-zinc-500 sm:inline">Signed in as <span class="font-medium text-zinc-300">{ user }</span></span>
+					<span class="hidden items-center gap-2 text-sm text-subtle sm:flex">
+						@avatar(user)
+						<span>Signed in as <span class="font-medium text-body">{ user }</span></span>
+					</span>
 				}
 			}
-			if len(inbox) > 0 {
-				@Inbox(inbox)
-			}
-			<div class="mx-auto w-full max-w-5xl px-6 pb-5 sm:px-10">
+			<div class="mx-auto w-full max-w-5xl px-6 pb-6 sm:px-10">
 				<div class="flex items-center gap-3">
 					<div class="relative max-w-md flex-1">
-						<span class="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-zinc-600">
+						<span class="pointer-events-none absolute left-3.5 top-1/2 -translate-y-1/2 text-faint">
 							@iconSearch()
 						</span>
 						<input
@@ -53,60 +47,39 @@ templ HomeContent(user string, unread int64, inbox []InboxItem, keyword string, 
 							data-filter
 							data-filter-url="/repositories/list"
 							data-filter-target="#repo-list"
-							class="w-full rounded-lg border border-zinc-800 bg-zinc-900/50 py-2.5 pl-9 pr-4 text-sm text-zinc-100 placeholder:text-zinc-600 transition-colors focus:border-zinc-600 focus:outline-none"
+							class="w-full rounded-xl border border-line bg-surface py-2.5 pl-10 pr-4 text-sm text-fg shadow-panel placeholder:text-faint transition-[border-color,box-shadow] focus:border-accent-line focus:outline-none focus:ring-4 focus:ring-accent-soft"
 						/>
 					</div>
-					<a href="/repositories/new" hx-get="/repositories/new" hx-target="#content" hx-swap="innerHTML swap:70ms settle:1ms" hx-push-url="true" class={ btnClass(btnInverse) }>New repository</a>
+					<a href="/repositories/new" hx-get="/repositories/new" hx-target="#content" hx-swap={ swapNav } hx-push-url="true" class={ btnClass(btnPrimary) }>
+						@iconPlus()
+						New Repository
+					</a>
 				</div>
 			</div>
 		</div>
 		<div id="repo-list" class="flex flex-1 flex-col overflow-hidden">
-			@HomeList(keyword, page1, url, pageSize, hasMore)
+			@RepositoryList(keyword, page1, url, pageSize, hasMore)
 		</div>
 	</div>
 }
 
-// Inbox is the signed-in person's CLs under way, from every cell: those waiting on them first.
-templ Inbox(items []InboxItem) {
-	<section id="inbox" class="mx-auto w-full max-w-5xl px-6 pb-5 sm:px-10">
-		<h2 class="mb-2 text-xs font-medium uppercase tracking-wide text-zinc-500">Your changes</h2>
-		<div class="rounded-lg border border-zinc-800 bg-zinc-900/40">
-			for _, it := range items {
-				<a
-					href={ templ.SafeURL(it.Link) }
-					data-inbox-item
-					data-attention={ boolAttr(it.Attention) }
-					class="flex items-center gap-3 border-b border-zinc-800/70 px-4 py-2.5 text-sm last:border-b-0 hover:bg-zinc-800/40"
-				>
-					if it.Attention {
-						<span class="h-2 w-2 shrink-0 rounded-full bg-amber-400" title="Waiting on you"></span>
-					} else {
-						<span class="h-2 w-2 shrink-0 rounded-full bg-zinc-700"></span>
-					}
-					<span class="shrink-0 font-mono text-xs text-zinc-500">{ it.Repository } #{ strconv.FormatInt(it.Number, 10) }</span>
-					<span class="min-w-0 flex-1 truncate text-zinc-200">{ it.Title }</span>
-					<span class="shrink-0 text-xs text-zinc-500">{ it.Role } · { it.Status }</span>
-					<span class="shrink-0 text-xs text-zinc-600" title={ it.UpdatedTitle }>{ it.UpdatedAgo }</span>
-				</a>
-			}
-		</div>
-	</section>
-}
-
-// HomeList is the repository list region — the windowed infinite-scroll card, or an empty state
-// (distinguishing "no matches" for a search from "no repositories yet"). It is what the search
-// box swaps into #repo-list, and what a direct GET renders inside HomeContent.
-templ HomeList(keyword string, page1 []RepoItem, url string, pageSize int, hasMore bool) {
+// RepositoryList is the repository list region — the windowed infinite-scroll list, or an empty
+// state (distinguishing "no matches" for a search from "no repositories yet"). It is what the
+// search box swaps into #repo-list, and what a direct GET renders inside RepositoriesContent.
+templ RepositoryList(keyword string, page1 []RepoItem, url string, pageSize int, hasMore bool) {
 	if len(page1) == 0 {
 		<div class="mx-auto w-full max-w-5xl px-6 sm:px-10">
-			<div class="py-16 text-center text-sm">
+			<div class="flex flex-col items-center py-20 text-center text-sm">
+				<span class="mb-4 flex h-12 w-12 items-center justify-center rounded-2xl bg-accent-soft text-accent-fg ring-1 ring-inset ring-accent-line">
+					@iconRepo("h-5 w-5")
+				</span>
 				if keyword != "" {
-					<div class="font-medium text-zinc-200">No Matches</div>
-					<div class="mt-1.5 text-sm text-zinc-500">No repositories match “{ keyword }”.</div>
+					<div class="font-medium text-fg">No Matches</div>
+					<div class="mt-1.5 text-sm text-subtle">No repositories match “{ keyword }”.</div>
 				} else {
-					<div class="font-medium text-zinc-200">No Repositories Yet</div>
-					<div class="mt-1.5 text-sm text-zinc-500">
-						<a href="/repositories/new" hx-get="/repositories/new" hx-target="#content" hx-swap="innerHTML swap:70ms settle:1ms" hx-push-url="true" class="text-zinc-300 underline decoration-zinc-700 underline-offset-2 hover:decoration-zinc-400">Create your first repository</a>, or run <span class="font-mono text-zinc-400">jj create</span>.
+					<div class="font-medium text-fg">No Repositories Yet</div>
+					<div class="mt-1.5 text-sm text-subtle">
+						<a href="/repositories/new" hx-get="/repositories/new" hx-target="#content" hx-swap={ swapNav } hx-push-url="true" class="text-accent-fg underline decoration-accent-line underline-offset-4 hover:decoration-accent-fg">Create your first repository</a>, or run <span class="font-mono text-muted">jj create</span>.
 					</div>
 				}
 			</div>
@@ -118,49 +91,51 @@ templ HomeList(keyword string, page1 []RepoItem, url string, pageSize int, hasMo
 	}
 }
 
-// RepoRow is one repository row: a favorite (star) toggle, the name, and an inline meta line
-// (its size and creator, and when main last moved). Flat — no box — separated from the next
-// row by a hairline that fades out to the right. data-* attributes
-// drive stars.js's optimistic toggle + FLIP reorder (favorites float to the top). The row is not
-// a single <a> (the star button can't nest inside a link), so the text block is the link.
+// RepoRow is one repository row: its monogram, the name, an inline meta line (its size and
+// creator, and when main last moved), and a favorite (star) toggle. Flat — no box — a row lights
+// up under the pointer. data-* attributes drive stars.js's optimistic toggle + FLIP reorder
+// (favorites float to the top). The row is not a single <a> (the star button can't nest inside
+// a link), so the text block is the link.
 templ RepoRow(r RepoItem) {
 	<div
 		data-repo-row
 		data-repo-link={ r.Link }
 		data-starred={ boolAttr(r.Starred) }
 		data-updated={ strconv.FormatInt(r.UpdatedUnix, 10) }
-		class="group relative flex items-start gap-3 py-3.5 after:pointer-events-none after:absolute after:inset-x-0 after:bottom-0 after:h-px after:bg-gradient-to-r after:from-zinc-700/60 after:via-zinc-800/30 after:to-transparent last:after:hidden"
+		class="group relative -mx-3 flex items-center gap-3.5 rounded-xl px-3 py-3 transition-colors hover:bg-hover"
 	>
+		<span class="flex h-9 w-9 shrink-0 items-center justify-center rounded-[10px] bg-accent-soft text-sm font-semibold text-accent-fg ring-1 ring-inset ring-accent-line transition-transform group-hover:scale-105">{ repoInitial(r.Name) }</span>
+		<a href={ templ.SafeURL(r.Link) } hx-get={ r.Link } hx-target="#content" hx-swap={ swapNav } hx-push-url="true" class="block min-w-0 flex-1">
+			<div class="truncate text-sm font-medium text-fg">{ r.Name }</div>
+			<div class="mt-0.5 flex items-center gap-2 text-sm text-subtle">
+				if r.Detail != "" {
+					<span class="truncate">{ r.Detail }</span>
+				}
+				if r.UpdatedAgo != "" {
+					if r.Detail != "" {
+						<span class="text-ghost">·</span>
+					}
+					<span class="shrink-0" title={ r.UpdatedTitle }>Updated { r.UpdatedAgo }</span>
+				}
+			</div>
+		</a>
+		<span class="hidden shrink-0 text-muted opacity-0 transition-[opacity,translate] group-hover:translate-x-0.5 group-hover:opacity-100 sm:block">
+			@iconArrowRight()
+		</span>
 		<button
 			type="button"
 			data-star
 			aria-pressed={ boolAttr(r.Starred) }
 			aria-label="Toggle favorite"
-			class="mt-0.5 shrink-0 rounded p-0.5 text-zinc-600 transition-colors hover:text-amber-400"
+			class="shrink-0 rounded-lg p-1.5 text-faint transition-colors hover:bg-hover-strong hover:text-accent"
 		>
-			<span data-star-yes class={ "text-amber-400", templ.KV("hidden", !r.Starred) }>
+			<span data-star-yes class={ "text-accent", templ.KV("hidden", !r.Starred) }>
 				@iconStarFilled()
 			</span>
 			<span data-star-no class={ templ.KV("hidden", r.Starred) }>
 				@iconStarOutline()
 			</span>
 		</button>
-		<a href={ templ.SafeURL(r.Link) } hx-get={ r.Link } hx-target="#content" hx-swap="innerHTML swap:70ms settle:1ms" hx-push-url="true" class="block min-w-0 flex-1">
-			<div class="flex items-center gap-2">
-				<span class="truncate text-sm font-medium text-zinc-100 group-hover:text-white">{ r.Name }</span>
-			</div>
-			<div class="mt-1.5 flex items-center gap-2 text-sm text-zinc-600">
-				if r.Detail != "" {
-					<span class="truncate">{ r.Detail }</span>
-				}
-				if r.UpdatedAgo != "" {
-					if r.Detail != "" {
-						<span class="text-zinc-700">·</span>
-					}
-					<span title={ r.UpdatedTitle }>Updated { r.UpdatedAgo }</span>
-				}
-			</div>
-		</a>
 	</div>
 }
 
@@ -176,62 +151,79 @@ templ RepoRows(repos []RepoItem) {
 // swappable fragment served on an htmx navigation. The form posts a normal (non-htmx) POST
 // so the server's 302 to the new repo is followed by the browser.
 templ NewRepoPage(n nav.Model, f NewRepoForm, errMsg string) {
-	@layout.Shell(shell("New repository · "+Brand, layout.LeftNav, n)) {
+	@layout.Shell(shell("New repository · "+Brand, layout.TopNav, n)) {
 		@NewRepoContent(f, errMsg)
 	}
 }
 
 templ NewRepoContent(f NewRepoForm, errMsg string) {
 	<div class="flex h-full flex-1 flex-col overflow-hidden">
-		<div class="shrink-0">
+		<div class="shrink-0 overflow-hidden [scrollbar-gutter:stable]">
 			if f.Upstream != "" {
 				@PageHead("Fork "+f.Upstream, "A repository of its own, holding all "+f.Upstream+" holds; you become its creator, and administer it.", "")
 			} else {
 				@PageHead("New Repository", "You become its creator, and administer it.", "")
 			}
 		</div>
-		<div class="flex-1 overflow-y-auto">
+		<div class="flex-1 overflow-y-auto [scrollbar-gutter:stable]">
 			<div class="mx-auto w-full max-w-5xl px-6 pb-12 sm:px-10">
-				if errMsg != "" {
-					<div class="max-w-xl rounded-lg border border-red-900/50 bg-red-950/20 px-4 py-3 text-sm text-red-400">{ errMsg }</div>
-				}
-				<form method="post" action={ templ.SafeURL(formAction(f)) } class="max-w-xl space-y-5">
-					<div class="flex items-end gap-2">
-						<div class="shrink-0">
-							<label class="mb-2 block text-sm font-medium text-zinc-400">Owner</label>
-							<select name="owner" class="rounded-lg border border-zinc-800 bg-zinc-900/50 px-3.5 py-2.5 text-sm text-zinc-100 transition-colors focus:border-zinc-600 focus:outline-none">
-								for _, o := range f.Owners {
-									<option value={ o } selected?={ o == f.Owner }>{ o }</option>
+				<div class="max-w-xl">
+					if errMsg != "" {
+						<div class="mb-4 flex items-start gap-2.5 rounded-xl border border-danger-line bg-danger-soft px-4 py-3 text-sm text-danger">
+							@iconAlert()
+							<span>{ errMsg }</span>
+						</div>
+					}
+					@panel() {
+						if f.Upstream != "" {
+							@panelTitle("Fork")
+						} else {
+							@panelTitle("Repository")
+						}
+						<form method="post" action={ templ.SafeURL(formAction(f)) } class="space-y-5 px-4 py-4">
+							<div class="flex items-end gap-2">
+								<div class="shrink-0">
+									<label for="new-repo-owner" class="mb-2 block text-sm font-medium text-muted">Owner</label>
+									<select id="new-repo-owner" name="owner" class={ selectClass }>
+										for _, o := range f.Owners {
+											<option value={ o } selected?={ o == f.Owner }>{ o }</option>
+										}
+									</select>
+								</div>
+								<span class="pb-2 text-lg text-faint">/</span>
+								<div class="min-w-0 flex-1">
+									<label for="new-repo-name" class="mb-2 block text-sm font-medium text-muted">Repository Name</label>
+									<input id="new-repo-name" name="name" type="text" value={ f.Name } required autofocus autocomplete="off" spellcheck="false" placeholder="my-project" class={ inputClass, "font-mono" }/>
+								</div>
+							</div>
+							<div class="flex items-start gap-2.5 rounded-lg border border-line-soft bg-neutral-soft px-3.5 py-3 text-sm text-subtle">
+								<span class="mt-px text-accent-fg">
+									@iconInfo()
+								</span>
+								<span>
+									if f.Upstream != "" {
+										Its main starts as { f.Upstream }'s, and it reads as { f.Upstream } does. It takes { f.Upstream }'s later work when you sync it, or <span class="font-mono text-body">jj sync --upstream</span> in a clone.
+									} else if f.Organization != "" {
+										One of { f.Organization }'s is read and changed by all of its people; one of your own is yours alone until you grant others a role on it.
+									} else {
+										One of an organization's is read as the organization says; one of your own is yours alone until you grant others a role on it.
+									}
+									if f.Upstream == "" {
+										Its main starts empty: clone it with <span class="font-mono text-body">jj clone</span>, make a change, and upload it with <span class="font-mono text-body">jj cl</span>.
+									}
+								</span>
+							</div>
+							<div class="flex items-center gap-3 border-t border-line-soft pt-4">
+								if f.Upstream != "" {
+									<button type="submit" class={ btnClass(btnPrimary) }>Fork Repository</button>
+								} else {
+									<button type="submit" class={ btnClass(btnPrimary) }>Create Repository</button>
 								}
-							</select>
-						</div>
-						<span class="pb-2.5 text-lg text-zinc-600">/</span>
-						<div class="flex-1">
-							<label class="mb-2 block text-sm font-medium text-zinc-400">Repository Name</label>
-							<input name="name" type="text" value={ f.Name } required autofocus autocomplete="off" spellcheck="false" placeholder="my-project" class="w-full rounded-lg border border-zinc-800 bg-zinc-900/50 px-3.5 py-2.5 text-sm text-zinc-100 placeholder:text-zinc-600 transition-colors focus:border-zinc-600 focus:outline-none"/>
-						</div>
-					</div>
-					<div class="rounded-lg border border-zinc-800 bg-zinc-900/30 px-3.5 py-2.5 text-sm text-zinc-500">
-						if f.Upstream != "" {
-							Its main starts as { f.Upstream }'s, and it reads as { f.Upstream } does. It takes { f.Upstream }'s later work when you sync it, or <span class="font-mono text-zinc-400">jj sync --upstream</span> in a clone.
-						} else if f.Organization != "" {
-							One of { f.Organization }'s is read and changed by all of its people; one of your own is yours alone until you grant others a role on it.
-						} else {
-							One of an organization's is read as the organization says; one of your own is yours alone until you grant others a role on it.
-						}
-						if f.Upstream == "" {
-							Its main starts empty: clone it with <span class="font-mono text-zinc-400">jj clone</span>, make a change, and upload it with <span class="font-mono text-zinc-400">jj cl</span>.
-						}
-					</div>
-					<div class="flex items-center gap-3 pt-2">
-						if f.Upstream != "" {
-							<button type="submit" class={ btnClass(btnInverse) }>Fork Repository</button>
-						} else {
-							<button type="submit" class={ btnClass(btnInverse) }>Create Repository</button>
-						}
-						<a href="/" hx-get="/" hx-target="#content" hx-swap="innerHTML swap:70ms settle:1ms" hx-push-url="true" class="text-sm text-zinc-400 transition-colors hover:text-zinc-200">Cancel</a>
-					</div>
-				</form>
+								<a href="/" hx-get="/" hx-target="#content" hx-swap={ swapNav } hx-push-url="true" class={ btnClass(btnSecondary) }>Cancel</a>
+							</div>
+						</form>
+					}
+				</div>
 			</div>
 		</div>
 	</div>
@@ -239,16 +231,16 @@ templ NewRepoContent(f NewRepoForm, errMsg string) {
 
 // ErrorPage / ErrorContent render a page that could not be shown: what went wrong, and why.
 templ ErrorPage(n nav.Model, title, message string) {
-	@layout.Shell(shell(title+" · "+Brand, layout.LeftNav, n)) {
+	@layout.Shell(shell(title+" · "+Brand, layout.TopNav, n)) {
 		@ErrorContent(title, message)
 	}
 }
 
 templ ErrorContent(title, message string) {
 	<div class="flex h-full flex-1 flex-col overflow-hidden">
-		<div class="shrink-0">
+		<div class="shrink-0 overflow-hidden [scrollbar-gutter:stable]">
 			@PageHead(title, message, "") {
-				<a href="/" hx-get="/" hx-target="#content" hx-swap="innerHTML swap:70ms settle:1ms" hx-push-url="true" class={ btnClass(btnSecondary) }>Repositories</a>
+				<a href="/" hx-get="/" hx-target="#content" hx-swap={ swapNav } hx-push-url="true" class={ btnClass(btnSecondary) }>Repositories</a>
 			}
 		</div>
 	</div>

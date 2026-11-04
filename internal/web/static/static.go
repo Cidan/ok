@@ -1,7 +1,8 @@
 // Package static is the assets every page of ok's web UI shares, served under /assets/: the
-// hydration runtime, the navigation rail's and components' scripts, the fonts' stylesheet, and the
-// favicon — and, from third_party (upstream's files, byte-identical, with their licenses; see
-// third_party/UPSTREAM), htmx and IBM Plex Sans.
+// hydration runtime, the loading feedback (progress.js), the theme's choice and switch
+// (theme-init.js, theme.js), the navigation's and components' scripts, the shell's and the fonts'
+// stylesheets, and the favicon — and, from third_party (upstream's files, byte-identical, with
+// their licenses; see third_party/UPSTREAM), htmx, IBM Plex Sans, and Geist and Geist Mono.
 package static
 
 import (

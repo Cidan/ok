@@ -16,19 +16,14 @@ import (
 
 // --- CL finder ------------------------------------------------------------------------------
 templ CLListPage(n nav.Model, v CLListView) {
-	@layout.Shell(shell("Changes · "+v.Chrome.Name+" · "+Brand, layout.LeftNav, n)) {
+	@layout.Shell(shell("Changes · "+v.Chrome.Name+" · "+Brand, layout.TopNav, n)) {
 		@CLListContent(v)
 	}
 }
 
 templ CLListContent(v CLListView) {
-	<div class="flex h-full flex-1 flex-col overflow-hidden">
-		<div class="shrink-0">
-			@PageHead(v.Chrome.Name, v.Chrome.Subtitle, "") {
-				@changesLink(v.Chrome.ChangesHref, "#repo-main")
-				@codeButton(v.Chrome.Clone)
-			}
-		</div>
+	<div class="group/repo flex h-full flex-1 flex-col overflow-hidden">
+		@repoHead(v.Chrome, tabChanges, "#repo-main", false)
 		<div id="repo-main" data-hydrate class="hydrating flex-1 overflow-y-auto">
 			@CLListMain(v)
 		</div>
@@ -36,16 +31,26 @@ templ CLListContent(v CLListView) {
 }
 
 templ CLListMain(v CLListView) {
-	<div class="mx-auto w-full max-w-5xl px-6 pb-16 sm:px-10">
+	<div class="mx-auto w-full max-w-5xl px-6 pt-6 pb-16 sm:px-10">
 		@panel() {
 			@panelHead() {
-				<nav class="flex min-w-0 flex-1 flex-wrap items-center gap-x-5 gap-y-1">
+				<nav class="-ml-2 flex min-w-0 flex-1 flex-wrap items-center gap-1">
 					for _, f := range v.Filters {
-						<a href={ templ.SafeURL(f.Href) } hx-get={ f.Href } hx-target="#repo-main" hx-swap="innerHTML swap:70ms settle:1ms" hx-push-url="true" class={ "transition-colors", templ.KV("text-zinc-100", f.Active), templ.KV("text-zinc-500 hover:text-zinc-300", !f.Active) }>{ f.Label }</a>
+						<a
+							href={ templ.SafeURL(f.Href) }
+							hx-get={ f.Href }
+							hx-target="#repo-main"
+							hx-swap={ swapNav }
+							hx-push-url="true"
+							if f.Active {
+								aria-current="page"
+							}
+							class="rounded-lg px-2.5 py-1 text-subtle transition-colors hover:bg-hover hover:text-body aria-[current=page]:bg-selected aria-[current=page]:text-fg"
+						>{ f.Label }</a>
 					}
 				</nav>
 				if len(v.Items) > 0 {
-					<span class="text-zinc-500">{ strconv.Itoa(len(v.Items)) }</span>
+					<span class="text-subtle">{ strconv.Itoa(len(v.Items)) }</span>
 				}
 			}
 			if len(v.Items) == 0 {
@@ -55,7 +60,7 @@ templ CLListMain(v CLListView) {
 					to propose a change.
 				}
 			} else {
-				<div class="divide-y divide-zinc-800/70">
+				<div class="divide-y divide-line-soft">
 					for _, it := range v.Items {
 						@clRow(it)
 					}
@@ -66,7 +71,7 @@ templ CLListMain(v CLListView) {
 }
 
 templ clRow(it CLItem) {
-	<a href={ templ.SafeURL(it.Href) } hx-get={ it.Href } hx-target="#repo-main" hx-swap="innerHTML swap:70ms settle:1ms" hx-push-url="true" class="flex items-center gap-3 px-4 py-2.5 text-sm transition-colors hover:bg-zinc-900/40">
+	<a href={ templ.SafeURL(it.Href) } hx-get={ it.Href } hx-target="#repo-main" hx-swap={ swapNav } hx-push-url="true" class="group flex items-center gap-3 px-4 py-3 text-sm transition-colors hover:bg-hover">
 		@chip(clStatusTone(it.StatusKind)) {
 			{ it.StatusLabel }
 		}
@@ -75,42 +80,68 @@ templ clRow(it CLItem) {
 				Rollback
 			}
 		}
-		<span class="shrink-0 font-mono text-zinc-500">#{ strconv.FormatInt(it.Number, 10) }</span>
-		<span class="min-w-0 flex-1 truncate font-medium text-zinc-100">{ it.Title }</span>
-		<span class="hidden shrink-0 text-zinc-500 sm:block">{ it.Author }</span>
-		<span class="shrink-0 whitespace-nowrap text-zinc-600" title={ it.AgeTitle }>{ it.Age }</span>
+		<span class="shrink-0 font-mono text-subtle">#{ strconv.FormatInt(it.Number, 10) }</span>
+		<span class="min-w-0 flex-1 truncate font-medium text-fg transition-colors group-hover:text-accent-fg">{ it.Title }</span>
+		<span class="hidden shrink-0 items-center gap-2 text-subtle sm:flex">
+			@avatar(it.Author)
+			{ it.Author }
+		</span>
+		<span class="min-w-24 shrink-0 whitespace-nowrap text-right text-faint" title={ it.AgeTitle }>{ it.Age }</span>
 	</a>
 }
 
 // --- CL view --------------------------------------------------------------------------------
 templ CLViewPage(n nav.Model, v CLView) {
-	@layout.Shell(shell("CL #"+strconv.FormatInt(v.Number, 10)+" · "+v.Chrome.Name+" · "+Brand, layout.LeftNav, n)) {
+	@layout.Shell(shell("CL #"+strconv.FormatInt(v.Number, 10)+" · "+v.Chrome.Name+" · "+Brand, layout.TopNav, n)) {
 		@CLViewContent(v)
 	}
 }
 
 templ CLViewContent(v CLView) {
-	<div class="flex h-full flex-1 flex-col overflow-hidden">
-		<div class="shrink-0">
-			@PageHead(v.Chrome.Name, v.Chrome.Subtitle, "") {
-				@changesLink(v.Chrome.ChangesHref, "#repo-main")
-				@codeButton(v.Chrome.Clone)
-			}
-		</div>
+	<div class="group/repo flex h-full flex-1 flex-col overflow-hidden">
+		@repoHead(v.Chrome, tabChanges, "#repo-main", false)
 		<div id="repo-main" data-hydrate class="hydrating flex-1 overflow-y-auto">
 			@CLViewMain(v)
 		</div>
 	</div>
 }
 
+// CLViewMain is a CL's review workspace: the change's header, pinned while the page scrolls under
+// it (its status, number, title, and actions); beneath, the description, the tabs — the files and
+// their diffs, the comments, the checks, the deployments — and the change log; and beside them a
+// sidebar, pinned too, of what a reviewer keeps an eye on: the submit requirements, the files to
+// jump between, who reviews, and the stack.
 templ CLViewMain(v CLView) {
-	<div class="mx-auto w-full max-w-[92rem] px-6 pb-16 sm:px-10 lg:px-12">
+	<div data-wide class="mx-auto w-full max-w-[100rem] px-6 pb-16 sm:px-10 lg:px-12">
 		@clHeader(v)
 		if v.Notice != "" {
-			<div class="mb-4 rounded-lg border border-amber-700/50 bg-amber-500/10 px-4 py-2.5 text-sm text-amber-300">{ v.Notice }</div>
+			<div data-notice class="mt-5 flex items-start gap-2.5 rounded-xl border border-warn-line bg-warn-soft px-4 py-3 text-sm text-warn">
+				@iconAlert()
+				<span>{ v.Notice }</span>
+			</div>
 		}
-		<div class="grid items-start gap-4 lg:grid-cols-3">
-			<div class="space-y-4 lg:col-span-1">
+		<div class="mt-6 grid items-start gap-6 xl:grid-cols-[minmax(0,1fr)_22rem]">
+			<div class="min-w-0">
+				@clMessageBox(v)
+				@clTabs(v)
+				<div data-tab-panel="files">
+					@clFilesHeader(v)
+					@clFileTable(v)
+				</div>
+				<div data-tab-panel="comments" hidden>
+					@clCommentsPanel(v)
+				</div>
+				<div data-tab-panel="checks" hidden>
+					@clChecksPanel(v)
+				</div>
+				<div data-tab-panel="deployments" hidden>
+					<div class="mt-4">
+						@clDeploysRegion(v.Deploys)
+					</div>
+				</div>
+				@clChangeLog(v)
+			</div>
+			<aside aria-label="Change" class="min-w-0 space-y-4 xl:sticky xl:top-[7.5rem] xl:max-h-[calc(100dvh-13rem)] xl:overflow-y-auto xl:[scrollbar-width:none]">
 				if v.DropCommand != "" {
 					@clAbandonedPanel(v)
 				}
@@ -120,31 +151,12 @@ templ CLViewMain(v CLView) {
 				if len(v.RolledBackBy) > 0 {
 					@clRolledBackPanel(v)
 				}
-				@clChangeInfo(v)
 				@clSubmitReqs(v)
+				@clFileNav(v)
+				@clChangeInfo(v)
 				@clRelated(v)
-			</div>
-			<div class="space-y-4 lg:col-span-2">
-				@clMessageBox(v)
-			</div>
+			</aside>
 		</div>
-		@clTabs(v)
-		<div data-tab-panel="files">
-			@clFilesHeader(v)
-			@clFileTable(v)
-		</div>
-		<div data-tab-panel="comments" hidden>
-			@clCommentsPanel(v)
-		</div>
-		<div data-tab-panel="checks" hidden>
-			@clChecksPanel(v)
-		</div>
-		<div data-tab-panel="deployments" hidden>
-			<div class="mt-4">
-				@clDeploysRegion(v.Deploys)
-			</div>
-		</div>
-		@clChangeLog(v)
 		if d := v.ReviewDialog(); d != nil {
 			@clReviewDialog(*d)
 		}
@@ -152,11 +164,54 @@ templ CLViewMain(v CLView) {
 	</div>
 }
 
+// clFileNav is the files to jump between: each changed file of the first page, its status in a
+// dot, its name above its directory, and its lines added and removed; a click brings it up, open
+// (ok.js), and the one at the top of the view is marked as the reader scrolls.
+templ clFileNav(v CLView) {
+	@panel() {
+		@panelHead() {
+			<h3>Files</h3>
+			<span class="flex-1"></span>
+			<span class="tabular-nums">{ strconv.Itoa(v.NumFiles) }</span>
+		}
+		if len(v.Files) == 0 {
+			@panelEmpty() {
+				No file changes.
+			}
+		} else {
+			<nav aria-label="Files" class="max-h-80 overflow-y-auto p-1.5">
+				for _, f := range v.Files {
+					<a href={ templ.SafeURL("#" + f.Anchor) } data-file-jump={ f.Anchor } class="group flex items-center gap-2.5 rounded-lg px-2.5 py-1.5 text-sm transition-colors hover:bg-hover aria-[current=true]:bg-selected">
+						<span class="flex w-2 shrink-0 justify-center">
+							@clDot(diffStatusTone(f.Status), diffStatusLabel(f.Status))
+						</span>
+						<span class="min-w-0 flex-1">
+							<span class="block truncate font-mono text-[12.5px] text-fg">{ baseName(f.Name) }</span>
+							if dirName(f.Name) != "" {
+								<span class="block truncate text-xs text-subtle">{ dirName(f.Name) }</span>
+							}
+						</span>
+						if f.ThreadCount > 0 {
+							<span class="shrink-0 rounded-full bg-info-soft px-1.5 text-xs leading-5 font-medium text-info tabular-nums" title="review comments">{ strconv.Itoa(f.ThreadCount) }</span>
+						}
+						if !f.OffDiff && !f.IsBinary {
+							<span class="shrink-0 text-xs tabular-nums"><span class="text-success">+{ strconv.Itoa(f.Addition) }</span> <span class="text-danger">−{ strconv.Itoa(f.Deletion) }</span></span>
+						}
+					</a>
+				}
+				if v.NumFiles > len(v.Files) {
+					<div class="px-2.5 py-1.5 text-xs text-subtle">and { strconv.Itoa(v.NumFiles - len(v.Files)) } more in the list</div>
+				}
+			</nav>
+		}
+	}
+}
+
 // clHeader is the change identity: status chip, CL number, subject, and the actions the CL's
 // state offers the viewer — Restore (abandoned), Request Review (a draft), Submit, Reply, Return to
 // Draft (open), Abandon, and Roll Back (submitted).
 templ clHeader(v CLView) {
-	<div class="mb-5 flex items-start justify-between gap-4">
+	<div class="sticky top-0 z-20 -mx-6 flex flex-col gap-3 border-b border-line-soft bg-canvas/85 px-6 py-4 backdrop-blur-xl sm:-mx-10 sm:px-10 lg:-mx-12 lg:flex-row lg:items-center lg:justify-between lg:px-12">
 		<div class="min-w-0">
 			<div class="flex items-center gap-2.5 text-sm">
 				@chip(clStatusTone(v.StatusKind)) {
@@ -172,11 +227,11 @@ templ clHeader(v CLView) {
 						Rollback
 					}
 				}
-				<span class="font-mono text-zinc-500">#{ strconv.FormatInt(v.Number, 10) }</span>
+				<span class="font-mono text-subtle">#{ strconv.FormatInt(v.Number, 10) }</span>
 			</div>
-			<h2 class="mt-2 text-xl font-semibold tracking-tight text-zinc-50">{ v.Title }</h2>
+			<h2 class="mt-1.5 truncate text-xl font-semibold tracking-tight text-fg">{ v.Title }</h2>
 		</div>
-		<div class="flex shrink-0 flex-wrap items-center justify-end gap-2">
+		<div class="flex shrink-0 flex-wrap items-center gap-2 lg:justify-end">
 			if v.RestoreHref != "" {
 				@clActionButton(v.RestoreHref, "Restore", btnPrimary)
 			}
@@ -212,11 +267,11 @@ templ clHeader(v CLView) {
 templ clRollbackForm(href string) {
 	<details class="group/rollback relative shrink-0">
 		<summary class={ btnClass(btnSecondary), "list-none [&::-webkit-details-marker]:hidden" }>Roll Back</summary>
-		<form method="post" action={ templ.SafeURL(href) } hx-post={ href } hx-target="#repo-main" hx-swap="innerHTML swap:70ms settle:1ms" class="absolute right-0 z-20 mt-2 w-96 overflow-hidden rounded-xl border border-zinc-800 bg-zinc-950 shadow-xl shadow-black/50">
+		<form method="post" action={ templ.SafeURL(href) } hx-post={ href } hx-target="#repo-main" hx-swap={ swapAction } class={ popoverClass, "absolute right-0 z-20 mt-2 w-96" }>
 			@panelTitle("Roll Back")
 			@panelBody() {
-				<p class="mb-3 text-sm text-zinc-400">Creates a CL of yours that undoes this change, and any landed above it in its stack. It lands like any CL, after its checks, with an LGTM from anyone but you; the changes it undoes need no owner's Approval.</p>
-				<textarea name="reason" rows="3" required placeholder="Why is it rolled back?" class="w-full rounded-lg border border-zinc-800 bg-zinc-900/60 px-3 py-2 text-sm text-zinc-200 placeholder:text-zinc-600 focus:border-zinc-600 focus:outline-none"></textarea>
+				<p class="mb-3 text-sm text-muted">Creates a CL of yours that undoes this change, and any landed above it in its stack. It lands like any CL, after its checks, with an LGTM from anyone but you; the changes it undoes need no owner's Approval.</p>
+				<textarea name="reason" rows="3" required placeholder="Why is it rolled back?" class={ inputClass }></textarea>
 				<div class="mt-3 flex justify-end">
 					<button type="submit" class={ btnClass(btnPrimary) }>Create Rollback</button>
 				</div>
@@ -237,11 +292,11 @@ templ clRollbackPanel(v CLView) {
 			}
 		</div>
 		if len(v.RollbackLeft) > 0 {
-			<div class="border-t border-zinc-800 px-4 py-3">
-				<p class="text-sm text-zinc-400">Main changed these after the changes landed, so they are left as main has them. Roll them back by hand in a CL stacked on this one, reviewed like any change, and Submit Stack lands both.</p>
+			<div class="border-t border-line px-4 py-3">
+				<p class="text-sm text-muted">Main changed these after the changes landed, so they are left as main has them. Roll them back by hand in a CL stacked on this one, reviewed like any change, and Submit Stack lands both.</p>
 				<ul class="mt-2 space-y-0.5">
 					for _, p := range v.RollbackLeft {
-						<li class="truncate font-mono text-sm text-zinc-300">{ p }</li>
+						<li class="truncate font-mono text-sm text-body">{ p }</li>
 					}
 				</ul>
 				if v.GetCommand != "" {
@@ -269,18 +324,18 @@ templ clRolledBackPanel(v CLView) {
 
 // clLinkRow is another CL, linked, with its status.
 templ clLinkRow(l CLLink) {
-	<a href={ templ.SafeURL(l.Href) } hx-get={ l.Href } hx-target="#repo-main" hx-swap="innerHTML swap:70ms settle:1ms" hx-push-url="true" class="flex items-center gap-2 rounded-lg px-2 py-1.5 text-sm transition-colors hover:bg-zinc-900/60">
+	<a href={ templ.SafeURL(l.Href) } hx-get={ l.Href } hx-target="#repo-main" hx-swap={ swapNav } hx-push-url="true" class="flex items-center gap-2 rounded-lg px-2 py-1.5 text-sm transition-colors hover:bg-sunken">
 		@chip(clStatusTone(l.StatusKind)) {
 			{ l.StatusLabel }
 		}
-		<span class="font-mono text-zinc-500">#{ strconv.FormatInt(l.Number, 10) }</span>
-		<span class="min-w-0 flex-1 truncate text-zinc-400">{ l.Title }</span>
+		<span class="font-mono text-subtle">#{ strconv.FormatInt(l.Number, 10) }</span>
+		<span class="min-w-0 flex-1 truncate text-muted">{ l.Title }</span>
 	</a>
 }
 
 // clActionButton is a one-click lifecycle action: an htmx POST that re-renders the CL.
 templ clActionButton(href, label, variant string) {
-	<form method="post" action={ templ.SafeURL(href) } hx-post={ href } hx-target="#repo-main" hx-swap="innerHTML swap:70ms settle:1ms" class="shrink-0">
+	<form method="post" action={ templ.SafeURL(href) } hx-post={ href } hx-target="#repo-main" hx-swap={ swapAction } class="shrink-0">
 		<button type="submit" class={ btnClass(variant) }>{ label }</button>
 	</form>
 }
@@ -289,11 +344,11 @@ templ clActionButton(href, label, variant string) {
 templ clAbandonForm(href string) {
 	<details class="group/abandon relative shrink-0">
 		<summary class={ btnClass(btnSecondary), "list-none [&::-webkit-details-marker]:hidden" }>Abandon</summary>
-		<form method="post" action={ templ.SafeURL(href) } hx-post={ href } hx-target="#repo-main" hx-swap="innerHTML swap:70ms settle:1ms" class="absolute right-0 z-20 mt-2 w-80 overflow-hidden rounded-xl border border-zinc-800 bg-zinc-950 shadow-xl shadow-black/50">
+		<form method="post" action={ templ.SafeURL(href) } hx-post={ href } hx-target="#repo-main" hx-swap={ swapAction } class={ popoverClass, "absolute right-0 z-20 mt-2 w-80" }>
 			@panelTitle("Abandon")
 			@panelBody() {
-				<p class="mb-3 text-sm text-zinc-400">Close the change without submitting it. Nothing is deleted, and Restore reopens it.</p>
-				<textarea name="reason" rows="2" placeholder="Reason (optional)" class="w-full rounded-lg border border-zinc-800 bg-zinc-900/60 px-3 py-2 text-sm text-zinc-200 placeholder:text-zinc-600 focus:border-zinc-600 focus:outline-none"></textarea>
+				<p class="mb-3 text-sm text-muted">Close the change without submitting it. Nothing is deleted, and Restore reopens it.</p>
+				<textarea name="reason" rows="2" placeholder="Reason (optional)" class={ inputClass }></textarea>
 				<div class="mt-3 flex justify-end">
 					<button type="submit" class={ btnClass(btnSecondary) }>Abandon</button>
 				</div>
@@ -308,7 +363,7 @@ templ clAbandonedPanel(v CLView) {
 	@panel() {
 		@panelTitle("Abandoned")
 		@panelBody() {
-			<p class="text-sm text-zinc-400">
+			<p class="text-sm text-muted">
 				Restore reopens this change for new patchsets. A checkout that still holds it re-uploads it with every{ " " }
 				@code("jj cl")
 				{ " " }until it is dropped.
@@ -331,10 +386,10 @@ templ clReviewTrigger(title, class string) {
 // (clcomments.js adds a picked result as a checked reviewer); an optional message follows. It
 // POSTs every checked "reviewer" id.
 templ clReviewDialog(d CLReviewDialog) {
-	<div id="cl-review-dialog" data-popover hidden role="dialog" aria-label={ d.Title } class="fixed z-30 w-[26rem] overflow-hidden rounded-xl border border-zinc-800 bg-zinc-950 shadow-xl shadow-black/50">
-		<form method="post" action={ templ.SafeURL(d.Href) } hx-post={ d.Href } hx-target="#repo-main" hx-swap="innerHTML swap:70ms settle:1ms">
+	<div id="cl-review-dialog" data-popover hidden role="dialog" aria-label={ d.Title } class={ popoverClass, "fixed z-30 w-[26rem]" }>
+		<form method="post" action={ templ.SafeURL(d.Href) } hx-post={ d.Href } hx-target="#repo-main" hx-swap={ swapAction }>
 			@panelTitle(d.Title)
-			<div class="max-h-[26rem] divide-y divide-zinc-800/70 overflow-y-auto border-b border-zinc-800">
+			<div class="max-h-[26rem] divide-y divide-line-soft overflow-y-auto border-b border-line">
 				for _, set := range d.OwnerSets {
 					@clSuggestRow("Approval · " + set.Label) {
 						for _, c := range set.Candidates {
@@ -350,16 +405,16 @@ templ clReviewDialog(d CLReviewDialog) {
 					}
 				}
 				@clSuggestRow("Anyone Else") {
-					<input type="search" name="q" data-reviewer-search placeholder="Search people" autocomplete="off" hx-get={ d.SearchHref } hx-trigger="input changed delay:200ms, search" hx-target="next [data-reviewer-results]" hx-include="closest form" hx-swap="innerHTML" class="mb-1 w-full rounded-lg border border-zinc-800 bg-zinc-900/60 px-3 py-1.5 text-sm text-zinc-200 placeholder:text-zinc-600 focus:border-zinc-600 focus:outline-none"/>
+					<input type="search" name="q" data-reviewer-search placeholder="Search people" autocomplete="off" hx-get={ d.SearchHref } hx-trigger="input changed delay:200ms, search" hx-target="next [data-reviewer-results]" hx-include="closest form" hx-swap="innerHTML" class={ inputClass, "mb-1" }/>
 					<div data-reviewer-results class="space-y-0.5"></div>
 					<div data-reviewer-picked class="space-y-0.5"></div>
 				}
 			</div>
 			@panelBody() {
 				if d.NeedsLGTM {
-					<p class="mb-2 text-sm text-amber-300">Nobody chosen can give the LGTM this change needs.</p>
+					<p class="mb-2 text-sm text-warn">Nobody chosen can give the LGTM this change needs.</p>
 				}
-				<textarea name="message" rows="2" placeholder="Message (optional)" class="w-full rounded-lg border border-zinc-800 bg-zinc-900/60 px-3 py-2 text-sm text-zinc-200 placeholder:text-zinc-600 focus:border-zinc-600 focus:outline-none"></textarea>
+				<textarea name="message" rows="2" placeholder="Message (optional)" class={ inputClass }></textarea>
 				<div class="mt-3 flex justify-end">
 					<button type="submit" class={ btnClass(btnPrimary) }>{ d.Action }</button>
 				</div>
@@ -371,7 +426,7 @@ templ clReviewDialog(d CLReviewDialog) {
 // clSuggestRow is one row of the review dialog's list: a label line, then its people.
 templ clSuggestRow(label string) {
 	<div class="space-y-1 px-4 py-3">
-		<div class="truncate text-sm text-zinc-300">{ label }</div>
+		<div class="truncate text-sm text-body">{ label }</div>
 		{ children... }
 	</div>
 }
@@ -380,13 +435,13 @@ templ clSuggestRow(label string) {
 // for several owner sets toggles together), or a checked, disabled row for someone already
 // reviewing.
 templ clCandidate(c CLCandidate) {
-	<label class={ "flex items-center gap-2.5 rounded-lg px-2 py-1.5 text-sm text-zinc-300 transition-colors", templ.KV("cursor-pointer hover:bg-zinc-900", !c.Assigned) }>
+	<label class={ "flex items-center gap-2.5 rounded-lg px-2 py-1.5 text-sm text-body transition-colors", templ.KV("cursor-pointer hover:bg-hover", !c.Assigned) }>
 		if c.Assigned {
-			<input type="checkbox" checked disabled class="h-4 w-4 accent-emerald-500"/>
+			<input type="checkbox" checked disabled class="h-4 w-4 accent-success-solid"/>
 			<span>{ c.Name }</span>
-			<span class="text-zinc-500">Reviewing</span>
+			<span class="text-subtle">Reviewing</span>
 		} else {
-			<input type="checkbox" name="reviewer" value={ c.Principal } data-reviewer-id={ c.Principal } checked?={ c.Selected } class="h-4 w-4 cursor-pointer accent-sky-500"/>
+			<input type="checkbox" name="reviewer" value={ c.Principal } data-reviewer-id={ c.Principal } checked?={ c.Selected } class="h-4 w-4 cursor-pointer accent-accent"/>
 			<span>{ c.Name }</span>
 		}
 	</label>
@@ -396,11 +451,11 @@ templ clCandidate(c CLCandidate) {
 // clcomments.js turns into a checked reviewer.
 templ CLReviewerResults(searched bool, users []CLCandidate) {
 	if searched && len(users) == 0 {
-		<div class="px-2 py-1.5 text-sm text-zinc-500">No matches.</div>
+		<div class="px-2 py-1.5 text-sm text-subtle">No matches.</div>
 	}
 	for _, u := range users {
-		<button type="button" data-reviewer-pick data-id={ u.Principal } data-name={ u.Name } class="flex w-full cursor-pointer items-center gap-2.5 rounded-lg px-2 py-1.5 text-left text-sm text-zinc-300 transition-colors hover:bg-zinc-900">
-			<span class="flex w-4 justify-center text-sky-400">+</span>
+		<button type="button" data-reviewer-pick data-id={ u.Principal } data-name={ u.Name } class="flex w-full cursor-pointer items-center gap-2.5 rounded-lg px-2 py-1.5 text-left text-sm text-body transition-colors hover:bg-hover">
+			<span class="flex h-4 w-4 items-center justify-center rounded bg-accent-soft text-accent-fg">+</span>
 			{ u.Name }
 		</button>
 	}
@@ -411,7 +466,7 @@ templ CLReviewerResults(searched bool, users []CLCandidate) {
 // shows Submit greyed, never hidden, on an open change.
 templ clSubmitButton(v CLView) {
 	if v.CanSubmit {
-		<form method="post" action={ templ.SafeURL(v.SubmitHref) } hx-post={ v.SubmitHref } hx-target="#repo-main" hx-swap="innerHTML swap:70ms settle:1ms" class="shrink-0">
+		<form method="post" action={ templ.SafeURL(v.SubmitHref) } hx-post={ v.SubmitHref } hx-target="#repo-main" hx-swap={ swapAction } class="shrink-0">
 			<button type="submit" class={ btnClass(btnSuccess) }>Submit</button>
 		</form>
 	} else {
@@ -424,7 +479,7 @@ templ clSubmitButton(v CLView) {
 // as its tooltip, until every CL in the stack can be submitted.
 templ clSubmitStackButton(v CLView) {
 	if v.CanSubmitStack {
-		<form method="post" action={ templ.SafeURL(v.SubmitStackHref) } hx-post={ v.SubmitStackHref } hx-target="#repo-main" hx-swap="innerHTML swap:70ms settle:1ms" class="shrink-0">
+		<form method="post" action={ templ.SafeURL(v.SubmitStackHref) } hx-post={ v.SubmitStackHref } hx-target="#repo-main" hx-swap={ swapAction } class="shrink-0">
 			<button type="submit" class={ btnClass(btnSuccess) }>Submit Stack ({ strconv.Itoa(v.StackSize) })</button>
 		</form>
 	} else {
@@ -440,21 +495,21 @@ templ clReplyForm(v CLView) {
 	if v.CanReply {
 		<details class="group/reply relative shrink-0">
 			<summary class={ btnClass(replyVariant(v)), "list-none [&::-webkit-details-marker]:hidden" }>Reply</summary>
-			<form method="post" action={ templ.SafeURL(v.ReplyHref) } hx-post={ v.ReplyHref } hx-target="#repo-main" hx-swap="innerHTML swap:70ms settle:1ms" class="absolute right-0 z-20 mt-2 w-96 overflow-hidden rounded-xl border border-zinc-800 bg-zinc-950 shadow-xl shadow-black/50">
+			<form method="post" action={ templ.SafeURL(v.ReplyHref) } hx-post={ v.ReplyHref } hx-target="#repo-main" hx-swap={ swapAction } class={ popoverClass, "absolute right-0 z-20 mt-2 w-96" }>
 				@panelTitle("Reply")
 				@panelBody() {
 					if len(v.ReplyLabels) > 0 {
 						<div class="mb-3 space-y-1">
 							for _, l := range v.ReplyLabels {
 								<input type="hidden" name="label" value={ l.Name }/>
-								<label class="flex cursor-pointer items-center gap-2.5 rounded-lg px-2 py-1.5 text-sm text-zinc-300 transition-colors hover:bg-zinc-900">
-									<input type="checkbox" name={ "grant:" + l.Name } checked?={ l.Granted } class="h-4 w-4 cursor-pointer accent-emerald-500"/>
+								<label class="flex cursor-pointer items-center gap-2.5 rounded-lg px-2 py-1.5 text-sm text-body transition-colors hover:bg-hover">
+									<input type="checkbox" name={ "grant:" + l.Name } checked?={ l.Granted } class="h-4 w-4 cursor-pointer accent-success-solid"/>
 									{ l.Name }
 								</label>
 							}
 						</div>
 					}
-					<textarea name="comment" rows="3" placeholder="Comment (optional)" class="w-full rounded-lg border border-zinc-800 bg-zinc-900/60 px-3 py-2 text-sm text-zinc-200 placeholder:text-zinc-600 focus:border-zinc-600 focus:outline-none"></textarea>
+					<textarea name="comment" rows="3" placeholder="Comment (optional)" class={ inputClass }></textarea>
 					<div class="mt-3 flex justify-end">
 						<button type="submit" class={ btnClass(btnPrimary) }>Send</button>
 					</div>
@@ -476,17 +531,17 @@ templ clChangeInfo(v CLView) {
 				@clInfoRow("Repository", v.Chrome.Name)
 				@clInfoRow("Change ID", v.ChangeID)
 				<div class="flex min-h-[1.625rem] items-center gap-3">
-					<dt class="w-28 shrink-0 text-zinc-500">Reviewers</dt>
+					<dt class="w-28 shrink-0 text-subtle">Reviewers</dt>
 					<dd class="flex min-w-0 flex-1 flex-wrap items-center gap-1.5">
 						if len(v.Reviewers) == 0 {
-							<span class="text-zinc-600">—</span>
+							<span class="text-faint">—</span>
 						} else {
 							for _, r := range v.Reviewers {
 								@clReviewerChip(r)
 							}
 						}
 						if v.AddReviewers != nil {
-							@clReviewTrigger(v.AddReviewers.Title, "cursor-pointer text-sm text-sky-400 transition-colors hover:text-sky-300")
+							@clReviewTrigger(v.AddReviewers.Title, "cursor-pointer rounded-md px-1 text-sm text-accent-fg transition-colors hover:bg-accent-soft")
 						}
 					</dd>
 				</div>
@@ -500,8 +555,8 @@ templ clChangeInfo(v CLView) {
 // "—" is exactly as tall as one showing chips and the panel never changes shape.
 templ clInfoRow(label, value string) {
 	<div class="flex min-h-[1.625rem] items-center gap-3">
-		<dt class="w-28 shrink-0 text-zinc-500">{ label }</dt>
-		<dd class="min-w-0 truncate text-zinc-300">{ value }</dd>
+		<dt class="w-28 shrink-0 text-subtle">{ label }</dt>
+		<dd class="min-w-0 truncate text-body">{ value }</dd>
 	</div>
 }
 
@@ -511,10 +566,10 @@ templ clReviewerChip(r CLReviewer) {
 	@chip(toneNeutral) {
 		{ r.Name }
 		for _, l := range r.Labels {
-			<span class="text-emerald-300">· { l }</span>
+			<span class="text-success">· { l }</span>
 		}
 		if r.RemoveHref != "" {
-			<button type="button" hx-post={ r.RemoveHref } hx-target="#repo-main" hx-swap="innerHTML swap:70ms settle:1ms" title={ "Remove " + r.Name } aria-label={ "Remove " + r.Name } class="-mr-1 cursor-pointer px-0.5 text-zinc-500 transition-colors hover:text-zinc-200">×</button>
+			<button type="button" hx-post={ r.RemoveHref } hx-target="#repo-main" hx-swap={ swapAction } title={ "Remove " + r.Name } aria-label={ "Remove " + r.Name } class="-mr-1 cursor-pointer px-0.5 text-subtle transition-colors hover:text-fg">×</button>
 		}
 	}
 }
@@ -536,27 +591,21 @@ templ clSubmitReqs(v CLView) {
 }
 
 templ clSubmitReqRow(s CLSubmitReq) {
-	<div class="flex items-center gap-2 text-sm">
-		if s.Satisfied {
-			<span class="flex w-4 shrink-0 justify-center text-emerald-400">
-				@iconCheck()
-			</span>
-		} else {
-			<span class="flex w-4 shrink-0 justify-center text-zinc-600">○</span>
-		}
+	<div class="flex items-center gap-2.5 text-sm">
+		@reqMark(s.Satisfied)
 		<span class="flex-1">
 			if s.Label == "Approval" {
-				<button type="button" data-popover-open="cl-approval-popover" aria-haspopup="dialog" title="Who can approve" class="cursor-pointer text-zinc-300 underline decoration-zinc-600 decoration-dotted underline-offset-4 transition-colors hover:text-zinc-100 hover:decoration-zinc-400">{ s.Label }</button>
+				<button type="button" data-popover-open="cl-approval-popover" aria-haspopup="dialog" title="Who can approve" class="cursor-pointer text-body underline decoration-faint decoration-dotted underline-offset-4 transition-colors hover:text-fg hover:decoration-muted">{ s.Label }</button>
 			} else {
-				<span class="text-zinc-300">{ s.Label }</span>
+				<span class="text-body">{ s.Label }</span>
 			}
 		</span>
 		if len(s.GrantedBy) > 0 {
-			<span class="min-w-0 truncate text-zinc-500">{ strings.Join(s.GrantedBy, ", ") }</span>
+			<span class="min-w-0 truncate text-subtle">{ strings.Join(s.GrantedBy, ", ") }</span>
 		} else if s.Detail != "" {
-			<span class="min-w-0 truncate text-zinc-500">{ s.Detail }</span>
+			<span class="min-w-0 truncate text-subtle">{ s.Detail }</span>
 		} else {
-			<span class="text-zinc-600">—</span>
+			<span class="text-faint">—</span>
 		}
 	</div>
 }
@@ -566,19 +615,19 @@ templ clSubmitReqRow(s CLSubmitReq) {
 // changed files it governs (the list on hover), and who approved or can approve. clcomments.js
 // positions it at the pointer and closes it on an outside click or Escape.
 templ clApprovalPopover(v CLView) {
-	<div id="cl-approval-popover" data-popover hidden role="dialog" aria-label="Who can approve" class="fixed z-30 w-80 overflow-hidden rounded-xl border border-zinc-800 bg-zinc-950 shadow-xl shadow-black/50">
+	<div id="cl-approval-popover" data-popover hidden role="dialog" aria-label="Who can approve" class={ popoverClass, "fixed z-30 w-80" }>
 		@panelTitle("Who Can Approve")
 		if v.IdentityError != "" {
-			<div class="border-b border-zinc-800/70 px-4 py-3 text-sm text-red-300">{ v.IdentityError }</div>
+			<div class="border-b border-line-soft px-4 py-3 text-sm text-danger">{ v.IdentityError }</div>
 		}
 		if v.OwnersError != "" {
-			<div class="px-4 py-3 text-sm text-red-300">{ v.OwnersError }</div>
+			<div class="px-4 py-3 text-sm text-danger">{ v.OwnersError }</div>
 		} else if len(v.OwnerSets) == 0 && v.IdentityError == "" {
 			@panelEmpty() {
 				No changed files.
 			}
 		} else {
-			<div class="max-h-80 divide-y divide-zinc-800/70 overflow-y-auto">
+			<div class="max-h-80 divide-y divide-line-soft overflow-y-auto">
 				for _, o := range v.OwnerSets {
 					@clOwnerSetRow(o)
 				}
@@ -589,38 +638,32 @@ templ clApprovalPopover(v CLView) {
 
 templ clOwnerSetRow(o CLOwnerSet) {
 	<div class="space-y-1.5 px-4 py-3 text-sm">
-		<div class="flex items-center gap-2">
-			if o.Satisfied {
-				<span class="flex w-4 shrink-0 justify-center text-emerald-400">
-					@iconCheck()
-				</span>
-			} else {
-				<span class="flex w-4 shrink-0 justify-center text-zinc-600">○</span>
-			}
+		<div class="flex items-center gap-2.5">
+			@reqMark(o.Satisfied)
 			if o.Href != "" {
-				<a href={ templ.SafeURL(o.Href) } hx-get={ o.Href } hx-target="#content" hx-swap={ swapNav } hx-push-url="true" class="min-w-0 truncate font-mono text-zinc-200 hover:underline">{ o.Label }</a>
+				<a href={ templ.SafeURL(o.Href) } hx-get={ o.Href } hx-target="#content" hx-swap={ swapNav } hx-push-url="true" class="min-w-0 truncate font-mono text-fg hover:underline">{ o.Label }</a>
 			} else {
-				<span class="min-w-0 truncate text-zinc-300">No OWNERS apply</span>
+				<span class="min-w-0 truncate text-body">No OWNERS apply</span>
 			}
 			<span class="flex-1"></span>
 			if o.What == "" {
-				<span class="shrink-0 cursor-help text-zinc-500" title={ o.FilesTitle }>{ pluralCount(o.NumFiles, "file", "files") }</span>
+				<span class="shrink-0 cursor-help text-subtle" title={ o.FilesTitle }>{ pluralCount(o.NumFiles, "file", "files") }</span>
 			}
 		</div>
 		if o.What != "" {
-			<div class="truncate pl-6 text-zinc-400" title={ o.What }>{ o.What }</div>
+			<div class="truncate pl-7.5 text-muted" title={ o.What }>{ o.What }</div>
 		}
-		<div class="flex flex-wrap items-center gap-1.5 pl-6 text-zinc-500">
+		<div class="flex flex-wrap items-center gap-1.5 pl-7.5 text-subtle">
 			if o.Implicit && o.What != "" {
 				Satisfied — the author is a member
 			} else if o.Implicit {
 				Satisfied — the author is an owner
 			} else if len(o.ApprovedBy) > 0 {
-				Approved by <span class="text-zinc-300">{ strings.Join(o.ApprovedBy, ", ") }</span>
+				Approved by <span class="text-body">{ strings.Join(o.ApprovedBy, ", ") }</span>
 			} else if len(o.Owners) == 0 && o.What != "" {
-				<span class="text-red-300">No one is a member</span>
+				<span class="text-danger">No one is a member</span>
 			} else if len(o.Owners) == 0 {
-				<span class="text-red-300">No eligible owners — fix this OWNERS file</span>
+				<span class="text-danger">No eligible owners — fix this OWNERS file</span>
 			} else {
 				for _, name := range o.Owners {
 					@chip(toneNeutral) {
@@ -629,16 +672,22 @@ templ clOwnerSetRow(o CLOwnerSet) {
 				}
 			}
 			if o.AllowSelf {
-				<span class="text-zinc-600">· allow self</span>
+				<span class="text-faint">· allow self</span>
 			}
 		</div>
 	</div>
 }
 
+// clMessageBox is the change's description — its commit message, the first thing a reviewer reads.
 templ clMessageBox(v CLView) {
 	@panel() {
-		@panelTitle("Commit Message")
-		<pre class="whitespace-pre-wrap px-4 py-3 font-mono text-sm leading-relaxed text-zinc-300">{ clFullMessage(v.Title, v.Message) }</pre>
+		@panelHead() {
+			<h3>Description</h3>
+			<span class="flex-1"></span>
+			@avatar(v.Author)
+			<span class="font-normal text-subtle">{ v.Author }</span>
+		}
+		<pre class="whitespace-pre-wrap px-5 py-4 font-mono text-[12.5px] leading-relaxed text-body">{ clFullMessage(v.Title, v.Message) }</pre>
 	}
 }
 
@@ -647,11 +696,11 @@ templ clRelated(v CLView) {
 	@panel() {
 		@panelTitle("Related Changes")
 		if len(v.Related) > 1 {
-			<div class="space-y-0.5 p-2">
-				for _, rc := range v.Related {
-					@clRelatedRow(rc)
+			<ol class="p-2">
+				for i, rc := range v.Related {
+					@clRelatedRow(rc, i == 0, i == len(v.Related)-1)
 				}
-			</div>
+			</ol>
 		} else {
 			@panelEmpty() {
 				Not part of a stack.
@@ -660,18 +709,25 @@ templ clRelated(v CLView) {
 	}
 }
 
-templ clRelatedRow(rc CLRelated) {
-	if rc.Current {
-		<div class="flex items-center gap-2 rounded-lg bg-zinc-800/60 px-2 py-1.5 text-sm">
-			<span class="font-mono text-zinc-500">#{ strconv.FormatInt(rc.Number, 10) }</span>
-			<span class="min-w-0 flex-1 truncate font-medium text-zinc-100">{ rc.Title }</span>
-		</div>
-	} else {
-		<a href={ templ.SafeURL(rc.Href) } hx-get={ rc.Href } hx-target="#repo-main" hx-swap="innerHTML swap:70ms settle:1ms" hx-push-url="true" class="flex items-center gap-2 rounded-lg px-2 py-1.5 text-sm transition-colors hover:bg-zinc-900/60">
-			<span class="font-mono text-zinc-500">#{ strconv.FormatInt(rc.Number, 10) }</span>
-			<span class="min-w-0 flex-1 truncate text-zinc-400">{ rc.Title }</span>
-		</a>
-	}
+// clRelatedRow is one CL of the stack, drawn as a node on the line that joins them (first and
+// last end it), the one shown a filled node in the accent.
+templ clRelatedRow(rc CLRelated, first, last bool) {
+	<li class="relative">
+		<span aria-hidden="true" class={ "absolute left-[17.5px] w-px bg-line-strong", templ.KV("top-1/2", first), templ.KV("top-0", !first), templ.KV("bottom-1/2", last), templ.KV("bottom-0", !last) }></span>
+		if rc.Current {
+			<div class="relative flex items-center gap-2.5 rounded-lg bg-selected px-2 py-1.5 text-sm">
+				<span class="z-10 mx-[5px] h-2.5 w-2.5 shrink-0 rounded-full bg-accent ring-4 ring-accent-soft"></span>
+				<span class="font-mono text-subtle">#{ strconv.FormatInt(rc.Number, 10) }</span>
+				<span class="min-w-0 flex-1 truncate font-medium text-fg">{ rc.Title }</span>
+			</div>
+		} else {
+			<a href={ templ.SafeURL(rc.Href) } hx-get={ rc.Href } hx-target="#repo-main" hx-swap={ swapNav } hx-push-url="true" class="group relative flex items-center gap-2.5 rounded-lg px-2 py-1.5 text-sm transition-colors hover:bg-hover">
+				<span class="z-10 mx-[5px] h-2.5 w-2.5 shrink-0 rounded-full border-2 border-line-strong bg-surface transition-colors group-hover:border-accent"></span>
+				<span class="font-mono text-subtle">#{ strconv.FormatInt(rc.Number, 10) }</span>
+				<span class="min-w-0 flex-1 truncate text-muted transition-colors group-hover:text-fg">{ rc.Title }</span>
+			</a>
+		}
+	</li>
 }
 
 // clTabs is the Files/Comments/Checks/Deployments tab bar. clcomments.js activates the clicked
@@ -679,24 +735,24 @@ templ clRelatedRow(rc CLRelated) {
 // active on load). Every tab is one weight; the active one differs only in colour and underline,
 // so selecting a tab moves nothing.
 templ clTabs(v CLView) {
-	<div data-tabs class="mt-6 flex items-center gap-6 border-b border-zinc-800 text-sm">
-		<button type="button" data-tab="files" class="cl-tab cl-tab-active">Files <span class="text-zinc-500">{ strconv.Itoa(v.NumFiles) }</span></button>
+	<div data-tabs class="mt-6 flex items-center gap-6 overflow-x-auto border-b border-line text-sm [scrollbar-width:none]">
+		<button type="button" data-tab="files" class="cl-tab cl-tab-active">Files <span class="text-subtle">{ strconv.Itoa(v.NumFiles) }</span></button>
 		<button type="button" data-tab="comments" class="cl-tab">
 			Comments
 			if v.CommentCount > 0 {
-				<span class="text-zinc-500">{ strconv.Itoa(v.CommentCount) }</span>
+				<span class="text-subtle">{ strconv.Itoa(v.CommentCount) }</span>
 			}
 		</button>
 		<button type="button" data-tab="checks" class="cl-tab">
 			Checks
 			if len(v.Checks.Runs) > 0 {
-				<span class="text-zinc-500">{ strconv.Itoa(len(v.Checks.Runs)) }</span>
+				<span class="text-subtle">{ strconv.Itoa(len(v.Checks.Runs)) }</span>
 			}
 		</button>
 		<button type="button" data-tab="deployments" class="cl-tab">
 			Deployments
 			if len(v.Deploys.Items) > 0 {
-				<span class="text-zinc-500">{ strconv.Itoa(len(v.Deploys.Items)) }</span>
+				<span class="text-subtle">{ strconv.Itoa(len(v.Deploys.Items)) }</span>
 			}
 		</button>
 	</div>
@@ -704,16 +760,16 @@ templ clTabs(v CLView) {
 
 // clFilesHeader is the patchset range selector row + the changed-files stat.
 templ clFilesHeader(v CLView) {
-	<div class="mt-4 mb-3 flex flex-wrap items-center gap-2 text-sm text-zinc-500">
+	<div class="mt-4 mb-3 flex flex-wrap items-center gap-2 text-sm text-subtle">
 		<span>Base</span>
-		<span class="text-zinc-600">→</span>
+		<span class="text-faint">→</span>
 		@clPatchSetSelect(v)
 		<span class="flex-1"></span>
-		<span><span class="font-medium text-zinc-300">{ strconv.Itoa(v.NumFiles) }</span> { pluralize(int64(v.NumFiles), "file", "files") } changed</span>
+		<span><span class="font-medium text-body">{ strconv.Itoa(v.NumFiles) }</span> { pluralize(int64(v.NumFiles), "file", "files") } changed</span>
 		if v.TotalsKnown {
-			<span class="text-emerald-400">+{ strconv.Itoa(v.Addition) }</span>
-			<span class="text-red-400">−{ strconv.Itoa(v.Deletion) }</span>
+			@diffStat(v.Addition, v.Deletion)
 		}
+		@diffViewToggle()
 	</div>
 }
 
@@ -721,21 +777,21 @@ templ clFilesHeader(v CLView) {
 // in-repo htmx nav to ?ps=N (viewing that patchset's diff against its base).
 templ clPatchSetSelect(v CLView) {
 	if len(v.PatchSets) <= 1 {
-		<span class="rounded-lg border border-zinc-800 bg-zinc-900/60 px-2.5 py-1 text-sm text-zinc-300">Patchset { strconv.FormatInt(v.CurrentPatchSet, 10) } · <span class="font-mono">{ v.CommitShort }</span></span>
+		<span class="rounded-lg border border-line bg-sunken px-2.5 py-1 text-sm text-body">Patchset { strconv.FormatInt(v.CurrentPatchSet, 10) } · <span class="font-mono">{ v.CommitShort }</span></span>
 	} else {
 		<details class="group/ps relative">
-			<summary class="flex cursor-pointer list-none items-center gap-1.5 rounded-lg border border-zinc-800 bg-zinc-900/60 px-2.5 py-1 text-sm text-zinc-300 hover:bg-zinc-900 [&::-webkit-details-marker]:hidden">
+			<summary class="flex cursor-pointer list-none items-center gap-1.5 rounded-lg border border-line bg-sunken px-2.5 py-1 text-sm text-body hover:bg-hover [&::-webkit-details-marker]:hidden">
 				Patchset { strconv.FormatInt(v.CurrentPatchSet, 10) } · <span class="font-mono">{ v.CommitShort }</span>
-				<span class="text-zinc-500 transition-transform group-open/ps:rotate-180">
+				<span class="text-subtle transition-transform group-open/ps:rotate-180">
 					@iconChevron()
 				</span>
 			</summary>
-			<div class="absolute left-0 z-20 mt-1.5 w-56 overflow-hidden rounded-xl border border-zinc-800 bg-zinc-950 py-1 shadow-xl shadow-black/50">
+			<div class={ popoverClass, "absolute left-0 z-20 mt-1.5 w-56 py-1" }>
 				for _, ps := range v.PatchSets {
-					<a href={ templ.SafeURL(ps.Href) } hx-get={ ps.Href } hx-target="#repo-main" hx-swap="innerHTML swap:70ms settle:1ms" hx-push-url="true" class={ "flex items-center justify-between gap-2 px-3 py-1.5 text-sm transition-colors hover:bg-zinc-900", templ.KV("text-zinc-100", ps.Current), templ.KV("text-zinc-400", !ps.Current) }>
+					<a href={ templ.SafeURL(ps.Href) } hx-get={ ps.Href } hx-target="#repo-main" hx-swap={ swapNav } hx-push-url="true" class={ "flex items-center justify-between gap-2 px-3 py-1.5 text-sm transition-colors hover:bg-hover", templ.KV("text-fg", ps.Current), templ.KV("text-muted", !ps.Current) }>
 						<span>Patchset { strconv.FormatInt(ps.Number, 10) } · <span class="font-mono">{ ps.CommitShort }</span></span>
 						if ps.Current {
-							<span class="text-emerald-400">
+							<span class="text-success">
 								@iconCheck()
 							</span>
 						}
@@ -766,7 +822,7 @@ templ clFileTable(v CLView) {
 templ CLFileBody(f DiffFileView, commentHref string, canComment bool) {
 	<div data-live>
 		if len(f.Threads) > 0 {
-			<div class="space-y-3 bg-zinc-950/60 px-4 py-3">
+			<div class="space-y-3 bg-sunken px-4 py-3">
 				for _, t := range f.Threads {
 					<div class="max-w-3xl">
 						@clThread(t, canComment, true)
@@ -789,23 +845,28 @@ templ clChangeLog(v CLView) {
 					No activity yet.
 				}
 			} else {
-				<div class="divide-y divide-zinc-800/70">
-					for _, m := range v.Messages {
-						@clLogRow(m)
+				<ol class="py-1.5">
+					for i, m := range v.Messages {
+						@clLogRow(m, i == len(v.Messages)-1)
 					}
-				</div>
+				</ol>
 			}
 		}
 	</div>
 }
 
-templ clLogRow(m CLMessage) {
-	<div class="flex items-start gap-3 px-4 py-3 text-sm">
-		@clAvatar(m.Author)
+// clLogRow is one event of the change log: its author's badge on the line that joins the
+// events, what they did, and when.
+templ clLogRow(m CLMessage, last bool) {
+	<li class="relative flex items-start gap-3 px-4 py-2.5 text-sm">
+		if !last {
+			<span aria-hidden="true" class="absolute top-10 bottom-0 left-[29.5px] w-px bg-line"></span>
+		}
+		@avatar(m.Author)
 		<div class="min-w-0 flex-1 pt-0.5">
 			<div class="flex flex-wrap items-center gap-2">
-				<span class="font-medium text-zinc-300">{ m.Author }</span>
-				<span class="text-zinc-500">{ m.Action }</span>
+				<span class="font-medium text-body">{ m.Author }</span>
+				<span class="text-subtle">{ m.Action }</span>
 				if m.Label != "" {
 					if m.Revoked {
 						@chip(toneNeutral) {
@@ -818,23 +879,18 @@ templ clLogRow(m CLMessage) {
 					}
 				}
 				if m.Commit != "" {
-					<a href={ templ.SafeURL(m.CommitHref) } hx-get={ m.CommitHref } hx-target="#repo-main" hx-swap="innerHTML swap:70ms settle:1ms" hx-push-url="true" class={ chipClass(toneNeutral), "font-mono transition-colors hover:text-zinc-100" }>{ m.Commit }</a>
+					<a href={ templ.SafeURL(m.CommitHref) } hx-get={ m.CommitHref } hx-target="#repo-main" hx-swap={ swapNav } hx-push-url="true" class={ chipClass(toneNeutral), "font-mono transition-colors hover:border-accent-line hover:text-accent-fg" }>{ m.Commit }</a>
 				}
 				if m.CL != 0 {
-					<a href={ templ.SafeURL(m.CLHref) } hx-get={ m.CLHref } hx-target="#repo-main" hx-swap="innerHTML swap:70ms settle:1ms" hx-push-url="true" class={ chipClass(toneNeutral), "font-mono transition-colors hover:text-zinc-100" }>#{ strconv.FormatInt(m.CL, 10) }</a>
+					<a href={ templ.SafeURL(m.CLHref) } hx-get={ m.CLHref } hx-target="#repo-main" hx-swap={ swapNav } hx-push-url="true" class={ chipClass(toneNeutral), "font-mono transition-colors hover:border-accent-line hover:text-accent-fg" }>#{ strconv.FormatInt(m.CL, 10) }</a>
 				}
 			</div>
 			if m.Body != "" {
-				<div class="mt-1 whitespace-pre-wrap text-zinc-400">{ m.Body }</div>
+				<div class="mt-1.5 whitespace-pre-wrap rounded-lg border border-line-soft bg-sunken px-3 py-2 text-body">{ m.Body }</div>
 			}
 		</div>
-		<span class="shrink-0 whitespace-nowrap pt-0.5 text-zinc-600" title={ m.AgeTitle }>{ m.Age }</span>
-	</div>
-}
-
-// clAvatar is a person's initial in a round badge (timeline + comments).
-templ clAvatar(name string) {
-	<span class="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-zinc-800 text-sm font-medium text-zinc-400">{ clInitial(name) }</span>
+		<span class="shrink-0 whitespace-nowrap pt-0.5 text-faint" title={ m.AgeTitle }>{ m.Age }</span>
+	</li>
 }
 
 // clDiffFileBody is the CL-view variant of diffFileBody: same line-numbered diff table, but each
@@ -866,7 +922,7 @@ templ clDiffFileBody(f DiffFileView, commentHref string, canComment bool) {
 		}
 	} else {
 		<div class="chroma overflow-x-auto">
-			<table class="w-full border-collapse font-mono text-[12.5px] leading-[1.6]">
+			<table class="q-diff-unified w-full border-collapse font-mono text-[12.5px] leading-[1.6]">
 				<tbody>
 					for _, sec := range f.Sections {
 						for _, ln := range sec {
@@ -875,6 +931,7 @@ templ clDiffFileBody(f DiffFileView, commentHref string, canComment bool) {
 					}
 				</tbody>
 			</table>
+			@splitTable(f, f.Name, true, canComment)
 		</div>
 	}
 }
@@ -884,8 +941,8 @@ templ clDiffFileBody(f DiffFileView, commentHref string, canComment bool) {
 // Thread rows reset to the UI font — they are prose, not code.
 templ clDiffLine(ln DiffLineRow, filePath string, canComment bool) {
 	if ln.Type == "tag" {
-		<tr class="select-none bg-zinc-900/60 text-zinc-500">
-			<td colspan="4" class="px-3 py-1">
+		<tr class="select-none bg-hunk text-subtle">
+			<td colspan="4" class="px-3 py-1.5">
 				@templ.Raw(ln.Content)
 			</td>
 		</tr>
@@ -893,17 +950,17 @@ templ clDiffLine(ln DiffLineRow, filePath string, canComment bool) {
 		<tr class={ "cl-diff-row", diffRowClass(ln.Type) }>
 			<td class="w-[1%] select-none whitespace-nowrap px-1 text-center align-top">
 				if canComment && commentable(ln) {
-					<button type="button" class="cl-comment-add rounded bg-sky-500/20 px-1 font-semibold leading-none text-sky-300 hover:bg-sky-500/40" data-file={ filePath } data-line={ anchorLine(ln) } data-side={ anchorSide(ln) } title="Add comment">+</button>
+					<button type="button" class="cl-comment-add flex h-[18px] w-[18px] cursor-pointer items-center justify-center rounded-md bg-accent font-semibold leading-none text-on-accent transition-colors hover:bg-accent-hi" data-file={ filePath } data-line={ anchorLine(ln) } data-side={ anchorSide(ln) } title="Add comment">+</button>
 				}
 			</td>
-			<td class="w-[1%] select-none whitespace-nowrap px-2 text-right align-top text-zinc-600">{ lineNo(ln.LeftIdx) }</td>
-			<td class="w-[1%] select-none whitespace-nowrap px-2 text-right align-top text-zinc-600">{ lineNo(ln.RightIdx) }</td>
-			<td class="w-full whitespace-pre-wrap break-all py-px pl-2 pr-3 align-top text-zinc-200">
-				<span class="mr-1 select-none text-zinc-500">{ diffMarker(ln.Type) }</span>@templ.Raw(ln.Content)
+			<td class="w-[1%] select-none whitespace-nowrap px-2 text-right align-top text-faint">{ lineNo(ln.LeftIdx) }</td>
+			<td class="w-[1%] select-none whitespace-nowrap px-2 text-right align-top text-faint">{ lineNo(ln.RightIdx) }</td>
+			<td class="w-full whitespace-pre-wrap break-all py-px pl-2 pr-3 align-top text-fg">
+				<span class={ diffMarkerClass(ln.Type) }>{ diffMarker(ln.Type) }</span>@templ.Raw(ln.Content)
 			</td>
 		</tr>
 		for _, t := range ln.Threads {
-			<tr class="bg-zinc-950/60">
+			<tr class="border-y border-line-soft bg-sunken">
 				<td></td>
 				<td colspan="3" class="px-2 py-3 font-sans text-sm leading-normal">
 					<div class="max-w-3xl">
@@ -923,10 +980,10 @@ templ clThread(t CommentThread, canComment, showLocation bool) {
 	@panel() {
 		@panelHead() {
 			if showLocation {
-				<span class="min-w-0 truncate font-mono font-normal text-zinc-300">
+				<span class="min-w-0 truncate font-mono font-normal text-body">
 					{ t.FilePath }
 					if t.Line > 0 {
-						<span class="text-zinc-500">:{ strconv.Itoa(t.Line) }</span>
+						<span class="text-subtle">:{ strconv.Itoa(t.Line) }</span>
 					}
 				</span>
 				@chip(toneNeutral) {
@@ -943,7 +1000,7 @@ templ clThread(t CommentThread, canComment, showLocation bool) {
 				}
 			}
 			if showLocation || t.Port != "" || t.Outdated {
-				<a href={ templ.SafeURL(t.PatchSetHref) } hx-get={ t.PatchSetHref } hx-target="#repo-main" hx-swap="innerHTML swap:70ms settle:1ms" hx-push-url="true" title={ threadOriginTitle(t) } class={ chipClass(threadOriginTone(t)), "transition-colors hover:text-zinc-100" }>{ threadOriginLabel(t) }</a>
+				<a href={ templ.SafeURL(t.PatchSetHref) } hx-get={ t.PatchSetHref } hx-target="#repo-main" hx-swap={ swapNav } hx-push-url="true" title={ threadOriginTitle(t) } class={ chipClass(threadOriginTone(t)), "transition-colors hover:text-fg" }>{ threadOriginLabel(t) }</a>
 			}
 			<span class="flex-1"></span>
 			if canComment {
@@ -954,16 +1011,16 @@ templ clThread(t CommentThread, canComment, showLocation bool) {
 				}
 			}
 		}
-		<div class="divide-y divide-zinc-800/60">
+		<div class="divide-y divide-line-soft">
 			for _, c := range t.Comments {
 				@clComment(c)
 			}
 		</div>
 		if canComment {
-			<details class="group/treply border-t border-zinc-800">
-				<summary class="cursor-pointer list-none px-4 py-2.5 text-sm text-sky-400 hover:text-sky-300 [&::-webkit-details-marker]:hidden">Reply</summary>
-				<form method="post" action={ templ.SafeURL(t.ReplyHref) } hx-post={ t.ReplyHref } hx-target="#repo-main" hx-swap="innerHTML swap:70ms settle:1ms" class="px-4 pb-3">
-					<textarea name="content" rows="2" required placeholder="Reply…" class="w-full rounded-lg border border-zinc-800 bg-zinc-900/60 px-3 py-2 text-sm text-zinc-200 placeholder:text-zinc-600 focus:border-zinc-600 focus:outline-none"></textarea>
+			<details class="group/treply border-t border-line">
+				<summary class="cursor-pointer list-none px-4 py-2.5 text-sm text-accent-fg transition-colors hover:text-fg [&::-webkit-details-marker]:hidden">Reply</summary>
+				<form method="post" action={ templ.SafeURL(t.ReplyHref) } hx-post={ t.ReplyHref } hx-target="#repo-main" hx-swap={ swapAction } class="px-4 py-3">
+					<textarea name="content" rows="2" required placeholder="Reply…" class={ inputClass }></textarea>
 					<div class="mt-2 flex justify-end">
 						<button type="submit" class={ btnClass(btnPrimary) }>Reply</button>
 					</div>
@@ -974,19 +1031,19 @@ templ clThread(t CommentThread, canComment, showLocation bool) {
 }
 
 templ clThreadToggle(href, label string) {
-	<form method="post" action={ templ.SafeURL(href) } hx-post={ href } hx-target="#repo-main" hx-swap="innerHTML swap:70ms settle:1ms" class="shrink-0">
+	<form method="post" action={ templ.SafeURL(href) } hx-post={ href } hx-target="#repo-main" hx-swap={ swapAction } class="shrink-0">
 		<button type="submit" class={ btnClass(btnSecondary) }>{ label }</button>
 	</form>
 }
 
 templ clComment(c CommentView) {
 	<div class="px-4 py-3 text-sm">
-		<div class="flex items-center gap-2">
-			@clAvatar(c.Author)
-			<span class="font-medium text-zinc-300">{ c.Author }</span>
-			<span class="text-zinc-600" title={ c.AgeTitle }>{ c.Age }</span>
+		<div class="flex items-center gap-2.5">
+			@avatar(c.Author)
+			<span class="font-medium text-fg">{ c.Author }</span>
+			<span class="text-faint" title={ c.AgeTitle }>{ c.Age }</span>
 		</div>
-		<div class="mt-1 whitespace-pre-wrap pl-9 text-zinc-300">{ c.Body }</div>
+		<div class="mt-1 whitespace-pre-wrap pl-[2.375rem] text-body">{ c.Body }</div>
 	</div>
 }
 
@@ -999,9 +1056,9 @@ templ clComposerTemplate(v CLView) {
 		<template id="cl-composer-template">
 			<table>
 				<tbody>
-					<tr class="cl-composer-row bg-zinc-950/60">
+					<tr class="cl-composer-row bg-sunken">
 						<td colspan="4" class="px-4 py-3 font-sans text-sm leading-normal">
-							<form method="post" action={ templ.SafeURL(v.CommentHref) } hx-post={ v.CommentHref } hx-target="#repo-main" hx-swap="innerHTML swap:70ms settle:1ms" class="max-w-3xl">
+							<form method="post" action={ templ.SafeURL(v.CommentHref) } hx-post={ v.CommentHref } hx-target="#repo-main" hx-swap={ swapAction } class="max-w-3xl">
 								@panel() {
 									@panelTitle("New Comment")
 									@panelBody() {
@@ -1009,7 +1066,7 @@ templ clComposerTemplate(v CLView) {
 										<input type="hidden" name="file"/>
 										<input type="hidden" name="line"/>
 										<input type="hidden" name="side"/>
-										<textarea name="content" rows="3" required placeholder="Add a comment…" class="w-full rounded-lg border border-zinc-800 bg-zinc-900/60 px-3 py-2 text-sm text-zinc-200 placeholder:text-zinc-600 focus:border-zinc-600 focus:outline-none"></textarea>
+										<textarea name="content" rows="3" required placeholder="Add a comment…" class={ inputClass }></textarea>
 										<div class="mt-2 flex justify-end gap-2">
 											<button type="button" class={ btnClass(btnSecondary), "cl-composer-cancel" }>Cancel</button>
 											<button type="submit" class={ btnClass(btnPrimary) }>Comment</button>
@@ -1075,7 +1132,7 @@ templ clChecksRegion(c CLChecks) {
 		@panel() {
 			@panelHead() {
 				<h3>Pre</h3>
-				<span class="text-zinc-500">Patchset { strconv.FormatInt(c.Patchset, 10) }</span>
+				<span class="text-subtle">Patchset { strconv.FormatInt(c.Patchset, 10) }</span>
 				<span class="flex-1"></span>
 				@chip(clCheckTone(c.VerdictKind)) {
 					{ c.Verdict }
@@ -1116,7 +1173,7 @@ templ clPostPanel(p CLPost) {
 		@panelHead() {
 			<h3>Post</h3>
 			if p.SubmittedBy != "" {
-				<span class="text-zinc-500" title={ p.AgeTitle }>Submitted by { p.SubmittedBy } { p.Age }</span>
+				<span class="text-subtle" title={ p.AgeTitle }>Submitted by { p.SubmittedBy } { p.Age }</span>
 			}
 			<span class="flex-1"></span>
 			if p.Status != "" {
@@ -1135,10 +1192,10 @@ templ clPostPanel(p CLPost) {
 			}
 		} else {
 			if p.Detail != "" {
-				<div class="border-b border-zinc-800/70 px-4 py-2.5 text-sm text-zinc-300">{ p.Detail }</div>
+				<div data-post-detail class="border-b border-line-soft px-4 py-2.5 text-sm text-body">{ p.Detail }</div>
 			}
 			if len(p.Runs) == 0 {
-				<div class="border-b border-zinc-800/70 px-4 py-2.5 text-sm text-zinc-500">The landing queue is preparing its candidate.</div>
+				<div class="border-b border-line-soft px-4 py-2.5 text-sm text-subtle">The landing queue is preparing its candidate.</div>
 			} else {
 				for _, g := range checkGroups("post", p.Runs, p.Skipped) {
 					@clCheckGroup(g)
@@ -1154,19 +1211,19 @@ templ clPostPanel(p CLPost) {
 // header alone.
 templ clCheckGroup(g checkGroup) {
 	if g.Count == 0 {
-		<div class="flex items-center gap-3 border-b border-zinc-800/70 px-4 py-2.5 text-sm last:border-b-0">
+		<div class="flex items-center gap-3 border-b border-line-soft px-4 py-2.5 text-sm last:border-b-0">
 			<span class="h-4 w-4 shrink-0"></span>
 			@clCheckGroupHeader(g)
 		</div>
 	} else {
-		<details data-check-group={ g.Key } open?={ g.Open } class="border-b border-zinc-800/70 last:border-b-0">
-			<summary class="flex cursor-pointer list-none items-center gap-3 px-4 py-2.5 text-sm transition-colors hover:bg-zinc-900/40 [&::-webkit-details-marker]:hidden">
-				<span data-check-chevron class="flex h-4 w-4 shrink-0 items-center justify-center text-zinc-500 transition-transform">
+		<details data-check-group={ g.Key } open?={ g.Open } class="border-b border-line-soft last:border-b-0">
+			<summary class="flex cursor-pointer list-none items-center gap-3 px-4 py-2.5 text-sm transition-colors hover:bg-hover [&::-webkit-details-marker]:hidden">
+				<span data-check-chevron class="flex h-4 w-4 shrink-0 items-center justify-center text-subtle transition-transform">
 					@iconChevron()
 				</span>
 				@clCheckGroupHeader(g)
 			</summary>
-			<div class="border-t border-zinc-800/70 pl-7">
+			<div class="border-t border-line-soft pl-7">
 				for _, c := range g.Runs {
 					@clCheckRow(c)
 				}
@@ -1183,13 +1240,13 @@ templ clCheckGroup(g checkGroup) {
 
 // clCheckGroupHeader is a group's header: what it is, how many, where they stand, and the worst.
 templ clCheckGroupHeader(g checkGroup) {
-	<span class="w-56 shrink-0 font-medium text-zinc-200">
+	<span class="w-56 shrink-0 font-medium text-fg">
 		{ g.Title }
 		if g.Count > 0 {
-			<span class="ml-1 font-normal text-zinc-500">{ strconv.Itoa(g.Count) }</span>
+			<span class="ml-1 font-normal text-subtle">{ strconv.Itoa(g.Count) }</span>
 		}
 	</span>
-	<span class="min-w-0 flex-1 truncate text-zinc-500">{ g.Tally }</span>
+	<span class="min-w-0 flex-1 truncate text-subtle">{ g.Tally }</span>
 	@chip(clCheckTone(g.StatusKind)) {
 		{ g.StatusLabel }
 	}
@@ -1198,7 +1255,7 @@ templ clCheckGroupHeader(g checkGroup) {
 // clAttemptRow is one attempt at landing a submission: main's commit it was prepared on, what it
 // speculated land first, and why the queue moved on from it.
 templ clAttemptRow(a CLAttempt) {
-	<div class="flex items-start gap-3 border-b border-zinc-800/70 px-4 py-2.5 text-sm last:border-b-0">
+	<div class="flex items-start gap-3 border-b border-line-soft px-4 py-2.5 text-sm last:border-b-0">
 		<span class="w-24 shrink-0">
 			@chip(clCheckTone(a.StatusKind)) {
 				{ a.Status }
@@ -1206,15 +1263,15 @@ templ clAttemptRow(a CLAttempt) {
 		</span>
 		<div class="min-w-0 flex-1 leading-6">
 			<div class="flex min-w-0 items-center gap-2">
-				<span class="text-zinc-200">Attempt { strconv.Itoa(a.Number) }</span>
-				<span class="text-zinc-500">on main at</span>
-				<span class="font-mono text-zinc-400">{ a.Base }</span>
+				<span class="text-fg">Attempt { strconv.Itoa(a.Number) }</span>
+				<span class="text-subtle">on main at</span>
+				<span class="font-mono text-muted">{ a.Base }</span>
 				if a.OnTopOf != "" {
-					<span class="truncate text-zinc-500">with { a.OnTopOf } landing first</span>
+					<span class="truncate text-subtle">with { a.OnTopOf } landing first</span>
 				}
 			</div>
 			if a.Reason != "" {
-				<div class="text-zinc-400">{ a.Reason }</div>
+				<div class="text-muted">{ a.Reason }</div>
 			}
 		</div>
 	</div>
@@ -1224,7 +1281,7 @@ templ clAttemptRow(a CLAttempt) {
 // failed), how long it took, its log, and its one action — Cancel while it runs, Rerun once it
 // has finished — disabled, with the reason, when the viewer may not take it.
 templ clCheckRow(c CLCheck) {
-	<div class="flex items-start gap-3 border-b border-zinc-800/70 px-4 py-2.5 text-sm last:border-b-0">
+	<div data-check class="flex items-start gap-3 border-b border-line-soft px-4 py-2.5 text-sm last:border-b-0">
 		<span class="w-24 shrink-0">
 			@chip(clCheckTone(c.StatusKind)) {
 				{ c.StatusLabel }
@@ -1232,15 +1289,15 @@ templ clCheckRow(c CLCheck) {
 		</span>
 		<div class="min-w-0 flex-1 leading-6">
 			<div class="flex min-w-0 items-center gap-2">
-				<span class="truncate font-mono text-zinc-200">{ checkRowName(c) }</span>
-				<span class="truncate text-zinc-500">{ c.Source }</span>
+				<span data-check-name class="truncate font-mono text-fg">{ checkRowName(c) }</span>
+				<span class="truncate text-subtle">{ c.Source }</span>
 			</div>
-			<div class="text-zinc-500">{ c.Why }</div>
+			<div class="text-subtle">{ c.Why }</div>
 			if c.Reason != "" {
-				<div class="text-zinc-400">{ c.Reason }</div>
+				<div class="text-muted">{ c.Reason }</div>
 			}
 		</div>
-		<span class="w-20 shrink-0 text-right font-mono leading-6 text-zinc-500">
+		<span class="w-20 shrink-0 text-right font-mono leading-6 text-subtle">
 			if c.Duration != "" {
 				{ c.Duration }
 			} else {
@@ -1248,7 +1305,7 @@ templ clCheckRow(c CLCheck) {
 			}
 		</span>
 		<span class="flex shrink-0 items-center gap-2">
-			<a href={ templ.SafeURL(c.LogHref) } hx-get={ c.LogHref } hx-target="#repo-main" hx-swap="innerHTML swap:70ms settle:1ms" hx-push-url="true" class={ btnClass(btnSecondary) }>Log</a>
+			<a href={ templ.SafeURL(c.LogHref) } hx-get={ c.LogHref } hx-target="#repo-main" hx-swap={ swapNav } hx-push-url="true" class={ btnClass(btnSecondary) }>Log</a>
 			if c.ActionHref != "" {
 				<button type="button" hx-post={ c.ActionHref } hx-target="#cl-checks" hx-swap="outerHTML" class={ btnClass(btnSecondary) }>{ c.ActionLabel }</button>
 			} else {
@@ -1261,7 +1318,7 @@ templ clCheckRow(c CLCheck) {
 // clSkippedRow is a workflow job left to main: the job, where it comes from, its target, and why
 // it was selected yet does not run.
 templ clSkippedRow(sk CLSkippedCheck) {
-	<div class="flex items-start gap-3 border-b border-zinc-800/70 px-4 py-2.5 text-sm last:border-b-0">
+	<div class="flex items-start gap-3 border-b border-line-soft px-4 py-2.5 text-sm last:border-b-0">
 		<span class="w-24 shrink-0">
 			@chip(toneNeutral) {
 				Not Run
@@ -1269,11 +1326,11 @@ templ clSkippedRow(sk CLSkippedCheck) {
 		</span>
 		<div class="min-w-0 flex-1 leading-6">
 			<div class="flex min-w-0 items-center gap-2">
-				<span class="truncate font-mono text-zinc-200">{ sk.Name }</span>
-				<span class="truncate text-zinc-500">{ sk.Source }</span>
+				<span data-check-name class="truncate font-mono text-fg">{ sk.Name }</span>
+				<span class="truncate text-subtle">{ sk.Source }</span>
 			</div>
-			<div class="font-mono text-zinc-400">{ sk.Target }</div>
-			<div class="text-zinc-500">{ sk.Why }</div>
+			<div class="font-mono text-muted">{ sk.Target }</div>
+			<div class="text-subtle">{ sk.Why }</div>
 		</div>
 	</div>
 }

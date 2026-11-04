@@ -1,6 +1,39 @@
-/* Self-hosted IBM Plex Sans (latin subset), replacing the Google Fonts CDN. woff2 files
-   vendored under third_party/fonts/ibm-plex-sans/ (SIL OFL 1.1, LICENSE beside them) and served by the app at
-   /assets/fonts/ibm-plex-sans/. Weights 300/400/500/600/700 normal + 400 italic. */
+/* The self-hosted faces the pages may use (latin subset): IBM Plex Sans, and Geist and Geist Mono.
+   The woff2 files are vendored under third_party/fonts/ (SIL OFL 1.1, a LICENSE beside each) and
+   served at /assets/fonts/. A browser downloads a face only when a page uses its family, so a page
+   set pays only for the families its --font-sans and --font-mono name. */
+
+/* Geist and Geist Mono: variable weight (100–900), upright and italic. */
+@font-face {
+  font-family: 'Geist';
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url('/assets/fonts/geist/geist-latin-wght-normal.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'Geist';
+  font-style: italic;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url('/assets/fonts/geist/geist-latin-wght-italic.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'Geist Mono';
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url('/assets/fonts/geist-mono/geist-mono-latin-wght-normal.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'Geist Mono';
+  font-style: italic;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url('/assets/fonts/geist-mono/geist-mono-latin-wght-italic.woff2') format('woff2');
+}
+
+/* IBM Plex Sans: weights 300/400/500/600/700 normal + 400 italic. */
 @font-face {
   font-family: 'IBM Plex Sans';
   font-style: normal;

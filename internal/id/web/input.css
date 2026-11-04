@@ -3,3 +3,219 @@
 @import "tailwindcss" source(none);
 @source "./views.templ";
 @source "./passkeys.js";
+
+/* Geist and Geist Mono, from internal/web/static's third_party, served under /id/assets/fonts/. */
+@font-face {
+  font-family: 'Geist';
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url('/id/assets/fonts/geist/geist-latin-wght-normal.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'Geist Mono';
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url('/id/assets/fonts/geist-mono/geist-mono-latin-wght-normal.woff2') format('woff2');
+}
+
+/* --- Theme tokens ---------------------------------------------------------------------------
+   ok's two themes, the control pages' own (docs/web.md, "Theme tokens"). Every colour a page draws with is one of
+   these roles, never a palette shade: utilities name the role (bg-surface, text-muted,
+   border-line, text-success, bg-accent-soft, …) and the theme decides its colour. Dark — warm
+   blacks lit with gold and ember — is the default; light — warm paper and ink, bronze for the
+   accent — overrides it on <html data-theme="light">, which the shell sets before the first
+   paint (layout.Props.Themes) and static/theme.js switches.
+
+     canvas      the page behind everything          surface   a panel
+     raised      the open drawer, a code popover      overlay   a floating popover or menu
+     sunken      inputs, code blocks, hunk headers    hover / hover-strong / selected   row states
+     line / line-soft / line-strong                   borders, dividers inside panels, controls
+     fg > body > muted > subtle > faint > ghost       text, strongest to weakest
+     accent (+ accent-hi, ember for its gradient), accent-fg (accent text and links),
+     accent-soft / accent-line (tinted fills and borders), on-accent (text on the accent)
+     success / danger / info / warn (+ -soft, -line), neutral-soft / neutral-line: the tones
+     diff-add / diff-del (+ -word), hunk: diffs                                                  */
+@theme static {
+  --font-sans: 'Geist', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-mono: 'Geist Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+  --color-canvas: #0b0a09;
+  --color-surface: #12100e;
+  --color-raised: #171411;
+  --color-overlay: #1a1714;
+  --color-sunken: #0e0d0b;
+  --color-hover: #1a1714;
+  --color-hover-strong: #25211c;
+  --color-selected: #231f1a;
+  --color-line: #28231e;
+  --color-line-soft: #1f1c18;
+  --color-line-strong: #3b352d;
+
+  --color-fg: #f7f2ea;
+  --color-body: #ded6ca;
+  --color-muted: #aaa093;
+  --color-subtle: #887e71;
+  --color-faint: #675e53;
+  --color-ghost: #413a33;
+
+  --color-accent: #eeb043;
+  --color-accent-hi: #f8cd6e;
+  --color-ember: #ea7a2c;
+  --color-accent-fg: #f2c063;
+  --color-accent-soft: rgb(238 176 67 / 0.11);
+  --color-accent-line: rgb(238 176 67 / 0.36);
+  --color-on-accent: #1d1305;
+
+  --color-success: #6fd39a;
+  --color-success-soft: rgb(111 211 154 / 0.09);
+  --color-success-line: rgb(111 211 154 / 0.26);
+  --color-success-solid: #3fae6c;
+  --color-on-success: #04140a;
+  --color-danger: #ff8a7a;
+  --color-danger-soft: rgb(255 138 122 / 0.09);
+  --color-danger-line: rgb(255 138 122 / 0.28);
+  --color-info: #95b9ff;
+  --color-info-soft: rgb(149 185 255 / 0.09);
+  --color-info-line: rgb(149 185 255 / 0.27);
+  --color-warn: #f89d4c;
+  --color-warn-soft: rgb(248 157 76 / 0.1);
+  --color-warn-line: rgb(248 157 76 / 0.3);
+  --color-neutral-soft: rgb(255 238 214 / 0.045);
+  --color-neutral-line: #37312a;
+
+  --color-diff-add: rgb(111 211 154 / 0.075);
+  --color-diff-del: rgb(255 138 122 / 0.075);
+  --color-diff-add-word: rgb(111 211 154 / 0.26);
+  --color-diff-del-word: rgb(255 138 122 / 0.26);
+  --color-hunk: rgb(149 185 255 / 0.055);
+
+  --shadow-panel: var(--q-shadow-panel);
+  --shadow-pop: var(--q-shadow-pop);
+  --shadow-mark: var(--q-shadow-mark);
+}
+
+:root {
+  color-scheme: dark;
+  /* The rail's geometry and colours (internal/web/nav): rows inset from its edges and
+     rounded, a gold mark beside the active one, a hairline down its edge. */
+  --nav-inset: 10px;
+  --nav-radius: 12px;
+  --color-nav-mark: var(--color-accent);
+  --color-rail-line: var(--color-line-soft);
+
+  --q-shadow-panel: inset 0 1px 0 rgb(255 236 210 / 0.035), 0 1px 2px rgb(0 0 0 / 0.4);
+  --q-shadow-pop: 0 0 0 1px rgb(255 236 210 / 0.04), 0 28px 60px -18px rgb(0 0 0 / 0.8), 0 10px 24px -10px rgb(0 0 0 / 0.55);
+  --q-shadow-mark: inset 0 1px 0 rgb(255 255 255 / 0.3), 0 1px 2px rgb(0 0 0 / 0.4);
+  --q-canvas-glow: radial-gradient(1100px 460px at 55% -220px, rgb(238 176 67 / 0.075), transparent 70%);
+
+  /* Syntax colours for highlighted code (.chroma). */
+  --syn-text: #e9e1d4;
+  --syn-comment: #7a7063;
+  --syn-keyword: #ff9757;
+  --syn-type: #82c4e0;
+  --syn-operator: #e2a77f;
+  --syn-punct: #9d9283;
+  --syn-attr: #e8c07a;
+  --syn-builtin: #79c8bf;
+  --syn-func: #ffcb6b;
+  --syn-tag: #ff9757;
+  --syn-var: #f28b82;
+  --syn-const: #dca5f2;
+  --syn-string: #b8d47c;
+  --syn-number: #f2a477;
+  --syn-error: #ff6b6b;
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+
+  --color-canvas: #f6f3ed;
+  --color-surface: #fffdf9;
+  --color-raised: #fffdf9;
+  --color-overlay: #ffffff;
+  --color-sunken: #f4f0e8;
+  --color-hover: #f6f1e9;
+  --color-hover-strong: #ede6da;
+  --color-selected: #f0e8db;
+  --color-line: #e5ddd0;
+  --color-line-soft: #efe9df;
+  --color-line-strong: #d5cab9;
+
+  --color-fg: #1b1713;
+  --color-body: #3a332b;
+  --color-muted: #6b6155;
+  --color-subtle: #84796b;
+  --color-faint: #a2978a;
+  --color-ghost: #cdc3b5;
+
+  --color-accent: #eca83b;
+  --color-accent-hi: #f6c565;
+  --color-ember: #e2741f;
+  --color-accent-fg: #9b5a07;
+  --color-accent-soft: rgb(226 152 38 / 0.12);
+  --color-accent-line: rgb(205 130 22 / 0.4);
+  --color-on-accent: #1d1305;
+
+  --color-success: #19794a;
+  --color-success-soft: #e8f4ec;
+  --color-success-line: #bfe2cc;
+  --color-success-solid: #1f8a52;
+  --color-on-success: #ffffff;
+  --color-danger: #b8352a;
+  --color-danger-soft: #fcece9;
+  --color-danger-line: #f1c4bc;
+  --color-info: #2c5aa8;
+  --color-info-soft: #ebf0fa;
+  --color-info-line: #c8d6ef;
+  --color-warn: #a24e00;
+  --color-warn-soft: #fcf0df;
+  --color-warn-line: #f0d0a2;
+  --color-neutral-soft: #f3eee6;
+  --color-neutral-line: #e2d9cb;
+
+  --color-diff-add: #eaf6ee;
+  --color-diff-del: #fcedeb;
+  --color-diff-add-word: #bfe5cc;
+  --color-diff-del-word: #f6c9c1;
+  --color-hunk: #eef2fa;
+
+  --q-shadow-panel: 0 1px 2px rgb(70 48 20 / 0.05), 0 1px 1px rgb(70 48 20 / 0.03);
+  --q-shadow-pop: 0 0 0 1px rgb(70 48 20 / 0.07), 0 28px 56px -20px rgb(70 48 20 / 0.3), 0 8px 18px -10px rgb(70 48 20 / 0.16);
+  --q-shadow-mark: inset 0 1px 0 rgb(255 255 255 / 0.5), 0 1px 2px rgb(110 64 8 / 0.2);
+  --q-canvas-glow: radial-gradient(1100px 460px at 55% -220px, rgb(236 168 59 / 0.14), transparent 70%);
+
+  --syn-text: #2b241d;
+  --syn-comment: #998e80;
+  --syn-keyword: #c24f0a;
+  --syn-type: #1d6c94;
+  --syn-operator: #9f582a;
+  --syn-punct: #6b6155;
+  --syn-attr: #8a6100;
+  --syn-builtin: #11766e;
+  --syn-func: #8f5d00;
+  --syn-tag: #c24f0a;
+  --syn-var: #b8352a;
+  --syn-const: #8a3fb0;
+  --syn-string: #4c7810;
+  --syn-number: #b0500f;
+  --syn-error: #c62828;
+}
+
+/* --- Base ------------------------------------------------------------------------------------ */
+@layer base {
+  body {
+    background-image: var(--q-canvas-glow);
+    background-repeat: no-repeat;
+    font-feature-settings: 'ss01', 'cv11';
+  }
+  ::selection { background: color-mix(in oklab, var(--color-accent) 32%, transparent); }
+  * { scrollbar-width: thin; scrollbar-color: var(--color-line-strong) transparent; }
+  :focus-visible { outline: 2px solid color-mix(in oklab, var(--color-accent) 75%, transparent); outline-offset: 2px; }
+  input, textarea { caret-color: var(--color-accent); }
+}
+
+/* A change of theme (static/theme.js) grows the new one out of its control as a circle, in place of
+   the view transition's default cross-fade. */
+::view-transition-old(root), ::view-transition-new(root) { animation: none; mix-blend-mode: normal; }

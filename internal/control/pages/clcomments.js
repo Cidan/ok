@@ -12,9 +12,10 @@
 //      fields, and lets htmx POST it (the form's hx-post re-renders #repo-main with the new
 //      thread anchored in place). Replies and resolve/unresolve are plain server-rendered htmx
 //      forms and need no JS.
-//   3. Pointer popovers — clicking a [data-popover-open="<id>"] trigger shows the [data-popover]
-//      element with that id at the pointer (below the trigger when activated from the keyboard),
-//      clamped inside the viewport. An outside click, Escape, or an htmx swap closes it.
+//   3. Popovers — clicking a [data-popover-open="<id>"] trigger shows the [data-popover] element
+//      with that id at the pointer (below the trigger when activated from the keyboard, or when the
+//      trigger is a menu button, data-popover-anchor="end"), clamped inside the viewport, and
+//      marks its triggers aria-expanded. An outside click, Escape, or an htmx swap closes it.
 //   4. The review dialog's reviewer picker — clicking a live-search result ([data-reviewer-pick])
 //      checks that person: their existing checkbox if the dialog already offers them, otherwise a
 //      new checked reviewer row in [data-reviewer-picked]. Checkboxes for the same person (offered
@@ -26,34 +27,51 @@
   // --- Pointer popovers -------------------------------------------------------------------
   var MARGIN = 8;
 
-  function closePopovers(except) {
-    document.querySelectorAll('[data-popover]').forEach((p) => {
-      if (p !== except) p.hidden = true;
+  // A popover's triggers say whether it is open (aria-expanded), for assistive technology and
+  // for their own styling (a chevron that turns).
+  function setExpanded(pop, open) {
+    document.querySelectorAll('[data-popover-open="' + CSS.escape(pop.id) + '"]').forEach((t) => {
+      t.setAttribute('aria-expanded', open ? 'true' : 'false');
     });
   }
 
+  function closePopovers(except) {
+    document.querySelectorAll('[data-popover]').forEach((p) => {
+      if (p === except || p.hidden) return;
+      p.hidden = true;
+      setExpanded(p, false);
+    });
+  }
+
+  // openPopover shows a popover at the pointer — or under its trigger, right-aligned to it, for a
+  // trigger that is a menu button (data-popover-anchor="end"), and for a keyboard activation,
+  // which carries no pointer position — clamped inside the viewport.
   function openPopover(trigger, e) {
     var pop = document.getElementById(trigger.getAttribute('data-popover-open'));
     if (!pop) return;
     if (!pop.hidden) {
       pop.hidden = true;
+      setExpanded(pop, false);
       return;
     }
     closePopovers(pop);
+    var r = trigger.getBoundingClientRect();
+    var end = trigger.getAttribute('data-popover-anchor') === 'end';
     var x = e.clientX,
       y = e.clientY;
-    if (e.detail === 0) {
-      // Keyboard activation carries no pointer position: anchor under the trigger.
-      const r = trigger.getBoundingClientRect();
+    if (end || e.detail === 0) {
       x = r.left;
       y = r.bottom;
     }
     pop.hidden = false;
+    setExpanded(pop, true);
     var w = pop.offsetWidth,
       h = pop.offsetHeight;
+    if (end) x = r.right - w;
     var left = Math.min(x, window.innerWidth - w - MARGIN);
     var top = y + MARGIN;
-    if (top + h > window.innerHeight - MARGIN) top = Math.max(MARGIN, y - h - MARGIN);
+    if (top + h > window.innerHeight - MARGIN)
+      top = Math.max(MARGIN, (end ? r.top : y) - h - MARGIN);
     pop.style.left = Math.max(MARGIN, left) + 'px';
     pop.style.top = top + 'px';
   }
@@ -159,14 +177,14 @@
       if (!picked) return;
       const label = document.createElement('label');
       label.className =
-        'flex cursor-pointer items-center gap-2.5 rounded-lg px-2 py-1.5 text-sm text-zinc-300 transition-colors hover:bg-zinc-900';
+        'flex cursor-pointer items-center gap-2.5 rounded-lg px-2 py-1.5 text-sm text-body transition-colors hover:bg-hover';
       const box = document.createElement('input');
       box.type = 'checkbox';
       box.name = 'reviewer';
       box.value = id;
       box.checked = true;
       box.setAttribute('data-reviewer-id', id);
-      box.className = 'h-4 w-4 cursor-pointer accent-sky-500';
+      box.className = 'h-4 w-4 cursor-pointer accent-accent';
       const name = document.createElement('span');
       name.textContent = btn.getAttribute('data-name');
       label.append(box, name);

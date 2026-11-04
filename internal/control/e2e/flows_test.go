@@ -16,12 +16,12 @@ import (
 
 // chip reports whether a page has a status chip reading label.
 func chip(p page, label string) bool {
-	return regexp.MustCompile(`<span class="[^"]*">\s*` + regexp.QuoteMeta(label) + `\s*</span>`).MatchString(p.body)
+	return regexp.MustCompile(`<span[^>]*>\s*` + regexp.QuoteMeta(label) + `\s*</span>`).MatchString(p.body)
 }
 
 // logged reports whether a CL page's change log has an entry by who with action.
 func logged(p page, who, action string) bool {
-	return regexp.MustCompile(`>` + regexp.QuoteMeta(who) + `</span>\s*<span class="text-zinc-500">` + regexp.QuoteMeta(action) + `</span>`).MatchString(p.body)
+	return regexp.MustCompile(`>` + regexp.QuoteMeta(who) + `</span>\s*<span[^>]*>` + regexp.QuoteMeta(action) + `</span>`).MatchString(p.body)
 }
 
 // grant is a Reply form granting (and so, for labels left out, revoking) labels.
@@ -169,10 +169,13 @@ func TestRepositoriesAndBrowsing(t *testing.T) {
 	// The repository view: entries with their last commits, the README rendered with its
 	// links resolved, the latest commit.
 	home = e.get(bob, "/example/browse")
-	for _, want := range []string{">svc<", ">README.md<", "a first change", `href="/example/browse/tree/main/svc/main.go"`, `src="/example/browse/raw/main/img/logo.svg"`, ">1</span> commit"} {
+	for _, want := range []string{">svc<", ">README.md<", "a first change", `href="/example/browse/tree/main/svc/main.go"`, `src="/example/browse/raw/main/img/logo.svg"`} {
 		if !home.has(want) {
 			t.Errorf("repository view lacks %s:\n%s", want, excerpt(home.body))
 		}
+	}
+	if !regexp.MustCompile(`<span data-commits[^>]*>1</span>`).MatchString(home.body) {
+		t.Errorf("repository view's History tab lacks main's 1 commit:\n%s", excerpt(home.body))
 	}
 	dir := e.get(bob, "/example/browse/tree/main/svc")
 	if !dir.has(">main.go<") {
@@ -279,8 +282,8 @@ func TestRepositoriesAndBrowsing(t *testing.T) {
 	if p := e.do(bob, http.MethodPost, "/example/browse/action/star", url.Values{}, nil); p.status != http.StatusNoContent {
 		t.Fatalf("favorite: %d", p.status)
 	}
-	rows := e.get(bob, "/").body
-	if strings.Index(rows, ">browse<") > strings.Index(rows, ">zebra<") {
+	rows := e.get(bob, "/repositories").body
+	if strings.Index(rows, ">browse<") > strings.Index(rows, ">zebra<") || !strings.Contains(rows, ">zebra<") {
 		t.Error("a favorite is not listed first")
 	}
 
@@ -346,6 +349,40 @@ func TestChangeListLifecycle(t *testing.T) {
 	reason := submitTitle(p, "Submit")
 	if !strings.Contains(reason, "LGTM") || !strings.Contains(reason, "Approval from //lib/OWNERS") {
 		t.Errorf("an open CL's submit: %q", reason)
+	}
+
+	// The dashboard, from the directory's inbox: the CL waits on bob's review, and is alice's in
+	// flight, waiting on no one's reply of hers; the palette finds it in bob's by its number and by
+	// words of its title, and offers the repository it is asked from.
+	section := func(p page, key string) string {
+		i := strings.Index(p.body, `data-dashboard="`+key+`"`)
+		if i < 0 {
+			return ""
+		}
+		return p.body[i : i+strings.Index(p.body[i:], "</section>")]
+	}
+	e.waitFor("the review waiting on bob, on his dashboard", func() bool {
+		return strings.Contains(section(e.get(bob, "/"), "waiting"), `href="`+path+`"`)
+	})
+	if waiting := section(e.get(bob, "/"), "waiting"); !strings.Contains(waiting, "two from lib") || !strings.Contains(waiting, "Needs Review") {
+		t.Errorf("bob's waiting list: %q", waiting)
+	}
+	e.waitFor("alice's CL in flight, on her dashboard", func() bool {
+		return strings.Contains(section(e.get(alice, "/"), "yours"), `href="`+path+`"`)
+	})
+	if waiting := section(e.get(alice, "/"), "waiting"); strings.Contains(waiting, `href="`+path+`"`) {
+		t.Errorf("alice's own CL waits on her: %q", waiting)
+	}
+	for _, q := range []string{fmt.Sprintf("#%d", cl), "TWO from"} {
+		if p := e.get(bob, "/repositories/palette?"+url.Values{"q": {q}, "repo": {"example/svc"}}.Encode()); !p.has(`href="` + path + `"`) {
+			t.Errorf("the palette for %q: %s", q, excerpt(p.body))
+		}
+	}
+	if p := e.get(carol, "/repositories/palette?"+url.Values{"repo": {"example/svc"}}.Encode()); !p.has(`href="/example/svc/cls"`) || !p.has(`href="/example/svc/search"`) {
+		t.Errorf("the palette in example/svc: %s", excerpt(p.body))
+	}
+	if p := e.get(carol, "/repositories/palette?"+url.Values{"repo": {"../svc"}}.Encode()); p.has(`href="/../svc`) {
+		t.Errorf("the palette took a repository named %q: %s", "../svc", excerpt(p.body))
 	}
 
 	// bob comments on a line: unresolved, it holds the CL back.

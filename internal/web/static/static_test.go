@@ -16,12 +16,12 @@ func TestServesWhatIsReferenced(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	paths := []string{"/htmx.min.js", "/hydrate.js", "/nav.js", "/infinite.js", "/livefilter.js", "/live.js", "/clipboard.js", "/fonts.css", "/favicon.svg"}
+	paths := []string{"/htmx.min.js", "/hydrate.js", "/progress.js", "/theme-init.js", "/theme.js", "/nav.js", "/infinite.js", "/livefilter.js", "/live.js", "/clipboard.js", "/fonts.css", "/shell.css", "/favicon.svg"}
 	for _, m := range regexp.MustCompile(`url\('/assets(/[^']+)'\)`).FindAllStringSubmatch(string(css), -1) {
 		paths = append(paths, m[1])
 	}
-	if len(paths) < 14 {
-		t.Fatalf("fonts.css names %d fonts", len(paths)-8)
+	if len(paths) < 23 {
+		t.Fatalf("fonts.css names %d fonts", len(paths)-13)
 	}
 	h := Handler()
 	for _, p := range paths {

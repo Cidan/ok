@@ -29,14 +29,14 @@ import (
 const servicesEvents = "/services/events"
 
 templ ServicesPage(n nav.Model, v ServicesView) {
-	@layout.Shell(shell("Services · "+Brand, layout.LeftNav, n)) {
+	@layout.Shell(shell("Services · "+Brand, layout.TopNav, n)) {
 		@ServicesContent(v)
 	}
 }
 
 templ ServicesContent(v ServicesView) {
 	<div class="flex h-full flex-1 flex-col overflow-hidden">
-		<div class="shrink-0">
+		<div class="shrink-0 overflow-hidden [scrollbar-gutter:stable]">
 			@PageHead("Services", "What ok deploys, and what runs.", "")
 		</div>
 		<div id="services" data-hydrate class="hydrating flex-1 overflow-y-auto">
@@ -49,14 +49,28 @@ templ ServicesContent(v ServicesView) {
 	</div>
 }
 
-// serviceGroupsPanel is the list of groups: what #service-groups refreshes.
+// serviceGroupsPanel is the list of groups — under a count of them by how they stand — which
+// #service-groups refreshes.
 templ serviceGroupsPanel(v ServicesView) {
+	if v.Error == "" {
+		<div data-service-counts class="mb-6 grid grid-cols-2 gap-3 sm:grid-cols-4">
+			for _, c := range serviceCounts(v.Groups) {
+				<div class="rounded-2xl border border-line bg-surface px-4 py-3.5 shadow-panel">
+					<div class={ "text-3xl font-semibold tracking-tight tabular-nums", templ.KV(toneTextClass(c.Tone), c.N > 0), templ.KV("text-faint", c.N == 0) }>{ strconv.Itoa(c.N) }</div>
+					<div class="mt-0.5 flex items-center gap-1.5 text-xs font-medium text-subtle">
+						@statusDot(c.Tone, c.Label)
+						{ c.Label }
+					</div>
+				</div>
+			}
+		</div>
+	}
 	@panel() {
 		@panelHead() {
 			<h3>Services</h3>
 			<span class="flex-1"></span>
 			if v.Error == "" {
-				<span class="text-zinc-500">{ strconv.Itoa(len(v.Groups)) }</span>
+				<span class="text-subtle">{ strconv.Itoa(len(v.Groups)) }</span>
 			}
 		}
 		if v.Error != "" {
@@ -68,7 +82,7 @@ templ serviceGroupsPanel(v ServicesView) {
 				No repository declares a service yet.
 			}
 		} else {
-			<div class="divide-y divide-zinc-800/70">
+			<div class="divide-y divide-line-soft">
 				for _, g := range v.Groups {
 					@serviceGroupRow(g)
 				}
@@ -80,18 +94,18 @@ templ serviceGroupsPanel(v ServicesView) {
 // serviceGroupRow is a group in the list: its name and what it holds, the reason for its status,
 // a dot for each service's status, the deployment ok made last, and its status in aggregate.
 templ serviceGroupRow(g ServiceGroup) {
-	<div class="flex items-start gap-4 px-4 py-3 text-sm transition-colors hover:bg-zinc-900/40">
+	<div data-service-group class="flex items-start gap-4 px-4 py-3 text-sm transition-colors hover:bg-hover">
 		<div class="min-w-0 flex-1">
 			<div class="flex items-center gap-2">
-				<a href={ templ.SafeURL(g.Href()) } hx-get={ g.Href() } hx-target="#content" hx-swap={ swapNav } hx-push-url="true" class="truncate font-medium text-zinc-100 transition-colors hover:text-sky-300">{ g.Name }</a>
+				<a href={ templ.SafeURL(g.Href()) } hx-get={ g.Href() } hx-target="#content" hx-swap={ swapNav } hx-push-url="true" class="truncate font-medium text-fg transition-colors hover:text-accent-fg">{ g.Name }</a>
 				if !g.Declared() {
 					@chip(toneNeutral) {
 						No Longer Declared
 					}
 				}
 			</div>
-			<div class="mt-0.5 truncate text-zinc-500">{ g.Detail() }</div>
-			<div class="mt-0.5 break-words text-zinc-400">
+			<div class="mt-0.5 truncate text-subtle">{ g.Detail() }</div>
+			<div class="mt-0.5 break-words text-muted">
 				if g.Reason != "" {
 					{ g.Reason }
 				} else {
@@ -106,19 +120,19 @@ templ serviceGroupRow(g ServiceGroup) {
 				}
 			</div>
 			if sv, ok := g.Newest(); ok {
-				<div class="mt-0.5 flex min-w-0 items-center gap-1.5 whitespace-nowrap text-zinc-500">
-					@contentLink(sv.CommitHref, "font-mono transition-colors hover:text-zinc-300") {
+				<div class="mt-0.5 flex min-w-0 items-center gap-1.5 whitespace-nowrap text-subtle">
+					@contentLink(sv.CommitHref, "font-mono transition-colors hover:text-body") {
 						{ sv.Commit }
 					}
 					if sv.CL != 0 {
-						<span class="text-zinc-700">·</span>
-						@contentLink(sv.CLHref, "text-sky-400 transition-colors hover:text-sky-300") {
+						<span class="text-ghost">·</span>
+						@contentLink(sv.CLHref, "text-accent-fg transition-colors hover:text-fg") {
 							CL #{ strconv.FormatInt(sv.CL, 10) }
 						}
 					}
 				</div>
 			} else {
-				<div class="mt-0.5 text-zinc-600">Not deployed</div>
+				<div class="mt-0.5 text-faint">Not deployed</div>
 			}
 		</div>
 		<div class="flex w-40 shrink-0 flex-col items-end gap-1">
@@ -126,7 +140,7 @@ templ serviceGroupRow(g ServiceGroup) {
 				{ g.StatusLabel }
 			}
 			if sv, ok := g.Newest(); ok {
-				<span class="whitespace-nowrap text-zinc-600" title={ sv.AgeTitle }>{ sv.Age }</span>
+				<span class="whitespace-nowrap text-faint" title={ sv.AgeTitle }>{ sv.Age }</span>
 			}
 		</div>
 	</div>
@@ -142,7 +156,7 @@ templ contentLink(href, class string) {
 
 // --- A group's page ----------------------------------------------------------------------
 templ ServiceGroupPage(n nav.Model, v ServiceGroupView) {
-	@layout.Shell(shell(serviceGroupTitle(v), layout.LeftNav, n)) {
+	@layout.Shell(shell(serviceGroupTitle(v), layout.TopNav, n)) {
 		@ServiceGroupContent(v)
 	}
 }
@@ -151,7 +165,7 @@ templ ServiceGroupPage(n nav.Model, v ServiceGroupView) {
 // of its services, and the pane.
 templ ServiceGroupContent(v ServiceGroupView) {
 	<div class="flex h-full flex-1 flex-col overflow-hidden">
-		<div class="shrink-0">
+		<div class="shrink-0 overflow-hidden [scrollbar-gutter:stable]">
 			@PageHeadWide(v.Group.Name, v.Group.Detail(), "")
 		</div>
 		<div class="flex min-h-0 flex-1 gap-6 pl-6 sm:pl-10">
@@ -241,7 +255,7 @@ templ serviceNavOOB(v ServiceGroupView) {
 templ serviceNavRows(v ServiceGroupView) {
 	if v.Group.Overview() {
 		@serviceNavRow(v.Group.Href(), v.Selected == 0) {
-			<span class="flex h-4 w-4 shrink-0 items-center justify-center text-zinc-500">
+			<span class="flex h-4 w-4 shrink-0 items-center justify-center text-subtle">
 				@iconOverview()
 			</span>
 			<span class="min-w-0 flex-1 truncate">Overview</span>
@@ -252,7 +266,7 @@ templ serviceNavRows(v ServiceGroupView) {
 			<span class="flex h-4 w-4 shrink-0 items-center justify-center">
 				@statusDot(serviceStatusTone(sv.StatusKind), sv.StatusLabel)
 			</span>
-			<span class={ "min-w-0 flex-1 truncate", templ.KV("text-zinc-500", !sv.Declared) } title={ serviceNavTitle(sv) }>{ sv.Name }</span>
+			<span class={ "min-w-0 flex-1 truncate", templ.KV("text-subtle", !sv.Declared) } title={ serviceNavTitle(sv) }>{ sv.Name }</span>
 		}
 	}
 }
@@ -292,18 +306,18 @@ templ serviceGroupStatusPanel(g ServiceGroup) {
 				@runInfoRow("Healthy", g.Healthy())
 				if sv, ok := g.Newest(); ok {
 					<div class="flex min-h-[1.625rem] items-start gap-3 leading-[1.625rem]">
-						<dt class="w-28 shrink-0 text-zinc-500">Last Deployed</dt>
+						<dt class="w-28 shrink-0 text-subtle">Last Deployed</dt>
 						<dd class="flex min-w-0 flex-wrap items-center gap-2">
-							<span class="text-zinc-300">{ sv.Name }</span>
-							@contentLink(sv.CommitHref, "font-mono text-zinc-400 transition-colors hover:text-zinc-200") {
+							<span class="text-body">{ sv.Name }</span>
+							@contentLink(sv.CommitHref, "font-mono text-muted transition-colors hover:text-fg") {
 								{ sv.Commit }
 							}
 							if sv.CL != 0 {
-								@contentLink(sv.CLHref, "text-sky-400 transition-colors hover:text-sky-300") {
+								@contentLink(sv.CLHref, "text-accent-fg transition-colors hover:text-fg") {
 									CL #{ strconv.FormatInt(sv.CL, 10) }
 								}
 							}
-							<span class="text-zinc-600" title={ sv.AgeTitle }>{ sv.Age }</span>
+							<span class="text-faint" title={ sv.AgeTitle }>{ sv.Age }</span>
 						</dd>
 					</div>
 				} else {
@@ -324,13 +338,13 @@ templ serviceMembersPanel(g ServiceGroup) {
 			<span class="hidden w-56 shrink-0 lg:block">Deployed</span>
 			<span class="w-16 shrink-0 text-right">Ready</span>
 		}
-		<div class="divide-y divide-zinc-800/70">
+		<div class="divide-y divide-line-soft">
 			for _, sv := range g.Members {
-				<div class="flex items-start gap-3 px-4 py-3 text-sm transition-colors hover:bg-zinc-900/40">
+				<div class="flex items-start gap-3 px-4 py-3 text-sm transition-colors hover:bg-hover">
 					<div class="min-w-0 flex-1">
-						<a href={ templ.SafeURL(ServiceHref(sv.ID)) } hx-get={ ServiceHref(sv.ID) } hx-target="#service-main" hx-swap={ swapPane } hx-push-url="true" class="block truncate font-medium text-zinc-100 transition-colors hover:text-sky-300">{ sv.Name }</a>
-						<div class="mt-0.5 truncate text-zinc-500">{ sv.Repository } · { sv.Workload }</div>
-						<div class="mt-0.5 break-words text-zinc-400">
+						<a href={ templ.SafeURL(ServiceHref(sv.ID)) } hx-get={ ServiceHref(sv.ID) } hx-target="#service-main" hx-swap={ swapPane } hx-push-url="true" class="block truncate font-medium text-fg transition-colors hover:text-accent-fg">{ sv.Name }</a>
+						<div class="mt-0.5 truncate text-subtle">{ sv.Repository } · { sv.Workload }</div>
+						<div class="mt-0.5 break-words text-muted">
 							if sv.Reason != "" {
 								{ sv.Reason }
 							} else {
@@ -350,27 +364,27 @@ templ serviceMembersPanel(g ServiceGroup) {
 					</div>
 					<div class="hidden w-56 shrink-0 lg:block">
 						if sv.DeployedID != 0 {
-							<div class="truncate font-mono text-zinc-300" title={ sv.Version }>{ sv.Version }</div>
-							<div class="mt-0.5 flex flex-wrap items-center gap-x-1.5 whitespace-nowrap text-zinc-500">
-								@contentLink(sv.CommitHref, "font-mono transition-colors hover:text-zinc-300") {
+							<div class="truncate font-mono text-body" title={ sv.Version }>{ sv.Version }</div>
+							<div class="mt-0.5 flex flex-wrap items-center gap-x-1.5 whitespace-nowrap text-subtle">
+								@contentLink(sv.CommitHref, "font-mono transition-colors hover:text-body") {
 									{ sv.Commit }
 								}
 								if sv.CL != 0 {
-									@contentLink(sv.CLHref, "text-sky-400 transition-colors hover:text-sky-300") {
+									@contentLink(sv.CLHref, "text-accent-fg transition-colors hover:text-fg") {
 										CL #{ strconv.FormatInt(sv.CL, 10) }
 									}
 								}
-								<span class="text-zinc-600" title={ sv.AgeTitle }>{ sv.Age }</span>
+								<span class="text-faint" title={ sv.AgeTitle }>{ sv.Age }</span>
 							</div>
 						} else {
-							<div class="text-zinc-600">Not deployed</div>
+							<div class="text-faint">Not deployed</div>
 						}
 					</div>
-					<div class="w-16 shrink-0 text-right text-zinc-300">
+					<div class="w-16 shrink-0 text-right text-body">
 						if sv.Found {
 							{ strconv.Itoa(int(sv.Ready)) }/{ strconv.Itoa(int(sv.Replicas)) }
 						} else {
-							<span class="text-zinc-600">—</span>
+							<span class="text-faint">—</span>
 						}
 					</div>
 				</div>
@@ -393,9 +407,9 @@ templ serviceStatusPanel(v ServiceView) {
 			<dl class="space-y-1.5 text-sm">
 				@runInfoRow("Why", v.Reason)
 				<div class="flex min-h-[1.625rem] items-start gap-3 leading-[1.625rem]">
-					<dt class="w-28 shrink-0 text-zinc-500">Repository</dt>
+					<dt class="w-28 shrink-0 text-subtle">Repository</dt>
 					<dd class="min-w-0">
-						@contentLink(v.RepositoryHref, "text-sky-400 transition-colors hover:text-sky-300") {
+						@contentLink(v.RepositoryHref, "text-accent-fg transition-colors hover:text-fg") {
 							{ v.Repository }
 						}
 					</dd>
@@ -422,26 +436,26 @@ templ serviceStatusPanel(v ServiceView) {
 // serviceDeploymentRow is a deployment in a status row: its status, commit, and CL, linked.
 templ serviceDeploymentRow(label string, d *ServiceDeployment) {
 	<div class="flex min-h-[1.625rem] items-start gap-3 leading-[1.625rem]">
-		<dt class="w-28 shrink-0 text-zinc-500">{ label }</dt>
+		<dt class="w-28 shrink-0 text-subtle">{ label }</dt>
 		if d == nil {
-			<dd class="text-zinc-600">—</dd>
+			<dd class="text-faint">—</dd>
 		} else {
 			<dd class="flex min-w-0 flex-wrap items-center gap-2">
 				@chip(deployStatusTone(d.StatusKind)) {
 					{ d.StatusLabel }
 				}
-				@contentLink(d.Href, "text-sky-400 transition-colors hover:text-sky-300") {
+				@contentLink(d.Href, "text-accent-fg transition-colors hover:text-fg") {
 					Deployment { strconv.FormatInt(d.ID, 10) }
 				}
-				@contentLink(d.CommitHref, "font-mono text-zinc-400 transition-colors hover:text-zinc-200") {
+				@contentLink(d.CommitHref, "font-mono text-muted transition-colors hover:text-fg") {
 					{ d.Commit }
 				}
 				if d.CL != 0 {
-					@contentLink(d.CLHref, "text-sky-400 transition-colors hover:text-sky-300") {
+					@contentLink(d.CLHref, "text-accent-fg transition-colors hover:text-fg") {
 						CL #{ strconv.FormatInt(d.CL, 10) }
 					}
 				}
-				<span class="text-zinc-600" title={ d.AgeTitle }>{ d.Age }</span>
+				<span class="text-faint" title={ d.AgeTitle }>{ d.Age }</span>
 			</dd>
 		}
 	</div>
@@ -455,11 +469,11 @@ templ serviceImagesPanel(v ServiceView) {
 				The cluster shows no images.
 			}
 		} else {
-			<div class="divide-y divide-zinc-800/70">
+			<div class="divide-y divide-line-soft">
 				for _, im := range v.Images {
 					<div class="px-4 py-3 text-sm">
 						<div class="flex items-center gap-2">
-							<span class="font-medium text-zinc-200">{ im.Container }</span>
+							<span class="font-medium text-fg">{ im.Container }</span>
 							<span class="flex-1"></span>
 							if im.Deployed != "" && !im.Matches {
 								@chip(toneWarn) {
@@ -469,15 +483,15 @@ templ serviceImagesPanel(v ServiceView) {
 						</div>
 						<dl class="mt-1 space-y-0.5">
 							<div class="flex gap-3">
-								<dt class="w-20 shrink-0 text-zinc-500">Running</dt>
-								<dd class="min-w-0 break-all font-mono text-zinc-300">{ im.Running }</dd>
+								<dt class="w-20 shrink-0 text-subtle">Running</dt>
+								<dd class="min-w-0 break-all font-mono text-body">{ im.Running }</dd>
 							</div>
 							<div class="flex gap-3">
-								<dt class="w-20 shrink-0 text-zinc-500">Deployed</dt>
+								<dt class="w-20 shrink-0 text-subtle">Deployed</dt>
 								if im.Deployed == "" {
-									<dd class="text-zinc-600">—</dd>
+									<dd class="text-faint">—</dd>
 								} else {
-									<dd class="min-w-0 break-all font-mono text-zinc-400">{ im.Deployed }</dd>
+									<dd class="min-w-0 break-all font-mono text-muted">{ im.Deployed }</dd>
 								}
 							</div>
 						</dl>
@@ -493,14 +507,14 @@ templ servicePodsPanel(v ServiceView) {
 		@panelHead() {
 			<h3>Pods</h3>
 			<span class="flex-1"></span>
-			<span class="text-zinc-500">{ strconv.Itoa(len(v.Pods)) }</span>
+			<span class="text-subtle">{ strconv.Itoa(len(v.Pods)) }</span>
 		}
 		if len(v.Pods) == 0 {
 			@panelEmpty() {
 				No pods run.
 			}
 		} else {
-			<div class="divide-y divide-zinc-800/70">
+			<div class="divide-y divide-line-soft">
 				for _, p := range v.Pods {
 					@servicePodRow(p)
 				}
@@ -512,7 +526,7 @@ templ servicePodsPanel(v ServiceView) {
 templ servicePodRow(p ServicePod) {
 	<div class="px-4 py-3 text-sm">
 		<div class="flex flex-wrap items-center gap-2">
-			<span class="min-w-0 truncate font-mono text-zinc-200">{ p.Name }</span>
+			<span class="min-w-0 truncate font-mono text-fg">{ p.Name }</span>
 			if p.Copy != "" {
 				@chip(toneNeutral) {
 					{ p.Copy }
@@ -532,18 +546,18 @@ templ servicePodRow(p ServicePod) {
 					Not Ready
 				}
 			}
-			<span class="w-24 shrink-0 text-right text-zinc-500">{ pluralCount(int(p.Restarts), "Restart", "Restarts") }</span>
-			<span class="w-28 shrink-0 whitespace-nowrap text-right text-zinc-600" title={ p.AgeTitle }>{ p.Age }</span>
+			<span class="w-24 shrink-0 text-right text-subtle">{ pluralCount(int(p.Restarts), "Restart", "Restarts") }</span>
+			<span class="w-28 shrink-0 whitespace-nowrap text-right text-faint" title={ p.AgeTitle }>{ p.Age }</span>
 		</div>
 		if p.Reason != "" {
-			<div class="mt-1 text-red-300">{ p.Reason }</div>
+			<div class="mt-1 text-danger">{ p.Reason }</div>
 		}
 		for _, im := range p.Images {
 			<div class="mt-1 flex gap-3">
-				<span class="w-20 shrink-0 text-zinc-500">{ im.Container }</span>
-				<span class="min-w-0 break-all font-mono text-zinc-400">{ im.Image }</span>
+				<span class="w-20 shrink-0 text-subtle">{ im.Container }</span>
+				<span class="min-w-0 break-all font-mono text-muted">{ im.Image }</span>
 				if !im.Matches {
-					<span class="shrink-0 text-amber-300">not deployed by ok</span>
+					<span class="shrink-0 text-warn">not deployed by ok</span>
 				}
 			</div>
 		}
@@ -560,31 +574,31 @@ templ serviceRecentPanel(recent []ServiceDeployment, named bool) {
 				Never deployed.
 			}
 		} else {
-			<div class="divide-y divide-zinc-800/70">
+			<div class="divide-y divide-line-soft">
 				for _, d := range recent {
-					<a href={ templ.SafeURL(d.Href) } hx-get={ d.Href } hx-target="#content" hx-swap={ swapNav } hx-push-url="true" class="flex items-start gap-3 px-4 py-2.5 text-sm transition-colors hover:bg-zinc-900/40">
+					<a href={ templ.SafeURL(d.Href) } hx-get={ d.Href } hx-target="#content" hx-swap={ swapNav } hx-push-url="true" class="flex items-start gap-3 px-4 py-2.5 text-sm transition-colors hover:bg-hover">
 						@chip(deployStatusTone(d.StatusKind)) {
 							{ d.StatusLabel }
 						}
 						<div class="min-w-0 flex-1">
 							<div class="flex flex-wrap items-center gap-x-2">
 								if named {
-									<span class="font-medium text-zinc-200">{ d.Service }</span>
+									<span class="font-medium text-fg">{ d.Service }</span>
 								}
-								<span class="font-mono text-zinc-300">Deployment { strconv.FormatInt(d.ID, 10) }</span>
-								<span class="font-mono text-zinc-500">{ d.Commit }</span>
+								<span class="font-mono text-body">Deployment { strconv.FormatInt(d.ID, 10) }</span>
+								<span class="font-mono text-subtle">{ d.Commit }</span>
 								if d.CL != 0 {
-									<span class="text-zinc-500">CL #{ strconv.FormatInt(d.CL, 10) }</span>
+									<span class="text-subtle">CL #{ strconv.FormatInt(d.CL, 10) }</span>
 								}
 								if d.Stage != "" {
-									<span class="text-zinc-500">{ d.Stage }</span>
+									<span class="text-subtle">{ d.Stage }</span>
 								}
 							</div>
 							if d.Reason != "" {
-								<div class="mt-0.5 break-words text-zinc-400">{ d.Reason }</div>
+								<div class="mt-0.5 break-words text-muted">{ d.Reason }</div>
 							}
 						</div>
-						<span class="shrink-0 whitespace-nowrap text-zinc-600" title={ d.AgeTitle }>{ d.Age }</span>
+						<span class="shrink-0 whitespace-nowrap text-faint" title={ d.AgeTitle }>{ d.Age }</span>
 					</a>
 				}
 			</div>

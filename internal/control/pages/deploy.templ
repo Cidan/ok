@@ -28,7 +28,7 @@ templ clDeploysRegion(d CLDeploys) {
 				<h3>Deployments</h3>
 				<span class="flex-1"></span>
 				if len(d.Items) > 0 {
-					<span class="text-zinc-500">{ strconv.Itoa(len(d.Items)) }</span>
+					<span class="text-subtle">{ strconv.Itoa(len(d.Items)) }</span>
 				}
 			}
 			switch  {
@@ -60,7 +60,7 @@ templ clDeploysRegion(d CLDeploys) {
 // clDeploymentRow is one deployment: its status, the deploy and where a running one is, its
 // workload, why it failed, and when.
 templ clDeploymentRow(d CLDeployment) {
-	<a href={ templ.SafeURL(d.Href) } hx-get={ d.Href } hx-target="#repo-main" hx-swap={ swapNav } hx-push-url="true" class="flex items-start gap-3 border-b border-zinc-800/70 px-4 py-2.5 text-sm transition-colors last:border-b-0 hover:bg-zinc-900/40">
+	<a href={ templ.SafeURL(d.Href) } hx-get={ d.Href } hx-target="#repo-main" hx-swap={ swapNav } hx-push-url="true" class="flex items-start gap-3 border-b border-line-soft px-4 py-2.5 text-sm transition-colors last:border-b-0 hover:bg-hover">
 		<span class="w-36 shrink-0">
 			@chip(deployStatusTone(d.StatusKind)) {
 				{ d.StatusLabel }
@@ -68,19 +68,19 @@ templ clDeploymentRow(d CLDeployment) {
 		</span>
 		<div class="min-w-0 flex-1 leading-6">
 			<div class="flex min-w-0 items-center gap-2">
-				<span class="truncate font-medium text-zinc-200">{ d.Name }</span>
+				<span class="truncate font-medium text-fg">{ d.Name }</span>
 				if d.Workload != "" {
-					<span class="truncate font-mono text-zinc-500">{ d.Workload }</span>
+					<span class="truncate font-mono text-subtle">{ d.Workload }</span>
 				}
 			</div>
 			if d.Stage != "" {
-				<div class="text-zinc-400">{ d.Stage }</div>
+				<div class="text-muted">{ d.Stage }</div>
 			}
 			if d.Reason != "" {
-				<div class="break-words text-zinc-400">{ d.Reason }</div>
+				<div class="break-words text-muted">{ d.Reason }</div>
 			}
 		</div>
-		<span class="shrink-0 whitespace-nowrap leading-6 text-zinc-600" title={ d.AgeTitle }>{ d.Age }</span>
+		<span class="shrink-0 whitespace-nowrap leading-6 text-faint" title={ d.AgeTitle }>{ d.Age }</span>
 	</a>
 }
 
@@ -88,19 +88,14 @@ templ clDeploymentRow(d CLDeployment) {
 // why, where it stands, what it pushed and migrated, and its log. While it runs, its status
 // panel and its log refresh themselves (docs/web.md, "Live regions").
 templ DeploymentViewPage(n nav.Model, v DeploymentView) {
-	@layout.Shell(shell(v.Name+" · Deployment "+strconv.FormatInt(v.ID, 10)+" · "+v.Chrome.Name+" · "+Brand, layout.LeftNav, n)) {
+	@layout.Shell(shell(v.Name+" · Deployment "+strconv.FormatInt(v.ID, 10)+" · "+v.Chrome.Name+" · "+Brand, layout.TopNav, n)) {
 		@DeploymentViewContent(v)
 	}
 }
 
 templ DeploymentViewContent(v DeploymentView) {
-	<div class="flex h-full flex-1 flex-col overflow-hidden">
-		<div class="shrink-0">
-			@PageHead(v.Chrome.Name, v.Chrome.Subtitle, "") {
-				@changesLink(v.Chrome.ChangesHref, "#repo-main")
-				@codeButton(v.Chrome.Clone)
-			}
-		</div>
+	<div class="group/repo flex h-full flex-1 flex-col overflow-hidden">
+		@repoHead(v.Chrome, tabChanges, "#repo-main", false)
 		<div id="repo-main" data-hydrate class="hydrating flex-1 overflow-y-auto">
 			@DeploymentViewMain(v)
 		</div>
@@ -108,17 +103,17 @@ templ DeploymentViewContent(v DeploymentView) {
 }
 
 templ DeploymentViewMain(v DeploymentView) {
-	<div class="mx-auto w-full max-w-[92rem] px-6 pb-16 sm:px-10 lg:px-12">
+	<div data-wide class="mx-auto w-full max-w-[100rem] px-6 pt-6 pb-16 sm:px-10 lg:px-12">
 		<div class="mb-5 flex min-w-0 items-start gap-4">
 			<div class="min-w-0 flex-1">
 				<div class="flex items-center gap-2.5 text-sm">
 					if v.CLHref != "" {
-						<a href={ templ.SafeURL(v.CLHref) } hx-get={ v.CLHref } hx-target="#repo-main" hx-swap="innerHTML swap:70ms settle:1ms" hx-push-url="true" class="text-sky-400 transition-colors hover:text-sky-300">CL #{ strconv.FormatInt(v.CLNumber, 10) }</a>
-						<span class="text-zinc-600">/</span>
+						<a href={ templ.SafeURL(v.CLHref) } hx-get={ v.CLHref } hx-target="#repo-main" hx-swap={ swapNav } hx-push-url="true" class="text-accent-fg transition-colors hover:text-fg">CL #{ strconv.FormatInt(v.CLNumber, 10) }</a>
+						<span class="text-faint">/</span>
 					}
-					<span class="font-mono text-zinc-500">Deployment { strconv.FormatInt(v.ID, 10) }</span>
+					<span class="font-mono text-subtle">Deployment { strconv.FormatInt(v.ID, 10) }</span>
 				</div>
-				<h2 class="mt-2 truncate font-mono text-xl font-semibold tracking-tight text-zinc-50">{ v.Name }</h2>
+				<h2 class="mt-2 truncate font-mono text-xl font-semibold tracking-tight text-fg">{ v.Name }</h2>
 			</div>
 			<div class="flex shrink-0 items-center gap-2 pt-6">
 				if v.AllowHref != "" {
@@ -133,7 +128,10 @@ templ DeploymentViewMain(v DeploymentView) {
 			</div>
 		</div>
 		if v.Notice != "" {
-			<div class="mb-4 rounded-lg border border-amber-700/50 bg-amber-500/10 px-4 py-2.5 text-sm text-amber-300">{ v.Notice }</div>
+			<div data-notice class="mb-4 flex items-start gap-2.5 rounded-xl border border-warn-line bg-warn-soft px-4 py-3 text-sm text-warn">
+				@iconAlert()
+				<span>{ v.Notice }</span>
+			</div>
 		}
 		<div class="grid items-start gap-4 lg:grid-cols-3">
 			<div class="space-y-4 lg:col-span-1">
@@ -191,9 +189,9 @@ templ deploymentStatus(v DeploymentView) {
 
 templ clDeploymentCommitRow(v DeploymentView) {
 	<div class="flex min-h-[1.625rem] items-center gap-3">
-		<dt class="w-28 shrink-0 text-zinc-500">Commit</dt>
+		<dt class="w-28 shrink-0 text-subtle">Commit</dt>
 		<dd class="min-w-0 truncate">
-			<a href={ templ.SafeURL(v.CommitHref) } hx-get={ v.CommitHref } hx-target="#repo-main" hx-swap="innerHTML swap:70ms settle:1ms" hx-push-url="true" class="font-mono text-sky-400 transition-colors hover:text-sky-300">{ v.Commit }</a>
+			<a href={ templ.SafeURL(v.CommitHref) } hx-get={ v.CommitHref } hx-target="#repo-main" hx-swap={ swapNav } hx-push-url="true" class="font-mono text-accent-fg transition-colors hover:text-fg">{ v.Commit }</a>
 		</dd>
 	</div>
 }
@@ -206,21 +204,21 @@ templ deploymentImages(v DeploymentView) {
 				It only migrates.
 			}
 		} else {
-			<div class="divide-y divide-zinc-800/70">
+			<div class="divide-y divide-line-soft">
 				for _, im := range v.Images {
 					<div class="px-4 py-3 text-sm">
 						<div class="flex items-center gap-2">
-							<span class="font-medium text-zinc-200">{ im.Container }</span>
+							<span class="font-medium text-fg">{ im.Container }</span>
 							<span class="flex-1"></span>
 							if im.Run != 0 {
-								<span class="font-mono text-zinc-500">Push Run { strconv.FormatInt(im.Run, 10) }</span>
+								<span class="font-mono text-subtle">Push Run { strconv.FormatInt(im.Run, 10) }</span>
 							}
 						</div>
-						<div class="mt-0.5 truncate font-mono text-zinc-500">{ im.Target }</div>
+						<div class="mt-0.5 truncate font-mono text-subtle">{ im.Target }</div>
 						if im.Reference != "" {
-							<div class="mt-0.5 break-all font-mono text-zinc-400">{ im.Reference }</div>
+							<div class="mt-0.5 break-all font-mono text-muted">{ im.Reference }</div>
 						} else {
-							<div class="mt-0.5 text-zinc-600">Not pushed yet</div>
+							<div class="mt-0.5 text-faint">Not pushed yet</div>
 						}
 					</div>
 				}
@@ -237,7 +235,7 @@ templ deploymentMigrations(v DeploymentView) {
 				No migrations.
 			}
 		} else {
-			<div class="divide-y divide-zinc-800/70">
+			<div class="divide-y divide-line-soft">
 				for _, m := range v.Migrations {
 					@deploymentMigration(m)
 				}
@@ -249,24 +247,24 @@ templ deploymentMigrations(v DeploymentView) {
 templ deploymentMigration(m DeploymentMigration) {
 	<div class="px-4 py-3 text-sm">
 		<div class="flex items-center gap-2">
-			<span class="min-w-0 flex-1 truncate font-mono text-zinc-200">{ m.Target }</span>
+			<span class="min-w-0 flex-1 truncate font-mono text-fg">{ m.Target }</span>
 			@chip(deployStatusTone(m.StatusKind)) {
 				{ m.StatusLabel }
 			}
 		</div>
 		if len(m.Refused) > 0 {
-			<p class="mt-2 text-amber-300">Its plan carries gated hazards: { strings.Join(m.Refused, ", ") }. A repository admin allows them, and it applies again with them.</p>
+			<p class="mt-2 text-warn">Its plan carries gated hazards: { strings.Join(m.Refused, ", ") }. A repository admin allows them, and it applies again with them.</p>
 		}
 		if m.AllowedBy != "" {
-			<p class="mt-2 text-zinc-400">{ m.AllowedBy } allowed { strings.Join(m.Allowed, ", ") }.</p>
+			<p class="mt-2 text-muted">{ m.AllowedBy } allowed { strings.Join(m.Allowed, ", ") }.</p>
 		}
 		if len(m.Steps) > 0 {
 			<ol class="mt-2 space-y-2">
 				for i, st := range m.Steps {
-					<li class="rounded-lg border border-zinc-800 px-3 py-2">
+					<li class="rounded-lg border border-line bg-sunken px-3 py-2">
 						<div class="flex flex-wrap items-center gap-2">
-							<span class="text-zinc-500">{ strconv.Itoa(i+1) }.</span>
-							<span class="text-zinc-300">{ st.Description }</span>
+							<span class="text-subtle">{ strconv.Itoa(i+1) }.</span>
+							<span class="text-body">{ st.Description }</span>
 							for _, h := range st.Hazards {
 								if h.Gated {
 									@chip(toneDanger) {
@@ -279,15 +277,15 @@ templ deploymentMigration(m DeploymentMigration) {
 								}
 							}
 						</div>
-						<pre class="mt-1.5 overflow-x-auto whitespace-pre-wrap break-words font-mono text-[12.5px] leading-[1.6] text-zinc-400">{ st.SQL }</pre>
+						<pre class="mt-1.5 overflow-x-auto whitespace-pre-wrap break-words font-mono text-[12.5px] leading-[1.6] text-muted">{ st.SQL }</pre>
 					</li>
 				}
 			</ol>
 		}
 		if m.Output != "" {
 			<details class="mt-2">
-				<summary class="cursor-pointer text-zinc-500 transition-colors hover:text-zinc-300">Output</summary>
-				<pre class="mt-1.5 max-h-96 overflow-auto whitespace-pre-wrap break-words font-mono text-[12.5px] leading-[1.6] text-zinc-400">{ m.Output }</pre>
+				<summary class="cursor-pointer text-subtle transition-colors hover:text-body">Output</summary>
+				<pre class="mt-1.5 max-h-96 overflow-auto whitespace-pre-wrap break-words font-mono text-[12.5px] leading-[1.6] text-muted">{ m.Output }</pre>
 			</details>
 		}
 	</div>
@@ -301,11 +299,11 @@ templ deploymentLog(v DeploymentView) {
 				Nothing yet.
 			}
 		} else {
-			<ol class="divide-y divide-zinc-800/70">
+			<ol class="divide-y divide-line-soft">
 				for _, e := range v.Events {
 					<li class="flex items-start gap-3 px-4 py-2 text-sm">
-						<span class="w-20 shrink-0 whitespace-nowrap text-zinc-600" title={ e.AtTitle }>{ e.At }</span>
-						<span class="min-w-0 flex-1 break-words text-zinc-300">{ e.Message }</span>
+						<span class="min-w-28 shrink-0 whitespace-nowrap text-faint" title={ e.AtTitle }>{ e.At }</span>
+						<span class="min-w-0 flex-1 break-words text-body">{ e.Message }</span>
 					</li>
 				}
 			</ol>

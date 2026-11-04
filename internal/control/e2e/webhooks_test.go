@@ -42,7 +42,7 @@ func TestWebhooks(t *testing.T) {
 	}))
 	defer srv.Close()
 	base := "/example/hooked/webhooks"
-	if !e.get(alice, "/example/hooked").has(`id="webhooks-link"`) || e.get(bob, "/example/hooked").has(`id="webhooks-link"`) {
+	if !e.get(alice, "/example/hooked").has(`href="/example/hooked/webhooks"`) || e.get(bob, "/example/hooked").has(`href="/example/hooked/webhooks"`) {
 		t.Error("the repository's page links its webhooks for its administrator alone")
 	}
 	if p := e.do(bob, http.MethodGet, base, nil, nil); p.status != http.StatusForbidden {

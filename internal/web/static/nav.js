@@ -91,24 +91,47 @@
     { passive: true },
   );
 
-  // updateActive refreshes the active highlight on every navigation. The rail is persistent
+  // updateActive re-marks the active destination on every navigation. The rail is persistent
   // (never swapped — see nav.templ), so after an htmx swap the server can't re-mark the active
-  // item; we do it here from the pushed URL, mirroring Model.IsActive (prefix match) and the
-  // activeRow classes (bg-zinc-800/900 + text-zinc-100). Only [data-nav-link] links (section
-  // rows, footer, TopBar items — not the Actions, unless HighlightActions) are eligible. text-zinc-400
-  // stays on the element (as in the server markup); we only toggle the active bg + text-zinc-100.
-  function isActive(cur, p) {
+  // item; we do it here from the pushed URL, mirroring Model.IsActive: a link's patterns
+  // (data-nav-match, space-separated) are "/" for the root alone, a path for itself and below, a
+  // path ending in "$" for itself alone, and "*" for any path no other link matches. The active link carries aria-current="page",
+  // which the nav's aria-[current=page] variants style. Only [data-nav-link] links (section
+  // rows, footer, TopBar items — not the Actions, unless HighlightActions) are eligible.
+  function matchPath(cur, p) {
     if (!p || p === '#') return false;
     if (p === '/') return cur === '/';
+    if (p.endsWith('$')) return cur === p.slice(0, -1);
     return cur === p || cur.indexOf(p + '/') === 0;
   }
+  function patterns(a) {
+    return (
+      a.getAttribute('data-nav-match') ||
+      a.getAttribute('hx-get') ||
+      a.getAttribute('href') ||
+      ''
+    )
+      .split(/\s+/)
+      .filter(Boolean);
+  }
+  // A "*" link is current when no other link of its group — its nearest [data-nav-group] (the
+  // rail, the top bar, or an app's own set of links, such as tabs) — is.
   function updateActive() {
     var cur = location.pathname;
+    var groups = new Map();
     document.querySelectorAll('a[data-nav-link]').forEach((a) => {
-      var on = isActive(cur, a.getAttribute('hx-get') || a.getAttribute('href'));
-      var bg = a.closest('header') ? 'bg-zinc-900' : 'bg-zinc-800'; // TopBar vs rail
-      a.classList.toggle(bg, on);
-      a.classList.toggle('text-zinc-100', on);
+      var g = a.closest('[data-nav-group]') || document;
+      if (!groups.has(g)) groups.set(g, []);
+      groups.get(g).push(a);
+    });
+    groups.forEach((links) => {
+      var matched = links.map((a) => patterns(a).some((p) => p !== '*' && matchPath(cur, p)));
+      var any = matched.some(Boolean);
+      links.forEach((a, i) => {
+        var on = matched[i] || (!any && patterns(a).indexOf('*') >= 0);
+        if (on) a.setAttribute('aria-current', 'page');
+        else a.removeAttribute('aria-current');
+      });
     });
   }
   // The rail persists across content swaps, so re-mark the active item after each htmx swap

@@ -6,6 +6,8 @@ package pages
 import (
 	"encoding/json"
 	"net/http"
+	"net/url"
+	"path"
 	"strconv"
 	"strings"
 
@@ -17,16 +19,17 @@ import (
 	"github.com/Cidan/ok/internal/web/static"
 )
 
-// ok's head assets, served by Assets() at /assets. layout.Shell is app-neutral, so ok
-// lists exactly what its pages need: htmx (SPA content swaps), the hydration runtime, nav.js
-// (the rail drawer), infinite.js (the repository list), livefilter.js (the search box), live.js
-// (the live regions, refreshed as the server says what they show changed),
-// clipboard.js (the clone-URL copy buttons), and tree.js (the browser's file tree), plus its
-// fonts and Tailwind output. No
-// chat/figure/markdown/api.js — ok renders markup server-side.
+// ok's head assets, served by Assets() at /assets. layout.Shell is app-neutral, so ok lists
+// exactly what its pages need: htmx (SPA content swaps), the hydration runtime, the loading
+// feedback (progress.js) and the theme switch (theme.js), nav.js (the top bar's current
+// destination), infinite.js (the repository list), livefilter.js (the search box), live.js (the
+// live regions, refreshed as the server says what they show changed), clipboard.js (the clone-URL
+// copy buttons), tree.js (the browser's file tree), and ok.js (the command palette, the keyboard
+// shortcuts, the diff view), plus its fonts and Tailwind output. No chat/figure/markdown/api.js —
+// ok renders markup server-side.
 var styles = []string{"/assets/fonts.css", "/assets/app.css"}
 
-var scripts = []string{"/assets/htmx.min.js", "/assets/hydrate.js", "/assets/nav.js", "/assets/infinite.js", "/assets/livefilter.js", "/assets/live.js", "/assets/stars.js", "/assets/clcomments.js", "/assets/clipboard.js", "/assets/tree.js"}
+var scripts = []string{"/assets/htmx.min.js", "/assets/hydrate.js", "/assets/progress.js", "/assets/theme.js", "/assets/nav.js", "/assets/infinite.js", "/assets/livefilter.js", "/assets/live.js", "/assets/stars.js", "/assets/clcomments.js", "/assets/clipboard.js", "/assets/tree.js", "/assets/ok.js"}
 
 func shell(title string, variant layout.Variant, n nav.Model) layout.Props {
 	return layout.Props{
@@ -38,23 +41,35 @@ func shell(title string, variant layout.Variant, n nav.Model) layout.Props {
 		Scripts: scripts,
 		// Every page renders the whole document to a history restore (hxNav).
 		HistoryRestore: true,
+		// ok is light and dark (input.css's two themes).
+		Themes: true,
+		// The command palette and the keyboard shortcuts, over every page (palette.templ).
+		Overlay: overlay(),
 	}
 }
 
-// Brand is what the pages call the installation: in the navigation rail and every title. The
+// Brand is what the pages call the installation: in the top bar and every title. The
 // installation's configuration names it (installation); set it before serving.
 var Brand = "ok"
 
-// NavModel builds the left rail for the given request path (active-state prefix match).
+// NavModel builds ok's top bar for the given request path (active-state prefix match): the mark
+// and Brand, Home, Repositories — the finder, and everything that is neither Home nor another
+// destination, so it stays current inside every repository — Services, and Notifications; the
+// search field that opens the command palette in the middle; the theme control at the end.
 func NavModel(current string) nav.Model {
 	return nav.Model{
 		Brand: nav.Item{Label: Brand, Href: "/", Icon: "bolt"},
+		Logo:  okMark("h-7 w-7"),
 		Actions: []nav.Item{
-			{Label: "Repositories", Href: "/", Icon: "repo"},
-			{Label: "Services", Href: "/services", Icon: "server"},
+			{Label: "Home", Href: "/", Icon: "home", Shortcut: "g h"},
+			{Label: "Repositories", Href: "/repositories", Icon: "repo", Match: "/repositories *", Shortcut: "g r"},
+			{Label: "Services", Href: "/services", Icon: "server", Shortcut: "g s"},
+			{Label: "Notifications", Href: "/notifications", Icon: "bell", Shortcut: "g n"},
 		},
 		Current:          current,
 		HighlightActions: true,
+		ThemeToggle:      true,
+		Center:           searchTrigger(),
 	}
 }
 
@@ -67,21 +82,6 @@ type RepoItem struct {
 	Link         string
 	Starred      bool
 	UpdatedUnix  int64
-	UpdatedAgo   string
-	UpdatedTitle string
-}
-
-// InboxItem is a CL in the signed-in person's inbox (docs/hosted.md, "ok control at scale, as
-// built"), whichever cell holds it.
-type InboxItem struct {
-	Repository string
-	Number     int64
-	Title      string
-	// Role is "author" or "reviewer"; Attention, that the CL waits on them.
-	Role         string
-	Attention    bool
-	Status       string
-	Link         string
 	UpdatedAgo   string
 	UpdatedTitle string
 }
@@ -146,6 +146,10 @@ type SearchLine struct {
 
 // ServeSearch renders a repository's code search.
 func ServeSearch(w http.ResponseWriter, r *http.Request, v SearchView) {
+	if hxTargetIs(r, "repo-main") {
+		render(w, r, SearchMain(v))
+		return
+	}
 	if hxNav(r) {
 		render(w, r, SearchContent(v))
 		return
@@ -183,6 +187,10 @@ type DeliveryItem struct {
 
 // ServeWebhooks renders a repository's webhooks.
 func ServeWebhooks(w http.ResponseWriter, r *http.Request, v WebhooksView) {
+	if hxTargetIs(r, "repo-main") {
+		render(w, r, WebhooksMain(v))
+		return
+	}
 	if hxNav(r) {
 		render(w, r, WebhooksContent(v))
 		return
@@ -190,24 +198,250 @@ func ServeWebhooks(w http.ResponseWriter, r *http.Request, v WebhooksView) {
 	render(w, r, WebhooksPage(NavModel(r.URL.Path), v))
 }
 
-// ServeHome renders the home repo-finder: the bare content fragment on an htmx navigation, the
-// full document otherwise. user is the signed-in person's handle; unread their unread
-// notifications; inbox their CLs under way;
-// keyword is the active search filter; page1 is the first batch of rows; url is the ?page=N rows
-// endpoint (carrying the keyword); hasMore says whether page 2 exists.
-func ServeHome(w http.ResponseWriter, r *http.Request, user string, unread int64, inbox []InboxItem, keyword string, page1 []RepoItem, url string,
-	pageSize int, hasMore bool) {
+// ServeRepositories renders the repository finder (/repositories): the bare content fragment on an
+// htmx navigation, the full document otherwise. user is the signed-in person's handle; keyword is the active search
+// filter; page1 is the first batch of rows; url is the ?page=N rows endpoint (carrying the
+// keyword); hasMore says whether page 2 exists.
+func ServeRepositories(w http.ResponseWriter, r *http.Request, user, keyword string, page1 []RepoItem, url string, pageSize int, hasMore bool) {
 	if hxNav(r) {
-		render(w, r, HomeContent(user, unread, inbox, keyword, page1, url, pageSize, hasMore))
+		render(w, r, RepositoriesContent(user, keyword, page1, url, pageSize, hasMore))
 		return
 	}
-	render(w, r, HomePage(NavModel(r.URL.Path), user, unread, inbox, keyword, page1, url, pageSize, hasMore))
+	render(w, r, RepositoriesPage(NavModel(r.URL.Path), user, keyword, page1, url, pageSize, hasMore))
 }
 
-// ServeHomeList renders just the repository list region — the fragment the search box (livefilter)
+// DashboardView is ok's home: who is signed in (User, their handle); their inbox, from every cell
+// — the CLs that wait on them (as their reviewer, or their author), theirs in flight that do not,
+// those they review that do not, and theirs lately landed — each CL in one list alone; their
+// unread notifications and the latest of them; the repositories (their favorites first); and
+// every group of services ok deploys. InboxError and ServicesError say why a part is missing when
+// the directory or the deployer could not be asked.
+type DashboardView struct {
+	User          string
+	Waiting       []CLItem
+	Yours         []CLItem
+	Reviewing     []CLItem
+	Landed        []CLItem
+	InboxError    string
+	Unread        int64
+	Notifications []NotificationItem
+	Repos         []RepoItem
+	Services      []ServiceGroup
+	ServicesError string
+}
+
+// ServeDashboard renders ok's home (/).
+func ServeDashboard(w http.ResponseWriter, r *http.Request, v DashboardView) {
+	if hxNav(r) {
+		render(w, r, DashboardContent(v))
+		return
+	}
+	render(w, r, DashboardPage(NavModel(r.URL.Path), v))
+}
+
+// PaletteView is the command palette's results for what the reader typed (Query): the pages and
+// commands it names, the current repository's (Repo — "" outside one), and the repositories, the
+// reader's CLs, and the services it finds. Without a query, CLs are the reader's in flight.
+type PaletteView struct {
+	Query    string
+	Repo     string
+	Repos    []RepoItem
+	CLs      []CLItem
+	Services []ServiceGroup
+}
+
+// ServePalette renders the palette's results.
+func ServePalette(w http.ResponseWriter, r *http.Request, v PaletteView) {
+	render(w, r, PaletteResults(v))
+}
+
+// paletteCommand is a page or a command the palette offers: a navigation (Href), a theme to
+// choose (Theme), or the keyboard shortcuts (Shortcuts), with the keys that also do it (Keys) or
+// what kind of thing it is (Hint). Keywords are more words it answers to.
+type paletteCommand struct {
+	Label     string
+	Href      string
+	Theme     string
+	Shortcuts bool
+	Icon      string
+	Keys      string
+	Hint      string
+	Keywords  string
+}
+
+// paletteCommands are the palette's pages and commands that answer to its query — every word of
+// it found in a command's name, kind, or keywords: where to go, what the current repository
+// offers (and, asked something there, a search of its code for it, or its CL of that number),
+// and the themes.
+func paletteCommands(v PaletteView) (jump, here, themes []paletteCommand) {
+	words := strings.Fields(strings.ToLower(v.Query))
+	match := func(cs []paletteCommand) []paletteCommand {
+		var out []paletteCommand
+		for _, c := range cs {
+			text := strings.ToLower(c.Label + " " + c.Hint + " " + c.Keywords)
+			ok := true
+			for _, w := range words {
+				ok = ok && strings.Contains(text, w)
+			}
+			if ok {
+				out = append(out, c)
+			}
+		}
+		return out
+	}
+	jump = match([]paletteCommand{
+		{Label: "Home", Href: "/", Icon: "home", Keys: "g h", Keywords: "dashboard start review queue"},
+		{Label: "Repositories", Href: "/repositories", Icon: "repo", Keys: "g r", Keywords: "repos finder all"},
+		{Label: "Services", Href: "/services", Icon: "server", Keys: "g s", Keywords: "deployments deploys health"},
+		{Label: "Notifications", Href: "/notifications", Icon: "bell", Keys: "g n", Keywords: "inbox mail unread"},
+		{Label: "New Repository", Href: "/repositories/new", Icon: "plus", Hint: "Create", Keywords: "create repo"},
+		{Label: "Keyboard Shortcuts", Shortcuts: true, Icon: "keyboard", Keys: "?", Keywords: "keys help hotkeys"},
+	})
+	if v.Repo != "" {
+		l := "/" + v.Repo
+		here = match([]paletteCommand{
+			{Label: "Code", Href: l, Icon: "code", Keys: "g c", Keywords: v.Repo + " files browse tree readme"},
+			{Label: "Changes", Href: l + "/cls", Icon: "changes", Keys: "g l", Keywords: v.Repo + " cls changelists review"},
+			{Label: "History", Href: l + "/commits", Icon: "history", Keys: "g y", Keywords: v.Repo + " commits log"},
+			{Label: "Search Code", Href: l + "/search", Icon: "search", Keys: "g f", Keywords: v.Repo + " find grep"},
+		})
+		if q := strings.TrimSpace(v.Query); q != "" {
+			if n, err := strconv.ParseInt(strings.TrimPrefix(q, "#"), 10, 64); err == nil && n > 0 {
+				here = append([]paletteCommand{{Label: "CL " + strconv.FormatInt(n, 10), Href: l + "/cl/" + strconv.FormatInt(n, 10), Icon: "changes", Hint: "Go to"}}, here...)
+			} else {
+				here = append([]paletteCommand{{Label: "Search the code for “" + q + "”", Href: l + "/search?" + url.Values{"q": {q}}.Encode(), Icon: "search", Hint: "Search"}}, here...)
+			}
+		}
+	}
+	themes = match([]paletteCommand{
+		{Label: "System Theme", Theme: "system", Icon: "monitor", Hint: "Theme", Keywords: "appearance mode auto"},
+		{Label: "Light Theme", Theme: "light", Icon: "sun", Hint: "Theme", Keywords: "appearance mode"},
+		{Label: "Dark Theme", Theme: "dark", Icon: "moon", Hint: "Theme", Keywords: "appearance mode"},
+	})
+	return jump, here, themes
+}
+
+// paletteCLGroup names the palette's CLs: the reader's in flight, or those of theirs the query found.
+func paletteCLGroup(v PaletteView) string {
+	if v.Query == "" {
+		return "Your Changes"
+	}
+	return "Changes"
+}
+
+// kickerClass is a kicker: the small label over a heading that says what it is a part of.
+const kickerClass = "text-xs font-semibold uppercase tracking-[0.14em] text-accent-fg"
+
+// dashboardSummary is the hero's line: what waits on the reader, and what of theirs is in flight.
+func dashboardSummary(v DashboardView) string {
+	if v.InboxError != "" {
+		return v.InboxError
+	}
+	waiting := "Nothing waits on you"
+	switch n := len(v.Waiting); n {
+	case 0:
+	case 1:
+		waiting = "One change waits on you"
+	default:
+		waiting = strconv.Itoa(n) + " changes wait on you"
+	}
+	review := waiting
+	switch n := inFlight(v); n {
+	case 0:
+		return review + ", and nothing of yours is in flight."
+	case 1:
+		return review + ", and one of yours is in flight."
+	default:
+		return review + ", and " + strconv.Itoa(n) + " of yours are in flight."
+	}
+}
+
+// inFlight is how many of the reader's own CLs are in flight: those of theirs that wait on their
+// reply, and those that do not.
+func inFlight(v DashboardView) int {
+	n := len(v.Yours)
+	for _, c := range v.Waiting {
+		if c.Waiting == waitingReply {
+			n++
+		}
+	}
+	return n
+}
+
+// Why a CL waits on the reader (CLItem.Waiting): their review, as its reviewer, or their reply to
+// its threads, as its author.
+const (
+	waitingReview = "Review"
+	waitingReply  = "Reply"
+)
+
+// WaitingFor is why a CL waits on the reader: as its author, their reply; as its reviewer, their
+// review.
+func WaitingFor(authored bool) string {
+	if authored {
+		return waitingReply
+	}
+	return waitingReview
+}
+
+// waitingLabel is why a CL waits on the reader, as its chip says.
+func waitingLabel(w string) string { return "Needs " + w }
+
+// repoInitial is a repository's monogram: the first letter of its name, past its owner.
+func repoInitial(name string) string {
+	if i := strings.LastIndexByte(name, '/'); i >= 0 {
+		name = name[i+1:]
+	}
+	return clInitial(name)
+}
+
+// servicesHealth is the hero's count of healthy services' groups, "—" when the deployer could not
+// be asked or nothing is deployed.
+func servicesHealth(v DashboardView) string {
+	if v.ServicesError != "" || len(v.Services) == 0 {
+		return "—"
+	}
+	healthy := 0
+	for _, g := range v.Services {
+		if g.StatusKind == "healthy" {
+			healthy++
+		}
+	}
+	return strconv.Itoa(healthy) + "/" + strconv.Itoa(len(v.Services))
+}
+
+// serviceStatusText colours a service's status where it is text, not a chip: in its tone.
+func serviceStatusText(kind string) string {
+	return toneTextClass(serviceStatusTone(kind))
+}
+
+// toneTextClass is a tone's text colour.
+func toneTextClass(tone string) string {
+	switch tone {
+	case toneSuccess:
+		return "text-success"
+	case toneDanger:
+		return "text-danger"
+	case toneInfo:
+		return "text-info"
+	case toneWarn:
+		return "text-warn"
+	default:
+		return "text-subtle"
+	}
+}
+
+// keyList is a shortcut's keys, as they are pressed: "g h" is g, then h.
+func keyList(keys string) []string { return strings.Fields(keys) }
+
+// paletteItemClass is a result of the palette: a row, lit while it is the one Enter opens
+// (aria-selected, kept by ok.js).
+const paletteItemClass = "group/item flex w-full cursor-pointer items-center gap-3 rounded-xl px-3 py-2 text-left text-sm text-body transition-colors hover:bg-hover aria-selected:bg-selected aria-selected:text-fg"
+
+// ServeRepositoryList renders just the repository list region — the fragment the search box (livefilter)
 // swaps into #repo-list for a keyword.
-func ServeHomeList(w http.ResponseWriter, r *http.Request, keyword string, page1 []RepoItem, url string, pageSize int, hasMore bool) {
-	render(w, r, HomeList(keyword, page1, url, pageSize, hasMore))
+func ServeRepositoryList(w http.ResponseWriter, r *http.Request, keyword string, page1 []RepoItem, url string, pageSize int, hasMore bool) {
+	render(w, r, RepositoryList(keyword, page1, url, pageSize, hasMore))
 }
 
 // NewRepoForm holds the create-repository form's field, echoed back on a validation error so
@@ -652,6 +886,8 @@ type BlameLine struct {
 
 // CLItem is one ChangeList row on the CL finder: its number, subject, author, status, and age.
 type CLItem struct {
+	Repository  string // its repository's name, where a list spans repositories ("" in a repository's own)
+	Waiting     string // why it waits on the reader, in a list of those that do: "Review" or "Reply"
 	Number      int64
 	Title       string
 	Author      string
@@ -1015,21 +1251,27 @@ func ServeServiceGroup(w http.ResponseWriter, r *http.Request, v ServiceGroupVie
 	}
 }
 
-// dotClass is a status dot's: the compact form of a chip's tone (statusDot).
+// dotClass is a status dot's: the compact form of a chip's tone (statusDot). The info tone is a
+// status still moving (deploying, running), so its dot pulses.
 func dotClass(tone string) string {
 	const base = "inline-block h-2 w-2 shrink-0 rounded-full "
 	switch tone {
 	case toneSuccess:
-		return base + "bg-emerald-400"
+		return base + "bg-success text-success"
 	case toneDanger:
-		return base + "bg-red-400"
+		return base + "bg-danger text-danger"
 	case toneInfo:
-		return base + "bg-sky-400"
+		return base + "q-pulse bg-info text-info"
 	case toneWarn:
-		return base + "bg-amber-400"
+		return base + "bg-warn text-warn"
 	default:
-		return base + "bg-zinc-500"
+		return base + "bg-faint text-faint"
 	}
+}
+
+// stillDotClass is dotClass without the info tone's pulse.
+func stillDotClass(tone string) string {
+	return strings.Replace(dotClass(tone), "q-pulse ", "", 1)
 }
 
 // ServeServiceGroupUnavailable answers a group's page when the deployer could not be asked: the
@@ -1041,6 +1283,32 @@ func ServeServiceGroupUnavailable(w http.ResponseWriter, r *http.Request, why st
 		return
 	}
 	ServeError(w, r, http.StatusServiceUnavailable, "Services Unavailable", why)
+}
+
+// serviceCount is how many groups of services stand one way.
+type serviceCount struct {
+	Label string
+	Tone  string
+	N     int
+}
+
+// serviceCounts counts the groups by how they stand: healthy, deploying, needing attention
+// (degraded, or their last deploy failed), and drifted from what ok deployed.
+func serviceCounts(groups []ServiceGroup) []serviceCount {
+	counts := []serviceCount{{"Healthy", toneSuccess, 0}, {"Deploying", toneInfo, 0}, {"Need Attention", toneDanger, 0}, {"Drifted", toneWarn, 0}}
+	for _, g := range groups {
+		switch g.StatusKind {
+		case "healthy":
+			counts[0].N++
+		case "deploying":
+			counts[1].N++
+		case "degraded", "failed":
+			counts[2].N++
+		case "drifted":
+			counts[3].N++
+		}
+	}
+	return counts
 }
 
 // serviceStatusTone maps a service's status to its chip tone.
@@ -1427,12 +1695,14 @@ func boolAttr(b bool) string {
 // hxTargetIs reports whether the htmx swap target (the HX-Target request header) is the element
 // with the given id. htmx v4 serialises the target as "<tag>#<id>" (e.g. "div#repo-main"), NOT
 // the bare id, so we compare the id part after the '#'.
-// The swap specs of a navigation. swapNav is every page's: a short fade of the region it
-// replaces. swapPane is the browser pane's, which scrolls back to the top, since the pane is
-// its own scroll container and keeps its scroll position across a swap.
+// The swap specs. swapNav is every navigation's: a short fade of the region it replaces, which
+// then starts at its top — a region that is its own scroll container (#repo-main, the browser's
+// pane) keeps its scroll position across a swap. swapPane is the browser pane's, the same.
+// swapAction is a form's, which re-renders the page it was posted from where the reader was.
 const (
-	swapNav  = "innerHTML swap:70ms settle:1ms"
-	swapPane = "innerHTML swap:70ms settle:1ms scroll:top"
+	swapNav    = "innerHTML swap:70ms settle:1ms scroll:top"
+	swapPane   = swapNav
+	swapAction = "innerHTML swap:70ms settle:1ms"
 )
 
 // PaneSwap is the swap spec of a navigation into the browser's pane (#browse-main), for the
@@ -1449,9 +1719,53 @@ func browseTitle(v BrowseView) string {
 	return t
 }
 
+// A repository's tabs (repoHead): its files, its CLs, main's history, a search of main's code, and
+// — for its administrators — its webhooks.
+const (
+	tabCode     = "code"
+	tabChanges  = "changes"
+	tabHistory  = "history"
+	tabSearch   = "search"
+	tabWebhooks = "webhooks"
+)
+
+// repoTabMatch is a tab's paths, for nav.js to keep the current tab current as the page beneath
+// the header changes (nav.Model.IsActive's patterns): Code is the repository's root alone and
+// its browser; Changes its CLs, their runs, and their deployments; History main's commits; Search
+// and Webhooks their pages.
+func repoTabMatch(c RepoChrome, tab string) string {
+	l := c.Link
+	switch tab {
+	case tabCode:
+		return l + "$ " + l + "/tree " + l + "/blame"
+	case tabChanges:
+		return l + "/cls " + l + "/cl " + l + "/deploy"
+	case tabSearch:
+		return l + "/search"
+	case tabWebhooks:
+		return l + "/webhooks"
+	default:
+		return l + "/commits " + l + "/commit"
+	}
+}
+
+// repoHeadWidth is the repository header's container: across the content region above the
+// browser (full); otherwise centered at the width of the page beneath it — the narrow pages',
+// growing to the wide pages' when #repo-main shows one (a [data-wide] root).
+func repoHeadWidth(full bool) string {
+	if full {
+		return "w-full px-6 sm:px-10"
+	}
+	return "mx-auto w-full max-w-5xl px-6 transition-[max-width,padding] duration-300 ease-out sm:px-10 group-has-[[data-wide]]/repo:max-w-[100rem] lg:group-has-[[data-wide]]/repo:px-12"
+}
+
+// segmentClass is one segment of a segmented control: links side by side in one bordered strip
+// (a file's History, Blame, and Raw).
+const segmentClass = "px-2.5 py-1 text-muted transition-colors hover:bg-hover-strong hover:text-fg"
+
 // treeRowClass is a row of the browser's tree — a folder's summary or a file's link — with the
 // row the pane shows (aria-current, set by the server and kept by tree.js) highlighted.
-const treeRowClass = "flex items-center gap-1.5 rounded-md py-1 pr-2 text-sm text-zinc-300 transition-colors hover:bg-zinc-900/70 aria-[current=page]:bg-zinc-800/80 aria-[current=page]:font-medium aria-[current=page]:text-zinc-50"
+const treeRowClass = "flex items-center gap-1.5 rounded-lg py-1 pr-2 text-sm text-body transition-colors hover:bg-hover hover:text-fg aria-[current=page]:bg-selected aria-[current=page]:font-medium aria-[current=page]:text-fg"
 
 // treeIndents are the tree's row indents by depth, written out so Tailwind sees each class: a
 // row spans the panel's width, so its highlight does too, and its content is inset by depth.
@@ -1467,7 +1781,7 @@ func treeLevel(depth int) string { return strconv.Itoa(depth + 1) }
 
 // iconBtnClass is a borderless icon button (copy, the Files panel's show/hide): the caller sets
 // its display, which may vary (hidden until a state applies).
-const iconBtnClass = "shrink-0 items-center justify-center rounded-md p-1.5 text-zinc-500 transition-colors hover:bg-zinc-800 hover:text-zinc-200"
+const iconBtnClass = "shrink-0 items-center justify-center rounded-lg p-1.5 text-subtle transition-colors hover:bg-hover-strong hover:text-fg"
 
 // hxNav reports whether a request is an htmx navigation that swaps a region of the page —
 // not a deep link, and not a history restore: on Back and Forward, htmx 4 fetches the page
@@ -1492,7 +1806,7 @@ func Navigate(w http.ResponseWriter, r *http.Request, href string) {
 		http.Redirect(w, r, href, http.StatusSeeOther)
 		return
 	}
-	loc, _ := json.Marshal(map[string]string{"path": href, "target": "#repo-main", "swap": "innerHTML swap:70ms settle:1ms"})
+	loc, _ := json.Marshal(map[string]string{"path": href, "target": "#repo-main", "swap": swapNav})
 	w.Header().Set("HX-Location", string(loc))
 	w.WriteHeader(http.StatusOK)
 }
@@ -1506,20 +1820,20 @@ const (
 	toneNeutral = "neutral"
 )
 
-// chipClass is the one chip style: a fixed size + shape, coloured by tone.
+// chipClass is the one chip style: a fixed size + shape (a pill), coloured by tone.
 func chipClass(tone string) string {
-	const base = "inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-md border px-2 text-sm leading-6 font-medium "
+	const base = "inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-full border px-2.5 text-sm leading-6 font-medium "
 	switch tone {
 	case toneSuccess:
-		return base + "border-emerald-700/50 bg-emerald-500/10 text-emerald-300"
+		return base + "border-success-line bg-success-soft text-success"
 	case toneDanger:
-		return base + "border-red-700/50 bg-red-500/10 text-red-300"
+		return base + "border-danger-line bg-danger-soft text-danger"
 	case toneInfo:
-		return base + "border-sky-700/50 bg-sky-500/10 text-sky-300"
+		return base + "border-info-line bg-info-soft text-info"
 	case toneWarn:
-		return base + "border-amber-700/50 bg-amber-500/10 text-amber-300"
+		return base + "border-warn-line bg-warn-soft text-warn"
 	default:
-		return base + "border-zinc-700 bg-zinc-800/40 text-zinc-300"
+		return base + "border-neutral-line bg-neutral-soft text-body"
 	}
 }
 
@@ -1532,21 +1846,111 @@ const (
 	btnDisabled  = "disabled"
 )
 
-// btnClass is the one button style.
+// btnClass is the one button style, flat — a fill and a border, no bevel or glow. Primary is the
+// accent, gold, lighter under the pointer; inverse the ink of the theme on its canvas; success
+// the green that lands a change; secondary a quiet raised control. A button whose request is in
+// flight shows a spinner (input.css's q-btn, in --btn-spin, the variant's text colour).
 func btnClass(variant string) string {
-	const base = "inline-flex shrink-0 items-center justify-center gap-1.5 rounded-lg border px-3 py-1.5 text-sm font-medium transition-colors "
+	const base = "q-btn relative inline-flex shrink-0 select-none items-center justify-center gap-1.5 rounded-lg border px-3 py-1.5 text-sm font-medium transition-[background-color,border-color,color,filter] duration-150 "
 	switch variant {
 	case btnPrimary:
-		return base + "cursor-pointer border-transparent bg-sky-500/90 text-white hover:bg-sky-500"
+		return base + "cursor-pointer border-transparent bg-accent text-on-accent [--btn-spin:var(--color-on-accent)] hover:bg-accent-hi"
 	case btnInverse:
-		return base + "cursor-pointer border-transparent bg-zinc-100 text-zinc-900 hover:bg-white"
+		return base + "cursor-pointer border-transparent bg-fg text-canvas [--btn-spin:var(--color-canvas)] hover:bg-body"
 	case btnSuccess:
-		return base + "cursor-pointer border-transparent bg-emerald-500/90 text-white hover:bg-emerald-500"
+		return base + "cursor-pointer border-transparent bg-success-solid text-on-success [--btn-spin:var(--color-on-success)] hover:brightness-110"
 	case btnDisabled:
-		return base + "cursor-not-allowed border-transparent bg-zinc-800 text-zinc-500"
+		return base + "cursor-not-allowed border-line bg-sunken text-faint"
 	default:
-		return base + "cursor-pointer border-zinc-700 bg-zinc-800 text-zinc-200 hover:bg-zinc-700"
+		return base + "cursor-pointer border-line-strong bg-raised text-body hover:border-faint hover:bg-hover-strong hover:text-fg"
 	}
+}
+
+// inputClass is the one text field (an input or a textarea): sunken, with the accent's ring when
+// it has focus.
+const inputClass = "w-full rounded-lg border border-line bg-sunken px-3 py-2 text-sm text-fg placeholder:text-faint transition-[border-color,box-shadow] focus:border-accent-line focus:outline-none focus:ring-4 focus:ring-accent-soft"
+
+// searchLines is how many lines a code search lists, across its files.
+func searchLines(v SearchView) int {
+	n := 0
+	for _, f := range v.Files {
+		n += len(f.Lines)
+	}
+	return n
+}
+
+// selectClass is a select: an input's look, as wide as its options.
+const selectClass = "cursor-pointer rounded-lg border border-line bg-sunken py-2 pr-8 pl-3 text-sm text-fg transition-[border-color,box-shadow] focus:border-accent-line focus:outline-none focus:ring-4 focus:ring-accent-soft"
+
+// deliveryTone and deliveryLabel are a webhook delivery's state as its chip shows it: delivered,
+// still being tried, or given up on.
+func deliveryTone(state string) string {
+	switch state {
+	case "delivered":
+		return toneSuccess
+	case "waiting":
+		return toneWarn
+	case "dead":
+		return toneDanger
+	default:
+		return toneNeutral
+	}
+}
+
+func deliveryLabel(state string) string {
+	switch state {
+	case "delivered":
+		return "Delivered"
+	case "waiting":
+		return "Retrying"
+	case "dead":
+		return "Failed"
+	default:
+		return state
+	}
+}
+
+// popoverClass is a floating surface — a popover, a dialog, a menu: the panel's radius, the
+// overlay colour, a deep shadow, and a quick drop-in as it opens (input.css's q-pop). Headed like
+// a panel (docs/web.md).
+const popoverClass = "q-pop overflow-hidden rounded-xl border border-line bg-overlay shadow-pop"
+
+// avatarClass is a person's badge: a round initial on their colour (input.css's q-person-N,
+// picked from their name), so a person keeps one colour wherever they appear and a conversation
+// reads by who is speaking.
+func avatarClass(name string) string {
+	var h uint32 = 2166136261
+	for i := 0; i < len(name); i++ {
+		h = (h ^ uint32(name[i])) * 16777619
+	}
+	return "q-person-" + strconv.Itoa(int(h%7)) + " flex h-7 w-7 shrink-0 select-none items-center justify-center rounded-full text-sm font-semibold ring-2 ring-surface"
+}
+
+// diffBlocks is a file's change at a glance: five blocks shared between its added and removed
+// lines in proportion (a block for each fifth), the rest empty — tints of the ± counts beside them.
+func diffBlocks(add, del int) []string {
+	blocks := make([]string, 5)
+	total := add + del
+	adds, dels := 0, 0
+	if total > 0 {
+		adds = (add*5 + total - 1) / total
+		dels = min(5-adds, (del*5+total-1)/total)
+		if del > 0 && dels == 0 && adds > 1 {
+			adds--
+			dels = 1
+		}
+	}
+	for i := range blocks {
+		switch {
+		case i < adds:
+			blocks[i] = "bg-success"
+		case i < adds+dels:
+			blocks[i] = "bg-danger"
+		default:
+			blocks[i] = "bg-ghost"
+		}
+	}
+	return blocks
 }
 
 // clStatusTone maps a CL status kind to its chip tone.
@@ -1675,11 +2079,135 @@ func diffMarker(t string) string {
 func diffRowClass(t string) string {
 	switch t {
 	case "add":
-		return "bg-emerald-500/10"
+		return "bg-diff-add"
 	case "del":
-		return "bg-red-500/10"
+		return "bg-diff-del"
 	default:
 		return ""
+	}
+}
+
+// splitRow is a row of a side-by-side diff: a hunk header across both sides (Tag), or a line on
+// each side — the same line on both for context, a removed line beside the line that replaced it
+// — either side empty where one side has more lines than the other.
+type splitRow struct {
+	Tag         string
+	Left, Right *DiffLineRow
+}
+
+// threads are the review threads anchored to either of the row's lines.
+func (r splitRow) threads() []CommentThread {
+	if r.Left == nil || r.Left == r.Right {
+		if r.Right == nil {
+			return nil
+		}
+		return r.Right.Threads
+	}
+	if r.Right == nil {
+		return r.Left.Threads
+	}
+	return append(append([]CommentThread{}, r.Left.Threads...), r.Right.Threads...)
+}
+
+// splitRows lays a hunk's lines out side by side: each run of removed lines beside the run of
+// added lines that follows it, line for line.
+func splitRows(sec []DiffLineRow) []splitRow {
+	var out []splitRow
+	for i := 0; i < len(sec); {
+		switch sec[i].Type {
+		case "tag":
+			out = append(out, splitRow{Tag: sec[i].Content})
+			i++
+		case "del", "add":
+			var dels, adds []*DiffLineRow
+			for ; i < len(sec) && sec[i].Type == "del"; i++ {
+				dels = append(dels, &sec[i])
+			}
+			for ; i < len(sec) && sec[i].Type == "add"; i++ {
+				adds = append(adds, &sec[i])
+			}
+			for j := range max(len(dels), len(adds)) {
+				var r splitRow
+				if j < len(dels) {
+					r.Left = dels[j]
+				}
+				if j < len(adds) {
+					r.Right = adds[j]
+				}
+				out = append(out, r)
+			}
+		default:
+			out = append(out, splitRow{Left: &sec[i], Right: &sec[i]})
+			i++
+		}
+	}
+	return out
+}
+
+// splitLineNo is a line's number on one side of a split row ("left" the base, "right" the
+// patchset); splitAnchorLine the line a comment on that side anchors to.
+func splitLineNo(ln *DiffLineRow, side string) string {
+	if side == "left" {
+		return lineNo(ln.LeftIdx)
+	}
+	return lineNo(ln.RightIdx)
+}
+
+func splitAnchorLine(ln *DiffLineRow, side string) string {
+	if side == "left" {
+		return strconv.Itoa(ln.LeftIdx)
+	}
+	return strconv.Itoa(ln.RightIdx)
+}
+
+// splitCommentable reports whether a comment can anchor to the line on that side.
+func splitCommentable(ln *DiffLineRow, side string) bool {
+	if side == "left" {
+		return ln.LeftIdx > 0
+	}
+	return ln.RightIdx > 0
+}
+
+// splitSideClass is a split row's side's background: a removed line's on the left, an added
+// line's on the right.
+func splitSideClass(t, side string) string {
+	switch {
+	case t == "del" && side == "left":
+		return "bg-diff-del"
+	case t == "add" && side == "right":
+		return "bg-diff-add"
+	default:
+		return ""
+	}
+}
+
+// splitMarkerType is the change a split row's side shows: its own, or context.
+func splitMarkerType(t, side string) string {
+	if (t == "del" && side == "left") || (t == "add" && side == "right") {
+		return t
+	}
+	return ""
+}
+
+// baseName and dirName are a path's last element and the directory holding it ("" at the root).
+func baseName(p string) string { return path.Base(p) }
+
+func dirName(p string) string {
+	if d := path.Dir(p); d != "." {
+		return d
+	}
+	return ""
+}
+
+// diffMarkerClass colours a diff line's leading +/− in its change's tone.
+func diffMarkerClass(t string) string {
+	switch t {
+	case "add":
+		return "mr-1 select-none text-success"
+	case "del":
+		return "mr-1 select-none text-danger"
+	default:
+		return "mr-1 select-none text-faint"
 	}
 }
 
@@ -1771,6 +2299,7 @@ func Assets() http.Handler {
 	mux.HandleFunc("/assets/stars.js", asset(starsJS, js))
 	mux.HandleFunc("/assets/clcomments.js", asset(clcommentsJS, js))
 	mux.HandleFunc("/assets/tree.js", asset(treeJS, js))
+	mux.HandleFunc("/assets/ok.js", asset(okJS, js))
 	shared := http.StripPrefix("/assets/", static.Handler())
 	mux.Handle("/assets/", shared)
 	mux.HandleFunc("/favicon.svg", func(w http.ResponseWriter, r *http.Request) {

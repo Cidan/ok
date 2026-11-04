@@ -1888,7 +1888,7 @@ outbox moves with its repository (`moveTables`). Each event feeds three consumer
   full name, number, title, status, when it changed), and set in the directory (identity's
   `Delivery.SetInbox`, every entry of the CL at once, at a version, so an older write never
   overwrites a newer). The directory keeps them (`inbox`: principal, repository, CL, relation), so
-  a person's "My CLs" and "Needs my review" span every cell: the home page lists them
+  a person's "My CLs" and "Needs my review" span every cell: the home page, a dashboard, lists them
   (`Inbox.ListInbox`), and a CL's page is its cell's. A repository moved keeps its entries — they
   name the repository, which the edge routes — and a purge removes them.
 - **Notifications.** An event that asks something of someone notifies them, never the one who did
@@ -1987,8 +1987,10 @@ then its consumers (notifications, webhooks), then removes the entries. A reposi
 directory's events have not named in the projection yet is named by the directory
 (`GetRepositoryEntry`). The inbox carries no checks verdict: ok control is not told when pre
 finishes, so a verdict there would go stale. `ListInbox` drops entries of repositories the person
-may no longer see (`readerRole`), so losing access hides a CL's title. The home page shows the
-signed-in person's ten latest, those waiting on them first.
+may no longer see (`readerRole`), so losing access hides a CL's title. The home page — a dashboard
+— reads the signed-in person's whole inbox, closed CLs too, and lists each CL once: those that
+wait on them, theirs in flight, those they review, and theirs lately landed; the command palette
+finds their CLs in it by number or title.
 
 *As built, (2):* `Tenancy.Search`, through the store's `SearchRepositories` and `SearchPrincipals`:
 repositories by their names (owner/name narrowing to owners whose handles start with owner), people

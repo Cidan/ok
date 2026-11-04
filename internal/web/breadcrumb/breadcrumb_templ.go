@@ -11,8 +11,9 @@ import templruntime "github.com/a-h/templ/runtime"
 // Trail renders the crumbs as a horizontal path: a "/" divider is inserted between segments,
 // each Crumb with an Href becomes a link, and a Crumb with an empty Href renders as the plain
 // (current-location) segment. class is merged onto the container so the consumer controls
-// placement/spacing; the segment/link/divider styling follows the estate's zinc design system
-// (as nav/layout do), keeping every trail visually consistent across apps.
+// placement/spacing; the segment/link/divider styling is in the app's theme tokens
+// (docs/web.md, "Theme tokens"), as nav/layout are, keeping every trail visually consistent
+// across apps.
 func Trail(crumbs []Crumb, class string) templ.Component {
 	return templruntime.GeneratedTemplate(func(templ_7745c5c3_Input templruntime.GeneratedComponentInput) (templ_7745c5c3_Err error) {
 		templ_7745c5c3_W, ctx := templ_7745c5c3_Input.Writer, templ_7745c5c3_Input.Context
@@ -58,7 +59,7 @@ func Trail(crumbs []Crumb, class string) templ.Component {
 		}
 		for i, c := range crumbs {
 			if i > 0 {
-				templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 3, "<span class=\"select-none text-zinc-600\">/</span>")
+				templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 3, "<span class=\"select-none text-faint\">/</span>")
 				if templ_7745c5c3_Err != nil {
 					return templ_7745c5c3_Err
 				}
@@ -76,7 +77,7 @@ func Trail(crumbs []Crumb, class string) templ.Component {
 					var templ_7745c5c3_Var4 templ.SafeURL
 					templ_7745c5c3_Var4, templ_7745c5c3_Err = templ.JoinURLErrs(templ.SafeURL(c.Href))
 					if templ_7745c5c3_Err != nil {
-						return templ.Error{Err: templ_7745c5c3_Err, FileName: `breadcrumb/breadcrumb.templ`, Line: 16, Col: 36}
+						return templ.Error{Err: templ_7745c5c3_Err, FileName: `breadcrumb/breadcrumb.templ`, Line: 17, Col: 36}
 					}
 					_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var4))
 					if templ_7745c5c3_Err != nil {
@@ -89,7 +90,7 @@ func Trail(crumbs []Crumb, class string) templ.Component {
 					var templ_7745c5c3_Var5 string
 					templ_7745c5c3_Var5, templ_7745c5c3_Err = templ.ResolveAttributeValue(c.Href)
 					if templ_7745c5c3_Err != nil {
-						return templ.Error{Err: templ_7745c5c3_Err, FileName: `breadcrumb/breadcrumb.templ`, Line: 16, Col: 54}
+						return templ.Error{Err: templ_7745c5c3_Err, FileName: `breadcrumb/breadcrumb.templ`, Line: 17, Col: 54}
 					}
 					_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var5)
 					if templ_7745c5c3_Err != nil {
@@ -102,7 +103,7 @@ func Trail(crumbs []Crumb, class string) templ.Component {
 					var templ_7745c5c3_Var6 string
 					templ_7745c5c3_Var6, templ_7745c5c3_Err = templ.ResolveAttributeValue(c.Target)
 					if templ_7745c5c3_Err != nil {
-						return templ.Error{Err: templ_7745c5c3_Err, FileName: `breadcrumb/breadcrumb.templ`, Line: 16, Col: 77}
+						return templ.Error{Err: templ_7745c5c3_Err, FileName: `breadcrumb/breadcrumb.templ`, Line: 17, Col: 77}
 					}
 					_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var6)
 					if templ_7745c5c3_Err != nil {
@@ -115,20 +116,20 @@ func Trail(crumbs []Crumb, class string) templ.Component {
 					var templ_7745c5c3_Var7 string
 					templ_7745c5c3_Var7, templ_7745c5c3_Err = templ.ResolveAttributeValue(c.swap())
 					if templ_7745c5c3_Err != nil {
-						return templ.Error{Err: templ_7745c5c3_Err, FileName: `breadcrumb/breadcrumb.templ`, Line: 16, Col: 98}
+						return templ.Error{Err: templ_7745c5c3_Err, FileName: `breadcrumb/breadcrumb.templ`, Line: 17, Col: 98}
 					}
 					_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var7)
 					if templ_7745c5c3_Err != nil {
 						return templ_7745c5c3_Err
 					}
-					templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 9, "\" hx-push-url=\"true\" class=\"truncate text-zinc-400 transition-colors hover:text-zinc-200\">")
+					templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 9, "\" hx-push-url=\"true\" class=\"truncate text-muted transition-colors hover:text-fg\">")
 					if templ_7745c5c3_Err != nil {
 						return templ_7745c5c3_Err
 					}
 					var templ_7745c5c3_Var8 string
 					templ_7745c5c3_Var8, templ_7745c5c3_Err = templ.JoinStringErrs(c.Label)
 					if templ_7745c5c3_Err != nil {
-						return templ.Error{Err: templ_7745c5c3_Err, FileName: `breadcrumb/breadcrumb.templ`, Line: 16, Col: 198}
+						return templ.Error{Err: templ_7745c5c3_Err, FileName: `breadcrumb/breadcrumb.templ`, Line: 17, Col: 189}
 					}
 					_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var8))
 					if templ_7745c5c3_Err != nil {
@@ -146,20 +147,20 @@ func Trail(crumbs []Crumb, class string) templ.Component {
 					var templ_7745c5c3_Var9 templ.SafeURL
 					templ_7745c5c3_Var9, templ_7745c5c3_Err = templ.JoinURLErrs(templ.SafeURL(c.Href))
 					if templ_7745c5c3_Err != nil {
-						return templ.Error{Err: templ_7745c5c3_Err, FileName: `breadcrumb/breadcrumb.templ`, Line: 18, Col: 36}
+						return templ.Error{Err: templ_7745c5c3_Err, FileName: `breadcrumb/breadcrumb.templ`, Line: 19, Col: 36}
 					}
 					_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var9))
 					if templ_7745c5c3_Err != nil {
 						return templ_7745c5c3_Err
 					}
-					templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 12, "\" class=\"truncate text-zinc-400 transition-colors hover:text-zinc-200\">")
+					templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 12, "\" class=\"truncate text-muted transition-colors hover:text-fg\">")
 					if templ_7745c5c3_Err != nil {
 						return templ_7745c5c3_Err
 					}
 					var templ_7745c5c3_Var10 string
 					templ_7745c5c3_Var10, templ_7745c5c3_Err = templ.JoinStringErrs(c.Label)
 					if templ_7745c5c3_Err != nil {
-						return templ.Error{Err: templ_7745c5c3_Err, FileName: `breadcrumb/breadcrumb.templ`, Line: 18, Col: 117}
+						return templ.Error{Err: templ_7745c5c3_Err, FileName: `breadcrumb/breadcrumb.templ`, Line: 19, Col: 108}
 					}
 					_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var10))
 					if templ_7745c5c3_Err != nil {
@@ -171,14 +172,14 @@ func Trail(crumbs []Crumb, class string) templ.Component {
 					}
 				}
 			} else {
-				templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 14, "<span class=\"truncate font-medium text-zinc-100\">")
+				templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 14, "<span class=\"truncate font-medium text-fg\">")
 				if templ_7745c5c3_Err != nil {
 					return templ_7745c5c3_Err
 				}
 				var templ_7745c5c3_Var11 string
 				templ_7745c5c3_Var11, templ_7745c5c3_Err = templ.JoinStringErrs(c.Label)
 				if templ_7745c5c3_Err != nil {
-					return templ.Error{Err: templ_7745c5c3_Err, FileName: `breadcrumb/breadcrumb.templ`, Line: 21, Col: 62}
+					return templ.Error{Err: templ_7745c5c3_Err, FileName: `breadcrumb/breadcrumb.templ`, Line: 22, Col: 56}
 				}
 				_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var11))
 				if templ_7745c5c3_Err != nil {

@@ -4,8 +4,9 @@ import _ "embed"
 
 // app.css is the Tailwind output over the pages and the shared components (scripts/css.sh). The
 // scripts are the pages' own: the favorite toggle and reorder of the repository list (stars.js),
-// a ChangeList's review tabs and inline comment composer (clcomments.js), and the repository
-// browser's file tree (tree.js). Everything else under /assets/ is internal/web/static's.
+// a ChangeList's review tabs, inline comment composer, and popovers (clcomments.js), the
+// repository browser's file tree (tree.js), and the command palette, the keyboard shortcuts, and
+// the diff view (ok.js). Everything else under /assets/ is internal/web/static's.
 
 //go:embed app.css
 var appCSS []byte
@@ -18,3 +19,6 @@ var clcommentsJS []byte
 
 //go:embed tree.js
 var treeJS []byte
+
+//go:embed ok.js
+var okJS []byte

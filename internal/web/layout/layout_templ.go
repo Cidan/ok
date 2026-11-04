@@ -11,15 +11,16 @@ import templruntime "github.com/a-h/templ/runtime"
 import "github.com/Cidan/ok/internal/web/nav"
 
 // Shell renders a full HTML document for one view: head (the caller-supplied stylesheets +
-// deferred scripts, served by the consumer at /assets), the full-viewport dark body (h-dvh
-// overflow-hidden bg-zinc-950 text-zinc-100), and the chrome for the chosen Variant around
-// the page content (children). It is application-neutral — every /assets reference comes from
-// Props (Favicon/Styles/Scripts), so a consumer ships only the assets its pages need. It is
-// the persistent htmx SPA shell: in-app navigation htmx-GETs a route and swaps ONLY the
-// returned content fragment into <main id="content"> (see the consumer's fragment handler),
-// while the head assets and the nav rail persist across swaps; a direct/deep-link GET renders
-// this whole document. The LeftNav shell carries data-nav/data-open and the group/nav marker
-// that nav.LeftRail's collapse variants key off; nav.js flips data-open.
+// deferred scripts, served by the consumer at /assets), the full-viewport body in the app's
+// theme tokens (h-dvh overflow-hidden bg-canvas text-fg font-sans; docs/web.md, "Theme
+// tokens"), and the chrome for the chosen Variant around the page content (children). It is
+// application-neutral — every /assets reference comes from Props (Favicon/Styles/Scripts), so a
+// consumer ships only the assets its pages need. It is the persistent htmx SPA shell: in-app
+// navigation htmx-GETs a route and swaps ONLY the returned content fragment into
+// <main id="content"> (see the consumer's fragment handler), while the head assets and the nav
+// rail persist across swaps; a direct/deep-link GET renders this whole document. The LeftNav
+// shell carries data-nav/data-open and the group/nav marker that nav.LeftRail's collapse
+// variants key off; nav.js flips data-open.
 func Shell(p Props) templ.Component {
 	return templruntime.GeneratedTemplate(func(templ_7745c5c3_Input templruntime.GeneratedComponentInput) (templ_7745c5c3_Err error) {
 		templ_7745c5c3_W, ctx := templ_7745c5c3_Input.Writer, templ_7745c5c3_Input.Context
@@ -48,7 +49,7 @@ func Shell(p Props) templ.Component {
 		var templ_7745c5c3_Var2 string
 		templ_7745c5c3_Var2, templ_7745c5c3_Err = templ.JoinStringErrs(p.Title)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `layout/layout.templ`, Line: 22, Col: 19}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `layout/layout.templ`, Line: 23, Col: 19}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var2))
 		if templ_7745c5c3_Err != nil {
@@ -66,7 +67,7 @@ func Shell(p Props) templ.Component {
 			var templ_7745c5c3_Var3 templ.SafeURL
 			templ_7745c5c3_Var3, templ_7745c5c3_Err = templ.JoinURLErrs(templ.SafeURL(p.Favicon))
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `layout/layout.templ`, Line: 24, Col: 73}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `layout/layout.templ`, Line: 25, Col: 73}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var3))
 			if templ_7745c5c3_Err != nil {
@@ -85,7 +86,7 @@ func Shell(p Props) templ.Component {
 			var templ_7745c5c3_Var4 templ.SafeURL
 			templ_7745c5c3_Var4, templ_7745c5c3_Err = templ.JoinURLErrs(templ.SafeURL(href))
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `layout/layout.templ`, Line: 27, Col: 53}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `layout/layout.templ`, Line: 28, Col: 53}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var4))
 			if templ_7745c5c3_Err != nil {
@@ -96,35 +97,41 @@ func Shell(p Props) templ.Component {
 				return templ_7745c5c3_Err
 			}
 		}
-		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 7, "<!-- Reveal is gated on hydration, not on a timer (see static/hydrate.js). Every\n\t\t\t     [data-hydrate] boundary ships hidden (`hydrating` → opacity:0) so server-rendered\n\t\t\t     inert markup is never shown before the client libraries process it; the runtime\n\t\t\t     reveals it — a 120ms opacity fade — once hydration settles, on both the initial\n\t\t\t     load and every htmx swap. Boundaries nest: a partial swap (e.g. #repo-main inside\n\t\t\t     #content) fades ONLY that region. A no-JS override keeps content visible when\n\t\t\t     scripts are off. The <body> keyframe fades the shell chrome in on a full load; the\n\t\t\t     dark <html> bg + color-scheme avoid a white/grey flash. These are static/shell.css:\n\t\t\t     render-blocking as an inline <style> was, which the pages' policy refuses. --><link rel=\"stylesheet\" href=\"/assets/shell.css\"><noscript><link rel=\"stylesheet\" href=\"/assets/noscript.css\"></noscript>")
+		if p.Themes {
+			templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 7, "<!-- The theme is chosen before the first paint, so a page never flashes in the other\n\t\t\t\t     one: static/theme-init.js, loaded synchronously after the stylesheets (the pages'\n\t\t\t\t     policy refuses an inline script), picks the reader's choice (localStorage \"theme\":\n\t\t\t\t     light, dark, or system), or the system's when it is system or unset, and gives the\n\t\t\t\t     browser chrome (theme-color) the chosen theme's canvas. static/theme.js switches it\n\t\t\t\t     afterwards. --> <script src=\"/assets/theme-init.js\"></script>")
+			if templ_7745c5c3_Err != nil {
+				return templ_7745c5c3_Err
+			}
+		}
+		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 8, "<!-- Reveal is gated on hydration, not on a timer (see static/hydrate.js). Every\n\t\t\t     [data-hydrate] boundary ships hidden (`hydrating` → opacity:0) so server-rendered\n\t\t\t     inert markup is never shown before the client libraries process it; the runtime\n\t\t\t     reveals it — a 120ms opacity fade — once hydration settles, on both the initial\n\t\t\t     load and every htmx swap. Boundaries nest: a partial swap (e.g. #repo-main inside\n\t\t\t     #content) fades ONLY that region. A no-JS override keeps content visible when\n\t\t\t     scripts are off. The <body> keyframe fades the shell chrome in on a full load; the\n\t\t\t     canvas-coloured <html> bg + color-scheme avoid a white/grey flash. These are\n\t\t\t     static/shell.css: render-blocking as an inline <style> was, which the pages' policy\n\t\t\t     refuses. --><link rel=\"stylesheet\" href=\"/assets/shell.css\"><noscript><link rel=\"stylesheet\" href=\"/assets/noscript.css\"></noscript>")
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
 		for _, src := range p.Scripts {
-			templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 8, "<script src=\"")
+			templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 9, "<script src=\"")
 			if templ_7745c5c3_Err != nil {
 				return templ_7745c5c3_Err
 			}
 			var templ_7745c5c3_Var5 string
 			templ_7745c5c3_Var5, templ_7745c5c3_Err = templ.ResolveAttributeValue(templ.SafeURL(src))
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `layout/layout.templ`, Line: 43, Col: 36}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `layout/layout.templ`, Line: 54, Col: 36}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var5)
 			if templ_7745c5c3_Err != nil {
 				return templ_7745c5c3_Err
 			}
-			templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 9, "\" defer></script>")
+			templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 10, "\" defer></script>")
 			if templ_7745c5c3_Err != nil {
 				return templ_7745c5c3_Err
 			}
 		}
-		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 10, "</head><body class=\"preload h-dvh overflow-hidden bg-zinc-950 text-zinc-100 antialiased flex flex-col font-['IBM_Plex_Sans',sans-serif]\"><script src=\"/assets/preload.js\"></script>")
+		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 11, "</head><body class=\"preload h-dvh overflow-hidden bg-canvas text-fg font-sans antialiased flex flex-col\"><script src=\"/assets/preload.js\"></script>")
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
 		if p.Variant == Navless {
-			templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 11, "<div class=\"flex-1 flex items-center justify-center p-6 overflow-y-auto\">")
+			templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 12, "<div class=\"flex-1 flex items-center justify-center p-6 overflow-y-auto\">")
 			if templ_7745c5c3_Err != nil {
 				return templ_7745c5c3_Err
 			}
@@ -132,12 +139,12 @@ func Shell(p Props) templ.Component {
 			if templ_7745c5c3_Err != nil {
 				return templ_7745c5c3_Err
 			}
-			templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 12, "</div>")
+			templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 13, "</div>")
 			if templ_7745c5c3_Err != nil {
 				return templ_7745c5c3_Err
 			}
 		} else if p.Variant == TopNav {
-			templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 13, "<div class=\"w-full h-full flex flex-col overflow-hidden\">")
+			templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 14, "<div class=\"w-full h-full flex flex-col overflow-hidden\">")
 			if templ_7745c5c3_Err != nil {
 				return templ_7745c5c3_Err
 			}
@@ -145,17 +152,17 @@ func Shell(p Props) templ.Component {
 			if templ_7745c5c3_Err != nil {
 				return templ_7745c5c3_Err
 			}
-			templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 14, "<main id=\"content\" data-hydrate")
+			templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 15, "<main id=\"content\" data-hydrate")
 			if templ_7745c5c3_Err != nil {
 				return templ_7745c5c3_Err
 			}
 			if p.HistoryRestore {
-				templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 15, " hx-history-elt")
+				templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 16, " hx-history-elt")
 				if templ_7745c5c3_Err != nil {
 					return templ_7745c5c3_Err
 				}
 			}
-			templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 16, " class=\"hydrating flex-1 flex flex-col overflow-hidden\">")
+			templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 17, " class=\"hydrating flex-1 flex flex-col overflow-hidden\">")
 			if templ_7745c5c3_Err != nil {
 				return templ_7745c5c3_Err
 			}
@@ -163,12 +170,12 @@ func Shell(p Props) templ.Component {
 			if templ_7745c5c3_Err != nil {
 				return templ_7745c5c3_Err
 			}
-			templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 17, "</main></div>")
+			templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 18, "</main></div>")
 			if templ_7745c5c3_Err != nil {
 				return templ_7745c5c3_Err
 			}
 		} else {
-			templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 18, "<div data-nav=\"true\" data-open=\"false\" class=\"relative w-full h-full flex overflow-hidden group/nav\">")
+			templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 19, "<div data-nav=\"true\" data-open=\"false\" class=\"relative w-full h-full flex overflow-hidden group/nav\">")
 			if templ_7745c5c3_Err != nil {
 				return templ_7745c5c3_Err
 			}
@@ -176,17 +183,17 @@ func Shell(p Props) templ.Component {
 			if templ_7745c5c3_Err != nil {
 				return templ_7745c5c3_Err
 			}
-			templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 19, "<main id=\"content\" data-hydrate")
+			templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 20, "<main id=\"content\" data-hydrate")
 			if templ_7745c5c3_Err != nil {
 				return templ_7745c5c3_Err
 			}
 			if p.HistoryRestore {
-				templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 20, " hx-history-elt")
+				templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 21, " hx-history-elt")
 				if templ_7745c5c3_Err != nil {
 					return templ_7745c5c3_Err
 				}
 			}
-			templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 21, " class=\"hydrating flex-1 flex flex-col h-full min-w-0 pl-0 md:pl-16\">")
+			templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 22, " class=\"hydrating flex-1 flex flex-col h-full min-w-0 pl-0 md:pl-16\">")
 			if templ_7745c5c3_Err != nil {
 				return templ_7745c5c3_Err
 			}
@@ -194,12 +201,18 @@ func Shell(p Props) templ.Component {
 			if templ_7745c5c3_Err != nil {
 				return templ_7745c5c3_Err
 			}
-			templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 22, "</main></div>")
+			templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 23, "</main></div>")
 			if templ_7745c5c3_Err != nil {
 				return templ_7745c5c3_Err
 			}
 		}
-		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 23, "</body></html>")
+		if p.Overlay != nil {
+			templ_7745c5c3_Err = p.Overlay.Render(ctx, templ_7745c5c3_Buffer)
+			if templ_7745c5c3_Err != nil {
+				return templ_7745c5c3_Err
+			}
+		}
+		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 24, "</body></html>")
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}

@@ -135,7 +135,7 @@ secrets: {root: `+keystest.Keyring(t, 1)+`}
 	var page string
 	for i := 0; ; i++ {
 		// The sync makes ada as identity starts: until it has, she cannot sign in.
-		if code, page = get("/id/login/oidc/fake?next=" + url.QueryEscape("/")); code == http.StatusOK && strings.Contains(page, "<title>Repositories · Example ok</title>") {
+		if code, page = get("/id/login/oidc/fake?next=" + url.QueryEscape("/")); code == http.StatusOK && strings.Contains(page, "<title>Home · Example ok</title>") {
 			break
 		}
 		if i == 100 {

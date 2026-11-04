@@ -1,0 +1,318 @@
+package pages
+
+import "strconv"
+
+// The command palette — ok's way to go anywhere and do anything from the keyboard: Ctrl+K (⌘K on a
+// Mac), /, or the top bar's search field open it over the page. What the reader types is sent to ok
+// control (/repositories/palette), which answers with the results below — the pages and commands
+// it names, the current repository's, and the repositories, the reader's CLs, and the services it
+// finds — and ok.js moves through them with the arrow keys and opens one with Enter. A result is a
+// link like any other (an htmx navigation of #content) or a command (a theme, the shortcuts).
+
+// overlay is what ok draws once, outside every page (layout.Props.Overlay): the palette and the
+// keyboard shortcuts.
+templ overlay() {
+	@palette()
+	@shortcutsDialog()
+}
+
+// palette is the palette's dialog: the search field, the results it fills, and how to move.
+templ palette() {
+	<div id="palette" data-palette hidden class="fixed inset-0 z-[60]" role="dialog" aria-modal="true" aria-label={ "Search " + Brand }>
+		<div data-palette-close class="q-fade absolute inset-0 bg-[rgb(10_8_5/0.45)] backdrop-blur-[3px]"></div>
+		<div class="q-pop relative mx-auto mt-[12vh] flex max-h-[72vh] w-[min(44rem,calc(100vw-2rem))] flex-col overflow-hidden rounded-2xl border border-line-strong bg-overlay shadow-pop">
+			<div class="flex shrink-0 items-center gap-3 border-b border-line px-4">
+				<span class="text-accent-fg">
+					@iconSearchLarge()
+				</span>
+				<input data-palette-input type="text" placeholder="Search repositories, changes, services, and commands…" autocomplete="off" spellcheck="false" aria-label="Search" aria-controls="palette-results" class="h-14 min-w-0 flex-1 bg-transparent text-base text-fg placeholder:text-faint focus:outline-none"/>
+				<span data-palette-busy class="hidden h-4 w-4 shrink-0 animate-spin rounded-full border-2 border-accent border-r-transparent"></span>
+				@kbd("Esc")
+			</div>
+			<div id="palette-results" data-palette-results role="listbox" class="min-h-0 flex-1 overflow-y-auto p-2"></div>
+			<div class="flex shrink-0 items-center gap-4 border-t border-line px-4 py-2.5 text-xs text-subtle">
+				<span class="flex items-center gap-1.5">
+					@kbd("↑")
+					@kbd("↓")
+					Navigate
+				</span>
+				<span class="flex items-center gap-1.5">
+					@kbd("↵")
+					Open
+				</span>
+				<span class="flex items-center gap-1.5">
+					@kbd("?")
+					Shortcuts
+				</span>
+				<span class="flex-1"></span>
+				<span class="flex items-center gap-1.5 text-faint">
+					@okMark("h-4 w-4")
+					{ Brand }
+				</span>
+			</div>
+		</div>
+	</div>
+}
+
+// searchTrigger is the top bar's search field: it opens the palette.
+templ searchTrigger() {
+	<button type="button" data-palette-open aria-label="Search or jump to" class="group flex h-9 w-full max-w-[26rem] cursor-pointer items-center gap-2.5 rounded-xl border border-line bg-surface px-3 text-sm text-subtle shadow-panel transition-[border-color,color,box-shadow] hover:border-line-strong hover:text-muted focus-visible:border-accent-line">
+		<span class="text-faint transition-colors group-hover:text-accent-fg">
+			@iconSearch()
+		</span>
+		<span class="hidden flex-1 truncate text-left sm:block">Search or jump to…</span>
+		<span class="hidden items-center gap-1 sm:flex" data-palette-keys>
+			@kbd("Ctrl")
+			@kbd("K")
+		</span>
+	</button>
+}
+
+// kbd is a key, as the palette and the shortcuts show it.
+templ kbd(k string) {
+	<kbd class="inline-flex h-5 min-w-5 items-center justify-center rounded-md border border-line-strong bg-raised px-1.5 font-sans text-xs font-medium text-muted shadow-[inset_0_-1px_0_var(--color-line-strong)]">{ k }</kbd>
+}
+
+// PaletteResults is the palette's results for a query: each group of them under its name, or —
+// nothing found — what to try.
+templ PaletteResults(v PaletteView) {
+	{{ jump, here, themes := paletteCommands(v) }}
+	if len(jump)+len(here)+len(themes)+len(v.Repos)+len(v.CLs)+len(v.Services) == 0 {
+		<div class="flex flex-col items-center px-6 py-12 text-center text-sm">
+			<span class="mb-3 text-faint">
+				@iconSearchLarge()
+			</span>
+			<div class="font-medium text-fg">Nothing Matches “{ v.Query }”</div>
+			<div class="mt-1 text-subtle">Try a repository's name, a CL's number or words from its title, or a service.</div>
+		</div>
+	}
+	if len(here) > 0 {
+		@paletteGroup(v.Repo) {
+			for _, c := range here {
+				@paletteCommandItem(c)
+			}
+		}
+	}
+	if len(jump) > 0 {
+		@paletteGroup("Go To") {
+			for _, c := range jump {
+				@paletteCommandItem(c)
+			}
+		}
+	}
+	if len(v.CLs) > 0 {
+		@paletteGroup(paletteCLGroup(v)) {
+			for _, c := range v.CLs {
+				@paletteCLItem(c)
+			}
+		}
+	}
+	if len(v.Repos) > 0 {
+		@paletteGroup("Repositories") {
+			for _, r := range v.Repos {
+				@paletteLink(r.Link) {
+					<span class="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-accent-soft text-xs font-semibold text-accent-fg ring-1 ring-inset ring-accent-line">{ repoInitial(r.Name) }</span>
+					<span class="min-w-0 flex-1">
+						<span class="block truncate font-medium text-fg">{ r.Name }</span>
+						<span class="block truncate text-xs text-subtle">{ r.Detail }</span>
+					</span>
+					if r.Starred {
+						<span class="text-accent">
+							@iconStarFilled()
+						</span>
+					}
+				}
+			}
+		}
+	}
+	if len(v.Services) > 0 {
+		@paletteGroup("Services") {
+			for _, g := range v.Services {
+				@paletteLink(g.Href()) {
+					<span class="flex h-7 w-7 shrink-0 items-center justify-center">
+						@statusDot(serviceStatusTone(g.StatusKind), g.StatusLabel)
+					</span>
+					<span class="min-w-0 flex-1">
+						<span class="block truncate font-medium text-fg">{ g.Name }</span>
+						<span class="block truncate text-xs text-subtle">{ g.Detail() }</span>
+					</span>
+					<span class="shrink-0 text-xs text-subtle">{ g.StatusLabel }</span>
+				}
+			}
+		}
+	}
+	if len(themes) > 0 {
+		@paletteGroup("Theme") {
+			for _, c := range themes {
+				@paletteCommandItem(c)
+			}
+		}
+	}
+}
+
+// paletteGroup is a group of results under its name.
+templ paletteGroup(name string) {
+	<div class="mb-1 last:mb-0" role="group" aria-label={ name }>
+		<div class="truncate px-3 pt-2.5 pb-1.5 text-xs font-semibold tracking-wide text-subtle">{ name }</div>
+		{ children... }
+	</div>
+}
+
+// paletteLink is a result that goes somewhere: a navigation of the content region.
+templ paletteLink(href string) {
+	<a href={ templ.SafeURL(href) } hx-get={ href } hx-target="#content" hx-swap={ swapNav } hx-push-url="true" data-palette-item role="option" class={ paletteItemClass }>
+		{ children... }
+	</a>
+}
+
+// paletteCommandItem is a page or a command: its icon, its name, and its keys or kind.
+templ paletteCommandItem(c paletteCommand) {
+	if c.Theme != "" {
+		<button type="button" data-palette-item data-theme-set={ c.Theme } role="option" class={ paletteItemClass }>
+			@paletteCommandBody(c)
+		</button>
+	} else if c.Shortcuts {
+		<button type="button" data-palette-item data-shortcuts-open role="option" class={ paletteItemClass }>
+			@paletteCommandBody(c)
+		</button>
+	} else {
+		@paletteLink(c.Href) {
+			@paletteCommandBody(c)
+		}
+	}
+}
+
+templ paletteCommandBody(c paletteCommand) {
+	<span class="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-raised text-muted ring-1 ring-inset ring-line group-aria-selected/item:text-accent-fg group-aria-selected/item:ring-accent-line">
+		@paletteIcon(c.Icon)
+	</span>
+	<span class="min-w-0 flex-1 truncate font-medium text-fg">{ c.Label }</span>
+	if c.Keys != "" {
+		<span class="flex shrink-0 items-center gap-1">
+			for _, k := range keyList(c.Keys) {
+				@kbd(k)
+			}
+		</span>
+	} else if c.Hint != "" {
+		<span class="shrink-0 text-xs text-subtle">{ c.Hint }</span>
+	}
+}
+
+// paletteCLItem is a CL: its status, number, title, and where it lives.
+templ paletteCLItem(c CLItem) {
+	@paletteLink(c.Href) {
+		<span class="flex h-7 w-7 shrink-0 items-center justify-center">
+			@clDot(clStatusTone(c.StatusKind), c.StatusLabel)
+		</span>
+		<span class="min-w-0 flex-1">
+			<span class="flex min-w-0 items-center gap-2">
+				<span class="shrink-0 font-mono text-xs text-subtle">#{ strconv.FormatInt(c.Number, 10) }</span>
+				<span class="truncate font-medium text-fg">{ c.Title }</span>
+			</span>
+			<span class="block truncate text-xs text-subtle">
+				{ c.Repository }
+				if c.Author != "" {
+					· { c.Author }
+				}
+				if c.Waiting != "" {
+					· <span class="text-accent-fg">{ waitingLabel(c.Waiting) }</span>
+				} else {
+					· { c.StatusLabel }
+				}
+				· { c.Age }
+			</span>
+		</span>
+	}
+}
+
+// shortcutsDialog is the keyboard shortcuts, which ? opens.
+templ shortcutsDialog() {
+	<div id="shortcuts" data-shortcuts hidden class="fixed inset-0 z-[61]" role="dialog" aria-modal="true" aria-label="Keyboard Shortcuts">
+		<div data-shortcuts-close class="q-fade absolute inset-0 bg-[rgb(10_8_5/0.45)] backdrop-blur-[3px]"></div>
+		<div class="q-pop relative mx-auto mt-[14vh] w-[min(36rem,calc(100vw-2rem))] overflow-hidden rounded-2xl border border-line-strong bg-overlay shadow-pop">
+			<div class="flex items-center gap-3 border-b border-line px-5 py-4">
+				<h2 class="flex-1 text-base font-semibold text-fg">Keyboard Shortcuts</h2>
+				@kbd("Esc")
+			</div>
+			<div class="grid gap-x-8 gap-y-5 p-5 sm:grid-cols-2">
+				@shortcutGroup("Anywhere") {
+					@shortcutRow("Search or Jump To", "Ctrl K")
+					@shortcutRow("Search or Jump To", "/")
+					@shortcutRow("Home", "g h")
+					@shortcutRow("Repositories", "g r")
+					@shortcutRow("Services", "g s")
+					@shortcutRow("Notifications", "g n")
+					@shortcutRow("These Shortcuts", "?")
+				}
+				@shortcutGroup("In a Repository") {
+					@shortcutRow("Code", "g c")
+					@shortcutRow("Changes", "g l")
+					@shortcutRow("History", "g y")
+					@shortcutRow("Search Code", "g f")
+				}
+				@shortcutGroup("Reading a Change") {
+					@shortcutRow("Next File", "j")
+					@shortcutRow("Previous File", "k")
+					@shortcutRow("Open or Close the File", "o")
+					@shortcutRow("Unified or Split Diff", "d")
+				}
+			</div>
+		</div>
+	</div>
+}
+
+templ shortcutGroup(name string) {
+	<div>
+		<div class="mb-2 text-xs font-semibold tracking-wide text-accent-fg">{ name }</div>
+		<div class="space-y-1.5">
+			{ children... }
+		</div>
+	</div>
+}
+
+templ shortcutRow(label, keys string) {
+	<div class="flex items-center gap-3 text-sm">
+		<span class="flex-1 text-body">{ label }</span>
+		<span class="flex items-center gap-1">
+			for _, k := range keyList(keys) {
+				@kbd(k)
+			}
+		</span>
+	</div>
+}
+
+// paletteIcon is a page's or command's glyph.
+templ paletteIcon(name string) {
+	switch name {
+		case "home":
+			<svg class="h-4 w-4" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M6.906.664a1.749 1.749 0 0 1 2.187 0l5.25 4.2c.415.332.657.835.657 1.367v7.019A1.75 1.75 0 0 1 13.25 15h-3.5a.75.75 0 0 1-.75-.75V9H7v5.25a.75.75 0 0 1-.75.75h-3.5A1.75 1.75 0 0 1 1 13.25V6.23c0-.531.242-1.034.657-1.366l5.25-4.2Zm1.25 1.171a.25.25 0 0 0-.312 0l-5.25 4.2a.25.25 0 0 0-.094.196v7.019c0 .138.112.25.25.25H5.5V8.25a.75.75 0 0 1 .75-.75h3.5a.75.75 0 0 1 .75.75v5.25h2.75a.25.25 0 0 0 .25-.25V6.23a.25.25 0 0 0-.094-.195Z"></path></svg>
+		case "repo":
+			@iconRepo("h-4 w-4")
+		case "server":
+			<svg class="h-4 w-4" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M1.75 1h12.5c.966 0 1.75.784 1.75 1.75v4c0 .372-.116.717-.314 1 .198.283.314.628.314 1v4a1.75 1.75 0 0 1-1.75 1.75H1.75A1.75 1.75 0 0 1 0 12.75v-4c0-.358.109-.707.314-1a1.739 1.739 0 0 1-.314-1v-4C0 1.784.784 1 1.75 1ZM1.5 2.75v4c0 .138.112.25.25.25h12.5a.25.25 0 0 0 .25-.25v-4a.25.25 0 0 0-.25-.25H1.75a.25.25 0 0 0-.25.25Zm.25 5.75a.25.25 0 0 0-.25.25v4c0 .138.112.25.25.25h12.5a.25.25 0 0 0 .25-.25v-4a.25.25 0 0 0-.25-.25ZM7 4.75A.75.75 0 0 1 7.75 4h4.5a.75.75 0 0 1 0 1.5h-4.5A.75.75 0 0 1 7 4.75ZM7.75 10h4.5a.75.75 0 0 1 0 1.5h-4.5a.75.75 0 0 1 0-1.5ZM3 4.75A.75.75 0 0 1 3.75 4h.5a.75.75 0 0 1 0 1.5h-.5A.75.75 0 0 1 3 4.75ZM3.75 10h.5a.75.75 0 0 1 0 1.5h-.5a.75.75 0 0 1 0-1.5Z"></path></svg>
+		case "plus":
+			@iconPlus()
+		case "search":
+			@iconSearch()
+		case "bell":
+			<svg class="h-4 w-4" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 16a2 2 0 0 0 1.985-1.75c.017-.137-.097-.25-.235-.25h-3.5c-.138 0-.252.113-.235.25A2 2 0 0 0 8 16ZM3 5a5 5 0 0 1 10 0v2.947c0 .05.015.098.042.139l1.703 2.555A1.519 1.519 0 0 1 13.482 13H2.518a1.516 1.516 0 0 1-1.263-2.36l1.703-2.554A.255.255 0 0 0 3 7.947Zm5-3.5A3.5 3.5 0 0 0 4.5 5v2.947c0 .346-.102.683-.294.97l-1.703 2.556a.017.017 0 0 0-.003.01l.001.006c0 .002.002.004.004.006l.006.004.007.001h10.964l.007-.001.006-.004.004-.006.001-.007a.017.017 0 0 0-.003-.01l-1.703-2.554a1.745 1.745 0 0 1-.294-.97V5A3.5 3.5 0 0 0 8 1.5Z"></path></svg>
+		case "code":
+			@iconCode()
+		case "changes":
+			@iconChanges()
+		case "history":
+			@iconHistory()
+		case "keyboard":
+			<svg class="h-4 w-4" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M0 4.75C0 3.784.784 3 1.75 3h12.5c.966 0 1.75.784 1.75 1.75v6.5A1.75 1.75 0 0 1 14.25 13H1.75A1.75 1.75 0 0 1 0 11.25Zm1.75-.25a.25.25 0 0 0-.25.25v6.5c0 .138.112.25.25.25h12.5a.25.25 0 0 0 .25-.25v-6.5a.25.25 0 0 0-.25-.25ZM3.5 6.25a.75.75 0 0 1 .75-.75h7a.75.75 0 0 1 0 1.5h-7a.75.75 0 0 1-.75-.75Zm.75 2.25h4a.75.75 0 0 1 0 1.5h-4a.75.75 0 0 1 0-1.5Z"></path></svg>
+		case "sun":
+			<svg class="h-4 w-4" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 12a4 4 0 1 1 0-8 4 4 0 0 1 0 8Zm0-1.5a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5Zm5.657-8.157a.75.75 0 0 1 0 1.061l-1.061 1.06a.749.749 0 0 1-1.275-.326.749.749 0 0 1 .215-.734l1.06-1.06a.75.75 0 0 1 1.06 0Zm-9.193 9.193a.75.75 0 0 1 0 1.06l-1.06 1.061a.75.75 0 1 1-1.061-1.06l1.06-1.061a.75.75 0 0 1 1.061 0ZM8 0a.75.75 0 0 1 .75.75v1.5a.75.75 0 0 1-1.5 0V.75A.75.75 0 0 1 8 0ZM3 8a.75.75 0 0 1-.75.75H.75a.75.75 0 0 1 0-1.5h1.5A.75.75 0 0 1 3 8Zm13 0a.75.75 0 0 1-.75.75h-1.5a.75.75 0 0 1 0-1.5h1.5A.75.75 0 0 1 16 8Zm-8 5a.75.75 0 0 1 .75.75v1.5a.75.75 0 0 1-1.5 0v-1.5A.75.75 0 0 1 8 13Zm3.536-1.464a.75.75 0 0 1 1.06 0l1.061 1.06a.75.75 0 0 1-1.06 1.061l-1.061-1.06a.75.75 0 0 1 0-1.061ZM2.343 2.343a.75.75 0 0 1 1.061 0l1.06 1.061a.751.751 0 0 1-.018 1.042.751.751 0 0 1-1.042.018l-1.06-1.06a.75.75 0 0 1 0-1.06Z"></path></svg>
+		case "moon":
+			<svg class="h-4 w-4" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M9.598 1.591a.749.749 0 0 1 .785-.175 7.001 7.001 0 1 1-8.967 8.967.75.75 0 0 1 .961-.96 5.5 5.5 0 0 0 7.046-7.046.75.75 0 0 1 .175-.786Zm1.616 1.945a7 7 0 0 1-7.678 7.678 5.499 5.499 0 1 0 7.678-7.678Z"></path></svg>
+		case "monitor":
+			<svg class="h-4 w-4" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M14.25 1c.966 0 1.75.784 1.75 1.75v7.5A1.75 1.75 0 0 1 14.25 12h-3.727c.099 1.041.52 1.872 1.292 2.757A.752.752 0 0 1 11.25 16h-6.5a.75.75 0 0 1-.565-1.243c.772-.885 1.192-1.716 1.292-2.757H1.75A1.75 1.75 0 0 1 0 10.25v-7.5C0 1.784.784 1 1.75 1ZM1.75 2.5a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h12.5a.25.25 0 0 0 .25-.25v-7.5a.25.25 0 0 0-.25-.25ZM9.018 12H6.982a5.72 5.72 0 0 1-.765 2.5h3.566a5.72 5.72 0 0 1-.765-2.5Z"></path></svg>
+	}
+}
+
+templ iconSearchLarge() {
+	<svg class="h-5 w-5" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M10.68 11.74a6 6 0 0 1-7.922-8.982 6 6 0 0 1 8.982 7.922l3.04 3.04a.749.749 0 0 1-.326 1.275.749.749 0 0 1-.734-.215ZM11.5 7a4.499 4.499 0 1 0-8.997 0A4.499 4.499 0 0 0 11.5 7Z"></path></svg>
+}

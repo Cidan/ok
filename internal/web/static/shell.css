@@ -1,11 +1,15 @@
 /* Every page's shell, before its own stylesheets apply (layout.templ). */
-/* color-scheme keeps the UA canvas, form controls, and scrollbars dark, so a full
-   document load never flashes a light-grey frame/scrollbar before paint. */
-html { background-color: #09090b; color-scheme: dark; } /* zinc-950 */
+/* color-scheme keeps the UA canvas, form controls, and scrollbars dark, so a full document load
+   never flashes a light-grey frame/scrollbar before paint. A themed page set's stylesheet sets its
+   canvas (--color-canvas) and its light theme's color-scheme on :root[data-theme]. */
+html { background-color: var(--color-canvas, #09090b); color-scheme: dark; }
 @keyframes shell-fade-in { from { opacity: 0 } to { opacity: 1 } }
 body { animation: shell-fade-in 70ms ease-in-out both; }
 [data-hydrate] { transition: opacity 120ms ease-in-out; }
 [data-hydrate].hydrating { opacity: 0; transition: none; }
+/* A change of theme (theme.js) grows the new one out of its control as a circle, in place of the
+   view transition's default cross-fade. */
+::view-transition-old(root), ::view-transition-new(root) { animation: none; mix-blend-mode: normal; }
 @media (prefers-reduced-motion: reduce) {
   body { animation: none !important; }
   [data-hydrate] { transition: none !important; }

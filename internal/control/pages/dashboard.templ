@@ -1,0 +1,245 @@
+package pages
+
+import (
+	"strconv"
+
+	"github.com/Cidan/ok/internal/web/layout"
+	"github.com/Cidan/ok/internal/web/nav"
+)
+
+// The dashboard — ok's home (/): where the reader's work stands, from every cell. A hero greets them
+// with what waits on them (the CLs that wait on their review or their reply, theirs in flight,
+// their unread notifications) and the two things they most often do next (search, a new
+// repository); beneath it their inbox — the CLs that wait on them, theirs in flight, those they
+// review, theirs lately landed, each CL in one list alone — and beside it their latest
+// notifications, the repositories (their favorites first), and every group of services with its
+// status. The finder (/repositories) lists every repository.
+templ DashboardPage(n nav.Model, v DashboardView) {
+	@layout.Shell(shell("Home · "+Brand, layout.TopNav, n)) {
+		@DashboardContent(v)
+	}
+}
+
+templ DashboardContent(v DashboardView) {
+	<div class="flex h-full flex-1 flex-col overflow-hidden">
+		<div id="dashboard" class="flex-1 overflow-y-auto [scrollbar-gutter:stable]">
+			<div class="mx-auto w-full max-w-7xl px-6 pt-8 pb-16 sm:px-10">
+				@dashboardHero(v)
+				<div class="mt-8 grid items-start gap-6 lg:grid-cols-[minmax(0,1fr)_23rem]">
+					<div class="min-w-0 space-y-6">
+						@dashboardCLs("Waiting on You", "waiting", v.Waiting, v.InboxError, "Nothing waits on you.", "When a change asks for your review, or your reply to its threads, it appears here.")
+						@dashboardCLs("Your Changes", "yours", v.Yours, v.InboxError, "Nothing of yours is in flight.", "Run jj cl in a workspace to propose a change.")
+						@dashboardCLs("Reviewing", "reviewing", v.Reviewing, v.InboxError, "You review nothing else in flight.", "Changes you review that wait on someone else appear here.")
+						@dashboardCLs("Recently Landed", "landed", v.Landed, v.InboxError, "Nothing of yours has landed lately.", "Changes you submit appear here once they land on main.")
+					</div>
+					<div class="min-w-0 space-y-6">
+						@dashboardNotifications(v)
+						@dashboardRepos(v.Repos)
+						@dashboardServices(v)
+					</div>
+				</div>
+			</div>
+		</div>
+	</div>
+}
+
+// dashboardHero is the dashboard's head: a greeting (ok.js makes it the time of day's), a line
+// saying what waits, the counts, and the two ways on.
+templ dashboardHero(v DashboardView) {
+	<section class="relative overflow-hidden rounded-3xl border border-line bg-surface shadow-panel">
+		<div aria-hidden="true" class="pointer-events-none absolute -top-40 -right-24 h-96 w-[44rem] rounded-full bg-[radial-gradient(closest-side,color-mix(in_oklab,var(--color-accent)_30%,transparent),transparent)] blur-2xl"></div>
+		<div aria-hidden="true" class="pointer-events-none absolute -bottom-48 left-1/4 h-80 w-[30rem] rounded-full bg-[radial-gradient(closest-side,color-mix(in_oklab,var(--color-ember)_16%,transparent),transparent)] blur-2xl"></div>
+		<div class="relative flex flex-col gap-8 px-7 py-8 sm:px-10 sm:py-10 lg:flex-row lg:items-end lg:justify-between">
+			<div class="min-w-0">
+				<div class={ kickerClass }>Your Day on { Brand }</div>
+				<h1 data-greeting data-name={ v.User } class="mt-2 text-3xl font-semibold tracking-tight text-fg sm:text-4xl">Welcome back, { v.User }</h1>
+				<p class="mt-3 max-w-xl text-base text-muted">{ dashboardSummary(v) }</p>
+				<div class="mt-6 flex flex-wrap items-center gap-3">
+					<button type="button" data-palette-open class={ btnClass(btnPrimary), "h-10 px-4" }>
+						@iconSearch()
+						Search or Jump To
+						<span data-mod class="ml-1 rounded-md bg-[rgb(29_19_5/0.12)] px-1.5 text-xs font-semibold">Ctrl K</span>
+					</button>
+					<a href="/repositories/new" hx-get="/repositories/new" hx-target="#content" hx-swap={ swapNav } hx-push-url="true" class={ btnClass(btnSecondary), "h-10 px-4" }>
+						@iconPlus()
+						New Repository
+					</a>
+				</div>
+			</div>
+			<div class="grid grid-cols-3 gap-2 sm:shrink-0 sm:gap-4">
+				@heroStat(strconv.Itoa(len(v.Waiting)), "Waiting on You", len(v.Waiting) > 0)
+				@heroStat(strconv.Itoa(inFlight(v)), "In Flight", false)
+				@heroStat(strconv.FormatInt(v.Unread, 10), "Unread", v.Unread > 0)
+			</div>
+		</div>
+	</section>
+}
+
+// heroStat is one of the hero's counts; hot lights it in the accent (something waits on the reader).
+templ heroStat(value, label string, hot bool) {
+	<div class={ "min-w-0 rounded-2xl border px-3 py-3 backdrop-blur-sm sm:min-w-[7.5rem] sm:px-4 sm:py-3.5", templ.KV("border-accent-line bg-accent-soft", hot), templ.KV("border-line bg-canvas/40", !hot) }>
+		<div class={ "text-2xl font-semibold tracking-tight tabular-nums sm:text-3xl", templ.KV("text-accent-fg", hot), templ.KV("text-fg", !hot) }>{ value }</div>
+		<div class="mt-0.5 text-xs font-medium text-subtle">{ label }</div>
+	</div>
+}
+
+// dashboardCLs is a list of the reader's CLs across every cell, each a row; an empty list says so,
+// and what fills it — or, the directory unreachable, why it is empty.
+templ dashboardCLs(title, key string, cls []CLItem, failed, empty, hint string) {
+	<section data-dashboard={ key } class="overflow-hidden rounded-2xl border border-line bg-surface shadow-panel">
+		<div class="flex min-h-12 items-center gap-3 border-b border-line px-5">
+			<h2 class="text-sm font-semibold text-fg">{ title }</h2>
+			<span class="rounded-full bg-neutral-soft px-2 text-xs leading-5 font-medium text-subtle tabular-nums">{ strconv.Itoa(len(cls)) }</span>
+		</div>
+		if len(cls) == 0 {
+			<div class="flex items-center gap-4 px-5 py-6">
+				<span class="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-raised text-faint ring-1 ring-inset ring-line">
+					@iconChanges()
+				</span>
+				<div class="text-sm">
+					if failed != "" {
+						<div class="font-medium text-body">{ failed }</div>
+					} else {
+						<div class="font-medium text-body">{ empty }</div>
+						<div class="mt-0.5 text-subtle">{ hint }</div>
+					}
+				</div>
+			</div>
+		} else {
+			<div class="divide-y divide-line-soft">
+				for _, c := range cls {
+					@dashboardCLRow(c)
+				}
+			</div>
+		}
+	</section>
+}
+
+// dashboardCLRow is a CL in a dashboard list: its status (or why it waits on the reader), its
+// repository and number, its title, and when it last moved.
+templ dashboardCLRow(c CLItem) {
+	<a href={ templ.SafeURL(c.Href) } hx-get={ c.Href } hx-target="#content" hx-swap={ swapNav } hx-push-url="true" data-inbox-item data-attention={ boolAttr(c.Waiting != "") } class="group flex items-center gap-3 px-4 py-3 text-sm transition-colors hover:bg-hover sm:gap-4 sm:px-5">
+		<span class="shrink-0 sm:w-[6.5rem]">
+			if c.Waiting != "" {
+				@chip(toneWarn) {
+					{ waitingLabel(c.Waiting) }
+				}
+			} else {
+				@chip(clStatusTone(c.StatusKind)) {
+					{ c.StatusLabel }
+				}
+			}
+		</span>
+		<span class="min-w-0 flex-1">
+			<span class="block truncate font-medium text-fg transition-colors group-hover:text-accent-fg">{ c.Title }</span>
+			<span class="mt-0.5 flex min-w-0 items-center gap-1.5 text-xs text-subtle">
+				<span class="truncate font-medium text-muted">{ c.Repository }</span>
+				<span class="shrink-0 font-mono">#{ strconv.FormatInt(c.Number, 10) }</span>
+				if c.Waiting != "" {
+					<span class="shrink-0">· { c.StatusLabel }</span>
+				}
+			</span>
+		</span>
+		<span class="hidden w-24 shrink-0 text-right text-xs whitespace-nowrap text-faint sm:block" title={ c.AgeTitle }>{ c.Age }</span>
+	</a>
+}
+
+// dashboardNotifications is the reader's latest notifications, the unread lit, and the way to all
+// of them.
+templ dashboardNotifications(v DashboardView) {
+	<section class="overflow-hidden rounded-2xl border border-line bg-surface shadow-panel">
+		<div class="flex min-h-12 items-center gap-3 border-b border-line px-5">
+			<h2 class="flex-1 text-sm font-semibold text-fg">Notifications</h2>
+			<a id="notifications-link" href="/notifications" hx-get="/notifications" hx-target="#content" hx-swap={ swapNav } hx-push-url="true" class="flex items-center gap-1.5 text-xs font-medium text-accent-fg transition-colors hover:text-fg">
+				if v.Unread > 0 {
+					<span class="rounded-full bg-accent px-1.5 leading-5 font-semibold text-on-accent tabular-nums">{ strconv.FormatInt(v.Unread, 10) }</span>
+				}
+				All Notifications
+				@iconArrowRight()
+			</a>
+		</div>
+		if len(v.Notifications) == 0 {
+			<div class="px-5 py-6 text-sm text-subtle">Nothing yet.</div>
+		} else {
+			<div class="p-2">
+				for _, it := range v.Notifications {
+					<a href={ templ.SafeURL(it.Link) } data-read={ boolAttr(it.Read) } class="group flex items-start gap-3 rounded-xl px-3 py-2.5 transition-colors hover:bg-hover">
+						<span class="relative mt-0.5 shrink-0">
+							@avatar(it.Who)
+							if !it.Read {
+								<span class="absolute -top-0.5 -right-0.5 h-2.5 w-2.5 rounded-full bg-accent ring-2 ring-surface" title="Unread"></span>
+							}
+						</span>
+						<span class="min-w-0 flex-1">
+							<span class={ "block truncate text-sm", templ.KV("text-fg", !it.Read), templ.KV("text-muted", it.Read) }><span class="font-medium">{ it.Who }</span> { it.Text }</span>
+							<span class="block truncate text-xs text-subtle">{ it.Repository } #{ strconv.FormatInt(it.Number, 10) } · { it.Ago }</span>
+						</span>
+					</a>
+				}
+			</div>
+		}
+	</section>
+}
+
+// dashboardRepos is the repositories, favorites first, and the way to every one.
+templ dashboardRepos(repos []RepoItem) {
+	<section class="overflow-hidden rounded-2xl border border-line bg-surface shadow-panel">
+		<div class="flex min-h-12 items-center gap-3 border-b border-line px-5">
+			<h2 class="flex-1 text-sm font-semibold text-fg">Repositories</h2>
+			<a href="/repositories" hx-get="/repositories" hx-target="#content" hx-swap={ swapNav } hx-push-url="true" class="flex items-center gap-1 text-xs font-medium text-accent-fg transition-colors hover:text-fg">
+				All Repositories
+				@iconArrowRight()
+			</a>
+		</div>
+		if len(repos) == 0 {
+			<div class="px-5 py-6 text-sm text-subtle">No repositories yet.</div>
+		} else {
+			<div class="p-2">
+				for _, r := range repos {
+					<a href={ templ.SafeURL(r.Link) } hx-get={ r.Link } hx-target="#content" hx-swap={ swapNav } hx-push-url="true" class="group flex items-center gap-3 rounded-xl px-3 py-2.5 transition-colors hover:bg-hover">
+						<span class="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-accent-soft text-sm font-semibold text-accent-fg ring-1 ring-inset ring-accent-line transition-transform group-hover:scale-105">{ repoInitial(r.Name) }</span>
+						<span class="min-w-0 flex-1">
+							<span class="block truncate text-sm font-medium text-fg">{ r.Name }</span>
+							<span class="block truncate text-xs text-subtle" title={ r.UpdatedTitle }>Updated { r.UpdatedAgo }</span>
+						</span>
+						if r.Starred {
+							<span class="shrink-0 text-accent">
+								@iconStarFilled()
+							</span>
+						}
+					</a>
+				}
+			</div>
+		}
+	</section>
+}
+
+// dashboardServices is every group of services ok deploys, each with its status.
+templ dashboardServices(v DashboardView) {
+	<section class="overflow-hidden rounded-2xl border border-line bg-surface shadow-panel">
+		<div class="flex min-h-12 items-center gap-3 border-b border-line px-5">
+			<h2 class="flex-1 text-sm font-semibold text-fg">Services</h2>
+			<a href="/services" hx-get="/services" hx-target="#content" hx-swap={ swapNav } hx-push-url="true" class="flex items-center gap-1 text-xs font-medium text-accent-fg transition-colors hover:text-fg">
+				All Services
+				@iconArrowRight()
+			</a>
+		</div>
+		if v.ServicesError != "" {
+			<div class="px-5 py-6 text-sm text-subtle">{ v.ServicesError }</div>
+		} else if len(v.Services) == 0 {
+			<div class="px-5 py-6 text-sm text-subtle">No repository declares a service yet.</div>
+		} else {
+			<div class="p-2">
+				for _, g := range v.Services {
+					<a href={ templ.SafeURL(g.Href()) } hx-get={ g.Href() } hx-target="#content" hx-swap={ swapNav } hx-push-url="true" class="group flex items-center gap-3 rounded-xl px-3 py-2 text-sm transition-colors hover:bg-hover">
+						<span class="flex w-4 shrink-0 justify-center">
+							@statusDot(serviceStatusTone(g.StatusKind), g.StatusLabel)
+						</span>
+						<span class="min-w-0 flex-1 truncate font-medium text-fg">{ g.Name }</span>
+						<span class={ "shrink-0 text-xs font-medium", serviceStatusText(g.StatusKind) }>{ g.StatusLabel }</span>
+					</a>
+				}
+			</div>
+		}
+	</section>
+}

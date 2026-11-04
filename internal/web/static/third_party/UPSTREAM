@@ -6,6 +6,8 @@
 # file                          package                       version  path in the package          license
 htmx.min.js                     htmx.org                      4.0.0    dist/htmx.min.js              0BSD (htmx.LICENSE)
 fonts/ibm-plex-sans/*.woff2     @fontsource/ibm-plex-sans     5.3.0    files/ibm-plex-sans-latin-*   OFL-1.1 (fonts/ibm-plex-sans/LICENSE)
+fonts/geist/*.woff2             @fontsource-variable/geist    5.3.0    files/geist-latin-wght-*      OFL-1.1 (fonts/geist/LICENSE)
+fonts/geist-mono/*.woff2        @fontsource-variable/geist-mono 5.3.0  files/geist-mono-latin-wght-* OFL-1.1 (fonts/geist-mono/LICENSE)
 #
 # sha256
 # e484d9171a9db30a39c8f16e3d709d4137f3211c659f8e6125816635033d593f  htmx.min.js
@@ -15,3 +17,7 @@ fonts/ibm-plex-sans/*.woff2     @fontsource/ibm-plex-sans     5.3.0    files/ibm
 # 0717336fb31fcdcde4b8deb3675bb4a0f7f6d484864afcd6751ac29975962203  fonts/ibm-plex-sans/ibm-plex-sans-latin-500-normal.woff2
 # 8960851d691c054ed38e259bdcf1a6190d157b4203ed5bb32c632a863fb8ec2f  fonts/ibm-plex-sans/ibm-plex-sans-latin-600-normal.woff2
 # 42e7b0c143c19df9d99fd896e76b48f846edf0902d200bc29796b34d12c33aa7  fonts/ibm-plex-sans/ibm-plex-sans-latin-700-normal.woff2
+# 9b10496762af92659f3b05d2b084b0c8f962c3ecdf637aa764e3b7fd17f5acaf  fonts/geist/geist-latin-wght-italic.woff2
+# 19f9c92546aa300c312235e3125af1b81394d8db9a4bc4a425cd5b641d2d54e1  fonts/geist/geist-latin-wght-normal.woff2
+# 7842d88c32207514dd03ddb9abc6c84b032d6fef58af1177e0b23f6554c80c75  fonts/geist-mono/geist-mono-latin-wght-italic.woff2
+# 684ad5b531f81d43c1e8c7038262d5db7cdc1f68006e04d6c7769efa8d33c8cc  fonts/geist-mono/geist-mono-latin-wght-normal.woff2

@@ -24,20 +24,15 @@ import (
 // RepoBrowsePage / RepoBrowseContent render the browser; RepoBrowseContent is what replaces
 // #content on entering it.
 templ RepoBrowsePage(n nav.Model, v BrowseView) {
-	@layout.Shell(shell(browseTitle(v), layout.LeftNav, n)) {
+	@layout.Shell(shell(browseTitle(v), layout.TopNav, n)) {
 		@RepoBrowseContent(v)
 	}
 }
 
 templ RepoBrowseContent(v BrowseView) {
 	<div data-browser data-tree="open" class="group/browser flex h-full flex-1 flex-col overflow-hidden">
-		<div class="shrink-0">
-			@PageHeadWide(v.Chrome.Name, v.Chrome.Subtitle, "") {
-				@changesLink(v.Chrome.ChangesHref, "#content")
-				@codeButton(v.Chrome.Clone)
-			}
-		</div>
-		<div class="flex min-h-0 flex-1 gap-6 pl-6 sm:pl-10">
+		@repoHead(v.Chrome, tabCode, "#content", true)
+		<div class="flex min-h-0 flex-1 gap-6 pt-6 pl-6 sm:pl-10">
 			@fileTree(v)
 			<div id="browse-main" data-hydrate class="hydrating min-w-0 flex-1 overflow-y-auto pr-6 sm:pr-10">
 				@RepoBrowseMain(v)
@@ -60,7 +55,7 @@ templ RepoBrowseMain(v BrowseView) {
 				<span data-copy-idle title="Copy Path">
 					@iconCopy()
 				</span>
-				<span data-copy-done class="hidden text-emerald-400">
+				<span data-copy-done class="hidden text-success">
 					@iconCheck()
 				</span>
 			}
@@ -143,10 +138,10 @@ templ treeFolder(n TreeNode) {
 				}
 				class={ treeRowClass, treeIndent(n.Depth), "cursor-pointer list-none [&::-webkit-details-marker]:hidden" }
 			>
-				<span data-tree-chevron class="flex h-4 w-4 shrink-0 items-center justify-center text-zinc-500 transition-transform">
+				<span data-tree-chevron class="flex h-4 w-4 shrink-0 items-center justify-center text-faint transition-transform">
 					@iconChevron()
 				</span>
-				<span class="shrink-0 text-sky-400/80">
+				<span class="shrink-0 text-accent">
 					@iconFolder()
 				</span>
 				<a href={ templ.SafeURL(n.Href) } hx-get={ n.Href } hx-target="#browse-main" hx-swap={ swapPane } hx-push-url="true" class="min-w-0 flex-1 truncate">{ n.Name }</a>
@@ -178,11 +173,11 @@ templ treeFile(n TreeNode) {
 		>
 			<span class="h-4 w-4 shrink-0"></span>
 			if n.IsLink {
-				<span class="shrink-0 text-zinc-400">
+				<span class="shrink-0 text-muted">
 					@iconSymlink()
 				</span>
 			} else {
-				<span class="shrink-0 text-zinc-500">
+				<span class="shrink-0 text-subtle">
 					@iconFile()
 				</span>
 			}
@@ -197,16 +192,16 @@ templ treeFile(n TreeNode) {
 templ browseDir(d BrowseDir) {
 	@panel() {
 		@latestCommitBar(d.Latest, "#content")
-		<div class="divide-y divide-zinc-800/70">
+		<div class="divide-y divide-line-soft">
 			if d.ParentHref != "" {
-				<div class="flex items-center gap-3 px-4 py-2.5 text-sm transition-colors hover:bg-zinc-900/40">
-					<span class="shrink-0 text-sky-400/80">
+				<div class="flex items-center gap-3 px-4 py-2.5 text-sm transition-colors hover:bg-hover">
+					<span class="shrink-0 text-accent">
 						@iconFolder()
 					</span>
 					if d.ParentRoot {
-						<a href={ templ.SafeURL(d.ParentHref) } hx-get={ d.ParentHref } hx-target="#content" hx-swap={ swapNav } hx-push-url="true" title="Up" class="font-medium text-zinc-100">..</a>
+						<a href={ templ.SafeURL(d.ParentHref) } hx-get={ d.ParentHref } hx-target="#content" hx-swap={ swapNav } hx-push-url="true" title="Up" class="font-medium text-fg">..</a>
 					} else {
-						<a href={ templ.SafeURL(d.ParentHref) } hx-get={ d.ParentHref } hx-target="#browse-main" hx-swap={ swapPane } hx-push-url="true" title="Up" class="font-medium text-zinc-100">..</a>
+						<a href={ templ.SafeURL(d.ParentHref) } hx-get={ d.ParentHref } hx-target="#browse-main" hx-swap={ swapPane } hx-push-url="true" title="Up" class="font-medium text-fg">..</a>
 					}
 				</div>
 			}
@@ -228,7 +223,9 @@ templ browseBlame(b BrowseBlame) {
 			<h3>Blame</h3>
 			<span class="flex-1"></span>
 			if b.FileHref != "" {
-				<a href={ templ.SafeURL(b.FileHref) } hx-get={ b.FileHref } hx-target="#browse-main" hx-swap={ swapPane } hx-push-url="true" class="shrink-0 font-normal transition-colors hover:text-zinc-200">View File</a>
+				<span class="flex shrink-0 items-center overflow-hidden rounded-lg border border-line font-normal">
+					<a href={ templ.SafeURL(b.FileHref) } hx-get={ b.FileHref } hx-target="#browse-main" hx-swap={ swapPane } hx-push-url="true" class={ segmentClass }>View File</a>
+				</span>
 			}
 		}
 		if b.Message != "" {
@@ -236,7 +233,7 @@ templ browseBlame(b BrowseBlame) {
 				{ b.Message }
 			}
 		} else {
-			<div class="chroma overflow-x-auto">
+			<div class="chroma overflow-x-auto py-1.5">
 				<table class="w-full border-collapse font-mono text-[12.5px] leading-[1.6]">
 					<tbody>
 						for _, l := range b.Lines {

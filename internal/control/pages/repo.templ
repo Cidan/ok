@@ -9,24 +9,25 @@ import (
 	"github.com/Cidan/ok/internal/web/nav"
 )
 
-// PageHead is the shared page header used by EVERY ok page (dashboard, repositories, new
-// repository, repo view). It fixes the title + subtitle geometry — same position, same size,
-// same block height — so the heading never shifts as you move between pages. title is the
-// heading; subtitle sits directly under it (always rendered, so the block height is constant
-// even when a page has nothing to say); badge, when set, is a small pill after the title;
-// children are the page's right-aligned actions (a button, a Code popover, …).
+// PageHead is the page header of every ok page outside a repository (the dashboard's lists, the
+// repositories, a new repository, the services, the notifications, an error). It fixes the title
+// + subtitle geometry — same position, same size, same block height — so the heading never shifts
+// as you move between pages. title is the heading; subtitle sits directly under it (always
+// rendered, so the block height is constant even when a page has nothing to say); badge, when set,
+// is a chip after the title; children are the page's right-aligned actions (a button, …). A
+// repository's pages have repoHead instead.
 templ PageHead(title, subtitle, badge string) {
-	<div class="mx-auto w-full max-w-5xl px-6 pt-10 pb-6 sm:px-10">
+	<div class="mx-auto w-full max-w-5xl px-6 pt-10 pb-7 sm:px-10">
 		@pageHeadInner(title, subtitle, badge) {
 			{ children... }
 		}
 	</div>
 }
 
-// PageHeadWide is PageHead across the whole content region, for a page that fills it (the
-// repository browser): the same title block and actions at the same height, edge to edge.
+// PageHeadWide is PageHead across the whole content region, for a page that fills it (a group of
+// services): the same title block and actions at the same height, edge to edge.
 templ PageHeadWide(title, subtitle, badge string) {
-	<div class="w-full px-6 pt-10 pb-6 sm:px-10">
+	<div class="w-full px-6 pt-10 pb-7 sm:px-10">
 		@pageHeadInner(title, subtitle, badge) {
 			{ children... }
 		}
@@ -37,14 +38,14 @@ templ pageHeadInner(title, subtitle, badge string) {
 	<div class="flex items-start justify-between gap-4">
 		<div class="min-w-0">
 			<div class="flex items-center gap-2.5">
-				<h1 class="truncate text-2xl font-semibold tracking-tight text-zinc-50">{ title }</h1>
+				<h1 class="truncate text-3xl font-semibold tracking-tight text-fg">{ title }</h1>
 				if badge != "" {
 					@chip(toneNeutral) {
 						{ badge }
 					}
 				}
 			</div>
-			<p class="mt-1.5 truncate text-sm text-zinc-400">{ subtitle }</p>
+			<p class="mt-2 truncate text-base text-muted">{ subtitle }</p>
 		</div>
 		<div class="flex shrink-0 items-center gap-2 pt-0.5">
 			{ children... }
@@ -52,30 +53,120 @@ templ pageHeadInner(title, subtitle, badge string) {
 	</div>
 }
 
-// RepoViewPage / RepoViewContent render a repository's landing — its root, centered: the shared
-// header (name + Code clone popover), the commit chip + toolbar, the root's listing with
-// per-entry last-commit, and the rendered README. RepoViewContent is the swappable region. An
-// entry opens the browser (browse.templ), which replaces this whole content region.
+// --- A repository's header ---------------------------------------------------------------------
+
+// repoHead is the header of every page in a repository, in one row: its mark, name, and creator
+// (or, a fork, what it is a fork of), the repository's tabs — Code (its files), Changes (its CLs),
+// History (main's commits), Search (main's code), and, for its administrators, Webhooks — and its
+// actions: a fork's Sync, Fork, and the Code clone popover. It names the repository (data-repo-name) for the command palette. It sits above the page's region (#repo-main) and stays put as a navigation
+// swaps that region; nav.js moves the current tab after each swap (the tabs are a
+// [data-nav-group] of data-nav-link links, matched by their paths). Its width follows the page
+// beneath it — the wide pages (a CL, a run, a deployment) mark their root data-wide, and the
+// header grows to match (group/repo's :has) — so their edges line up whichever page is shown.
+// full spans the content region instead, above the browser. target is what the tabs swap:
+// #repo-main, or #content from the browser, whose layout the other pages do not share.
+templ repoHead(c RepoChrome, tab, target string, full bool) {
+	<header data-repo-name={ c.Name } class="shrink-0 overflow-hidden border-b border-line-soft [scrollbar-gutter:stable]">
+		<div class={ repoHeadWidth(full) }>
+			<div class="flex flex-wrap items-end gap-x-8 gap-y-1 pt-5">
+				<div class="flex min-w-0 items-center gap-3 pb-3">
+					<span class="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-accent-soft text-accent-fg ring-1 ring-inset ring-accent-line">
+						@iconRepo("h-[18px] w-[18px]")
+					</span>
+					<div class="min-w-0">
+						<h1 class="truncate text-lg leading-6 font-semibold tracking-tight text-fg">{ c.Name }</h1>
+						if c.Upstream != "" {
+							<p data-upstream class="truncate text-xs text-subtle">
+								Fork of <a href={ templ.SafeURL(c.UpstreamHref) } hx-get={ c.UpstreamHref } hx-target="#content" hx-swap={ swapNav } hx-push-url="true" class="font-mono text-body transition-colors hover:text-accent-fg">{ c.Upstream }</a>
+							</p>
+						} else {
+							<p class="truncate text-xs text-subtle">{ c.Subtitle }</p>
+						}
+					</div>
+				</div>
+				<nav data-nav-group aria-label="Repository" class="order-last flex w-full items-end gap-1 overflow-x-auto sm:order-none sm:w-auto">
+					@repoTab(c.Link, repoTabMatch(c, tabCode), "g c", target, tab == tabCode) {
+						@iconCode()
+						Code
+					}
+					@repoTab(c.ChangesHref, repoTabMatch(c, tabChanges), "g l", target, tab == tabChanges) {
+						@iconChanges()
+						Changes
+					}
+					@repoTab(c.CommitsHref, repoTabMatch(c, tabHistory), "g y", target, tab == tabHistory) {
+						@iconHistory()
+						History
+						if c.CommitsCount > 0 {
+							<span data-commits class="tabular-nums text-faint">{ strconv.FormatInt(c.CommitsCount, 10) }</span>
+						}
+					}
+					@repoTab(c.Link+"/search", repoTabMatch(c, tabSearch), "g f", target, tab == tabSearch) {
+						@iconSearch()
+						Search
+					}
+					if c.WebhooksHref != "" {
+						@repoTab(c.WebhooksHref, repoTabMatch(c, tabWebhooks), "", target, tab == tabWebhooks) {
+							@iconWebhook()
+							Webhooks
+						}
+					}
+				</nav>
+				<div class="ml-auto flex shrink-0 items-center gap-2 pb-2.5">
+					@forkControls(c)
+					@codeButton(c.Clone)
+				</div>
+			</div>
+		</div>
+	</header>
+}
+
+// repoTab is one of a repository's tabs: a navigation of target, underlined in the accent while
+// it is the current one (aria-current, kept by nav.js), reached too by its shortcut (ok.js). A
+// tab with nowhere to go is shown dimmed.
+templ repoTab(href, match, shortcut, target string, current bool) {
+	if href != "" {
+		<a
+			href={ templ.SafeURL(href) }
+			hx-get={ href }
+			hx-target={ target }
+			hx-swap={ swapNav }
+			hx-push-url="true"
+			data-nav-link
+			data-nav-match={ match }
+			if shortcut != "" {
+				data-shortcut={ shortcut }
+			}
+			if current {
+				aria-current="page"
+			}
+			class="group/tab relative shrink-0 pb-2.5 text-sm font-medium text-subtle transition-colors hover:text-body aria-[current=page]:text-fg after:absolute after:inset-x-1 after:bottom-0 after:h-0.5 after:rounded-full after:bg-[linear-gradient(90deg,var(--color-accent-hi),var(--color-accent),var(--color-ember))] after:scale-x-0 after:transition-transform after:duration-300 aria-[current=page]:after:scale-x-100 [&[aria-current=page]_svg]:text-accent-fg"
+		>
+			<span class="flex items-center gap-2 rounded-lg px-2.5 py-1.5 transition-colors group-hover/tab:bg-hover">
+				{ children... }
+			</span>
+		</a>
+	} else {
+		<span class="shrink-0 pb-2.5 text-sm font-medium text-ghost">
+			<span class="flex items-center gap-2 px-2.5 py-1.5">
+				{ children... }
+			</span>
+		</span>
+	}
+}
+
+// RepoViewPage / RepoViewContent render a repository's landing — its root, centered: the
+// repository's header, the commit chip + breadcrumb, the root's listing with per-entry
+// last-commit, and the rendered README. RepoViewContent is the swappable region. An entry opens
+// the browser (browse.templ), which replaces this whole content region.
 templ RepoViewPage(n nav.Model, v RepoView) {
-	@layout.Shell(shell(v.Chrome.Name+" · "+Brand, layout.LeftNav, n)) {
+	@layout.Shell(shell(v.Chrome.Name+" · "+Brand, layout.TopNav, n)) {
 		@RepoViewContent(v)
 	}
 }
 
 templ RepoViewContent(v RepoView) {
-	<div class="flex h-full flex-1 flex-col overflow-hidden">
-		<div class="shrink-0">
-			@PageHead(v.Chrome.Name, v.Chrome.Subtitle, "") {
-				@changesLink(v.Chrome.ChangesHref, "#repo-main")
-				<a id="search-link" href={ templ.SafeURL(v.Chrome.Link + "/search") } class={ btnClass(btnSecondary) }>Search</a>
-				if v.Chrome.WebhooksHref != "" {
-					<a id="webhooks-link" href={ templ.SafeURL(v.Chrome.WebhooksHref) } class={ btnClass(btnSecondary) }>Webhooks</a>
-				}
-				@forkControls(v.Chrome)
-				@codeButton(v.Chrome.Clone)
-			}
-			@upstreamLine(v.Chrome)
-		</div>
+	<div class="group/repo flex h-full flex-1 flex-col overflow-hidden">
+		@repoHead(v.Chrome, tabCode, "#repo-main", false)
 		<div id="repo-main" data-hydrate class="hydrating flex-1 overflow-y-auto">
 			@RepoViewMain(v)
 		</div>
@@ -87,7 +178,7 @@ templ RepoViewContent(v RepoView) {
 // THIS (#repo-main), so the repo header + nav rail never reload; ServeRepoView returns it alone
 // on an HX-Target=repo-main request.
 templ RepoViewMain(v RepoView) {
-	<div class="mx-auto w-full max-w-5xl px-6 pb-16 sm:px-10">
+	<div class="mx-auto w-full max-w-5xl px-6 pt-6 pb-16 sm:px-10">
 		if v.IsEmpty {
 			@emptyRepo(v.Chrome)
 		} else {
@@ -100,25 +191,12 @@ templ RepoViewMain(v RepoView) {
 	</div>
 }
 
-// repoToolbar is the row above the file list: the commit being browsed, the path breadcrumb,
-// and main's commit count.
+// repoToolbar is the row above the file list: the commit being browsed and the path breadcrumb.
+// (main's commit count is on the History tab.)
 templ repoToolbar(c RepoChrome) {
-	<div class="mb-4 flex flex-wrap items-center gap-3">
+	<div class="mb-4 flex min-h-9 flex-wrap items-center gap-3">
 		@atChip(c.At, "#repo-main")
 		@breadcrumb.Trail(c.Crumbs, "")
-		<span class="flex-1"></span>
-		if c.CommitsCount > 0 {
-			if c.CommitsHref != "" {
-				<a href={ templ.SafeURL(c.CommitsHref) } hx-get={ c.CommitsHref } hx-target="#repo-main" hx-swap="innerHTML swap:70ms settle:1ms" hx-push-url="true" class="flex shrink-0 items-center gap-1.5 whitespace-nowrap text-sm text-zinc-500 transition-colors hover:text-zinc-200">
-					<span class="text-zinc-500">
-						@iconHistory()
-					</span>
-					<span class="font-medium text-zinc-300">{ strconv.FormatInt(c.CommitsCount, 10) }</span> { pluralize(c.CommitsCount, "commit", "commits") }
-				</a>
-			} else {
-				<span class="shrink-0 whitespace-nowrap text-sm text-zinc-500">{ strconv.FormatInt(c.CommitsCount, 10) } { pluralize(c.CommitsCount, "commit", "commits") }</span>
-			}
-		}
 	</div>
 }
 
@@ -128,7 +206,7 @@ templ repoToolbar(c RepoChrome) {
 templ fileList(v RepoView) {
 	@panel() {
 		@latestCommitBar(v.Latest, "#repo-main")
-		<div class="divide-y divide-zinc-800/70">
+		<div class="divide-y divide-line-soft">
 			for _, e := range v.Entries {
 				@entryRow(e, "#content", swapNav, "#repo-main")
 			}
@@ -136,20 +214,21 @@ templ fileList(v RepoView) {
 	}
 }
 
-// latestCommitBar is a listing panel's header: the latest commit that changed the directory,
-// its message a link to the commit, which swaps commitTarget.
+// latestCommitBar is a listing panel's header: the latest commit that changed the directory —
+// who, its message (a link to the commit, which swaps commitTarget), and when.
 templ latestCommitBar(lc LatestCommit, commitTarget string) {
 	@panelHead() {
 		if lc.Present {
-			<span class="shrink-0 text-zinc-300">{ lc.Author }</span>
+			@avatar(lc.Author)
+			<span class="shrink-0 text-body">{ lc.Author }</span>
 			if lc.Href != "" {
-				<a href={ templ.SafeURL(lc.Href) } hx-get={ lc.Href } hx-target={ commitTarget } hx-swap={ swapNav } hx-push-url="true" class="min-w-0 flex-1 truncate font-normal text-zinc-500 transition-colors hover:text-zinc-300">{ lc.Message }</a>
+				<a href={ templ.SafeURL(lc.Href) } hx-get={ lc.Href } hx-target={ commitTarget } hx-swap={ swapNav } hx-push-url="true" class="min-w-0 flex-1 truncate font-normal text-subtle transition-colors hover:text-fg">{ lc.Message }</a>
 			} else {
-				<span class="min-w-0 flex-1 truncate font-normal text-zinc-500">{ lc.Message }</span>
+				<span class="min-w-0 flex-1 truncate font-normal text-subtle">{ lc.Message }</span>
 			}
-			<span class="shrink-0 whitespace-nowrap font-normal text-zinc-600" title={ lc.AgeTitle }>{ lc.Age }</span>
+			<span class="shrink-0 whitespace-nowrap font-normal text-faint" title={ lc.AgeTitle }>{ lc.Age }</span>
 		} else {
-			<span class="font-normal text-zinc-500">No commits yet</span>
+			<span class="font-normal text-subtle">No commits yet</span>
 		}
 	}
 }
@@ -158,35 +237,35 @@ templ latestCommitBar(lc LatestCommit, commitTarget string) {
 // link inside it) — the name and the commit message are separate links within a hover row. The
 // name swaps target (with swap, the swap spec), the commit message commitTarget.
 templ entryRow(e EntryItem, target, swap, commitTarget string) {
-	<div class="flex items-center gap-3 px-4 py-2.5 text-sm transition-colors hover:bg-zinc-900/40">
+	<div class="group flex items-center gap-3 px-4 py-2.5 text-sm transition-colors hover:bg-hover">
 		if e.IsLink {
-			<span class="shrink-0 text-zinc-400">
+			<span class="shrink-0 text-muted">
 				@iconSymlink()
 			</span>
 		} else if e.IsDir {
-			<span class="shrink-0 text-sky-400/80">
+			<span class="shrink-0 text-accent">
 				@iconFolder()
 			</span>
 		} else {
-			<span class="shrink-0 text-zinc-500">
+			<span class="shrink-0 text-subtle">
 				@iconFile()
 			</span>
 		}
 		if e.Href != "" {
-			<a href={ templ.SafeURL(e.Href) } hx-get={ e.Href } hx-target={ target } hx-swap={ swap } hx-push-url="true" class={ "truncate", templ.KV("font-medium text-zinc-100", e.IsDir), templ.KV("text-zinc-300", !e.IsDir) }>{ e.Name }</a>
+			<a href={ templ.SafeURL(e.Href) } hx-get={ e.Href } hx-target={ target } hx-swap={ swap } hx-push-url="true" class={ "truncate transition-colors hover:text-accent-fg", templ.KV("font-medium text-fg", e.IsDir), templ.KV("text-body", !e.IsDir) }>{ e.Name }</a>
 		} else {
-			<span class={ "truncate", templ.KV("font-medium text-zinc-100", e.IsDir), templ.KV("text-zinc-300", !e.IsDir) }>{ e.Name }</span>
+			<span class={ "truncate", templ.KV("font-medium text-fg", e.IsDir), templ.KV("text-body", !e.IsDir) }>{ e.Name }</span>
 		}
 		<span class="min-w-0 flex-1"></span>
 		if e.CommitMsg != "" {
 			if e.CommitHref != "" {
-				<a href={ templ.SafeURL(e.CommitHref) } hx-get={ e.CommitHref } hx-target={ commitTarget } hx-swap={ swapNav } hx-push-url="true" class="hidden max-w-[45%] truncate text-sm text-zinc-500 transition-colors hover:text-zinc-300 hover:underline md:block">{ e.CommitMsg }</a>
+				<a href={ templ.SafeURL(e.CommitHref) } hx-get={ e.CommitHref } hx-target={ commitTarget } hx-swap={ swapNav } hx-push-url="true" class="hidden max-w-[45%] truncate text-sm text-subtle transition-colors hover:text-fg md:block">{ e.CommitMsg }</a>
 			} else {
-				<span class="hidden max-w-[45%] truncate text-sm text-zinc-500 md:block">{ e.CommitMsg }</span>
+				<span class="hidden max-w-[45%] truncate text-sm text-subtle md:block">{ e.CommitMsg }</span>
 			}
 		}
 		if e.Age != "" {
-			<span class="shrink-0 whitespace-nowrap text-sm text-zinc-600" title={ e.AgeTitle }>{ e.Age }</span>
+			<span class="min-w-24 shrink-0 whitespace-nowrap text-right text-sm text-faint" title={ e.AgeTitle }>{ e.Age }</span>
 		}
 	</div>
 }
@@ -197,12 +276,12 @@ templ readmeCard(r ReadmeView) {
 	<div class="mt-6">
 		@panel() {
 			@panelHead() {
-				<span class="text-zinc-500">
+				<span class="text-accent-fg">
 					@iconBook()
 				</span>
 				<h3>{ r.Name }</h3>
 			}
-			<div class="markup px-6 py-6 sm:px-8">
+			<div class="markup px-6 py-7 sm:px-10">
 				@templ.Raw(r.HTML)
 			</div>
 		}
@@ -210,42 +289,48 @@ templ readmeCard(r ReadmeView) {
 }
 
 // fileCard renders one file's content, in the browser's pane, in the mode the backend chose.
-// Blame opens in the pane; History, a page of its own, in place of the browser.
+// Blame opens in the pane; History, a page of its own, in place of the browser. The views of the
+// file — History, Blame, Raw — are one segmented control in its header.
 templ fileCard(f FileBlob) {
 	@panel() {
 		@panelHead() {
+			<span class="text-subtle">
+				@iconFile()
+			</span>
 			<span class="whitespace-nowrap">{ f.SizeHuman }</span>
 			if f.LexerName != "" {
-				<span class="text-zinc-600">·</span>
+				<span class="text-ghost">·</span>
 				<span class="min-w-0 truncate">{ f.LexerName }</span>
 			}
 			<span class="flex-1"></span>
-			if f.HistoryHref != "" {
-				<a href={ templ.SafeURL(f.HistoryHref) } hx-get={ f.HistoryHref } hx-target="#content" hx-swap={ swapNav } hx-push-url="true" class="shrink-0 transition-colors hover:text-zinc-200">History</a>
-			}
-			if f.BlameHref != "" {
-				<a href={ templ.SafeURL(f.BlameHref) } hx-get={ f.BlameHref } hx-target="#browse-main" hx-swap={ swapPane } hx-push-url="true" class="shrink-0 transition-colors hover:text-zinc-200">Blame</a>
-			}
-			if f.RawHref != "" {
-				<a href={ templ.SafeURL(f.RawHref) } class="shrink-0 transition-colors hover:text-zinc-200">Raw</a>
-			}
+			<span class="flex shrink-0 items-center divide-x divide-line overflow-hidden rounded-lg border border-line font-normal">
+				if f.HistoryHref != "" {
+					<a href={ templ.SafeURL(f.HistoryHref) } hx-get={ f.HistoryHref } hx-target="#content" hx-swap={ swapNav } hx-push-url="true" class={ segmentClass }>History</a>
+				}
+				if f.BlameHref != "" {
+					<a href={ templ.SafeURL(f.BlameHref) } hx-get={ f.BlameHref } hx-target="#browse-main" hx-swap={ swapPane } hx-push-url="true" class={ segmentClass }>Blame</a>
+				}
+				if f.RawHref != "" {
+					<a href={ templ.SafeURL(f.RawHref) } class={ segmentClass }>Raw</a>
+				}
+			</span>
 		}
 		switch f.Mode {
 			case "markup":
-				<div class="markup px-6 py-6 sm:px-8">
+				<div class="markup px-6 py-7 sm:px-10">
 					@templ.Raw(f.HTML)
 				</div>
 			case "source":
 				@sourceView(f)
 			case "image":
-				<div class="flex justify-center bg-zinc-950 p-6">
-					<img src={ f.ImageSrc } alt={ f.Name } class="max-w-full"/>
+				<div class="flex justify-center bg-sunken bg-[conic-gradient(var(--color-hover)_25%,transparent_0_50%,var(--color-hover)_0_75%,transparent_0)] bg-[length:16px_16px] p-8">
+					<img src={ f.ImageSrc } alt={ f.Name } class="max-w-full rounded-lg shadow-pop"/>
 				</div>
 			default:
 				@panelEmpty() {
 					This file can't be displayed here.
 					if f.RawHref != "" {
-						<a href={ templ.SafeURL(f.RawHref) } class="text-zinc-300 underline decoration-zinc-700 underline-offset-2 hover:decoration-zinc-400">Download</a>
+						<a href={ templ.SafeURL(f.RawHref) } class="text-accent-fg underline decoration-accent-line underline-offset-4 hover:decoration-accent-fg">Download</a>
 					}
 				}
 		}
@@ -253,17 +338,18 @@ templ fileCard(f FileBlob) {
 }
 
 // sourceView is a line-numbered, syntax-highlighted code table. Each line is server-highlighted
-// (chroma) HTML; the `.chroma` scope on the table resolves the token color classes.
+// (chroma) HTML; the `.chroma` scope on the table resolves the token color classes. The line a
+// link points at (#Lnn) is lit in the accent.
 templ sourceView(f FileBlob) {
-	<div class="chroma overflow-x-auto">
+	<div class="chroma overflow-x-auto py-1.5">
 		<table class="w-full border-collapse font-mono text-[12.5px] leading-[1.6]">
 			<tbody>
 				for i, line := range f.Lines {
-					<tr class="transition-colors hover:bg-zinc-900/40">
-						<td class="w-[1%] select-none whitespace-nowrap px-4 text-right align-top text-zinc-600">
-							<a href={ templ.SafeURL("#L" + strconv.Itoa(i+1)) } id={ "L" + strconv.Itoa(i+1) } class="text-zinc-600 hover:text-zinc-300">{ strconv.Itoa(i + 1) }</a>
+					<tr class="transition-colors hover:bg-hover has-[:target]:bg-accent-soft">
+						<td class="w-[1%] select-none whitespace-nowrap pl-4 pr-3 text-right align-top text-faint">
+							<a href={ templ.SafeURL("#L" + strconv.Itoa(i+1)) } id={ "L" + strconv.Itoa(i+1) } class="text-faint transition-colors hover:text-accent-fg">{ strconv.Itoa(i + 1) }</a>
 						</td>
-						<td class="w-full whitespace-pre px-4 align-top text-zinc-200">
+						<td class="w-full whitespace-pre border-l border-line-soft px-4 align-top text-fg">
 							@templ.Raw(string(line))
 						</td>
 					</tr>
@@ -279,23 +365,11 @@ templ emptyRepo(c RepoChrome) {
 	@panel() {
 		@panelTitle("Quick Setup")
 		@panelBody() {
-			<p class="text-sm text-zinc-500">Nothing has landed on main yet. Clone the repository with ok's jj, make a change, and upload it for review; it lands on main when it is submitted.</p>
+			<p class="text-sm text-subtle">Nothing has landed on main yet. Clone the repository with ok's jj, make a change, and upload it for review; it lands on main when it is submitted.</p>
 			@cloneRow("Clone", c.Clone.Command)
-			<div class="mt-6 text-sm font-medium text-zinc-400">A First Change</div>
-			<pre class="mt-2 overflow-x-auto rounded-lg border border-zinc-800 bg-zinc-950 px-4 py-3 font-mono text-sm leading-relaxed text-zinc-300">{ c.Clone.Command + "\ncd " + c.Name + "\n# make a change, then describe it and upload it:\njj describe -m 'the first change'\njj cl --ready" }</pre>
+			<div class="mt-6 text-sm font-medium text-muted">A First Change</div>
+			<pre class="mt-2 overflow-x-auto rounded-lg border border-line bg-sunken px-4 py-3 font-mono text-sm leading-relaxed text-body">{ c.Clone.Command + "\ncd " + c.Name + "\n# make a change, then describe it and upload it:\njj describe -m 'the first change'\njj cl --ready" }</pre>
 		}
-	}
-}
-
-// changesLink is the repo-header "Changes" button → the ChangeList (CL) finder: an htmx swap of
-// target — the landing's #repo-main (the header + rail stay put), or #content from the browser,
-// whose layout the finder does not share.
-// upstreamLine says which repository a fork is of.
-templ upstreamLine(c RepoChrome) {
-	if c.Upstream != "" {
-		<p class="mx-auto -mt-4 w-full max-w-5xl px-6 pb-4 text-sm text-zinc-500 sm:px-10">
-			Fork of <a href={ templ.SafeURL(c.UpstreamHref) } hx-get={ c.UpstreamHref } hx-target="#content" hx-swap={ swapNav } hx-push-url="true" class="font-mono text-zinc-300 hover:text-zinc-100">{ c.Upstream }</a>
-		</p>
 	}
 }
 
@@ -303,21 +377,16 @@ templ upstreamLine(c RepoChrome) {
 templ forkControls(c RepoChrome) {
 	if c.SyncAction != "" {
 		<form method="post" action={ templ.SafeURL(c.SyncAction) }>
-			<button type="submit" class={ btnClass(btnSecondary) } title={ "Bring it " + c.Upstream + "'s newer work" }>Sync Fork</button>
+			<button type="submit" class={ btnClass(btnSecondary) } title={ "Bring it " + c.Upstream + "'s newer work" }>
+				@iconSync()
+				Sync Fork
+			</button>
 		</form>
 	}
 	if c.ForkHref != "" {
-		<a href={ templ.SafeURL(c.ForkHref) } hx-get={ c.ForkHref } hx-target="#content" hx-swap={ swapNav } hx-push-url="true" class={ btnClass(btnSecondary) }>Fork</a>
-	}
-}
-
-templ changesLink(href, target string) {
-	if href != "" {
-		<a href={ templ.SafeURL(href) } hx-get={ href } hx-target={ target } hx-swap={ swapNav } hx-push-url="true" class={ btnClass(btnSecondary) }>
-			<span class="text-zinc-500">
-				@iconChanges()
-			</span>
-			Changes
+		<a href={ templ.SafeURL(c.ForkHref) } hx-get={ c.ForkHref } hx-target="#content" hx-swap={ swapNav } hx-push-url="true" class={ btnClass(btnSecondary) }>
+			@iconFork()
+			Fork
 		</a>
 	}
 }
@@ -326,37 +395,37 @@ templ iconChanges() {
 	<svg class="h-4 w-4" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M1.5 3.25a2.25 2.25 0 1 1 3 2.122v5.256a2.251 2.251 0 1 1-1.5 0V5.372A2.25 2.25 0 0 1 1.5 3.25Zm5.677-.177L9.573.677A.25.25 0 0 1 10 .854V2.5h1A2.5 2.5 0 0 1 13.5 5v5.628a2.251 2.251 0 1 1-1.5 0V5a1 1 0 0 0-1-1h-1v1.646a.25.25 0 0 1-.427.177L7.177 3.427a.25.25 0 0 1 0-.354ZM3.75 2.5a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5Zm0 9.5a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5Zm8.25.75a.75.75 0 1 0 1.5 0 .75.75 0 0 0-1.5 0Z"></path></svg>
 }
 
-// codeButton is the "Code" clone popover — a native <details> disclosure (no JS): the jj clone
-// command with a copy button (the clipboard component). ok's jj is the only client.
+// codeButton is the "Code" clone popover, headed like a panel: the jj clone command with a copy
+// button (the clipboard component). ok's jj is the only client. It floats (fixed, placed under the
+// button by clcomments.js), so the header, which clips, never cuts it off.
 templ codeButton(c CloneURLs) {
-	<details class="group/code relative">
-		<summary class={ btnClass(btnInverse), "list-none [&::-webkit-details-marker]:hidden" }>
-			<span class="text-zinc-700">
-				@iconCode()
-			</span>
-			Code
-			<span class="text-zinc-500 transition-transform group-open/code:rotate-180">
-				@iconChevron()
-			</span>
-		</summary>
-		<div class="absolute right-0 z-20 mt-2 w-80 rounded-xl border border-zinc-800 bg-zinc-950 p-4 shadow-xl shadow-black/50">
-			<div class="text-sm font-medium text-zinc-400">Clone</div>
+	<button type="button" data-popover-open="repo-clone" data-popover-anchor="end" aria-haspopup="dialog" aria-expanded="false" class={ btnClass(btnInverse), "group/code" }>
+		@iconCode()
+		Code
+		<span class="opacity-60 transition-transform group-aria-expanded/code:rotate-180">
+			@iconChevron()
+		</span>
+	</button>
+	<div id="repo-clone" data-popover hidden role="dialog" aria-label="Clone" class={ popoverClass, "fixed z-30 w-[22rem]" }>
+		@panelTitle("Clone")
+		<div class="px-4 pb-4">
 			@cloneRow("With ok's jj", c.Command)
 		</div>
-	</details>
+	</div>
 }
 
 // cloneRow is one labelled, read-only clone command with a copy button.
 templ cloneRow(label, url string) {
 	<div class="mt-3">
-		<div class="mb-1 text-sm text-zinc-400">{ label }</div>
-		<div class="flex items-center gap-2 rounded-lg border border-zinc-800 bg-zinc-900/60 px-2.5 py-1.5">
-			<input readonly value={ url } class="min-w-0 flex-1 bg-transparent font-mono text-sm text-zinc-200 focus:outline-none"/>
-			@clipboard.Button(url, "shrink-0 rounded-md p-1.5 text-zinc-400 transition-colors hover:bg-zinc-800 hover:text-zinc-100") {
+		<div class="mb-1.5 text-sm text-muted">{ label }</div>
+		<div class="flex items-center gap-2 rounded-lg border border-line bg-sunken py-1 pl-3 pr-1">
+			<span class="select-none font-mono text-sm text-faint">$</span>
+			<input readonly value={ url } class="min-w-0 flex-1 bg-transparent font-mono text-sm text-fg focus:outline-none"/>
+			@clipboard.Button(url, "shrink-0 rounded-md p-1.5 text-muted transition-colors hover:bg-hover-strong hover:text-fg") {
 				<span data-copy-idle>
 					@iconCopy()
 				</span>
-				<span data-copy-done class="hidden text-emerald-400">
+				<span data-copy-done class="hidden text-success">
 					@iconCheck()
 				</span>
 			}
@@ -368,20 +437,20 @@ templ cloneRow(label, url string) {
 // main, which swaps target.
 templ atChip(at CommitAt, target string) {
 	if at.Short == "" {
-		<span class="flex items-center gap-2 rounded-lg border border-zinc-800 bg-zinc-900/60 px-3 py-1.5 text-sm font-medium text-zinc-200">
-			<span class="text-zinc-500">
-				@iconHistory()
+		<span class="flex items-center gap-2 rounded-lg border border-line bg-surface px-3 py-1.5 text-sm font-medium text-fg shadow-panel">
+			<span class="text-accent-fg">
+				@iconBranch()
 			</span>
 			main
 		</span>
 	} else {
-		<span class="flex items-center gap-2 rounded-lg border border-zinc-800 bg-zinc-900/60 px-3 py-1.5 text-sm text-zinc-300">
-			<span class="text-zinc-500">
-				@iconHistory()
+		<span class="flex items-center gap-2 rounded-lg border border-warn-line bg-warn-soft px-3 py-1.5 text-sm text-body">
+			<span class="text-warn">
+				@iconCommit()
 			</span>
-			<span class="font-mono">{ at.Short }</span>
+			<span class="font-mono text-fg">{ at.Short }</span>
 			if at.MainHref != "" {
-				<a href={ templ.SafeURL(at.MainHref) } hx-get={ at.MainHref } hx-target={ target } hx-swap={ swapNav } hx-push-url="true" class="text-zinc-500 transition-colors hover:text-zinc-200">Back to main</a>
+				<a href={ templ.SafeURL(at.MainHref) } hx-get={ at.MainHref } hx-target={ target } hx-swap={ swapNav } hx-push-url="true" class="text-subtle transition-colors hover:text-fg">Back to main</a>
 			}
 		</span>
 	}
@@ -389,22 +458,17 @@ templ atChip(at CommitAt, target string) {
 
 // --- Commit history ------------------------------------------------------------------------
 
-// CommitsPage / CommitsContent render main's history: the shared header + Code popover, the
-// commit rows (optionally only those touching a path), and a pager.
+// CommitsPage / CommitsContent render main's history: the repository's header, the commit rows
+// (optionally only those touching a path), and a pager.
 templ CommitsPage(n nav.Model, v CommitsView) {
-	@layout.Shell(shell("Commits · "+v.Chrome.Name+" · "+Brand, layout.LeftNav, n)) {
+	@layout.Shell(shell("Commits · "+v.Chrome.Name+" · "+Brand, layout.TopNav, n)) {
 		@CommitsContent(v)
 	}
 }
 
 templ CommitsContent(v CommitsView) {
-	<div class="flex h-full flex-1 flex-col overflow-hidden">
-		<div class="shrink-0">
-			@PageHead(v.Chrome.Name, v.Chrome.Subtitle, "") {
-				@changesLink(v.Chrome.ChangesHref, "#repo-main")
-				@codeButton(v.Chrome.Clone)
-			}
-		</div>
+	<div class="group/repo flex h-full flex-1 flex-col overflow-hidden">
+		@repoHead(v.Chrome, tabHistory, "#repo-main", false)
 		<div id="repo-main" data-hydrate class="hydrating flex-1 overflow-y-auto">
 			@CommitsMain(v)
 		</div>
@@ -415,17 +479,17 @@ templ CommitsContent(v CommitsView) {
 // the pager. Swapped as #repo-main; ServeCommits returns it alone on an
 // HX-Target=repo-main request.
 templ CommitsMain(v CommitsView) {
-	<div class="mx-auto w-full max-w-5xl px-6 pb-16 sm:px-10">
+	<div class="mx-auto w-full max-w-5xl px-6 pt-6 pb-16 sm:px-10">
 		@panel() {
 			@panelHead() {
 				<h3>Commits on Main</h3>
 				if v.FilePath != "" {
-					<span class="text-zinc-600">·</span>
-					<span class="min-w-0 truncate font-mono font-normal text-zinc-400">{ v.FilePath }</span>
+					<span class="text-ghost">·</span>
+					<span class="min-w-0 truncate font-mono font-normal text-muted">{ v.FilePath }</span>
 				}
 				<span class="flex-1"></span>
 				if v.Count > 0 {
-					<span class="shrink-0 whitespace-nowrap font-normal text-zinc-500"><span class="font-medium text-zinc-300">{ strconv.FormatInt(v.Count, 10) }</span> { pluralize(v.Count, "commit", "commits") }</span>
+					<span class="shrink-0 whitespace-nowrap font-normal text-subtle"><span class="font-medium text-body">{ strconv.FormatInt(v.Count, 10) }</span> { pluralize(v.Count, "commit", "commits") }</span>
 				}
 			}
 			if len(v.Commits) == 0 {
@@ -433,7 +497,7 @@ templ CommitsMain(v CommitsView) {
 					No commits found.
 				}
 			} else {
-				<div class="divide-y divide-zinc-800/70">
+				<div class="divide-y divide-line-soft">
 					for _, c := range v.Commits {
 						@commitRow(c)
 					}
@@ -446,33 +510,34 @@ templ CommitsMain(v CommitsView) {
 	</div>
 }
 
-// commitRow is one commit in the history: the subject (linked to its diff), author + age + the
-// CL it landed from, and a trailing control cluster — the short commit ID (→ diff), a copy
-// button, and a "browse the tree at this commit" link.
+// commitRow is one commit in the history: its author's badge, the subject (linked to its diff),
+// author + age + the CL it landed from, and a trailing control cluster — the short commit ID
+// (→ diff), a copy button, and a "browse the tree at this commit" link.
 templ commitRow(c CommitRow) {
-	<div class="flex items-center gap-3 px-4 py-3 text-sm transition-colors hover:bg-zinc-900/40">
+	<div class="group flex items-center gap-3.5 px-4 py-3 text-sm transition-colors hover:bg-hover">
+		@avatar(c.Author)
 		<div class="min-w-0 flex-1">
-			<a href={ templ.SafeURL(c.Href) } hx-get={ c.Href } hx-target="#repo-main" hx-swap="innerHTML swap:70ms settle:1ms" hx-push-url="true" class="block truncate font-medium text-zinc-100 transition-colors hover:text-white hover:underline">{ c.Title }</a>
-			<div class="mt-0.5 flex flex-wrap items-center gap-2 text-sm text-zinc-500">
-				<span class="font-medium text-zinc-400">{ c.Author }</span>
-				<span class="text-zinc-600">·</span>
+			<a href={ templ.SafeURL(c.Href) } hx-get={ c.Href } hx-target="#repo-main" hx-swap={ swapNav } hx-push-url="true" class="block truncate font-medium text-fg transition-colors hover:text-accent-fg">{ c.Title }</a>
+			<div class="mt-0.5 flex flex-wrap items-center gap-2 text-sm text-subtle">
+				<span class="font-medium text-muted">{ c.Author }</span>
+				<span class="text-ghost">·</span>
 				<span title={ c.AgeTitle }>{ c.Age }</span>
 				if c.CLHref != "" {
-					<a href={ templ.SafeURL(c.CLHref) } hx-get={ c.CLHref } hx-target="#repo-main" hx-swap="innerHTML swap:70ms settle:1ms" hx-push-url="true" class={ chipClass(toneNeutral), "transition-colors hover:text-zinc-100" }>CL { strconv.FormatInt(c.CL, 10) }</a>
+					<a href={ templ.SafeURL(c.CLHref) } hx-get={ c.CLHref } hx-target="#repo-main" hx-swap={ swapNav } hx-push-url="true" class={ chipClass(toneNeutral), "transition-colors hover:border-accent-line hover:text-accent-fg" }>CL { strconv.FormatInt(c.CL, 10) }</a>
 				}
 			</div>
 		</div>
 		<div class="flex shrink-0 items-center gap-1">
-			<a href={ templ.SafeURL(c.Href) } hx-get={ c.Href } hx-target="#repo-main" hx-swap="innerHTML swap:70ms settle:1ms" hx-push-url="true" class="rounded-md border border-zinc-800 bg-zinc-900/60 px-2 py-1 font-mono text-sm text-zinc-300 transition-colors hover:bg-zinc-800 hover:text-zinc-100">{ c.ShortSHA }</a>
-			@clipboard.Button(c.SHA, "rounded-md p-1.5 text-zinc-500 transition-colors hover:bg-zinc-800 hover:text-zinc-200") {
+			<a href={ templ.SafeURL(c.Href) } hx-get={ c.Href } hx-target="#repo-main" hx-swap={ swapNav } hx-push-url="true" class="rounded-lg border border-line bg-sunken px-2 py-1 font-mono text-sm text-body transition-colors hover:border-accent-line hover:text-accent-fg">{ c.ShortSHA }</a>
+			@clipboard.Button(c.SHA, "rounded-lg p-1.5 text-subtle transition-colors hover:bg-hover-strong hover:text-fg") {
 				<span data-copy-idle>
 					@iconCopy()
 				</span>
-				<span data-copy-done class="hidden text-emerald-400">
+				<span data-copy-done class="hidden text-success">
 					@iconCheck()
 				</span>
 			}
-			<a href={ templ.SafeURL(c.BrowseHref) } hx-get={ c.BrowseHref } hx-target="#repo-main" hx-swap="innerHTML swap:70ms settle:1ms" hx-push-url="true" title="Browse the repository at this commit" class="rounded-md p-1.5 text-zinc-500 transition-colors hover:bg-zinc-800 hover:text-zinc-200">
+			<a href={ templ.SafeURL(c.BrowseHref) } hx-get={ c.BrowseHref } hx-target="#repo-main" hx-swap={ swapNav } hx-push-url="true" title="Browse the repository at this commit" class="rounded-lg p-1.5 text-subtle transition-colors hover:bg-hover-strong hover:text-fg">
 				@iconCode()
 			</a>
 		</div>
@@ -480,19 +545,19 @@ templ commitRow(c CommitRow) {
 }
 
 // commitPager is the newer/older pair for the commit history (only rendered when a neighbour page
-// exists; the unavailable direction is a dimmed, non-interactive label).
+// exists; the unavailable direction is a disabled button).
 templ commitPager(v CommitsView) {
 	if v.PrevHref != "" || v.NextHref != "" {
 		<div class="mt-4 flex items-center justify-between">
 			if v.PrevHref != "" {
-				<a href={ templ.SafeURL(v.PrevHref) } hx-get={ v.PrevHref } hx-target="#repo-main" hx-swap="innerHTML swap:70ms settle:1ms" hx-push-url="true" class="rounded-lg border border-zinc-800 bg-zinc-900/60 px-3 py-1.5 text-sm text-zinc-300 transition-colors hover:bg-zinc-900">Newer</a>
+				<a href={ templ.SafeURL(v.PrevHref) } hx-get={ v.PrevHref } hx-target="#repo-main" hx-swap={ swapNav } hx-push-url="true" class={ btnClass(btnSecondary) }>Newer</a>
 			} else {
-				<span class="rounded-lg border border-zinc-900 px-3 py-1.5 text-sm text-zinc-700">Newer</span>
+				<span class={ btnClass(btnDisabled) }>Newer</span>
 			}
 			if v.NextHref != "" {
-				<a href={ templ.SafeURL(v.NextHref) } hx-get={ v.NextHref } hx-target="#repo-main" hx-swap="innerHTML swap:70ms settle:1ms" hx-push-url="true" class="rounded-lg border border-zinc-800 bg-zinc-900/60 px-3 py-1.5 text-sm text-zinc-300 transition-colors hover:bg-zinc-900">Older</a>
+				<a href={ templ.SafeURL(v.NextHref) } hx-get={ v.NextHref } hx-target="#repo-main" hx-swap={ swapNav } hx-push-url="true" class={ btnClass(btnSecondary) }>Older</a>
 			} else {
-				<span class="rounded-lg border border-zinc-900 px-3 py-1.5 text-sm text-zinc-700">Older</span>
+				<span class={ btnClass(btnDisabled) }>Older</span>
 			}
 		</div>
 	}
@@ -500,22 +565,17 @@ templ commitPager(v CommitsView) {
 
 // --- Single-commit diff --------------------------------------------------------------------
 
-// CommitDiffPage / CommitDiffContent render one commit: the shared header + Code popover, the
-// commit message + metadata card, a changed-files stat bar, and one card per changed file.
+// CommitDiffPage / CommitDiffContent render one commit: the repository's header, the commit
+// message + metadata card, a changed-files stat bar, and one card per changed file.
 templ CommitDiffPage(n nav.Model, v CommitDiffView) {
-	@layout.Shell(shell(v.ShortSHA+" · "+v.Chrome.Name+" · "+Brand, layout.LeftNav, n)) {
+	@layout.Shell(shell(v.ShortSHA+" · "+v.Chrome.Name+" · "+Brand, layout.TopNav, n)) {
 		@CommitDiffContent(v)
 	}
 }
 
 templ CommitDiffContent(v CommitDiffView) {
-	<div class="flex h-full flex-1 flex-col overflow-hidden">
-		<div class="shrink-0">
-			@PageHead(v.Chrome.Name, v.Chrome.Subtitle, "") {
-				@changesLink(v.Chrome.ChangesHref, "#repo-main")
-				@codeButton(v.Chrome.Clone)
-			}
-		</div>
+	<div class="group/repo flex h-full flex-1 flex-col overflow-hidden">
+		@repoHead(v.Chrome, tabHistory, "#repo-main", false)
 		<div id="repo-main" data-hydrate class="hydrating flex-1 overflow-y-auto">
 			@CommitDiffMain(v)
 		</div>
@@ -526,7 +586,7 @@ templ CommitDiffContent(v CommitDiffView) {
 // stat bar, and the per-file diffs. Swapped as #repo-main; ServeCommitDiff returns it alone on an
 // HX-Target=repo-main request.
 templ CommitDiffMain(v CommitDiffView) {
-	<div class="mx-auto w-full max-w-5xl px-6 pb-16 sm:px-10">
+	<div class="mx-auto w-full max-w-5xl px-6 pt-6 pb-16 sm:px-10">
 		@commitHeader(v)
 		@diffStatBar(v)
 		@panel() {
@@ -546,46 +606,48 @@ templ CommitDiffMain(v CommitDiffView) {
 // a Commit Message panel whose header carries the author + age, the CL it landed from, the parent
 // link(s), the change ID, and the commit ID with a copy button.
 templ commitHeader(v CommitDiffView) {
-	<h2 class="mb-4 text-xl font-semibold tracking-tight text-zinc-50">{ v.Title }</h2>
+	<h2 class="mb-4 text-xl font-semibold tracking-tight text-fg">{ v.Title }</h2>
 	<div class="mb-4">
 		@panel() {
 			@panelHead() {
-				<span class="text-zinc-300">{ v.Author }</span>
-				<span class="font-normal text-zinc-500" title={ v.AgeTitle }>committed { v.Age }</span>
+				@avatar(v.Author)
+				<span class="text-body">{ v.Author }</span>
+				<span class="font-normal text-subtle" title={ v.AgeTitle }>committed { v.Age }</span>
 				if v.CLHref != "" {
-					<a href={ templ.SafeURL(v.CLHref) } hx-get={ v.CLHref } hx-target="#repo-main" hx-swap="innerHTML swap:70ms settle:1ms" hx-push-url="true" class={ chipClass(toneNeutral), "transition-colors hover:text-zinc-100" }>CL { strconv.FormatInt(v.CL, 10) }</a>
+					<a href={ templ.SafeURL(v.CLHref) } hx-get={ v.CLHref } hx-target="#repo-main" hx-swap={ swapNav } hx-push-url="true" class={ chipClass(toneNeutral), "transition-colors hover:border-accent-line hover:text-accent-fg" }>CL { strconv.FormatInt(v.CL, 10) }</a>
 				}
 				<span class="flex-1"></span>
 				if len(v.Parents) > 0 {
-					<span class="font-normal text-zinc-600">Parent</span>
+					<span class="font-normal text-faint">Parent</span>
 					for _, p := range v.Parents {
-						<a href={ templ.SafeURL(p.Href) } hx-get={ p.Href } hx-target="#repo-main" hx-swap="innerHTML swap:70ms settle:1ms" hx-push-url="true" class={ chipClass(toneNeutral), "font-mono transition-colors hover:text-zinc-100" }>{ p.ShortSHA }</a>
+						<a href={ templ.SafeURL(p.Href) } hx-get={ p.Href } hx-target="#repo-main" hx-swap={ swapNav } hx-push-url="true" class={ chipClass(toneNeutral), "font-mono transition-colors hover:border-accent-line hover:text-accent-fg" }>{ p.ShortSHA }</a>
 					}
 				}
 				<span class={ chipClass(toneNeutral), "font-mono" } title="Change ID">{ v.ChangeID }</span>
 				<span class={ chipClass(toneNeutral), "font-mono" } title="Commit ID">{ v.ShortSHA }</span>
-				@clipboard.Button(v.SHA, "rounded-md p-1 text-zinc-500 transition-colors hover:bg-zinc-800 hover:text-zinc-200") {
+				@clipboard.Button(v.SHA, "rounded-lg p-1 text-subtle transition-colors hover:bg-hover-strong hover:text-fg") {
 					<span data-copy-idle>
 						@iconCopy()
 					</span>
-					<span data-copy-done class="hidden text-emerald-400">
+					<span data-copy-done class="hidden text-success">
 						@iconCheck()
 					</span>
 				}
 			}
-			<pre class="whitespace-pre-wrap px-4 py-3 font-mono text-sm leading-relaxed text-zinc-300">{ clFullMessage(v.Title, v.Body) }</pre>
+			<pre class="whitespace-pre-wrap px-4 py-3.5 font-mono text-sm leading-relaxed text-body">{ clFullMessage(v.Title, v.Body) }</pre>
 		}
 	</div>
 }
 
 // diffStatBar is the "N files changed, +X −Y" summary line above the file list.
 templ diffStatBar(v CommitDiffView) {
-	<div class="mb-4 flex flex-wrap items-center gap-3 text-sm text-zinc-500">
-		<span><span class="font-medium text-zinc-300">{ strconv.Itoa(v.NumFiles) }</span> { pluralize(int64(v.NumFiles), "file", "files") } changed</span>
+	<div class="mb-4 flex flex-wrap items-center gap-3 text-sm text-subtle">
+		<span><span class="font-medium text-body">{ strconv.Itoa(v.NumFiles) }</span> { pluralize(int64(v.NumFiles), "file", "files") } changed</span>
 		if v.TotalsKnown {
-			<span class="text-emerald-400">+{ strconv.Itoa(v.Addition) }</span>
-			<span class="text-red-400">−{ strconv.Itoa(v.Deletion) }</span>
+			@diffStat(v.Addition, v.Deletion)
 		}
+		<span class="flex-1"></span>
+		@diffViewToggle()
 	</div>
 }
 
@@ -606,7 +668,9 @@ templ FileRows(rows []DiffFileView, next string) {
 		@fileRow(f)
 	}
 	if next != "" {
-		<div data-live hx-get={ next } hx-trigger="intersect once" hx-swap="outerHTML" class="px-4 py-2.5 text-sm text-zinc-500">Loading more files…</div>
+		<div data-live hx-get={ next } hx-trigger="intersect once" hx-swap="outerHTML">
+			@loading("Loading more files…")
+		</div>
 	}
 }
 
@@ -614,36 +678,38 @@ templ FileRows(rows []DiffFileView, next string) {
 // opened — its diff, which it loads then (a row that starts open loads it as it scrolls into
 // view).
 templ fileRow(f DiffFileView) {
-	<details id={ f.Anchor } class="group border-b border-zinc-800/70 last:border-b-0" open?={ f.Open }>
-		<summary class="flex cursor-pointer list-none items-center gap-3 px-4 py-2.5 text-sm transition-colors hover:bg-zinc-900/40 [&::-webkit-details-marker]:hidden">
-			<span class="w-24 shrink-0">
+	<details id={ f.Anchor } class="group border-b border-line-soft last:border-b-0" open?={ f.Open }>
+		<summary class="flex cursor-pointer list-none items-center gap-3 px-4 py-2.5 text-sm transition-colors hover:bg-hover group-open:bg-neutral-soft [&::-webkit-details-marker]:hidden">
+			<span class="shrink-0 sm:w-24">
 				@diffStatusPill(f.Status)
 			</span>
 			<span class="flex min-w-0 flex-1 items-center gap-2 font-mono">
 				if f.OldName != "" && f.OldName != f.Name {
-					<span class="min-w-0 truncate text-zinc-500">{ f.OldName }</span>
-					<span class="shrink-0 text-zinc-600">→</span>
+					<span class="min-w-0 truncate text-subtle">{ f.OldName }</span>
+					<span class="shrink-0 text-faint">→</span>
 				}
-				<span class="min-w-0 truncate text-zinc-200">{ f.Name }</span>
+				<span data-file-name class="min-w-0 truncate text-fg">{ f.Name }</span>
 			</span>
 			if f.ThreadCount > 0 {
-				<span title="review comments">
+				<span title="review comments" class="hidden sm:inline">
 					@chip(toneInfo) {
 						{ pluralCount(f.ThreadCount, "Comment", "Comments") }
 					}
 				</span>
 			}
 			if f.OffDiff {
-				<span class="shrink-0 text-zinc-600">—</span>
+				<span class="shrink-0 text-faint">—</span>
 			} else if !f.IsBinary {
-				<span class="shrink-0 whitespace-nowrap"><span class="text-emerald-400">+{ strconv.Itoa(f.Addition) }</span> <span class="text-red-400">−{ strconv.Itoa(f.Deletion) }</span></span>
+				@diffStat(f.Addition, f.Deletion)
 			}
-			<span class="flex w-4 shrink-0 justify-center text-zinc-600 transition-transform group-open:rotate-180">
+			<span class="flex w-4 shrink-0 justify-center text-faint transition-transform group-open:rotate-180">
 				@iconChevron()
 			</span>
 		</summary>
-		<div class="border-t border-zinc-800/70">
-			<div data-live hx-get={ f.BodyHref } hx-trigger="intersect once" hx-swap="outerHTML" class="px-4 py-3 text-sm text-zinc-500">Loading the diff…</div>
+		<div class="border-t border-line-soft">
+			<div data-live hx-get={ f.BodyHref } hx-trigger="intersect once" hx-swap="outerHTML">
+				@loading("Loading the diff…")
+			</div>
 		</div>
 	</details>
 }
@@ -677,7 +743,7 @@ templ diffFileBody(f DiffFileView) {
 		}
 	} else {
 		<div class="chroma overflow-x-auto">
-			<table class="w-full border-collapse font-mono text-[12.5px] leading-[1.6]">
+			<table class="q-diff-unified w-full border-collapse font-mono text-[12.5px] leading-[1.6]">
 				<tbody>
 					for _, sec := range f.Sections {
 						for _, ln := range sec {
@@ -686,25 +752,98 @@ templ diffFileBody(f DiffFileView) {
 					}
 				</tbody>
 			</table>
+			@splitTable(f, "", false, false)
 		</div>
 	}
+}
+
+// splitTable is a file's diff side by side — the base on the left, the change on the right — which
+// a reader who prefers it sees instead of the unified table (<html data-diff="split">). A CL's
+// (threads) has every review thread follow its row, and — when the reader may comment — each
+// side's lines take a comment.
+templ splitTable(f DiffFileView, filePath string, threads, comments bool) {
+	<table class="q-diff-split w-full table-fixed border-collapse font-mono text-[12.5px] leading-[1.6]">
+		<colgroup>
+			<col class="w-14"/>
+			<col/>
+			<col class="w-14"/>
+			<col/>
+		</colgroup>
+		<tbody>
+			for _, sec := range f.Sections {
+				for _, row := range splitRows(sec) {
+					if row.Tag != "" {
+						<tr class="select-none bg-hunk text-subtle">
+							<td colspan="4" class="truncate px-3 py-1.5">
+								@templ.Raw(row.Tag)
+							</td>
+						</tr>
+					} else {
+						<tr class="cl-diff-row">
+							@splitSide(row.Left, "left", filePath, comments)
+							@splitSide(row.Right, "right", filePath, comments)
+						</tr>
+						if threads {
+							for _, t := range row.threads() {
+								<tr class="border-y border-line-soft bg-sunken">
+									<td colspan="4" class="px-3 py-3 font-sans text-sm leading-normal">
+										<div class="max-w-3xl">
+											@clThread(t, comments, false)
+										</div>
+									</td>
+								</tr>
+							}
+						}
+					}
+				}
+			}
+		</tbody>
+	</table>
+}
+
+// splitSide is one side of a split row: the line's number (with the comment control, when
+// comments are taken), and the line; an empty side where the other has more lines.
+templ splitSide(ln *DiffLineRow, side, filePath string, comments bool) {
+	if ln == nil {
+		<td class="bg-sunken"></td>
+		<td class={ "bg-sunken", templ.KV("border-l border-line-soft", side == "right") }></td>
+	} else {
+		<td class={ "relative select-none whitespace-nowrap px-2 text-right align-top text-faint", splitSideClass(ln.Type, side) }>
+			if comments && splitCommentable(ln, side) {
+				<button type="button" class="cl-comment-add absolute top-[3px] left-1 flex h-[18px] w-[18px] cursor-pointer items-center justify-center rounded-md bg-accent font-semibold leading-none text-on-accent transition-colors hover:bg-accent-hi" data-file={ filePath } data-line={ splitAnchorLine(ln, side) } data-side={ side } title="Add comment">+</button>
+			}
+			{ splitLineNo(ln, side) }
+		</td>
+		<td class={ "whitespace-pre-wrap break-all py-px pr-3 pl-2 align-top text-fg", splitSideClass(ln.Type, side), templ.KV("border-l border-line-soft", side == "right") }>
+			<span class={ diffMarkerClass(splitMarkerType(ln.Type, side)) }>{ diffMarker(splitMarkerType(ln.Type, side)) }</span>@templ.Raw(ln.Content)
+		</td>
+	}
+}
+
+// diffViewToggle switches the diff between unified and split, for every file at once
+// (ok.js, which remembers the choice; d does it too).
+templ diffViewToggle() {
+	<span class="flex shrink-0 items-center rounded-lg border border-line bg-surface p-0.5 text-xs font-medium">
+		<button type="button" data-diff-view="unified" title="Unified diff" class="cursor-pointer rounded-md px-2.5 py-1 text-subtle transition-colors hover:text-fg [:root:not([data-diff=split])_&]:bg-selected [:root:not([data-diff=split])_&]:text-fg">Unified</button>
+		<button type="button" data-diff-view="split" title="Split diff" class="cursor-pointer rounded-md px-2.5 py-1 text-subtle transition-colors hover:text-fg [[data-diff=split]_&]:bg-selected [[data-diff=split]_&]:text-fg">Split</button>
+	</span>
 }
 
 // diffLine is one row of a file diff: a hunk header spanning the row, or a two-gutter (old/new
 // line number) code line coloured by change type. Content is server-highlighted HTML.
 templ diffLine(ln DiffLineRow) {
 	if ln.Type == "tag" {
-		<tr class="select-none bg-zinc-900/60 text-zinc-500">
-			<td colspan="3" class="px-3 py-1">
+		<tr class="select-none bg-hunk text-subtle">
+			<td colspan="3" class="px-3 py-1.5">
 				@templ.Raw(ln.Content)
 			</td>
 		</tr>
 	} else {
 		<tr class={ diffRowClass(ln.Type) }>
-			<td class="w-[1%] select-none whitespace-nowrap px-2 text-right align-top text-zinc-600">{ lineNo(ln.LeftIdx) }</td>
-			<td class="w-[1%] select-none whitespace-nowrap px-2 text-right align-top text-zinc-600">{ lineNo(ln.RightIdx) }</td>
-			<td class="w-full whitespace-pre-wrap break-all py-px pl-2 pr-3 align-top text-zinc-200">
-				<span class="mr-1 select-none text-zinc-500">{ diffMarker(ln.Type) }</span>@templ.Raw(ln.Content)
+			<td class="w-[1%] select-none whitespace-nowrap px-2 text-right align-top text-faint">{ lineNo(ln.LeftIdx) }</td>
+			<td class="w-[1%] select-none whitespace-nowrap px-2 text-right align-top text-faint">{ lineNo(ln.RightIdx) }</td>
+			<td class="w-full whitespace-pre-wrap break-all py-px pl-2 pr-3 align-top text-fg">
+				<span class={ diffMarkerClass(ln.Type) }>{ diffMarker(ln.Type) }</span>@templ.Raw(ln.Content)
 			</td>
 		</tr>
 	}
@@ -723,20 +862,20 @@ templ diffStatusPill(status string) {
 // commit (its short ID, author, and age, titled with its subject); then the line number and the
 // highlighted line.
 templ blameLine(l BlameLine) {
-	<tr class={ "transition-colors hover:bg-zinc-900/40", templ.KV("border-t border-zinc-800/70", l.First && l.Number > 1) }>
-		<td class="w-[1%] max-w-[18rem] whitespace-nowrap px-3 align-top font-sans text-sm" title={ l.CommitTitle }>
+	<tr class={ "transition-colors hover:bg-hover has-[:target]:bg-accent-soft", templ.KV("border-t border-line-soft", l.First && l.Number > 1) }>
+		<td class="w-[1%] max-w-[18rem] whitespace-nowrap border-r border-line-soft px-3 align-top font-sans text-sm" title={ l.CommitTitle }>
 			if l.First {
 				if l.CommitHref != "" {
-					<a href={ templ.SafeURL(l.CommitHref) } hx-get={ l.CommitHref } hx-target="#content" hx-swap={ swapNav } hx-push-url="true" class="font-mono text-zinc-400 transition-colors hover:text-zinc-100">{ l.CommitShort }</a>
+					<a href={ templ.SafeURL(l.CommitHref) } hx-get={ l.CommitHref } hx-target="#content" hx-swap={ swapNav } hx-push-url="true" class="font-mono text-accent-fg transition-colors hover:text-fg">{ l.CommitShort }</a>
 				}
-				<span class="ml-2 text-zinc-500">{ l.Author }</span>
-				<span class="ml-2 text-zinc-600" title={ l.AgeTitle }>{ l.Age }</span>
+				<span class="ml-2 text-subtle">{ l.Author }</span>
+				<span class="ml-2 text-faint" title={ l.AgeTitle }>{ l.Age }</span>
 			}
 		</td>
-		<td class="w-[1%] select-none whitespace-nowrap px-3 text-right align-top text-zinc-600">
-			<a href={ templ.SafeURL("#L" + strconv.Itoa(l.Number)) } id={ "L" + strconv.Itoa(l.Number) } class="text-zinc-600 hover:text-zinc-300">{ strconv.Itoa(l.Number) }</a>
+		<td class="w-[1%] select-none whitespace-nowrap px-3 text-right align-top text-faint">
+			<a href={ templ.SafeURL("#L" + strconv.Itoa(l.Number)) } id={ "L" + strconv.Itoa(l.Number) } class="text-faint transition-colors hover:text-accent-fg">{ strconv.Itoa(l.Number) }</a>
 		</td>
-		<td class="w-full whitespace-pre px-3 align-top text-zinc-200">
+		<td class="w-full whitespace-pre px-3 align-top text-fg">
 			@templ.Raw(l.HTML)
 		</td>
 	</tr>
@@ -772,7 +911,7 @@ templ iconCheck() {
 }
 
 templ iconHistory() {
-	<svg class="h-3.5 w-3.5" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="m.427 1.927 1.215 1.215a8.002 8.002 0 1 1-1.6 5.685.75.75 0 1 1 1.493-.154 6.5 6.5 0 1 0 1.18-4.458l1.358 1.358A.25.25 0 0 1 5.075 6H1.25A.25.25 0 0 1 1 5.75V1.925c0-.223.27-.335.427-.178ZM8 4a.75.75 0 0 1 .75.75v2.99l1.943 1.94a.751.751 0 0 1-1.06 1.061L7.47 8.53a.75.75 0 0 1-.22-.53V4.75A.75.75 0 0 1 8 4Z"></path></svg>
+	<svg class="h-4 w-4" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="m.427 1.927 1.215 1.215a8.002 8.002 0 1 1-1.6 5.685.75.75 0 1 1 1.493-.154 6.5 6.5 0 1 0 1.18-4.458l1.358 1.358A.25.25 0 0 1 5.075 6H1.25A.25.25 0 0 1 1 5.75V1.925c0-.223.27-.335.427-.178ZM8 4a.75.75 0 0 1 .75.75v2.99l1.943 1.94a.751.751 0 0 1-1.06 1.061L7.47 8.53a.75.75 0 0 1-.22-.53V4.75A.75.75 0 0 1 8 4Z"></path></svg>
 }
 
 templ iconBook() {
@@ -793,4 +932,45 @@ templ iconStarOutline() {
 
 templ iconTrash() {
 	<svg class="h-4 w-4" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M11 1.75V3h2.25a.75.75 0 0 1 0 1.5H2.75a.75.75 0 0 1 0-1.5H5V1.75C5 .784 5.784 0 6.75 0h2.5C10.216 0 11 .784 11 1.75ZM4.496 6.675l.66 6.6a.25.25 0 0 0 .249.225h5.19a.25.25 0 0 0 .249-.225l.66-6.6a.75.75 0 0 1 1.492.149l-.66 6.6A1.748 1.748 0 0 1 10.595 15h-5.19a1.75 1.75 0 0 1-1.741-1.575l-.66-6.6a.75.75 0 1 1 1.492-.15ZM6.5 1.75V3h3V1.75a.25.25 0 0 0-.25-.25h-2.5a.25.25 0 0 0-.25.25Z"></path></svg>
+}
+
+// iconRepo is a repository: a book with its spine. cls sizes it.
+templ iconRepo(cls string) {
+	<svg class={ cls } viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M2 2.5A2.5 2.5 0 0 1 4.5 0h8.75a.75.75 0 0 1 .75.75v12.5a.75.75 0 0 1-.75.75h-2.5a.75.75 0 0 1 0-1.5h1.75v-2h-8a1 1 0 0 0-.714 1.7.75.75 0 1 1-1.072 1.05A2.495 2.495 0 0 1 2 11.5Zm10.5-1h-8a1 1 0 0 0-1 1v6.708A2.486 2.486 0 0 1 4.5 9h8ZM5 12.25a.25.25 0 0 1 .25-.25h3.5a.25.25 0 0 1 .25.25v3.25a.25.25 0 0 1-.4.2l-1.45-1.087a.249.249 0 0 0-.3 0L5.4 15.7a.25.25 0 0 1-.4-.2Z"></path></svg>
+}
+
+templ iconBranch() {
+	<svg class="h-4 w-4" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M9.5 3.25a2.25 2.25 0 1 1 3 2.122V6A2.5 2.5 0 0 1 10 8.5H6a1 1 0 0 0-1 1v1.128a2.251 2.251 0 1 1-1.5 0V5.372a2.25 2.25 0 1 1 1.5 0v1.836A2.493 2.493 0 0 1 6 7h4a1 1 0 0 0 1-1v-.628A2.25 2.25 0 0 1 9.5 3.25Zm-6 0a.75.75 0 1 0 1.5 0 .75.75 0 0 0-1.5 0Zm8.25-.75a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5ZM4.25 12a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5Z"></path></svg>
+}
+
+templ iconCommit() {
+	<svg class="h-4 w-4" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M11.93 8.5a4.002 4.002 0 0 1-7.86 0H.75a.75.75 0 0 1 0-1.5h3.32a4.002 4.002 0 0 1 7.86 0h3.32a.75.75 0 0 1 0 1.5Zm-1.43-.75a2.5 2.5 0 1 0-5 0 2.5 2.5 0 0 0 5 0Z"></path></svg>
+}
+
+templ iconPlus() {
+	<svg class="h-4 w-4" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M7.75 2a.75.75 0 0 1 .75.75V7h4.25a.75.75 0 0 1 0 1.5H8.5v4.25a.75.75 0 0 1-1.5 0V8.5H2.75a.75.75 0 0 1 0-1.5H7V2.75A.75.75 0 0 1 7.75 2Z"></path></svg>
+}
+
+templ iconArrowRight() {
+	<svg class="h-4 w-4" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8.22 2.97a.75.75 0 0 1 1.06 0l4.25 4.25a.75.75 0 0 1 0 1.06l-4.25 4.25a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l2.97-2.97H3.75a.75.75 0 0 1 0-1.5h7.44L8.22 4.03a.75.75 0 0 1 0-1.06Z"></path></svg>
+}
+
+templ iconAlert() {
+	<svg class="mt-px h-4 w-4 shrink-0" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M6.457 1.047c.659-1.234 2.427-1.234 3.086 0l6.082 11.378A1.75 1.75 0 0 1 14.082 15H1.918a1.75 1.75 0 0 1-1.543-2.575Zm1.763.707a.25.25 0 0 0-.44 0L1.698 13.132a.25.25 0 0 0 .22.368h12.164a.25.25 0 0 0 .22-.368Zm.53 3.996v2.5a.75.75 0 0 1-1.5 0v-2.5a.75.75 0 0 1 1.5 0ZM9 11a1 1 0 1 1-2 0 1 1 0 0 1 2 0Z"></path></svg>
+}
+
+templ iconSync() {
+	<svg class="h-4 w-4" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M1.705 8.005a.75.75 0 0 1 .834.656 5.5 5.5 0 0 0 9.592 2.97l-1.204-1.204a.25.25 0 0 1 .177-.427h3.646a.25.25 0 0 1 .25.25v3.646a.25.25 0 0 1-.427.177l-1.38-1.38A7.002 7.002 0 0 1 1.05 8.84a.75.75 0 0 1 .656-.834ZM8 2.5a5.487 5.487 0 0 0-4.131 1.869l1.204 1.204A.25.25 0 0 1 4.896 6H1.25A.25.25 0 0 1 1 5.75V2.104a.25.25 0 0 1 .427-.177l1.38 1.38A7.002 7.002 0 0 1 14.95 7.16a.75.75 0 0 1-1.49.178A5.5 5.5 0 0 0 8 2.5Z"></path></svg>
+}
+
+templ iconFork() {
+	<svg class="h-4 w-4" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M5 5.372v.878c0 .414.336.75.75.75h4.5a.75.75 0 0 0 .75-.75v-.878a2.25 2.25 0 1 1 1.5 0v.878a2.25 2.25 0 0 1-2.25 2.25h-1.5v2.128a2.251 2.251 0 1 1-1.5 0V8.5h-1.5A2.25 2.25 0 0 1 3.5 6.25v-.878a2.25 2.25 0 1 1 1.5 0ZM5 3.25a.75.75 0 1 0-1.5 0 .75.75 0 0 0 1.5 0Zm6.75.75a.75.75 0 1 0 0-1.5.75.75 0 0 0 0 1.5Zm-3 8.75a.75.75 0 1 0-1.5 0 .75.75 0 0 0 1.5 0Z"></path></svg>
+}
+
+templ iconWebhook() {
+	<svg class="h-4 w-4" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M5.5 4.25a2.25 2.25 0 0 1 4.5 0 .75.75 0 0 0 1.5 0 3.75 3.75 0 1 0-6.14 2.889l-2.272 4.258a.75.75 0 0 0 1.324.706L7 7.25a.75.75 0 0 0-.309-1.015A2.25 2.25 0 0 1 5.5 4.25Z"></path><path d="M7.364 3.607a.75.75 0 0 1 1.03.257l2.608 4.349a3.75 3.75 0 1 1-.628 6.785.75.75 0 0 1 .752-1.299 2.25 2.25 0 1 0-.033-3.88.75.75 0 0 1-1.03-.256L7.107 4.636a.75.75 0 0 1 .257-1.03Z"></path><path d="M2.9 8.776A.75.75 0 0 1 2.625 9.8 2.25 2.25 0 1 0 6 11.75a.75.75 0 0 1 .75-.751h5.5a.75.75 0 0 1 0 1.5H7.425a3.751 3.751 0 1 1-5.55-3.998.75.75 0 0 1 1.024.274Z"></path></svg>
+}
+
+templ iconInfo() {
+	<svg class="h-4 w-4 shrink-0" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M0 8a8 8 0 1 1 16 0A8 8 0 0 1 0 8Zm8-6.5a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13ZM6.5 7.75A.75.75 0 0 1 7.25 7h1a.75.75 0 0 1 .75.75v2.75h.25a.75.75 0 0 1 0 1.5h-2a.75.75 0 0 1 0-1.5h.25v-2h-.25a.75.75 0 0 1-.75-.75ZM8 6a1 1 0 1 1 0-2 1 1 0 0 1 0 2Z"></path></svg>
 }

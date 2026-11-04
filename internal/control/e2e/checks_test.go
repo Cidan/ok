@@ -21,7 +21,7 @@ type checkRow struct {
 	logHref      string
 }
 
-var checkRowRE = regexp.MustCompile(`(?s)<span class="[^"]*rounded-md[^"]*">\s*([A-Za-z ]+?)\s*</span>\s*</span>\s*<div class="min-w-0 flex-1 leading-6"><div class="flex min-w-0 items-center gap-2"><span class="truncate font-mono text-zinc-200">([^<]+)</span>.*?<a href="([^"]+)"[^>]*>Log</a>\s*(?:<button type="button" hx-post="[^"]+"[^>]*>([A-Za-z]+)</button>|<button type="button" disabled title="([^"]*)"[^>]*>([A-Za-z]+)</button>)`)
+var checkRowRE = regexp.MustCompile(`(?s)<div data-check[^>]*>\s*<span[^>]*>\s*<span data-chip[^>]*>\s*([A-Za-z ]+?)\s*</span>\s*</span>\s*<div[^>]*>\s*<div[^>]*>\s*<span data-check-name[^>]*>([^<]+)</span>.*?<a href="([^"]+)"[^>]*>Log</a>\s*(?:<button type="button" hx-post="[^"]+"[^>]*>([A-Za-z]+)</button>|<button type="button" disabled title="([^"]*)"[^>]*>([A-Za-z]+)</button>)`)
 
 // checks reads the Checks tab's runs, its verdict, whether it refreshes itself, and its
 // unaffected workflow jobs, from a page or the region's own fragment.
@@ -34,7 +34,7 @@ func checks(t *testing.T, p page) (rows []checkRow, verdict string, live bool, s
 	body := p.body[i:]
 	open := body[:strings.IndexByte(body, '>')]
 	live = strings.Contains(open, `hx-trigger="live" data-live-events="/example/svc/cl/`)
-	if m := regexp.MustCompile(`(?s)<h3>Pre</h3>.*?<span class="[^"]*rounded-md[^"]*">\s*([A-Za-z ]+?)\s*</span>`).FindStringSubmatch(body); m != nil {
+	if m := regexp.MustCompile(`(?s)<h3>Pre</h3>.*?<span data-chip[^>]*>\s*([A-Za-z ]+?)\s*</span>`).FindStringSubmatch(body); m != nil {
 		verdict = m[1]
 	}
 	for _, m := range checkRowRE.FindAllStringSubmatch(body, -1) {
@@ -46,7 +46,7 @@ func checks(t *testing.T, p page) (rows []checkRow, verdict string, live bool, s
 		}
 		rows = append(rows, r)
 	}
-	for _, m := range regexp.MustCompile(`(?s)Not Run\s*</span>\s*</span>\s*<div class="min-w-0 flex-1 leading-6"><div class="flex min-w-0 items-center gap-2"><span class="truncate font-mono text-zinc-200">([^<]+)</span>`).FindAllStringSubmatch(body, -1) {
+	for _, m := range regexp.MustCompile(`(?s)Not Run\s*</span>\s*</span>\s*<div[^>]*>\s*<div[^>]*>\s*<span data-check-name[^>]*>([^<]+)</span>`).FindAllStringSubmatch(body, -1) {
 		skipped = append(skipped, m[1])
 	}
 	return rows, verdict, live, skipped
@@ -238,10 +238,10 @@ func TestChecks(t *testing.T) {
 		}
 		body := p.body[i:]
 		end := strings.Index(body, "</section>")
-		if m := regexp.MustCompile(`(?s)^.*?rounded-md[^"]*">\s*([A-Za-z ]+?)\s*</span>`).FindStringSubmatch(body[:end]); m != nil {
+		if m := regexp.MustCompile(`(?s)^.*?<span data-chip[^>]*>\s*([A-Za-z ]+?)\s*</span>`).FindStringSubmatch(body[:end]); m != nil {
 			status = m[1]
 		}
-		if m := regexp.MustCompile(`px-4 py-2.5 text-sm text-zinc-300">([^<]*)</div>`).FindStringSubmatch(body[:end]); m != nil {
+		if m := regexp.MustCompile(`<div data-post-detail[^>]*>([^<]*)</div>`).FindStringSubmatch(body[:end]); m != nil {
 			detail = m[1]
 		}
 		for _, m := range checkRowRE.FindAllStringSubmatch(body[:end], -1) {

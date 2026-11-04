@@ -99,7 +99,7 @@ func TestServices(t *testing.T) {
 	rows := map[string]string{}
 	raw := map[string]string{}
 	hrefs := map[string]string{}
-	for _, m := range regexp.MustCompile(`(?s)href="(/services/(?:group/[a-z0-9_.-]+|\d+))"[^>]*>([^<]+)</a>(.*?)(?:<div class="flex items-start gap-4 px-4 py-3|</section>)`).FindAllStringSubmatch(p.body, -1) {
+	for _, m := range regexp.MustCompile(`(?s)href="(/services/(?:group/[a-z0-9_.-]+|\d+))"[^>]*>([^<]+)</a>(.*?)(?:<div data-service-group|</section>)`).FindAllStringSubmatch(p.body, -1) {
 		rows[m[2]], raw[m[2]], hrefs[m[2]] = excerpt(m[3]), m[3], m[1]
 	}
 	for name, want := range map[string][]string{
@@ -179,7 +179,7 @@ func TestServices(t *testing.T) {
 	hx := func(path, target string) page {
 		return e.do(carol, http.MethodGet, path, nil, map[string]string{"HX-Request": "true", "HX-Target": target})
 	}
-	if p := hx("/services", "div#service-groups"); !strings.HasPrefix(p.body, "<section") || p.has("data-hydrate") || !p.has("edge") {
+	if p := hx("/services", "div#service-groups"); !strings.HasPrefix(p.body, "<div data-service-counts") || !p.has("<section") || p.has("data-hydrate") || !p.has("edge") {
 		t.Errorf("the list's refresh: %s", excerpt(p.body))
 	}
 	if p := hx("/services/1", "div#service-main"); !strings.HasPrefix(p.body, `<div class="pb-16">`) || !p.has(`id="service-live"`) ||

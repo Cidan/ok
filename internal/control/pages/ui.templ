@@ -1,14 +1,17 @@
 package pages
 
-// ok's UI primitives — the one way to draw a container, a header, a status chip, and a button.
-// Pages compose these instead of restyling ad hoc, so every surface shares one type scale
-// (text-sm), one case (Title Case), one border/radius vocabulary, and one header treatment.
-// The principles are documented app-neutrally in docs/web.md ("Visual design system").
+import "strconv"
 
-// panel is the one bordered container: a rounded, transparent surface. Its first child is a
-// panelHead (every panel is titled); its body follows.
+// ok's UI primitives — the one way to draw a container, a header, a status chip, and a button.
+// Pages compose these instead of restyling ad hoc, so every surface shares one type scale, one
+// case (Title Case), one border/radius vocabulary, and one header treatment. The principles are
+// docs/web.md's ("Visual design system"); the colours are input.css's theme tokens, so each
+// primitive is right in both themes.
+
+// panel is the one bordered container: a rounded surface, lifted off the canvas. Its first child
+// is a panelHead (every panel is titled); its body follows.
 templ panel() {
-	<section class="overflow-hidden rounded-xl border border-zinc-800">
+	<section class="overflow-hidden rounded-2xl border border-line bg-surface shadow-panel">
 		{ children... }
 	</section>
 }
@@ -16,16 +19,17 @@ templ panel() {
 // panelFill is a panel that fills its column's height (the browser's Files panel): its header,
 // then a body the caller lets scroll (min-h-0 flex-1 overflow-y-auto).
 templ panelFill() {
-	<section class="flex min-h-0 flex-1 flex-col overflow-hidden rounded-xl border border-zinc-800">
+	<section class="flex min-h-0 flex-1 flex-col overflow-hidden rounded-2xl border border-line bg-surface shadow-panel">
 		{ children... }
 	</section>
 }
 
 // panelHead is a panel's header strip: fixed height, a hairline rule across the panel below it,
-// no background tint. Content is a panelTitle plus optional trailing meta/actions (push them
-// right with a flex-1 spacer), or a row of column labels for a tabular panel.
+// no background tint. Content is a panelTitle (its h3, the title, in the strongest text) plus
+// optional trailing meta/actions (push them right with a flex-1 spacer), or a row of column
+// labels for a tabular panel, quieter.
 templ panelHead() {
-	<div class="flex min-h-11 items-center gap-3 border-b border-zinc-800 px-4 py-1 text-sm font-medium text-zinc-400">
+	<div class="flex min-h-12 items-center gap-3 border-b border-line px-4 py-1 text-sm font-medium text-muted [&_h3]:font-semibold [&_h3]:text-fg">
 		{ children... }
 	</div>
 }
@@ -47,7 +51,7 @@ templ panelBody() {
 
 // panelEmpty is the empty state inside a panel (below its header).
 templ panelEmpty() {
-	<div class="px-4 py-8 text-center text-sm text-zinc-500">
+	<div class="px-4 py-9 text-center text-sm text-subtle">
 		{ children... }
 	</div>
 }
@@ -56,20 +60,77 @@ templ panelEmpty() {
 // text and a following @code call, and always one space after it: write `text{ " " }` before the
 // call and continue the sentence with a word after it, never punctuation.
 templ code(s string) {
-	<span class="font-mono text-zinc-300">{ s }</span>
+	<span class="font-mono text-body">{ s }</span>
 }
 
 // statusDot is a chip's tone in a dot: the compact form of a status, for a list where a chip on
 // every row would crowd it (a group's services in the sub-nav, a group's row). title says what
-// the chip would.
+// the chip would. A service's info tone is a status still moving, and pulses.
 templ statusDot(tone, title string) {
 	<span class={ dotClass(tone) } title={ title }></span>
 }
 
+// clDot is a CL's status in a dot: the same tones, still — a CL's info tone (open) is not motion.
+templ clDot(tone, title string) {
+	<span class={ stillDotClass(tone) } title={ title }></span>
+}
+
 // chip is the one status/label chip: a single size (text-sm), Title Case, toned by meaning
-// (see chipClass). Content is the label, optionally with a leading icon.
+// (see chipClass). Content is the label, optionally with a leading icon. data-chip marks it for
+// readers of the page (ok control's end-to-end tests read a status by it).
 templ chip(tone string) {
-	<span class={ chipClass(tone) }>
+	<span data-chip class={ chipClass(tone) }>
 		{ children... }
+	</span>
+}
+
+// avatar is a person's badge: their initial on their colour (avatarClass).
+templ avatar(name string) {
+	<span class={ avatarClass(name) } aria-hidden="true">{ clInitial(name) }</span>
+}
+
+// reqMark is whether a requirement is met: a check in a success disc, or an empty dashed ring.
+templ reqMark(met bool) {
+	if met {
+		<span class="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-success-soft text-success ring-1 ring-success-line">
+			<svg class="h-3 w-3" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L1.72 8.78a.751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0Z"></path></svg>
+		</span>
+	} else {
+		<span class="h-5 w-5 shrink-0 rounded-full border-[1.5px] border-dashed border-line-strong"></span>
+	}
+}
+
+// diffStat is a file's or a change's lines added and removed: the counts, and five blocks
+// sharing their proportion (diffBlocks).
+templ diffStat(add, del int) {
+	<span class="inline-flex shrink-0 items-center gap-2 whitespace-nowrap">
+		<span data-added class="text-success">+{ strconv.Itoa(add) }</span>
+		<span data-removed class="text-danger">−{ strconv.Itoa(del) }</span>
+		<span class="hidden gap-0.5 sm:flex" aria-hidden="true">
+			for _, b := range diffBlocks(add, del) {
+				<span class={ "h-2 w-2 rounded-[2px]", b }></span>
+			}
+		</span>
+	</span>
+}
+
+// loading is the placeholder for content on its way — a diff as its row opens, the next page of a
+// list: shimmering lines, with what is loading said for a screen reader.
+templ loading(what string) {
+	<div class="space-y-2.5 px-4 py-3.5 text-sm" role="status">
+		<span class="sr-only">{ what }</span>
+		<div class="q-shimmer h-3 w-2/5"></div>
+		<div class="q-shimmer h-3 w-4/5"></div>
+		<div class="q-shimmer h-3 w-3/5"></div>
+	</div>
+}
+
+// okMark is ok's mark: a check, inked on a gold tile lit from the top left — whatever the
+// installation calls itself (Brand), which the top bar writes beside it. cls sizes it.
+templ okMark(cls string) {
+	<span class={ "flex shrink-0 items-center justify-center rounded-[28%] bg-[linear-gradient(135deg,var(--color-accent-hi),var(--color-accent)_50%,var(--color-ember))] text-on-accent shadow-mark", cls } aria-hidden="true">
+		<svg class="h-[62%] w-[62%]" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round">
+			<path d="M5.5 12.8l4.2 4.2L18.5 7.6"></path>
+		</svg>
 	</span>
 }

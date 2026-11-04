@@ -114,7 +114,9 @@ func (s *Server) Mount(r chi.Router) {
 	r.Handle("/favicon.svg", assets)
 	r.Group(func(r chi.Router) {
 		r.Use(identify)
-		r.Get("/", s.home)
+		r.Get("/", s.dashboard)
+		r.Get("/repositories", s.repositories)
+		r.Get("/repositories/palette", s.palette)
 		r.Get("/repositories/list", s.homeList)
 		r.Get("/repositories/rows", s.homeRows)
 		r.Get("/repositories/new", s.newRepository)

@@ -1,11 +1,15 @@
 // Package layout is the reusable page shell: it owns the HTML document (head assets,
-// fonts, the full-viewport dark body) and arranges a navigation presentation around a
+// fonts, the full-viewport body in the app's theme tokens) and arranges a navigation presentation around a
 // content slot. The nav is presentation-agnostic (package nav); the layout picks HOW
 // it is shown via Variant, so "the nav adapts to the layout": LeftNav renders the
 // collapsible left drawer, TopNav a horizontal bar, Navless a centered card (onboarding).
 package layout
 
-import "github.com/Cidan/ok/internal/web/nav"
+import (
+	"github.com/a-h/templ"
+
+	"github.com/Cidan/ok/internal/web/nav"
+)
 
 // Variant selects the chrome arrangement.
 type Variant int
@@ -40,4 +44,13 @@ type Props struct {
 	// history element — the whole <body>, rail and all, without one. Set it only when every
 	// page serves the whole document to a request carrying HX-History-Restore-Request.
 	HistoryRestore bool
+	// Themes makes the app light and dark: the shell picks the reader's theme before the first
+	// paint and marks <html> with it (data-theme="light" or "dark", data-theme-pref the choice:
+	// light, dark, or system). The app's stylesheet defines both themes' tokens, and serves
+	// static/theme.js to switch them (docs/web.md, "Theme tokens").
+	Themes bool
+	// Overlay is what the app draws once, above every page and outside every swapped region, at
+	// the end of <body>: a command palette, a dialog the whole app opens. A navigation never
+	// replaces it.
+	Overlay templ.Component
 }

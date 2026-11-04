@@ -34,7 +34,7 @@ func TestInbox(t *testing.T) {
 
 	e.post(alice, path+"/request-review", url.Values{"reviewer": {e.id(bob)}, "message": {"please look"}})
 	e.waitFor("the review waiting on bob", func() bool { listed, attn := waiting(bob); return listed && attn })
-	if p := e.get(bob, "/"); !strings.Contains(p.body, "a note for bob") || !strings.Contains(p.body, "reviewer · open") {
+	if p := e.get(bob, "/"); !strings.Contains(p.body, "a note for bob") || !strings.Contains(p.body, "Needs Review") {
 		t.Errorf("bob's inbox row: %s", excerpt(p.body))
 	}
 
