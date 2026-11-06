@@ -90,13 +90,13 @@ type ContentLog struct {
 // never looking inside.
 type LogPlace []byte
 
-// Pack is a pack's row: its number, size, and the dictionary that last considered it (nil:
-// none).
+// Pack is a pack's row: its number, its size, and whether compaction wrote it — not a publish,
+// whose records are frames of their own at the level a waiting client is given.
 type Pack struct {
-	ID         encoding.ID
-	Num        uint64
-	Size       int64
-	Dictionary *int64
+	ID        encoding.ID
+	Num       uint64
+	Size      int64
+	Compacted bool
 }
 
 // Segment is a manifest's reference to a segment: its scope's, a repository's or a network's. Net

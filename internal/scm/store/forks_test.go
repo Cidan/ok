@@ -407,7 +407,7 @@ func TestForkDictionaries(t *testing.T) {
 	}
 	landFiles(p, 120, 120)
 	r, err = p.s.GC(ctx, p.repo, time.Now().Add(2*DictionaryRetrain), GCOptions{})
-	if err != nil || r.DictionaryTrained == 0 || r.ChunksRecompressed == 0 {
+	if err != nil || r.DictionaryTrained == 0 || r.RecordsFramed == 0 {
 		t.Fatalf("the parent's second dictionary: %s, %v", r, err)
 	}
 	second := r.DictionaryTrained
@@ -418,7 +418,7 @@ func TestForkDictionaries(t *testing.T) {
 		t.Errorf("the parent cannot read its own dictionary: %v", err)
 	}
 	// The fork lands files the parent landed after the fork: it holds their chunks, which the
-	// network stored first for the parent and compressed with the newer dictionary. The parent reads
+	// network stored first for the parent and framed with the newer dictionary. The parent reads
 	// them so; the fork, raw.
 	f := &clEnv{t: t, s: p.s, repo: fr.ID}
 	same := map[string]string{}

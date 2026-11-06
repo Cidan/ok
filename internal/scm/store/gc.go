@@ -72,9 +72,13 @@ type GCReport struct {
 	// ChunkBytesSwept).
 	ChunksReleased, TreesReleased, LocationsDropped int64
 	// Compaction: the packs it wrote and retired, the source bytes it read, and the pack
-	// bytes it reclaimed (the retired packs' sizes less the written packs').
+	// bytes it reclaimed (the retired packs' sizes less the written packs'); the frames it wrote,
+	// the records it put in frames of many, and the packs of records (versions 1 and 2) it rewrote.
 	PacksWritten, PacksRetired int
 	BytesRead, BytesReclaimed  int64
+	FramesWritten              int
+	RecordsFramed              int64
+	PacksUpgraded              int
 	PacksDeleted, OrphanPacks  int
 	// Segments merged away past their grace, and segments no row records, deleted.
 	SegmentsDeleted, OrphanSegments int
@@ -84,12 +88,11 @@ type GCReport struct {
 	// Segments is what the pass moved from the tail into segments, however little was waiting
 	// (nil when the repository's compaction was already running).
 	Segments *SegmentReport
-	// Dictionaries: one the pass trained (its frame ID, and the files it learned from), the one
-	// compaction compressed with, and the small chunks it compressed and the stored bytes saved.
-	DictionaryTrained                     uint32
-	DictionarySamples                     int
-	Dictionary                            uint32
-	ChunksRecompressed, BytesRecompressed int64
+	// Dictionaries: one the pass trained (its frame ID, and the files it learned from), and the one
+	// compaction compressed frames of many with.
+	DictionaryTrained uint32
+	DictionarySamples int
+	Dictionary        uint32
 	// ContentKept counts the content index's stale files and chunks the mark reached, which the
 	// pass touched.
 	ContentKept int64
@@ -559,7 +562,7 @@ func (s *Store) sweepBatch(ctx context.Context, repo int64, t table, batch []enc
 			if e, ok := held[id]; ok && !e.Pinned && e.Day < day {
 				n++
 				if l, ok := locs[id]; ok {
-					bytes += int64(l.Loc.Stored)
+					bytes += packLocation(l.Loc).Footprint()
 				}
 			}
 		}
@@ -635,7 +638,7 @@ func (s *Store) sweepContent(ctx context.Context, tx *txn, repo int64, kind enco
 			continue
 		}
 		if l, ok := locs[id]; ok {
-			*bytes += int64(l.Loc.Stored)
+			*bytes += packLocation(l.Loc).Footprint()
 			s.logIndex(tx, netScope, contentindex.Update{Op: contentindex.Drop, ID: id, Entry: contentindex.Entry{Kind: kind}})
 		}
 	}
@@ -699,7 +702,7 @@ func (s *Store) collectReleases(ctx context.Context, net backend.Network, dryRun
 				for _, id := range unheld {
 					if l, ok := locs[id]; ok {
 						n++
-						b += int64(l.Loc.Stored)
+						b += packLocation(l.Loc).Footprint()
 						if !dryRun {
 							s.logIndex(tx, netScope, contentindex.Update{Op: contentindex.Drop, ID: id, Entry: contentindex.Entry{Kind: kind}})
 						}
@@ -1184,8 +1187,14 @@ func (r *GCReport) String() string {
 	if r.DictionaryTrained != 0 {
 		dict += fmt.Sprintf("; trained dictionary %d on %d files", r.DictionaryTrained, r.DictionarySamples)
 	}
-	if r.ChunksRecompressed > 0 {
-		dict += fmt.Sprintf("; compressed %d small chunks with dictionary %d, saving %d bytes", r.ChunksRecompressed, r.Dictionary, r.BytesRecompressed)
+	if r.FramesWritten > 0 {
+		dict += fmt.Sprintf("; wrote %d frames, %d records in frames of many", r.FramesWritten, r.RecordsFramed)
+		if r.Dictionary != 0 {
+			dict += fmt.Sprintf(" with dictionary %d", r.Dictionary)
+		}
+		if r.PacksUpgraded > 0 {
+			dict += fmt.Sprintf(", rewriting %d packs of records", r.PacksUpgraded)
+		}
 	}
 	if r.ContentKept > 0 {
 		dict += fmt.Sprintf("; touched %d files, chunks, and trees the mark kept", r.ContentKept)

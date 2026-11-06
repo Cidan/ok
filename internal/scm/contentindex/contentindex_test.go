@@ -18,6 +18,12 @@ func chunkEntry(pack uint64, off int64, day Day) Entry {
 	return Entry{Kind: encoding.KindChunk, Body: true, Day: day, Loc: Location{Pack: pack, Offset: off, Stored: 900, Raw: 2100, Codec: 1}}
 }
 
+// framedEntry is a chunk's in a frame of a version 3 pack, inFrame bytes into it.
+func framedEntry(pack uint64, off int64, inFrame uint32, day Day) Entry {
+	return Entry{Kind: encoding.KindChunk, Body: true, Day: day, Loc: Location{Pack: pack, Offset: off, Stored: 40000, Raw: 2100, Codec: 1,
+		Framed: true, FrameRaw: 1 << 20, InFrame: inFrame}}
+}
+
 func fileEntry(day Day, chunks ...FileChunk) Entry {
 	var size uint64
 	for _, c := range chunks {
@@ -33,6 +39,8 @@ func TestEncodings(t *testing.T) {
 		{Op: Put, ID: id(2), Entry: fileEntry(20001, FileChunk{id(1), 2100}, FileChunk{id(3), 5})},
 		{Op: Touch, ID: id(4), Entry: Entry{Kind: encoding.KindFile, Day: 20002}},
 		{Op: Pin, ID: id(5), Entry: Entry{Kind: encoding.KindChunk}},
+		{Op: Put, ID: id(6), Entry: framedEntry(8, 1<<20, 300, 20003)},
+		{Op: Move, ID: id(7), Entry: framedEntry(9, 77, 0, 0)},
 	}
 	got, err := DecodeLog(EncodeLog(updates))
 	if err != nil {
@@ -112,6 +120,31 @@ func TestMalformed(t *testing.T) {
 	tree := Entry{Kind: encoding.KindTree, Body: true, Day: 4, Loc: Location{Pack: 3, Offset: 9, Stored: 40, Raw: 70}}
 	if got, err := DecodeEntry(EncodeEntry(tree)); err != nil || !got.Equal(tree) {
 		t.Fatalf("a tree's entry, located: %+v, %v", got, err)
+	}
+	framed := framedEntry(3, 9, 50, 4)
+	enc := EncodeEntry(framed)
+	if got, err := DecodeEntry(enc); err != nil || !got.Equal(framed) {
+		t.Fatalf("a framed entry: %+v, %v", got, err)
+	}
+	for n := range enc {
+		if _, err := DecodeEntry(enc[:n]); err == nil {
+			t.Fatalf("a framed entry cut to %d of %d bytes decoded", n, len(enc))
+		}
+	}
+	past := framedEntry(3, 9, 1<<20-2000, 4)
+	if _, err := DecodeEntry(EncodeEntry(past)); err == nil {
+		t.Fatal("a record past the end of its frame decoded")
+	}
+	// The framed flag on a file's entry, or a bodiless one.
+	file := EncodeEntry(fileEntry(1, FileChunk{id(1), 10}))
+	file[1] |= flagFramed
+	if _, err := DecodeEntry(file); err == nil {
+		t.Fatal("a file's entry flagged framed decoded")
+	}
+	stone := EncodeEntry(Entry{Kind: encoding.KindChunk, Day: 3})
+	stone[1] |= flagFramed
+	if _, err := DecodeEntry(stone); err == nil {
+		t.Fatal("a tombstone flagged framed decoded")
 	}
 	op := EncodeLog([]Update{{Op: Pin, ID: id(1), Entry: Entry{Kind: encoding.KindChunk}}})
 	op[2] = 9

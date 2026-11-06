@@ -265,6 +265,29 @@ func (s *Store) fsckPack(ctx context.Context, repo int64, net backend.Network, h
 	for _, rec := range records {
 		byID[rec.ID] = rec
 	}
+	dicts := s.dicts.of(net)
+	// A record's raw bytes from the local copy, whose frames Verify decoded and hashed: a frame of
+	// many decoded once while its records are read one after another, as the files below are, in the
+	// order of their first chunks in the pack.
+	var frameAt int64 = -1
+	var frame []byte
+	recordRaw := func(rec pack.Record) ([]byte, error) {
+		stored := make([]byte, rec.StoredLength)
+		if _, err := f.ReadAt(stored, rec.DataOffset()); err != nil {
+			return nil, err
+		}
+		if rec.Whole() {
+			return pack.Decompress(dicts, rec.ID, rec.Codec, rec.RawLength, stored)
+		}
+		if rec.DataOffset() != frameAt {
+			var err error
+			if frame, err = pack.DecodeFrame(dicts, rec.Location, stored); err != nil {
+				return nil, err
+			}
+			frameAt = rec.DataOffset()
+		}
+		return pack.RecordOf(frame, rec.Location)
+	}
 	// The index's chunks in this pack must agree with it.
 	pointed := map[encoding.ID]bool{}
 	for _, k := range here {
@@ -276,7 +299,7 @@ func (s *Store) fsckPack(ctx context.Context, repo int64, net backend.Network, h
 			r.Chunks++
 		}
 		rec, ok := byID[id]
-		want := pack.Location{Offset: e.Loc.Offset, Codec: pack.Codec(e.Loc.Codec), RawLength: e.Loc.Raw, StoredLength: e.Loc.Stored}
+		want := packLocation(e.Loc)
 		switch {
 		case !ok:
 			r.problem("%s %s: the index has it in pack %s, which does not hold it", e.Kind, id, pr.id)
@@ -285,11 +308,7 @@ func (s *Store) fsckPack(ctx context.Context, repo int64, net backend.Network, h
 		case rec.Kind != e.Kind:
 			r.problem("%s %s: pack %s's record of it is a %s's", e.Kind, id, pr.id, rec.Kind)
 		case e.Kind == encoding.KindTree:
-			stored := make([]byte, rec.StoredLength)
-			if _, err := f.ReadAt(stored, rec.DataOffset()); err != nil {
-				return nil, err
-			}
-			raw, err := pack.Decompress(s.dicts.of(net), id, rec.Codec, rec.RawLength, stored)
+			raw, err := recordRaw(rec)
 			if err == nil {
 				_, err = verifyBody(encoding.KindTree, id, raw)
 			}
@@ -304,13 +323,16 @@ func (s *Store) fsckPack(ctx context.Context, repo int64, net backend.Network, h
 		if !ok || !pointed[id] {
 			return nil, false, nil
 		}
-		stored := make([]byte, rec.StoredLength)
-		if _, err := f.ReadAt(stored, rec.DataOffset()); err != nil {
-			return nil, true, err
-		}
-		raw, err := pack.Decompress(s.dicts.of(net), id, rec.Codec, rec.RawLength, stored)
+		raw, err := recordRaw(rec)
 		return raw, true, err
 	}
+	at := func(f fsckFile) int64 {
+		if rec, ok := byID[f.chunks[0].ID]; ok {
+			return rec.DataOffset()
+		}
+		return -1
+	}
+	sort.SliceStable(files, func(i, j int) bool { return at(files[i]) < at(files[j]) })
 	for _, file := range files {
 		s.fsckFile(ctx, repo, file, local, r)
 	}
@@ -452,7 +474,7 @@ func (s *Store) fsckOrphans(ctx context.Context, repo int64, netScope backend.Sc
 	for _, o := range orphans {
 		id, rec, pr, kind := o.pack.ID, o.pack, o.pr, o.pack.Kind
 		if located[id] || !used[id] || rebuilt[id] {
-			r.DeadBytes += int64(rec.StoredLength) + pack.RecordHeaderLen
+			r.DeadBytes += rec.Footprint()
 			continue
 		}
 		if !repair {
@@ -476,7 +498,7 @@ func (s *Store) fsckOrphans(ctx context.Context, repo int64, netScope backend.Sc
 			inserted = true
 			s.logIndex(tx, netScope, contentindex.Update{Op: contentindex.Put, ID: id, Entry: contentindex.Entry{
 				Kind: kind, Day: locs.today,
-				Loc: contentindex.Location{Pack: pr.num, Offset: rec.Offset, Stored: rec.StoredLength, Raw: rec.RawLength, Codec: uint8(rec.Codec)},
+				Loc: indexLocation(pr.num, rec.Location),
 			}})
 			if _, ok, err := held.has(ctx, kind, id); err != nil {
 				return err
@@ -492,7 +514,7 @@ func (s *Store) fsckOrphans(ctx context.Context, repo int64, netScope backend.Sc
 		}
 		if !inserted {
 			// A concurrent publish stored it first, into its own pack.
-			r.DeadBytes += int64(rec.StoredLength) + pack.RecordHeaderLen
+			r.DeadBytes += rec.Footprint()
 			continue
 		}
 		rebuilt[id] = true

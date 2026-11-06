@@ -13,7 +13,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/klauspost/compress/zstd"
+
 	"github.com/Cidan/ok/internal/blob"
+	"github.com/Cidan/ok/internal/scm/contentindex"
 	"github.com/Cidan/ok/internal/scm/copies"
 	"github.com/Cidan/ok/internal/scm/encoding"
 	"github.com/Cidan/ok/internal/scm/pack"
@@ -227,13 +230,26 @@ func (s *Store) recordLocations(ctx context.Context, repo int64, kind encoding.K
 	}
 	for id, e := range entries {
 		pid := packs[e.Loc.Pack]
-		out[id] = chunkLoc{id: id, kind: kind, pack: pid, loc: pack.Location{
-			Offset: e.Loc.Offset, Codec: pack.Codec(e.Loc.Codec), RawLength: e.Loc.Raw, StoredLength: e.Loc.Stored}}
+		out[id] = chunkLoc{id: id, kind: kind, pack: pid, loc: packLocation(e.Loc)}
 	}
 	return out, nil
 }
 
-// storedChunk is a chunk as a pack stores it: its codec, its raw length, and its stored bytes.
+// packLocation is a content index location as the pack format has it.
+func packLocation(l contentindex.Location) pack.Location {
+	return pack.Location{Offset: l.Offset, Codec: pack.Codec(l.Codec), RawLength: l.Raw, StoredLength: l.Stored,
+		Framed: l.Framed, FrameRaw: l.FrameRaw, InFrame: l.InFrame}
+}
+
+// indexLocation is a record's location in pack number num, as the content index has it.
+func indexLocation(num uint64, l pack.Location) contentindex.Location {
+	return contentindex.Location{Pack: num, Offset: l.Offset, Stored: l.StoredLength, Raw: l.RawLength, Codec: uint8(l.Codec),
+		Framed: l.Framed, FrameRaw: l.FrameRaw, InFrame: l.InFrame}
+}
+
+// storedChunk is a chunk or a tree as the chunk cache holds it and ReadFiles sends it: compressed
+// alone — as its pack stores it, when it is a record of its own (pack.Location.Whole), or as a record
+// of a frame of many is sent (sendable) — its codec, its raw length, and those bytes.
 type storedChunk struct {
 	codec pack.Codec
 	raw   uint32
@@ -280,9 +296,9 @@ func (s *Store) heldTreeBodies(ctx context.Context, repo int64, members []encodi
 	return s.treeBodies(ctx, repo, ids)
 }
 
-// storedRecords returns chunks or trees (kind) as their packs store them, from the chunk cache
-// before S3. The cache holds records compressed, as stored, each verified against its ID when it
-// was fetched. A read whose pack was retired by repacking re-reads the locations once.
+// storedRecords returns chunks or trees (kind) compressed alone (storedChunk), from the chunk cache
+// before S3. The cache holds records compressed, each verified against its ID when it was fetched.
+// A read whose pack was retired by repacking re-reads the locations once.
 func (s *Store) storedRecords(ctx context.Context, repo int64, kind encoding.Kind, members []encoding.ID) (map[encoding.ID]storedChunk, error) {
 	net, sc, err := s.networkOf(ctx, repo)
 	if err != nil {
@@ -339,10 +355,10 @@ type span struct {
 }
 
 // fetchChunks reads the chunks at locs into out, returning those whose pack is gone. Chunks
-// close together in a pack — their data at most mergeGap apart, the whole at most maxSpan — are
-// read with one range GET, the bytes between them discarded, and up to fetchesAtOnce GETs run
-// at once: a pack's chunks lie in the order compaction wrote them (by path), so a directory's
-// files are usually one read.
+// close together in a pack — their stored bytes at most mergeGap apart, the whole at most maxSpan —
+// are read with one range GET, the bytes between them discarded, and up to fetchesAtOnce GETs run
+// at once: a pack's chunks lie in the order compaction wrote them (by path), and small files share
+// frames, so a directory's files are usually one read. Records of one frame are one read of it.
 func (s *Store) fetchChunks(ctx context.Context, net backend.Network, locs map[encoding.ID]chunkLoc, out map[encoding.ID]storedChunk) ([]encoding.ID, error) {
 	byPack := map[encoding.ID][]chunkLoc{}
 	for _, l := range locs {
@@ -350,7 +366,10 @@ func (s *Store) fetchChunks(ctx context.Context, net backend.Network, locs map[e
 	}
 	var spans []span
 	for packID, ls := range byPack {
-		sort.Slice(ls, func(i, j int) bool { return ls[i].loc.Offset < ls[j].loc.Offset })
+		sort.Slice(ls, func(i, j int) bool {
+			a, b := ls[i].loc, ls[j].loc
+			return a.DataOffset() < b.DataOffset() || (a.DataOffset() == b.DataOffset() && a.InFrame < b.InFrame)
+		})
 		for start := 0; start < len(ls); {
 			end := start + 1
 			for end < len(ls) {
@@ -424,8 +443,9 @@ var (
 		"Windows of chunks each ReadFiles call read, located and fetched together.", metrics.Count, "form")
 )
 
-// fetchSpan reads one span's chunks, verifying each against its ID and caching it as stored; a
-// span whose pack is gone returns its chunks as lost.
+// fetchSpan reads one span's chunks, verifying each against its ID and caching it compressed alone:
+// a whole record as stored, a record of a frame of many — its frame decoded once for all the span
+// reads of it — as it is sent (sendable). A span whose pack is gone returns its chunks as lost.
 func (s *Store) fetchSpan(ctx context.Context, net backend.Network, sp span) (map[encoding.ID]storedChunk, []encoding.ID, error) {
 	first, last := sp.locs[0].loc, sp.locs[len(sp.locs)-1].loc
 	length := last.DataOffset() + int64(last.StoredLength) - first.DataOffset()
@@ -445,23 +465,73 @@ func (s *Store) fetchSpan(ctx context.Context, net backend.Network, sp span) (ma
 	}
 	packRangeChunks.Observe(float64(len(sp.locs)))
 	used := int64(0)
-	for _, l := range sp.locs {
-		used += int64(l.loc.StoredLength)
+	for i, l := range sp.locs {
+		if i == 0 || l.loc.DataOffset() != sp.locs[i-1].loc.DataOffset() {
+			used += int64(l.loc.StoredLength)
+		}
 	}
 	packRangeUnused.Add(uint64(length - used))
+	dicts := s.dicts.of(net)
+	frames := map[int64][]byte{}
 	got := make(map[encoding.ID]storedChunk, len(sp.locs))
 	for _, l := range sp.locs {
 		at := l.loc.DataOffset() - first.DataOffset()
 		data := b[at : at+int64(l.loc.StoredLength)]
-		if _, err := pack.DecodeObject(s.dicts.of(net), l.kind, l.id, l.loc.Codec, l.loc.RawLength, data); err != nil {
-			return nil, nil, err
+		var c storedChunk
+		if l.loc.Whole() {
+			if _, err := pack.DecodeObject(dicts, l.kind, l.id, l.loc.Codec, l.loc.RawLength, data); err != nil {
+				return nil, nil, fmt.Errorf("pack %s: %w", sp.pack, err)
+			}
+			// A copy: the span's other bytes, and the gaps between its chunks, are not kept.
+			c = storedChunk{codec: l.loc.Codec, raw: l.loc.RawLength, data: bytes.Clone(data)}
+		} else {
+			frame, ok := frames[l.loc.DataOffset()]
+			if !ok {
+				if frame, err = pack.DecodeFrame(dicts, l.loc, data); err != nil {
+					return nil, nil, fmt.Errorf("pack %s: %w", sp.pack, err)
+				}
+				frames[l.loc.DataOffset()] = frame
+			}
+			raw, err := pack.RecordOf(frame, l.loc)
+			if err == nil {
+				err = pack.Check(l.kind, l.id, raw)
+			}
+			if err != nil {
+				return nil, nil, fmt.Errorf("pack %s: %w", sp.pack, err)
+			}
+			if c, err = s.sendable(net, l.kind, raw, l.loc.Codec, data); err != nil {
+				return nil, nil, err
+			}
 		}
-		// A copy: the span's other bytes, and the gaps between its chunks, are not kept.
-		c := storedChunk{codec: l.loc.Codec, raw: l.loc.RawLength, data: bytes.Clone(data)}
 		got[l.id] = c
 		s.chunks.put(chunkKey(net, l.kind, l.id), c, len(c.data))
 	}
 	return got, nil, nil
+}
+
+// memberEncoder compresses records of frames of many for the chunk cache and the wire, each alone.
+var memberEncoder, _ = zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedDefault), zstd.WithLowerEncoderMem(true))
+
+// sendable is a record of a frame of many — raw, its frame's bytes, stored by codec as frame — as
+// the chunk cache holds it and ReadFiles sends it: compressed alone, unless that does not shrink it;
+// a small chunk with the dictionary its frame was compressed with, which every reader of the frame's
+// records may read, as a dictionary's chunk was stored before frames (DictionaryChunkMax).
+func (s *Store) sendable(net backend.Network, kind encoding.Kind, raw []byte, codec pack.Codec, frame []byte) (storedChunk, error) {
+	enc, dictCodec := memberEncoder, pack.Zstd
+	if kind == encoding.KindChunk && codec == pack.ZstdDict && len(raw) <= DictionaryChunkMax {
+		dict, err := pack.DictionaryID(frame)
+		if err != nil {
+			return storedChunk{}, err
+		}
+		if enc, err = s.dicts.encoder(net, dict); err != nil {
+			return storedChunk{}, err
+		}
+		dictCodec = pack.ZstdDict
+	}
+	if z := enc.EncodeAll(raw, nil); len(z) < len(raw) {
+		return storedChunk{codec: dictCodec, raw: uint32(len(raw)), data: z}, nil
+	}
+	return storedChunk{codec: pack.Stored, raw: uint32(len(raw)), data: bytes.Clone(raw)}, nil
 }
 
 type fileChunk struct {

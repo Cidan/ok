@@ -500,9 +500,9 @@ type spoolWindow struct {
 // sentWindow is the most a read of a sent pack's records fetches beyond what it was asked for.
 const sentWindow = 4 << 20
 
-// recordCost is the memory a record of n bytes takes in a pack being written: its stored bytes at
-// most, its header, and its index entry.
-func recordCost(n int) int64 { return int64(n) + pack.Overhead(1) - pack.Overhead(0) }
+// recordCost is the memory a record of n bytes takes in a pack being written, as a frame of its
+// own: its stored bytes at most, the frame's header, and its index entry.
+func recordCost(n int) int64 { return int64(n) + pack.Overhead(1, 1) - pack.Overhead(0, 0) }
 
 // spoolRecord adds a chunk's or a tree's record to the publish's pack in memory, holding what it
 // costs of the store's publishMemory: past publishPackBytes, the pack is sent first, and another
@@ -1020,8 +1020,7 @@ func (p *Publication) insertPacks(ctx context.Context, tx *txn) ([]ref, error) {
 	for _, r := range unlocated {
 		p.s.logIndex(tx, backend.NetworkScope(p.net), contentindex.Update{Op: contentindex.Put, ID: r.id, Entry: contentindex.Entry{
 			Kind: r.kind, Day: net.today,
-			Loc: contentindex.Location{Pack: nums[r.at.pack], Offset: r.at.loc.Offset, Stored: r.at.loc.StoredLength, Raw: r.at.loc.RawLength,
-				Codec: uint8(r.at.loc.Codec)},
+			Loc: indexLocation(nums[r.at.pack], r.at.loc),
 		}})
 	}
 	return held, nil

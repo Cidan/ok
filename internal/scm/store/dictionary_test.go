@@ -41,9 +41,10 @@ func Get%[1]d(ctx context.Context, key string) (string, error) {
 `, i, i*7919))
 }
 
-// A repository's GC trains a dictionary on its small files once it has enough, and compaction
-// compresses its small chunks with it; every read form serves them — raw, stored with the
-// dictionary's chunks sent raw, and stored as is — and a pass after that changes nothing.
+// A repository's GC trains a dictionary on its small files once it has enough, and compaction frames
+// them with it, many to a frame; every read form serves them — raw, stored with the dictionary's
+// chunks sent raw, and stored, each sent alone with the dictionary its frame names — and a pass after
+// that changes nothing.
 func TestDictionaries(t *testing.T) {
 	ctx := context.Background()
 	e := newCLEnv(t)
@@ -67,7 +68,7 @@ func TestDictionaries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r.DictionaryTrained == 0 || r.DictionarySamples < 50 || r.Dictionary != r.DictionaryTrained || r.ChunksRecompressed == 0 || r.BytesRecompressed <= 0 {
+	if r.DictionaryTrained == 0 || r.DictionarySamples < 50 || r.Dictionary != r.DictionaryTrained || r.RecordsFramed < 200 || r.FramesWritten == 0 {
 		t.Fatalf("no dictionary trained and used: %s", r)
 	}
 	// Pinned, the chunks' locations are folded into the chunk index's segments: read it whole.
@@ -77,15 +78,15 @@ func TestDictionaries(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := v.each(ctx, func(_ encoding.ID, e contentindex.Entry) bool {
-		if e.Kind == encoding.KindChunk && pack.Codec(e.Loc.Codec) == pack.ZstdDict {
+		if e.Kind == encoding.KindChunk && !packLocation(e.Loc).Whole() && pack.Codec(e.Loc.Codec) == pack.ZstdDict {
 			dictChunks++
 		}
 		return true
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if int64(dictChunks) != r.ChunksRecompressed {
-		t.Fatalf("%d chunks name the dictionary; the pass compressed %d", dictChunks, r.ChunksRecompressed)
+	if int64(dictChunks) != r.RecordsFramed {
+		t.Fatalf("%d chunks are in frames compressed with the dictionary; the pass framed %d", dictChunks, r.RecordsFramed)
 	}
 
 	files := make([]FileRange, 0, len(contents))
@@ -159,7 +160,7 @@ func TestDictionaries(t *testing.T) {
 		t.Fatal(err)
 	}
 	if sent != dictChunks {
-		t.Fatalf("%d chunks sent compressed with the dictionary, %d stored so", sent, dictChunks)
+		t.Fatalf("%d chunks sent compressed with the dictionary, %d in its frames", sent, dictChunks)
 	}
 	// A dictionary is read only through its repository.
 	other := newRepo(t, e.s).ID
@@ -175,7 +176,7 @@ func TestDictionaries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if again.DictionaryTrained != 0 || again.PacksWritten != 0 || again.ChunksRecompressed != 0 {
+	if again.DictionaryTrained != 0 || again.PacksWritten != 0 || again.FramesWritten != 0 {
 		t.Fatalf("a settled repository changed: %s", again)
 	}
 	// After DictionaryRetrain, a newer one joins it; the old one still decodes what names it.
@@ -220,7 +221,7 @@ func TestDictionariesPerNetwork(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if r.DictionaryTrained == 0 || r.ChunksRecompressed == 0 {
+		if r.DictionaryTrained == 0 || r.Dictionary == 0 || r.RecordsFramed == 0 {
 			t.Fatalf("%s: no dictionary trained and used: %s", flavor, r)
 		}
 		return r.DictionaryTrained, contents
@@ -266,7 +267,7 @@ func TestNoDictionaryForFewFiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r.DictionaryTrained != 0 || r.ChunksRecompressed != 0 {
+	if r.DictionaryTrained != 0 || r.Dictionary != 0 {
 		t.Fatalf("a dictionary for two files: %s", r)
 	}
 	clean(t, e.s, e.repo)

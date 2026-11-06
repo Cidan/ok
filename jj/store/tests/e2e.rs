@@ -1141,9 +1141,9 @@ fn go_file(i: usize) -> Vec<u8> {
     .into_bytes()
 }
 
-// Once ok scm trains a repository's dictionary and compacts with it, a cold machine reads its
-// files as the SCM stores them — compressed with the dictionary, which it fetches once — and
-// reads them again from its cache.
+// Once ok scm trains a repository's dictionary and frames its small files with it, a cold machine
+// reads each file as the SCM sends it from a frame — alone, compressed with the dictionary, which it
+// fetches once — and reads them again from its cache.
 #[tokio::test(flavor = "multi_thread")]
 async fn chunks_compressed_with_a_dictionary_reach_a_cold_machine() {
     if !ok_testscm::available() {
@@ -1178,7 +1178,8 @@ async fn chunks_compressed_with_a_dictionary_reach_a_cold_machine() {
 
     let report = ok_testscm::gc(&remote.name);
     assert!(
-        report.contains("trained dictionary") && report.contains("small chunks with dictionary"),
+        report.contains("trained dictionary")
+            && report.contains("in frames of many with dictionary"),
         "{report}"
     );
 

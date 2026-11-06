@@ -37,14 +37,19 @@ func DayOf(t time.Time) Day {
 // Time is the day's first instant, UTC.
 func (d Day) Time() time.Time { return time.Unix(int64(d)*86400, 0).UTC() }
 
-// Location is where a chunk or a tree is stored: its pack (by the pack's number), its record's
-// offset, and how the record stores it.
+// Location is where a chunk or a tree is stored: its pack (by the pack's number), the offset and
+// length of the stored bytes that hold it and how they are encoded, and its own length (pack.Location).
+// Framed is a pack of frames' (version 3): the stored bytes are its frame's, which decode to
+// FrameRaw bytes, the record's from InFrame.
 type Location struct {
-	Pack   uint64
-	Offset int64
-	Stored uint32
-	Raw    uint32
-	Codec  uint8
+	Pack     uint64
+	Offset   int64
+	Stored   uint32
+	Raw      uint32
+	Codec    uint8
+	Framed   bool
+	FrameRaw uint32
+	InFrame  uint32
 }
 
 // FileChunk is one chunk of a file: its ID and length.
@@ -135,6 +140,9 @@ const (
 
 	flagPinned = 1 << 0
 	flagBody   = 1 << 1
+	// flagFramed marks a location in a frame: its frame's raw length and its offset in them follow
+	// its codec.
+	flagFramed = 1 << 2
 )
 
 var errMalformed = errors.New("contentindex: malformed")
@@ -150,6 +158,9 @@ func appendEntry(b []byte, e Entry) []byte {
 	if e.Body {
 		flags |= flagBody
 	}
+	if e.Body && Located(e.Kind) && e.Loc.Framed {
+		flags |= flagFramed
+	}
 	b = append(b, byte(e.Kind), flags)
 	b = binary.AppendUvarint(b, uint64(e.Day))
 	if !e.Body {
@@ -160,7 +171,12 @@ func appendEntry(b []byte, e Entry) []byte {
 		b = binary.AppendUvarint(b, uint64(e.Loc.Offset))
 		b = binary.AppendUvarint(b, uint64(e.Loc.Stored))
 		b = binary.AppendUvarint(b, uint64(e.Loc.Raw))
-		return append(b, e.Loc.Codec)
+		b = append(b, e.Loc.Codec)
+		if e.Loc.Framed {
+			b = binary.AppendUvarint(b, uint64(e.Loc.FrameRaw))
+			b = binary.AppendUvarint(b, uint64(e.Loc.InFrame))
+		}
+		return b
 	}
 	b = binary.AppendUvarint(b, e.Size)
 	b = binary.AppendUvarint(b, uint64(len(e.Chunks)))
@@ -231,7 +247,8 @@ func (r *reader) entry() Entry {
 	var e Entry
 	e.Kind = encoding.Kind(r.byte())
 	flags := r.byte()
-	if r.err == nil && (!validKind(e.Kind) || flags&^(flagPinned|flagBody) != 0) {
+	if r.err == nil && (!validKind(e.Kind) || flags&^(flagPinned|flagBody|flagFramed) != 0 ||
+		(flags&flagFramed != 0 && (flags&flagBody == 0 || !Located(e.Kind)))) {
 		r.fail()
 	}
 	e.Pinned, e.Body = flags&flagPinned != 0, flags&flagBody != 0
@@ -253,6 +270,14 @@ func (r *reader) entry() Entry {
 		e.Loc.Stored = r.u32()
 		e.Loc.Raw = r.u32()
 		e.Loc.Codec = r.byte()
+		if flags&flagFramed != 0 {
+			e.Loc.Framed = true
+			e.Loc.FrameRaw = r.u32()
+			e.Loc.InFrame = r.u32()
+			if r.err == nil && uint64(e.Loc.InFrame)+uint64(e.Loc.Raw) > uint64(e.Loc.FrameRaw) {
+				r.fail()
+			}
+		}
 		return e
 	}
 	e.Size = r.uvarint()

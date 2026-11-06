@@ -238,13 +238,13 @@ func TestReadFilesAfterRepack(t *testing.T) {
 		}
 		// As compaction moves chunks.
 		if err := s.inTx(ctx, func(ctx context.Context, tx *txn) error {
-			num, err := tx.InsertPack(ctx, netOf(t, s, repo), id, size, nil)
+			num, err := tx.InsertPack(ctx, netOf(t, s, repo), id, size)
 			if err != nil {
 				return err
 			}
 			for cid, loc := range locs {
 				s.logIndex(tx, backend.NetworkScope(netOf(t, s, repo)), contentindex.Update{Op: contentindex.Move, ID: cid, Entry: contentindex.Entry{Kind: encoding.KindChunk,
-					Loc: contentindex.Location{Pack: num, Offset: loc.Offset, Stored: loc.StoredLength, Raw: loc.RawLength, Codec: uint8(loc.Codec)}}})
+					Loc: indexLocation(num, loc)}})
 			}
 			return nil
 		}); err != nil {

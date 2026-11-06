@@ -16,15 +16,15 @@ import (
 	"github.com/Cidan/ok/internal/scm/encoding"
 	"github.com/Cidan/ok/internal/scm/pack"
 	"github.com/Cidan/ok/internal/scm/store/backend"
-	"github.com/Cidan/ok/internal/serve/metrics"
 )
 
-// Dictionaries (docs/scm.md, "Dictionaries"): each repository's zstd dictionaries,
-// trained on samples of its small files, which compaction compresses its small chunks with. Small
-// data compresses badly alone — compression learns from what came before, and a 3 KB file has
-// nothing before it — and a dictionary gives it a past: measured on the monorepo, at zstd's
-// highest level, files to 4 KiB store 26% smaller, to 16 KiB 17%. A dictionary never changes and
-// is never deleted; a newer one only joins it.
+// Dictionaries (docs/scm.md, "Dictionaries"): each network's zstd dictionaries, trained on
+// samples of its small files, which compaction compresses frames of many with and a small file read
+// from one is sent with. Small data compresses badly alone — compression learns from what came
+// before, and a 3 KB file has nothing before it — and a dictionary gives it a past: measured on the
+// monorepo, at zstd's highest level, files to 4 KiB 26% smaller, to 16 KiB 17%. In a frame of many a
+// file has its neighbours for a past, so a dictionary saves the frame little; it is what a file sent
+// alone saves. A dictionary never changes and is never deleted; a newer one only joins it.
 //
 // A chunk's zstd frame names its dictionary by 32768 + the dictionary's row ID: RFC 8878 leaves
 // IDs from 32768 below 2^31 to private use.
@@ -42,22 +42,21 @@ const (
 	// big enough to compress well alone.
 	dictionaryFileMin = 64
 	dictionaryFileMax = 16 << 10
-	// DictionaryChunkMax is the largest chunk compaction compresses with a dictionary: past it,
-	// a chunk has its own past.
+	// DictionaryChunkMax is the largest chunk sent alone with a dictionary: past it, a chunk has
+	// its own past.
 	DictionaryChunkMax = 64 << 10
 	// DictionaryRetrain is how old a repository's newest dictionary grows before a pass trains
 	// another.
 	DictionaryRetrain = 90 * 24 * time.Hour
 )
 
-var dictionaryChunks = metrics.NewCounter("ok_scm_dictionary_chunks_total",
-	"Chunks compaction compressed with a repository's dictionary, and those it tried that did not shrink.", "result")
-
-// dictionaries holds decoders and encoders of the dictionaries this store has read.
+// dictionaries holds decoders and encoders of the dictionaries this store has read: a dictionary
+// never changes, so neither goes stale.
 type dictionaries struct {
 	s        *Store
 	mu       sync.Mutex
 	decoders map[netDictionary]*zstd.Decoder
+	encoders map[netDictionary]*zstd.Encoder
 }
 
 // netDictionary is a dictionary as a frame names it within its network: an ID is its network's.
@@ -67,7 +66,7 @@ type netDictionary struct {
 }
 
 func newDictionaries(s *Store) *dictionaries {
-	return &dictionaries{s: s, decoders: map[netDictionary]*zstd.Decoder{}}
+	return &dictionaries{s: s, decoders: map[netDictionary]*zstd.Decoder{}, encoders: map[netDictionary]*zstd.Encoder{}}
 }
 
 // of decodes the frames of a network's packs (pack.Dicts): each names one of its network's
@@ -112,6 +111,41 @@ func (d *dictionaries) decoder(net backend.Network, id uint32) (*zstd.Decoder, e
 	}
 	d.decoders[k] = dec
 	return dec, nil
+}
+
+// encoder is an encoder holding a network's dictionary a frame names, read once: what a record of a
+// frame compressed with it is compressed alone with, to be sent (sendable).
+func (d *dictionaries) encoder(net backend.Network, id uint32) (*zstd.Encoder, error) {
+	k := netDictionary{net, id}
+	d.mu.Lock()
+	enc, ok := d.encoders[k]
+	d.mu.Unlock()
+	if ok {
+		return enc, nil
+	}
+	if id < dictionaryIDBase {
+		return nil, fmt.Errorf("dictionary %d: no dictionary has that ID", id)
+	}
+	body, _, ok, err := d.s.b.NetworkDictionary(context.Background(), net, int64(id-dictionaryIDBase))
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, notFound("network %d's dictionary %d", net, id)
+	}
+	enc, err = zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedDefault), zstd.WithEncoderDict(body),
+		zstd.WithEncoderCRC(true), zstd.WithLowerEncoderMem(true))
+	if err != nil {
+		return nil, fmt.Errorf("dictionary %d: %w", id, err)
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if have, ok := d.encoders[k]; ok {
+		enc.Close()
+		return have, nil
+	}
+	d.encoders[k] = enc
+	return enc, nil
 }
 
 // Dictionary is a repository's network's dictionary as a zstd frame names it: what a client
@@ -207,26 +241,6 @@ func (s *Store) newestDictionary(ctx context.Context, repo int64) (id uint32, bo
 		return 0, nil, time.Time{}, err
 	}
 	return uint32(row + dictionaryIDBase), body, at, nil
-}
-
-// dictionaryEncoder is an encoder with a repository's newest dictionary: compaction's. It encodes
-// small chunks one EncodeAll at a time, and each call resets the encoder; at SpeedBestCompression a
-// reset with a dictionary copies the level's large tables, some 4.5 ms a chunk however small, for
-// 0.2% less output than SpeedBetterCompression's 37 µs. Nil when the repository has none.
-func (s *Store) dictionaryEncoder(ctx context.Context, repo int64) (*zstd.Encoder, uint32, error) {
-	id, body, _, err := s.newestDictionary(ctx, repo)
-	if err != nil || body == nil {
-		return nil, 0, err
-	}
-	enc, err := zstd.NewWriter(nil,
-		zstd.WithEncoderLevel(zstd.SpeedBetterCompression),
-		zstd.WithEncoderDict(body),
-		zstd.WithEncoderCRC(true),
-		zstd.WithEncoderConcurrency(1))
-	if err != nil {
-		return nil, 0, fmt.Errorf("dictionary %d: %w", id, err)
-	}
-	return enc, id, nil
 }
 
 // trainDictionary trains a dictionary for the repository's network, if the repository is the one

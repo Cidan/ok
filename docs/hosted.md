@@ -1247,9 +1247,11 @@ Chunks are ordered by the paths of `main` of the repository whose collection rep
 **Direct reads: URLs bound to ranges.** A URL is signed for one byte range of a pack, its `Range`
 header in the signature — S3's `X-Amz-SignedHeaders` (minio-go's `PresignHeader`), GCS's V4 signed
 headers (`SignedURLOptions.Headers`) — so the store refuses it for any other range. The SCM signs
-only runs of whole records the reader's repository holds: never the gaps a read through the SCM
-merges across (`fetchChunks` reads up to 128 KiB between chunks), which may hold another
-repository's. So a pack need not be one repository's. `blob.Store` gains `SignRange(ctx, key,
+only runs of whole frames (scm.md, "Storage") every live record of which the reader's repository
+holds: never the gaps a read through the SCM merges across (`fetchChunks` reads up to 128 KiB
+between chunks), which may hold another repository's, and never a frame of many holding a record
+it does not — a small file another repository of the network landed, framed beside its own — which
+it reads through the SCM instead, each record sent alone. So a pack need not be one repository's. `blob.Store` gains `SignRange(ctx, key,
 offset, length, ttl)`, and its conformance suite proves against MinIO, which checks signatures as S3
 does, that a URL signed for one range reads no other range and nothing without its `Range`; GCS
 enforces signed headers the same way (its emulator checks no signatures, so CI cannot show it).

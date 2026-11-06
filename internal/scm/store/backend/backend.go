@@ -280,9 +280,8 @@ type Ops interface {
 	// PutPack records a pack a publish wrote — again, its size updated, if it is recorded — and
 	// returns its number.
 	PutPack(ctx context.Context, net Network, id encoding.ID, size int64) (uint64, error)
-	// InsertPack records a pack compaction wrote, with the dictionary it considered (nil: none),
-	// and returns its number.
-	InsertPack(ctx context.Context, net Network, id encoding.ID, size int64, dictionary *int64) (uint64, error)
+	// InsertPack records a pack compaction wrote — compacted — and returns its number.
+	InsertPack(ctx context.Context, net Network, id encoding.ID, size int64) (uint64, error)
 	// NumberedPacks are the IDs of a network's packs of numbers nums, retired ones too: a number is
 	// one pack's for good. Read without locking them (a reader of a chunk index names many).
 	NumberedPacks(ctx context.Context, net Network, nums []uint64) (map[uint64]encoding.ID, error)
@@ -292,8 +291,6 @@ type Ops interface {
 	RetiredPackIDs(ctx context.Context, net Network) ([]encoding.ID, error)
 	// PackIDs are every one of a network's packs' IDs.
 	PackIDs(ctx context.Context, net Network) ([]encoding.ID, error)
-	// SetPacksDictionary records the dictionary that considered packs.
-	SetPacksDictionary(ctx context.Context, net Network, ids []encoding.ID, dictionary int64) error
 	// RetirePack retires a pack, now.
 	RetirePack(ctx context.Context, net Network, id encoding.ID) error
 	// LivePackNumbers are the numbers of the packs among ids not retired, by ID.

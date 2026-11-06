@@ -547,31 +547,35 @@ subtree found to hold no value is remembered by its ID.
 - **File contents** are read many files at a time, never one by one: every requested file's
   manifest (its size and chunks) with one query per 1,000 files, then the chunks a window at a time
   — up to 16 MiB of them, located with one query — each window's packs read together before its
-  frames go out, in request order. Chunks whose data lie within 128 KiB of each other in a pack are
-  read with one range GET, up to 4 MiB, the bytes between them discarded; packs keep a
-  directory's files together (compaction orders chunks by path), so a directory is usually one
-  read. Up to eight range GETs run at once per call. Every chunk is verified against its ID as it
-  arrives and kept in an in-memory cache as its pack stores it, compressed; a read whose pack was
-  retired by repacking re-reads the chunk's location once. `ReadFiles`, `DiffFiles` (all of a
+  frames go out, in request order. Chunks whose stored bytes lie within 128 KiB of each other in a
+  pack are read with one range GET, up to 4 MiB, the bytes between them discarded; packs keep a
+  directory's files together (compaction orders chunks by path, and frames small files many to
+  one), so a directory is usually one read, and the records of one frame are one read of it,
+  decoded once. Up to eight range GETs run at once per call. Every chunk is verified against its ID
+  as it arrives and kept in an in-memory cache compressed alone: a record of a frame of one as its
+  pack stores it; a record of a frame of many compressed alone as it is sent (below). A read whose
+  pack was retired by repacking re-reads the chunk's location once. `ReadFiles`, `DiffFiles` (all of a
   call's pairs, up to 32 MiB of contents at a time), `Export`, and every internal read go through
   this path.
-- **Chunks travel as stored.** A `ReadFiles` that sets `stored` gets each chunk exactly as its
-  pack holds it — one zstd frame where compressing shrank it, the raw bytes where it did not —
-  with its codec (`ChunkCodec`) and raw length on the frame, so the SCM neither decompresses what
-  it serves nor sends more than it stores (source code compresses about fivefold). The client
+- **Chunks travel compressed alone.** A `ReadFiles` that sets `stored` gets each chunk as one zstd
+  frame where compressing shrank it, the raw bytes where it did not, with its codec (`ChunkCodec`)
+  and raw length on the frame: a chunk its pack stores alone exactly as stored, so the SCM neither
+  decompresses it nor sends more than it stores (source code compresses about fivefold); a small
+  file a frame of many holds compressed alone once, when the frame is read, with the dictionary
+  the frame names — what a dictionary is for (*Dictionaries*) — and cached so. The client
   decompresses, checks the raw length, and verifies the chunk against its ID, as it always did; it
   refuses a frame claiming more than a message could carry raw (16 MiB) before decompressing it.
   ok's `jj` and okfs (ruzstd, pure Rust) and ok's workers and deployer (the Go checkout
   client) all read this way, and keep what they read as it came
   (*Cache, outbox, and prefetch*). A client that leaves `stored` unset receives raw bytes and no
-  codec. One that sets `dictionaries` too receives the chunks compaction compressed with the
-  network's dictionary as they are (`CHUNK_CODEC_ZSTD_DICT`) and fetches each dictionary its
-  frames name once (`ReadDictionary`); one that does not receives those chunks raw (*Dictionaries*).
+  codec. One that sets `dictionaries` too receives the chunks compressed with the network's
+  dictionary as they are (`CHUNK_CODEC_ZSTD_DICT`) and fetches each dictionary its frames name once
+  (`ReadDictionary`); one that does not receives those chunks raw (*Dictionaries*).
 - **Manifests** — a file's size and its chunks' IDs and offsets, with no contents — are read in
   bulk with `ReadFilesRequest.manifests_only`, one query per batch of files rather than two per
   file. okfs reads them for what a directory's sizes record does not answer (*Tree sizes*), then
   only the chunks a read covers (a ranged `ReadFiles`).
-- **The three caches** — objects (256 MiB), chunks (512 MiB, compressed as stored), and diffs
+- **The three caches** — objects (256 MiB), chunks (512 MiB, each compressed alone), and diffs
   (64 MiB), in each
   replica's memory — hold only values derived from content-addressed IDs, keyed by repository and
   those IDs (a diff by its two files' IDs and its context lines, or by the IDs alone for counts), so
@@ -753,31 +757,51 @@ of one fork network — a repository and its forks (hosted.md, "Fork networks, a
 repository's alone until it is forked — whose chunk index says where each chunk is (*The content
 index*), and the trees the publish that wrote it stored, after its chunks: a publish writes no row
 of `object` for a tree, so a workspace's trees cost the database nothing but their content index
-entries. A landing's splice writes the trees it makes as rows, unless a publish stored them. The pack ID is the BLAKE3 of the pack's bytes, and the nonce makes every pack written unique (version 1 packs, written before
-it, have none and are read the same way).
+entries. A landing's splice writes the trees it makes as rows, unless a publish stored them. The
+pack ID is the BLAKE3 of the pack's bytes, and the nonce makes every pack written unique.
+
+A pack is **frames**: independently decodable runs of records — chunks' or trees' — each
+compressed as one, the shape of zstd's seekable format and of containers' `zstd:chunked` layers.
 
 ```
 magic      "OKSCMPAK"                        8 bytes
-version    u32 = 2
+version    u32 = 3
 nonce      16 random bytes
-records    repeated:
-  id             32 bytes: a chunk's, or a tree's
-  codec          u8     0 = stored, 1 = zstd, 2 = zstd with a dictionary
-  raw length     u32
+frames     repeated:
+  codec          u8     0 = stored, 1 = zstd, 2 = zstd with a dictionary its header names
+  members        u32    how many records it holds, at least one
+  raw length     u32    of its members' raw bytes, one after another
   stored length  u32
+  member table   members × (id 32 bytes: a chunk's or a tree's, raw length u32)
   data           stored-length bytes
-index      u64 count, then (id, u64 offset of its record), sorted by id
+index      u64 count, then (id, u64 offset of its frame), sorted by id
 footer     u64 offset of the index, magic "OKSCMEND"
 ```
 
-Chunks are stored with zstd (level 3) unless compression doesn't shrink them; compaction later
-compresses small ones with the network's dictionary (*Dictionaries*), which the frame names.
-The records and index make a pack self-describing, so `ok scm fsck` can verify every pack
-against the content index (hashes, locations, lengths) and rebuild its locations from the object
-store; a chunk compressed with a dictionary is verified with it. A record carries no kind: an ID
-hashes its kind's byte with the bytes, so a record is a chunk's or a tree's as its bytes hash to its
-ID, which fsck checks against what the content index says it is, and a reader decodes a record only
-as the kind it asks for. A tree's record is its canonical body, compressed as a chunk is.
+- **A frame of one** is a record stored alone, as every record was before frames: what a publish
+  writes (zstd at klauspost/compress's `SpeedDefault`, roughly level 3, the client waiting), and
+  what compaction writes for a large file's chunk and a tree, at `SpeedBestCompression`. Its stored
+  bytes are the record's, sent and cached as they are.
+- **A frame of many** is what compaction writes for small files: whole files of the repository's,
+  one chunk each, up to 1 MiB of them in path order, at `SpeedBestCompression` with the network's
+  newest dictionary. Small files compress far better together than alone — measured on the
+  monorepo's sources, 27% less than each alone as a publish stores them; 4 MiB frames save 2% more
+  for four times what a read of one file decodes — and are read together, a directory at a time.
+  A record in one is its frame's raw bytes from the sum of the raw lengths before it.
+- **Self-describing.** Every frame's member table and the index make a pack describe itself, so
+  `ok scm fsck` verifies every pack against the content index (hashes, locations, lengths) and
+  rebuilds its locations from the object store; a frame compressed with a dictionary is verified
+  with it. A record carries no kind: an ID hashes its kind's byte with the bytes, so a record is a
+  chunk's or a tree's as its bytes hash to its ID, which fsck checks against what the content index
+  says it is, and a reader decodes a record only as the kind it asks for. A tree's record is its
+  canonical body.
+- **Every write is checked.** A frame of many is decoded back before it is written, and each of its
+  records hashed against its ID; compaction reads every new pack back from the object store before
+  anything is moved onto it.
+- **Versions 1 and 2** held records, not frames — `(id, codec u8, raw length u32, stored length u32,
+  data)`, each compressed alone, the index naming each record's offset — version 1 with no nonce.
+  They are read still, where the content index says, and compaction rewrites every one it finds
+  into frames (*Garbage collection and compaction*).
 
 ### Segments
 
@@ -856,8 +880,9 @@ only record of them:
   lacks is not found through it, whatever its network holds. The walks — touch, refresh, pin —
   and garbage collection's mark go through its trees as through rows, reading each tree's body
   from its pack.
-- **Its network's chunk index** holds where each chunk and tree is: its pack, offset, lengths, and
-  codec, pinned when a repository pins it, so a pinned location folds into the network's runs as
+- **Its network's chunk index** holds where each chunk and tree is: its pack, the offset and length
+  of the stored bytes that hold it and their codec, its own length, and — in a pack of frames — its
+  frame's raw length and its offset in them (a flag says which), pinned when a repository pins it, so a pinned location folds into the network's runs as
   its entry folds into the repository's. A read finds a file or tree in the repository's index and
   its bytes through the network's; repacking moves chunks and trees in the network's alone.
 - **Which writes which.** A publish records the files, chunks, and trees the repository lacks in
@@ -1025,21 +1050,22 @@ files to 4 KiB store 26% smaller, to 16 KiB 17%, and to 64 KiB 9%; against how p
   size. A repository with fewer than 1,000 such files trains none.
   Dictionaries are 110 KiB at most, kept in the `dictionary` table, and never deleted: a newer one
   joins the older, which still decodes the chunks that name it.
-- **Compaction compresses with it.** A small chunk (64 KiB or less) compaction copies is re-encoded
-  with the newest dictionary, when that shrinks it (`codec` 2), at klauspost/compress's
-  `SpeedBetterCompression`: each chunk is one `EncodeAll`, which resets the encoder, and the highest
-  level's reset with a dictionary copies its large tables — measured, 4.5 ms a small chunk against
-  37 µs, for 0.2% less output. Training is at the same level, for the same reason: it encodes each
-  sample to fit the dictionary's tables, 30 s for 8,000 samples at the highest level against about a
-  second, for a dictionary that encodes 0.05% smaller. A pack holding at least 16 small chunks the
-  newest dictionary has not yet considered is rewritten for them, within the pass's 1 GiB; each pack
-  records the dictionary that considered it (`pack.dictionary_id`), and one with fewer is marked
-  without being rewritten, so no pass counts its chunks again until a newer dictionary arrives.
-- **Named by the frame.** A chunk's zstd frame names its dictionary, 32768 plus the row's ID (RFC
-  8878 leaves IDs from 32768 below 2^31 to private use), so a stored chunk carries everything
-  needed to decode it within its network: an ID is its network's — another network, which may
-  have moved in from another cell, can hold the same — so every lookup, and the decoders the SCM
-  keeps, are by network and ID.
+- **What it is for: a small file sent alone.** In a frame of many a file has its neighbours for a
+  past, so compressing the frame with the dictionary saves it little; a file sent alone has none.
+  Compaction compresses its frames of many with the newest dictionary, at `SpeedBestCompression`
+  (one `EncodeAll` a frame, whose reset with a dictionary — 4.5 ms at that level — is nothing beside
+  a frame's megabyte), and the frame's zstd header names it; a reader compresses each small file
+  (64 KiB or less) it takes from such a frame alone with that dictionary, at `SpeedDefault`, for the
+  chunk cache and the wire (`codec` 2), when that shrinks it. A newer dictionary changes no pack:
+  every frame keeps the one it was compressed with. Training is at `SpeedBetterCompression`: it
+  encodes each sample to fit the dictionary's tables, 30 s for 8,000 samples at the highest level
+  against about a second, for a dictionary that encodes 0.05% smaller.
+- **Named by the frame.** A zstd frame names its dictionary, 32768 plus the row's ID (RFC 8878
+  leaves IDs from 32768 below 2^31 to private use), so stored bytes carry everything needed to
+  decode them within their network: an ID is its network's — another network, which may have moved
+  in from another cell, can hold the same — so every lookup, and the decoders and encoders the SCM
+  keeps, are by network and ID. Packs written before frames hold small chunks compressed alone with
+  a dictionary (version 2), read the same way.
 - **Clients ask for it.** `ReadFiles` sends such a chunk as it is only to a client that sets
   `dictionaries`, which fetches the dictionary with `ReadDictionary`, and keeps it beside what it
   decodes; to any other, raw. A dictionary holds pieces of the files it was trained on, so a
@@ -1523,23 +1549,36 @@ repositories themselves are never deleted (see "Decisions").
   - A view published after the mark read its roots references only commits that publish
     touched; a view that existed then was a root.
 - **Compaction and repacking.** Packs the content index has no chunk in are retired outright.
-  Packs more than half dead — bytes no chunk in the index is, beyond what a pack of just its live chunks
-  spends on its header, record headers, and index — and the small ones (under 16 MiB) when there
-  are two or more, and those with small chunks the repository's newest dictionary has not yet
-  considered (*Dictionaries*), are rewritten into packs of
-  up to 256 MiB holding only their live chunks, copied as stored (each verified against its ID),
-  but for small ones the dictionary shrinks, which are re-encoded with it. New packs order chunks
-  by the path on `main` of a file that holds them, then their offset in it, for read locality;
-  chunks no file on `main` holds follow, by ID. One pass rewrites at most 1 GiB of source packs in a
-  repository; the rest waits for the next. It reads only their live records, 32 MiB of an output at
-  a time, with the range reads the read path makes (records close together in a source in one GET,
-  eight GETs at once), and nothing touches the server's disk.
+  Rewritten, into packs of up to 256 MiB holding only their live chunks and trees, in frames
+  (*Storage*), are packs of records (versions 1 and 2), every one; packs more than half dead —
+  their size less their live records' footprints (a record's share of its frame, in proportion to
+  its raw bytes, and its table entries) and their header and footer; the small ones (under 16 MiB)
+  when there are two or more; and a publish's pack of 16 records or more (`pack.compacted` is
+  false), its records each a frame of its own at the level a waiting client is given. What
+  compaction writes it does not rewrite again unless it dies or merges with a small pack. New packs
+  order records in groups, frames of many holding records of one group:
+  1. **Main's head:** chunks of files on `main`'s head, by path, then offset — what checkouts and
+     builds read;
+  2. **Main's history:** chunks of older versions of `main`'s files, by path, oldest first, found by
+     diffing each of `main`'s last 4,096 commits from its parent, newest first, until every such
+     file is placed — versions of a file compress against each other in a frame as a delta would,
+     with no record depending on another;
+  3. **The rest** — work not landed, other repositories' chunks — by ID;
+  4. **Trees,** each a frame of its own, as a walk reads them.
+
+  Whole small files — the one chunk of a file the repository holds — go many to a frame, up to
+  1 MiB; every other chunk, and every tree, is a frame of its own, recompressed at
+  `SpeedBestCompression` but for one stored raw, copied as it is. Every record is verified against
+  its ID as it is read and again as it is written. One pass rewrites at most 1 GiB of source packs in
+  a repository; the rest waits for the next. It reads only their live records, 32 MiB of an output
+  at a time, with the range reads the read path makes (stored bytes close together in a source in
+  one GET, eight GETs at once), and nothing touches the server's disk.
   1. The new pack is written to the object store as it is made: uploaded under a temporary key in
      the network's packs (`staging/…`), which a server-side copy names once its hash is known —
      and which collection deletes as an orphan should the writer stop first.
   2. One transaction moves its chunks to it in the content index — each only if the index still
-     has it where compaction read it. Once every new pack is written, the source packs left with
-     no chunk are retired.
+     has it where compaction read it, the whole of its location (a frame's records share its
+     offset). Once every new pack is written, the source packs left with no chunk are retired.
   3. Retired packs are deleted from the object store an hour later, then their rows. A read that located a
      chunk in a pack before it moved still reads it, and one that finds the pack gone locates
      the chunk again.
@@ -1657,8 +1696,8 @@ binary is refused. The tables:
   it with its tree).
   Objects, sizes records, copy edges, and commits pinned since compaction last ran are the tail of
   what `segment` records (*Segments*).
-- **File contents:** `pack` (an S3 pack's size, retirement, the dictionary compaction considered
-  it with, and its number), `dictionary` (each repository's zstd dictionaries, *Dictionaries*),
+- **File contents:** `pack` (an S3 pack's size, retirement, its number, and whether compaction
+  wrote it), `dictionary` (each network's zstd dictionaries, *Dictionaries*),
   and the content index — `content_index`, `content_log`, and its runs in `segment` (*The content
   index*) — which holds each file's and chunk's pinning and freshness too. Objects and commits
   carry GC's `pinned` and `touched_at`.
