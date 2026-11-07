@@ -141,6 +141,26 @@ type blockedCache struct {
 	active       bool
 	files, added []string
 	ancestors    []int64
+	// Once it lands: its commit, and the deployments covering it as the deployer last listed them
+	// (DeploySubjects).
+	landed      []byte
+	deployments []int64
+}
+
+// DeploySubjects are what following a CL that landed as commit registers on with the deployer — a
+// watch of it, its page's change events: its commit (the deployments of it), the repository's plans
+// (one reaching the commit decides what will deploy it, which may be nothing, and no deployment then
+// says so), and each deployment covering it, of a newer commit when it landed below a plan's head,
+// whose changes its own commit never hears of. None before it lands.
+func DeploySubjects(repo int64, commit []byte, deployments []int64) []string {
+	if len(commit) == 0 {
+		return nil
+	}
+	out := []string{wait.CommitSubject(repo, commit), wait.PlanSubject(repo)}
+	for _, id := range deployments {
+		out = append(out, wait.DeploymentSubject(id))
+	}
+	return out
 }
 
 // maxStack bounds the stack below a CL a watch registers on.
@@ -225,12 +245,23 @@ func (a *API) status(ctx context.Context, t *target, bc *blockedCache) (*control
 		st.Post = a.postOut(ctx, t, subs.GetSubmissions()[0])
 	}
 
+	if bc != nil {
+		bc.landed, bc.deployments = nil, nil
+	}
 	if t.cl.Status == db.StatusSubmitted && len(t.cl.LandedCommit) > 0 {
+		if bc != nil {
+			bc.landed = t.cl.LandedCommit
+		}
 		resp, err := a.deploys.ListDeployments(ctx, &deploypb.ListDeploymentsRequest{RepositoryId: t.repo.GetId(), CommitId: t.cl.LandedCommit, Limit: 500})
 		if err != nil {
 			a.unavailable(ctx, st, unavailableDeployer, "listing deployments", t, err)
 		} else {
 			st.Deployments = a.deploymentsOut(ctx, t, resp)
+			if bc != nil {
+				for _, d := range resp.GetDeployments() {
+					bc.deployments = append(bc.deployments, d.GetId())
+				}
+			}
 		}
 	}
 

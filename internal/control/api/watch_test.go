@@ -38,3 +38,22 @@ func TestWatched(t *testing.T) {
 		}
 	}
 }
+
+// A CL that has not landed registers on nothing with the deployer. Landed, it registers on its
+// commit and the repository's plans — a plan with nothing to deploy for it deploys it, and makes no
+// deployment that would say so — and on each deployment covering it, a newer commit's when it
+// landed below a plan's head.
+func TestDeploySubjects(t *testing.T) {
+	if got := DeploySubjects(7, nil, nil); len(got) != 0 {
+		t.Errorf("an unlanded CL registers on %v", got)
+	}
+	landed := []byte{0xab, 0xcd}
+	want := []string{wait.CommitSubject(7, landed), wait.PlanSubject(7)}
+	if got := DeploySubjects(7, landed, nil); !slices.Equal(got, want) {
+		t.Errorf("landed, unplanned: %v, want %v", got, want)
+	}
+	want = append(want, wait.DeploymentSubject(3), wait.DeploymentSubject(4))
+	if got := DeploySubjects(7, landed, []int64{3, 4}); !slices.Equal(got, want) {
+		t.Errorf("covered by two deployments: %v, want %v", got, want)
+	}
+}

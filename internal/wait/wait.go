@@ -186,16 +186,23 @@ func (w *Waiter) Close() {
 }
 
 // CLSubject is a CL's: what changes what its status shows, in ok control (its review, its record),
-// in ok automation (its pre and post), and — for its landed commit, CommitSubject — in the
-// deployer. ok control's watchers of the CL register on it with each.
+// in ok automation (its pre and post), and — for its landed commit, CommitSubject, PlanSubject, and
+// each covering deployment's DeploymentSubject — in the deployer. ok control's watchers of the CL
+// register on it with each.
 func CLSubject(repo, number int64) string {
 	return "cl/" + strconv.FormatInt(repo, 10) + "/" + strconv.FormatInt(number, 10)
 }
 
-// CommitSubject is a landed commit's, in the deployer: its deployments.
+// CommitSubject is a landed commit's, in the deployer: the deployments of it, those whose head it is.
 func CommitSubject(repo int64, commit []byte) string {
 	return "commit/" + strconv.FormatInt(repo, 10) + "/" + hex.EncodeToString(commit)
 }
+
+// PlanSubject is a repository's plans, in the deployer: a plan recorded reaches every commit of
+// main up to its head, each of which then has every deployment it will have, or none with nothing
+// to deploy. Those deployments cover the commits below the head too, whose CLs hear of them through
+// each one's DeploymentSubject.
+func PlanSubject(repo int64) string { return "plan/" + strconv.FormatInt(repo, 10) }
 
 // HeadSubject is a repository's main, as ok control's change feed applies its moves: what decides
 // whether an approved CL whose pre passed can land.

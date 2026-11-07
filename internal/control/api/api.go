@@ -8,7 +8,6 @@ package api
 
 import (
 	"context"
-	"encoding/hex"
 	"errors"
 	"io"
 	"net/url"
@@ -168,7 +167,8 @@ func (a *API) Watch(req *controlpb.CLRef, stream grpc.ServerStreamingServer[cont
 // service whose writes change the status (internal/wait) — ok control's (the CL and the stack below
 // it, their reviews, and what of main's head decides whether it can land: what governs every CL,
 // and the paths it changes — watched), ok automation's (their pre and post), and, once it lands,
-// the deployer's (its commit's deployments) — and reads the status again as each says it changed:
+// the deployer's (DeploySubjects: its commit, the repository's plans, and each deployment covering
+// it) — and reads the status again as each says it changed:
 // after it registers, so a change between a read and its registration is read too. A move of main
 // that changes none of what it registered on wakes no watch (feed's head step).
 func (a *API) WatchStatus(ctx context.Context, ref *controlpb.CLRef, send func(*controlpb.CLStatus) error) error {
@@ -200,7 +200,7 @@ func (a *API) WatchStatus(ctx context.Context, ref *controlpb.CLRef, send func(*
 		return status.Errorf(codes.Unavailable, "watching the CL: %v", err)
 	}
 	defer w.Close()
-	deploys := false
+	registeredDeploy := map[string]bool{}
 	for {
 		if st, err = a.statusOf(ctx, ref, &bc); err != nil {
 			return toStatus(err)
@@ -214,14 +214,20 @@ func (a *API) WatchStatus(ctx context.Context, ref *controlpb.CLRef, send func(*
 		if Finished(st) {
 			return nil
 		}
-		// A new patchset, a stack's change: what the status depends on now, registered on before
-		// the read after, so a change between this read and the registration is read too.
-		more, moreStack := unregistered(watched(&bc, ref.GetNumber()), registered), unregistered(stackOf(&bc, ref.GetNumber()), registeredStack)
+		// A new patchset, a stack's change, the CL landing, a deployment newly covering it: what
+		// the status depends on now, registered on before the read after, so a change between this
+		// read and the registration is read too.
+		more := unregistered(watched(&bc, ref.GetNumber()), registered)
+		moreStack := unregistered(stackOf(&bc, ref.GetNumber()), registeredStack)
+		moreDeploy := unregistered(DeploySubjects(bc.repo, bc.landed, bc.deployments), registeredDeploy)
 		if a.waits.Automation == nil {
 			moreStack = nil
 		}
-		if len(more) > 0 || len(moreStack) > 0 {
-			for _, r := range []wait.Reg{{Store: a.db.Waits(), Subjects: more}, {Store: a.waits.Automation, Subjects: moreStack}} {
+		if a.waits.Deploy == nil {
+			moreDeploy = nil
+		}
+		if len(more) > 0 || len(moreStack) > 0 || len(moreDeploy) > 0 {
+			for _, r := range []wait.Reg{{Store: a.db.Waits(), Subjects: more}, {Store: a.waits.Automation, Subjects: moreStack}, {Store: a.waits.Deploy, Subjects: moreDeploy}} {
 				if len(r.Subjects) == 0 {
 					continue
 				}
@@ -230,17 +236,6 @@ func (a *API) WatchStatus(ctx context.Context, ref *controlpb.CLRef, send func(*
 				}
 			}
 			continue
-		}
-		if landed := st.GetCl().GetLandedCommit(); landed != "" && !deploys && a.waits.Deploy != nil {
-			commit, err := hex.DecodeString(landed)
-			if err != nil {
-				return status.Errorf(codes.Internal, "the CL's landed commit %q: %v", landed, err)
-			}
-			if err := w.Add(ctx, wait.Reg{Store: a.waits.Deploy, Subjects: []string{wait.CommitSubject(bc.repo, commit)}}); err != nil {
-				return status.Errorf(codes.Unavailable, "watching the CL's deployments: %v", err)
-			}
-			deploys = true
-			continue // registered now: what changed since the read above is read again
 		}
 		if _, err := w.Next(ctx); err != nil {
 			if ctx.Err() != nil {

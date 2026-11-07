@@ -515,7 +515,12 @@ func (s *Store) RecordPlan(ctx context.Context, p PlanResult) (int64, error) {
 				return err
 			}
 		}
-		return tx.SetPlanned(ctx, p.Repository, p.Head, p.HeadSeq)
+		if err := tx.SetPlanned(ctx, p.Repository, p.Head, p.HeadSeq); err != nil {
+			return err
+		}
+		// Every commit the plan reaches is planned now, with its deployments or none: a CL that
+		// landed as one of them is told, however many the plan made.
+		return pendChanged(ctx, tx, wait.PlanSubject(p.Repository), wait.ServicesSubject)
 	})
 	return id, err
 }

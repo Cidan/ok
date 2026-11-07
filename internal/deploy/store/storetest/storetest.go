@@ -29,7 +29,7 @@ func Run(t *testing.T, open func(t *testing.T) store.Backend) {
 		{"Agents", testAgents},
 		{"Cursors", testCursors},
 		{"Unnamed", testUnnamed},
-		{"Plans", testPlans}, {"Purge", testPurge},
+		{"Plans", testPlans}, {"PlanTellsWaiters", testPlanTellsWaiters}, {"Purge", testPurge},
 		{"Lifecycle", testLifecycle},
 		{"Actions", testActions},
 		{"Retiring", testRetiring},

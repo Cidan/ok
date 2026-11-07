@@ -11,6 +11,7 @@ import (
 	"github.com/Cidan/ok/internal/control/api"
 	"github.com/Cidan/ok/internal/control/db"
 	"github.com/Cidan/ok/internal/wait"
+	deploypb "github.com/Cidan/ok/proto/ok/deploy/v1"
 )
 
 // A page's live regions (live.js) are refreshed as the server says what they show changed: each
@@ -84,7 +85,8 @@ func (s *Server) liveEvents(w http.ResponseWriter, r *http.Request, regs []wait.
 }
 
 // clEvents are a CL page's change events: of the CL, as ok control records it, and as ok
-// automation's checks of it go — and, once it lands, its commit's deployments.
+// automation's checks of it go — and, once it lands, what decides its deployments
+// (api.DeploySubjects), the deployments newly covering it registered on as each change brings them.
 func (s *Server) clEvents(w http.ResponseWriter, r *http.Request) {
 	t, err := s.loadCL(r)
 	if err != nil {
@@ -97,25 +99,42 @@ func (s *Server) clEvents(w http.ResponseWriter, r *http.Request) {
 	if s.waits.Automation != nil {
 		regs = append(regs, wait.Reg{Store: s.waits.Automation, Subjects: []string{subject}})
 	}
-	deploys := func(cl db.ChangeList) []wait.Reg {
+	registered := map[string]bool{}
+	deploys := func(ctx context.Context, cl db.ChangeList) []wait.Reg {
 		if s.waits.Deploy == nil || cl.Status != db.StatusSubmitted || len(cl.LandedCommit) == 0 {
 			return nil
 		}
-		return []wait.Reg{{Store: s.waits.Deploy, Subjects: []string{wait.CommitSubject(repo, cl.LandedCommit)}}}
+		var covering []int64
+		resp, err := s.deploys.ListDeployments(ctx, &deploypb.ListDeploymentsRequest{RepositoryId: repo, CommitId: cl.LandedCommit, Limit: 500})
+		if err != nil {
+			slog.Warn("ok control: listing a CL's deployments for its page's changes", "cl", number, "err", err)
+		}
+		for _, d := range resp.GetDeployments() {
+			covering = append(covering, d.GetId())
+		}
+		var add []string
+		for _, sub := range api.DeploySubjects(repo, cl.LandedCommit, covering) {
+			if !registered[sub] {
+				registered[sub] = true
+				add = append(add, sub)
+			}
+		}
+		if len(add) == 0 {
+			return nil
+		}
+		return []wait.Reg{{Store: s.waits.Deploy, Subjects: add}}
 	}
-	regs = append(regs, deploys(t.cl)...)
-	watching := deploys(t.cl) != nil
+	cl := t.cl
+	regs = append(regs, deploys(r.Context(), cl)...)
 	s.liveEvents(w, r, regs, func(ctx context.Context) ([]wait.Reg, error) {
-		if watching {
-			return nil, nil
+		if cl.Status != db.StatusSubmitted {
+			latest, ok, err := s.db.GetChangeList(ctx, repo, number)
+			if err != nil || !ok {
+				return nil, err
+			}
+			cl = latest
 		}
-		cl, ok, err := s.db.GetChangeList(ctx, repo, number)
-		if err != nil || !ok {
-			return nil, err
-		}
-		add := deploys(cl)
-		watching = add != nil
-		return add, nil
+		return deploys(ctx, cl), nil
 	})
 }
 
