@@ -255,11 +255,12 @@ type pass struct {
 // write waits, on a store whose writes resting on one lease may not run beside each other
 // (store.FencedWritesBesideEachOther), for the pass's other writes, and returns the function that
 // lets the next go. Each of a pass's writes rests on the queue's lease and marks the queue's work
-// row; on PostgreSQL the lease's check holds that row in share mode and the mark then writes it, so
-// writes beside each other deadlock on it and hold off the lease's renewal — 16 at once committed
-// one write in eight seconds, and the lease was lost — and they take turns, the SCM's calls behind
-// them, where the time goes, still at once. Taking turns on Spanner, where each write is slower and
-// the fence reads a cell no mark writes, cost staging's peak seconds a landing.
+// row; on PostgreSQL the mark holds that row until its transaction ends, so writes beside each other
+// wait on each other's marks and hold off the lease's renewal with them — 16 at once, when the
+// lease's check held the row in share mode too and deadlocked them, committed one write in eight
+// seconds, and the lease was lost — and they take turns, the SCM's calls behind them, where the time
+// goes, still at once. Taking turns on Spanner, where each write is slower and the fence reads a
+// cell no mark writes, cost staging's peak seconds a landing.
 func (p *pass) write() func() {
 	if p == nil || !p.serial {
 		return func() {}

@@ -241,3 +241,67 @@ func TestCheckFence(t *testing.T) {
 		t.Errorf("the new holder: %v", err)
 	}
 }
+
+// A fenced transaction holds off a takeover until it ends, never its own holder's renewals.
+func TestRenewalBesideAFence(t *testing.T) {
+	ctx := context.Background()
+	p := testdb.Pool(t)
+	if _, err := p.Exec(ctx, pgdata.WorkSchema+lock.Schema); err != nil {
+		t.Fatal(err)
+	}
+	w := pgdata.Work(p)
+	if got, err := w.Take(ctx, "k", 1, "a", time.Minute); err != nil || !got.Took {
+		t.Fatalf("taking the work: %v %v", got, err)
+	}
+	fa := data.WithFence(ctx, data.Fence{Kind: "k", Key: 1, Holder: "a"})
+	tx, err := p.Begin(fa)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	if err := pgdata.CheckFence(fa, tx); err != nil {
+		t.Fatal(err)
+	}
+	// The holder's renewals come from another goroutine than the fenced transaction's, as a lease's do.
+	elsewhere := func(f func() error) error {
+		done := make(chan error, 1)
+		go func() { done <- f() }()
+		return <-done
+	}
+	renewCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := elsewhere(func() error {
+		ok, err := w.Renew(renewCtx, "k", 1, "a", time.Minute)
+		if err == nil && !ok {
+			err = errors.New("the lease was not its holder's")
+		}
+		return err
+	}); err != nil {
+		t.Fatalf("its holder's renewal beside the fenced transaction: %v", err)
+	}
+	if err := elsewhere(func() error {
+		_, err := p.Exec(ctx, `UPDATE work SET lease_until = now() - interval '1 second' WHERE kind = 'k' AND key = 1`)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	took := make(chan error, 1)
+	go func() {
+		got, err := w.Take(ctx, "k", 1, "b", time.Minute)
+		if err == nil && !got.Took {
+			err = errors.New("not taken")
+		}
+		took <- err
+	}()
+	select {
+	case err := <-took:
+		t.Fatalf("taken over beside the fenced transaction: %v", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-took; err != nil {
+		t.Errorf("the takeover once the fenced transaction ended: %v", err)
+	}
+}

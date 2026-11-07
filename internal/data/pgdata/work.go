@@ -191,10 +191,12 @@ func LetWork(ctx context.Context, q Querier, kind string, key int64, holder stri
 }
 
 // CheckWorkFence fails the transaction q is with data.ErrFenced unless f's work is still leased to
-// f's holder, and holds its row against a takeover until the transaction ends.
+// f's holder, and holds its row against a takeover until the transaction ends: FOR KEY SHARE, which
+// a takeover's FOR UPDATE waits for and the holder's renewals, updating no key, do not, so a fenced
+// transaction longer than a renewal period never loses its own lease (as lock.CheckFence).
 func CheckWorkFence(ctx context.Context, q Querier, f data.Fence) error {
 	var held bool
-	err := q.QueryRow(ctx, `SELECT holder = $3 AND lease_until >= now() FROM work WHERE kind = $1 AND key = $2 FOR SHARE`,
+	err := q.QueryRow(ctx, `SELECT holder = $3 AND lease_until >= now() FROM work WHERE kind = $1 AND key = $2 FOR KEY SHARE`,
 		f.Kind, f.Key, f.Holder).Scan(&held)
 	if errors.Is(err, pgx.ErrNoRows) || err == nil && !held {
 		return fmt.Errorf("%w: %s", data.ErrFenced, f)

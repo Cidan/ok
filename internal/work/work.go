@@ -241,7 +241,7 @@ func NewHolder() string {
 // — the job back before the holder's lease lapsed — it is looked at again once the lease may have
 // ended. Otherwise it is taken, and done until it stays unmarked.
 func (r *Runner) job(ctx context.Context, jobs Jobs, l bus.Leased) {
-	key, token, ok := parseJob(l.Job())
+	key, mark, token, ok := parseJob(l.Job())
 	if !ok {
 		r.ack(ctx, l)
 		return
@@ -249,30 +249,36 @@ func (r *Runner) job(ctx context.Context, jobs Jobs, l bus.Leased) {
 	holder := r.Holder + jobHolder + token
 	p, err := r.Store.Peek(ctx, r.Kind, key)
 	if err != nil {
-		r.later(ctx, jobs, l, key, token, time.Second, err)
+		r.later(ctx, jobs, l, key, mark, token, time.Second, err)
 		return
 	}
 	if p.Held {
-		r.held(ctx, jobs, l, key, token, p)
+		r.held(ctx, jobs, l, key, mark, token, p)
 		return
 	}
 	t, err := r.Store.Take(ctx, r.Kind, key, holder, r.TTL)
 	switch {
 	case err != nil:
-		r.later(ctx, jobs, l, key, token, time.Second, err)
+		r.later(ctx, jobs, l, key, mark, token, time.Second, err)
 		return
 	case !t.Took:
 		p, err := r.Store.Peek(ctx, r.Kind, key)
 		if err != nil {
-			r.later(ctx, jobs, l, key, token, time.Second, err)
+			r.later(ctx, jobs, l, key, mark, token, time.Second, err)
 			return
 		}
-		r.held(ctx, jobs, l, key, token, p)
+		r.held(ctx, jobs, l, key, mark, token, p)
 		return
 	case !t.Due && !t.Later.IsZero():
-		// Its mark falls due later — the job came early, by the bus's clock — and is looked at then.
+		// Its mark falls due later. The mark's own job came early, by the bus's clock, and looks again
+		// then. An older mark's job ends: the mark has its own, and kept going it would look again every
+		// period for good, multiplying with every mark of work that books its own next time.
 		if r.let(ctx, key, holder) {
-			r.later(ctx, jobs, l, key, token, time.Until(t.Later)+time.Second, nil)
+			if sameMark(mark, t.Later) {
+				r.laterFor(ctx, jobs, l, key, token, t.Later)
+			} else {
+				r.ack(ctx, l)
+			}
 		}
 		return
 	case !t.Due:
@@ -352,7 +358,7 @@ func (r *Runner) letGo(ctx context.Context, key int64) {
 }
 
 // held is what a job does with work another holds.
-func (r *Runner) held(ctx context.Context, jobs Jobs, l bus.Leased, key int64, token string, p Peeked) {
+func (r *Runner) held(ctx context.Context, jobs Jobs, l bus.Leased, key int64, mark time.Time, token string, p Peeked) {
 	_, under, ok := strings.Cut(p.Holder, jobHolder)
 	switch {
 	case ok && under != token:
@@ -362,20 +368,31 @@ func (r *Runner) held(ctx context.Context, jobs Jobs, l bus.Leased, key int64, t
 	default:
 		// A claim, which brings nothing back should it die; or this job's own holder, its lease not
 		// lapsed yet: looked at again once it may have.
-		r.later(ctx, jobs, l, key, token, p.Left+time.Second, nil)
+		r.later(ctx, jobs, l, key, mark, token, p.Left+time.Second, nil)
 	}
 }
 
-// later has a job looked at again after delay — a fresh job of its token, enqueued before this
-// one is acknowledged, so no number of looks spends its attempts; or, that failing, this one
+// later has a job looked at again after delay — a fresh job of its token and its mark, enqueued
+// before this one is acknowledged, so no number of looks spends its attempts, and the job of a mark
+// due later is still known as that mark's when it comes back early; or, that failing, this one
 // returned.
-func (r *Runner) later(ctx context.Context, jobs Jobs, l bus.Leased, key int64, token string, delay time.Duration, cause error) {
+func (r *Runner) later(ctx context.Context, jobs Jobs, l bus.Leased, key int64, mark time.Time, token string, delay time.Duration, cause error) {
 	if cause != nil && ctx.Err() == nil {
 		r.Log.Warn("work: looking at a job again later", "kind", r.Kind, "key", key, "err", cause)
 	}
 	ctx = context.WithoutCancel(ctx)
-	if err := jobs.Queue.Enqueue(ctx, jobs.jobWith(r.Kind, key, time.Now().Add(delay), token)); err != nil {
+	if err := jobs.Queue.Enqueue(ctx, jobs.jobWith(r.Kind, key, time.Now().Add(delay), mark, token)); err != nil {
 		r.nack(ctx, l, delay)
+		return
+	}
+	r.ack(ctx, l)
+}
+
+// laterFor has a job of a mark due at due look again a moment after it is, as later does.
+func (r *Runner) laterFor(ctx context.Context, jobs Jobs, l bus.Leased, key int64, token string, due time.Time) {
+	ctx = context.WithoutCancel(ctx)
+	if err := jobs.Queue.Enqueue(ctx, jobs.jobWith(r.Kind, key, due.Add(time.Second), due, token)); err != nil {
+		r.nack(ctx, l, time.Until(due)+time.Second)
 		return
 	}
 	r.ack(ctx, l)
@@ -405,7 +422,7 @@ func (r *Runner) letOn(ctx context.Context, jobs Jobs, l bus.Leased, key int64, 
 	}
 	p, err := r.Store.Peek(context.WithoutCancel(ctx), r.Kind, key)
 	if err != nil || p.Marked && !p.Held {
-		r.later(ctx, jobs, l, key, token, 0, err)
+		r.later(ctx, jobs, l, key, time.Time{}, token, 0, err)
 		return
 	}
 	r.ack(ctx, l)

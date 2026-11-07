@@ -31,9 +31,9 @@ type Backend interface {
 	Waits() wait.Store
 	// FencedWritesBesideEachOther reports whether transactions that rest on one keyed-work lease
 	// and mark its work row may run beside each other. On Spanner they may: the fence reads the
-	// holder's cell, which a mark does not write. On PostgreSQL they may not: the fence holds the
-	// work row in share mode, which a mark of it then upgrades, so beside each other they deadlock
-	// on it and hold off the lease's renewal.
+	// holder's cell, which a mark does not write. On PostgreSQL they may not: a mark writes the work
+	// row and holds it until its transaction ends, so beside each other each waits on the others'
+	// marks, and the lease's renewal, which writes the row too, on all of them.
 	FencedWritesBesideEachOther() bool
 }
 

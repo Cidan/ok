@@ -89,8 +89,9 @@ func moveWhere(table string) string {
 // Moves are the backend's rows about repositories, for a move.
 func (b *Backend) Moves() move.Rows { return b.moves }
 
-// FencedWritesBesideEachOther is false: a work fence holds its row FOR SHARE, which a mark of the
-// row in the same transaction upgrades (pgdata.CheckWorkFence).
+// FencedWritesBesideEachOther is false: a mark of the work row holds it until its transaction ends,
+// which the others' marks and the lease's renewal wait for (pgdata.CheckWorkFence holds it FOR KEY
+// SHARE, which neither waits on).
 func (b *Backend) FencedWritesBesideEachOther() bool { return false }
 
 func (x queries) RunningRuns(ctx context.Context, repos []int64) ([]int64, error) {

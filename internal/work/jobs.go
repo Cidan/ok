@@ -34,18 +34,25 @@ type Jobs struct {
 // QueueOf is a kind's queue.
 func (j Jobs) QueueOf(kind string) string { return "work." + j.Prefix + "." + kind }
 
-// job is a job naming key's work of kind, due at at (zero: now), under a fresh token.
+// job is the job of a mark of key's work of kind, due at at (zero: now), under a fresh token.
 func (j Jobs) job(kind string, key int64, at time.Time) bus.Job {
-	return j.jobWith(kind, key, at, newToken())
+	return j.jobWith(kind, key, at, at, newToken())
 }
 
-// jobWith is a job naming key's work of kind under token: a holder's lease names the token of the
-// job it holds the work under, so a copy of that job is known as its own.
-func (j Jobs) jobWith(kind string, key int64, at time.Time, token string) bus.Job {
+// jobWith is a job naming key's work of kind, due at at, under token: a holder's lease names the
+// token of the job it holds the work under, so a copy of that job is known as its own. It carries
+// the time of the mark it is of (zero: none due later), so one that comes before its mark falls due
+// is known from an older mark's.
+func (j Jobs) jobWith(kind string, key int64, at, mark time.Time, token string) bus.Job {
 	var id [12]byte
 	rand.Read(id[:])
-	return bus.Job{ID: hex.EncodeToString(id[:]), Queue: j.QueueOf(kind), Key: key, NotBefore: at,
-		Body: append(binary.BigEndian.AppendUint64(nil, uint64(key)), token...)}
+	body := binary.BigEndian.AppendUint64(nil, uint64(key))
+	var micros int64
+	if !mark.IsZero() {
+		micros = mark.UnixMicro()
+	}
+	body = binary.BigEndian.AppendUint64(body, uint64(micros))
+	return bus.Job{ID: hex.EncodeToString(id[:]), Queue: j.QueueOf(kind), Key: key, NotBefore: at, Body: append(body, token...)}
 }
 
 // Enqueue enqueues the jobs of marks made outside any transaction of a registered database's —
@@ -77,12 +84,24 @@ func newToken() string {
 	return hex.EncodeToString(b[:])
 }
 
-// parseJob is the key and token a job names.
-func parseJob(j bus.Job) (key int64, token string, ok bool) {
-	if len(j.Body) < 8 {
-		return 0, "", false
+// tokenLen is the length of a job's token as newToken makes it.
+const tokenLen = 16
+
+// parseJob is the key, mark, and token a job names.
+func parseJob(j bus.Job) (key int64, mark time.Time, token string, ok bool) {
+	if len(j.Body) != 16+tokenLen {
+		return 0, time.Time{}, "", false
 	}
-	return int64(binary.BigEndian.Uint64(j.Body)), string(j.Body[8:]), true
+	if micros := int64(binary.BigEndian.Uint64(j.Body[8:])); micros != 0 {
+		mark = time.UnixMicro(micros)
+	}
+	return int64(binary.BigEndian.Uint64(j.Body)), mark, string(j.Body[16:]), true
+}
+
+// sameMark reports whether a job's mark is the mark a row says falls due at due, to the database's
+// precision.
+func sameMark(mark, due time.Time) bool {
+	return !mark.IsZero() && mark.Sub(due).Abs() <= time.Millisecond
 }
 
 // databases are the registered databases' registrations, by their handles.

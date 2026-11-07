@@ -19,13 +19,14 @@ import (
 // the store's lock held, enqueues its job before it lets go, as a transaction enqueues before it
 // commits.
 type store struct {
-	jobs    work.Jobs
-	mu      sync.Mutex
-	rows    map[int64]*row
-	renew   func(holder string) bool // false loses the lease
-	looks   atomic.Int64             // Peeks and Takes
-	failLet atomic.Int32             // Lets to fail, as a database going away fails them
-	failAt  atomic.Int32             // MarkAts to fail, as a bus going away fails their jobs
+	jobs     work.Jobs
+	mu       sync.Mutex
+	rows     map[int64]*row
+	renew    func(holder string) bool // false loses the lease
+	looks    atomic.Int64             // Peeks and Takes
+	failLet  atomic.Int32             // Lets to fail, as a database going away fails them
+	failAt   atomic.Int32             // MarkAts to fail, as a bus going away fails their jobs
+	failPeek atomic.Int32             // Peeks to fail, as a database going away fails them
 	// beforeLet, when set, runs as a Let begins; inLet once its job is enqueued, before it lets go.
 	beforeLet, inLet atomic.Pointer[func()]
 }
@@ -82,6 +83,9 @@ func (s *store) MarkAt(ctx context.Context, kind string, key int64, at time.Time
 func (s *store) Peek(_ context.Context, _ string, key int64) (work.Peeked, error) {
 	if key != math.MinInt64 { // a kind's adoption's booking, as its runner starts
 		s.looks.Add(1)
+		if s.failPeek.Add(-1) >= 0 {
+			return work.Peeked{}, errors.New("the database is going away")
+		}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -853,5 +857,71 @@ func TestRegistrations(t *testing.T) {
 	work.Register(db, b)
 	if got := work.JobsOf(db); got.Prefix != "b" {
 		t.Errorf("registered again: %q", got.Prefix)
+	}
+}
+
+// Work that books its own next time brings a job for each time it books. An older job, come while a
+// later mark waits, ends: kept for the mark's time, it would look again each period for good, and
+// they would multiply with every mark.
+func TestOlderJobsDoNotMultiply(t *testing.T) {
+	const period = 100 * time.Millisecond
+	ctx := context.Background()
+	s, d := newStore(), newDoer()
+	run(t, &work.Runner{Kind: "q", Store: s, TTL: time.Minute, Holder: "a", Do: d.do("a", func(ctx context.Context, key int64) error {
+		return s.MarkAt(ctx, "q", key, time.Now().Add(period))
+	})})
+	for range 30 {
+		if err := s.Mark(ctx, "q", 1); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(period / 20)
+	}
+	time.Sleep(3 * period) // what is left of those marks' jobs comes
+	before := s.looks.Load()
+	time.Sleep(10 * period)
+	// Ten rounds, each a Peek and a Take; a job kept going would add as many again for each of the 30.
+	if looks := s.looks.Load() - before; looks > 40 {
+		t.Errorf("%d looks in ten periods: jobs multiplied", looks)
+	}
+	if got := d.count(1); got < 5 {
+		t.Errorf("the work was done %d times", got)
+	}
+}
+
+// The job of the mark that waits, come early by the bus's clock, looks again for it: ended, the mark
+// would have no job at all, and nothing else looks for it.
+func TestAMarksOwnJobComeEarlyLooksAgain(t *testing.T) {
+	ctx := context.Background()
+	s, d := newStore(), newDoer()
+	run(t, &work.Runner{Kind: "q", Store: s, TTL: time.Minute, Holder: "a", Do: d.do("a", nil)})
+	// Made once the runner has adopted what was marked as it started: the job is the mark's only one.
+	time.Sleep(200 * time.Millisecond)
+	due := time.Now().Add(500 * time.Millisecond)
+	s.markOld(1, due)
+	if err := s.jobs.Queue.Enqueue(ctx, work.JobOfMark(s.jobs, "q", 1, due)); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "the work done when due", func() bool { return d.count(1) == 1 })
+	if time.Now().Before(due) {
+		t.Error("the work was done before it was due")
+	}
+}
+
+// The job of the mark that waits, come early and looked at again after a look that failed, is still
+// that mark's: it looks again for it, rather than ending as an older mark's would.
+func TestAMarksOwnJobLooksAgainAfterAFailedLook(t *testing.T) {
+	ctx := context.Background()
+	s, d := newStore(), newDoer()
+	run(t, &work.Runner{Kind: "q", Store: s, TTL: time.Minute, Holder: "a", Do: d.do("a", nil)})
+	time.Sleep(200 * time.Millisecond)
+	due := time.Now().Add(2 * time.Second)
+	s.markOld(1, due)
+	s.failPeek.Store(1)
+	if err := s.jobs.Queue.Enqueue(ctx, work.JobOfMark(s.jobs, "q", 1, due)); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "the work done when due", func() bool { return d.count(1) == 1 })
+	if time.Now().Before(due) {
+		t.Error("the work was done before it was due")
 	}
 }
