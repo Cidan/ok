@@ -379,6 +379,40 @@ func RunQueue(t *testing.T, open func(t *testing.T, maxAttempts int) bus.Queue, 
 			t.Fatalf("the job was leased %v after it was enqueued, before its NotBefore %v", time.Since(start), vis)
 		}
 	})
+	// A job due in a moment — one put off, as a step whose attempt is still committing puts its own
+	// — is leased soon after it is due by the Lease that waits next, as a worker's does, not once
+	// that Lease's wait or a visibility has passed.
+	t.Run("NotBeforeSoon", func(t *testing.T) {
+		q := open(t, 10)
+		queue := name("queue")
+		lease(t, q, queue, bus.LeaseOptions{Max: 1, Visibility: vis}) // the queue made, where leasing makes it
+		start := time.Now()
+		enqueue(t, q, bus.Job{ID: "soon", Queue: queue, NotBefore: start.Add(300 * time.Millisecond)})
+		ls := lease(t, q, queue, bus.LeaseOptions{Max: 1, Visibility: long, Wait: 15 * time.Second})
+		if took := time.Since(start); len(ls) != 1 || took > 5*time.Second {
+			t.Fatalf("a job due in 0.3s: %d leased, %v after it was enqueued", len(ls), took)
+		}
+	})
+	// A job due in a moment, enqueued while a Lease waits — by another process where queues are
+	// shared — is that Lease's soon after it is due.
+	t.Run("NotBeforeWhileWaiting", func(t *testing.T) {
+		q := open(t, 10)
+		sender := q
+		if o.Shared {
+			sender = open(t, 10)
+		}
+		queue := name("queue")
+		lease(t, q, queue, bus.LeaseOptions{Max: 1, Visibility: vis}) // the queue made, where leasing makes it
+		go func() {
+			time.Sleep(300 * time.Millisecond)
+			enqueue(t, sender, bus.Job{ID: "soon", Queue: queue, NotBefore: time.Now().Add(300 * time.Millisecond)})
+		}()
+		start := time.Now()
+		ls := lease(t, q, queue, bus.LeaseOptions{Max: 1, Visibility: long, Wait: 15 * time.Second})
+		if took := time.Since(start); len(ls) != 1 || took > 5*time.Second {
+			t.Fatalf("a job enqueued 0.3s into a Lease's wait, due 0.3s later: %d leased, %v after the Lease began", len(ls), took)
+		}
+	})
 	t.Run("Dedupe", func(t *testing.T) {
 		if !o.Dedupe {
 			t.Skip("the queue does not drop duplicate IDs")

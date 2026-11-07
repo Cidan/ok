@@ -7,9 +7,10 @@
 // on a subscription with a dead-letter policy, so each queue's has one, at its attempts (no fewer
 // than Pub/Sub's five); a job nacked on its last attempt is published to the queue's dead letters —
 // a topic that keeps what it is sent — and acknowledged. Pub/Sub delays nothing, so a job not due
-// waits on the queue's delay topic, hidden by its ack deadline, until a Lease moves it onto the
-// queue — so a job is due within the subscriptions' retention, seven days at most — and a Nack
-// delayed past ten minutes goes the same way, carrying its attempts with it.
+// waits on the queue's delay topic, hidden by its ack deadline until it is, and a Lease moves it
+// onto the queue — as the Lease starts, or while it waits, as the job comes due — so a job is due
+// within the subscriptions' retention, seven days at most; a Nack delayed past ten minutes goes
+// the same way, carrying its attempts with it.
 // Pub/Sub drops no duplicate publish, so the queue drops no duplicate ID.
 package pubsubbus
 
@@ -17,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"strings"
 	"sync"
@@ -57,11 +59,16 @@ func (o *Options) defaults() {
 	o.MaxAttempts = min(o.MaxAttempts, 100)
 }
 
-// Pub/Sub's bounds on an ack deadline.
+// Pub/Sub's bounds on an ack deadline: a subscription's is at least minDeadline; a delivery's,
+// modified, any whole number of seconds up to maxDeadline.
 const (
 	minDeadline = 10 * time.Second
 	maxDeadline = 600 * time.Second
 )
+
+// promoteWait is how long a queue's promoter waits on its delay topic's subscription for a job to
+// come due before it looks again whether any Lease of the queue waits.
+const promoteWait = 5 * time.Second
 
 // Attributes a message carries.
 const (
@@ -80,6 +87,9 @@ type Bus struct {
 	mu         sync.Mutex
 	made       map[string]bool // topics and subscriptions made
 	publishers map[string]*pubsub.Publisher
+	// promoters move the delayed jobs of the queues this process's Leases wait on onto them as they
+	// come due: one a queue, while any of its Leases waits (promoting).
+	promoters map[string]*promoter
 	// inboxes are this process's inboxes (bus.Inboxes): every process's replies share one topic,
 	// each process's queue a subscription to it that keeps its own, which Pub/Sub removes a day
 	// after it was last leased, should the process stop before it closes its inboxes.
@@ -91,7 +101,7 @@ var _ bus.Queue = (*Bus)(nil)
 // Open is a bus on c's project.
 func Open(c *pubsub.Client, opts Options) *Bus {
 	opts.defaults()
-	b := &Bus{c: c, opts: opts, made: map[string]bool{}, publishers: map[string]*pubsub.Publisher{}}
+	b := &Bus{c: c, opts: opts, made: map[string]bool{}, publishers: map[string]*pubsub.Publisher{}, promoters: map[string]*promoter{}}
 	b.inboxes = bus.NewInboxes(b, b.prepareInboxes, b.dropInboxes)
 	return b
 }
@@ -324,20 +334,21 @@ func (b *Bus) pull(ctx context.Context, sub string, n int, wait time.Duration) (
 	}
 }
 
+// modify hides deliveries for d from now, in Pub/Sub's whole seconds rounded up: no shorter.
 func (b *Bus) modify(ctx context.Context, sub string, ackIDs []string, d time.Duration) error {
 	return b.c.SubscriptionAdminClient.ModifyAckDeadline(ctx, &pubsubpb.ModifyAckDeadlineRequest{
-		Subscription: sub, AckIds: ackIDs, AckDeadlineSeconds: int32(min(d, maxDeadline) / time.Second)})
+		Subscription: sub, AckIds: ackIDs, AckDeadlineSeconds: int32((min(d, maxDeadline) + time.Second - 1) / time.Second)})
 }
 
 func (b *Bus) ack(ctx context.Context, sub string, ackIDs ...string) error {
 	return b.c.SubscriptionAdminClient.Acknowledge(ctx, &pubsubpb.AcknowledgeRequest{Subscription: sub, AckIds: ackIDs})
 }
 
-// promote moves a queue's delayed jobs that are due onto it, and hides the rest until they are, as
-// far as an ack deadline reaches.
-func (b *Bus) promote(ctx context.Context, queue string) error {
+// promote moves a queue's delayed jobs that are due onto it, waiting up to wait for one to be, and
+// hides the rest until they are, as far as an ack deadline reaches.
+func (b *Bus) promote(ctx context.Context, queue string, wait time.Duration) error {
 	sub := b.laterSub(queue)
-	msgs, err := b.pull(ctx, sub, 100, 0)
+	msgs, err := b.pull(ctx, sub, 100, wait)
 	if err != nil {
 		return err
 	}
@@ -359,21 +370,71 @@ func (b *Bus) promote(ctx context.Context, queue string) error {
 			}
 			continue
 		}
-		if err := b.modify(ctx, sub, []string{rm.AckId}, max(time.Until(due), minDeadline)); err != nil {
+		if err := b.modify(ctx, sub, []string{rm.AckId}, time.Until(due)); err != nil {
 			return fmt.Errorf("pubsubbus: holding a delayed job of %s: %w", queue, err)
 		}
 	}
 	return nil
 }
 
-// Lease moves queue's due delayed jobs onto it, then takes up to o.Max of its ready jobs.
+// promoter is a queue's: it runs while any of the process's Leases of the queue waits.
+type promoter struct{ waiting int }
+
+// await counts a Lease of queue as waiting until done is called, starting the queue's promoter
+// unless it runs.
+func (b *Bus) await(queue string) (done func()) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	p := b.promoters[queue]
+	if p == nil {
+		p = &promoter{}
+		b.promoters[queue] = p
+		go b.promoting(queue, p)
+	}
+	p.waiting++
+	return func() {
+		b.mu.Lock()
+		p.waiting--
+		b.mu.Unlock()
+	}
+}
+
+// promoting moves queue's delayed jobs onto it as they come due, waiting on its delay topic's
+// subscription, until no Lease of the queue waits. No pull of it is cut short: what a canceled
+// pull was handed stays hidden for the subscription's ack deadline.
+func (b *Bus) promoting(queue string, p *promoter) {
+	for {
+		err := b.promote(context.Background(), queue, promoteWait)
+		b.mu.Lock()
+		idle := p.waiting == 0
+		if idle {
+			delete(b.promoters, queue)
+		}
+		b.mu.Unlock()
+		switch {
+		case idle:
+			return
+		case err != nil:
+			slog.Warn("pubsubbus: moving due jobs onto their queue", "queue", queue, "err", err)
+			time.Sleep(time.Second)
+		}
+	}
+}
+
+// Lease takes up to o.Max of queue's ready jobs, waiting up to o.Wait for one: it moves the queue's
+// due delayed jobs onto it first, and while it waits, the queue's promoter moves each as it comes
+// due.
 func (b *Bus) Lease(ctx context.Context, queue string, o bus.LeaseOptions) ([]bus.Leased, error) {
 	if err := b.ensureQueue(ctx, queue); err != nil {
 		return nil, err
 	}
 	if !bus.IsInboxQueue(queue) {
-		if err := b.promote(ctx, queue); err != nil {
+		if err := b.promote(ctx, queue, 0); err != nil {
 			return nil, err
+		}
+		if o.Wait > 0 {
+			done := b.await(queue)
+			defer done()
 		}
 	}
 	sub := b.queueSub(queue)

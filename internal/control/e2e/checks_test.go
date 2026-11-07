@@ -184,10 +184,15 @@ func TestChecks(t *testing.T) {
 		t.Errorf("alice's test, to another member: %+v", rowNamed(t, rows, "//lib:test"))
 	}
 
-	// A run's page: its status and its log, which grows while it runs, then its raw bytes.
-	testRun := lease()
-	if want := "test //lib:test"; testRun.GetOrigin().GetJob() != want {
-		t.Fatalf("leased %q, want %q", testRun.GetOrigin().GetJob(), want)
+	// A run's page: its status and its log, which grows while it runs, then its raw bytes. The worker
+	// takes both queued runs, the test and the rebuilt build, in whichever order the bus hands them
+	// out: Pub/Sub keeps none.
+	testRun, rebuild := lease(), lease()
+	if testRun.GetOrigin().GetJob() == "build" {
+		testRun, rebuild = rebuild, testRun
+	}
+	if testRun.GetOrigin().GetJob() != "test //lib:test" || rebuild.GetOrigin().GetJob() != "build" {
+		t.Fatalf("leased %q and %q, want the test and the rebuilt build", testRun.GetOrigin().GetJob(), rebuild.GetOrigin().GetJob())
 	}
 	first := "=== RUN   TestLib\n\x1b[32mok\x1b[0m\n"
 	appendLog(testRun, 0, first)
@@ -212,7 +217,7 @@ func TestChecks(t *testing.T) {
 	}
 
 	// The rebuilt build passes, and so does pre: the tab stops refreshing.
-	finish(lease(), automationpb.Run_STATUS_PASSED, nil)
+	finish(rebuild, automationpb.Run_STATUS_PASSED, nil)
 	rows, verdict, live, _ = checks(t, e.get(alice, checksPath))
 	if verdict != "Passed" || live {
 		t.Errorf("with every job passed: %+v, %q, live %v", rows, verdict, live)
