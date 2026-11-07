@@ -169,7 +169,8 @@ func TestRollbacks(t *testing.T) {
 	e.post(dana, p8+"/reply", grant("LGTM"))
 	e.post(dana, clPath("svc", n9)+"/reply", grant("LGTM"))
 	e.post(bob, clPath("svc", n9)+"/reply", grant("Approval"))
-	e.prePassed("svc", 8)
+	// Pre runs at the stack's top, over both: the rollback's own was canceled as the hand edit was
+	// sent for review on it, unless it had finished first.
 	e.prePassed("svc", n9)
 	e.submitted(carol, clPath("svc", n9), "submit-stack")
 	if got, _ := e.file("svc", "lib/lib.go"); got != "package lib\n\nfunc One() int { return 1 }\n" {
