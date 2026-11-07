@@ -45,3 +45,10 @@ tempfile.workspace = true
 name = "kernel"
 path = "tests/kernel.rs"
 harness = false
+
+# The secrets test enters a user and mount namespace of its own first thing in main, as the kernel
+# test does: it has a harness of its own (okfs_fuse::testns::run).
+[[test]]
+name = "secrets"
+path = "tests/secrets.rs"
+harness = false

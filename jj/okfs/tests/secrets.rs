@@ -1,6 +1,9 @@
 //! A workspace's secrets through the kernel (docs/secrets.md, "Clients"): a mount over a tree with
 //! //secret, whose values a stand-in for ok secrets holds, driven by ordinary file-system calls in a
-//! user and mount namespace of the test's own.
+//! user and mount namespace of the test's own. The binary enters the namespace first thing in its
+//! `main` (okfs_fuse::testns), so it runs on a harness of its own, and reaches okfs's test fixtures
+//! through the `testkit` feature.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code, unused_imports))]
 
 use std::collections::HashMap;
 use std::fs;
@@ -10,7 +13,6 @@ use std::io::Seek as _;
 use std::io::Write as _;
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::MetadataExt as _;
-use std::process::Command;
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -19,14 +21,13 @@ use ok_secret::Digest;
 use ok_secret::SecretBuf;
 use okfs_fuse as fuse;
 
-use crate::fs::Mount;
-use crate::fs::SecretStore;
-use crate::testfix::Entry;
-use crate::testfix::Fixture;
-use crate::testfix::FixtureFetch;
-use crate::testfix::path;
+use okfs::fs::Mount;
+use okfs::fs::SecretStore;
+use okfs::testfix::Entry;
+use okfs::testfix::Fixture;
+use okfs::testfix::FixtureFetch;
+use okfs::testfix::path;
 
-const CHILD: &str = "OKFS_SECRETS_KERNEL_TEST";
 const PROD_ACL: &[u8] = b"readers: [prod]\nwriters: [prod]\n";
 const OTHER_ACL: &[u8] = b"readers: [other]\nwriters: [other]\n";
 const REPO: i64 = 7;
@@ -113,32 +114,6 @@ impl SecretStore for Store {
     }
 }
 
-#[test]
-fn secrets_kernel() {
-    assert!(
-        std::path::Path::new("/dev/fuse").exists(),
-        "no /dev/fuse: the test needs FUSE (docs/building.md, \"Tests\")"
-    );
-    let mut cmd = Command::new(std::env::current_exe().unwrap());
-    cmd.args([
-        "--exact",
-        "secret_tests::secrets_kernel_child",
-        "--nocapture",
-        "--test-threads=1",
-    ])
-    .env(CHILD, "1");
-    fuse::testns::unshare(&mut cmd);
-    let out = cmd.output().expect("run the child");
-    assert!(
-        out.status.success()
-            && String::from_utf8_lossy(&out.stdout).contains("okfs-secrets-scenario-done"),
-        "the child: {}\n{}\n{}",
-        out.status,
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-}
-
 fn errno(e: io::Error) -> i32 {
     e.raw_os_error().unwrap_or(0)
 }
@@ -178,11 +153,10 @@ fn contains(hay: &[u8], needle: &[u8]) -> bool {
     hay.windows(needle.len()).any(|w| w == needle)
 }
 
-#[test]
-fn secrets_kernel_child() {
-    if std::env::var_os(CHILD).is_none() {
-        return;
-    }
+/// Secrets through the kernel: what each kind of folder lets be read and written, a value never on
+/// disk, and what a write that is not sealed shows.
+#[cfg(target_os = "linux")]
+fn secrets() {
     // secret/denied/ is neither readable nor writable; secret/readonly/ only readable;
     // secret/writeonly/ only writable.
     let store = Arc::new(Store {
@@ -594,5 +568,17 @@ fn secrets_kernel_child() {
 
     fuse::unmount(&mnt).unwrap();
     server.join().unwrap().unwrap();
-    println!("okfs-secrets-scenario-done");
 }
+
+#[cfg(target_os = "linux")]
+fn main() {
+    fuse::testns::enter().expect("enter a user and mount namespace of the test's own");
+    assert!(
+        std::path::Path::new("/dev/fuse").exists(),
+        "no /dev/fuse: the test target declares devices: [fuse] (docs/building.md, Tests)"
+    );
+    fuse::testns::run(&[("secrets", secrets)]);
+}
+
+#[cfg(not(target_os = "linux"))]
+fn main() {}

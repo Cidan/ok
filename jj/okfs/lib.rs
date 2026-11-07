@@ -59,8 +59,6 @@ mod model_tests;
 mod nfs_kernel_tests;
 #[cfg(test)]
 mod nfs_tests;
-#[cfg(all(test, target_os = "linux"))]
-mod secret_tests;
 #[cfg(any(test, feature = "testkit"))]
 #[doc(hidden)]
 pub mod testfix;
