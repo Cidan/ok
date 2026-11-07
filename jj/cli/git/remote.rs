@@ -227,8 +227,7 @@ pub async fn clone(ui: &mut Ui, cx: &Cx<'_>, args: &[String]) -> Code {
     }
     let workspace = a.workspace.map(WorkspaceNameBuf::from);
     let attach = a.attach.map(WorkspaceNameBuf::from);
-    // Boxed: `jj git-compat` is itself one of the commands `commands::run` runs.
-    Box::pin(crate::commands::run(
+    crate::commands::run(
         ui,
         cx.command,
         crate::commands::Command::Clone(crate::commands::CloneArgs::new(
@@ -238,7 +237,7 @@ pub async fn clone(ui: &mut Ui, cx: &Cx<'_>, args: &[String]) -> Code {
             a.real,
             attach,
         )),
-    ))
+    )
     .await?;
     Ok(0)
 }

@@ -1985,18 +1985,7 @@ pub async fn config(ui: &mut Ui, cx: &Cx<'_>, args: &[String]) -> Code {
             let k = key.to_ascii_lowercase();
             if k == "user.name" || k == "user.email" {
                 drop(out);
-                let mut cmd = std::process::Command::new(std::env::current_exe()?);
-                cmd.args([
-                    "--no-pager",
-                    "config",
-                    "set",
-                    if global { "--user" } else { "--repo" },
-                    &k,
-                    value,
-                ])
-                .current_dir(cx.command.cwd());
-                let status = cmd.status()?;
-                return Ok(if status.success() { 0 } else { 4 });
+                return set_identity(ui, cx, global, &k, value);
             }
             writeln!(
                 ui.stderr(),
@@ -2137,6 +2126,27 @@ rebases — says so, and names what to use instead. `jj` is always there underne
 `jj log`, `jj op log`, and `jj undo` see and undo everything git did.
 "#
     )?;
+    Ok(0)
+}
+
+/// Sets `user.name` or `user.email` in jj's configuration, as `jj config set` does: the user's with
+/// `--global`, the repository's otherwise. It changes the author of commits from now on.
+fn set_identity(ui: &Ui, cx: &Cx<'_>, global: bool, key: &str, value: &str) -> Code {
+    let env = cx.command.config_env();
+    let raw = cx.command.raw_config();
+    let files = if global {
+        env.user_config_files(raw)?
+    } else {
+        env.repo_config_files(ui, raw)?
+    };
+    let Some(mut file) = files.into_iter().next() else {
+        return error(ui, "there is no configuration file to write", 4);
+    };
+    let name = jj_lib::config::ConfigNamePathBuf::from_iter(key.split('.'));
+    if let Err(e) = file.set_value(&name, value) {
+        return error(ui, format!("could not set {key}: {e}"), 4);
+    }
+    file.save()?;
     Ok(0)
 }
 

@@ -10,6 +10,7 @@ use std::path::PathBuf;
 
 use futures::TryStreamExt as _;
 use jj_cli::cli_util::WorkspaceCommandHelper;
+use jj_cli::cli_util::print_large_file_hint;
 use jj_cli::command_error::CommandError;
 use jj_cli::command_error::internal_error;
 use jj_cli::ui::Ui;
@@ -22,6 +23,7 @@ use jj_lib::matchers::EverythingMatcher;
 use jj_lib::matchers::Matcher;
 use jj_lib::merge::Merge;
 use jj_lib::merged_tree::MergedTree;
+use jj_lib::merged_tree_builder::MergedTreeBuilder;
 use jj_lib::object_id::ObjectId as _;
 use jj_lib::op_store::RefTarget;
 use jj_lib::ref_name::RefName;
@@ -31,6 +33,7 @@ use jj_lib::repo_path::RepoPathBuf;
 use jj_lib::revset::ResolvedRevsetExpression;
 use jj_lib::revset::RevsetExpression;
 use jj_lib::rewrite::restore_tree;
+use jj_lib::working_copy::UntrackedReason;
 
 use super::Code;
 use super::Cx;
@@ -489,12 +492,7 @@ pub async fn add(ui: &mut Ui, cx: &Cx<'_>, args: &[String]) -> Code {
         }
     }
     if a.force && !paths.is_empty() && !a.dry_run {
-        let status = std::process::Command::new(std::env::current_exe()?)
-            .args(["--no-pager", "file", "track", "--include-ignored", "--"])
-            .args(&paths)
-            .current_dir(cx.command.cwd())
-            .status()?;
-        return Ok(if status.success() { 0 } else { 128 });
+        return track_ignored(ui, cx, &paths).await;
     }
     if !a.quiet {
         writeln!(
@@ -502,6 +500,88 @@ pub async fn add(ui: &mut Ui, cx: &Cx<'_>, args: &[String]) -> Code {
             "ok tracks every file automatically: there is nothing to add."
         )?;
     }
+    Ok(0)
+}
+
+/// Tracks the files `paths` name, ignored ones too, as `jj file track --include-ignored` does:
+/// one snapshot that takes them in, then the transaction. One it still leaves out — a file too
+/// large — is an error, with jj's hint.
+async fn track_ignored(ui: &mut Ui, cx: &Cx<'_>, paths: &[String]) -> Code {
+    let mut ws = cx.command.workspace_helper(ui).await?;
+    let matcher = ws.parse_file_patterns(ui, paths)?.to_matcher();
+    let mut options = ws.snapshot_options_with_start_tracking_matcher(&matcher)?;
+    options.force_tracking_matcher = &matcher;
+    let mut tx = ws.start_transaction().into_inner();
+    let (mut locked, _) = ws.start_working_copy_mutation().await?;
+    let (_, stats) = locked.locked_wc().snapshot(&options).await?;
+    tx.repo_mut().rebase_descendants().await?;
+    let repo = tx.commit("git add --force").await?;
+    locked.finish(repo.op_id().clone()).await?;
+    // What the snapshot still left out: a file too large to track, said as git says what it
+    // could not add.
+    let mut large = Vec::new();
+    for (path, reason) in &stats.untracked_paths {
+        if let UntrackedReason::FileTooLarge { size, max_size } = reason {
+            let name = ws.format_file_path(path);
+            writeln!(
+                ui.stderr(),
+                "error: '{name}' was not added: it is {size} bytes, over {max_size} (snapshot.max-new-file-size)"
+            )?;
+            large.push((name, *size));
+        }
+    }
+    if let Some(max) = large.iter().map(|(_, s)| *s).max() {
+        let names: Vec<String> = large.into_iter().map(|(p, _)| p).collect();
+        print_large_file_hint(ui, max, Some(&names))?;
+        return Ok(128);
+    }
+    Ok(0)
+}
+
+/// Untracks the files `matcher` names, as `jj file untrack` does: they leave the working-copy
+/// commit, and keep out of it only while the ignore files name them — a snapshot that would take
+/// one back refuses.
+async fn untrack(ui: &mut Ui, mut ws: WorkspaceCommandHelper, matcher: &dyn Matcher) -> Code {
+    let auto = ws.auto_tracking_matcher(ui)?;
+    let options = ws.snapshot_options_with_start_tracking_matcher(&auto)?;
+    let mut tx = ws.start_transaction().into_inner();
+    let (mut locked, wc_commit) = ws.start_working_copy_mutation().await?;
+    let wc_tree = wc_commit.tree();
+    let mut builder = MergedTreeBuilder::new(wc_tree.clone());
+    for (path, _) in wc_tree.entries_matching(matcher) {
+        builder.set_or_remove(path, Merge::absent());
+    }
+    let new_tree = builder.write_tree().await?;
+    let new_commit = tx
+        .repo_mut()
+        .rewrite_commit(&wc_commit)
+        .set_tree(new_tree)
+        .write()
+        .await?;
+    locked.locked_wc().reset(&new_commit).await?;
+    let (taken, _) = locked.locked_wc().snapshot(&options).await?;
+    if taken.tree_ids() != new_commit.tree_ids() {
+        if let Some((path, _)) = taken.entries_matching(matcher).next() {
+            drop(locked);
+            fatal(
+                ui,
+                format!(
+                    "'{}' is not ignored: ok tracks every file the ignore files do not name, so the next command would take it back",
+                    ws.format_file_path(&path)
+                ),
+            )?;
+            hint(
+                ui,
+                "name it in an ignore file (docs/jj.md, \"Ignoring files\"), then untrack it",
+            )?;
+            return Ok(128);
+        }
+        // Other changes came into the working copy meanwhile: they are not this command's.
+        locked.locked_wc().reset(&new_commit).await?;
+    }
+    tx.repo_mut().rebase_descendants().await?;
+    let repo = tx.commit("git rm --cached").await?;
+    locked.finish(repo.op_id().clone()).await?;
     Ok(0)
 }
 
@@ -597,13 +677,7 @@ pub async fn rm(ui: &mut Ui, cx: &Cx<'_>, args: &[String]) -> Code {
             }
             return Ok(0);
         }
-        drop(ws);
-        let status = std::process::Command::new(std::env::current_exe()?)
-            .args(["--no-pager", "file", "untrack", "--"])
-            .args(&specs)
-            .current_dir(cx.command.cwd())
-            .status()?;
-        return Ok(if status.success() { 0 } else { 128 });
+        return untrack(ui, ws, &matcher).await;
     }
     let root = ws.workspace_root().to_owned();
     let mut dirs: Vec<PathBuf> = Vec::new();

@@ -94,12 +94,17 @@ orphan branches, `submodule add`, and git's object-writing plumbing (`update-ref
   another backend, or nothing makes it git's. A clone is ok's to decide, once it can read ok's
   configuration. `--git-dir`, `--work-tree`, `GIT_DIR`, and options only git answers
   (`--version`, `--exec-path`, …) are git's.
-- **ok's commands run as jj's.** jj's runner reads its arguments from the process, so the front
-  end executes the binary again as `jj --quiet git-compat -- <git's arguments>` (the hidden
-  subcommand, `git.rs`): jj's configuration, workspace loading, snapshots, and transactions are
-  every git command's. `--quiet` keeps jj's reports of the working copy moving out of git's
-  output (a clone keeps them). `GIT_PAGER`, `GIT_EDITOR`, `core.editor`, `color.ui`, and a
-  command's `--color` become jj's pager, editor, and colors.
+- **ok's commands run as jj's, in the same process.** jj's runner reads its arguments from the
+  process, so when the command is ok's its command-line application is told the first of them is
+  no program's name (clap's `no_binary_name`) and takes it — the path the program was started by,
+  `git` — for a subcommand of its own whose arguments pass as they are (`AsGit`, `git.rs`): jj's
+  configuration, workspace loading, snapshots, and transactions are every git command's, and the
+  program never runs itself again. jj's reports of the working copy moving stay out of git's
+  output (`ui.quiet`; a clone keeps them). `GIT_PAGER` and `GIT_EDITOR` (or `core.editor`) become
+  jj's pager and editor, through `JJ_PAGER` and `JJ_EDITOR`, set before jj's runner reads its
+  environment; `--no-pager`, `color.ui`, and a command's `--color` become its paging and colors.
+  What jj's own commands do for git's — `add -f` tracks ignored files, `rm --cached` untracks,
+  `config user.name` writes jj's configuration — is done here, as those commands do it.
 - **Exit statuses are git's**: 1 for a difference (`diff --exit-code`), a key not set (`config`),
   a commit with nothing to commit; 128 for a fatal error; 129 for a usage error. jj's runner knows
   only its own, so the command records its status and `main` exits with it.
@@ -115,7 +120,7 @@ All of it is in the `jj` binary's crate (`jj/cli`):
 
 | File | What it is |
 |---|---|
-| `git.rs` | The hidden `jj git-compat` subcommand: dispatch, exit statuses, and what every command shares |
+| `git.rs` | The program as `git` (`AsGit`): dispatch, exit statuses, and what every command shares |
 | `git/front.rs` | The front end: the name `git`, git's global options, ok's or git's, and handing to git |
 | `git/repo.rs` | The workspace as git sees it: HEAD and its branch, git's revision syntax, pathspecs |
 | `git/fmt.rs` | git's output: dates, `--pretty` formats and `--format` placeholders, quoted paths |

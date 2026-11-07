@@ -1664,6 +1664,44 @@ pub async fn git_workflow(mode: Mode) {
         run.all()
     );
     assert_eq!(alice.git_ok("repo", &["status", "--porcelain"]).stdout, "");
+    // An ignored file is tracked when `add -f` names it and untracked again by `rm --cached`; one
+    // the ignore files do not name cannot be untracked, as the next command would take it back.
+    alice.write("repo/.ignore", "out/\n");
+    alice.write("repo/out/built.txt", "built\n");
+    assert_eq!(
+        alice.git_ok("repo", &["status", "--porcelain"]).stdout,
+        "A  .ignore\n"
+    );
+    alice.git_ok("repo", &["add", "-f", "out/built.txt"]);
+    assert_eq!(
+        alice.git_ok("repo", &["status", "--porcelain"]).stdout,
+        "A  .ignore\nA  out/built.txt\n"
+    );
+    alice.git_ok("repo", &["rm", "--cached", "-q", "out/built.txt"]);
+    assert_eq!(
+        alice.git_ok("repo", &["status", "--porcelain"]).stdout,
+        "A  .ignore\n"
+    );
+    let run = alice.git_exits("repo", &["rm", "--cached", ".ignore"], 128);
+    assert!(run.stderr.contains("is not ignored"), "{}", run.all());
+    std::fs::remove_dir_all(alice.home.path().join("repo/out")).unwrap();
+    std::fs::remove_file(alice.home.path().join("repo/.ignore")).unwrap();
+    assert_eq!(alice.git_ok("repo", &["status", "--porcelain"]).stdout, "");
+    // The author's name and email are jj's configuration, the repository's or, with --global, the
+    // person's: `git config` writes them there.
+    alice.git_ok("repo", &["config", "user.name", "Alice Liddell"]);
+    // The test's JJ_USER outranks it, so it is listed as overridden.
+    let listed = alice.ok(
+        "repo",
+        &[
+            "config",
+            "list",
+            "--repo",
+            "--include-overridden",
+            "user.name",
+        ],
+    );
+    assert!(listed.contains("user.name = \"Alice Liddell\""), "{listed}");
     alice.git_exits("repo", &["commit", "-m", "nothing"], 1);
     let head = alice.git_ok("repo", &["rev-parse", "HEAD"]).stdout;
     let head = head.trim().to_owned();

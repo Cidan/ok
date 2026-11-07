@@ -102,18 +102,29 @@ async fn isolated_workspaces(
 
 fn main() -> ExitCode {
     // Run as `git`: ok's git commands in ok workspaces, git's everywhere else (docs/git.md).
-    if let Some(code) = git::front::main() {
-        return code;
-    }
-    let code: u8 = CliRunner::init()
+    let as_git = match git::front::main() {
+        None => None,
+        Some(git::front::Front::Exited(code)) => return code,
+        Some(git::front::Front::Ours(opts)) => Some(opts),
+    };
+    let runner = CliRunner::init()
         .version(env!("CARGO_PKG_VERSION"))
         .add_store_factories(ok_store::factories())
         .add_working_copy_factories(working_copy_factories())
         .set_workspace_loader_factory(Box::new(ok_working_copy::OkWorkspaceLoaderFactory))
         .add_extra_config(defaults())
         .add_subcommand(commands::run)
-        .add_dispatch_hook(isolated_workspaces)
-        .run();
+        .add_dispatch_hook(isolated_workspaces);
+    let code: u8 = match as_git {
+        Some(opts) => runner
+            .add_subcommand(
+                async move |ui: &mut Ui, command: &CommandHelper, a: git::AsGit| {
+                    git::run(ui, command, a, opts).await
+                },
+            )
+            .run(),
+        None => runner.run(),
+    };
     // A git command chooses its own exit status: git's, not jj's.
     let code = ExitCode::from(git::exit_code().unwrap_or(code));
     // What the command asked ok, when OK_STATS names a file (jj/store/calls.rs).

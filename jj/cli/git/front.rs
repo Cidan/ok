@@ -1,7 +1,7 @@
 //! The `git` front end (docs/git.md, "How it runs"): this binary run by the name `git`. In an ok
-//! workspace, and for a clone, it runs ok's git commands — it executes itself as `jj git-compat`,
-//! since jj's runner reads its arguments from the process — and everywhere else it runs the git
-//! that is on the PATH after it, so a `git` that is ok's leaves every other repository to git.
+//! workspace, and for a clone, it has ok's git commands run — in this process, by jj's runner, as
+//! its `git` subcommand (`git::AsGit`) — and everywhere else it runs the git that is on the PATH
+//! after it, so a `git` that is ok's leaves every other repository to git.
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -201,17 +201,40 @@ fn is_executable(p: &Path) -> bool {
 fn started_as_git() -> bool {
     std::env::args_os()
         .next()
-        .and_then(|a0| {
-            Path::new(&a0)
-                .file_stem()
-                .map(|s| s.eq_ignore_ascii_case("git"))
-        })
+        .and_then(|a0| a0.to_str().map(is_git))
         .unwrap_or(false)
 }
 
-/// The front end: `None` unless this process was started as `git`; otherwise what it exits with,
-/// having run git, or itself as ok's git.
-pub fn main() -> Option<ExitCode> {
+/// Whether a program's name, as it was started by (its path, or the name the `PATH` found), is
+/// `git`'s.
+pub fn is_git(name: &str) -> bool {
+    Path::new(name)
+        .file_stem()
+        .is_some_and(|s| s.eq_ignore_ascii_case("git"))
+}
+
+/// What the front end decided, for a process started as `git`.
+pub enum Front {
+    /// git ran, or the command was refused: what the process exits with.
+    Exited(ExitCode),
+    /// The command is ok's: jj's runner runs it, presented so.
+    Ours(Options),
+}
+
+/// How ok's git command presents itself, as git's options and environment ask: jj's reports of the
+/// working copy moving kept out of git's output (`quiet`; a clone keeps them, which say where the
+/// workspace is and what it is called), the pager, and colors. git's pager and editor reach jj as
+/// its own environment's (`JJ_PAGER`, `JJ_EDITOR`), set before its runner reads them.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Options {
+    pub quiet: bool,
+    pub no_pager: bool,
+    pub color: Option<&'static str>,
+}
+
+/// The front end: `None` unless this process was started as `git`; otherwise whether the command
+/// is ok's, or what the process exits with, having run git.
+pub fn main() -> Option<Front> {
     if !started_as_git() {
         return None;
     }
@@ -222,7 +245,7 @@ pub fn main() -> Option<ExitCode> {
             "fatal: {} is ok's jj, not git; name git with {REAL_GIT_ENV}",
             me.display()
         );
-        return Some(ExitCode::from(128));
+        return Some(Front::Exited(ExitCode::from(128)));
     }
     let raw: Vec<OsString> = std::env::args_os().skip(1).collect();
     let Some(args) = raw
@@ -230,7 +253,7 @@ pub fn main() -> Option<ExitCode> {
         .map(|a| a.to_str().map(str::to_owned))
         .collect::<Option<Vec<String>>>()
     else {
-        return Some(run_git(&raw, None));
+        return Some(Front::Exited(run_git(&raw, None)));
     };
     let (globals, rest) = split_globals(&args);
     let cmd = rest.first().map(String::as_str);
@@ -239,13 +262,13 @@ pub fn main() -> Option<ExitCode> {
         || cmd.is_none()
         || std::env::var_os("GIT_DIR").is_some()
     {
-        return Some(run_git(&raw, None));
+        return Some(Front::Exited(run_git(&raw, None)));
     }
     let mut cwd = match std::env::current_dir() {
         Ok(d) => d,
         Err(e) => {
             eprintln!("fatal: unable to read the current directory: {e}");
-            return Some(ExitCode::from(128));
+            return Some(Front::Exited(ExitCode::from(128)));
         }
     };
     for d in &globals.dirs {
@@ -258,7 +281,7 @@ pub fn main() -> Option<ExitCode> {
         _ if cmd == "help" => rest.get(1).is_some_and(|a| a == "ok"),
         Place::Ok(root) => {
             if is_repoless(cmd, &rest[1..]) {
-                return Some(run_git(&repoless_args(&args), Some(&root)));
+                return Some(Front::Exited(run_git(&repoless_args(&args), Some(&root))));
             }
             true
         }
@@ -266,15 +289,15 @@ pub fn main() -> Option<ExitCode> {
         Place::Elsewhere => cmd == "clone",
     };
     if !ours {
-        return Some(run_git(&raw, None));
+        return Some(Front::Exited(run_git(&raw, None)));
     }
     if !globals.dirs.is_empty()
         && let Err(e) = std::env::set_current_dir(&cwd)
     {
         eprintln!("fatal: cannot change to '{}': {e}", cwd.display());
-        return Some(ExitCode::from(128));
+        return Some(Front::Exited(ExitCode::from(128)));
     }
-    Some(run_ours(&globals, &rest))
+    Some(Front::Ours(options_for(&globals, &rest)))
 }
 
 /// Commands git runs without a repository, which in an ok workspace mean the same as anywhere:
@@ -303,32 +326,22 @@ fn repoless_args(args: &[String]) -> Vec<OsString> {
     out
 }
 
-/// Runs this binary as `jj git-compat`, with jj's own options from git's.
-fn run_ours(globals: &Globals, rest: &[String]) -> ExitCode {
-    let exe = match std::env::current_exe() {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("fatal: cannot find ok's jj: {e}");
-            return ExitCode::from(128);
-        }
+/// How ok's command presents itself (`Options`), setting jj's pager and editor to git's.
+fn options_for(globals: &Globals, rest: &[String]) -> Options {
+    let mut opts = Options {
+        quiet: rest.first().map(String::as_str) != Some("clone"),
+        ..Default::default()
     };
-    let mut cmd = Command::new(&exe);
-    // git says what it did in its own words; jj's reports of the working copy moving would only
-    // be noise. A clone keeps them: they say where the workspace is and what it is called.
-    if rest.first().map(String::as_str) != Some("clone") {
-        cmd.arg("--quiet");
-    }
     let pager = std::env::var("GIT_PAGER").ok();
     if globals.no_pager || pager.as_deref().is_some_and(|p| p.is_empty() || p == "cat") {
-        cmd.arg("--no-pager");
+        opts.no_pager = true;
     } else if let Some(p) = pager {
-        cmd.args(["--config", &format!("ui.pager={}", toml_string(&p))]);
+        set_env("JJ_PAGER", &p);
     }
-    let mut color = None;
     let mut editor = std::env::var("GIT_EDITOR").ok();
     for c in &globals.config {
         if let Some(c) = color_setting(c) {
-            color = Some(c);
+            opts.color = Some(c);
         }
         if let Some((k, v)) = c.split_once('=')
             && k.eq_ignore_ascii_case("core.editor")
@@ -340,25 +353,26 @@ fn run_ours(globals: &Globals, rest: &[String]) -> ExitCode {
     // A command's own `--color` and `--no-color` decide its colors, as git's do.
     for a in rest.iter().skip(1).take_while(|a| *a != "--") {
         match a.as_str() {
-            "--color" => color = Some("always"),
-            "--no-color" => color = Some("never"),
+            "--color" => opts.color = Some("always"),
+            "--no-color" => opts.color = Some("never"),
             _ => {
                 if let Some(v) = a.strip_prefix("--color=") {
-                    color = color_setting(&format!("color.ui={v}")).or(color);
+                    opts.color = color_setting(&format!("color.ui={v}")).or(opts.color);
                 }
             }
         }
     }
-    if let Some(c) = color {
-        cmd.arg(format!("--color={c}"));
-    }
     if let Some(e) = editor.filter(|e| !e.is_empty()) {
-        cmd.args(["--config", &format!("ui.editor={}", toml_string(&e))]);
+        set_env("JJ_EDITOR", &e);
     }
-    cmd.arg(super::SUBCOMMAND).arg("--");
-    cmd.args(&globals.forwarded);
-    cmd.args(rest);
-    exec(cmd, "ok's jj")
+    opts
+}
+
+/// Sets a variable of this process's environment, before any thread that could read it starts:
+/// the front end runs first in `main`.
+fn set_env(name: &str, value: &str) {
+    // SAFETY: called from `main` before jj's runner, or anything else, starts a thread.
+    unsafe { std::env::set_var(name, value) };
 }
 
 /// `color.ui` (or `color.diff`, …) as jj's `--color`.
@@ -374,19 +388,6 @@ fn color_setting(c: &str) -> Option<&'static str> {
         "auto" | "true" | "on" | "yes" | "1" => Some("auto"),
         _ => None,
     }
-}
-
-fn toml_string(s: &str) -> String {
-    let mut out = String::from("\"");
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
 }
 
 /// Runs git with `args`. In an ok workspace (`within`), git is kept from finding a repository

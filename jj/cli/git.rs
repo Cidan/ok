@@ -2,8 +2,10 @@
 //! commands over ok's jj — `git clone` makes a virtual workspace, `git commit` a change, `git push`
 //! uploads ChangeLists, `git pull` syncs — and hands everything outside ok to git itself.
 //!
-//! `front` is the half that runs first, by the name `git`; the rest runs as the hidden `jj
-//! git-compat`, the front end executing this binary again with jj's runner.
+//! `front` is the half that runs first, by the name `git`; the rest runs in the same process, as
+//! a subcommand of jj's runner ([`AsGit`]): jj's command-line application is told its first
+//! argument is no program's name, so the name the program was started by is the subcommand and
+//! every argument after it git's.
 
 pub mod front;
 
@@ -23,16 +25,52 @@ use jj_cli::cli_util::CommandHelper;
 use jj_cli::cli_util::WorkspaceCommandHelper;
 use jj_cli::command_error::CommandError;
 use jj_cli::ui::Ui;
+use jj_lib::config::ConfigLayer;
+use jj_lib::config::ConfigSource;
 
-/// The hidden subcommand the front end runs.
-pub const SUBCOMMAND: &str = "git-compat";
+/// The program run as `git`, in an ok workspace or for a clone (`front::Front::Ours`), and every
+/// argument it was started with: git's global options, its command, and the command's arguments.
+/// jj's runner parses its arguments from the process, so its command-line application takes the
+/// first of them for an argument, not the program's name (`no_binary_name`), and that name — the
+/// path the program was started by, `git` — for a subcommand of its own, whose arguments are passed
+/// as they are (an external subcommand's): the command runs here, in this process, as any of jj's
+/// does.
+#[derive(Clone, Debug)]
+pub struct AsGit(Vec<String>);
 
-/// Run git's command in an ok workspace (what `git` does there; not run by hand)
-#[derive(clap::Args, Clone, Debug)]
-pub struct GitCompatArgs {
-    /// git's global options, its command, and the command's arguments
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-    args: Vec<String>,
+impl clap::FromArgMatches for AsGit {
+    fn from_arg_matches(m: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        match m.subcommand() {
+            // The front end hands git anything not UTF-8, so here every argument is.
+            Some((name, sub)) if front::is_git(name) => Ok(AsGit(
+                sub.get_many::<std::ffi::OsString>("")
+                    .into_iter()
+                    .flatten()
+                    .map(|a| a.to_string_lossy().into_owned())
+                    .collect(),
+            )),
+            _ => Err(clap::Error::new(clap::error::ErrorKind::MissingSubcommand)),
+        }
+    }
+
+    fn update_from_arg_matches(&mut self, m: &clap::ArgMatches) -> Result<(), clap::Error> {
+        *self = Self::from_arg_matches(m)?;
+        Ok(())
+    }
+}
+
+impl clap::Subcommand for AsGit {
+    fn augment_subcommands(cmd: clap::Command) -> clap::Command {
+        cmd.no_binary_name(true).allow_external_subcommands(true)
+    }
+
+    fn augment_subcommands_for_update(cmd: clap::Command) -> clap::Command {
+        Self::augment_subcommands(cmd)
+    }
+
+    fn has_subcommand(name: &str) -> bool {
+        front::is_git(name)
+    }
 }
 
 /// The exit status a git command chose, which jj's runner, knowing only success and its own
@@ -184,12 +222,28 @@ macro_rules! parse_or_return {
 }
 pub(crate) use parse_or_return;
 
+/// Runs git's command, presented as `opts` say (git's pager, colors, and quiet reports, which the
+/// front end read from git's options and environment).
 pub async fn run(
     ui: &mut Ui,
     command: &CommandHelper,
-    args: GitCompatArgs,
+    AsGit(args): AsGit,
+    opts: front::Options,
 ) -> Result<(), CommandError> {
-    let (globals, rest) = front::split_globals(&args.args);
+    let mut layer = ConfigLayer::empty(ConfigSource::CommandArg);
+    if opts.quiet {
+        layer.set_value("ui.quiet", true).expect("a boolean");
+    }
+    if opts.no_pager {
+        layer.set_value("ui.paginate", "never").expect("a string");
+    }
+    if let Some(c) = opts.color {
+        layer.set_value("ui.color", c).expect("a string");
+    }
+    let mut config = command.settings().config().clone();
+    config.add_layer(layer);
+    ui.reset(&config)?;
+    let (globals, rest) = front::split_globals(&args);
     let cx = Cx { command, globals };
     let code = match rest.split_first() {
         Some((name, args)) => dispatch(ui, &cx, name, args).await?,
