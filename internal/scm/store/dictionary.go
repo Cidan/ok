@@ -6,13 +6,13 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
 	builddict "github.com/klauspost/compress/dict"
 	"github.com/klauspost/compress/zstd"
 
-	"github.com/Cidan/ok/internal/scm/contentindex"
 	"github.com/Cidan/ok/internal/scm/encoding"
 	"github.com/Cidan/ok/internal/scm/pack"
 	"github.com/Cidan/ok/internal/scm/store/backend"
@@ -245,17 +245,18 @@ func (s *Store) newestDictionary(ctx context.Context, repo int64) (id uint32, bo
 
 // trainDictionary trains a dictionary for the repository's network, if the repository is the one
 // that trains them, when it has none or its newest is older than DictionaryRetrain: from up to
-// dictionarySamples of its small pinned files, chosen as the files
-// whose IDs follow a random point — IDs are uniform, so they are a uniform sample, read through
-// the primary key whatever the repository's size. It returns the dictionary's frame ID, 0 when it
-// trained none.
+// dictionarySamples of the small files its main's head holds, chosen as the files whose IDs follow
+// a random point, wrapping around — IDs are uniform, so they are a uniform sample. It returns the
+// dictionary's frame ID, 0 when it trained none.
 func (s *Store) trainDictionary(ctx context.Context, repo int64, now time.Time) (uint32, int, error) {
 	net, err := s.network(ctx, repo)
 	if err != nil {
 		return 0, 0, err
 	}
-	// One repository of a network trains, and only from what it has pinned: a dictionary holds
+	// One repository of a network trains, and only from what its main holds: a dictionary holds
 	// pieces of what it was trained on, and every reader its trainer grants it to may read that.
+	// Pinned is no stand-in — what a workspace's settled operations reach is pinned (settle.go), a
+	// person's files no CL ever held.
 	trainer, err := s.ops(ctx).NetworkTrainer(ctx, net)
 	if err != nil || trainer != repo {
 		return 0, 0, err
@@ -267,32 +268,19 @@ func (s *Store) trainDictionary(ctx context.Context, repo int64, now time.Time) 
 	if body != nil && now.Sub(at) < DictionaryRetrain {
 		return 0, 0, nil
 	}
+	held, err := s.mainSmallFiles(ctx, repo)
+	if err != nil {
+		return 0, 0, err
+	}
 	var start encoding.ID
 	if _, err := rand.Read(start[:]); err != nil {
 		return 0, 0, err
 	}
-	v, err := s.contentView(ctx, repoScope(repo))
-	if err != nil {
-		return 0, 0, err
-	}
-	// The small files whose IDs follow the random point, wrapping around.
-	var files []encoding.ID
-	sample := func(id encoding.ID, e contentindex.Entry) bool {
-		if e.Kind == encoding.KindFile && e.Pinned && e.Size >= dictionaryFileMin && e.Size <= dictionaryFileMax {
-			files = append(files, id)
-		}
-		return len(files) < dictionarySamples
-	}
-	if err := v.ascend(ctx, encoding.ID(start), sample); err != nil {
-		return 0, 0, err
-	}
-	if len(files) < dictionarySamples {
-		err := v.ascend(ctx, encoding.ID{}, func(id encoding.ID, e contentindex.Entry) bool {
-			return bytes.Compare(id[:], start[:]) < 0 && sample(id, e)
-		})
-		if err != nil {
-			return 0, 0, err
-		}
+	sortIDs(held)
+	first, _ := slices.BinarySearchFunc(held, start, func(id, start encoding.ID) int { return bytes.Compare(id[:], start[:]) })
+	files := make([]encoding.ID, 0, min(len(held), dictionarySamples))
+	for i := 0; i < len(held) && len(files) < dictionarySamples; i++ {
+		files = append(files, held[(first+i)%len(held)])
 	}
 	least := minDictionarySamples
 	if s.dictionaryMinSamples > 0 {
@@ -335,6 +323,50 @@ func (s *Store) trainDictionary(ctx context.Context, repo int64, now time.Time) 
 	}
 	return id, len(samples), nil
 }
+
+// mainSmallFiles are the distinct files of dictionaryFileMin to dictionaryFileMax bytes that a
+// repository's main's head holds: its tree walked a level at a time, and the files' sizes read from
+// the repository's content index a batch at a time.
+func (s *Store) mainSmallFiles(ctx context.Context, repo int64) ([]encoding.ID, error) {
+	head, _, ok, err := s.ops(ctx).Head(ctx, repo, false)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, notFound("repository %d", repo)
+	}
+	tree, err := s.resolvedTree(ctx, repo, head)
+	if err != nil {
+		return nil, err
+	}
+	seen := map[encoding.ID]bool{}
+	var all []encoding.ID
+	if err := diffTrees(treeReader{ctx: ctx, s: s, repo: repo}, encoding.EmptyTreeID, tree, "", func(ch leafChange) error {
+		if v := ch.After; v != nil && v.Kind == encoding.TreeValueFile && !seen[v.ID] {
+			seen[v.ID] = true
+			all = append(all, v.ID)
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	var out []encoding.ID
+	for start := 0; start < len(all); start += mainFileBatch {
+		_, entries, err := s.contentEntries(ctx, repoScope(repo), encoding.KindFile, all[start:min(start+mainFileBatch, len(all))])
+		if err != nil {
+			return nil, err
+		}
+		for id, e := range entries {
+			if e.Size >= dictionaryFileMin && e.Size <= dictionaryFileMax {
+				out = append(out, id)
+			}
+		}
+	}
+	return out, nil
+}
+
+// mainFileBatch bounds the files whose sizes one read of the content index asks for.
+const mainFileBatch = 10_000
 
 // sampleContents is the contents of the files of one chunk among files: what a dictionary trains
 // on.

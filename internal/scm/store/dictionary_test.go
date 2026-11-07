@@ -61,8 +61,8 @@ func TestDictionaries(t *testing.T) {
 	commit := b.commit(b.tree(entries...), "many small files", encoding.RootCommitID)
 	op := b.operation(b.view(commit), "snapshot", encoding.RootOperationID)
 	mustPublish(t, e.s, e.repo, alice, b, &OpHeadsUpdate{New: op})
-	// Uploaded, so pinned: only pinned files train a dictionary.
-	e.mustUpload(alice, Ready, commit)
+	// Landed: a dictionary learns what main holds.
+	e.mustLand(LandItem{Number: e.mustUpload(alice, Ready, commit)[0].Number, Patchset: 1})
 
 	r, err := e.s.GC(ctx, e.repo, time.Now(), GCOptions{})
 	if err != nil {
@@ -216,7 +216,7 @@ func TestDictionariesPerNetwork(t *testing.T) {
 		}
 		commit := b.commit(b.tree(entries...), "many small files", encoding.RootCommitID)
 		mustPublish(t, e.s, env.repo, alice, b, &OpHeadsUpdate{New: b.operation(b.view(commit), "snapshot", encoding.RootOperationID)})
-		env.mustUpload(alice, Ready, commit)
+		env.mustLand(LandItem{Number: env.mustUpload(alice, Ready, commit)[0].Number, Patchset: 1})
 		r, err := e.s.GC(ctx, env.repo, time.Now(), GCOptions{})
 		if err != nil {
 			t.Fatal(err)
@@ -271,4 +271,34 @@ func TestNoDictionaryForFewFiles(t *testing.T) {
 		t.Fatalf("a dictionary for two files: %s", r)
 	}
 	clean(t, e.s, e.repo)
+}
+
+// Files a workspace published — even pinned, as its settled operations' content is — or an open CL
+// holds train no dictionary: a dictionary holds pieces of what it learned, and every reader its
+// trainer grants it to reads it. Once they land, main holds them, and a dictionary learns them.
+func TestNoDictionaryOfFilesMainLacks(t *testing.T) {
+	ctx := context.Background()
+	e := newCLEnv(t)
+	e.s.dictionaryMinSamples = 50
+	b := newBuilder(t)
+	var entries []encoding.TreeEntry
+	for i := range 200 {
+		entries = append(entries, fileEntry(fmt.Sprintf("p%03d.go", i), b.file(goFile(i))))
+	}
+	commit := b.commit(b.tree(entries...), "many small files", encoding.RootCommitID)
+	mustPublish(t, e.s, e.repo, alice, b, &OpHeadsUpdate{New: b.operation(b.view(commit), "snapshot", encoding.RootOperationID)})
+	if missing, err := e.s.pinRoots(ctx, e.repo, []ref{{table: tCommit, id: commit}}); err != nil || len(missing) != 0 {
+		t.Fatalf("pinning the workspace's commit: %v, %v", missing, err)
+	}
+	if id, n, err := e.s.trainDictionary(ctx, e.repo, time.Now()); err != nil || id != 0 {
+		t.Fatalf("a dictionary of %d pinned files main lacks: %d, %v", n, id, err)
+	}
+	n := e.mustUpload(alice, Ready, commit)[0].Number
+	if id, _, err := e.s.trainDictionary(ctx, e.repo, time.Now()); err != nil || id != 0 {
+		t.Fatalf("a dictionary of an open CL's files: %d, %v", id, err)
+	}
+	e.mustLand(LandItem{Number: n, Patchset: 1})
+	if id, n, err := e.s.trainDictionary(ctx, e.repo, time.Now()); err != nil || id == 0 || n < 50 {
+		t.Fatalf("once landed: dictionary %d of %d files, %v", id, n, err)
+	}
 }

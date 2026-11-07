@@ -1141,9 +1141,11 @@ fn go_file(i: usize) -> Vec<u8> {
     .into_bytes()
 }
 
-// Once ok scm trains a repository's dictionary and frames its small files with it, a cold machine
-// reads each file as the SCM sends it from a frame — alone, compressed with the dictionary, which it
-// fetches once — and reads them again from its cache.
+// Once ok scm trains a repository's dictionary — on what its main holds — and frames its small files
+// with it, a cold machine reads each file as the SCM sends it from a frame — alone, compressed with
+// the dictionary, which it fetches once — and reads them again from its cache. The files it reads
+// are an open CL's, which the dictionary never learned: main's are read by the SCM itself as main
+// moves (code search), and kept in its chunk cache as they were sent before framing.
 #[tokio::test(flavor = "multi_thread")]
 async fn chunks_compressed_with_a_dictionary_reach_a_cold_machine() {
     if !ok_testscm::available() {
@@ -1154,27 +1156,66 @@ async fn chunks_compressed_with_a_dictionary_reach_a_cold_machine() {
     let remote = new_repository(&endpoint, "dictionaries").await;
     let a = Machine::new(&endpoint, &remote).await;
     let repo = a.head().await;
-    let files: Vec<(String, Vec<u8>)> = (0..1100)
-        .map(|i| (format!("src/p{i:04}.go"), go_file(i)))
+    let set = |from: usize, dir: &str| -> Vec<(String, Vec<u8>)> {
+        (0..1100)
+            .map(|i| (format!("{dir}/p{i:04}.go"), go_file(from + i)))
+            .collect()
+    };
+    let (landed, files) = (set(0, "src"), set(5000, "open"));
+    let mut tx = repo.start_transaction();
+    let root = repo.store().root_commit();
+    let main_changes: Vec<(&str, Content)> = landed
+        .iter()
+        .map(|(p, c)| (p.as_str(), Content::File(c)))
         .collect();
+    let on_main = child(&mut tx, &root, &main_changes, "small files on main").await;
     let changes: Vec<(&str, Content)> = files
         .iter()
         .map(|(p, c)| (p.as_str(), Content::File(c)))
         .collect();
-    let mut tx = repo.start_transaction();
-    let root = repo.store().root_commit();
-    let commit = child(&mut tx, &root, &changes, "small files").await;
+    let commit = child(&mut tx, &root, &changes, "small files in review").await;
     tx.commit("small files").await.unwrap();
-    // Uploaded, so pinned: a dictionary is trained only on what its trainer has pinned.
+    // One CL lands — a dictionary learns what its trainer's main holds — and one stays open, its
+    // files pinned by their upload and framed with the dictionary, which never learned them.
     let shared_a = ok_store::Shared::for_store_path(&a.repo_dir.join("store")).unwrap();
-    ok_store::changelists::upload(
+    let uploaded = ok_store::changelists::upload(
         &shared_a,
-        &[commit.id().clone()],
+        &[on_main.id().clone(), commit.id().clone()],
         ok_store::pb::upload_request::Readiness::Ready,
         Vec::new(),
     )
     .await
     .unwrap();
+    let main = ok_testscm::repositories(PRINCIPAL)
+        .await
+        .get_repository(ok_store::pb::GetRepositoryRequest {
+            key: Some(ok_store::pb::get_repository_request::Key::Id(remote.id)),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .head;
+    ok_testscm::landing(ok_testscm::AUTOMATION)
+        .await
+        .land(ok_store::pb::LandRequest {
+            repository_id: remote.id,
+            items: vec![ok_store::pb::land_request::Item {
+                number: uploaded
+                    .results
+                    .iter()
+                    .find(|r| r.commit_id == on_main.id().as_bytes())
+                    .expect("the landing CL's upload")
+                    .number,
+                patchset: 1,
+                candidate: Vec::new(),
+                actor_id: String::new(),
+            }],
+            actor_id: ok_testscm::id(PRINCIPAL).await,
+            expected_head: main,
+            dry_run: false,
+        })
+        .await
+        .unwrap();
 
     let report = ok_testscm::gc(&remote.name);
     assert!(
