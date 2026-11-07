@@ -18,14 +18,21 @@ func TestInbox(t *testing.T) {
 	a.jj("inbox", "describe", "-m", "a note for bob")
 	cl := uploaded(a.jj("inbox", "cl"))[0]
 	path := clPath("inbox", cl)
+	// The CL's row in who's inbox — the dashboard's lists, not its notifications, which link to the CL
+	// as long as they are kept — and whether it waits on them.
 	waiting := func(who string) (bool, bool) {
-		p := e.get(who, "/")
-		at := strings.Index(p.body, `href="`+path+`"`)
-		if at < 0 {
-			return false, false
+		body := e.get(who, "/").body
+		for at := 0; ; {
+			i := strings.Index(body[at:], `<a href="`+path+`"`)
+			if i < 0 {
+				return false, false
+			}
+			tag := body[at+i : at+i+strings.Index(body[at+i:], ">")]
+			if strings.Contains(tag, "data-inbox-item") {
+				return true, strings.Contains(tag, `data-attention="true"`)
+			}
+			at += i + len(tag)
 		}
-		row := p.body[at:min(len(p.body), at+400)]
-		return true, strings.Contains(row, `data-attention="true"`)
 	}
 	e.waitFor("the draft in alice's inbox", func() bool { listed, _ := waiting(alice); return listed })
 	if listed, _ := waiting(bob); listed {
