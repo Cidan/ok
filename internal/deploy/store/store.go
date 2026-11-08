@@ -440,7 +440,9 @@ type PlanResult struct {
 
 // RecordPlan records a plan and its deployments, and moves the repository's planned head to
 // it. A deployment of a deploy that another deployment still waits for replaces it — the newest
-// commit wins — and takes its place: its gates, and its wave in its plan.
+// commit wins — and takes its place: its gates, its wave in its plan, and the commits it covered,
+// which it deploys too (main is one line), so a CL whose deployment was replaced follows the
+// replacement (Covering).
 func (s *Store) RecordPlan(ctx context.Context, p PlanResult) (int64, error) {
 	var id int64
 	ctx = move.WithRepository(ctx, p.Repository)
@@ -461,12 +463,14 @@ func (s *Store) RecordPlan(ctx context.Context, p PlanResult) (int64, error) {
 		}
 		for _, d := range p.Deployments {
 			var gates []Gate
+			from := p.BaseSeq
 			if d.FailedWhy == "" {
 				replaced, err := tx.CancelWaitingOf(ctx, p.Repository, d.Deploy.ID(), fmt.Sprintf("replaced by the deployment at %s", short(p.Head)))
 				if err != nil {
 					return err
 				}
 				for _, r := range replaced {
+					from = min(from, r.FromSeq)
 					gates = append(gates, r.Gates...)
 					if r.Plan != 0 {
 						gates = append(gates, Gate{Plan: r.Plan, Wave: r.Wave})
@@ -478,7 +482,7 @@ func (s *Store) RecordPlan(ctx context.Context, p PlanResult) (int64, error) {
 				status, stage, reason = Failed, Done, d.FailedWhy
 			}
 			nid, err := insertDeployment(ctx, tx, DeploymentRow{
-				Repository: p.Repository, Plan: id, Deploy: d.Deploy, Commit: p.Head, FromSeq: p.BaseSeq, ToSeq: p.HeadSeq,
+				Repository: p.Repository, Plan: id, Deploy: d.Deploy, Commit: p.Head, FromSeq: from, ToSeq: p.HeadSeq,
 				Why: d.Why, Wave: d.Wave, RequestedBy: p.By, Self: d.Self, Status: status, Stage: stage, Reason: reason,
 			})
 			if err != nil {

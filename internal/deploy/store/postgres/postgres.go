@@ -339,7 +339,7 @@ func gatesOf(plans []int64, waves []int32) []store.Gate {
 func (x queries) CancelWaitingOf(ctx context.Context, repo int64, deploy, reason string) ([]store.Replaced, error) {
 	rows, err := x.q.Query(ctx, `UPDATE deployment SET status = $3, stage = $4, reason = $5, finished_at = now()
 		WHERE repository_id = $1 AND deploy = $2 AND status = $6
-		RETURNING id, coalesce(plan_id, 0), wave, gate_plans, gate_waves`,
+		RETURNING id, coalesce(plan_id, 0), wave, gate_plans, gate_waves, from_seq`,
 		repo, deploy, store.Canceled, store.Done, reason, store.Waiting)
 	if err != nil {
 		return nil, err
@@ -348,7 +348,7 @@ func (x queries) CancelWaitingOf(ctx context.Context, repo int64, deploy, reason
 		var c store.Replaced
 		var gp []int64
 		var gw []int32
-		if err := r.Scan(&c.ID, &c.Plan, &c.Wave, &gp, &gw); err != nil {
+		if err := r.Scan(&c.ID, &c.Plan, &c.Wave, &gp, &gw, &c.FromSeq); err != nil {
 			return c, err
 		}
 		c.Gates = gatesOf(gp, gw)

@@ -410,7 +410,7 @@ func (x queries) CancelWaitingOf(ctx context.Context, repo int64, deploy, reason
 	var out []store.Replaced
 	err := x.Returning(ctx, `UPDATE deployment SET status = @canceled, stage = @done, reason = @reason, finished_at = CURRENT_TIMESTAMP()
 		WHERE repository_id = @repo AND deploy = @deploy AND status = @waiting
-		THEN RETURN deployment_id, IFNULL(plan_id, 0), wave, gate_plans, gate_waves`,
+		THEN RETURN deployment_id, IFNULL(plan_id, 0), wave, gate_plans, gate_waves, from_seq`,
 		map[string]any{"repo": repo, "deploy": deploy, "reason": reason, "canceled": int64(store.Canceled), "done": int64(store.Done),
 			"waiting": int64(store.Waiting)},
 		func() { out = nil },
@@ -418,7 +418,7 @@ func (x queries) CancelWaitingOf(ctx context.Context, repo int64, deploy, reason
 			var c store.Replaced
 			var wave int64
 			var gp, gw []int64
-			if err := row.Columns(&c.ID, &c.Plan, &wave, &gp, &gw); err != nil {
+			if err := row.Columns(&c.ID, &c.Plan, &wave, &gp, &gw, &c.FromSeq); err != nil {
 				return err
 			}
 			c.Wave, c.Gates = int(wave), gatesOf(gp, gw)

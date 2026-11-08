@@ -220,13 +220,14 @@ type DeploymentRow struct {
 	Reason      string
 }
 
-// Replaced is a waiting deployment a newer one replaced: its ID, its plan (0: none), its wave, and
-// the places it had taken.
+// Replaced is a waiting deployment a newer one replaced: its ID, its plan (0: none), its wave, the
+// places it had taken, and the main sequence number after which it covered commits.
 type Replaced struct {
-	ID    int64
-	Plan  int64
-	Wave  int
-	Gates []Gate
+	ID      int64
+	Plan    int64
+	Wave    int
+	Gates   []Gate
+	FromSeq int64
 }
 
 // ServiceRow is a service, with its latest and its latest succeeded deployment's IDs (0: none).

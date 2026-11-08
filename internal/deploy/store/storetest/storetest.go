@@ -222,6 +222,16 @@ func testPlans(t *testing.T, s *store.Store) {
 	if err != nil || old.Status != store.Canceled || !strings.Contains(old.Reason, "replaced by the deployment at 03") {
 		t.Errorf("the replaced deployment %+v (%v)", old, err)
 	}
+	// The replacement deploys the commits the replaced one covered too: theirs follow it.
+	for _, c := range []byte{1, 2, 3} {
+		cov, _, err := s.Covering(ctx, 1, commit(c))
+		if err != nil || len(cov) == 0 {
+			t.Fatalf("commit %d covered by %v (%v)", c, cov, err)
+		}
+		if newest := cov[0]; newest.Deploy != w.Deploy || newest.ID == w.ID || newest.Status != store.Waiting || newest.FromSeq != 0 || newest.ToSeq != 3 {
+			t.Errorf("commit %d's newest covering deployment %+v, want web's replacement covering 0 to 3", c, newest)
+		}
+	}
 }
 
 // A deployment runs through its stages and finishes; its plan stops when it fails.
