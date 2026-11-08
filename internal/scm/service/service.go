@@ -547,6 +547,47 @@ func (s *Store) ReadCheckout(req *scmpb.ReadCheckoutRequest, stream grpc.ServerS
 	}))
 }
 
+func (s *Store) ReadGraph(req *scmpb.ReadGraphRequest, stream grpc.ServerStreamingServer[scmpb.GraphFrame]) error {
+	ctx := stream.Context()
+	if _, err := caller(ctx); err != nil {
+		return err
+	}
+	for _, f := range []struct {
+		name string
+		n    int
+	}{{"heads", len(req.GetHeads())}, {"have", len(req.GetHave())}, {"held_layers", len(req.GetHeldLayers())}} {
+		if f.n > maxRefs {
+			return status.Errorf(codes.InvalidArgument, "%s: %d (at most %d)", f.name, f.n, maxRefs)
+		}
+	}
+	heads, err := idsIn(req.GetHeads(), "heads")
+	if err != nil {
+		return err
+	}
+	have, err := idsIn(req.GetHave(), "have")
+	if err != nil {
+		return err
+	}
+	held, err := idsIn(req.GetHeldLayers(), "held_layers")
+	if err != nil {
+		return err
+	}
+	return toStatus(s.c.store.ReadGraph(ctx, req.GetRepositoryId(), heads, have, held, func(top encoding.ID, layers []store.GraphLayerRef) error {
+		h := &scmpb.GraphHeader{}
+		if top != (encoding.ID{}) {
+			h.Top = top[:]
+		}
+		for _, l := range layers {
+			h.Layers = append(h.Layers, l.ID[:])
+		}
+		return stream.Send(&scmpb.GraphFrame{Frame: &scmpb.GraphFrame_Header{Header: h}})
+	}, func(id encoding.ID, data []byte, last bool) error {
+		return stream.Send(&scmpb.GraphFrame{Frame: &scmpb.GraphFrame_Layer{Layer: &scmpb.LayerData{LayerId: id[:], Data: data, Last: last}}})
+	}, func(data []byte) error {
+		return stream.Send(&scmpb.GraphFrame{Frame: &scmpb.GraphFrame_Records{Records: &scmpb.GraphRecords{Data: data}}})
+	}))
+}
+
 func (s *Store) ReadTreeSizes(req *scmpb.ReadTreeSizesRequest, stream grpc.ServerStreamingServer[scmpb.TreeSizes]) error {
 	ctx := stream.Context()
 	if _, err := caller(ctx); err != nil {

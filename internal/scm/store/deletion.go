@@ -74,6 +74,9 @@ func (s *Store) finishDeletion(ctx context.Context, d backend.Deletion) error {
 	if err := s.dropCheckouts(ctx, d.Repo); err != nil {
 		return err
 	}
+	if err := s.dropGraphs(ctx, d.Repo); err != nil {
+		return err
+	}
 	repos, err := s.ops(ctx).NetworkRepositories(ctx, d.Net)
 	if err != nil {
 		return err

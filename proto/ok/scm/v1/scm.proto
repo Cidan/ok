@@ -168,6 +168,11 @@ service Store {
   // immutable objects the SCM derives once for each commit, each layer sent only to a client that
   // does not hold it.
   rpc ReadCheckout(ReadCheckoutRequest) returns (stream CheckoutFrame);
+  // What a client's index of the commits reachable from heads needs (docs/scm.md, "The commit
+  // graph"): each commit's ID, change ID, generation, committer's time, tree, and parents, not its
+  // body — main's history as immutable layers, each sent only to a client that does not hold it,
+  // and the rest as records.
+  rpc ReadGraph(ReadGraphRequest) returns (stream GraphFrame);
 
   // OpStore and OpHeadsStore, on the operation log of one of the caller's workspaces in the
   // repository (docs/scm.md, "Decisions", 3): each request names the workspace, and no
@@ -348,6 +353,40 @@ message CheckoutHeader {
   repeated bytes layers = 2;
   // The request's have_tree, when the layers are what the commit changes from it.
   bytes since_tree = 3;
+}
+
+// At most 100,000 heads, haves, and held layers.
+message ReadGraphRequest {
+  int64 repository_id = 1;
+  // The commits whose ancestry the client indexes.
+  repeated bytes heads = 2;
+  // Commits whose whole ancestry the client indexed: nothing reachable from them is sent.
+  repeated bytes have = 3;
+  // Layers of main's graph the client indexed, any head's: a layer it holds is not sent.
+  repeated bytes held_layers = 4;
+}
+
+// A graph's stream: its header, then the bytes of each of main's layers the client does not hold,
+// a layer at a time, in pieces, then the records of the commits reachable from the request's heads
+// that neither its haves nor the head main's layers reach do.
+message GraphFrame {
+  oneof frame {
+    GraphHeader header = 1;
+    LayerData layer = 2;
+    GraphRecords records = 3;
+  }
+}
+
+message GraphHeader {
+  // The head of main its layers reach; empty before main's graph is first derived.
+  bytes top = 1;
+  // Its layers, oldest first: together they hold every commit reachable from top.
+  repeated bytes layers = 2;
+}
+
+// Records of the commit graph, in topological order (encoding.EncodeGraphRecords).
+message GraphRecords {
+  bytes data = 1;
 }
 
 // A piece of a layer: the client joins a layer's pieces and checks that their BLAKE3 is its ID.

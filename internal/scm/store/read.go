@@ -1045,7 +1045,7 @@ const (
 // PrefetchCommits streams every commit reachable from want (plus, with opLog, every
 // commit the caller's operation log references) that is not reachable from have,
 // newest generation first, stopping after limit commits (0: no limit). It paints
-// ancestry by generation, loading parent edges a window of generations per query.
+// ancestry by generation, loading parent edges a window of generations per query (walkWanted).
 func (s *Store) PrefetchCommits(ctx context.Context, repo int64, principal, workspace string, want, have []encoding.ID, opLog bool, limit int, emit func(EncodedObject) error) error {
 	if opLog {
 		logged, err := s.opLogCommits(ctx, repo, principal, workspace)
@@ -1054,6 +1054,51 @@ func (s *Store) PrefetchCommits(ctx context.Context, repo int64, principal, work
 		}
 		want = append(append([]encoding.ID(nil), want...), logged...)
 	}
+	var batch []encoding.ID
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		refs := make([]ObjectRef, len(batch))
+		for i, id := range batch {
+			refs[i] = ObjectRef{Kind: encoding.KindCommit, ID: id}
+		}
+		res, err := s.ReadObjects(ctx, repo, refs)
+		if err != nil {
+			return err
+		}
+		for _, r := range res {
+			if r.Found {
+				if err := emit(EncodedObject{Kind: encoding.KindCommit, ID: r.Ref.ID, Body: r.Body}); err != nil {
+					return err
+				}
+			}
+		}
+		batch = batch[:0]
+		return nil
+	}
+	sent := 0
+	err := s.walkWanted(ctx, repo, want, have, func(id encoding.ID, _ int64) (bool, error) {
+		batch = append(batch, id)
+		sent++
+		if len(batch) == 256 {
+			if err := flush(); err != nil {
+				return false, err
+			}
+		}
+		return limit > 0 && sent >= limit, nil
+	})
+	if err != nil {
+		return err
+	}
+	return flush()
+}
+
+// walkWanted visits, newest generation first, every commit the repository holds that is reachable
+// from want and not from have, with its generation, until visit says to stop. It paints ancestry by
+// generation, loading parent edges a window of generations per query; a commit the repository does
+// not hold is passed over.
+func (s *Store) walkWanted(ctx context.Context, repo int64, want, have []encoding.ID, visit func(id encoding.ID, gen int64) (stop bool, err error)) error {
 	gen := map[encoding.ID]int64{}
 	edges := map[encoding.ID][]encoding.ID{}
 	loaded := map[encoding.ID]bool{}
@@ -1090,30 +1135,6 @@ func (s *Store) PrefetchCommits(ctx context.Context, repo int64, principal, work
 	for _, id := range want {
 		push(id, markWant)
 	}
-	var batch []encoding.ID
-	flush := func() error {
-		if len(batch) == 0 {
-			return nil
-		}
-		refs := make([]ObjectRef, len(batch))
-		for i, id := range batch {
-			refs[i] = ObjectRef{Kind: encoding.KindCommit, ID: id}
-		}
-		res, err := s.ReadObjects(ctx, repo, refs)
-		if err != nil {
-			return err
-		}
-		for _, r := range res {
-			if r.Found {
-				if err := emit(EncodedObject{Kind: encoding.KindCommit, ID: r.Ref.ID, Body: r.Body}); err != nil {
-					return err
-				}
-			}
-		}
-		batch = batch[:0]
-		return nil
-	}
-	sent := 0
 	for h.Len() > 0 && wantOnly > 0 {
 		n := heap.Pop(h).(genNode)
 		delete(queued, n.id)
@@ -1139,21 +1160,15 @@ func (s *Store) PrefetchCommits(ctx context.Context, repo int64, principal, work
 			}
 			continue
 		}
-		batch = append(batch, n.id)
-		sent++
-		if len(batch) == 256 {
-			if err := flush(); err != nil {
-				return err
-			}
-		}
-		if limit > 0 && sent >= limit {
-			break
+		stop, err := visit(n.id, n.gen)
+		if err != nil || stop {
+			return err
 		}
 		for _, p := range edges[n.id] {
 			push(p, markWant)
 		}
 	}
-	return flush()
+	return nil
 }
 
 func (s *Store) loadGenerations(ctx context.Context, repo int64, members []encoding.ID, gen map[encoding.ID]int64) error {

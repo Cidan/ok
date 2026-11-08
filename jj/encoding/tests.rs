@@ -808,3 +808,77 @@ fn layer_vectors() {
         assert!(got.is_err(), "{}: decoded {got:?}", c.name);
     }
 }
+
+// --- the commit graph -----------------------------------------------------------------------
+
+const GRAPH_VECTORS: &str = include_str!("../../internal/scm/encoding/testdata/graph.json");
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GraphVectors {
+    #[allow(dead_code)]
+    comment: Vec<String>,
+    valid: Vec<GraphValid>,
+    invalid: Vec<GraphInvalid>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GraphValid {
+    name: String,
+    records: Vec<GraphJRecord>,
+    bytes: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GraphJRecord {
+    id: String,
+    change_id: String,
+    generation: u64,
+    committed: i64,
+    zone: i32,
+    tree: Vec<String>,
+    parents: Vec<String>,
+    filter: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GraphInvalid {
+    name: String,
+    bytes: Vec<String>,
+}
+
+#[test]
+fn graph_vectors() {
+    let v: GraphVectors = serde_json::from_str(GRAPH_VECTORS).expect("parsing graph.json");
+    assert!(!v.valid.is_empty() && !v.invalid.is_empty());
+    let id = |s: &String| -> [u8; 32] { unhex(s).try_into().unwrap() };
+    for c in v.valid {
+        let want: Vec<GraphRecord> = c
+            .records
+            .iter()
+            .map(|r| GraphRecord {
+                id: id(&r.id),
+                change_id: unhex(&r.change_id),
+                generation: r.generation,
+                committed_millis: r.committed,
+                tz_offset: r.zone,
+                tree: r.tree.iter().map(id).collect(),
+                parents: r.parents.iter().map(id).collect(),
+                filter: r.filter.as_ref().map(|f| unhex(f)),
+            })
+            .collect();
+        assert_eq!(
+            decode_graph_records(&hex_lines(&c.bytes)),
+            Ok(want),
+            "{}",
+            c.name
+        );
+    }
+    for c in v.invalid {
+        let got = decode_graph_records(&hex_lines(&c.bytes));
+        assert!(got.is_err(), "{}: decoded {got:?}", c.name);
+    }
+}

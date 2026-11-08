@@ -36,6 +36,7 @@ var actions = map[string]authz.Action{
 	"/ok.scm.v1.Store/ReadTreeSizes":          authz.ReadCode,
 	"/ok.scm.v1.Store/ReadDictionary":         authz.ReadCode,
 	"/ok.scm.v1.Store/ReadCheckout":           authz.ReadCode,
+	"/ok.scm.v1.Store/ReadGraph":              authz.ReadCode,
 	"/ok.scm.v1.Store/GetOpHeads":             authz.ReadCode,
 	"/ok.scm.v1.Store/ReadOperations":         authz.ReadCode,
 	"/ok.scm.v1.Store/PrefetchOperations":     authz.ReadCode,

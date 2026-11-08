@@ -89,12 +89,13 @@ func appendEvents(ctx context.Context, tx *txn, repositoryID int64, evs []*scmpb
 	if len(evs) == 0 {
 		return nil
 	}
-	// Main moved: its code is indexed again (codesearch.go) and its checkout derived
-	// (checkouts.go), each marked once the transaction commits.
+	// Main moved: its code is indexed again (codesearch.go), and its checkout (checkouts.go) and
+	// graph (graphs.go) derived, each marked once the transaction commits.
 	for _, ev := range evs {
 		if ev.GetHeadMoved() != nil {
 			tx.markAfter(CodeSearchWork, repositoryID)
 			tx.markAfter(CheckoutWork, repositoryID)
+			tx.markAfter(GraphWork, repositoryID)
 			break
 		}
 	}

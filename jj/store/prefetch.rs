@@ -138,10 +138,11 @@ fn flush(cache: &Cache, puts: &mut Puts) -> Result<(), Status> {
         .map_err(|e| Status::internal(format!("local cache: {e}")))
 }
 
-/// Streams the caller's whole operation log — its operations and views, then the commits they
-/// reference — into the cache of the repository whose store directory is `store_path`: what jj
-/// reads to load the repository and build its index, in a few calls rather than one per
-/// operation. The heads then head the operation frontier. Returns the commits streamed.
+/// Streams the caller's whole operation log — its operations and views — into the cache of the
+/// repository whose store directory is `store_path`: what jj reads to load the repository, in a few
+/// calls rather than one per operation. Its index is built from the commit graph (graph.rs), not
+/// from the commits the log references, which are read when a command looks at them. The heads
+/// then head the operation frontier. Returns the operations streamed.
 pub async fn operation_log(store_path: &Path) -> Result<usize, Status> {
     let shared = Shared::for_store_path(store_path).map_err(|e| Status::internal(e.to_string()))?;
     shared::run(async move {
@@ -161,18 +162,14 @@ pub async fn operation_log(store_path: &Path) -> Result<usize, Status> {
                 .filter(|h| *h != crate::ids::ROOT_ID)
                 .collect()
         };
-        let (logged, commits) = futures::future::try_join(
-            operations(&shared.client, &shared.cache, &heads, &[], 0),
-            commits(&shared.client, &shared.cache, &[], &[], true, 0),
-        )
-        .await?;
-        if logged.1 > 0 {
+        let (_, ops) = operations(&shared.client, &shared.cache, &heads, &[], 0).await?;
+        if ops > 0 {
             shared
                 .cache
                 .add_op_frontier(&heads)
                 .map_err(|e| Status::internal(format!("local cache: {e}")))?;
         }
-        Ok(commits.len())
+        Ok(ops)
     })
     .await
 }

@@ -1452,3 +1452,112 @@ async fn a_move_reads_changed_files_as_deltas() {
         Some(&b"y\n"[..])
     );
 }
+
+// The commit graph (docs/scm.md, "The commit graph"): a cold machine's clone indexes every commit
+// its operation log reaches from the graph — main's layers, and the workspace's commits beyond main
+// as records — reading no commit's body; a command reads one when it looks at it. A later clone,
+// holding main's layers, is sent none of them again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_clone_indexes_from_the_commit_graph() {
+    if !ok_testscm::available() {
+        return;
+    }
+    let endpoint = endpoint();
+    let remote = new_repository(&endpoint, "graph").await;
+    let a = Machine::new(&endpoint, &remote).await;
+    let mut repo = a.head().await;
+    let mut tx = repo.start_transaction();
+    let root = repo.store().root_commit();
+    let landed = child(&mut tx, &root, &[("a", Content::File(b"a\n"))], "lands").await;
+    repo = tx.commit("lands").await.unwrap();
+    let shared_a = ok_store::Shared::for_store_path(&a.repo_dir.join("store")).unwrap();
+    let uploaded = ok_store::changelists::upload(
+        &shared_a,
+        std::slice::from_ref(landed.id()),
+        ok_store::pb::upload_request::Readiness::Ready,
+        Vec::new(),
+    )
+    .await
+    .unwrap();
+    ok_testscm::landing(ok_testscm::AUTOMATION)
+        .await
+        .land(ok_store::pb::LandRequest {
+            repository_id: remote.id,
+            items: vec![ok_store::pb::land_request::Item {
+                number: uploaded.results[0].number,
+                patchset: 1,
+                candidate: Vec::new(),
+                actor_id: String::new(),
+            }],
+            actor_id: ok_testscm::id(PRINCIPAL).await,
+            expected_head: vec![0; 32],
+            dry_run: false,
+        })
+        .await
+        .unwrap();
+    // Main's graph is derived as main moves.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let read =
+            ok_store::graph::read_graph(shared_a.clone(), Vec::new(), Vec::new(), Vec::new())
+                .await
+                .unwrap();
+        if !read.layers.is_empty() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "main's graph was not derived"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    // Thirty commits in the workspace, on the commit that landed.
+    let mut tip = landed.clone();
+    for i in 0..30 {
+        let mut tx = repo.start_transaction();
+        let text = format!("work {i}\n");
+        tip = child(
+            &mut tx,
+            &tip,
+            &[("f", Content::File(text.as_bytes()))],
+            &text,
+        )
+        .await;
+        repo = tx.commit(text).await.unwrap();
+    }
+
+    let b = Machine::new(&endpoint, &remote).await;
+    ok_store::prefetch::operation_log(&b.repo_dir.join("store"))
+        .await
+        .unwrap();
+    ok_store::graph::index_heads(&b.loader, &b.repo_dir)
+        .await
+        .unwrap();
+    let shared_b = ok_store::Shared::for_store_path(&b.repo_dir.join("store")).unwrap();
+    assert_eq!(
+        shared_b.waits().reads,
+        0,
+        "indexing read a commit from the SCM"
+    );
+    let repo_b = b.head().await;
+    assert_eq!(repo_b.op_id(), repo.op_id());
+    for c in [&landed, &tip] {
+        assert!(
+            repo_b.index().has_id(c.id()).await.unwrap(),
+            "{} unindexed",
+            c.id()
+        );
+    }
+    let ancestors: Vec<CommitId> = repo_b.index().all_heads_for_gc().unwrap().collect();
+    assert!(ancestors.contains(tip.id()), "{ancestors:?}");
+    let held = std::fs::read(b.repo_dir.join("index").join("ok_graph_layers")).unwrap();
+    assert!(!held.is_empty(), "no layer of main's was taken in");
+    assert_eq!(
+        shared_b.waits().reads,
+        0,
+        "loading the repository read a commit"
+    );
+    // Looking at the commit reads it: its description is no index's.
+    let read_tip = repo_b.store().get_commit_async(tip.id()).await.unwrap();
+    assert_eq!(read_tip.description(), "work 29\n");
+}

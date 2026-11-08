@@ -254,7 +254,7 @@ func Build(ctx context.Context, cfg *config.Config, opts Options) (*Role, error)
 	r.closers = append(r.closers, peers.Close)
 	svc.InCell(cfg.Cell.Name, peerSCMs{peers}, identitypb.NewCellsClient(conn))
 	r.Root = &assembly{deps: []node.Node{svc, server.NewGC(svc, hour), server.NewPurge(svc, identitypb.NewDirectoryEventsClient(conn)), server.NewSegments(svc, 0), server.NewFolds(svc), server.NewRelay(svc, bb.Queue),
-		server.NewMovePurge(svc), server.NewCodeSearch(svc), server.NewCheckouts(svc)}}
+		server.NewMovePurge(svc), server.NewCodeSearch(svc), server.NewCheckouts(svc), server.NewGraphs(svc)}}
 	ok = true
 	return r, nil
 }

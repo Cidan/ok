@@ -17,6 +17,7 @@ pub mod checkouts;
 mod chunk;
 pub mod client;
 pub mod config;
+pub mod graph;
 mod ids;
 mod op_heads;
 mod op_store;

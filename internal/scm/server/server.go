@@ -390,6 +390,30 @@ func (n *Checkouts) Start(ctx context.Context) error {
 	}).Run(ctx)
 }
 
+// Graphs derives the commit graph of each repository's main as it moves (store.GraphWork), a
+// node.Application: every replica runs it, each repository's by one at a time.
+type Graphs struct{ svc *Service }
+
+var _ node.Application = (*Graphs)(nil)
+
+// NewGraphs derives the service's repositories' graphs.
+func NewGraphs(svc *Service) *Graphs { return &Graphs{svc: svc} }
+
+func (*Graphs) Name() string                 { return "ok/scm/graphs" }
+func (n *Graphs) Dependencies() []node.Node  { return []node.Node{n.svc} }
+func (*Graphs) Setup(context.Context) error  { return nil }
+func (*Graphs) Healthy(context.Context) bool { return true }
+
+func (n *Graphs) Start(ctx context.Context) error {
+	s := n.svc.store
+	return (&work.Runner{
+		Kind:    store.GraphWork,
+		Store:   s.Work(),
+		Do:      s.DeriveMainGraph,
+		Workers: 4,
+	}).Run(ctx)
+}
+
 // CodeSearch indexes repositories' main as it moves (store.CodeSearchWork), a node.Application:
 // every replica runs it, each repository's index built by one at a time.
 type CodeSearch struct{ svc *Service }

@@ -361,9 +361,9 @@ none do.
     then reloads from the server's heads, so one bad entry never blocks later commands.
 - **Prefetch.**
   - `jj clone` streams the whole operation log — its operations and views
-    (`PrefetchOperations`) and the commits they reference (`PrefetchCommits` with `op_log` set) —
-    and the working-copy tree (`ReadTreeClosure`, then `ReadFiles`) before jj builds its index
-    and checks out.
+    (`PrefetchOperations`) — builds jj's index from the commit graph (*The commit graph*), and
+    reads the working-copy tree (`ReadTreeClosure`, then `ReadFiles`) before it checks out. No
+    commit's body is read until a command looks at it.
   - A cache miss on a commit fetches it together with up to 1,000 of its uncached ancestors
     (`PrefetchCommits` with `limit`).
   - A cache miss on an operation fetches it together with its uncached ancestors and every one's
@@ -749,6 +749,46 @@ large (over 8 MiB or 200,000 lines) instead of diffing it. Every walk over trees
 needs a level at a time, each level in one query (up to 1,000 trees), before walking them in
 path order; `Export` fills its leaves' sizes and symlink targets 2,000 at a time. A walk of the
 monorepo's 13,000 directories is a dozen queries, not one per directory.
+
+### The commit graph
+
+jj's index holds every commit a workspace's operation log reaches, each with its change ID and
+parents, and jj builds it by reading every one of those commits — at a decade of a large
+repository's history, every commit's body on every clone, though a command looks at a few. The SCM
+sends what the index needs instead — the **commit graph** — and a commit's description, author, and
+the rest are read when a command looks at it — Sapling's segmented changelog, which downloads
+commits' metadata lazily, is the model.
+
+- **Records.** Each commit's ID, change ID, generation, committer's time, tree (a merge's terms),
+  and parents, in topological order; a commit whose one parent is the record before it — main's
+  history, a stack — names it with a flag, not its ID (`internal/scm/encoding/graph.go`, held to
+  golden vectors both languages pass, `testdata/graph.json`). A record may carry a filter of the
+  paths its commit changed.
+- **Main's layers.** Main's history is derived as it moves (`GraphWork`, keyed work marked by
+  every move of main, as checkouts' is) into layers in the bucket — immutable, named by the
+  BLAKE3 of their bytes, magic `OKGRAPHL`, a version, and one zstd frame of records
+  (`internal/scm/graph`) — merged as checkouts' are: the commits since the head the last
+  derivation reached become a layer on the others, and the top layers merge until each is more
+  than twice the one above it and there are at most 16. One manifest per repository names them and
+  the head they reach (`graphs/<repository>/main`); layers are at `graphs/<repository>/l/<layer>`.
+- **Reading it.** `ReadGraph` names the commits to index (`heads`), those whose whole ancestry
+  the client indexed (`have`), and the layers of main it holds (`held_layers`). It answers the
+  manifest's layers and head, the bytes of each layer not held in pieces of up to 1 MiB, then the
+  records of every commit the heads reach that neither the haves nor main's layers do — a
+  workspace's commits beyond main, and main's own while its derivation is behind — 4,096 a message.
+  A head the SCM does not hold is passed over.
+- **Building the index.** A clone, before jj loads the repository, builds the index at each
+  operation head jj's default index store has none of: from the nearest operation it has an index
+  of, it reads the graph for every commit the operations since reference, adds each record whose
+  parents the index holds, and adds what the graph lacked — what this machine has not published —
+  from the commits themselves; then it writes the index through jj's default index store, so jj
+  finds it there and the index on disk is jj's own (`jj/store/graph.rs`). The layers taken in are
+  listed beside it (`ok_graph_layers` in the index's directory, the newest 64) and named as held
+  next time; a layer named as held that the index lacks is asked for again. A build the graph cannot
+  finish — an SCM that serves none, or out of reach — is left to jj, which reads the commits.
+  An operation made since is indexed by jj as it is made, reading only the commits it adds.
+- **Kept.** Garbage collection deletes the layers the manifest no longer names, a day after they
+  were written.
 
 ### Storage
 

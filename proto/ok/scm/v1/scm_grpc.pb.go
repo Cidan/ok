@@ -374,6 +374,7 @@ const (
 	Store_ReadTreeSizes_FullMethodName          = "/ok.scm.v1.Store/ReadTreeSizes"
 	Store_ReadDictionary_FullMethodName         = "/ok.scm.v1.Store/ReadDictionary"
 	Store_ReadCheckout_FullMethodName           = "/ok.scm.v1.Store/ReadCheckout"
+	Store_ReadGraph_FullMethodName              = "/ok.scm.v1.Store/ReadGraph"
 	Store_GetOpHeads_FullMethodName             = "/ok.scm.v1.Store/GetOpHeads"
 	Store_ReadOperations_FullMethodName         = "/ok.scm.v1.Store/ReadOperations"
 	Store_PrefetchOperations_FullMethodName     = "/ok.scm.v1.Store/PrefetchOperations"
@@ -404,6 +405,11 @@ type StoreClient interface {
 	// immutable objects the SCM derives once for each commit, each layer sent only to a client that
 	// does not hold it.
 	ReadCheckout(ctx context.Context, in *ReadCheckoutRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[CheckoutFrame], error)
+	// What a client's index of the commits reachable from heads needs (docs/scm.md, "The commit
+	// graph"): each commit's ID, change ID, generation, committer's time, tree, and parents, not its
+	// body — main's history as immutable layers, each sent only to a client that does not hold it,
+	// and the rest as records.
+	ReadGraph(ctx context.Context, in *ReadGraphRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[GraphFrame], error)
 	// OpStore and OpHeadsStore, on the operation log of one of the caller's workspaces in the
 	// repository (docs/scm.md, "Decisions", 3): each request names the workspace, and no
 	// workspace's log is ever read or changed from another. A workspace that does not exist is
@@ -580,6 +586,25 @@ func (c *storeClient) ReadCheckout(ctx context.Context, in *ReadCheckoutRequest,
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type Store_ReadCheckoutClient = grpc.ServerStreamingClient[CheckoutFrame]
 
+func (c *storeClient) ReadGraph(ctx context.Context, in *ReadGraphRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[GraphFrame], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &Store_ServiceDesc.Streams[7], Store_ReadGraph_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[ReadGraphRequest, GraphFrame]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Store_ReadGraphClient = grpc.ServerStreamingClient[GraphFrame]
+
 func (c *storeClient) GetOpHeads(ctx context.Context, in *GetOpHeadsRequest, opts ...grpc.CallOption) (*GetOpHeadsResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetOpHeadsResponse)
@@ -592,7 +617,7 @@ func (c *storeClient) GetOpHeads(ctx context.Context, in *GetOpHeadsRequest, opt
 
 func (c *storeClient) ReadOperations(ctx context.Context, in *ReadOperationsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ObjectResult], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &Store_ServiceDesc.Streams[7], Store_ReadOperations_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &Store_ServiceDesc.Streams[8], Store_ReadOperations_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -611,7 +636,7 @@ type Store_ReadOperationsClient = grpc.ServerStreamingClient[ObjectResult]
 
 func (c *storeClient) PrefetchOperations(ctx context.Context, in *PrefetchOperationsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[EncodedObject], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &Store_ServiceDesc.Streams[8], Store_PrefetchOperations_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &Store_ServiceDesc.Streams[9], Store_PrefetchOperations_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -650,7 +675,7 @@ func (c *storeClient) CollectOperations(ctx context.Context, in *CollectOperatio
 
 func (c *storeClient) Publish(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[PublishRequest, PublishResponse], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &Store_ServiceDesc.Streams[9], Store_Publish_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &Store_ServiceDesc.Streams[10], Store_Publish_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -683,6 +708,11 @@ type StoreServer interface {
 	// immutable objects the SCM derives once for each commit, each layer sent only to a client that
 	// does not hold it.
 	ReadCheckout(*ReadCheckoutRequest, grpc.ServerStreamingServer[CheckoutFrame]) error
+	// What a client's index of the commits reachable from heads needs (docs/scm.md, "The commit
+	// graph"): each commit's ID, change ID, generation, committer's time, tree, and parents, not its
+	// body — main's history as immutable layers, each sent only to a client that does not hold it,
+	// and the rest as records.
+	ReadGraph(*ReadGraphRequest, grpc.ServerStreamingServer[GraphFrame]) error
 	// OpStore and OpHeadsStore, on the operation log of one of the caller's workspaces in the
 	// repository (docs/scm.md, "Decisions", 3): each request names the workspace, and no
 	// workspace's log is ever read or changed from another. A workspace that does not exist is
@@ -732,6 +762,9 @@ func (UnimplementedStoreServer) ReadDictionary(context.Context, *ReadDictionaryR
 }
 func (UnimplementedStoreServer) ReadCheckout(*ReadCheckoutRequest, grpc.ServerStreamingServer[CheckoutFrame]) error {
 	return status.Error(codes.Unimplemented, "method ReadCheckout not implemented")
+}
+func (UnimplementedStoreServer) ReadGraph(*ReadGraphRequest, grpc.ServerStreamingServer[GraphFrame]) error {
+	return status.Error(codes.Unimplemented, "method ReadGraph not implemented")
 }
 func (UnimplementedStoreServer) GetOpHeads(context.Context, *GetOpHeadsRequest) (*GetOpHeadsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetOpHeads not implemented")
@@ -885,6 +918,17 @@ func _Store_ReadCheckout_Handler(srv interface{}, stream grpc.ServerStream) erro
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type Store_ReadCheckoutServer = grpc.ServerStreamingServer[CheckoutFrame]
 
+func _Store_ReadGraph_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(ReadGraphRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(StoreServer).ReadGraph(m, &grpc.GenericServerStream[ReadGraphRequest, GraphFrame]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Store_ReadGraphServer = grpc.ServerStreamingServer[GraphFrame]
+
 func _Store_GetOpHeads_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(GetOpHeadsRequest)
 	if err := dec(in); err != nil {
@@ -1030,6 +1074,11 @@ var Store_ServiceDesc = grpc.ServiceDesc{
 		{
 			StreamName:    "ReadCheckout",
 			Handler:       _Store_ReadCheckout_Handler,
+			ServerStreams: true,
+		},
+		{
+			StreamName:    "ReadGraph",
+			Handler:       _Store_ReadGraph_Handler,
 			ServerStreams: true,
 		},
 		{

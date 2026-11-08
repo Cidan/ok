@@ -437,8 +437,9 @@ async fn attachable(
 }
 
 /// Lays out a jj repository in `repo_dir` with ok's stores, as workspace `name` — the
-/// workspace's own, its operation log the workspace's — and loads it at the operation heads,
-/// everything jj reads to load it and build its index fetched in a few calls.
+/// workspace's own, its operation log the workspace's — and loads it at the operation heads: the
+/// operation log fetched in a few calls, and its index built from the commit graph, so no commit is
+/// read until a command looks at it.
 async fn workspace_repo(
     settings: &jj_lib::settings::UserSettings,
     endpoint: &str,
@@ -466,6 +467,13 @@ async fn workspace_repo(
     ok_store::prefetch::operation_log(&repo_dir.join("store"))
         .await
         .map_err(|s| scm_error(endpoint, &remote.name, s))?;
+    // Should the graph not do, jj indexes the heads as it loads them, reading their commits.
+    if let Err(e) = ok_store::graph::index_heads(repo.loader(), repo_dir).await {
+        eprintln!(
+            "Warning: indexing {} from its commit graph: {e}",
+            remote.name
+        );
+    }
     Ok(repo.loader().load_at_head().await?)
 }
 

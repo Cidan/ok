@@ -17,6 +17,7 @@ use jj_lib::op_store::{Operation, View};
 mod decode;
 mod delta;
 mod encode;
+mod graph;
 mod layer;
 #[cfg(test)]
 mod tests;
@@ -28,6 +29,7 @@ pub use encode::{
     encode, encode_chunk, encode_commit, encode_copy_history, encode_file, encode_operation,
     encode_symlink, encode_tree, encode_view, signed_data,
 };
+pub use graph::{GraphRecord, decode_graph_records};
 pub use layer::{LayerRecord, decode_layer_records};
 pub use tree_sizes::{
     KIND_TREE_SIZES, TREE_SIZES_VERSION, TreeSizes, decode_tree_sizes, encode_tree_sizes,
