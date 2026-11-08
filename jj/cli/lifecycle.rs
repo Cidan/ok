@@ -4,6 +4,7 @@
 //! ChangeLists service (`jj/review`). Uploading stays `jj cl` itself.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::io::Write as _;
 use std::time::Duration;
 
@@ -504,6 +505,7 @@ async fn follow(
     let mut rx = control.follow(cls, json, timeout);
     let mut last: HashMap<i64, String> = HashMap::new();
     let mut done: HashMap<i64, Outcome> = HashMap::new();
+    let mut submitted: HashSet<i64> = HashSet::new();
     while done.len() < total {
         let Some(ev) = rx.recv().await else { break };
         let (n, what) = match ev {
@@ -520,27 +522,39 @@ async fn follow(
         if done.contains_key(&n) {
             continue;
         }
-        let (point, failure) = match what {
+        let (point, failure, ended) = match what {
             Followed::Status(st) => {
                 let l = render::line(&st);
                 if last.get(&n) != Some(&l) {
                     let _ = writeln!(ui.stdout(), "{l}");
                     last.insert(n, l);
                 }
-                (render::Point::from(&*st), render::failure(&st))
+                (
+                    render::Point::from(&*st),
+                    render::failure(&st),
+                    render::submission_ended(&st),
+                )
             }
             Followed::Json(line, point) => {
                 let _ = writeln!(ui.stdout(), "{line}");
-                (point, String::new())
+                (point, String::new(), String::new())
             }
             Followed::Failed(s) => {
                 let _ = writeln!(ui.stderr(), "cl/{n}: {}", s.message());
                 exit(ui, render::UNREACHABLE)
             }
         };
-        if let Some(o) = render::outcome(point, until) {
-            if o == Outcome::Failed && !failure.is_empty() {
-                let _ = write!(ui.stdout(), "{failure}");
+        let was_submitted = submitted.contains(&n);
+        if render::submitted(point.stage) {
+            submitted.insert(n);
+        }
+        if let Some(o) = render::outcome_after(point, until, was_submitted) {
+            if o == Outcome::Failed {
+                if was_submitted && !render::submitted(point.stage) {
+                    let _ = write!(ui.stdout(), "{ended}");
+                } else if !failure.is_empty() {
+                    let _ = write!(ui.stdout(), "{failure}");
+                }
             }
             done.insert(n, o);
         }

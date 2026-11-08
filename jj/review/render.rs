@@ -88,6 +88,37 @@ fn rank(s: Stage) -> u8 {
     }
 }
 
+/// Whether a stage is a submission's or later: submitted, landed, deployed, or failed on the way.
+pub fn submitted(s: Stage) -> bool {
+    rank(s) >= 4
+}
+
+/// Whether following stops at p for until, and how it ended, for a CL following has seen submitted
+/// or not: following until it lands or deploys, one it saw submitted that is back before submission
+/// — a new patchset, a cancel, a submission discarded — will not, and following ends there, failed.
+pub fn outcome_after(p: Point, until: Until, was_submitted: bool) -> Option<Outcome> {
+    if was_submitted
+        && p.stage != Stage::Abandoned
+        && !submitted(p.stage)
+        && matches!(until, Until::Landed | Until::Deployed)
+    {
+        return Some(Outcome::Failed);
+    }
+    outcome(p, until)
+}
+
+/// Why a CL's submission ended without landing: its post's reason.
+pub fn submission_ended(st: &ClStatus) -> String {
+    let n = st.cl.as_ref().map_or(0, |c| c.number);
+    let why = st
+        .post
+        .as_ref()
+        .map(|p| p.reason.as_str())
+        .filter(|r| !r.is_empty())
+        .unwrap_or("it went back to review");
+    format!("cl/{n}  its submission ended without landing — {why}\n")
+}
+
 /// Whether following stops at p for until, and how it ended; None to keep following.
 pub fn outcome(p: Point, until: Until) -> Option<Outcome> {
     let reached = match until {
@@ -432,4 +463,62 @@ pub fn full(st: &ClStatus) -> String {
 
     out.push_str(&failure(st));
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at(stage: Stage, waiting_on: WaitingOn) -> Point {
+        Point { stage, waiting_on }
+    }
+
+    #[test]
+    fn a_submission_that_ends_unlanded_ends_a_follow_until_it_lands() {
+        let back = at(Stage::PreRunning, WaitingOn::Unspecified);
+        assert_eq!(
+            outcome_after(back, Until::Deployed, true),
+            Some(Outcome::Failed)
+        );
+        assert_eq!(
+            outcome_after(back, Until::Landed, true),
+            Some(Outcome::Failed)
+        );
+        // Not seen submitted: a new patchset's pre is still followed.
+        assert_eq!(outcome_after(back, Until::Deployed, false), None);
+        // Settled waits for what happens without a person: the new patchset's pre.
+        assert_eq!(outcome_after(back, Until::Settled, true), None);
+        // Still submitted, or landed: followed on.
+        let testing = at(Stage::Submitted, WaitingOn::Unspecified);
+        assert_eq!(outcome_after(testing, Until::Deployed, true), None);
+        let deploying = at(Stage::Deploying, WaitingOn::Unspecified);
+        assert_eq!(outcome_after(deploying, Until::Deployed, true), None);
+        assert_eq!(
+            outcome_after(
+                at(Stage::Deployed, WaitingOn::Nobody),
+                Until::Deployed,
+                true
+            ),
+            Some(Outcome::Reached)
+        );
+    }
+
+    #[test]
+    fn why_a_submission_ended() {
+        let st = ClStatus {
+            cl: Some(pb::Cl {
+                number: 825,
+                ..Default::default()
+            }),
+            post: Some(pb::Post {
+                reason: "patchset 2 of CL 825 was uploaded while it was submitting".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            submission_ended(&st),
+            "cl/825  its submission ended without landing — patchset 2 of CL 825 was uploaded while it was submitting\n"
+        );
+    }
 }
