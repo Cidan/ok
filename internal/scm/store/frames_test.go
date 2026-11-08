@@ -98,7 +98,7 @@ func recordsPack(t *testing.T, s *Store, repo int64) int {
 		t.Fatal(err)
 	}
 	if err := s.inTx(ctx, func(ctx context.Context, tx *txn) error {
-		num, err := tx.InsertPack(ctx, net, id, int64(buf.Len()))
+		num, err := tx.InsertPack(ctx, net, id, int64(buf.Len()), 0)
 		if err != nil {
 			return err
 		}

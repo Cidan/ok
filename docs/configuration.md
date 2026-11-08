@@ -127,6 +127,7 @@ scm:
     # or, on Google Cloud: {type: gcs, bucket: example-ok-scm}
   email_domain: example.com             # <handle>@example.com in the commits ok writes
   gc_hour: 9                            # each repository's daily garbage collection, from 09:00 UTC
+  tiering: {class: infrequent}          # packs of what is read rarely kept cold (scm.md, "Tiering")
 automation:
   logs: {endpoint: https://s3.us-east-1.amazonaws.com, bucket: example-ok-logs, region: us-east-1}
   speculation_depth: 8                  # how many submissions ahead the landing queue speculates on
@@ -237,6 +238,7 @@ it to ok identity once it lands. Other repositories' `acl:` owners are ok identi
 | `scm.gc_hour` | The hour (UTC) each repository's daily garbage collection is due from. Default 9. |
 | `scm.cache` | The SCM's in-memory caches, in bytes: `objects` (default 256 MiB), `chunks` (512 MiB), `diffs` (64 MiB), `path_commits` (32 MiB: the newest commits of main that changed paths, which a tree's listing with its entries' last commits reads), `code_indexes` (256 MiB: the code search indexes a replica holds, [hosted.md](hosted.md), "ok control at scale, as built"), `deltas` (64 MiB: files' deltas against the versions clients hold, [scm.md](scm.md), "Deltas"), `checkouts` (512 MiB: commits' checkouts' layers, [scm.md](scm.md), "Checkouts"). |
 | `scm.publish_memory` | The memory, in bytes, every publish at once holds its packs in before they go to the object store (default 512 MiB): a publish sends a pack once it holds 64 MiB, or when this is all held, and waits only when what it then needs is held by others. |
+| `scm.tiering` | Storage tiering ([scm.md](scm.md), "Tiering"): `class`, the object store's class packs of what is read rarely are kept in — `infrequent` (S3's `STANDARD_IA`, GCS's `NEARLINE`) or `archive` (`GLACIER_IR`, `ARCHIVE`) — and `after`, how long a pinned chunk stays hot after it was put or pinned (default `720h`, the least an infrequent class bills an object for). Off unless `class` is set: MinIO, and Ceph without a storage class of those names, refuse them. A directory has none. |
 
 The SCM's design is [scm.md](scm.md). `ok scm fsck REPOSITORY` verifies a repository against its
 invariants, and `ok scm gc REPOSITORY` runs its garbage collection now; both read the same file.

@@ -280,8 +280,10 @@ type Ops interface {
 	// PutPack records a pack a publish wrote — again, its size updated, if it is recorded — and
 	// returns its number.
 	PutPack(ctx context.Context, net Network, id encoding.ID, size int64) (uint64, error)
-	// InsertPack records a pack compaction wrote — compacted — and returns its number.
-	InsertPack(ctx context.Context, net Network, id encoding.ID, size int64) (uint64, error)
+	// InsertPack records a pack compaction wrote — compacted, kept in class — and returns its number.
+	InsertPack(ctx context.Context, net Network, id encoding.ID, size int64, class int16) (uint64, error)
+	// SetPackClass records the class a pack is now kept in.
+	SetPackClass(ctx context.Context, net Network, id encoding.ID, class int16) error
 	// NumberedPacks are the IDs of a network's packs of numbers nums, retired ones too: a number is
 	// one pack's for good. Read without locking them (a reader of a chunk index names many).
 	NumberedPacks(ctx context.Context, net Network, nums []uint64) (map[uint64]encoding.ID, error)

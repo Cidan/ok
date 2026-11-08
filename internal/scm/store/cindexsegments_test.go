@@ -138,7 +138,7 @@ func TestRepackFoldedChunks(t *testing.T) {
 	before := chunkPack(t, e, a)
 
 	r := &GCReport{}
-	if err := e.s.compact(ctx, e.repo, GCOptions{}, r); err != nil || r.PacksWritten != 1 || r.PacksRetired != 2 {
+	if err := e.s.compact(ctx, e.repo, nil, GCOptions{}, r); err != nil || r.PacksWritten != 1 || r.PacksRetired != 2 {
 		t.Fatalf("repacking two small packs: %s, %v", r, err)
 	}
 	if m := logMoves(t, e.s, net); m != 4 {

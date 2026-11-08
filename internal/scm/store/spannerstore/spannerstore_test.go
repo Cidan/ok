@@ -356,7 +356,7 @@ func TestPackNumbersReservedOnce(t *testing.T) {
 		go func() {
 			errs <- txn(ctx, b, func(o backend.Ops) error {
 				var err error
-				nums[i], err = o.InsertPack(ctx, net, idOf("pack", i), 100)
+				nums[i], err = o.InsertPack(ctx, net, idOf("pack", i), 100, 0)
 				return err
 			})
 		}()

@@ -337,6 +337,12 @@ func (f *FS) Copy(ctx context.Context, src, dst string) (err error) {
 	return f.Put(ctx, dst, file, fi.Size())
 }
 
+// SetClass leaves the object as it is: a directory has no classes.
+func (f *FS) SetClass(ctx context.Context, key string, c Class) error {
+	_, err := f.Stat(ctx, key)
+	return err
+}
+
 // SignGet is unsupported: a directory has no URLs.
 func (f *FS) SignGet(ctx context.Context, key string, ttl time.Duration) (string, error) {
 	return "", fmt.Errorf("blob: sign %s: %w", key, ErrUnsupported)
@@ -365,12 +371,17 @@ func (s *fsStaged) Write(p []byte) (int, error) {
 	return n, err
 }
 
-func (s *fsStaged) Commit(ctx context.Context, key string) (err error) {
+func (s *fsStaged) Commit(ctx context.Context, key string, opts ...PutOption) (err error) {
 	defer func(start time.Time) { observe(s.f.root, "put", start, s.n, err) }(time.Now())
 	if s.done {
 		return errors.New("blob: a staged object committed after it ended")
 	}
 	s.done = true
+	if _, err := commitOpts(opts); err != nil {
+		s.tmp.Close()
+		os.Remove(s.tmp.Name())
+		return err
+	}
 	defer os.Remove(s.tmp.Name())
 	dst, err := s.f.file(key)
 	if err != nil {

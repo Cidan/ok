@@ -110,6 +110,12 @@ type Config struct {
 	// repository's content index's, and a network's go a transaction of at most this many at a
 	// time before the one that deletes their rows.
 	DeleteBatch int
+	// ColdClass is the object store's class a pack of cold records is kept in (tiering.go):
+	// blob.Standard, the zero value, keeps every pack standard.
+	ColdClass blob.Class
+	// ColdAfter is how long a pinned chunk stays hot after it was put or pinned: DefaultColdAfter
+	// unless set.
+	ColdAfter time.Duration
 	// LandingPaths bounds the rows of main's path history a landing's transaction writes: a landing
 	// that changed more paths writes them after it, a transaction of up to 10,000 at a time, its
 	// commit's answered from its trees meanwhile (paths.go).
@@ -185,13 +191,17 @@ type Store struct {
 	// one holds at most publishPackBytes.
 	publishMemory                        *semaphore.Weighted
 	publishMemoryBytes, publishPackBytes int64
-	names                                identity.Names
-	email                                string // the email domain
-	namer                                Namer
-	blobs                                blob.Store
-	objects                              *cache[[]byte]
-	chunks                               *cache[storedChunk]
-	diffs                                *cache[FileDiff]
+	// coldClass and coldAfter are Config's: the class of packs of cold records, and how long a
+	// pinned chunk stays hot.
+	coldClass blob.Class
+	coldAfter time.Duration
+	names     identity.Names
+	email     string // the email domain
+	namer     Namer
+	blobs     blob.Store
+	objects   *cache[[]byte]
+	chunks    *cache[storedChunk]
+	diffs     *cache[FileDiff]
 	// deltas are files' deltas against bases, compressed — empty where none pays (read.go); layers
 	// checkout layers' bytes, and checkouts the checkouts of commits, by repository and commit
 	// (checkouts.go). All are derived from IDs, so never stale.
@@ -306,6 +316,9 @@ func New(b backend.Backend, blobs blob.Store, cfg Config) (*Store, error) {
 	if cfg.LandingPaths == 0 {
 		cfg.LandingPaths = DefaultLandingPaths
 	}
+	if cfg.ColdAfter == 0 {
+		cfg.ColdAfter = DefaultColdAfter
+	}
 	if cfg.PublishMemoryBytes == 0 {
 		cfg.PublishMemoryBytes = DefaultPublishMemoryBytes
 	}
@@ -314,6 +327,8 @@ func New(b backend.Backend, blobs blob.Store, cfg Config) (*Store, error) {
 	}
 	s := &Store{
 		publishMemory:      semaphore.NewWeighted(cfg.PublishMemoryBytes),
+		coldClass:          cfg.ColdClass,
+		coldAfter:          cfg.ColdAfter,
 		publishMemoryBytes: cfg.PublishMemoryBytes,
 		publishPackBytes:   cfg.PublishPackBytes,
 		b:                  b,

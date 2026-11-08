@@ -58,6 +58,8 @@ type Object struct {
 	Key      string
 	Size     int64
 	Modified time.Time
+	// Class is how it is stored, where the store has classes: Standard otherwise.
+	Class Class
 }
 
 // Class is how an object is stored: how often it is read decides what keeping it costs. Every
@@ -95,12 +97,25 @@ func putOpts(opts []PutOption) putOptions {
 	return o
 }
 
+// ClassOf is the class opts name: what a store wrapping another records of a Put or a Commit.
+func ClassOf(opts ...PutOption) Class { return putOpts(opts).class }
+
+// commitOpts are a staged object's Commit's options: a class, and no IfAbsent.
+func commitOpts(opts []PutOption) (putOptions, error) {
+	o := putOpts(opts)
+	if o.ifAbsent {
+		return o, errors.New("blob: a staged object commits whatever is at its key: IfAbsent is a Put's")
+	}
+	return o, nil
+}
+
 // Staged is an object being written before its key is known (Store.Stage).
 type Staged interface {
 	io.Writer
 	// Commit stores what was written at key, replacing what is there: a key named by a hash over
 	// a random nonce, which names nothing else. Staging ends with it, whether it succeeds or not.
-	Commit(ctx context.Context, key string) error
+	// It takes WithClass; IfAbsent is a Put's alone, and refused.
+	Commit(ctx context.Context, key string, opts ...PutOption) error
 	// Abort discards what was written. After Commit it does nothing.
 	Abort()
 }
@@ -142,6 +157,10 @@ type Store interface {
 	// Copy copies the object at src to dst within the store, without moving its bytes through
 	// this process where the store can.
 	Copy(ctx context.Context, src, dst string) error
+	// SetClass stores the object at key in class c, in place and without moving its bytes through
+	// this process — its key, bytes, and size unchanged. A store with no classes leaves it as it is;
+	// a missing key is ErrNotFound.
+	SetClass(ctx context.Context, key string, c Class) error
 	// SignGet returns a URL from which anyone holding it may GET the object at key — whole, or a
 	// range with a Range header — until ttl passes. ErrUnsupported where the store has no URLs.
 	SignGet(ctx context.Context, key string, ttl time.Duration) (string, error)

@@ -116,6 +116,26 @@ func (g *GCS) wrap(op, key string, err error) error {
 // gcsClasses are GCS's names for each Class.
 var gcsClasses = map[Class]string{Standard: "", Infrequent: "NEARLINE", Archive: "ARCHIVE"}
 
+// gcsClassOf is the Class of GCS's name for one: Standard for STANDARD, none, and a name ok never
+// sets.
+func gcsClassOf(name string) Class {
+	for c, n := range gcsClasses {
+		if n != "" && n == name {
+			return c
+		}
+	}
+	return Standard
+}
+
+// gcsClassName is GCS's name for c, STANDARD's spelled out: a copy given none keeps the bucket's
+// default, not the source's.
+func gcsClassName(c Class) string {
+	if n := gcsClasses[c]; n != "" {
+		return n
+	}
+	return "STANDARD"
+}
+
 func (g *GCS) Put(ctx context.Context, key string, r io.Reader, size int64, opts ...PutOption) (err error) {
 	defer func(start time.Time) { observe(g.name, "put", start, size, err) }(time.Now())
 	o := putOpts(opts)
@@ -183,7 +203,7 @@ func (g *GCS) Stat(ctx context.Context, key string) (_ Object, err error) {
 	if err != nil {
 		return Object{}, g.wrap("stat", key, err)
 	}
-	return Object{Key: a.Name, Size: a.Size, Modified: a.Updated}, nil
+	return Object{Key: a.Name, Size: a.Size, Modified: a.Updated, Class: gcsClassOf(a.StorageClass)}, nil
 }
 
 // deleteParallel bounds how many deletes run at once: GCS has no multi-object delete.
@@ -234,7 +254,7 @@ func (g *GCS) list(ctx context.Context, prefix, after string, limit int) (_ []Ob
 		// StartOffset is inclusive; the smallest key after after is after itself and a NUL byte.
 		q.StartOffset = after + "\x00"
 	}
-	if err := q.SetAttrSelection([]string{"Name", "Size", "Updated"}); err != nil {
+	if err := q.SetAttrSelection([]string{"Name", "Size", "Updated", "StorageClass"}); err != nil {
 		return nil, "", err
 	}
 	it := g.bucket.Objects(ctx, q)
@@ -253,7 +273,7 @@ func (g *GCS) list(ctx context.Context, prefix, after string, limit int) (_ []Ob
 		if limit > 0 && len(out) == limit {
 			return out, out[len(out)-1].Key, nil
 		}
-		out = append(out, Object{Key: a.Name, Size: a.Size, Modified: a.Updated})
+		out = append(out, Object{Key: a.Name, Size: a.Size, Modified: a.Updated, Class: gcsClassOf(a.StorageClass)})
 	}
 }
 
@@ -261,6 +281,17 @@ func (g *GCS) Copy(ctx context.Context, src, dst string) (err error) {
 	defer func(start time.Time) { observe(g.name, "copy", start, 0, err) }(time.Now())
 	if _, err := g.bucket.Object(dst).CopierFrom(g.bucket.Object(src)).Run(ctx); err != nil {
 		return g.wrap("copy", src, err)
+	}
+	return nil
+}
+
+func (g *GCS) SetClass(ctx context.Context, key string, c Class) (err error) {
+	defer func(start time.Time) { observe(g.name, "class", start, 0, err) }(time.Now())
+	obj := g.bucket.Object(key)
+	cp := obj.CopierFrom(obj)
+	cp.StorageClass, cp.ContentType = gcsClassName(c), "application/octet-stream"
+	if _, err := cp.Run(ctx); err != nil {
+		return g.wrap("class", key, err)
 	}
 	return nil
 }
@@ -308,19 +339,28 @@ func (s *gcsStaged) Write(p []byte) (int, error) {
 	return n, err
 }
 
-func (s *gcsStaged) Commit(ctx context.Context, key string) (err error) {
+func (s *gcsStaged) Commit(ctx context.Context, key string, opts ...PutOption) (err error) {
 	defer func(start time.Time) { observe(s.g.name, "put", start, s.n, err) }(time.Now())
 	if s.done {
 		return errors.New("blob: a staged object committed after it ended")
 	}
 	s.done = true
+	o, err := commitOpts(opts)
+	if err != nil {
+		s.cancel()
+		return err
+	}
 	defer s.cancel()
 	if err := s.w.Close(); err != nil {
 		return s.g.wrap("put", s.tmp, err)
 	}
 	// tmp goes whether the copy succeeds or not; one this delete misses, the caller's sweep takes.
 	defer s.g.bucket.Object(s.tmp).Delete(context.WithoutCancel(ctx))
-	if _, err := s.g.bucket.Object(key).CopierFrom(s.g.bucket.Object(s.tmp)).Run(ctx); err != nil {
+	cp := s.g.bucket.Object(key).CopierFrom(s.g.bucket.Object(s.tmp))
+	if o.class != Standard {
+		cp.StorageClass, cp.ContentType = gcsClassName(o.class), "application/octet-stream"
+	}
+	if _, err := cp.Run(ctx); err != nil {
 		return s.g.wrap("put", key, err)
 	}
 	return nil

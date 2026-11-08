@@ -238,7 +238,7 @@ func TestReadFilesAfterRepack(t *testing.T) {
 		}
 		// As compaction moves chunks.
 		if err := s.inTx(ctx, func(ctx context.Context, tx *txn) error {
-			num, err := tx.InsertPack(ctx, netOf(t, s, repo), id, size)
+			num, err := tx.InsertPack(ctx, netOf(t, s, repo), id, size, 0)
 			if err != nil {
 				return err
 			}

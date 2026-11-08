@@ -146,12 +146,19 @@ type slowStaged struct {
 	s *Slow
 }
 
-func (st *slowStaged) Commit(ctx context.Context, key string) error {
+func (st *slowStaged) Commit(ctx context.Context, key string, opts ...blob.PutOption) error {
 	if err := st.s.wait(ctx, "commit"); err != nil {
 		st.Staged.Abort()
 		return err
 	}
-	return st.Staged.Commit(ctx, key)
+	return st.Staged.Commit(ctx, key, opts...)
+}
+
+func (s *Slow) SetClass(ctx context.Context, key string, c blob.Class) error {
+	if err := s.wait(ctx, "copy"); err != nil {
+		return err
+	}
+	return s.Store.SetClass(ctx, key, c)
 }
 
 func (s *Slow) Copy(ctx context.Context, src, dst string) error {

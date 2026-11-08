@@ -132,6 +132,7 @@ func open(ctx context.Context, cfg *config.Config, opts Options) (*store.Store, 
 		ObjectCacheBytes: cfg.SCM.Cache.Objects, ChunkCacheBytes: cfg.SCM.Cache.Chunks, DiffCacheBytes: cfg.SCM.Cache.Diffs,
 		PathCommitCacheBytes: cfg.SCM.Cache.PathCommits, CodeIndexCacheBytes: cfg.SCM.Cache.CodeIndexes,
 		DeltaCacheBytes: cfg.SCM.Cache.Deltas, CheckoutCacheBytes: cfg.SCM.Cache.Checkouts, PublishMemoryBytes: cfg.SCM.PublishMemory,
+		ColdClass: config.TieringClasses[cfg.SCM.Tiering.Class], ColdAfter: cfg.SCM.Tiering.After,
 	})
 	if err != nil {
 		done()

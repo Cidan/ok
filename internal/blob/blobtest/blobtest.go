@@ -27,6 +27,9 @@ type Options struct {
 	Client *http.Client
 	// Classes: the store accepts every blob.Class (a test server may refuse all but Standard).
 	Classes bool
+	// KeepsClasses: the store keeps each object's class, put or set, and reports it — as S3 and GCS
+	// do; a directory and versitygw's POSIX backend keep none, and fake-gcs-server none a copy sets.
+	KeepsClasses bool
 	// Nested: the store holds "a" and "a/b" side by side, as S3 and GCS do (a store over a POSIX
 	// file system, like versitygw's, cannot). ok's own keys never need it.
 	Nested bool
@@ -54,6 +57,8 @@ func Run(t *testing.T, open func(t *testing.T) blob.Store, o Options) {
 		{"ListPage", testListPage},
 		{"Copy", testCopy},
 		{"Empty", testEmpty},
+		{"ClassOfMissing", testClassOfMissing},
+		{"CommitRefusesIfAbsent", testCommitRefusesIfAbsent},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) { tc.fn(t, open(t)) })
@@ -68,7 +73,7 @@ func Run(t *testing.T, open func(t *testing.T) blob.Store, o Options) {
 		if !o.Classes {
 			t.Skip("the store refuses classes other than Standard")
 		}
-		testClasses(t, open(t))
+		testClasses(t, open(t), o.KeepsClasses)
 	})
 	t.Run("SignGet", func(t *testing.T) {
 		s := open(t)
@@ -397,13 +402,75 @@ func testEmpty(t *testing.T, s blob.Store) {
 	}
 }
 
-func testClasses(t *testing.T, s blob.Store) {
-	for _, c := range []blob.Class{blob.Standard, blob.Infrequent, blob.Archive} {
+func testClasses(t *testing.T, s blob.Store, keeps bool) {
+	ctx := context.Background()
+	classes := []blob.Class{blob.Standard, blob.Infrequent, blob.Archive}
+	// class is the class the store reports, or, keeping none, the one it was given.
+	class := func(key string, given blob.Class) blob.Class {
+		t.Helper()
+		o, err := s.Stat(ctx, key)
+		if err != nil {
+			t.Fatalf("Stat %s: %v", key, err)
+		}
+		objs, err := s.List(ctx, key)
+		if err != nil || len(objs) != 1 || objs[0].Class != o.Class {
+			t.Fatalf("List %s: %+v, %v; Stat says class %d", key, objs, err, o.Class)
+		}
+		if !keeps {
+			return given
+		}
+		return o.Class
+	}
+	for _, c := range classes {
 		key := fmt.Sprintf("class/%d", c)
 		put(t, s, key, []byte(key), blob.WithClass(c))
 		if got := get(t, s, key); string(got) != key {
 			t.Fatalf("class %d read as %q", c, got)
 		}
+		if got := class(key, c); got != c {
+			t.Fatalf("put in class %d, stored in %d", c, got)
+		}
+		// A staged object commits in its class.
+		staged := fmt.Sprintf("staged/%d", c)
+		d := data(70_000)
+		if err := stage(t, s, "tmp/class", d, 9_000).Commit(ctx, staged, blob.WithClass(c)); err != nil {
+			t.Fatalf("Commit in class %d: %v", c, err)
+		}
+		if got := class(staged, c); got != c || !bytes.Equal(get(t, s, staged), d) {
+			t.Fatalf("committed in class %d: stored in %d", c, got)
+		}
+	}
+	// A class changes in place, its bytes kept, and back.
+	d := data(40_000)
+	put(t, s, "moved", d)
+	for _, c := range []blob.Class{blob.Infrequent, blob.Archive, blob.Standard, blob.Infrequent} {
+		if err := s.SetClass(ctx, "moved", c); err != nil {
+			t.Fatalf("SetClass %d: %v", c, err)
+		}
+		if got := class("moved", c); got != c {
+			t.Fatalf("set to class %d, stored in %d", c, got)
+		}
+		if got := get(t, s, "moved"); !bytes.Equal(got, d) {
+			t.Fatalf("class %d: the object's bytes changed", c)
+		}
+	}
+}
+
+// SetClass of a key with no object is ErrNotFound, on every store.
+func testClassOfMissing(t *testing.T, s blob.Store) {
+	if err := s.SetClass(context.Background(), "nothing/here", blob.Infrequent); !errors.Is(err, blob.ErrNotFound) {
+		t.Fatalf("SetClass of a missing key: %v, want ErrNotFound", err)
+	}
+}
+
+// A staged object commits whatever is at its key: Commit refuses IfAbsent, storing nothing.
+func testCommitRefusesIfAbsent(t *testing.T, s blob.Store) {
+	ctx := context.Background()
+	if err := stage(t, s, "tmp/ifabsent", data(1_000), 500).Commit(ctx, "staged/ifabsent", blob.IfAbsent()); err == nil {
+		t.Fatal("Commit took IfAbsent")
+	}
+	if _, err := s.Stat(ctx, "staged/ifabsent"); !errors.Is(err, blob.ErrNotFound) {
+		t.Fatalf("a refused commit stored its object: %v", err)
 	}
 }
 

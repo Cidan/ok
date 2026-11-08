@@ -14,6 +14,7 @@ import (
 	"github.com/klauspost/compress/zstd"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/Cidan/ok/internal/blob"
 	"github.com/Cidan/ok/internal/scm/contentindex"
 	"github.com/Cidan/ok/internal/scm/encoding"
 	"github.com/Cidan/ok/internal/scm/pack"
@@ -106,7 +107,7 @@ type compactChunk struct {
 // transaction moves its records to it, in the index; the source packs left with nothing live are
 // retired once every new pack is written. Readers that located a chunk in a retired pack still read
 // it: a retired pack stays in S3 for RetiredPackGrace.
-func (s *Store) compact(ctx context.Context, repo int64, opts GCOptions, r *GCReport) error {
+func (s *Store) compact(ctx context.Context, repo int64, ts *tierScan, opts GCOptions, r *GCReport) error {
 	net, netScope, err := s.networkOf(ctx, repo)
 	if err != nil {
 		return err
@@ -142,7 +143,16 @@ func (s *Store) compact(ctx context.Context, repo int64, opts GCOptions, r *GCRe
 	if err != nil {
 		return err
 	}
-	var empty, old, sparse, small, loose []compactPack
+	// With tiering, a pack at least half of whose live bytes turned cold is split (tiering.go).
+	var packTiers map[uint64]packTier
+	if ts != nil {
+		t, err := ts.scan(ctx, v, nil)
+		if err != nil {
+			return err
+		}
+		packTiers = t.packs
+	}
+	var empty, old, sparse, small, loose, mixed []compactPack
 	for _, row := range live {
 		p := compactPack{id: row.ID, num: row.Num, size: row.Size, compacted: row.Compacted}
 		if st := stats[p.num]; st != nil {
@@ -159,6 +169,8 @@ func (s *Store) compact(ctx context.Context, repo int64, opts GCOptions, r *GCRe
 			small = append(small, p)
 		case p.loose():
 			loose = append(loose, p)
+		case p.compacted && packTiers[p.num].mixed():
+			mixed = append(mixed, p)
 		}
 	}
 	if len(empty) > 0 {
@@ -182,6 +194,7 @@ func (s *Store) compact(ctx context.Context, repo int64, opts GCOptions, r *GCRe
 	}
 	sources = append(sources, loose...)
 	sources = append(sources, old...)
+	sources = append(sources, mixed...)
 	var budget int64
 	var chosen []compactPack
 	for _, p := range sources {
@@ -199,21 +212,56 @@ func (s *Store) compact(ctx context.Context, repo int64, opts GCOptions, r *GCRe
 	if err != nil {
 		return err
 	}
-	// Outputs of up to maxPackBytes, in order, as their records stand now: frames only shrink them.
-	var outputs [][]compactChunk
-	var cur []compactChunk
-	var curBytes int64
-	for _, c := range chunks {
-		n := c.loc.Footprint()
-		if len(cur) > 0 && curBytes+n > maxPackBytes {
-			outputs = append(outputs, cur)
-			cur, curBytes = nil, 0
+	// Hot chunks, trees, and cold chunks go in packs of their own, the cold ones in the cold class
+	// (tiering.go), each in the order it has: a tree is never cold, and a pack of trees beside hot
+	// chunks would keep them hot once the chunks turn cold.
+	coldChunks := map[encoding.ID]bool{}
+	if ts != nil {
+		within := make(map[uint64]bool, len(chosen))
+		for _, p := range chosen {
+			within[p.num] = true
 		}
-		cur = append(cur, c)
-		curBytes += n
+		t, err := ts.scan(ctx, v, within)
+		if err != nil {
+			return err
+		}
+		coldChunks = t.chunks
 	}
-	if len(cur) > 0 {
-		outputs = append(outputs, cur)
+	var hot, trees, cold []compactChunk
+	for _, c := range chunks {
+		switch {
+		case coldChunks[c.id]:
+			cold = append(cold, c)
+		case ts != nil && c.kind == encoding.KindTree:
+			trees = append(trees, c)
+		default:
+			hot = append(hot, c)
+		}
+	}
+	// Outputs of up to maxPackBytes, in order, as their records stand now: frames only shrink them.
+	type output struct {
+		chunks []compactChunk
+		class  blob.Class
+	}
+	var outputs []output
+	for _, part := range []struct {
+		chunks []compactChunk
+		class  blob.Class
+	}{{hot, blob.Standard}, {trees, blob.Standard}, {cold, s.coldClass}} {
+		var cur []compactChunk
+		var curBytes int64
+		for _, c := range part.chunks {
+			n := c.loc.Footprint()
+			if len(cur) > 0 && curBytes+n > maxPackBytes {
+				outputs = append(outputs, output{cur, part.class})
+				cur, curBytes = nil, 0
+			}
+			cur = append(cur, c)
+			curBytes += n
+		}
+		if len(cur) > 0 {
+			outputs = append(outputs, output{cur, part.class})
+		}
 	}
 	sourceIDs := make([]encoding.ID, len(chosen))
 	sizes := make(map[encoding.ID]int64, len(chosen))
@@ -231,11 +279,14 @@ func (s *Store) compact(ctx context.Context, repo int64, opts GCOptions, r *GCRe
 		}
 		for _, o := range outputs {
 			out += pack.PackOverhead
-			for i, c := range o {
-				if i == 0 || c.pack != o[i-1].pack || c.loc.DataOffset() != o[i-1].loc.DataOffset() {
+			for i, c := range o.chunks {
+				if i == 0 || c.pack != o.chunks[i-1].pack || c.loc.DataOffset() != o.chunks[i-1].loc.DataOffset() {
 					r.BytesRead += int64(c.loc.StoredLength)
 				}
 				out += c.loc.Footprint()
+			}
+			if o.class != blob.Standard {
+				r.ColdPacksWritten++
 			}
 		}
 		r.PacksWritten += len(outputs)
@@ -251,11 +302,14 @@ func (s *Store) compact(ctx context.Context, repo int64, opts GCOptions, r *GCRe
 	defer encs.close()
 	var written int64
 	for _, out := range outputs {
-		size, err := s.writeCompacted(ctx, net, out, sizes, encs, r)
+		size, err := s.writeCompacted(ctx, net, out.chunks, out.class, sizes, encs, r)
 		if err != nil {
 			return err
 		}
 		r.PacksWritten++
+		if out.class != blob.Standard {
+			r.ColdPacksWritten++
+		}
 		written += size
 	}
 	retired, freed, err := s.retireDrained(ctx, net, sourceIDs, false)
@@ -537,7 +591,7 @@ const sourceFrames = 16
 
 // writeCompacted writes one output pack of chunks, read from their source packs (of sizes) a window
 // at a time, to the bucket as it is written, reads it back, and records it.
-func (s *Store) writeCompacted(ctx context.Context, net backend.Network, chunks []compactChunk, sizes map[encoding.ID]int64, encs *compactEncoders, r *GCReport) (int64, error) {
+func (s *Store) writeCompacted(ctx context.Context, net backend.Network, chunks []compactChunk, class blob.Class, sizes map[encoding.ID]int64, encs *compactEncoders, r *GCReport) (int64, error) {
 	st, err := s.blobs.Stage(ctx, staging(packPrefix(net)))
 	if err != nil {
 		return 0, err
@@ -657,7 +711,7 @@ func (s *Store) writeCompacted(ctx context.Context, net backend.Network, chunks 
 	if err != nil {
 		return 0, err
 	}
-	if err := st.Commit(ctx, packKey(net, packID)); err != nil {
+	if err := st.Commit(ctx, packKey(net, packID), blob.WithClass(class)); err != nil {
 		return 0, err
 	}
 	if err := s.checkStored(ctx, packKey(net, packID), written.Sum(nil), size); err != nil {
@@ -675,7 +729,7 @@ func (s *Store) writeCompacted(ctx context.Context, net backend.Network, chunks 
 		if err != nil {
 			return err
 		}
-		num, err := tx.InsertPack(ctx, net, packID, size)
+		num, err := tx.InsertPack(ctx, net, packID, size, int16(class))
 		if err != nil {
 			return err
 		}

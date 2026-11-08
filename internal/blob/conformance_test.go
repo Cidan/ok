@@ -1,6 +1,7 @@
 package blob_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
@@ -11,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -171,5 +173,157 @@ func TestFSKeys(t *testing.T) {
 		if err := s.Put(ctx, k, strings.NewReader("x"), 1); err == nil {
 			t.Errorf("Put %q succeeded", k)
 		}
+	}
+}
+
+// recorder records each request's method, path, and the headers and body that carry a class.
+type recorder struct {
+	base http.RoundTripper
+	mu   sync.Mutex
+	seen []recorded
+}
+
+type recorded struct {
+	method, path, class, directive, source, body string
+}
+
+func (r *recorder) RoundTrip(req *http.Request) (*http.Response, error) {
+	var body []byte
+	if req.Body != nil && req.Header.Get("Content-Type") == "application/json" {
+		b, err := io.ReadAll(req.Body)
+		if err != nil {
+			return nil, err
+		}
+		req.Body = io.NopCloser(bytes.NewReader(b))
+		body = b
+	}
+	r.mu.Lock()
+	r.seen = append(r.seen, recorded{method: req.Method, path: req.URL.Path, class: req.Header.Get("X-Amz-Storage-Class"),
+		directive: req.Header.Get("X-Amz-Metadata-Directive"), source: req.Header.Get("X-Amz-Copy-Source"), body: string(body)})
+	r.mu.Unlock()
+	return r.base.RoundTrip(req)
+}
+
+func (r *recorder) take() []recorded {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := r.seen
+	r.seen = nil
+	return out
+}
+
+// S3 is asked for each class by its own name: a put names it; a staged commit's copy and SetClass's
+// copy onto itself name it, STANDARD spelled out, with the metadata replaced — S3 copies in STANDARD
+// what a copy names no class of, and copies an object onto itself only so.
+func TestS3SendsClasses(t *testing.T) {
+	srv := testdb.S3(t)
+	rec := &recorder{base: http.DefaultTransport.(*http.Transport).Clone()}
+	s, err := blob.NewS3(blob.Config{
+		Endpoint: srv.Endpoint, Bucket: testdb.Bucket(t),
+		AccessKey: srv.AccessKey, SecretKey: srv.SecretKey, Region: srv.Region, Transport: rec,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	puts := func(want string) {
+		t.Helper()
+		for _, r := range rec.take() {
+			if r.method == http.MethodPut && r.source == "" && !strings.Contains(r.path, "/tmp/") {
+				if r.class != want {
+					t.Errorf("PUT %s names class %q, want %q", r.path, r.class, want)
+				}
+				return
+			}
+		}
+		t.Fatalf("no PUT of the object (want class %q)", want)
+	}
+	copies := func(want string) {
+		t.Helper()
+		for _, r := range rec.take() {
+			if r.method == http.MethodPut && r.source != "" {
+				if r.class != want || (want != "" && r.directive != "REPLACE") {
+					t.Errorf("copy to %s names class %q, directive %q; want %q, REPLACE", r.path, r.class, r.directive, want)
+				}
+				return
+			}
+		}
+		t.Fatalf("no copy (want class %q)", want)
+	}
+	for c, name := range map[blob.Class]string{blob.Standard: "", blob.Infrequent: "STANDARD_IA", blob.Archive: "GLACIER_IR"} {
+		if err := s.Put(ctx, "p", strings.NewReader("x"), 1, blob.WithClass(c)); err != nil {
+			t.Fatal(err)
+		}
+		puts(name)
+		st, err := s.Stage(ctx, "tmp/s")
+		if err != nil {
+			t.Fatal(err)
+		}
+		st.Write([]byte("staged"))
+		if err := st.Commit(ctx, "c", blob.WithClass(c)); err != nil {
+			t.Fatal(err)
+		}
+		copies(name)
+		if err := s.SetClass(ctx, "p", c); err != nil {
+			t.Fatal(err)
+		}
+		if name == "" {
+			name = "STANDARD"
+		}
+		copies(name)
+	}
+}
+
+// GCS is asked for each class by its own name: a staged commit's rewrite and SetClass's rewrite
+// onto itself carry it, STANDARD spelled out.
+func TestGCSSendsClasses(t *testing.T) {
+	srv, err := fakestorage.NewServerWithOptions(fakestorage.Options{NoListener: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(srv.Stop)
+	srv.CreateBucketWithOpts(fakestorage.CreateBucketOpts{Name: "classes"})
+	rec := &recorder{base: srv.HTTPClient().Transport}
+	client, err := storage.NewClient(t.Context(), option.WithCredentials(&google.Credentials{}), option.WithHTTPClient(&http.Client{Transport: rec}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { client.Close() })
+	s := blob.NewGCSFromClient(client, "classes")
+	ctx := context.Background()
+	rewrites := func(want string) {
+		t.Helper()
+		for _, r := range rec.take() {
+			if strings.Contains(r.path, "/rewriteTo/") {
+				if !strings.Contains(r.body, `"storageClass":"`+want+`"`) {
+					t.Errorf("rewrite %s: %s; want storageClass %s", r.path, r.body, want)
+				}
+				return
+			}
+		}
+		t.Fatalf("no rewrite (want %s)", want)
+	}
+	for c, name := range map[blob.Class]string{blob.Standard: "STANDARD", blob.Infrequent: "NEARLINE", blob.Archive: "ARCHIVE"} {
+		if err := s.Put(ctx, "p", strings.NewReader("x"), 1); err != nil {
+			t.Fatal(err)
+		}
+		rec.take()
+		if err := s.SetClass(ctx, "p", c); err != nil {
+			t.Fatal(err)
+		}
+		rewrites(name)
+		if c == blob.Standard {
+			continue
+		}
+		st, err := s.Stage(ctx, "tmp/s")
+		if err != nil {
+			t.Fatal(err)
+		}
+		st.Write([]byte("staged"))
+		rec.take()
+		if err := st.Commit(ctx, "c", blob.WithClass(c)); err != nil {
+			t.Fatal(err)
+		}
+		rewrites(name)
 	}
 }

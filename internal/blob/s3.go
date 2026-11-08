@@ -99,6 +99,16 @@ func (s *S3) wrap(op, key string, err error) error {
 // s3Classes are S3's names for each Class.
 var s3Classes = map[Class]string{Standard: "", Infrequent: "STANDARD_IA", Archive: "GLACIER_IR"}
 
+// s3ClassOf is the Class of S3's name for one: Standard for STANDARD, none, and a name ok never sets.
+func s3ClassOf(name string) Class {
+	for c, n := range s3Classes {
+		if n != "" && n == name {
+			return c
+		}
+	}
+	return Standard
+}
+
 func (s *S3) Put(ctx context.Context, key string, r io.Reader, size int64, opts ...PutOption) (err error) {
 	defer func(start time.Time) { observe(s.bucket, "put", start, size, err) }(time.Now())
 	o := putOpts(opts)
@@ -171,7 +181,7 @@ func (s *S3) Stat(ctx context.Context, key string) (_ Object, err error) {
 	if err != nil {
 		return Object{}, s.wrap("stat", key, err)
 	}
-	return Object{Key: info.Key, Size: info.Size, Modified: info.LastModified}, nil
+	return Object{Key: info.Key, Size: info.Size, Modified: info.LastModified, Class: s3ClassOf(info.StorageClass)}, nil
 }
 
 // Delete removes keys: one with one request, more with S3's multi-object delete, up to 1,000 keys
@@ -235,7 +245,7 @@ func (s *S3) list(ctx context.Context, prefix, after string, limit int) (_ []Obj
 		if limit > 0 && len(out) == limit {
 			return out, out[len(out)-1].Key, nil
 		}
-		out = append(out, Object{Key: info.Key, Size: info.Size, Modified: info.LastModified})
+		out = append(out, Object{Key: info.Key, Size: info.Size, Modified: info.LastModified, Class: s3ClassOf(info.StorageClass)})
 	}
 	return out, "", nil
 }
@@ -245,11 +255,30 @@ const copyLimit = 5 << 30
 
 func (s *S3) Copy(ctx context.Context, src, dst string) (err error) {
 	defer func(start time.Time) { observe(s.bucket, "copy", start, 0, err) }(time.Now())
+	return s.copy(ctx, src, dst, nil)
+}
+
+func (s *S3) SetClass(ctx context.Context, key string, c Class) (err error) {
+	defer func(start time.Time) { observe(s.bucket, "class", start, 0, err) }(time.Now())
+	return s.copy(ctx, key, key, &c)
+}
+
+// copy copies src to dst, in class c if it is set: S3 copies an object in STANDARD unless the copy
+// names another, and copies one onto itself only so, its metadata replaced.
+func (s *S3) copy(ctx context.Context, src, dst string, c *Class) error {
 	info, err := s.client.StatObject(ctx, s.bucket, src, minio.StatObjectOptions{})
 	if err != nil {
 		return s.wrap("copy", src, err)
 	}
 	d := minio.CopyDestOptions{Bucket: s.bucket, Object: dst}
+	if c != nil {
+		name := s3Classes[*c]
+		if name == "" {
+			name = "STANDARD"
+		}
+		d.ReplaceMetadata, d.ContentType = true, "application/octet-stream"
+		d.UserMetadata = map[string]string{"X-Amz-Storage-Class": name}
+	}
 	sr := minio.CopySrcOptions{Bucket: s.bucket, Object: src}
 	if info.Size > copyLimit {
 		_, err = s.client.ComposeObject(ctx, d, sr)
@@ -305,10 +334,15 @@ func (st *s3Staged) Write(p []byte) (int, error) {
 	return n, err
 }
 
-func (st *s3Staged) Commit(ctx context.Context, key string) (err error) {
+func (st *s3Staged) Commit(ctx context.Context, key string, opts ...PutOption) (err error) {
 	defer func(start time.Time) { observe(st.s.bucket, "put", start, st.n, err) }(time.Now())
 	if st.done {
 		return errors.New("blob: a staged object committed after it ended")
+	}
+	o, err := commitOpts(opts)
+	if err != nil {
+		st.Abort()
+		return err
 	}
 	st.done = true
 	st.pw.Close()
@@ -317,7 +351,11 @@ func (st *s3Staged) Commit(ctx context.Context, key string) (err error) {
 	}
 	// tmp goes whether the copy succeeds or not; one this delete misses, the caller's sweep takes.
 	defer st.s.client.RemoveObject(context.WithoutCancel(ctx), st.s.bucket, st.tmp, minio.RemoveObjectOptions{})
-	return st.s.Copy(ctx, st.tmp, key)
+	var class *Class
+	if o.class != Standard {
+		class = &o.class
+	}
+	return st.s.copy(ctx, st.tmp, key, class)
 }
 
 func (st *s3Staged) Abort() {

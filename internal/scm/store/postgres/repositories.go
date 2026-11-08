@@ -615,11 +615,16 @@ func (x queries) PutPack(ctx context.Context, net backend.Network, id encoding.I
 	return num, err
 }
 
-func (x queries) InsertPack(ctx context.Context, net backend.Network, id encoding.ID, size int64) (uint64, error) {
+func (x queries) InsertPack(ctx context.Context, net backend.Network, id encoding.ID, size int64, class int16) (uint64, error) {
 	var num uint64
-	err := x.q.QueryRow(ctx, `INSERT INTO pack (network_id, id, size, compacted) VALUES ($1, $2, $3, true) RETURNING num`,
-		net, id[:], size).Scan(&num)
+	err := x.q.QueryRow(ctx, `INSERT INTO pack (network_id, id, size, compacted, class) VALUES ($1, $2, $3, true, $4) RETURNING num`,
+		net, id[:], size, class).Scan(&num)
 	return num, err
+}
+
+func (x queries) SetPackClass(ctx context.Context, net backend.Network, id encoding.ID, class int16) error {
+	_, err := x.q.Exec(ctx, `UPDATE pack SET class = $3 WHERE network_id = $1 AND id = $2`, net, id[:], class)
+	return err
 }
 
 func (x queries) NumberedPacks(ctx context.Context, net backend.Network, nums []uint64) (map[uint64]encoding.ID, error) {
@@ -649,7 +654,7 @@ func (x queries) NumberedPacks(ctx context.Context, net backend.Network, nums []
 }
 
 func (x queries) LivePacks(ctx context.Context, net backend.Network) ([]backend.Pack, error) {
-	rows, err := x.q.Query(ctx, `SELECT id, num, size, compacted FROM pack
+	rows, err := x.q.Query(ctx, `SELECT id, num, size, compacted, class FROM pack
 		WHERE network_id = $1 AND retired_at IS NULL ORDER BY created_at, id`, net)
 	if err != nil {
 		return nil, err
@@ -659,7 +664,7 @@ func (x queries) LivePacks(ctx context.Context, net backend.Network) ([]backend.
 	for rows.Next() {
 		var b []byte
 		var p backend.Pack
-		if err := rows.Scan(&b, &p.Num, &p.Size, &p.Compacted); err != nil {
+		if err := rows.Scan(&b, &p.Num, &p.Size, &p.Compacted, &p.Class); err != nil {
 			return nil, err
 		}
 		if p.ID, err = toID(b); err != nil {

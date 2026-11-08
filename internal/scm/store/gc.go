@@ -80,6 +80,12 @@ type GCReport struct {
 	RecordsFramed              int64
 	PacksUpgraded              int
 	PacksDeleted, OrphanPacks  int
+	// Tiering (tiering.go): the packs it moved to the cold class, and their bytes, and those it moved
+	// back to the standard class; the cold packs compaction wrote; whether more wait to move.
+	PacksCooled, PacksWarmed int
+	BytesCooled              int64
+	ColdPacksWritten         int
+	TierMore                 bool
 	// Segments merged away past their grace, and segments no row records, deleted.
 	SegmentsDeleted, OrphanSegments int
 	// Checkouts kept past CheckoutRetention, not of main's head, and their layers no kept checkout
@@ -182,8 +188,15 @@ func (s *Store) GC(ctx context.Context, repo int64, now time.Time, opts GCOption
 			return r, fmt.Errorf("training a dictionary: %w", err)
 		}
 	}
-	if err := s.compact(ctx, repo, opts, r); err != nil {
+	ts, err := s.newTierScan(ctx, net, now)
+	if err != nil {
+		return r, fmt.Errorf("tiering: %w", err)
+	}
+	if err := s.compact(ctx, repo, ts, opts, r); err != nil {
 		return r, fmt.Errorf("compaction: %w", err)
+	}
+	if err := s.tierPacks(ctx, repo, ts, opts, r); err != nil {
+		return r, fmt.Errorf("tiering: %w", err)
 	}
 	if err := s.deletePacks(ctx, repo, now, opts, r); err != nil {
 		return r, fmt.Errorf("deleting packs: %w", err)
@@ -1203,6 +1216,12 @@ func (r *GCReport) String() string {
 		}
 		if r.PacksUpgraded > 0 {
 			dict += fmt.Sprintf(", rewriting %d packs of records", r.PacksUpgraded)
+		}
+	}
+	if r.PacksCooled > 0 || r.PacksWarmed > 0 || r.ColdPacksWritten > 0 {
+		dict += fmt.Sprintf("; moved %d packs (%d bytes) to the cold class and %d back, and wrote %d cold", r.PacksCooled, r.BytesCooled, r.PacksWarmed, r.ColdPacksWritten)
+		if r.TierMore {
+			dict += ", more to move"
 		}
 	}
 	if r.ContentKept > 0 {

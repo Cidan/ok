@@ -934,15 +934,21 @@ func (x queries) PutPack(ctx context.Context, net backend.Network, id encoding.I
 	return uint64(num), err
 }
 
-func (x queries) InsertPack(ctx context.Context, net backend.Network, id encoding.ID, size int64) (uint64, error) {
+func (x queries) InsertPack(ctx context.Context, net backend.Network, id encoding.ID, size int64, class int16) (uint64, error) {
 	num, err := x.packNum(ctx, net)
 	if err != nil {
 		return 0, err
 	}
-	_, err = x.exec(ctx, `INSERT INTO pack (network_id, id, size, created_at, num, compacted)
-		VALUES (@net, @id, @size, `+now+`, @num, true)`,
-		map[string]any{"net": int64(net), "id": id[:], "size": size, "num": num})
+	_, err = x.exec(ctx, `INSERT INTO pack (network_id, id, size, created_at, num, compacted, class)
+		VALUES (@net, @id, @size, `+now+`, @num, true, @class)`,
+		map[string]any{"net": int64(net), "id": id[:], "size": size, "num": num, "class": int64(class)})
 	return uint64(num), x.numberTaken(net, err)
+}
+
+func (x queries) SetPackClass(ctx context.Context, net backend.Network, id encoding.ID, class int16) error {
+	_, err := x.exec(ctx, `UPDATE pack SET class = @class WHERE network_id = @net AND id = @id`,
+		map[string]any{"net": int64(net), "id": id[:], "class": int64(class)})
+	return err
 }
 
 // packBlock is how many pack numbers a replica reserves of a network's counter at once: the
@@ -1057,14 +1063,15 @@ func (x queries) NumberedPacks(ctx context.Context, net backend.Network, nums []
 
 func (x queries) LivePacks(ctx context.Context, net backend.Network) ([]backend.Pack, error) {
 	var out []backend.Pack
-	err := x.rows(ctx, `SELECT id, num, size, compacted FROM pack WHERE network_id = @net AND retired_at IS NULL ORDER BY created_at, id`,
+	err := x.rows(ctx, `SELECT id, num, size, compacted, class FROM pack WHERE network_id = @net AND retired_at IS NULL ORDER BY created_at, id`,
 		map[string]any{"net": int64(net)}, func() { out = nil }, func(row *spanner.Row) error {
 			var b []byte
-			var num int64
+			var num, class int64
 			var p backend.Pack
-			if err := row.Columns(&b, &num, &p.Size, &p.Compacted); err != nil {
+			if err := row.Columns(&b, &num, &p.Size, &p.Compacted, &class); err != nil {
 				return err
 			}
+			p.Class = int16(class)
 			var err error
 			if p.ID, err = toID(b); err != nil {
 				return err

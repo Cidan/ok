@@ -1692,6 +1692,40 @@ repositories themselves are never deleted (see "Decisions").
   share an ID or a key even when they hold the same chunks. Nothing ever writes a deleted pack's
   key again, which is what makes deleting retired and orphan packs safe beside publishes.
 
+### Tiering
+
+Main's history is kept forever, and read rarely: a checkout, a build, and a review read what main's
+head and open work hold. With `scm.tiering.class` set (docs/configuration.md), packs that hold only
+what is read rarely are kept in the object store's cold class — `infrequent`, S3's `STANDARD_IA` or
+GCS's `NEARLINE`, or `archive`, `GLACIER_IR` or `ARCHIVE` — and the rest in its standard class.
+Every class reads at once: a read of history is the same read, only dearer (`internal/scm/store`,
+`tiering.go`).
+
+- **What is cold.** A chunk is cold when no repository of its network has it on main's head — a
+  head's files', or its large trees' — and every repository that holds it holds it pinned, as main's
+  history and uploads are, and has since before `scm.tiering.after` (30 days, the least an
+  infrequent class bills an object for). A chunk a workspace published, and one pinned lately, is
+  hot; a tree is never cold, since every walk of a commit reads its trees. The network is decided as
+  one: a chunk on a fork's head is hot in every repository of it.
+- **Deciding it.** A collection reads what every repository of the network has on main's head once
+  — a walk of each head, the dear part — and decides each record the network's chunk index locates
+  by merging that index, in ID order, against each repository's content index, as both are kept: no
+  map of every chunk is made.
+- **Compaction.** It writes hot chunks, trees, and cold chunks in packs of their own, the cold ones
+  in the cold class, and splits so a compacted pack at least half of whose live bytes turned cold:
+  files that left main's head, beside some still on it — a pack of a head's files has nothing dead
+  in it, and would otherwise never be rewritten.
+- **Moving packs.** The daily collection of the network's first repository then moves each
+  compacted pack of 1 MiB or more all of whose records turned cold to the cold class, and each cold
+  one a record of which turned hot again — a file came back to main's head — to the standard class,
+  up to 10,000 a day, each in place: the object store copies it onto itself in its new class, its
+  key and bytes unchanged, then its row records the class (`pack.class`), so no pass reads an object
+  to know where it is. A pack the copy moved but whose row was not updated is moved again, already
+  there.
+- **Off.** With no class set, every pack stays standard, and compaction writes them so. A store that
+  refuses a class — MinIO, and Ceph without a storage class of that name — must not be given one:
+  its collection would fail at the first pack it moves.
+
 ### Running it
 
 Every `ok scm` replica runs the GC node, and each repository's collection is keyed work

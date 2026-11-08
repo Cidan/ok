@@ -424,7 +424,21 @@ type SCM struct {
 	// PublishMemory bounds, in bytes, the memory every publish at once holds its packs in before
 	// they go to the bucket; zero for the default.
 	PublishMemory int64 `yaml:"publish_memory"`
+	// Tiering keeps packs of what is read rarely in the object store's cold class (docs/scm.md,
+	// "Tiering"); off unless it names one.
+	Tiering Tiering `yaml:"tiering"`
 }
+
+// Tiering is the SCM's storage tiering: the class packs of cold records are kept in — infrequent
+// (S3's STANDARD_IA, GCS's NEARLINE) or archive (GLACIER_IR, ARCHIVE), "" for none — and how long a
+// pinned chunk stays hot after it was put or pinned (default 30 days).
+type Tiering struct {
+	Class string        `yaml:"class"`
+	After time.Duration `yaml:"after"`
+}
+
+// TieringClasses are the classes scm.tiering.class names, by name.
+var TieringClasses = map[string]blob.Class{"": blob.Standard, "infrequent": blob.Infrequent, "archive": blob.Archive}
 
 // SCMCache bounds the SCM's in-memory caches.
 type SCMCache struct {
@@ -1136,6 +1150,15 @@ func (c *Config) check() error {
 	}
 	if h := c.SCM.GCHour; h != nil && (*h < 0 || *h > 23) {
 		add("scm.gc_hour is an hour, 0 to 23")
+	}
+	if _, ok := TieringClasses[c.SCM.Tiering.Class]; !ok {
+		add("scm.tiering.class is infrequent or archive, or none: not %q", c.SCM.Tiering.Class)
+	}
+	if c.SCM.Tiering.After < 0 {
+		add("scm.tiering.after is not negative")
+	}
+	if c.SCM.Tiering.Class != "" && c.SCM.Objects.Type == "fs" {
+		add("scm.tiering.class: a directory has no classes")
 	}
 	if c.Workload.TokenFile != "" && c.Workload.CredentialDir != "" {
 		add("workload names a token_file or a credential_dir, not both")

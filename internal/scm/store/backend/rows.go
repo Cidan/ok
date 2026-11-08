@@ -97,6 +97,9 @@ type Pack struct {
 	Num       uint64
 	Size      int64
 	Compacted bool
+	// Class is the object store's class the pack is kept in (blob.Class): standard, or the cold
+	// class tiering moved it to.
+	Class int16
 }
 
 // Segment is a manifest's reference to a segment: its scope's, a repository's or a network's. Net

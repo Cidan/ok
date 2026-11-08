@@ -118,7 +118,7 @@ func TestPackOfTreesAlone(t *testing.T) {
 		t.Fatalf("%d live packs after a publish of a tree alone, want %d", live, before+1)
 	}
 	r := &GCReport{}
-	if err := e.s.compact(ctx, e.repo, GCOptions{}, r); err != nil {
+	if err := e.s.compact(ctx, e.repo, nil, GCOptions{}, r); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := e.s.DeleteRetiredOf(ctx, e.repo, time.Now().Add(2*RetiredPackGrace)); err != nil {
