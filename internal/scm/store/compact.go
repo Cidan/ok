@@ -122,7 +122,7 @@ func (s *Store) compact(ctx context.Context, repo int64, opts GCOptions, r *GCRe
 	}
 	stats := map[uint64]*packStats{}
 	err = v.each(ctx, func(_ encoding.ID, e contentindex.Entry) bool {
-		if !contentindex.Located(e.Kind) {
+		if !e.Located() {
 			return true
 		}
 		st := stats[e.Loc.Pack]
@@ -289,7 +289,7 @@ func (s *Store) compactChunks(ctx context.Context, repo int64, v *contentView, s
 	var out []compactChunk
 	at := map[encoding.ID]int{}
 	err = v.each(ctx, func(id encoding.ID, e contentindex.Entry) bool {
-		if pid, ok := byNum[e.Loc.Pack]; ok && contentindex.Located(e.Kind) {
+		if pid, ok := byNum[e.Loc.Pack]; ok && e.Located() {
 			group := groupRest
 			if e.Kind == encoding.KindTree {
 				group = groupTrees
@@ -729,7 +729,7 @@ func (s *Store) retireDrained(ctx context.Context, net backend.Network, packIDs 
 	}
 	used := map[uint64]bool{}
 	err = v.each(ctx, func(_ encoding.ID, e contentindex.Entry) bool {
-		if contentindex.Located(e.Kind) {
+		if e.Located() {
 			used[e.Loc.Pack] = true
 		}
 		return true

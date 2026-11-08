@@ -205,7 +205,11 @@ func refsOut(rs []store.ObjectRef) []*scmpb.ObjectRef {
 }
 
 func objectOut(o store.EncodedObject) *scmpb.EncodedObject {
-	return &scmpb.EncodedObject{Kind: scmpb.ObjectKind(o.Kind), Id: o.ID[:], Body: o.Body}
+	out := &scmpb.EncodedObject{Kind: scmpb.ObjectKind(o.Kind), Id: o.ID[:], Body: o.Body, Size: o.Size}
+	for _, c := range o.Chunks {
+		out.Chunks = append(out.Chunks, &scmpb.ChunkRef{Id: c.ID[:], Length: c.Length})
+	}
+	return out
 }
 
 func resultOut(r store.ObjectResult) *scmpb.ObjectResult {
@@ -311,6 +315,32 @@ func (s *Store) ReadObjects(req *scmpb.ReadObjectsRequest, stream grpc.ServerStr
 	refs, err := refsIn(req.GetRefs(), "refs")
 	if err != nil {
 		return err
+	}
+	if req.GetLargeTreesAsChunks() {
+		var trees []encoding.ID
+		for _, r := range refs {
+			if r.Kind == encoding.KindTree {
+				trees = append(trees, r.ID)
+			}
+		}
+		large, err := s.c.store.LargeTrees(ctx, req.GetRepositoryId(), trees)
+		if err != nil {
+			return toStatus(err)
+		}
+		if len(large) > 0 {
+			rest := refs[:0:0]
+			for _, r := range refs {
+				e, ok := large[r.ID]
+				if !ok || r.Kind != encoding.KindTree {
+					rest = append(rest, r)
+					continue
+				}
+				if err := stream.Send(&scmpb.ObjectResult{Result: &scmpb.ObjectResult_Object{Object: objectOut(store.LargeTreeObject(r.ID, e))}}); err != nil {
+					return err
+				}
+			}
+			refs = rest
+		}
 	}
 	res, err := s.c.store.ReadObjects(ctx, req.GetRepositoryId(), refs)
 	if err != nil {
@@ -507,7 +537,7 @@ func (s *Store) ReadTreeClosure(req *scmpb.ReadTreeClosureRequest, stream grpc.S
 		}
 	}
 	return toStatus(s.c.store.ReadTreeClosure(ctx, req.GetRepositoryId(), id, base, req.GetPathPrefixes(), req.GetWithSizes(),
-		func(o store.EncodedObject) error { return stream.Send(objectOut(o)) }))
+		req.GetLargeTreesAsChunks(), func(o store.EncodedObject) error { return stream.Send(objectOut(o)) }))
 }
 
 // ReadCheckout streams a commit's checkout: its header, then each layer the caller does not hold.
@@ -747,7 +777,7 @@ func (s *Store) Publish(stream grpc.BidiStreamingServer[scmpb.PublishRequest, sc
 		if err != nil {
 			return err
 		}
-		m := store.FileManifest{FileID: id, Size: f.GetSize(), PathHint: f.GetPathHint(), Chunks: make([]store.ChunkRef, len(f.GetChunks()))}
+		m := store.FileManifest{FileID: id, Size: f.GetSize(), PathHint: f.GetPathHint(), Tree: f.GetTree(), Chunks: make([]store.ChunkRef, len(f.GetChunks()))}
 		for j, c := range f.GetChunks() {
 			cid, err := idIn(c.GetId(), "begin.files.chunks.id")
 			if err != nil {

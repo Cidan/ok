@@ -351,6 +351,7 @@ pub(crate) async fn tree_closure(
             path_prefixes: Vec::new(),
             with_sizes: !with_files,
             base_tree_id: base.map(|b| b.to_vec()).unwrap_or_default(),
+            large_trees_as_chunks: true,
         })
         .await?
         .into_inner();
@@ -371,7 +372,11 @@ pub(crate) async fn tree_closure(
             }
             continue;
         }
-        let (key, canonical) = from_wire(o)?;
+        let (key, canonical) = if crate::shared::is_large_tree(&o) {
+            crate::shared::join_large_tree(&shared.client, &shared.cache, &o).await?
+        } else {
+            from_wire(o)?
+        };
         if let Ok(Object::Tree(tree)) = ok_encoding::decode(&canonical) {
             for entry in tree.entries() {
                 if let TreeValue::File { id, .. } = entry.value()

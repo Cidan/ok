@@ -1,0 +1,160 @@
+{
+  "cases": [
+    {
+      "name": "four thousand files",
+      "prefix": "file-",
+      "entries": 4000,
+      "tree": "fe53c500c0653c868c23375c76632f129354e8c749d73e1e745c752d51472848",
+      "size": 240008,
+      "chunks": [
+        {
+          "length": 8,
+          "id": "ede7c1271713142b014b7db08a3d5ee11fa1cad9a79c2055683e60bdc9816483"
+        },
+        {
+          "length": 19080,
+          "id": "1357c87d4bba6ca3c438bb9fb3019e3138ab603bbfa9c63e5f002ccb6ba40fea"
+        },
+        {
+          "length": 67080,
+          "id": "6c807b98d5155e495270ac3dbe7b3a451110697a3b2e78da348e8b8593489b6f"
+        },
+        {
+          "length": 98760,
+          "id": "3361a21c6e59f35fc7e974b6a2db2c7e2099f75c265ce9164671f96836adffe0"
+        },
+        {
+          "length": 37200,
+          "id": "fcfa1be59e296e7b6c2bdd999a33cb99220e8ef3dc00e5aa082494cfc15a837c"
+        },
+        {
+          "length": 17880,
+          "id": "78f72f2fea8d799b0a8b3f4a53db235aae651018e1cc568f4b93db1f4fc9538f"
+        }
+      ]
+    },
+    {
+      "name": "twenty thousand files of long names",
+      "prefix": "a-rather-longer-name-of-an-asset-",
+      "entries": 20000,
+      "tree": "8c5553dc0140c110ef1459ae6d27ade8adc01695ea180bdfe6ff23ef24728c3d",
+      "size": 1760008,
+      "chunks": [
+        {
+          "length": 8,
+          "id": "bea9b57e4dc7eae6ed0e0a018bf04ed7705f31dae7ca8394a1472522cdc77094"
+        },
+        {
+          "length": 24200,
+          "id": "9673a3152c1995b79936cfed0d0e313e36506f8839c76694f97fc3f9ce750487"
+        },
+        {
+          "length": 123376,
+          "id": "3a9dda55d29985c5c5ab751782fdc71588d10b4f5503b56ac010f9ff91bd641c"
+        },
+        {
+          "length": 78584,
+          "id": "fe322106111c401559d4cd1ccea8f34b9590204eefd48f4032fc786e124c4721"
+        },
+        {
+          "length": 102344,
+          "id": "3ebe8da524c11fa8c09497bf9efc64fb45d3fc3fd6be1303abc4a8fc8da42739"
+        },
+        {
+          "length": 29832,
+          "id": "12708ec51f1eb9a31e1d87bc03afeda08882be4595895fbccd96df77a1d012f7"
+        },
+        {
+          "length": 76208,
+          "id": "0131d9e961db5c1a72620a6f2f4fc0ee363d5813ac34a6f145c512f8e35e577e"
+        },
+        {
+          "length": 37400,
+          "id": "d0a58ba8baec4c76f4e43cae2ad5121228a89c38c340722d6d68871a8160c1c6"
+        },
+        {
+          "length": 90024,
+          "id": "fc03c23851eda2bbb648f271676c3c41151db86d6c700f53fc82d61fa1925d35"
+        },
+        {
+          "length": 46816,
+          "id": "e1a870bacdbcf063eb5f2133074c299a2bc97d240eb4ddb2d3dcb72f48fcf54d"
+        },
+        {
+          "length": 109032,
+          "id": "81842c3216c49b15bd433bc6ecd96ec24fa22f71fb64f54008e18e6722e76682"
+        },
+        {
+          "length": 66264,
+          "id": "e682416b6bbffc6135978208efde5b240d22a0613bc6c656ac7f71db6b65eb52"
+        },
+        {
+          "length": 24816,
+          "id": "8d0e7bcccc952608102c03baa98b9510925c97ae5d5bcbe615b13eb3a834db6c"
+        },
+        {
+          "length": 16456,
+          "id": "7d273169e1df92a29508d16345634bb42e75f2621d724b6b12a74d871b049ec4"
+        },
+        {
+          "length": 142648,
+          "id": "a5b6dd5d3d8ddc950f517884f4935ba2f6a0ddb4115db56afbb8fb6bdf00eb16"
+        },
+        {
+          "length": 38544,
+          "id": "43ea0820dcb304528c65bf0c34e4ec33fbdc9308c4d652147af0c0558f68a0ca"
+        },
+        {
+          "length": 122584,
+          "id": "25be953604314c294faceac9b51ce24a727d640d1159d75ea2bf6b6477dcc595"
+        },
+        {
+          "length": 86680,
+          "id": "ce30d7cbb0a77de766d709f2ec812ae38a9f5ab75801bbc11d83da5769b0fc66"
+        },
+        {
+          "length": 261888,
+          "id": "50e1ed22d8d036ac5c5e6b345d1adcd6cf2ff0644e00e76b1dc961a20fc64a6c"
+        },
+        {
+          "length": 40744,
+          "id": "b5fa05f4f7adb8e0dd6fb30349232de924ede376585639f914bae4a7afd28c0a"
+        },
+        {
+          "length": 23848,
+          "id": "d18eb820a57c2d5ab385f818cfc0bbd46381d29ba354076d631b755a0bb3a521"
+        },
+        {
+          "length": 66440,
+          "id": "8ffd81adc17d4bd7cccdaebfd449e8eab195271c784ad3b06d5d5eb5a7c9d594"
+        },
+        {
+          "length": 46464,
+          "id": "35ab7ad6320219700dbf012dd87f90f4ac993898dad35ceafdcd3fd84d8257ef"
+        },
+        {
+          "length": 25168,
+          "id": "c1feea9006707dbc7223b67dcb228813047dfbbb75bf3556f01fcaa04f8348f9"
+        },
+        {
+          "length": 17072,
+          "id": "b8572445479ac554859b331d8a82020bf98b4541f0ed8c4a9baebf4b7af7ea9d"
+        },
+        {
+          "length": 46288,
+          "id": "67a01a54d411027553fa68bdae28678a9b2eb52e343f543e672f877b978ad99a"
+        },
+        {
+          "length": 16280,
+          "id": "9dd0cffc7726a799a01fbac800929fe718a33c42343e622adebcb940c524ea59"
+        }
+      ]
+    }
+  ],
+  "comment": [
+    "Golden vectors for large trees' chunks (docs/scm.md, \"Large trees\"). Each case's tree is entries",
+    "files named prefix and the index in five digits, each one's ID the BLAKE3 of its name, executable",
+    "every seventh. internal/scm/encoding (Go) and jj's encoding (Rust) must encode it to a body of size",
+    "bytes whose tree ID is tree, and cut it into exactly chunks, each of length bytes and chunk ID id."
+  ]
+}

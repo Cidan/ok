@@ -22,6 +22,7 @@ mod layer;
 mod path_filter;
 #[cfg(test)]
 mod tests;
+mod tree_chunks;
 mod tree_sizes;
 
 pub use decode::decode;
@@ -33,6 +34,7 @@ pub use encode::{
 pub use graph::{GraphRecord, decode_graph_records};
 pub use layer::{LayerRecord, decode_layer_records};
 pub use path_filter::path_filter_holds;
+pub use tree_chunks::{TREE_CHUNK_THRESHOLD, chunk_tree};
 pub use tree_sizes::{
     KIND_TREE_SIZES, TREE_SIZES_VERSION, TreeSizes, decode_tree_sizes, encode_tree_sizes,
 };

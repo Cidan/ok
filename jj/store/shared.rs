@@ -543,21 +543,98 @@ async fn read_objects(
             .read_objects(pb::ReadObjectsRequest {
                 repository_id,
                 refs,
+                large_trees_as_chunks: true,
             })
             .await?
             .into_inner()
     };
     let mut found = HashMap::new();
     let mut puts = Puts::default();
+    let mut large = Vec::new();
     while let Some(result) = stream.message().await? {
         if let Some(pb::object_result::Result::Object(o)) = result.result {
+            if is_large_tree(&o) {
+                large.push(o);
+                continue;
+            }
             let (key, canonical) = from_wire(o)?;
             puts.object(key, canonical.clone());
             found.insert(key, canonical);
         }
     }
+    for o in &large {
+        let (key, canonical) = join_large_tree(client, cache, o).await?;
+        puts.object(key, canonical.clone());
+        found.insert(key, canonical);
+    }
     cache.put_all(&puts).map_err(io_status)?;
     Ok(found)
+}
+
+/// Whether the SCM sent a tree as its body's chunks (docs/scm.md, "Large trees").
+pub(crate) fn is_large_tree(o: &pb::EncodedObject) -> bool {
+    o.body.is_empty() && !o.chunks.is_empty()
+}
+
+/// Joins a large tree the SCM sent as its body's chunks: each from the cache, which holds most of a
+/// large tree's last version, or read as the file of the tree's ID; then the body held to the tree's
+/// ID. Returns its key and canonical bytes.
+pub(crate) async fn join_large_tree(
+    client: &Client,
+    cache: &Cache,
+    o: &pb::EncodedObject,
+) -> Result<(Key, Vec<u8>), Status> {
+    let id = id_from(&o.id).ok_or_else(|| Status::data_loss("an object ID is not 32 bytes"))?;
+    let mut chunks = Vec::with_capacity(o.chunks.len());
+    let mut missing = Vec::new();
+    let mut offset = 0u64;
+    for c in &o.chunks {
+        let cid = id_from(&c.id).ok_or_else(|| Status::data_loss("a chunk ID is not 32 bytes"))?;
+        if cache.chunk(&cid).is_none() {
+            missing.push(ChunkRead {
+                chunk: cid,
+                file: id,
+                offset,
+                len: u64::from(c.length),
+            });
+        }
+        chunks.push(cid);
+        offset += u64::from(c.length);
+    }
+    if offset != o.size {
+        return Err(Status::data_loss(format!(
+            "tree {}'s chunks are {offset} bytes, not its {}",
+            hex::encode(id),
+            o.size
+        )));
+    }
+    let mut fetched: HashMap<Id, Vec<u8>> = fetch_chunks(client, cache, &missing)
+        .await?
+        .into_iter()
+        .map(|(r, data)| (r.chunk, data))
+        .collect();
+    let mut canonical = Vec::with_capacity(o.size as usize + 1);
+    canonical.push(Kind::Tree as u8);
+    for cid in &chunks {
+        let data = fetched
+            .remove(cid)
+            .or_else(|| cache.chunk(cid))
+            .ok_or_else(|| {
+                Status::data_loss(format!(
+                    "tree {}'s chunk {} came neither from the cache nor the SCM",
+                    hex::encode(id),
+                    hex::encode(cid)
+                ))
+            })?;
+        canonical.extend_from_slice(&data);
+    }
+    if canonical_id(Kind::Tree, &canonical) != Some(id) {
+        return Err(Status::data_loss(format!(
+            "tree {}'s chunks do not join to it",
+            hex::encode(id)
+        )));
+    }
+    Ok((Key::new(Kind::Tree, id), canonical))
 }
 
 fn object_batcher(client: Client, cache: Arc<Cache>) -> Arc<Batcher<Key, Vec<u8>>> {
@@ -664,54 +741,64 @@ fn chunk_batcher(client: Client, cache: Arc<Cache>) -> Arc<Batcher<ChunkRead, Ve
         Box::new(move |reads: Vec<ChunkRead>| {
             let client = client.clone();
             let cache = cache.clone();
-            Box::pin(async move {
-                let mut store = client.store().await?;
-                let req = pb::ReadFilesRequest {
-                    repository_id: client.repository_id(),
-                    files: reads
-                        .iter()
-                        .map(|r| pb::FileRange {
-                            file_id: r.file.to_vec(),
-                            offset: r.offset,
-                            length: r.len,
-                            base_file_id: Vec::new(),
-                        })
-                        .collect(),
-                    manifests_only: false,
-                    stored: true,
-                    dictionaries: true,
-                    deltas: false,
-                };
-                let wanted: HashMap<Id, ChunkRead> = reads.iter().map(|r| (r.chunk, *r)).collect();
-                let mut found = HashMap::new();
-                let mut puts = Puts::default();
-                let mut stream = store.read_files(req).await?.into_inner();
-                while let Some(frame) = stream.message().await? {
-                    if frame.not_found || frame.data.is_empty() {
-                        continue;
-                    }
-                    let cid = id_from(&frame.chunk_id)
-                        .ok_or_else(|| Status::data_loss("a chunk ID is not 32 bytes"))?;
-                    if let Some(dict) = frame_dictionary(&frame) {
-                        ensure_dictionary(&client, &cache, dict).await?;
-                    }
-                    let (data, stored) = stored_chunk(frame, &cache)?;
-                    if chunk_id(&data) != cid {
-                        return Err(Status::data_loss(format!(
-                            "chunk {} from the SCM does not hash to its ID",
-                            hex::encode(cid)
-                        )));
-                    }
-                    if let Some(read) = wanted.get(&cid) {
-                        puts.chunk(cid, &data, stored);
-                        found.insert(*read, data);
-                    }
-                }
-                cache.put_all(&puts).map_err(io_status)?;
-                Ok(found)
-            })
+            Box::pin(async move { fetch_chunks(&client, &cache, &reads).await })
         }),
     )
+}
+
+/// Reads chunks as the ranges of the files they are in (ReadFiles), each held to its ID and cached.
+async fn fetch_chunks(
+    client: &Client,
+    cache: &Cache,
+    reads: &[ChunkRead],
+) -> Result<HashMap<ChunkRead, Vec<u8>>, Status> {
+    if reads.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let mut store = client.store().await?;
+    let req = pb::ReadFilesRequest {
+        repository_id: client.repository_id(),
+        files: reads
+            .iter()
+            .map(|r| pb::FileRange {
+                file_id: r.file.to_vec(),
+                offset: r.offset,
+                length: r.len,
+                base_file_id: Vec::new(),
+            })
+            .collect(),
+        manifests_only: false,
+        stored: true,
+        dictionaries: true,
+        deltas: false,
+    };
+    let wanted: HashMap<Id, ChunkRead> = reads.iter().map(|r| (r.chunk, *r)).collect();
+    let mut found = HashMap::new();
+    let mut puts = Puts::default();
+    let mut stream = store.read_files(req).await?.into_inner();
+    while let Some(frame) = stream.message().await? {
+        if frame.not_found || frame.data.is_empty() {
+            continue;
+        }
+        let cid = id_from(&frame.chunk_id)
+            .ok_or_else(|| Status::data_loss("a chunk ID is not 32 bytes"))?;
+        if let Some(dict) = frame_dictionary(&frame) {
+            ensure_dictionary(client, cache, dict).await?;
+        }
+        let (data, stored) = stored_chunk(frame, cache)?;
+        if chunk_id(&data) != cid {
+            return Err(Status::data_loss(format!(
+                "chunk {} from the SCM does not hash to its ID",
+                hex::encode(cid)
+            )));
+        }
+        if let Some(read) = wanted.get(&cid) {
+            puts.chunk(cid, &data, stored);
+            found.insert(*read, data);
+        }
+    }
+    cache.put_all(&puts).map_err(io_status)?;
+    Ok(found)
 }
 
 /// Manifests read without contents (`manifests_only`): each file's size and chunks, cached for

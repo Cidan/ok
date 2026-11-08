@@ -100,7 +100,7 @@ func (s *Store) finishDeletion(ctx context.Context, d backend.Deletion) error {
 			return rerr == nil
 		}
 		if err := v.each(ctx, func(id encoding.ID, e contentindex.Entry) bool {
-			if contentindex.Located(e.Kind) {
+			if e.Located() {
 				batch = append(batch, id)
 			}
 			return len(batch) < gcBatch || flush()

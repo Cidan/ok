@@ -1619,3 +1619,119 @@ async fn a_clone_indexes_from_the_commit_graph() {
     assert_eq!(filters.may_change(&main, &["a".to_owned()]), Some(false));
     let _ = repo;
 }
+
+// Large trees (docs/scm.md, "Large trees"): a directory of thousands of entries is published as its
+// tree body's chunks, held so, and read by a cold machine from them; after one entry changes, a
+// machine holding the last version receives one chunk of the tree's, not the tree.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_large_tree_travels_as_its_chunks() {
+    if !ok_testscm::available() {
+        return;
+    }
+    use ok_store::calls;
+    let endpoint = endpoint();
+    let remote = new_repository(&endpoint, "large-trees").await;
+    let a = Machine::new(&endpoint, &remote).await;
+    let mut repo = a.head().await;
+    let names: Vec<String> = (0..5000).map(|i| format!("assets/a{i:05}.bin")).collect();
+    let mut tx = repo.start_transaction();
+    let root = repo.store().root_commit();
+    let changes: Vec<(&str, Content)> = names
+        .iter()
+        .map(|n| (n.as_str(), Content::File(b"x\n")))
+        .collect();
+    let first = child(&mut tx, &root, &changes, "assets").await;
+    repo = tx.commit("assets").await.unwrap();
+    let dir = assets_of(&first).await;
+
+    // The SCM holds the directory as its body's chunks: asked for them, it sends them.
+    let shared_a = ok_store::Shared::for_store_path(&a.repo_dir.join("store")).unwrap();
+    let sent = shared_a
+        .client
+        .store()
+        .await
+        .unwrap()
+        .read_objects(ok_store::pb::ReadObjectsRequest {
+            repository_id: remote.id,
+            refs: vec![ok_store::pb::ObjectRef {
+                kind: ok_store::pb::ObjectKind::Tree as i32,
+                id: dir.as_bytes().to_vec(),
+            }],
+            large_trees_as_chunks: true,
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .message()
+        .await
+        .unwrap()
+        .unwrap();
+    let Some(ok_store::pb::object_result::Result::Object(o)) = sent.result else {
+        panic!("the directory was not found");
+    };
+    assert!(
+        o.body.is_empty() && o.chunks.len() > 2,
+        "{} chunks",
+        o.chunks.len()
+    );
+    let size = o.size;
+
+    // A cold machine reads it whole from its chunks.
+    let b = Machine::new(&endpoint, &remote).await;
+    let repo_b = b.head().await;
+    let first_b = repo_b.store().get_commit_async(first.id()).await.unwrap();
+    assert_eq!(
+        read(&repo_b, first_b.id(), "assets/a04321.bin")
+            .await
+            .unwrap(),
+        b"x\n"
+    );
+    let tree_b = repo_b
+        .store()
+        .get_tree(RepoPathBuf::root(), &dir)
+        .await
+        .unwrap();
+    assert_eq!(tree_b.data().entries().count(), 5000);
+
+    // One entry changes: the machine holding the last version receives about a chunk of it.
+    let mut tx = repo.start_transaction();
+    let second = child(
+        &mut tx,
+        &first,
+        &[("assets/a02500.bin", Content::File(b"y\n"))],
+        "one",
+    )
+    .await;
+    tx.commit("one").await.unwrap();
+    let dir2 = assets_of(&second).await;
+    let before = calls::calls();
+    let tree_b2 = repo_b
+        .store()
+        .get_tree(RepoPathBuf::root(), &dir2)
+        .await
+        .unwrap();
+    assert_eq!(tree_b2.data().entries().count(), 5000);
+    let after = calls::calls();
+    let received = |m: &str| {
+        after.get(m).map_or(0, |c| c.received_bytes) - before.get(m).map_or(0, |c| c.received_bytes)
+    };
+    let got = received("Store/ReadObjects") + received("Store/ReadFiles");
+    assert!(
+        got < size / 2,
+        "{got} bytes received for a version of a {size}-byte tree with one entry changed"
+    );
+}
+
+/// The tree at `assets` in a commit.
+async fn assets_of(c: &Commit) -> jj_lib::backend::TreeId {
+    match c
+        .tree()
+        .path_value(&path("assets"))
+        .await
+        .unwrap()
+        .into_resolved()
+    {
+        Ok(Some(TreeValue::Tree(id))) => id,
+        v => panic!("assets is {v:?}"),
+    }
+}

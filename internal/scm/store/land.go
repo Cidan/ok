@@ -555,8 +555,19 @@ func (s *Store) budgetLanding(plan *landPlan) error {
 // each CL as the plan read it — errStaleLanding otherwise — every kind of row in a statement of its
 // own, whatever the number of CLs. It returns the last event it emitted.
 func (s *Store) writeLanding(ctx context.Context, repo int64, numbers []int64, plan *landPlan) (*scmpb.Event, error) {
+	var roots []encoding.ID
+	for _, st := range plan.steps {
+		if st.commit != nil {
+			roots = append(roots, st.commit.RootTree[0])
+		}
+	}
+	// Large trees' chunks go to the bucket before main is held.
+	large, err := s.stageLargeTrees(ctx, repo, plan.ts, roots)
+	if err != nil {
+		return nil, err
+	}
 	var last *scmpb.Event
-	err := s.inTx(ctx, func(ctx context.Context, tx *txn) error {
+	err = s.inTx(ctx, func(ctx context.Context, tx *txn) error {
 		last = nil
 		head, headSeq, ok, err := tx.Head(ctx, repo, true)
 		if err != nil {
@@ -592,6 +603,9 @@ func (s *Store) writeLanding(ctx context.Context, repo int64, numbers []int64, p
 				newActors = append(newActors, st.actor)
 				treeRoots = append(treeRoots, st.commit.RootTree[0])
 			}
+		}
+		if err := s.recordLargeTrees(ctx, tx, repo, large); err != nil {
+			return err
 		}
 		if err := plan.ts.insert(ctx, tx, treeRoots); err != nil {
 			return err
@@ -776,6 +790,13 @@ func (s *Store) PrepareCandidate(ctx context.Context, repo, number int64, patchs
 		if commit != nil {
 			gen, err := s.generation(ctx, repo, base)
 			if err != nil {
+				return err
+			}
+			large, err := s.stageLargeTrees(ctx, repo, ts, []encoding.ID{commit.RootTree[0]})
+			if err != nil {
+				return err
+			}
+			if err := s.recordLargeTrees(ctx, tx, repo, large); err != nil {
 				return err
 			}
 			if err := ts.insert(ctx, tx, []encoding.ID{commit.RootTree[0]}); err != nil {

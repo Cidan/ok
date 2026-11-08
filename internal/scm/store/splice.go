@@ -2,9 +2,12 @@ package store
 
 import (
 	"context"
+	"fmt"
+	"slices"
 	"sort"
 	"strings"
 
+	"github.com/Cidan/ok/internal/scm/contentindex"
 	"github.com/Cidan/ok/internal/scm/encoding"
 	"github.com/Cidan/ok/internal/scm/store/backend"
 )
@@ -33,6 +36,137 @@ func (p prefetched) readTree(id encoding.ID) (*encoding.Tree, error) {
 		return t, nil
 	}
 	return p.treeStore.readTree(id)
+}
+
+func (p prefetched) largeDiff(a, b encoding.ID) (*encoding.Tree, *encoding.Tree, bool, error) {
+	if d, ok := p.treeStore.(largeTreeDiffer); ok {
+		return d.largeDiff(a, b)
+	}
+	return nil, nil, false, nil
+}
+
+// largeTreeLooker is a treeStore that finds an entry of a large tree by its index (Store.lookupLarge):
+// one leaf read, not the tree. large is false for a tree not large, which the caller reads whole.
+type largeTreeLooker interface {
+	lookupLarge(tree encoding.ID, name string) (v *encoding.TreeValue, large bool, err error)
+}
+
+func (p *pendingTrees) lookupLarge(tree encoding.ID, name string) (*encoding.TreeValue, bool, error) {
+	if _, isNew := p.new[tree]; isNew {
+		return nil, false, nil
+	}
+	return p.s.lookupLarge(p.ctx, p.repo, tree, name)
+}
+
+func (p prefetched) lookupLarge(tree encoding.ID, name string) (*encoding.TreeValue, bool, error) {
+	if _, ok := p.trees[tree]; ok {
+		return nil, false, nil
+	}
+	if l, ok := p.treeStore.(largeTreeLooker); ok {
+		return l.lookupLarge(tree, name)
+	}
+	return nil, false, nil
+}
+
+// largeTreeDiffer is a treeStore that diffs two large trees by their chunks (docs/scm.md, "Large
+// trees"): each one's entries in the leaves the other lacks. What differs between the two is among
+// those, and nothing else — an entry is in one leaf of a tree, and a leaf both hold is the same
+// entries — so a diff of them is the trees' diff, reading only the leaves around what changed.
+type largeTreeDiffer interface {
+	// largeDiff returns those entries of a and of b as trees, or ok false unless both are large.
+	largeDiff(a, b encoding.ID) (ta, tb *encoding.Tree, ok bool, err error)
+}
+
+// largeTreeFinder is a treeBatcher that tells which trees are large, which a diff's prefetch leaves
+// to largeTreeDiffer rather than reading whole.
+type largeTreeFinder interface {
+	// largeOf are the large trees among ids.
+	largeOf(ids []encoding.ID) (map[encoding.ID]bool, error)
+}
+
+func (p *pendingTrees) largeOf(ids []encoding.ID) (map[encoding.ID]bool, error) {
+	var stored []encoding.ID
+	for _, id := range ids {
+		if _, isNew := p.new[id]; !isNew && id != encoding.EmptyTreeID {
+			stored = append(stored, id)
+		}
+	}
+	large, err := p.s.LargeTrees(p.ctx, p.repo, stored)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[encoding.ID]bool, len(large))
+	for id := range large {
+		out[id] = true
+	}
+	return out, nil
+}
+
+func (p *pendingTrees) largeDiff(a, b encoding.ID) (*encoding.Tree, *encoding.Tree, bool, error) {
+	for _, id := range []encoding.ID{a, b} {
+		if _, isNew := p.new[id]; isNew || id == encoding.EmptyTreeID {
+			return nil, nil, false, nil
+		}
+	}
+	large, err := p.s.LargeTrees(p.ctx, p.repo, []encoding.ID{a, b})
+	if err != nil {
+		return nil, nil, false, err
+	}
+	la, okA := large[a]
+	lb, okB := large[b]
+	if !okA || !okB {
+		return nil, nil, false, nil
+	}
+	in := func(e contentindex.Entry) map[encoding.ID]bool {
+		out := make(map[encoding.ID]bool, len(e.Chunks))
+		for _, c := range e.Chunks[1:] {
+			out[c.ID] = true
+		}
+		return out
+	}
+	inA, inB := in(la), in(lb)
+	var want []encoding.ID
+	for _, side := range []struct {
+		e     contentindex.Entry
+		other map[encoding.ID]bool
+	}{{la, inB}, {lb, inA}} {
+		for _, c := range side.e.Chunks[1:] {
+			if !side.other[c.ID] {
+				want = append(want, c.ID)
+			}
+		}
+	}
+	data, err := p.s.chunkBytes(p.ctx, p.repo, want)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	leaves := func(e contentindex.Entry, other map[encoding.ID]bool) (*encoding.Tree, error) {
+		t := &encoding.Tree{}
+		for _, c := range e.Chunks[1:] {
+			if other[c.ID] {
+				continue
+			}
+			b, ok := data[c.ID]
+			if !ok {
+				return nil, fmt.Errorf("a large tree's chunk %s: %w", c.ID, ErrNotFound)
+			}
+			got, err := encoding.TreeLeafEntries(b)
+			if err != nil {
+				return nil, err
+			}
+			t.Entries = append(t.Entries, got...)
+		}
+		return t, nil
+	}
+	ta, err := leaves(la, inB)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	tb, err := leaves(lb, inA)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	return ta, tb, true, nil
 }
 
 // pendingTrees is a treeStore over a repository's stored trees, holding the trees it
@@ -120,29 +254,7 @@ func (p *pendingTrees) writeTree(t *encoding.Tree) (encoding.ID, error) {
 // repository's content index does not hold: a tree a publish stored is kept there, where the
 // landing's pin or the candidate's refresh finds it.
 func (p *pendingTrees) insert(ctx context.Context, tx *txn, roots []encoding.ID) error {
-	keep := map[encoding.ID]bool{}
-	var mark func(id encoding.ID)
-	mark = func(id encoding.ID) {
-		t, ok := p.new[id]
-		if !ok || keep[id] {
-			return
-		}
-		keep[id] = true
-		for _, e := range t.Entries {
-			if e.Value.Kind == encoding.TreeValueTree {
-				mark(e.Value.ID)
-			}
-		}
-	}
-	for _, r := range roots {
-		mark(r)
-	}
-	var idCol []encoding.ID
-	for _, id := range p.order {
-		if keep[id] {
-			idCol = append(idCol, id)
-		}
-	}
+	idCol := p.kept(roots)
 	if len(idCol) == 0 {
 		return nil
 	}
@@ -266,6 +378,20 @@ func prefetchDiffs(bt treeBatcher, pairs [][2]encoding.ID) (map[encoding.ID]*enc
 				}
 			}
 		}
+		// A pair of large trees is the diff's to read by their chunks (largeTreeDiffer), not whole.
+		var large map[encoding.ID]bool
+		if d, ok := bt.(largeTreeFinder); ok {
+			var err error
+			if large, err = d.largeOf(want); err != nil {
+				return nil, err
+			}
+		}
+		if len(large) > 0 {
+			pairs = slices.DeleteFunc(pairs, func(p [2]encoding.ID) bool { return large[p[0]] && large[p[1]] })
+			want = slices.DeleteFunc(want, func(id encoding.ID) bool {
+				return large[id] && !slices.ContainsFunc(pairs, func(p [2]encoding.ID) bool { return p[0] == id || p[1] == id })
+			})
+		}
 		read, err := bt.readTrees(want)
 		if err != nil {
 			return nil, err
@@ -299,13 +425,22 @@ func walkDiff(ts treeStore, a, b encoding.ID, dir string, emit func(leafChange) 
 	if a == b {
 		return nil
 	}
-	ta, err := ts.readTree(a)
-	if err != nil {
-		return err
+	var ta, tb *encoding.Tree
+	large := false
+	if d, ok := ts.(largeTreeDiffer); ok {
+		var err error
+		if ta, tb, large, err = d.largeDiff(a, b); err != nil {
+			return err
+		}
 	}
-	tb, err := ts.readTree(b)
-	if err != nil {
-		return err
+	if !large {
+		var err error
+		if ta, err = ts.readTree(a); err != nil {
+			return err
+		}
+		if tb, err = ts.readTree(b); err != nil {
+			return err
+		}
 	}
 	ea, eb := entries(ta), entries(tb)
 	for _, name := range names(ta, tb) {
@@ -466,15 +601,31 @@ func lookupPath(ts treeStore, root encoding.ID, path string) (*encoding.TreeValu
 	dir := root
 	parts := strings.Split(path, "/")
 	for i, part := range parts {
-		t, err := ts.readTree(dir)
-		if err != nil {
-			return nil, err
+		var v encoding.TreeValue
+		var found, large bool
+		if l, ok := ts.(largeTreeLooker); ok {
+			var got *encoding.TreeValue
+			var err error
+			if got, large, err = l.lookupLarge(dir, part); err != nil {
+				return nil, err
+			}
+			if got != nil {
+				v, found = *got, true
+			}
 		}
-		j := sort.Search(len(t.Entries), func(k int) bool { return t.Entries[k].Name >= part })
-		if j == len(t.Entries) || t.Entries[j].Name != part {
+		if !large {
+			t, err := ts.readTree(dir)
+			if err != nil {
+				return nil, err
+			}
+			j := sort.Search(len(t.Entries), func(k int) bool { return t.Entries[k].Name >= part })
+			if found = j < len(t.Entries) && t.Entries[j].Name == part; found {
+				v = t.Entries[j].Value
+			}
+		}
+		if !found {
 			return nil, nil
 		}
-		v := t.Entries[j].Value
 		if i == len(parts)-1 {
 			return &v, nil
 		}

@@ -34,6 +34,11 @@ message EncodedObject {
   ObjectKind kind = 1;
   bytes id = 2;
   bytes body = 3;
+  // A large tree sent as its body's chunks (docs/scm.md, "Large trees"), to a client that asked for
+  // them (large_trees_as_chunks): body is empty, and the client reads the chunks as the file of the
+  // tree's ID (ReadFiles), joins them, and holds them to the ID.
+  uint64 size = 4;
+  repeated ChunkRef chunks = 5;
 }
 
 message ObjectResult {
@@ -194,6 +199,8 @@ service Store {
 message ReadObjectsRequest {
   int64 repository_id = 1;
   repeated ObjectRef refs = 2;
+  // A large tree is sent as its body's chunks (EncodedObject.chunks), not its body.
+  bool large_trees_as_chunks = 3;
 }
 
 message FileRange {
@@ -323,6 +330,8 @@ message ReadTreeClosureRequest {
   // same path is not sent: a subtree whose ID is the base's at its path, with everything beneath
   // it, and a symlink or copy history the base's tree there names too.
   bytes base_tree_id = 5;
+  // A large tree is sent as its body's chunks (EncodedObject.chunks), not its body.
+  bool large_trees_as_chunks = 6;
 }
 
 message ReadCheckoutRequest {
@@ -473,6 +482,9 @@ message FileManifest {
   uint64 size = 2;
   repeated ChunkRef chunks = 3;  // in file order
   string path_hint = 4;          // the path it was written at; orders chunks in packs
+  // A large tree's body (docs/scm.md, "Large trees"): file_id is the tree's ID, staged among the
+  // objects too, and the chunks are its body's as large trees are cut.
+  bool tree = 5;
 }
 
 message ChunkData {

@@ -67,18 +67,24 @@ type Entry struct {
 	Pinned bool
 	Day    Day
 	Loc    Location    // a chunk's or a tree's (Located)
-	Size   uint64      // a file's
-	Chunks []FileChunk // a file's, in order
+	Size   uint64      // a file's, or a chunked tree's body's
+	Chunks []FileChunk // a file's, or a chunked tree's, in order
+	// Chunked marks a tree held as chunks of its body (encoding.ChunkTree), as a file is: its Size
+	// and Chunks are the body's, and it has no location.
+	Chunked bool
 }
 
 // Located reports whether entries of kind have a location: chunks, and trees, which a publish
-// stores in its pack beside its chunks.
+// stores in its pack beside its chunks — but a chunked tree (Entry.Located).
 func Located(k encoding.Kind) bool { return k == encoding.KindChunk || k == encoding.KindTree }
+
+// Located reports whether the entry has a location: a chunk's, or a tree's held whole.
+func (e Entry) Located() bool { return Located(e.Kind) && !e.Chunked }
 
 // combine folds b into a: the body a has (or b's), pinned if either is, the later day.
 func combine(a, b Entry) Entry {
 	if !a.Body && b.Body {
-		a.Body, a.Loc, a.Size, a.Chunks = true, b.Loc, b.Size, b.Chunks
+		a.Body, a.Loc, a.Size, a.Chunks, a.Chunked = true, b.Loc, b.Size, b.Chunks, b.Chunked
 	}
 	a.Pinned = a.Pinned || b.Pinned
 	a.Day = max(a.Day, b.Day)
@@ -87,7 +93,8 @@ func combine(a, b Entry) Entry {
 
 // Equal reports whether two entries say the same.
 func (e Entry) Equal(o Entry) bool {
-	if e.Kind != o.Kind || e.Body != o.Body || e.Pinned != o.Pinned || e.Day != o.Day || e.Loc != o.Loc || e.Size != o.Size || len(e.Chunks) != len(o.Chunks) {
+	if e.Kind != o.Kind || e.Body != o.Body || e.Pinned != o.Pinned || e.Day != o.Day || e.Loc != o.Loc || e.Size != o.Size || len(e.Chunks) != len(o.Chunks) ||
+		e.Chunked != o.Chunked {
 		return false
 	}
 	for i := range e.Chunks {
@@ -143,6 +150,8 @@ const (
 	// flagFramed marks a location in a frame: its frame's raw length and its offset in them follow
 	// its codec.
 	flagFramed = 1 << 2
+	// flagChunked marks a tree held as chunks: its body's size and chunks follow, as a file's.
+	flagChunked = 1 << 3
 )
 
 var errMalformed = errors.New("contentindex: malformed")
@@ -158,15 +167,18 @@ func appendEntry(b []byte, e Entry) []byte {
 	if e.Body {
 		flags |= flagBody
 	}
-	if e.Body && Located(e.Kind) && e.Loc.Framed {
+	if e.Body && e.Located() && e.Loc.Framed {
 		flags |= flagFramed
+	}
+	if e.Body && e.Chunked {
+		flags |= flagChunked
 	}
 	b = append(b, byte(e.Kind), flags)
 	b = binary.AppendUvarint(b, uint64(e.Day))
 	if !e.Body {
 		return b
 	}
-	if Located(e.Kind) {
+	if e.Located() {
 		b = binary.AppendUvarint(b, e.Loc.Pack)
 		b = binary.AppendUvarint(b, uint64(e.Loc.Offset))
 		b = binary.AppendUvarint(b, uint64(e.Loc.Stored))
@@ -247,11 +259,12 @@ func (r *reader) entry() Entry {
 	var e Entry
 	e.Kind = encoding.Kind(r.byte())
 	flags := r.byte()
-	if r.err == nil && (!validKind(e.Kind) || flags&^(flagPinned|flagBody|flagFramed) != 0 ||
-		(flags&flagFramed != 0 && (flags&flagBody == 0 || !Located(e.Kind)))) {
+	if r.err == nil && (!validKind(e.Kind) || flags&^(flagPinned|flagBody|flagFramed|flagChunked) != 0 ||
+		(flags&flagFramed != 0 && (flags&flagBody == 0 || !Located(e.Kind) || flags&flagChunked != 0)) ||
+		(flags&flagChunked != 0 && (flags&flagBody == 0 || e.Kind != encoding.KindTree))) {
 		r.fail()
 	}
-	e.Pinned, e.Body = flags&flagPinned != 0, flags&flagBody != 0
+	e.Pinned, e.Body, e.Chunked = flags&flagPinned != 0, flags&flagBody != 0, flags&flagChunked != 0
 	if d := r.uvarint(); d > 1<<32-1 {
 		r.fail()
 	} else {
@@ -260,7 +273,7 @@ func (r *reader) entry() Entry {
 	if !e.Body || r.err != nil {
 		return e
 	}
-	if Located(e.Kind) {
+	if e.Located() {
 		e.Loc.Pack = r.uvarint()
 		off := r.uvarint()
 		if off > 1<<62 {
@@ -384,7 +397,7 @@ func DecodeLog(b []byte) ([]Update, error) {
 			u.Entry.Kind = encoding.Kind(r.byte())
 		case Move:
 			e := r.entry()
-			if !Located(e.Kind) || !e.Body {
+			if !e.Located() || !e.Body {
 				r.fail()
 			}
 			u.Entry = Entry{Kind: e.Kind, Loc: e.Loc}

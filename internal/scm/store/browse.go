@@ -222,6 +222,10 @@ func (t treeReader) readTree(id encoding.ID) (*encoding.Tree, error) {
 	return t.s.readTree(t.ctx, t.repo, id)
 }
 
+func (t treeReader) lookupLarge(tree encoding.ID, name string) (*encoding.TreeValue, bool, error) {
+	return t.s.lookupLarge(t.ctx, t.repo, tree, name)
+}
+
 func (t treeReader) readTrees(ids []encoding.ID) (map[encoding.ID]*encoding.Tree, error) {
 	return t.s.readTrees(t.ctx, t.repo, ids)
 }

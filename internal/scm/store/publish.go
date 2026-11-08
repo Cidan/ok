@@ -30,6 +30,9 @@ type FileManifest struct {
 	Size     uint64
 	Chunks   []ChunkRef
 	PathHint string
+	// Tree marks a large tree's body (docs/scm.md, "Large trees"): FileID is the tree's ID, and its
+	// chunks are the body's as encoding.ChunkTree cuts it. The tree is staged among the objects too.
+	Tree bool
 }
 
 // OpHeadsUpdate is jj's update_op_heads(old, new), applied with a publish.
@@ -56,8 +59,10 @@ type Publication struct {
 	received map[ObjectRef]encoding.Object
 	bodies   map[ObjectRef][]byte
 
-	files      map[encoding.ID]FileManifest // staged files the server lacks
-	heldFiles  map[encoding.ID]bool
+	files     map[encoding.ID]FileManifest // staged files the server lacks
+	heldFiles map[encoding.ID]bool
+	// treeBodies are the staged large trees the server lacks, sent as their bodies' chunks.
+	treeBodies map[encoding.ID]FileManifest
 	chunkLen   map[encoding.ID]uint32
 	wantChunks map[encoding.ID]bool
 	// packs are the publish's packs, each held in memory as it is written — what it holds counted
@@ -108,7 +113,7 @@ func (s *Store) BeginPublish(ctx context.Context, repo int64, principal, workspa
 		s: s, repo: repo, net: net, principal: principal, workspace: workspace,
 		staged: map[ObjectRef]bool{}, held: map[ObjectRef]bool{}, want: map[ObjectRef]bool{},
 		received: map[ObjectRef]encoding.Object{}, bodies: map[ObjectRef][]byte{},
-		files: map[encoding.ID]FileManifest{}, heldFiles: map[encoding.ID]bool{},
+		files: map[encoding.ID]FileManifest{}, heldFiles: map[encoding.ID]bool{}, treeBodies: map[encoding.ID]FileManifest{},
 		chunkLen: map[encoding.ID]uint32{}, wantChunks: map[encoding.ID]bool{},
 		spooled: map[encoding.ID]spooledAt{}, spooledTrees: map[encoding.ID]spooledAt{},
 	}
@@ -127,7 +132,24 @@ func (s *Store) BeginPublish(ctx context.Context, repo int64, principal, workspa
 		p.staged[r] = true
 	}
 	manifests := map[encoding.ID]FileManifest{}
+	trees := map[encoding.ID]FileManifest{}
 	for _, f := range files {
+		if f.Tree {
+			if _, dup := trees[f.FileID]; dup {
+				return nil, invalid("tree %s staged twice as chunks", f.FileID)
+			}
+			if !p.staged[ObjectRef{Kind: encoding.KindTree, ID: f.FileID}] {
+				return nil, invalid("tree %s is sent as chunks but not staged", f.FileID)
+			}
+			if f.Size <= encoding.TreeChunkThreshold || f.Size > MaxFileSize {
+				return nil, invalid("tree %s of %d bytes sent as chunks: a tree is chunked from %d bytes to %d", f.FileID, f.Size, encoding.TreeChunkThreshold+1, MaxFileSize)
+			}
+			if err := p.declareChunks(f, "tree"); err != nil {
+				return nil, err
+			}
+			trees[f.FileID] = f
+			continue
+		}
 		if _, dup := manifests[f.FileID]; dup {
 			return nil, invalid("file %s staged twice", f.FileID)
 		}
@@ -138,19 +160,8 @@ func (s *Store) BeginPublish(ctx context.Context, repo int64, principal, workspa
 			}
 			return nil, invalid("%s is %d bytes: ok holds files up to 50 MiB (%d bytes)", name, f.Size, MaxFileSize)
 		}
-		var total uint64
-		for _, c := range f.Chunks {
-			if c.Length == 0 || c.Length > MaxChunkLen {
-				return nil, invalid("file %s: chunk %s of %d bytes (1 to %d allowed)", f.FileID, c.ID, c.Length, MaxChunkLen)
-			}
-			if prev, ok := p.chunkLen[c.ID]; ok && prev != c.Length {
-				return nil, invalid("chunk %s declared as both %d and %d bytes", c.ID, prev, c.Length)
-			}
-			p.chunkLen[c.ID] = c.Length
-			total += uint64(c.Length)
-		}
-		if total != f.Size {
-			return nil, invalid("file %s: chunks total %d bytes, manifest says %d", f.FileID, total, f.Size)
+		if err := p.declareChunks(f, "file"); err != nil {
+			return nil, err
 		}
 		manifests[f.FileID] = f
 	}
@@ -197,7 +208,15 @@ func (s *Store) BeginPublish(ctx context.Context, repo int64, principal, workspa
 			lacking = append(lacking, id)
 		}
 	}
-	present, err := s.existing(ctx, s.ops(ctx), repo, tChunk, 0, chunksOf(lacking))
+	lackingChunks := chunksOf(lacking)
+	for id, f := range trees {
+		if !p.held[ObjectRef{Kind: encoding.KindTree, ID: id}] {
+			for _, c := range f.Chunks {
+				lackingChunks = append(lackingChunks, c.ID)
+			}
+		}
+	}
+	present, err := s.existing(ctx, s.ops(ctx), repo, tChunk, 0, lackingChunks)
 	if err != nil {
 		return nil, err
 	}
@@ -253,10 +272,22 @@ func (s *Store) BeginPublish(ctx context.Context, repo int64, principal, workspa
 	}
 
 	for r := range p.staged {
-		if !p.held[r] {
-			p.want[r] = true
-			p.missingObjects = append(p.missingObjects, r)
+		if p.held[r] {
+			continue
 		}
+		// A large tree the server lacks comes as the chunks of its body it lacks.
+		if f, ok := trees[r.ID]; ok && r.Kind == encoding.KindTree {
+			p.treeBodies[r.ID] = f
+			for _, c := range f.Chunks {
+				if !present[c.ID] && !p.wantChunks[c.ID] {
+					p.wantChunks[c.ID] = true
+					p.missingChunks = append(p.missingChunks, c.ID)
+				}
+			}
+			continue
+		}
+		p.want[r] = true
+		p.missingObjects = append(p.missingObjects, r)
 	}
 	for id, f := range manifests {
 		if p.heldFiles[id] {
@@ -276,6 +307,63 @@ func (s *Store) BeginPublish(ctx context.Context, repo int64, principal, workspa
 	})
 	sortIDs(p.missingChunks)
 	return p, nil
+}
+
+// declareChunks records a staged file's or large tree's (what) chunks' lengths, refusing a chunk
+// of no or too many bytes, one declared as two lengths, and chunks that do not add up to its size.
+func (p *Publication) declareChunks(f FileManifest, what string) error {
+	var total uint64
+	for _, c := range f.Chunks {
+		if c.Length == 0 || c.Length > MaxChunkLen {
+			return invalid("%s %s: chunk %s of %d bytes (1 to %d allowed)", what, f.FileID, c.ID, c.Length, MaxChunkLen)
+		}
+		if prev, ok := p.chunkLen[c.ID]; ok && prev != c.Length {
+			return invalid("chunk %s declared as both %d and %d bytes", c.ID, prev, c.Length)
+		}
+		p.chunkLen[c.ID] = c.Length
+		total += uint64(c.Length)
+	}
+	if total != f.Size {
+		return invalid("%s %s: chunks total %d bytes, manifest says %d", what, f.FileID, total, f.Size)
+	}
+	return nil
+}
+
+// verifyTree joins a large tree's body from its chunks and holds it to the tree: it hashes to the
+// tree's ID, decodes canonically, and is cut as large trees are (encoding.ChunkTree). The tree is
+// received, its body with it.
+func (p *Publication) verifyTree(ctx context.Context, f FileManifest) error {
+	body := make([]byte, 0, f.Size)
+	for _, c := range f.Chunks {
+		raw, err := p.chunk(ctx, c)
+		if err != nil {
+			return err
+		}
+		body = append(body, raw...)
+	}
+	r := ObjectRef{Kind: encoding.KindTree, ID: f.FileID}
+	canonical := append([]byte{byte(encoding.KindTree)}, body...)
+	if got := encoding.Hash(canonical); got != f.FileID {
+		return invalid("tree %s: its chunks hash to %s", f.FileID, got)
+	}
+	obj, err := encoding.Decode(canonical)
+	if err != nil {
+		return invalid("%s: %v", r, err)
+	}
+	cut, err := encoding.ChunkTree(body)
+	if err != nil {
+		return invalid("%s: %v", r, err)
+	}
+	ok := len(cut) == len(f.Chunks)
+	for i := 0; ok && i < len(cut); i++ {
+		ok = pack.ChunkID(cut[i]) == f.Chunks[i].ID
+	}
+	if !ok {
+		return invalid("%s is sent in %d chunks, not the %d it is cut into", r, len(f.Chunks), len(cut))
+	}
+	p.received[r] = obj
+	p.bodies[r] = body
+	return nil
 }
 
 // errTouchMissing rolls back a touch that reached a missing object.
@@ -751,6 +839,16 @@ func (p *Publication) Commit(ctx context.Context, heads *OpHeadsUpdate) ([]encod
 			return nil, err
 		}
 	}
+	treeIDs := make([]encoding.ID, 0, len(p.treeBodies))
+	for id := range p.treeBodies {
+		treeIDs = append(treeIDs, id)
+	}
+	sortIDs(treeIDs)
+	for _, id := range treeIDs {
+		if err := p.verifyTree(ctx, p.treeBodies[id]); err != nil {
+			return nil, err
+		}
+	}
 	if err := p.checkSecrets(ctx); err != nil {
 		return nil, err
 	}
@@ -803,10 +901,21 @@ func (p *Publication) Commit(ctx context.Context, heads *OpHeadsUpdate) ([]encod
 			}
 		}
 	}
+	for _, id := range treeIDs {
+		for _, c := range p.treeBodies[id].Chunks {
+			if _, sent := p.spooled[c.ID]; !sent {
+				repoRoots = append(repoRoots, ref{table: tChunk, id: c.ID})
+			}
+		}
+	}
 
 	// The trees sent go in the pack, after the chunks: the content index holds them, and reads
 	// find them there, as it does the chunks.
 	for _, r := range p.sortedReceived(func(k encoding.Kind) bool { return k == encoding.KindTree }) {
+		// A large tree is held as its chunks (insertChunkedTrees).
+		if _, chunked := p.treeBodies[r.ID]; chunked {
+			continue
+		}
 		if err := p.spoolTree(ctx, r.ID, p.bodies[r]); err != nil {
 			return nil, err
 		}
@@ -872,6 +981,10 @@ func (p *Publication) Commit(ctx context.Context, heads *OpHeadsUpdate) ([]encod
 		}
 		found, err := p.insertFiles(ctx, tx, fileIDs)
 		if err != nil {
+			return err
+		}
+		stored = append(stored, found...)
+		if found, err = p.insertChunkedTrees(ctx, tx, treeIDs); err != nil {
 			return err
 		}
 		stored = append(stored, found...)
@@ -1040,6 +1153,39 @@ func notInserted(want, inserted []encoding.ID, mk func(encoding.ID) ref) []ref {
 		}
 	}
 	return out
+}
+
+// insertChunkedTrees records the new large trees as their bodies' chunks in the repository's content
+// index (contentindex.Entry.Chunked), and returns those it found held already, to touch.
+func (p *Publication) insertChunkedTrees(ctx context.Context, tx *txn, ids []encoding.ID) ([]ref, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	lg, err := p.s.txIndex(ctx, tx, repoScope(p.repo))
+	if err != nil {
+		return nil, err
+	}
+	if err := lg.load(ctx, ids); err != nil {
+		return nil, err
+	}
+	var held []ref
+	for _, id := range ids {
+		if _, ok, err := lg.has(ctx, encoding.KindTree, id); err != nil {
+			return nil, err
+		} else if ok {
+			held = append(held, ref{table: tObject, kind: encoding.KindTree, id: id})
+			continue
+		}
+		f := p.treeBodies[id]
+		chunks := make([]contentindex.FileChunk, len(f.Chunks))
+		for i, c := range f.Chunks {
+			chunks[i] = contentindex.FileChunk{ID: c.ID, Length: c.Length}
+		}
+		p.s.logIndex(tx, repoScope(p.repo), contentindex.Update{Op: contentindex.Put, ID: id, Entry: contentindex.Entry{
+			Kind: encoding.KindTree, Day: lg.today, Chunked: true, Size: f.Size, Chunks: chunks,
+		}})
+	}
+	return held, nil
 }
 
 // insertFiles stores the new files and their chunk lists, and returns those it found

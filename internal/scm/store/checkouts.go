@@ -526,12 +526,20 @@ func (s *Store) layerRecords(ctx context.Context, repo int64, tree, base encodin
 				bodies[r.Ref.ID], trees[r.Ref.ID] = r.Body, o.(*encoding.Tree)
 			}
 		}
+		// A large tree is left out, its sizes kept: a client reads it as its chunks, which it holds
+		// most of from the tree's last version (docs/scm.md, "Large trees").
+		large, err := s.LargeTrees(ctx, repo, ids)
+		if err != nil {
+			return nil, err
+		}
 		var fresh []encoding.ID
 		for _, n := range level {
 			if !held[n.id] {
 				held[n.id] = true
 				fresh = append(fresh, n.id)
-				recs = append(recs, encoding.LayerRecord{Kind: encoding.KindTree, ID: n.id, Body: bodies[n.id]})
+				if _, isLarge := large[n.id]; !isLarge {
+					recs = append(recs, encoding.LayerRecord{Kind: encoding.KindTree, ID: n.id, Body: bodies[n.id]})
+				}
 			}
 		}
 		sizes, err := s.TreeSizes(ctx, repo, fresh)

@@ -5,8 +5,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 
+	"github.com/Cidan/ok/internal/scm/contentindex"
 	"github.com/Cidan/ok/internal/scm/encoding"
 	"github.com/Cidan/ok/internal/scm/pack"
 	"github.com/Cidan/ok/internal/scm/store/backend"
@@ -148,6 +150,10 @@ func (s *Store) planPin(ctx context.Context, repo int64, roots []ref) (pinPlan, 
 							toPin = append(toPin, id)
 							indexed[id] = true
 							plan.content = append(plan.content, ref{tObject, encoding.KindTree, id})
+							// A chunked tree's chunks are pinned with it.
+							if e.Chunked {
+								plan.content = append(plan.content, chunkRefs(e)...)
+							}
 						}
 					}
 					bodies, err := s.treeBodies(ctx, repo, toPin)
@@ -438,8 +444,11 @@ func (s *Store) walkIndexTrees(ctx context.Context, tx *txn, repo int64, members
 			continue
 		}
 		_, put := lg.puts[id]
+		_, recorded := tx.largeTrees[id]
 		switch {
-		case put:
+		// A tree this transaction stored is fresh, and what it names checked by the publish that sent
+		// it — but a large tree a landing spliced is pinned with the rest, and what it names.
+		case put && !(mode == pinWalk && recorded):
 			held[id] = true
 		case mode == touchWalk && (e.Pinned || e.Day >= lg.today || lg.touched[id]),
 			mode == refreshWalk && (e.Pinned || lg.touched[id]),
@@ -458,16 +467,48 @@ func (s *Store) walkIndexTrees(ctx context.Context, tx *txn, repo int64, members
 			read = append(read, id)
 		}
 	}
-	bodies, err := s.treeBodies(ctx, repo, read)
+	var stored []encoding.ID
+	bodies := map[encoding.ID][]byte{}
+	for _, id := range read {
+		if b, ok := tx.largeTrees[id]; ok {
+			bodies[id] = b
+		} else {
+			stored = append(stored, id)
+		}
+	}
+	got, err := s.treeBodies(ctx, repo, stored)
 	if err != nil {
 		return nil, nil, nil, err
 	}
+	for id, b := range got {
+		bodies[id] = b
+	}
 	out, err := walkedRefs(encoding.KindTree, bodies)
-	return out, held, rest, err
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	// A chunked tree goes on into its chunks too.
+	for _, id := range read {
+		if e, _, err := lg.has(ctx, encoding.KindTree, id); err != nil {
+			return nil, nil, nil, err
+		} else if e.Chunked {
+			out[id] = append(out[id], chunkRefs(e)...)
+		}
+	}
+	return out, held, rest, nil
 }
 
-// treeBodies reads trees the repository's content index holds from their packs: each one's
-// canonical body. Every one must be there.
+// chunkRefs are the chunks a chunked tree's body is held as.
+func chunkRefs(e contentindex.Entry) []ref {
+	out := make([]ref, len(e.Chunks))
+	for i, c := range e.Chunks {
+		out[i] = ref{table: tChunk, id: c.ID}
+	}
+	return out
+}
+
+// treeBodies reads trees the repository's content index holds — from their packs, or a chunked
+// tree's from its chunks (chunkedTreeBodies) — each one's canonical body. Every one must be there.
 func (s *Store) treeBodies(ctx context.Context, repo int64, ids []encoding.ID) (map[encoding.ID][]byte, error) {
 	out := make(map[encoding.ID][]byte, len(ids))
 	var misses []encoding.ID
@@ -476,6 +517,30 @@ func (s *Store) treeBodies(ctx context.Context, repo int64, ids []encoding.ID) (
 			out[id] = body
 		} else {
 			misses = append(misses, id)
+		}
+	}
+	if len(misses) == 0 {
+		return out, nil
+	}
+	_, held, err := s.contentEntries(ctx, repoScope(repo), encoding.KindTree, misses)
+	if err != nil {
+		return nil, err
+	}
+	chunked := map[encoding.ID]contentindex.Entry{}
+	misses = slices.DeleteFunc(misses, func(id encoding.ID) bool {
+		if e, ok := held[id]; ok && e.Chunked {
+			chunked[id] = e
+			return true
+		}
+		return false
+	})
+	if len(chunked) > 0 {
+		bodies, err := s.chunkedTreeBodies(ctx, repo, chunked)
+		if err != nil {
+			return nil, err
+		}
+		for id, b := range bodies {
+			out[id] = b
 		}
 	}
 	if len(misses) == 0 {
@@ -495,6 +560,44 @@ func (s *Store) treeBodies(ctx context.Context, repo int64, ids []encoding.ID) (
 			return nil, err
 		}
 		out[id] = bytes.Clone(raw)
+	}
+	return out, nil
+}
+
+// chunkedTreeBodies joins chunked trees' bodies from their chunks, each held to its tree's ID, and
+// keeps them in memory as any tree's.
+func (s *Store) chunkedTreeBodies(ctx context.Context, repo int64, entries map[encoding.ID]contentindex.Entry) (map[encoding.ID][]byte, error) {
+	var want []encoding.ID
+	seen := map[encoding.ID]bool{}
+	for _, e := range entries {
+		for _, c := range e.Chunks {
+			if !seen[c.ID] {
+				seen[c.ID] = true
+				want = append(want, c.ID)
+			}
+		}
+	}
+	data, err := s.chunkBytes(ctx, repo, want)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[encoding.ID][]byte, len(entries))
+	for id, e := range entries {
+		body := make([]byte, 0, e.Size)
+		for _, c := range e.Chunks {
+			b, ok := data[c.ID]
+			if !ok {
+				return nil, fmt.Errorf("tree %s: chunk %s: %w", id, c.ID, ErrNotFound)
+			}
+			body = append(body, b...)
+		}
+		h := encoding.NewHasher(encoding.KindTree)
+		h.Write(body)
+		if got := h.Sum(); got != id {
+			return nil, fmt.Errorf("tree %s: its chunks join to tree %s", id, got)
+		}
+		out[id] = body
+		s.objects.put(objectKey(repo, ObjectRef{Kind: encoding.KindTree, ID: id}), body, len(body))
 	}
 	return out, nil
 }

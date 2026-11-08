@@ -750,6 +750,47 @@ needs a level at a time, each level in one query (up to 1,000 trees), before wal
 path order; `Export` fills its leaves' sizes and symlink targets 2,000 at a time. A walk of the
 monorepo's 13,000 directories is a dozen queries, not one per directory.
 
+### Large trees
+
+A directory of 100,000 entries is a tree of about 7.5 MB, which an edit of one entry rewrites whole,
+stores again whole, and sends whole. A tree whose canonical body is over 128 KiB is instead held and
+sent as **chunks of its body**, as a large file is: an edit of one entry stores and sends a chunk or
+two. Its ID is unchanged, the BLAKE3 of its whole body, so nothing of jj's sees a difference.
+
+- **Cut by its entries.** The body's first chunk is its entry count (8 bytes); each other is a run of
+  whole entries of at least 16 KiB, ended after the entry whose name's BLAKE3 — its first 32 bits —
+  falls below that entry's length over 48 KiB of 2³², so runs average about 64 KiB, and an entry that
+  would carry a run past 256 KiB begins the next (`internal/scm/encoding/treechunks.go`, golden
+  vectors in `testdata/tree_chunks.json`, which jj's Rust cut passes too). The same entries cut the
+  same way everywhere, and an edit moves only the cuts beside it: one changed entry is one new
+  chunk, an added or removed entry the count and a leaf or two. A body with an entry over 256 KiB is
+  held whole.
+- **Held as its chunks.** The repository's content index holds such a tree as a file is held — its
+  body's size and chunks, in order (`contentindex.Entry.Chunked`), with no location of its own —
+  and its chunks as chunks. A read joins them and holds them to the tree's ID. The touch, pin, and
+  mark walks go on from it into its chunks and through its entries; garbage collection sweeps its
+  entry, and its chunks once nothing else names them; compaction moves its chunks as any; fsck
+  joins and verifies each, and holds it to its cut.
+- **Published as its chunks.** jj stages a large tree as a manifest of its body (`FileManifest`,
+  `tree` set, its ID the tree's), and sends only the chunks the SCM lacks; the SCM joins them, holds
+  them to the tree's ID, its canonical encoding, and its cut, and refuses a tree cut otherwise or
+  too small to be.
+- **Spliced as its chunks.** A landing, a candidate, or a rollback that splices a large tree holds it
+  as its chunks too, most of them the versions' it was spliced from: a landing sends a pack of the
+  ones the repository does not hold pinned before it holds main, and records them in its
+  transaction, which then stores the rest of its trees as rows; the pin walk goes on through the
+  large ones it recorded.
+- **Read as its chunks.** A client that asks for it (`large_trees_as_chunks`, on `ReadObjects` and
+  `ReadTreeClosure`) is sent a large tree as its body's size and chunks, and reads those it lacks as
+  the file of the tree's ID (`ReadFiles`), most of them cached from the tree's last version.
+  Checkout layers leave large trees out, their sizes in: a client reads one through its chunks.
+- **Diffed and looked up by its leaves.** Its leaves — the runs of entries — are a prolly tree's:
+  cut by content, the same entries the same leaves. Two versions' diff is the diff of the leaves each
+  lacks of the other's — an entry is in one leaf of a tree, and a leaf both hold is the same entries
+  — so a diff reads only the leaves around what changed. Each leaf is named in the tree's index by
+  its first entry's name, derived once a replica and kept in memory by its chunk, so a lookup of a
+  path reads one leaf, and a new version's index reads only the leaves it does not share.
+
 ### The commit graph
 
 jj's index holds every commit a workspace's operation log reaches, each with its change ID and

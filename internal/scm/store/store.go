@@ -65,6 +65,10 @@ type EncodedObject struct {
 	Kind encoding.Kind
 	ID   encoding.ID
 	Body []byte
+	// Size and Chunks are a large tree's body's, sent as its chunks (docs/scm.md, "Large trees"):
+	// Body is then empty, and the client reads the chunks as the file of the tree's ID.
+	Size   uint64
+	Chunks []ChunkRef
 }
 
 // Config sizes the store's in-memory caches.
@@ -369,6 +373,9 @@ type txn struct {
 	snapshotAt time.Time
 	// exclusive are the content indexes it holds alone (lockIndex), each as the lock read it.
 	exclusive map[backend.Scope]heldIndex
+	// largeTrees are the bodies of the large trees it recorded as their chunks (recordLargeTrees),
+	// which nothing outside it can read yet: a walk that pins them reads them here.
+	largeTrees map[encoding.ID][]byte
 }
 
 // heldIndex is a content index a transaction holds alone: its generation, and the database's day,

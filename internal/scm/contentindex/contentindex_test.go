@@ -352,3 +352,51 @@ func TestOrderDoesNotMatter(t *testing.T) {
 		t.Fatal("a touch alone gave a file a body")
 	}
 }
+
+// A chunked tree's entry is its body's size and chunks, as a file's, with no location: it
+// round-trips, combines with a touch or a pin, and is refused when its chunks do not add up, when
+// it is not a tree's, or when it would be moved or framed.
+func TestChunkedTreeEntries(t *testing.T) {
+	tree := Entry{Kind: encoding.KindTree, Body: true, Day: 9, Chunked: true, Size: 8 + 70000 + 90000,
+		Chunks: []FileChunk{{id(1), 8}, {id(2), 70000}, {id(3), 90000}}}
+	got, err := DecodeEntry(EncodeEntry(tree))
+	if err != nil || !got.Equal(tree) || got.Located() {
+		t.Fatalf("a chunked tree's entry: %+v, %v", got, err)
+	}
+	if (Entry{Kind: encoding.KindTree, Body: true}).Located() == false || !(Entry{Kind: encoding.KindChunk}).Located() {
+		t.Fatal("a tree held whole, or a chunk, has no location")
+	}
+	log := EncodeLog([]Update{{Op: Put, ID: id(4), Entry: tree}, {Op: Pin, ID: id(4), Entry: Entry{Kind: encoding.KindTree}},
+		{Op: Touch, ID: id(4), Entry: Entry{Kind: encoding.KindTree, Day: 12}}})
+	updates, err := DecodeLog(log)
+	if err != nil || len(updates) != 3 {
+		t.Fatalf("its log: %d updates, %v", len(updates), err)
+	}
+	e := updates[0].entry()
+	for _, u := range updates[1:] {
+		e = combine(e, u.entry())
+	}
+	if !e.Chunked || !e.Pinned || e.Day != 12 || len(e.Chunks) != 3 {
+		t.Fatalf("combined: %+v", e)
+	}
+	for name, bad := range map[string]Entry{
+		"its chunks short of its size": {Kind: encoding.KindTree, Body: true, Chunked: true, Size: 9, Chunks: []FileChunk{{id(1), 8}}},
+		"a chunk's":                    {Kind: encoding.KindChunk, Body: true, Chunked: true, Size: 8, Chunks: []FileChunk{{id(1), 8}}},
+		"a file's":                     {Kind: encoding.KindFile, Body: true, Chunked: true, Size: 8, Chunks: []FileChunk{{id(1), 8}}},
+	} {
+		if _, err := DecodeEntry(EncodeEntry(bad)); err == nil {
+			t.Errorf("%s decoded", name)
+		}
+	}
+	// A move carries a location, which a chunked tree has none of: its bytes as a put's are refused.
+	move := EncodeLog([]Update{{Op: Put, ID: id(4), Entry: tree}})
+	move[2] = byte(Move)
+	if _, err := DecodeLog(move); err == nil {
+		t.Error("a move of a chunked tree decoded")
+	}
+	framed := EncodeEntry(tree)
+	framed[1] |= flagFramed
+	if _, err := DecodeEntry(framed); err == nil {
+		t.Error("a chunked tree's entry, framed, decoded")
+	}
+}

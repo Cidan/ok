@@ -931,3 +931,73 @@ fn path_filter_vectors() {
         }
     }
 }
+
+// --- large trees -----------------------------------------------------------------------------
+
+const TREE_CHUNK_VECTORS: &str =
+    include_str!("../../internal/scm/encoding/testdata/tree_chunks.json");
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TreeChunkVectors {
+    #[allow(dead_code)]
+    comment: Vec<String>,
+    cases: Vec<TreeChunkCase>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TreeChunkCase {
+    name: String,
+    prefix: String,
+    entries: usize,
+    tree: String,
+    size: usize,
+    chunks: Vec<TreeChunk>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TreeChunk {
+    length: usize,
+    id: String,
+}
+
+#[test]
+fn tree_chunk_vectors() {
+    let v: TreeChunkVectors =
+        serde_json::from_str(TREE_CHUNK_VECTORS).expect("parsing tree_chunks.json");
+    assert!(!v.cases.is_empty());
+    for c in v.cases {
+        let tree = Tree::from_sorted_entries(
+            (0..c.entries)
+                .map(|i| {
+                    let name = format!("{}{i:05}", c.prefix);
+                    let value = TreeValue::File {
+                        id: FileId::new(hash(name.as_bytes()).to_vec()),
+                        executable: i % 7 == 0,
+                        copy_id: CopyId::new(Vec::new()),
+                    };
+                    (RepoPathComponentBuf::new(name).unwrap(), value)
+                })
+                .collect(),
+        );
+        let canonical = encode_tree(&tree).unwrap();
+        assert_eq!(encode_hex(&hash(&canonical)), c.tree, "{}", c.name);
+        let body = &canonical[1..];
+        assert_eq!(body.len(), c.size, "{}", c.name);
+        let chunks = chunk_tree(body).unwrap();
+        assert_eq!(chunks.len(), c.chunks.len(), "{}", c.name);
+        assert_eq!(chunks.concat(), body, "{}", c.name);
+        for (i, (got, want)) in chunks.iter().zip(&c.chunks).enumerate() {
+            let mut canonical = vec![Kind::Chunk as u8];
+            canonical.extend_from_slice(got);
+            assert_eq!(
+                (got.len(), encode_hex(&hash(&canonical))),
+                (want.length, want.id.clone()),
+                "{}: chunk {i}",
+                c.name
+            );
+        }
+    }
+}

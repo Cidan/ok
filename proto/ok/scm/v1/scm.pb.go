@@ -910,10 +910,15 @@ func (x *ObjectRef) GetId() []byte {
 
 // An object as its canonical body; id == BLAKE3-256(kind ‖ body). Files never travel this way.
 type EncodedObject struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Kind          ObjectKind             `protobuf:"varint,1,opt,name=kind,proto3,enum=ok.scm.v1.ObjectKind" json:"kind,omitempty"`
-	Id            []byte                 `protobuf:"bytes,2,opt,name=id,proto3" json:"id,omitempty"`
-	Body          []byte                 `protobuf:"bytes,3,opt,name=body,proto3" json:"body,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Kind  ObjectKind             `protobuf:"varint,1,opt,name=kind,proto3,enum=ok.scm.v1.ObjectKind" json:"kind,omitempty"`
+	Id    []byte                 `protobuf:"bytes,2,opt,name=id,proto3" json:"id,omitempty"`
+	Body  []byte                 `protobuf:"bytes,3,opt,name=body,proto3" json:"body,omitempty"`
+	// A large tree sent as its body's chunks (docs/scm.md, "Large trees"), to a client that asked for
+	// them (large_trees_as_chunks): body is empty, and the client reads the chunks as the file of the
+	// tree's ID (ReadFiles), joins them, and holds them to the ID.
+	Size          uint64      `protobuf:"varint,4,opt,name=size,proto3" json:"size,omitempty"`
+	Chunks        []*ChunkRef `protobuf:"bytes,5,rep,name=chunks,proto3" json:"chunks,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -965,6 +970,20 @@ func (x *EncodedObject) GetId() []byte {
 func (x *EncodedObject) GetBody() []byte {
 	if x != nil {
 		return x.Body
+	}
+	return nil
+}
+
+func (x *EncodedObject) GetSize() uint64 {
+	if x != nil {
+		return x.Size
+	}
+	return 0
+}
+
+func (x *EncodedObject) GetChunks() []*ChunkRef {
+	if x != nil {
+		return x.Chunks
 	}
 	return nil
 }
@@ -1531,11 +1550,13 @@ func (*GetRepositoryRequest_Id) isGetRepositoryRequest_Key() {}
 func (*GetRepositoryRequest_Name) isGetRepositoryRequest_Key() {}
 
 type ReadObjectsRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	RepositoryId  int64                  `protobuf:"varint,1,opt,name=repository_id,json=repositoryId,proto3" json:"repository_id,omitempty"`
-	Refs          []*ObjectRef           `protobuf:"bytes,2,rep,name=refs,proto3" json:"refs,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state        protoimpl.MessageState `protogen:"open.v1"`
+	RepositoryId int64                  `protobuf:"varint,1,opt,name=repository_id,json=repositoryId,proto3" json:"repository_id,omitempty"`
+	Refs         []*ObjectRef           `protobuf:"bytes,2,rep,name=refs,proto3" json:"refs,omitempty"`
+	// A large tree is sent as its body's chunks (EncodedObject.chunks), not its body.
+	LargeTreesAsChunks bool `protobuf:"varint,3,opt,name=large_trees_as_chunks,json=largeTreesAsChunks,proto3" json:"large_trees_as_chunks,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *ReadObjectsRequest) Reset() {
@@ -1580,6 +1601,13 @@ func (x *ReadObjectsRequest) GetRefs() []*ObjectRef {
 		return x.Refs
 	}
 	return nil
+}
+
+func (x *ReadObjectsRequest) GetLargeTreesAsChunks() bool {
+	if x != nil {
+		return x.LargeTreesAsChunks
+	}
+	return false
 }
 
 type FileRange struct {
@@ -2298,9 +2326,11 @@ type ReadTreeClosureRequest struct {
 	// A tree whose closure the client holds — the one it checked out before. What it holds at the
 	// same path is not sent: a subtree whose ID is the base's at its path, with everything beneath
 	// it, and a symlink or copy history the base's tree there names too.
-	BaseTreeId    []byte `protobuf:"bytes,5,opt,name=base_tree_id,json=baseTreeId,proto3" json:"base_tree_id,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	BaseTreeId []byte `protobuf:"bytes,5,opt,name=base_tree_id,json=baseTreeId,proto3" json:"base_tree_id,omitempty"`
+	// A large tree is sent as its body's chunks (EncodedObject.chunks), not its body.
+	LargeTreesAsChunks bool `protobuf:"varint,6,opt,name=large_trees_as_chunks,json=largeTreesAsChunks,proto3" json:"large_trees_as_chunks,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *ReadTreeClosureRequest) Reset() {
@@ -2366,6 +2396,13 @@ func (x *ReadTreeClosureRequest) GetBaseTreeId() []byte {
 		return x.BaseTreeId
 	}
 	return nil
+}
+
+func (x *ReadTreeClosureRequest) GetLargeTreesAsChunks() bool {
+	if x != nil {
+		return x.LargeTreesAsChunks
+	}
+	return false
 }
 
 type ReadCheckoutRequest struct {
@@ -3577,11 +3614,14 @@ func (x *ChunkRef) GetLength() uint32 {
 }
 
 type FileManifest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	FileId        []byte                 `protobuf:"bytes,1,opt,name=file_id,json=fileId,proto3" json:"file_id,omitempty"`
-	Size          uint64                 `protobuf:"varint,2,opt,name=size,proto3" json:"size,omitempty"`
-	Chunks        []*ChunkRef            `protobuf:"bytes,3,rep,name=chunks,proto3" json:"chunks,omitempty"`                     // in file order
-	PathHint      string                 `protobuf:"bytes,4,opt,name=path_hint,json=pathHint,proto3" json:"path_hint,omitempty"` // the path it was written at; orders chunks in packs
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	FileId   []byte                 `protobuf:"bytes,1,opt,name=file_id,json=fileId,proto3" json:"file_id,omitempty"`
+	Size     uint64                 `protobuf:"varint,2,opt,name=size,proto3" json:"size,omitempty"`
+	Chunks   []*ChunkRef            `protobuf:"bytes,3,rep,name=chunks,proto3" json:"chunks,omitempty"`                     // in file order
+	PathHint string                 `protobuf:"bytes,4,opt,name=path_hint,json=pathHint,proto3" json:"path_hint,omitempty"` // the path it was written at; orders chunks in packs
+	// A large tree's body (docs/scm.md, "Large trees"): file_id is the tree's ID, staged among the
+	// objects too, and the chunks are its body's as large trees are cut.
+	Tree          bool `protobuf:"varint,5,opt,name=tree,proto3" json:"tree,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3642,6 +3682,13 @@ func (x *FileManifest) GetPathHint() string {
 		return x.PathHint
 	}
 	return ""
+}
+
+func (x *FileManifest) GetTree() bool {
+	if x != nil {
+		return x.Tree
+	}
+	return false
 }
 
 type ChunkData struct {
@@ -10326,11 +10373,13 @@ const file_proto_ok_scm_v1_scm_proto_rawDesc = "" +
 	"\x19proto/ok/scm/v1/scm.proto\x12\tok.scm.v1\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x1dproto/ok/v1/annotations.proto\"F\n" +
 	"\tObjectRef\x12)\n" +
 	"\x04kind\x18\x01 \x01(\x0e2\x15.ok.scm.v1.ObjectKindR\x04kind\x12\x0e\n" +
-	"\x02id\x18\x02 \x01(\fR\x02id\"^\n" +
+	"\x02id\x18\x02 \x01(\fR\x02id\"\x9f\x01\n" +
 	"\rEncodedObject\x12)\n" +
 	"\x04kind\x18\x01 \x01(\x0e2\x15.ok.scm.v1.ObjectKindR\x04kind\x12\x0e\n" +
 	"\x02id\x18\x02 \x01(\fR\x02id\x12\x12\n" +
-	"\x04body\x18\x03 \x01(\fR\x04body\"\x81\x01\n" +
+	"\x04body\x18\x03 \x01(\fR\x04body\x12\x12\n" +
+	"\x04size\x18\x04 \x01(\x04R\x04size\x12+\n" +
+	"\x06chunks\x18\x05 \x03(\v2\x13.ok.scm.v1.ChunkRefR\x06chunks\"\x81\x01\n" +
 	"\fObjectResult\x122\n" +
 	"\x06object\x18\x01 \x01(\v2\x18.ok.scm.v1.EncodedObjectH\x00R\x06object\x123\n" +
 	"\tnot_found\x18\x02 \x01(\v2\x14.ok.scm.v1.ObjectRefH\x00R\bnotFoundB\b\n" +
@@ -10368,10 +10417,11 @@ const file_proto_ok_scm_v1_scm_proto_rawDesc = "" +
 	"\x14GetRepositoryRequest\x12\x10\n" +
 	"\x02id\x18\x01 \x01(\x03H\x00R\x02id\x12\x14\n" +
 	"\x04name\x18\x02 \x01(\tH\x00R\x04nameB\x05\n" +
-	"\x03key\"c\n" +
+	"\x03key\"\x96\x01\n" +
 	"\x12ReadObjectsRequest\x12#\n" +
 	"\rrepository_id\x18\x01 \x01(\x03R\frepositoryId\x12(\n" +
-	"\x04refs\x18\x02 \x03(\v2\x14.ok.scm.v1.ObjectRefR\x04refs\"v\n" +
+	"\x04refs\x18\x02 \x03(\v2\x14.ok.scm.v1.ObjectRefR\x04refs\x121\n" +
+	"\x15large_trees_as_chunks\x18\x03 \x01(\bR\x12largeTreesAsChunks\"v\n" +
 	"\tFileRange\x12\x17\n" +
 	"\afile_id\x18\x01 \x01(\fR\x06fileId\x12\x16\n" +
 	"\x06offset\x18\x02 \x01(\x04R\x06offset\x12\x16\n" +
@@ -10430,7 +10480,7 @@ const file_proto_ok_scm_v1_scm_proto_rawDesc = "" +
 	"\x04want\x18\x02 \x03(\fR\x04want\x12\x12\n" +
 	"\x04have\x18\x03 \x03(\fR\x04have\x12\x14\n" +
 	"\x05limit\x18\x04 \x01(\x05R\x05limit\x12\x1c\n" +
-	"\tworkspace\x18\x05 \x01(\tR\tworkspace\"\xbc\x01\n" +
+	"\tworkspace\x18\x05 \x01(\tR\tworkspace\"\xef\x01\n" +
 	"\x16ReadTreeClosureRequest\x12#\n" +
 	"\rrepository_id\x18\x01 \x01(\x03R\frepositoryId\x12\x17\n" +
 	"\atree_id\x18\x02 \x01(\fR\x06treeId\x12#\n" +
@@ -10438,7 +10488,8 @@ const file_proto_ok_scm_v1_scm_proto_rawDesc = "" +
 	"\n" +
 	"with_sizes\x18\x04 \x01(\bR\twithSizes\x12 \n" +
 	"\fbase_tree_id\x18\x05 \x01(\fR\n" +
-	"baseTreeId\"\x95\x01\n" +
+	"baseTreeId\x121\n" +
+	"\x15large_trees_as_chunks\x18\x06 \x01(\bR\x12largeTreesAsChunks\"\x95\x01\n" +
 	"\x13ReadCheckoutRequest\x12#\n" +
 	"\rrepository_id\x18\x01 \x01(\x03R\frepositoryId\x12\x1b\n" +
 	"\tcommit_id\x18\x02 \x01(\fR\bcommitId\x12\x1f\n" +
@@ -10524,12 +10575,13 @@ const file_proto_ok_scm_v1_scm_proto_rawDesc = "" +
 	"\x19CollectOperationsResponse\"2\n" +
 	"\bChunkRef\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\fR\x02id\x12\x16\n" +
-	"\x06length\x18\x02 \x01(\rR\x06length\"\x85\x01\n" +
+	"\x06length\x18\x02 \x01(\rR\x06length\"\x99\x01\n" +
 	"\fFileManifest\x12\x17\n" +
 	"\afile_id\x18\x01 \x01(\fR\x06fileId\x12\x12\n" +
 	"\x04size\x18\x02 \x01(\x04R\x04size\x12+\n" +
 	"\x06chunks\x18\x03 \x03(\v2\x13.ok.scm.v1.ChunkRefR\x06chunks\x12\x1b\n" +
-	"\tpath_hint\x18\x04 \x01(\tR\bpathHint\"/\n" +
+	"\tpath_hint\x18\x04 \x01(\tR\bpathHint\x12\x12\n" +
+	"\x04tree\x18\x05 \x01(\bR\x04tree\"/\n" +
 	"\tChunkData\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\fR\x02id\x12\x12\n" +
 	"\x04data\x18\x02 \x01(\fR\x04data\"?\n" +
@@ -11388,227 +11440,228 @@ var file_proto_ok_scm_v1_scm_proto_goTypes = []any{
 var file_proto_ok_scm_v1_scm_proto_depIdxs = []int32{
 	0,   // 0: ok.scm.v1.ObjectRef.kind:type_name -> ok.scm.v1.ObjectKind
 	0,   // 1: ok.scm.v1.EncodedObject.kind:type_name -> ok.scm.v1.ObjectKind
-	15,  // 2: ok.scm.v1.ObjectResult.object:type_name -> ok.scm.v1.EncodedObject
-	14,  // 3: ok.scm.v1.ObjectResult.not_found:type_name -> ok.scm.v1.ObjectRef
-	160, // 4: ok.scm.v1.Repository.created_at:type_name -> google.protobuf.Timestamp
-	14,  // 5: ok.scm.v1.ReadObjectsRequest.refs:type_name -> ok.scm.v1.ObjectRef
-	25,  // 6: ok.scm.v1.ReadFilesRequest.files:type_name -> ok.scm.v1.FileRange
-	1,   // 7: ok.scm.v1.FileData.codec:type_name -> ok.scm.v1.ChunkCodec
-	15,  // 8: ok.scm.v1.GetRelatedCopiesResponse.copies:type_name -> ok.scm.v1.EncodedObject
-	37,  // 9: ok.scm.v1.CheckoutFrame.header:type_name -> ok.scm.v1.CheckoutHeader
-	42,  // 10: ok.scm.v1.CheckoutFrame.layer:type_name -> ok.scm.v1.LayerData
-	40,  // 11: ok.scm.v1.GraphFrame.header:type_name -> ok.scm.v1.GraphHeader
-	42,  // 12: ok.scm.v1.GraphFrame.layer:type_name -> ok.scm.v1.LayerData
-	41,  // 13: ok.scm.v1.GraphFrame.records:type_name -> ok.scm.v1.GraphRecords
-	14,  // 14: ok.scm.v1.ReadOperationsRequest.refs:type_name -> ok.scm.v1.ObjectRef
-	4,   // 15: ok.scm.v1.ResolveOperationPrefixResponse.resolution:type_name -> ok.scm.v1.ResolveOperationPrefixResponse.Resolution
-	160, // 16: ok.scm.v1.CollectOperationsRequest.keep_newer:type_name -> google.protobuf.Timestamp
-	54,  // 17: ok.scm.v1.FileManifest.chunks:type_name -> ok.scm.v1.ChunkRef
-	150, // 18: ok.scm.v1.PublishRequest.begin:type_name -> ok.scm.v1.PublishRequest.Begin
-	15,  // 19: ok.scm.v1.PublishRequest.object:type_name -> ok.scm.v1.EncodedObject
-	56,  // 20: ok.scm.v1.PublishRequest.chunk:type_name -> ok.scm.v1.ChunkData
-	151, // 21: ok.scm.v1.PublishRequest.commit:type_name -> ok.scm.v1.PublishRequest.Commit
-	152, // 22: ok.scm.v1.PublishResponse.missing:type_name -> ok.scm.v1.PublishResponse.Missing
-	153, // 23: ok.scm.v1.PublishResponse.done:type_name -> ok.scm.v1.PublishResponse.Done
-	14,  // 24: ok.scm.v1.PublishRejection.missing:type_name -> ok.scm.v1.ObjectRef
-	160, // 25: ok.scm.v1.Patchset.uploaded_at:type_name -> google.protobuf.Timestamp
-	2,   // 26: ok.scm.v1.ChangeList.status:type_name -> ok.scm.v1.ChangeListStatus
-	2,   // 27: ok.scm.v1.ChangeList.abandoned_from:type_name -> ok.scm.v1.ChangeListStatus
-	61,  // 28: ok.scm.v1.ChangeList.patchsets:type_name -> ok.scm.v1.Patchset
-	160, // 29: ok.scm.v1.ChangeList.created_at:type_name -> google.protobuf.Timestamp
-	160, // 30: ok.scm.v1.ChangeList.updated_at:type_name -> google.protobuf.Timestamp
-	63,  // 31: ok.scm.v1.ChangeList.rollback:type_name -> ok.scm.v1.Rollback
-	62,  // 32: ok.scm.v1.RollbackResponse.change_list:type_name -> ok.scm.v1.ChangeList
-	5,   // 33: ok.scm.v1.RollbackRejection.reason:type_name -> ok.scm.v1.RollbackRejection.Reason
-	6,   // 34: ok.scm.v1.UploadRequest.readiness:type_name -> ok.scm.v1.UploadRequest.Readiness
-	154, // 35: ok.scm.v1.UploadResponse.results:type_name -> ok.scm.v1.UploadResponse.Result
-	8,   // 36: ok.scm.v1.ListSecretReferencesResponse.state:type_name -> ok.scm.v1.ListSecretReferencesResponse.State
-	71,  // 37: ok.scm.v1.ListSecretReferencesResponse.pointers:type_name -> ok.scm.v1.SecretPointer
-	9,   // 38: ok.scm.v1.UploadRejection.reason:type_name -> ok.scm.v1.UploadRejection.Reason
-	2,   // 39: ok.scm.v1.ListChangeListsRequest.statuses:type_name -> ok.scm.v1.ChangeListStatus
-	62,  // 40: ok.scm.v1.ListChangeListsResponse.change_lists:type_name -> ok.scm.v1.ChangeList
-	62,  // 41: ok.scm.v1.LookupChangesResponse.change_lists:type_name -> ok.scm.v1.ChangeList
-	10,  // 42: ok.scm.v1.TransitionRequest.kind:type_name -> ok.scm.v1.TransitionRequest.Kind
-	62,  // 43: ok.scm.v1.TransitionResponse.change_list:type_name -> ok.scm.v1.ChangeList
-	160, // 44: ok.scm.v1.Candidate.prepared_at:type_name -> google.protobuf.Timestamp
-	81,  // 45: ok.scm.v1.ListCandidatesResponse.candidates:type_name -> ok.scm.v1.Candidate
-	155, // 46: ok.scm.v1.LandRequest.items:type_name -> ok.scm.v1.LandRequest.Item
-	156, // 47: ok.scm.v1.LandResponse.landed:type_name -> ok.scm.v1.LandResponse.Landed
-	11,  // 48: ok.scm.v1.LandRejection.reason:type_name -> ok.scm.v1.LandRejection.Reason
-	91,  // 49: ok.scm.v1.CodeSearchResponse.matches:type_name -> ok.scm.v1.CodeMatch
-	92,  // 50: ok.scm.v1.Commit.author:type_name -> ok.scm.v1.Signature
-	92,  // 51: ok.scm.v1.Commit.committer:type_name -> ok.scm.v1.Signature
-	93,  // 52: ok.scm.v1.GetCommitsResponse.commits:type_name -> ok.scm.v1.Commit
-	93,  // 53: ok.scm.v1.LogResponse.commits:type_name -> ok.scm.v1.Commit
-	3,   // 54: ok.scm.v1.TreeValue.type:type_name -> ok.scm.v1.EntryType
-	98,  // 55: ok.scm.v1.TreeEntry.value:type_name -> ok.scm.v1.TreeValue
-	99,  // 56: ok.scm.v1.ReadTreeResponse.entries:type_name -> ok.scm.v1.TreeEntry
-	93,  // 57: ok.scm.v1.ReadTreeResponse.commits:type_name -> ok.scm.v1.Commit
-	98,  // 58: ok.scm.v1.ReadFileAtResponse.value:type_name -> ok.scm.v1.TreeValue
-	98,  // 59: ok.scm.v1.ReadFilesAtResponse.value:type_name -> ok.scm.v1.TreeValue
-	12,  // 60: ok.scm.v1.PathChange.kind:type_name -> ok.scm.v1.PathChange.Kind
-	98,  // 61: ok.scm.v1.PathChange.before:type_name -> ok.scm.v1.TreeValue
-	98,  // 62: ok.scm.v1.PathChange.after:type_name -> ok.scm.v1.TreeValue
-	107, // 63: ok.scm.v1.DiffTreesResponse.changes:type_name -> ok.scm.v1.PathChange
-	157, // 64: ok.scm.v1.DiffFilesRequest.pairs:type_name -> ok.scm.v1.DiffFilesRequest.Pair
-	13,  // 65: ok.scm.v1.DiffLine.op:type_name -> ok.scm.v1.DiffLine.Op
-	110, // 66: ok.scm.v1.Hunk.lines:type_name -> ok.scm.v1.DiffLine
-	111, // 67: ok.scm.v1.FileDiff.hunks:type_name -> ok.scm.v1.Hunk
-	112, // 68: ok.scm.v1.DiffFilesResponse.diffs:type_name -> ok.scm.v1.FileDiff
-	158, // 69: ok.scm.v1.AnnotateResponse.ranges:type_name -> ok.scm.v1.AnnotateResponse.Range
-	120, // 70: ok.scm.v1.ExportResponse.entry:type_name -> ok.scm.v1.ExportEntry
-	98,  // 71: ok.scm.v1.ExportEntry.value:type_name -> ok.scm.v1.TreeValue
-	159, // 72: ok.scm.v1.HeadsResponse.heads:type_name -> ok.scm.v1.HeadsResponse.Head
-	127, // 73: ok.scm.v1.ReadEventsResponse.events:type_name -> ok.scm.v1.Event
-	160, // 74: ok.scm.v1.Event.at:type_name -> google.protobuf.Timestamp
-	128, // 75: ok.scm.v1.Event.uploaded:type_name -> ok.scm.v1.ChangeListUploaded
-	129, // 76: ok.scm.v1.Event.transitioned:type_name -> ok.scm.v1.ChangeListTransitioned
-	130, // 77: ok.scm.v1.Event.landed:type_name -> ok.scm.v1.ChangeListLanded
-	131, // 78: ok.scm.v1.Event.head_moved:type_name -> ok.scm.v1.HeadMoved
-	132, // 79: ok.scm.v1.Event.repository_created:type_name -> ok.scm.v1.RepositoryCreated
-	133, // 80: ok.scm.v1.Event.repository_renamed:type_name -> ok.scm.v1.RepositoryRenamed
-	2,   // 81: ok.scm.v1.ChangeListUploaded.status:type_name -> ok.scm.v1.ChangeListStatus
-	2,   // 82: ok.scm.v1.ChangeListTransitioned.from:type_name -> ok.scm.v1.ChangeListStatus
-	2,   // 83: ok.scm.v1.ChangeListTransitioned.to:type_name -> ok.scm.v1.ChangeListStatus
-	160, // 84: ok.scm.v1.Lease.expires_at:type_name -> google.protobuf.Timestamp
-	135, // 85: ok.scm.v1.AttachResponse.lease:type_name -> ok.scm.v1.Lease
-	160, // 86: ok.scm.v1.AttachResponse.holder_expires_at:type_name -> google.protobuf.Timestamp
-	142, // 87: ok.scm.v1.AttachResponse.latest:type_name -> ok.scm.v1.Checkpoint
-	135, // 88: ok.scm.v1.RenewRequest.lease:type_name -> ok.scm.v1.Lease
-	135, // 89: ok.scm.v1.RenewResponse.lease:type_name -> ok.scm.v1.Lease
-	135, // 90: ok.scm.v1.ReleaseRequest.lease:type_name -> ok.scm.v1.Lease
-	160, // 91: ok.scm.v1.Checkpoint.created_at:type_name -> google.protobuf.Timestamp
-	135, // 92: ok.scm.v1.RecordCheckpointRequest.lease:type_name -> ok.scm.v1.Lease
-	142, // 93: ok.scm.v1.ListCheckpointsResponse.checkpoints:type_name -> ok.scm.v1.Checkpoint
-	149, // 94: ok.scm.v1.ListWorkspacesResponse.workspaces:type_name -> ok.scm.v1.WorkspaceState
-	160, // 95: ok.scm.v1.WorkspaceState.expires_at:type_name -> google.protobuf.Timestamp
-	142, // 96: ok.scm.v1.WorkspaceState.latest:type_name -> ok.scm.v1.Checkpoint
-	14,  // 97: ok.scm.v1.PublishRequest.Begin.objects:type_name -> ok.scm.v1.ObjectRef
-	55,  // 98: ok.scm.v1.PublishRequest.Begin.files:type_name -> ok.scm.v1.FileManifest
-	57,  // 99: ok.scm.v1.PublishRequest.Commit.op_heads:type_name -> ok.scm.v1.OpHeadsUpdate
-	14,  // 100: ok.scm.v1.PublishResponse.Missing.objects:type_name -> ok.scm.v1.ObjectRef
-	7,   // 101: ok.scm.v1.UploadResponse.Result.outcome:type_name -> ok.scm.v1.UploadResponse.Result.Outcome
-	17,  // 102: ok.scm.v1.Cells.MakeRepository:input_type -> ok.scm.v1.MakeRepositoryRequest
-	22,  // 103: ok.scm.v1.Repositories.CreateRepository:input_type -> ok.scm.v1.CreateRepositoryRequest
-	23,  // 104: ok.scm.v1.Repositories.GetRepository:input_type -> ok.scm.v1.GetRepositoryRequest
-	19,  // 105: ok.scm.v1.Repositories.ForkRepository:input_type -> ok.scm.v1.ForkRepositoryRequest
-	20,  // 106: ok.scm.v1.Repositories.SyncFork:input_type -> ok.scm.v1.SyncForkRequest
-	24,  // 107: ok.scm.v1.Store.ReadObjects:input_type -> ok.scm.v1.ReadObjectsRequest
-	26,  // 108: ok.scm.v1.Store.ReadFiles:input_type -> ok.scm.v1.ReadFilesRequest
-	28,  // 109: ok.scm.v1.Store.GetRelatedCopies:input_type -> ok.scm.v1.GetRelatedCopiesRequest
-	30,  // 110: ok.scm.v1.Store.GetCopyRecords:input_type -> ok.scm.v1.GetCopyRecordsRequest
-	32,  // 111: ok.scm.v1.Store.PrefetchCommits:input_type -> ok.scm.v1.PrefetchCommitsRequest
-	34,  // 112: ok.scm.v1.Store.ReadTreeClosure:input_type -> ok.scm.v1.ReadTreeClosureRequest
-	43,  // 113: ok.scm.v1.Store.ReadTreeSizes:input_type -> ok.scm.v1.ReadTreeSizesRequest
-	44,  // 114: ok.scm.v1.Store.ReadDictionary:input_type -> ok.scm.v1.ReadDictionaryRequest
-	35,  // 115: ok.scm.v1.Store.ReadCheckout:input_type -> ok.scm.v1.ReadCheckoutRequest
-	38,  // 116: ok.scm.v1.Store.ReadGraph:input_type -> ok.scm.v1.ReadGraphRequest
-	47,  // 117: ok.scm.v1.Store.GetOpHeads:input_type -> ok.scm.v1.GetOpHeadsRequest
-	48,  // 118: ok.scm.v1.Store.ReadOperations:input_type -> ok.scm.v1.ReadOperationsRequest
-	33,  // 119: ok.scm.v1.Store.PrefetchOperations:input_type -> ok.scm.v1.PrefetchOperationsRequest
-	50,  // 120: ok.scm.v1.Store.ResolveOperationPrefix:input_type -> ok.scm.v1.ResolveOperationPrefixRequest
-	52,  // 121: ok.scm.v1.Store.CollectOperations:input_type -> ok.scm.v1.CollectOperationsRequest
-	58,  // 122: ok.scm.v1.Store.Publish:input_type -> ok.scm.v1.PublishRequest
-	67,  // 123: ok.scm.v1.ChangeLists.Upload:input_type -> ok.scm.v1.UploadRequest
-	73,  // 124: ok.scm.v1.ChangeLists.GetChangeList:input_type -> ok.scm.v1.GetChangeListRequest
-	74,  // 125: ok.scm.v1.ChangeLists.ListChangeLists:input_type -> ok.scm.v1.ListChangeListsRequest
-	76,  // 126: ok.scm.v1.ChangeLists.LookupChanges:input_type -> ok.scm.v1.LookupChangesRequest
-	22,  // 127: ok.scm.v1.Review.CreateRepository:input_type -> ok.scm.v1.CreateRepositoryRequest
-	19,  // 128: ok.scm.v1.Review.ForkRepository:input_type -> ok.scm.v1.ForkRepositoryRequest
-	20,  // 129: ok.scm.v1.Review.SyncFork:input_type -> ok.scm.v1.SyncForkRequest
-	78,  // 130: ok.scm.v1.Review.Transition:input_type -> ok.scm.v1.TransitionRequest
-	64,  // 131: ok.scm.v1.Review.Rollback:input_type -> ok.scm.v1.RollbackRequest
-	80,  // 132: ok.scm.v1.Landing.PrepareCandidate:input_type -> ok.scm.v1.PrepareCandidateRequest
-	84,  // 133: ok.scm.v1.Landing.DiscardCandidate:input_type -> ok.scm.v1.DiscardCandidateRequest
-	82,  // 134: ok.scm.v1.Landing.ListCandidates:input_type -> ok.scm.v1.ListCandidatesRequest
-	86,  // 135: ok.scm.v1.Landing.Land:input_type -> ok.scm.v1.LandRequest
-	86,  // 136: ok.scm.v1.LandingChecks.DryRunLand:input_type -> ok.scm.v1.LandRequest
-	69,  // 137: ok.scm.v1.SecretReferences.ListSecretReferences:input_type -> ok.scm.v1.ListSecretReferencesRequest
-	94,  // 138: ok.scm.v1.Browse.GetCommits:input_type -> ok.scm.v1.GetCommitsRequest
-	96,  // 139: ok.scm.v1.Browse.Log:input_type -> ok.scm.v1.LogRequest
-	100, // 140: ok.scm.v1.Browse.ReadTree:input_type -> ok.scm.v1.ReadTreeRequest
-	102, // 141: ok.scm.v1.Browse.ReadFileAt:input_type -> ok.scm.v1.ReadFileAtRequest
-	104, // 142: ok.scm.v1.Browse.ReadFilesAt:input_type -> ok.scm.v1.ReadFilesAtRequest
-	106, // 143: ok.scm.v1.Browse.DiffTrees:input_type -> ok.scm.v1.DiffTreesRequest
-	109, // 144: ok.scm.v1.Browse.DiffFiles:input_type -> ok.scm.v1.DiffFilesRequest
-	114, // 145: ok.scm.v1.Browse.Annotate:input_type -> ok.scm.v1.AnnotateRequest
-	116, // 146: ok.scm.v1.Browse.IsAncestor:input_type -> ok.scm.v1.IsAncestorRequest
-	118, // 147: ok.scm.v1.Browse.Export:input_type -> ok.scm.v1.ExportRequest
-	89,  // 148: ok.scm.v1.Search.Code:input_type -> ok.scm.v1.CodeSearchRequest
-	125, // 149: ok.scm.v1.Events.Read:input_type -> ok.scm.v1.ReadEventsRequest
-	123, // 150: ok.scm.v1.Events.Heads:input_type -> ok.scm.v1.HeadsRequest
-	121, // 151: ok.scm.v1.Events.Follow:input_type -> ok.scm.v1.FollowRequest
-	136, // 152: ok.scm.v1.Workspaces.Attach:input_type -> ok.scm.v1.AttachRequest
-	138, // 153: ok.scm.v1.Workspaces.Renew:input_type -> ok.scm.v1.RenewRequest
-	140, // 154: ok.scm.v1.Workspaces.Release:input_type -> ok.scm.v1.ReleaseRequest
-	143, // 155: ok.scm.v1.Workspaces.RecordCheckpoint:input_type -> ok.scm.v1.RecordCheckpointRequest
-	144, // 156: ok.scm.v1.Workspaces.GetCheckpoint:input_type -> ok.scm.v1.GetCheckpointRequest
-	145, // 157: ok.scm.v1.Workspaces.ListCheckpoints:input_type -> ok.scm.v1.ListCheckpointsRequest
-	147, // 158: ok.scm.v1.Workspaces.ListWorkspaces:input_type -> ok.scm.v1.ListWorkspacesRequest
-	134, // 159: ok.scm.v1.Workspaces.CreateWorkspace:input_type -> ok.scm.v1.CreateWorkspaceRequest
-	18,  // 160: ok.scm.v1.Cells.MakeRepository:output_type -> ok.scm.v1.Repository
-	18,  // 161: ok.scm.v1.Repositories.CreateRepository:output_type -> ok.scm.v1.Repository
-	18,  // 162: ok.scm.v1.Repositories.GetRepository:output_type -> ok.scm.v1.Repository
-	18,  // 163: ok.scm.v1.Repositories.ForkRepository:output_type -> ok.scm.v1.Repository
-	21,  // 164: ok.scm.v1.Repositories.SyncFork:output_type -> ok.scm.v1.SyncForkResponse
-	16,  // 165: ok.scm.v1.Store.ReadObjects:output_type -> ok.scm.v1.ObjectResult
-	27,  // 166: ok.scm.v1.Store.ReadFiles:output_type -> ok.scm.v1.FileData
-	29,  // 167: ok.scm.v1.Store.GetRelatedCopies:output_type -> ok.scm.v1.GetRelatedCopiesResponse
-	31,  // 168: ok.scm.v1.Store.GetCopyRecords:output_type -> ok.scm.v1.CopyRecord
-	15,  // 169: ok.scm.v1.Store.PrefetchCommits:output_type -> ok.scm.v1.EncodedObject
-	15,  // 170: ok.scm.v1.Store.ReadTreeClosure:output_type -> ok.scm.v1.EncodedObject
-	46,  // 171: ok.scm.v1.Store.ReadTreeSizes:output_type -> ok.scm.v1.TreeSizes
-	45,  // 172: ok.scm.v1.Store.ReadDictionary:output_type -> ok.scm.v1.Dictionary
-	36,  // 173: ok.scm.v1.Store.ReadCheckout:output_type -> ok.scm.v1.CheckoutFrame
-	39,  // 174: ok.scm.v1.Store.ReadGraph:output_type -> ok.scm.v1.GraphFrame
-	49,  // 175: ok.scm.v1.Store.GetOpHeads:output_type -> ok.scm.v1.GetOpHeadsResponse
-	16,  // 176: ok.scm.v1.Store.ReadOperations:output_type -> ok.scm.v1.ObjectResult
-	15,  // 177: ok.scm.v1.Store.PrefetchOperations:output_type -> ok.scm.v1.EncodedObject
-	51,  // 178: ok.scm.v1.Store.ResolveOperationPrefix:output_type -> ok.scm.v1.ResolveOperationPrefixResponse
-	53,  // 179: ok.scm.v1.Store.CollectOperations:output_type -> ok.scm.v1.CollectOperationsResponse
-	59,  // 180: ok.scm.v1.Store.Publish:output_type -> ok.scm.v1.PublishResponse
-	68,  // 181: ok.scm.v1.ChangeLists.Upload:output_type -> ok.scm.v1.UploadResponse
-	62,  // 182: ok.scm.v1.ChangeLists.GetChangeList:output_type -> ok.scm.v1.ChangeList
-	75,  // 183: ok.scm.v1.ChangeLists.ListChangeLists:output_type -> ok.scm.v1.ListChangeListsResponse
-	77,  // 184: ok.scm.v1.ChangeLists.LookupChanges:output_type -> ok.scm.v1.LookupChangesResponse
-	18,  // 185: ok.scm.v1.Review.CreateRepository:output_type -> ok.scm.v1.Repository
-	18,  // 186: ok.scm.v1.Review.ForkRepository:output_type -> ok.scm.v1.Repository
-	21,  // 187: ok.scm.v1.Review.SyncFork:output_type -> ok.scm.v1.SyncForkResponse
-	79,  // 188: ok.scm.v1.Review.Transition:output_type -> ok.scm.v1.TransitionResponse
-	65,  // 189: ok.scm.v1.Review.Rollback:output_type -> ok.scm.v1.RollbackResponse
-	81,  // 190: ok.scm.v1.Landing.PrepareCandidate:output_type -> ok.scm.v1.Candidate
-	85,  // 191: ok.scm.v1.Landing.DiscardCandidate:output_type -> ok.scm.v1.DiscardCandidateResponse
-	83,  // 192: ok.scm.v1.Landing.ListCandidates:output_type -> ok.scm.v1.ListCandidatesResponse
-	87,  // 193: ok.scm.v1.Landing.Land:output_type -> ok.scm.v1.LandResponse
-	87,  // 194: ok.scm.v1.LandingChecks.DryRunLand:output_type -> ok.scm.v1.LandResponse
-	70,  // 195: ok.scm.v1.SecretReferences.ListSecretReferences:output_type -> ok.scm.v1.ListSecretReferencesResponse
-	95,  // 196: ok.scm.v1.Browse.GetCommits:output_type -> ok.scm.v1.GetCommitsResponse
-	97,  // 197: ok.scm.v1.Browse.Log:output_type -> ok.scm.v1.LogResponse
-	101, // 198: ok.scm.v1.Browse.ReadTree:output_type -> ok.scm.v1.ReadTreeResponse
-	103, // 199: ok.scm.v1.Browse.ReadFileAt:output_type -> ok.scm.v1.ReadFileAtResponse
-	105, // 200: ok.scm.v1.Browse.ReadFilesAt:output_type -> ok.scm.v1.ReadFilesAtResponse
-	108, // 201: ok.scm.v1.Browse.DiffTrees:output_type -> ok.scm.v1.DiffTreesResponse
-	113, // 202: ok.scm.v1.Browse.DiffFiles:output_type -> ok.scm.v1.DiffFilesResponse
-	115, // 203: ok.scm.v1.Browse.Annotate:output_type -> ok.scm.v1.AnnotateResponse
-	117, // 204: ok.scm.v1.Browse.IsAncestor:output_type -> ok.scm.v1.IsAncestorResponse
-	119, // 205: ok.scm.v1.Browse.Export:output_type -> ok.scm.v1.ExportResponse
-	90,  // 206: ok.scm.v1.Search.Code:output_type -> ok.scm.v1.CodeSearchResponse
-	126, // 207: ok.scm.v1.Events.Read:output_type -> ok.scm.v1.ReadEventsResponse
-	124, // 208: ok.scm.v1.Events.Heads:output_type -> ok.scm.v1.HeadsResponse
-	122, // 209: ok.scm.v1.Events.Follow:output_type -> ok.scm.v1.FollowResponse
-	137, // 210: ok.scm.v1.Workspaces.Attach:output_type -> ok.scm.v1.AttachResponse
-	139, // 211: ok.scm.v1.Workspaces.Renew:output_type -> ok.scm.v1.RenewResponse
-	141, // 212: ok.scm.v1.Workspaces.Release:output_type -> ok.scm.v1.ReleaseResponse
-	142, // 213: ok.scm.v1.Workspaces.RecordCheckpoint:output_type -> ok.scm.v1.Checkpoint
-	142, // 214: ok.scm.v1.Workspaces.GetCheckpoint:output_type -> ok.scm.v1.Checkpoint
-	146, // 215: ok.scm.v1.Workspaces.ListCheckpoints:output_type -> ok.scm.v1.ListCheckpointsResponse
-	148, // 216: ok.scm.v1.Workspaces.ListWorkspaces:output_type -> ok.scm.v1.ListWorkspacesResponse
-	149, // 217: ok.scm.v1.Workspaces.CreateWorkspace:output_type -> ok.scm.v1.WorkspaceState
-	160, // [160:218] is the sub-list for method output_type
-	102, // [102:160] is the sub-list for method input_type
-	102, // [102:102] is the sub-list for extension type_name
-	102, // [102:102] is the sub-list for extension extendee
-	0,   // [0:102] is the sub-list for field type_name
+	54,  // 2: ok.scm.v1.EncodedObject.chunks:type_name -> ok.scm.v1.ChunkRef
+	15,  // 3: ok.scm.v1.ObjectResult.object:type_name -> ok.scm.v1.EncodedObject
+	14,  // 4: ok.scm.v1.ObjectResult.not_found:type_name -> ok.scm.v1.ObjectRef
+	160, // 5: ok.scm.v1.Repository.created_at:type_name -> google.protobuf.Timestamp
+	14,  // 6: ok.scm.v1.ReadObjectsRequest.refs:type_name -> ok.scm.v1.ObjectRef
+	25,  // 7: ok.scm.v1.ReadFilesRequest.files:type_name -> ok.scm.v1.FileRange
+	1,   // 8: ok.scm.v1.FileData.codec:type_name -> ok.scm.v1.ChunkCodec
+	15,  // 9: ok.scm.v1.GetRelatedCopiesResponse.copies:type_name -> ok.scm.v1.EncodedObject
+	37,  // 10: ok.scm.v1.CheckoutFrame.header:type_name -> ok.scm.v1.CheckoutHeader
+	42,  // 11: ok.scm.v1.CheckoutFrame.layer:type_name -> ok.scm.v1.LayerData
+	40,  // 12: ok.scm.v1.GraphFrame.header:type_name -> ok.scm.v1.GraphHeader
+	42,  // 13: ok.scm.v1.GraphFrame.layer:type_name -> ok.scm.v1.LayerData
+	41,  // 14: ok.scm.v1.GraphFrame.records:type_name -> ok.scm.v1.GraphRecords
+	14,  // 15: ok.scm.v1.ReadOperationsRequest.refs:type_name -> ok.scm.v1.ObjectRef
+	4,   // 16: ok.scm.v1.ResolveOperationPrefixResponse.resolution:type_name -> ok.scm.v1.ResolveOperationPrefixResponse.Resolution
+	160, // 17: ok.scm.v1.CollectOperationsRequest.keep_newer:type_name -> google.protobuf.Timestamp
+	54,  // 18: ok.scm.v1.FileManifest.chunks:type_name -> ok.scm.v1.ChunkRef
+	150, // 19: ok.scm.v1.PublishRequest.begin:type_name -> ok.scm.v1.PublishRequest.Begin
+	15,  // 20: ok.scm.v1.PublishRequest.object:type_name -> ok.scm.v1.EncodedObject
+	56,  // 21: ok.scm.v1.PublishRequest.chunk:type_name -> ok.scm.v1.ChunkData
+	151, // 22: ok.scm.v1.PublishRequest.commit:type_name -> ok.scm.v1.PublishRequest.Commit
+	152, // 23: ok.scm.v1.PublishResponse.missing:type_name -> ok.scm.v1.PublishResponse.Missing
+	153, // 24: ok.scm.v1.PublishResponse.done:type_name -> ok.scm.v1.PublishResponse.Done
+	14,  // 25: ok.scm.v1.PublishRejection.missing:type_name -> ok.scm.v1.ObjectRef
+	160, // 26: ok.scm.v1.Patchset.uploaded_at:type_name -> google.protobuf.Timestamp
+	2,   // 27: ok.scm.v1.ChangeList.status:type_name -> ok.scm.v1.ChangeListStatus
+	2,   // 28: ok.scm.v1.ChangeList.abandoned_from:type_name -> ok.scm.v1.ChangeListStatus
+	61,  // 29: ok.scm.v1.ChangeList.patchsets:type_name -> ok.scm.v1.Patchset
+	160, // 30: ok.scm.v1.ChangeList.created_at:type_name -> google.protobuf.Timestamp
+	160, // 31: ok.scm.v1.ChangeList.updated_at:type_name -> google.protobuf.Timestamp
+	63,  // 32: ok.scm.v1.ChangeList.rollback:type_name -> ok.scm.v1.Rollback
+	62,  // 33: ok.scm.v1.RollbackResponse.change_list:type_name -> ok.scm.v1.ChangeList
+	5,   // 34: ok.scm.v1.RollbackRejection.reason:type_name -> ok.scm.v1.RollbackRejection.Reason
+	6,   // 35: ok.scm.v1.UploadRequest.readiness:type_name -> ok.scm.v1.UploadRequest.Readiness
+	154, // 36: ok.scm.v1.UploadResponse.results:type_name -> ok.scm.v1.UploadResponse.Result
+	8,   // 37: ok.scm.v1.ListSecretReferencesResponse.state:type_name -> ok.scm.v1.ListSecretReferencesResponse.State
+	71,  // 38: ok.scm.v1.ListSecretReferencesResponse.pointers:type_name -> ok.scm.v1.SecretPointer
+	9,   // 39: ok.scm.v1.UploadRejection.reason:type_name -> ok.scm.v1.UploadRejection.Reason
+	2,   // 40: ok.scm.v1.ListChangeListsRequest.statuses:type_name -> ok.scm.v1.ChangeListStatus
+	62,  // 41: ok.scm.v1.ListChangeListsResponse.change_lists:type_name -> ok.scm.v1.ChangeList
+	62,  // 42: ok.scm.v1.LookupChangesResponse.change_lists:type_name -> ok.scm.v1.ChangeList
+	10,  // 43: ok.scm.v1.TransitionRequest.kind:type_name -> ok.scm.v1.TransitionRequest.Kind
+	62,  // 44: ok.scm.v1.TransitionResponse.change_list:type_name -> ok.scm.v1.ChangeList
+	160, // 45: ok.scm.v1.Candidate.prepared_at:type_name -> google.protobuf.Timestamp
+	81,  // 46: ok.scm.v1.ListCandidatesResponse.candidates:type_name -> ok.scm.v1.Candidate
+	155, // 47: ok.scm.v1.LandRequest.items:type_name -> ok.scm.v1.LandRequest.Item
+	156, // 48: ok.scm.v1.LandResponse.landed:type_name -> ok.scm.v1.LandResponse.Landed
+	11,  // 49: ok.scm.v1.LandRejection.reason:type_name -> ok.scm.v1.LandRejection.Reason
+	91,  // 50: ok.scm.v1.CodeSearchResponse.matches:type_name -> ok.scm.v1.CodeMatch
+	92,  // 51: ok.scm.v1.Commit.author:type_name -> ok.scm.v1.Signature
+	92,  // 52: ok.scm.v1.Commit.committer:type_name -> ok.scm.v1.Signature
+	93,  // 53: ok.scm.v1.GetCommitsResponse.commits:type_name -> ok.scm.v1.Commit
+	93,  // 54: ok.scm.v1.LogResponse.commits:type_name -> ok.scm.v1.Commit
+	3,   // 55: ok.scm.v1.TreeValue.type:type_name -> ok.scm.v1.EntryType
+	98,  // 56: ok.scm.v1.TreeEntry.value:type_name -> ok.scm.v1.TreeValue
+	99,  // 57: ok.scm.v1.ReadTreeResponse.entries:type_name -> ok.scm.v1.TreeEntry
+	93,  // 58: ok.scm.v1.ReadTreeResponse.commits:type_name -> ok.scm.v1.Commit
+	98,  // 59: ok.scm.v1.ReadFileAtResponse.value:type_name -> ok.scm.v1.TreeValue
+	98,  // 60: ok.scm.v1.ReadFilesAtResponse.value:type_name -> ok.scm.v1.TreeValue
+	12,  // 61: ok.scm.v1.PathChange.kind:type_name -> ok.scm.v1.PathChange.Kind
+	98,  // 62: ok.scm.v1.PathChange.before:type_name -> ok.scm.v1.TreeValue
+	98,  // 63: ok.scm.v1.PathChange.after:type_name -> ok.scm.v1.TreeValue
+	107, // 64: ok.scm.v1.DiffTreesResponse.changes:type_name -> ok.scm.v1.PathChange
+	157, // 65: ok.scm.v1.DiffFilesRequest.pairs:type_name -> ok.scm.v1.DiffFilesRequest.Pair
+	13,  // 66: ok.scm.v1.DiffLine.op:type_name -> ok.scm.v1.DiffLine.Op
+	110, // 67: ok.scm.v1.Hunk.lines:type_name -> ok.scm.v1.DiffLine
+	111, // 68: ok.scm.v1.FileDiff.hunks:type_name -> ok.scm.v1.Hunk
+	112, // 69: ok.scm.v1.DiffFilesResponse.diffs:type_name -> ok.scm.v1.FileDiff
+	158, // 70: ok.scm.v1.AnnotateResponse.ranges:type_name -> ok.scm.v1.AnnotateResponse.Range
+	120, // 71: ok.scm.v1.ExportResponse.entry:type_name -> ok.scm.v1.ExportEntry
+	98,  // 72: ok.scm.v1.ExportEntry.value:type_name -> ok.scm.v1.TreeValue
+	159, // 73: ok.scm.v1.HeadsResponse.heads:type_name -> ok.scm.v1.HeadsResponse.Head
+	127, // 74: ok.scm.v1.ReadEventsResponse.events:type_name -> ok.scm.v1.Event
+	160, // 75: ok.scm.v1.Event.at:type_name -> google.protobuf.Timestamp
+	128, // 76: ok.scm.v1.Event.uploaded:type_name -> ok.scm.v1.ChangeListUploaded
+	129, // 77: ok.scm.v1.Event.transitioned:type_name -> ok.scm.v1.ChangeListTransitioned
+	130, // 78: ok.scm.v1.Event.landed:type_name -> ok.scm.v1.ChangeListLanded
+	131, // 79: ok.scm.v1.Event.head_moved:type_name -> ok.scm.v1.HeadMoved
+	132, // 80: ok.scm.v1.Event.repository_created:type_name -> ok.scm.v1.RepositoryCreated
+	133, // 81: ok.scm.v1.Event.repository_renamed:type_name -> ok.scm.v1.RepositoryRenamed
+	2,   // 82: ok.scm.v1.ChangeListUploaded.status:type_name -> ok.scm.v1.ChangeListStatus
+	2,   // 83: ok.scm.v1.ChangeListTransitioned.from:type_name -> ok.scm.v1.ChangeListStatus
+	2,   // 84: ok.scm.v1.ChangeListTransitioned.to:type_name -> ok.scm.v1.ChangeListStatus
+	160, // 85: ok.scm.v1.Lease.expires_at:type_name -> google.protobuf.Timestamp
+	135, // 86: ok.scm.v1.AttachResponse.lease:type_name -> ok.scm.v1.Lease
+	160, // 87: ok.scm.v1.AttachResponse.holder_expires_at:type_name -> google.protobuf.Timestamp
+	142, // 88: ok.scm.v1.AttachResponse.latest:type_name -> ok.scm.v1.Checkpoint
+	135, // 89: ok.scm.v1.RenewRequest.lease:type_name -> ok.scm.v1.Lease
+	135, // 90: ok.scm.v1.RenewResponse.lease:type_name -> ok.scm.v1.Lease
+	135, // 91: ok.scm.v1.ReleaseRequest.lease:type_name -> ok.scm.v1.Lease
+	160, // 92: ok.scm.v1.Checkpoint.created_at:type_name -> google.protobuf.Timestamp
+	135, // 93: ok.scm.v1.RecordCheckpointRequest.lease:type_name -> ok.scm.v1.Lease
+	142, // 94: ok.scm.v1.ListCheckpointsResponse.checkpoints:type_name -> ok.scm.v1.Checkpoint
+	149, // 95: ok.scm.v1.ListWorkspacesResponse.workspaces:type_name -> ok.scm.v1.WorkspaceState
+	160, // 96: ok.scm.v1.WorkspaceState.expires_at:type_name -> google.protobuf.Timestamp
+	142, // 97: ok.scm.v1.WorkspaceState.latest:type_name -> ok.scm.v1.Checkpoint
+	14,  // 98: ok.scm.v1.PublishRequest.Begin.objects:type_name -> ok.scm.v1.ObjectRef
+	55,  // 99: ok.scm.v1.PublishRequest.Begin.files:type_name -> ok.scm.v1.FileManifest
+	57,  // 100: ok.scm.v1.PublishRequest.Commit.op_heads:type_name -> ok.scm.v1.OpHeadsUpdate
+	14,  // 101: ok.scm.v1.PublishResponse.Missing.objects:type_name -> ok.scm.v1.ObjectRef
+	7,   // 102: ok.scm.v1.UploadResponse.Result.outcome:type_name -> ok.scm.v1.UploadResponse.Result.Outcome
+	17,  // 103: ok.scm.v1.Cells.MakeRepository:input_type -> ok.scm.v1.MakeRepositoryRequest
+	22,  // 104: ok.scm.v1.Repositories.CreateRepository:input_type -> ok.scm.v1.CreateRepositoryRequest
+	23,  // 105: ok.scm.v1.Repositories.GetRepository:input_type -> ok.scm.v1.GetRepositoryRequest
+	19,  // 106: ok.scm.v1.Repositories.ForkRepository:input_type -> ok.scm.v1.ForkRepositoryRequest
+	20,  // 107: ok.scm.v1.Repositories.SyncFork:input_type -> ok.scm.v1.SyncForkRequest
+	24,  // 108: ok.scm.v1.Store.ReadObjects:input_type -> ok.scm.v1.ReadObjectsRequest
+	26,  // 109: ok.scm.v1.Store.ReadFiles:input_type -> ok.scm.v1.ReadFilesRequest
+	28,  // 110: ok.scm.v1.Store.GetRelatedCopies:input_type -> ok.scm.v1.GetRelatedCopiesRequest
+	30,  // 111: ok.scm.v1.Store.GetCopyRecords:input_type -> ok.scm.v1.GetCopyRecordsRequest
+	32,  // 112: ok.scm.v1.Store.PrefetchCommits:input_type -> ok.scm.v1.PrefetchCommitsRequest
+	34,  // 113: ok.scm.v1.Store.ReadTreeClosure:input_type -> ok.scm.v1.ReadTreeClosureRequest
+	43,  // 114: ok.scm.v1.Store.ReadTreeSizes:input_type -> ok.scm.v1.ReadTreeSizesRequest
+	44,  // 115: ok.scm.v1.Store.ReadDictionary:input_type -> ok.scm.v1.ReadDictionaryRequest
+	35,  // 116: ok.scm.v1.Store.ReadCheckout:input_type -> ok.scm.v1.ReadCheckoutRequest
+	38,  // 117: ok.scm.v1.Store.ReadGraph:input_type -> ok.scm.v1.ReadGraphRequest
+	47,  // 118: ok.scm.v1.Store.GetOpHeads:input_type -> ok.scm.v1.GetOpHeadsRequest
+	48,  // 119: ok.scm.v1.Store.ReadOperations:input_type -> ok.scm.v1.ReadOperationsRequest
+	33,  // 120: ok.scm.v1.Store.PrefetchOperations:input_type -> ok.scm.v1.PrefetchOperationsRequest
+	50,  // 121: ok.scm.v1.Store.ResolveOperationPrefix:input_type -> ok.scm.v1.ResolveOperationPrefixRequest
+	52,  // 122: ok.scm.v1.Store.CollectOperations:input_type -> ok.scm.v1.CollectOperationsRequest
+	58,  // 123: ok.scm.v1.Store.Publish:input_type -> ok.scm.v1.PublishRequest
+	67,  // 124: ok.scm.v1.ChangeLists.Upload:input_type -> ok.scm.v1.UploadRequest
+	73,  // 125: ok.scm.v1.ChangeLists.GetChangeList:input_type -> ok.scm.v1.GetChangeListRequest
+	74,  // 126: ok.scm.v1.ChangeLists.ListChangeLists:input_type -> ok.scm.v1.ListChangeListsRequest
+	76,  // 127: ok.scm.v1.ChangeLists.LookupChanges:input_type -> ok.scm.v1.LookupChangesRequest
+	22,  // 128: ok.scm.v1.Review.CreateRepository:input_type -> ok.scm.v1.CreateRepositoryRequest
+	19,  // 129: ok.scm.v1.Review.ForkRepository:input_type -> ok.scm.v1.ForkRepositoryRequest
+	20,  // 130: ok.scm.v1.Review.SyncFork:input_type -> ok.scm.v1.SyncForkRequest
+	78,  // 131: ok.scm.v1.Review.Transition:input_type -> ok.scm.v1.TransitionRequest
+	64,  // 132: ok.scm.v1.Review.Rollback:input_type -> ok.scm.v1.RollbackRequest
+	80,  // 133: ok.scm.v1.Landing.PrepareCandidate:input_type -> ok.scm.v1.PrepareCandidateRequest
+	84,  // 134: ok.scm.v1.Landing.DiscardCandidate:input_type -> ok.scm.v1.DiscardCandidateRequest
+	82,  // 135: ok.scm.v1.Landing.ListCandidates:input_type -> ok.scm.v1.ListCandidatesRequest
+	86,  // 136: ok.scm.v1.Landing.Land:input_type -> ok.scm.v1.LandRequest
+	86,  // 137: ok.scm.v1.LandingChecks.DryRunLand:input_type -> ok.scm.v1.LandRequest
+	69,  // 138: ok.scm.v1.SecretReferences.ListSecretReferences:input_type -> ok.scm.v1.ListSecretReferencesRequest
+	94,  // 139: ok.scm.v1.Browse.GetCommits:input_type -> ok.scm.v1.GetCommitsRequest
+	96,  // 140: ok.scm.v1.Browse.Log:input_type -> ok.scm.v1.LogRequest
+	100, // 141: ok.scm.v1.Browse.ReadTree:input_type -> ok.scm.v1.ReadTreeRequest
+	102, // 142: ok.scm.v1.Browse.ReadFileAt:input_type -> ok.scm.v1.ReadFileAtRequest
+	104, // 143: ok.scm.v1.Browse.ReadFilesAt:input_type -> ok.scm.v1.ReadFilesAtRequest
+	106, // 144: ok.scm.v1.Browse.DiffTrees:input_type -> ok.scm.v1.DiffTreesRequest
+	109, // 145: ok.scm.v1.Browse.DiffFiles:input_type -> ok.scm.v1.DiffFilesRequest
+	114, // 146: ok.scm.v1.Browse.Annotate:input_type -> ok.scm.v1.AnnotateRequest
+	116, // 147: ok.scm.v1.Browse.IsAncestor:input_type -> ok.scm.v1.IsAncestorRequest
+	118, // 148: ok.scm.v1.Browse.Export:input_type -> ok.scm.v1.ExportRequest
+	89,  // 149: ok.scm.v1.Search.Code:input_type -> ok.scm.v1.CodeSearchRequest
+	125, // 150: ok.scm.v1.Events.Read:input_type -> ok.scm.v1.ReadEventsRequest
+	123, // 151: ok.scm.v1.Events.Heads:input_type -> ok.scm.v1.HeadsRequest
+	121, // 152: ok.scm.v1.Events.Follow:input_type -> ok.scm.v1.FollowRequest
+	136, // 153: ok.scm.v1.Workspaces.Attach:input_type -> ok.scm.v1.AttachRequest
+	138, // 154: ok.scm.v1.Workspaces.Renew:input_type -> ok.scm.v1.RenewRequest
+	140, // 155: ok.scm.v1.Workspaces.Release:input_type -> ok.scm.v1.ReleaseRequest
+	143, // 156: ok.scm.v1.Workspaces.RecordCheckpoint:input_type -> ok.scm.v1.RecordCheckpointRequest
+	144, // 157: ok.scm.v1.Workspaces.GetCheckpoint:input_type -> ok.scm.v1.GetCheckpointRequest
+	145, // 158: ok.scm.v1.Workspaces.ListCheckpoints:input_type -> ok.scm.v1.ListCheckpointsRequest
+	147, // 159: ok.scm.v1.Workspaces.ListWorkspaces:input_type -> ok.scm.v1.ListWorkspacesRequest
+	134, // 160: ok.scm.v1.Workspaces.CreateWorkspace:input_type -> ok.scm.v1.CreateWorkspaceRequest
+	18,  // 161: ok.scm.v1.Cells.MakeRepository:output_type -> ok.scm.v1.Repository
+	18,  // 162: ok.scm.v1.Repositories.CreateRepository:output_type -> ok.scm.v1.Repository
+	18,  // 163: ok.scm.v1.Repositories.GetRepository:output_type -> ok.scm.v1.Repository
+	18,  // 164: ok.scm.v1.Repositories.ForkRepository:output_type -> ok.scm.v1.Repository
+	21,  // 165: ok.scm.v1.Repositories.SyncFork:output_type -> ok.scm.v1.SyncForkResponse
+	16,  // 166: ok.scm.v1.Store.ReadObjects:output_type -> ok.scm.v1.ObjectResult
+	27,  // 167: ok.scm.v1.Store.ReadFiles:output_type -> ok.scm.v1.FileData
+	29,  // 168: ok.scm.v1.Store.GetRelatedCopies:output_type -> ok.scm.v1.GetRelatedCopiesResponse
+	31,  // 169: ok.scm.v1.Store.GetCopyRecords:output_type -> ok.scm.v1.CopyRecord
+	15,  // 170: ok.scm.v1.Store.PrefetchCommits:output_type -> ok.scm.v1.EncodedObject
+	15,  // 171: ok.scm.v1.Store.ReadTreeClosure:output_type -> ok.scm.v1.EncodedObject
+	46,  // 172: ok.scm.v1.Store.ReadTreeSizes:output_type -> ok.scm.v1.TreeSizes
+	45,  // 173: ok.scm.v1.Store.ReadDictionary:output_type -> ok.scm.v1.Dictionary
+	36,  // 174: ok.scm.v1.Store.ReadCheckout:output_type -> ok.scm.v1.CheckoutFrame
+	39,  // 175: ok.scm.v1.Store.ReadGraph:output_type -> ok.scm.v1.GraphFrame
+	49,  // 176: ok.scm.v1.Store.GetOpHeads:output_type -> ok.scm.v1.GetOpHeadsResponse
+	16,  // 177: ok.scm.v1.Store.ReadOperations:output_type -> ok.scm.v1.ObjectResult
+	15,  // 178: ok.scm.v1.Store.PrefetchOperations:output_type -> ok.scm.v1.EncodedObject
+	51,  // 179: ok.scm.v1.Store.ResolveOperationPrefix:output_type -> ok.scm.v1.ResolveOperationPrefixResponse
+	53,  // 180: ok.scm.v1.Store.CollectOperations:output_type -> ok.scm.v1.CollectOperationsResponse
+	59,  // 181: ok.scm.v1.Store.Publish:output_type -> ok.scm.v1.PublishResponse
+	68,  // 182: ok.scm.v1.ChangeLists.Upload:output_type -> ok.scm.v1.UploadResponse
+	62,  // 183: ok.scm.v1.ChangeLists.GetChangeList:output_type -> ok.scm.v1.ChangeList
+	75,  // 184: ok.scm.v1.ChangeLists.ListChangeLists:output_type -> ok.scm.v1.ListChangeListsResponse
+	77,  // 185: ok.scm.v1.ChangeLists.LookupChanges:output_type -> ok.scm.v1.LookupChangesResponse
+	18,  // 186: ok.scm.v1.Review.CreateRepository:output_type -> ok.scm.v1.Repository
+	18,  // 187: ok.scm.v1.Review.ForkRepository:output_type -> ok.scm.v1.Repository
+	21,  // 188: ok.scm.v1.Review.SyncFork:output_type -> ok.scm.v1.SyncForkResponse
+	79,  // 189: ok.scm.v1.Review.Transition:output_type -> ok.scm.v1.TransitionResponse
+	65,  // 190: ok.scm.v1.Review.Rollback:output_type -> ok.scm.v1.RollbackResponse
+	81,  // 191: ok.scm.v1.Landing.PrepareCandidate:output_type -> ok.scm.v1.Candidate
+	85,  // 192: ok.scm.v1.Landing.DiscardCandidate:output_type -> ok.scm.v1.DiscardCandidateResponse
+	83,  // 193: ok.scm.v1.Landing.ListCandidates:output_type -> ok.scm.v1.ListCandidatesResponse
+	87,  // 194: ok.scm.v1.Landing.Land:output_type -> ok.scm.v1.LandResponse
+	87,  // 195: ok.scm.v1.LandingChecks.DryRunLand:output_type -> ok.scm.v1.LandResponse
+	70,  // 196: ok.scm.v1.SecretReferences.ListSecretReferences:output_type -> ok.scm.v1.ListSecretReferencesResponse
+	95,  // 197: ok.scm.v1.Browse.GetCommits:output_type -> ok.scm.v1.GetCommitsResponse
+	97,  // 198: ok.scm.v1.Browse.Log:output_type -> ok.scm.v1.LogResponse
+	101, // 199: ok.scm.v1.Browse.ReadTree:output_type -> ok.scm.v1.ReadTreeResponse
+	103, // 200: ok.scm.v1.Browse.ReadFileAt:output_type -> ok.scm.v1.ReadFileAtResponse
+	105, // 201: ok.scm.v1.Browse.ReadFilesAt:output_type -> ok.scm.v1.ReadFilesAtResponse
+	108, // 202: ok.scm.v1.Browse.DiffTrees:output_type -> ok.scm.v1.DiffTreesResponse
+	113, // 203: ok.scm.v1.Browse.DiffFiles:output_type -> ok.scm.v1.DiffFilesResponse
+	115, // 204: ok.scm.v1.Browse.Annotate:output_type -> ok.scm.v1.AnnotateResponse
+	117, // 205: ok.scm.v1.Browse.IsAncestor:output_type -> ok.scm.v1.IsAncestorResponse
+	119, // 206: ok.scm.v1.Browse.Export:output_type -> ok.scm.v1.ExportResponse
+	90,  // 207: ok.scm.v1.Search.Code:output_type -> ok.scm.v1.CodeSearchResponse
+	126, // 208: ok.scm.v1.Events.Read:output_type -> ok.scm.v1.ReadEventsResponse
+	124, // 209: ok.scm.v1.Events.Heads:output_type -> ok.scm.v1.HeadsResponse
+	122, // 210: ok.scm.v1.Events.Follow:output_type -> ok.scm.v1.FollowResponse
+	137, // 211: ok.scm.v1.Workspaces.Attach:output_type -> ok.scm.v1.AttachResponse
+	139, // 212: ok.scm.v1.Workspaces.Renew:output_type -> ok.scm.v1.RenewResponse
+	141, // 213: ok.scm.v1.Workspaces.Release:output_type -> ok.scm.v1.ReleaseResponse
+	142, // 214: ok.scm.v1.Workspaces.RecordCheckpoint:output_type -> ok.scm.v1.Checkpoint
+	142, // 215: ok.scm.v1.Workspaces.GetCheckpoint:output_type -> ok.scm.v1.Checkpoint
+	146, // 216: ok.scm.v1.Workspaces.ListCheckpoints:output_type -> ok.scm.v1.ListCheckpointsResponse
+	148, // 217: ok.scm.v1.Workspaces.ListWorkspaces:output_type -> ok.scm.v1.ListWorkspacesResponse
+	149, // 218: ok.scm.v1.Workspaces.CreateWorkspace:output_type -> ok.scm.v1.WorkspaceState
+	161, // [161:219] is the sub-list for method output_type
+	103, // [103:161] is the sub-list for method input_type
+	103, // [103:103] is the sub-list for extension type_name
+	103, // [103:103] is the sub-list for extension extendee
+	0,   // [0:103] is the sub-list for field type_name
 }
 
 func init() { file_proto_ok_scm_v1_scm_proto_init() }

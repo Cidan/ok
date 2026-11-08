@@ -160,6 +160,13 @@ func (s *Store) Rollback(ctx context.Context, repo, number int64, actor, reason 
 		if err != nil {
 			return err
 		}
+		large, err := s.stageLargeTrees(ctx, repo, ts, []encoding.ID{tree})
+		if err != nil {
+			return err
+		}
+		if err := s.recordLargeTrees(ctx, tx, repo, large); err != nil {
+			return err
+		}
 		if err := ts.insert(ctx, tx, []encoding.ID{tree}); err != nil {
 			return err
 		}

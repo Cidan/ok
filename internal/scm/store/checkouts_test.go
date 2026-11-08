@@ -295,7 +295,7 @@ func TestReadTreeClosureWithBase(t *testing.T) {
 	root := b.tree(treeEntry("keep", keep), treeEntry("sub", sub2), link("l", old), link("n", fresh), treeEntry("moved", moved))
 	mustPublish(t, s, repo, "alice", b, nil)
 	var got []ObjectRef
-	if err := s.ReadTreeClosure(ctx, repo, root, base, nil, false, func(o EncodedObject) error {
+	if err := s.ReadTreeClosure(ctx, repo, root, base, nil, false, false, func(o EncodedObject) error {
 		got = append(got, ObjectRef{Kind: o.Kind, ID: o.ID})
 		return nil
 	}); err != nil {
@@ -314,7 +314,7 @@ func TestReadTreeClosureWithBase(t *testing.T) {
 	}
 	// Its own base, nothing.
 	got = nil
-	if err := s.ReadTreeClosure(ctx, repo, root, root, nil, false, func(o EncodedObject) error {
+	if err := s.ReadTreeClosure(ctx, repo, root, root, nil, false, false, func(o EncodedObject) error {
 		got = append(got, ObjectRef{Kind: o.Kind, ID: o.ID})
 		return nil
 	}); err != nil || len(got) != 0 {

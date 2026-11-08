@@ -19,6 +19,8 @@ type FsckReport struct {
 	Packs, Chunks, Files, Objects, Commits, Operations, Views int
 	// PackedTrees are the trees in packs the network's chunk index locates.
 	PackedTrees int
+	// ChunkedTrees are the trees held as chunks of their bodies, each joined and verified.
+	ChunkedTrees int
 	// IndexEntries are the content index's files, chunks, and trees.
 	IndexEntries int
 	// DeadBytes are pack bytes no location points at (reclaimed by compaction).
@@ -143,28 +145,39 @@ func (s *Store) fsckPacks(ctx context.Context, repo int64, repair bool, r *FsckR
 	}
 	var files []fsckFile
 	var unlocated []contentindex.Keyed
+	chunkedTrees := map[encoding.ID]contentindex.Entry{}
 	heldChunks := map[encoding.ID]bool{}
 	err = v.each(ctx, func(id encoding.ID, e contentindex.Entry) bool {
 		r.IndexEntries++
-		if _, ok := packOf[id]; contentindex.Located(e.Kind) && !ok {
+		if _, ok := packOf[id]; e.Located() && !ok {
 			unlocated = append(unlocated, contentindex.Keyed{ID: id, Entry: contentindex.Entry{Kind: e.Kind}})
 		}
-		switch e.Kind {
-		case encoding.KindChunk:
+		switch {
+		case e.Kind == encoding.KindChunk:
 			heldChunks[id] = true
-		case encoding.KindFile:
+		case e.Kind == encoding.KindFile:
 			files = append(files, fsckFile{id: id, size: e.Size, chunks: e.Chunks})
+		case e.Chunked && e.Body:
+			chunkedTrees[id] = e
 		}
 		return true
 	})
 	if err != nil {
 		return err
 	}
-	// A repository that holds a file holds its chunks.
+	// A repository that holds a file, or a chunked tree, holds its chunks.
 	var unheld []encoding.ID
 	seen := map[encoding.ID]bool{}
 	for _, f := range files {
 		for _, c := range f.chunks {
+			if !heldChunks[c.ID] && !seen[c.ID] {
+				seen[c.ID] = true
+				unheld = append(unheld, c.ID)
+			}
+		}
+	}
+	for _, e := range chunkedTrees {
+		for _, c := range e.Chunks {
 			if !heldChunks[c.ID] && !seen[c.ID] {
 				seen[c.ID] = true
 				unheld = append(unheld, c.ID)
@@ -231,6 +244,7 @@ func (s *Store) fsckPacks(ctx context.Context, repo int64, repair bool, r *FsckR
 	for _, f := range afterRepair {
 		s.fsckFile(ctx, repo, f, nil, r)
 	}
+	s.fsckChunkedTrees(ctx, repo, chunkedTrees, r)
 	objs, err := s.blobs.List(ctx, packPrefix(net))
 	if err != nil {
 		return err
@@ -241,6 +255,37 @@ func (s *Store) fsckPacks(ctx context.Context, repo int64, repair bool, r *FsckR
 		}
 	}
 	return nil
+}
+
+// fsckChunkedTrees verifies each tree held as chunks: its chunks join to a body of its size that
+// decodes canonically, its count first and whole entries after, to its ID.
+func (s *Store) fsckChunkedTrees(ctx context.Context, repo int64, trees map[encoding.ID]contentindex.Entry, r *FsckReport) {
+	ids := make([]encoding.ID, 0, len(trees))
+	for id := range trees {
+		ids = append(ids, id)
+	}
+	sortIDs(ids)
+	for _, id := range ids {
+		r.ChunkedTrees++
+		e := trees[id]
+		bodies, err := s.chunkedTreeBodies(ctx, repo, map[encoding.ID]contentindex.Entry{id: e})
+		if err != nil {
+			r.problem("tree %s: %v", id, err)
+			continue
+		}
+		body := bodies[id]
+		if uint64(len(body)) != e.Size {
+			r.problem("tree %s: its chunks join to %d bytes, its entry says %d", id, len(body), e.Size)
+			continue
+		}
+		if _, err := verifyBody(encoding.KindTree, id, body); err != nil {
+			r.problem("tree %s: %v", id, err)
+			continue
+		}
+		if chunks, err := encoding.ChunkTree(body); err != nil || len(chunks) != len(e.Chunks) {
+			r.problem("tree %s: not held as its body's chunks (%d of them, %v)", id, len(chunks), err)
+		}
+	}
 }
 
 // fsckPack verifies a pack against the content index's chunks and trees in it (here) — a tree's body
@@ -752,8 +797,8 @@ func (s *Store) fsckOperations(ctx context.Context, repo int64, r *FsckReport) e
 // String renders the report for the fsck command.
 func (r *FsckReport) String() string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "%d packs, %d chunks, %d packed trees, %d files, %d objects, %d commits, %d operations, %d views\n",
-		r.Packs, r.Chunks, r.PackedTrees, r.Files, r.Objects, r.Commits, r.Operations, r.Views)
+	fmt.Fprintf(&b, "%d packs, %d chunks, %d packed trees, %d chunked trees, %d files, %d objects, %d commits, %d operations, %d views\n",
+		r.Packs, r.Chunks, r.PackedTrees, r.ChunkedTrees, r.Files, r.Objects, r.Commits, r.Operations, r.Views)
 	fmt.Fprintf(&b, "%d dead pack bytes, %d orphan packs\n", r.DeadBytes, len(r.OrphanPacks))
 	fmt.Fprintf(&b, "%d content index entries\n", r.IndexEntries)
 	for _, o := range r.OrphanPacks {

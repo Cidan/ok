@@ -930,6 +930,9 @@ func (s *Store) markBatch(ctx context.Context, repo int64, t table, batch []enco
 		}
 		for _, id := range stale {
 			next = append(next, kids[id]...)
+			if e := held[id]; e.Chunked {
+				next = append(next, chunkRefs(e)...)
+			}
 		}
 		return next, nil
 	case tFile, tChunk:
@@ -1026,7 +1029,7 @@ func (s *Store) deleteRetiredPacks(ctx context.Context, net *backend.Network, no
 			}
 			u = map[uint64]bool{}
 			err = v.each(ctx, func(_ encoding.ID, e contentindex.Entry) bool {
-				if contentindex.Located(e.Kind) {
+				if e.Located() {
 					u[e.Loc.Pack] = true
 				}
 				return true

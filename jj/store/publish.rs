@@ -6,6 +6,7 @@
 //! references already stored by an earlier one), with only the last one moving the heads.
 //! Nothing is visible until the heads move, so a transaction still lands atomically.
 
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io;
 use std::sync::Arc;
@@ -342,6 +343,41 @@ async fn publish_once(
     heads: Option<pb::OpHeadsUpdate>,
 ) -> Result<Vec<Id>, Status> {
     use pb::publish_request::Step;
+    // A large tree goes as its body's chunks (docs/scm.md, "Large trees"): an edit sends a chunk
+    // or two, not the tree. They are kept in the cache too, where a read of the tree joins them.
+    let mut tree_chunks: HashMap<Id, Vec<u8>> = HashMap::new();
+    let mut trees: Vec<pb::FileManifest> = Vec::new();
+    for k in objects.iter().filter(|k| k.kind == Kind::Tree) {
+        let Some(canonical) = shared.outbox.object(*k).or_else(|| shared.cache.object(*k)) else {
+            continue;
+        };
+        let body = &canonical[1..];
+        if body.len() <= ok_encoding::TREE_CHUNK_THRESHOLD {
+            continue;
+        }
+        let Ok(chunks) = ok_encoding::chunk_tree(body) else {
+            continue;
+        };
+        let mut refs = Vec::with_capacity(chunks.len());
+        for c in chunks {
+            let id = crate::cache::chunk_id(c);
+            refs.push(pb::ChunkRef {
+                id: id.to_vec(),
+                length: c.len() as u32,
+            });
+            if let std::collections::hash_map::Entry::Vacant(v) = tree_chunks.entry(id) {
+                let _ = shared.cache.put_chunk(&id, c);
+                v.insert(c.to_vec());
+            }
+        }
+        trees.push(pb::FileManifest {
+            file_id: k.id.to_vec(),
+            size: body.len() as u64,
+            chunks: refs,
+            path_hint: String::new(),
+            tree: true,
+        });
+    }
     let mut store = shared.client.store().await?;
     let (tx, rx) = mpsc::channel(64);
     let begin = pb::publish_request::Begin {
@@ -370,7 +406,9 @@ async fn publish_once(
                     })
                     .collect(),
                 path_hint: m.path_hint.clone(),
+                tree: false,
             })
+            .chain(trees)
             .collect(),
     };
     let send = |tx: &mpsc::Sender<pb::PublishRequest>, step: Step| {
@@ -416,6 +454,7 @@ async fn publish_once(
                 kind: r.kind,
                 id: r.id.clone(),
                 body: canonical[1..].to_vec(),
+                ..Default::default()
             }),
         )
         .await?;
@@ -423,12 +462,15 @@ async fn publish_once(
     for c in &missing.chunks {
         let id =
             id_from(c).ok_or_else(|| Status::internal("the SCM asked for a malformed chunk ID"))?;
-        let data = shared.chunk(&id).ok_or_else(|| {
-            Status::failed_precondition(format!(
-                "chunk {} is no longer available locally",
-                hex::encode(id)
-            ))
-        })?;
+        let data = tree_chunks
+            .remove(&id)
+            .or_else(|| shared.chunk(&id))
+            .ok_or_else(|| {
+                Status::failed_precondition(format!(
+                    "chunk {} is no longer available locally",
+                    hex::encode(id)
+                ))
+            })?;
         send(
             &tx,
             Step::Chunk(pb::ChunkData {

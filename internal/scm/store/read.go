@@ -550,12 +550,56 @@ type manifest struct {
 // verifies, at once.
 const manifestBatch = 1000
 
-// manifests reads files' manifests from the content index; an absent file has no entry. A file's
-// manifest never changes, so the index is read as the replica holds it (knownEntries).
+// LargeTrees are, of ids, the trees the repository holds as their bodies' chunks (docs/scm.md,
+// "Large trees"), with their entries: a chunked tree's never changes, so the index is read as the
+// replica holds it (knownEntries).
+func (s *Store) LargeTrees(ctx context.Context, repo int64, ids []encoding.ID) (map[encoding.ID]contentindex.Entry, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	_, entries, err := s.knownEntries(ctx, repoScope(repo), encoding.KindTree, ids)
+	if err != nil {
+		return nil, err
+	}
+	for id, e := range entries {
+		if !e.Chunked || !e.Body {
+			delete(entries, id)
+		}
+	}
+	return entries, nil
+}
+
+// LargeTreeObject is a large tree as it is sent: its body's size and chunks, without the body.
+func LargeTreeObject(id encoding.ID, e contentindex.Entry) EncodedObject {
+	o := EncodedObject{Kind: encoding.KindTree, ID: id, Size: e.Size, Chunks: make([]ChunkRef, len(e.Chunks))}
+	for i, c := range e.Chunks {
+		o.Chunks[i] = ChunkRef{ID: c.ID, Length: c.Length}
+	}
+	return o
+}
+
+// manifests reads files' manifests from the content index — and a large tree's, whose body reads as
+// the file of its ID (docs/scm.md, "Large trees") — an absent file has no entry. A file's manifest
+// never changes, so the index is read as the replica holds it (knownEntries).
 func (s *Store) manifests(ctx context.Context, repo int64, files []encoding.ID) (map[encoding.ID]*manifest, error) {
 	_, entries, err := s.knownEntries(ctx, repoScope(repo), encoding.KindFile, files)
 	if err != nil {
 		return nil, err
+	}
+	if len(entries) < len(files) {
+		var rest []encoding.ID
+		for _, id := range files {
+			if _, ok := entries[id]; !ok {
+				rest = append(rest, id)
+			}
+		}
+		large, err := s.LargeTrees(ctx, repo, rest)
+		if err != nil {
+			return nil, err
+		}
+		for id, e := range large {
+			entries[id] = e
+		}
 	}
 	out := make(map[encoding.ID]*manifest, len(entries))
 	for id, e := range entries {
@@ -1272,7 +1316,7 @@ func cleanPrefixes(prefixes []string) ([]string, error) {
 // (zero for none) is a tree whose closure the caller holds: what it holds at the same path is not
 // sent — a subtree whose ID is the base's there, with everything beneath it, and a symlink or copy
 // history the base's tree there names too.
-func (s *Store) ReadTreeClosure(ctx context.Context, repo int64, treeID, base encoding.ID, prefixes []string, withSizes bool, emit func(EncodedObject) error) error {
+func (s *Store) ReadTreeClosure(ctx context.Context, repo int64, treeID, base encoding.ID, prefixes []string, withSizes, largeAsChunks bool, emit func(EncodedObject) error) error {
 	prefixes, err := cleanPrefixes(prefixes)
 	if err != nil {
 		return err
@@ -1309,6 +1353,32 @@ func (s *Store) ReadTreeClosure(ctx context.Context, repo int64, treeID, base en
 			if !sent[r] {
 				sent[r] = true
 				fresh = append(fresh, r)
+			}
+		}
+		if largeAsChunks {
+			var ids []encoding.ID
+			for _, r := range fresh {
+				if r.Kind == encoding.KindTree {
+					ids = append(ids, r.ID)
+				}
+			}
+			large, err := s.LargeTrees(ctx, repo, ids)
+			if err != nil {
+				return err
+			}
+			if len(large) > 0 {
+				var whole []ObjectRef
+				for _, r := range fresh {
+					e, ok := large[r.ID]
+					if !ok || r.Kind != encoding.KindTree {
+						whole = append(whole, r)
+						continue
+					}
+					if err := emit(LargeTreeObject(r.ID, e)); err != nil {
+						return err
+					}
+				}
+				fresh = whole
 			}
 		}
 		res, err := s.ReadObjects(ctx, repo, fresh)
