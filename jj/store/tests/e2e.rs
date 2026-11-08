@@ -1628,7 +1628,6 @@ async fn a_large_tree_travels_as_its_chunks() {
     if !ok_testscm::available() {
         return;
     }
-    use ok_store::calls;
     let endpoint = endpoint();
     let remote = new_repository(&endpoint, "large-trees").await;
     let a = Machine::new(&endpoint, &remote).await;
@@ -1646,35 +1645,8 @@ async fn a_large_tree_travels_as_its_chunks() {
 
     // The SCM holds the directory as its body's chunks: asked for them, it sends them.
     let shared_a = ok_store::Shared::for_store_path(&a.repo_dir.join("store")).unwrap();
-    let sent = shared_a
-        .client
-        .store()
-        .await
-        .unwrap()
-        .read_objects(ok_store::pb::ReadObjectsRequest {
-            repository_id: remote.id,
-            refs: vec![ok_store::pb::ObjectRef {
-                kind: ok_store::pb::ObjectKind::Tree as i32,
-                id: dir.as_bytes().to_vec(),
-            }],
-            large_trees_as_chunks: true,
-        })
-        .await
-        .unwrap()
-        .into_inner()
-        .message()
-        .await
-        .unwrap()
-        .unwrap();
-    let Some(ok_store::pb::object_result::Result::Object(o)) = sent.result else {
-        panic!("the directory was not found");
-    };
-    assert!(
-        o.body.is_empty() && o.chunks.len() > 2,
-        "{} chunks",
-        o.chunks.len()
-    );
-    let size = o.size;
+    let o = large_tree(&shared_a, remote.id, &dir).await;
+    assert!(o.chunks.len() > 2, "{} chunks", o.chunks.len());
 
     // A cold machine reads it whole from its chunks.
     let b = Machine::new(&endpoint, &remote).await;
@@ -1693,7 +1665,8 @@ async fn a_large_tree_travels_as_its_chunks() {
         .unwrap();
     assert_eq!(tree_b.data().entries().count(), 5000);
 
-    // One entry changes: the machine holding the last version receives about a chunk of it.
+    // One entry changes: the machine holding the last version lacks a chunk or two of it, and reads
+    // only those — its cache holds the rest from the last version.
     let mut tx = repo.start_transaction();
     let second = child(
         &mut tx,
@@ -1704,22 +1677,29 @@ async fn a_large_tree_travels_as_its_chunks() {
     .await;
     tx.commit("one").await.unwrap();
     let dir2 = assets_of(&second).await;
-    let before = calls::calls();
+    let chunks: Vec<[u8; 32]> = large_tree(&shared_a, remote.id, &dir2)
+        .await
+        .chunks
+        .iter()
+        .map(|c| c.id.as_slice().try_into().unwrap())
+        .collect();
+    let shared_b = ok_store::Shared::for_store_path(&b.repo_dir.join("store")).unwrap();
+    let lacking = chunks
+        .iter()
+        .filter(|c| shared_b.cache.chunk(c).is_none())
+        .count();
+    assert!(
+        (1..=3).contains(&lacking),
+        "{lacking} of the new version's {} chunks are not cached from the last",
+        chunks.len()
+    );
     let tree_b2 = repo_b
         .store()
         .get_tree(RepoPathBuf::root(), &dir2)
         .await
         .unwrap();
     assert_eq!(tree_b2.data().entries().count(), 5000);
-    let after = calls::calls();
-    let received = |m: &str| {
-        after.get(m).map_or(0, |c| c.received_bytes) - before.get(m).map_or(0, |c| c.received_bytes)
-    };
-    let got = received("Store/ReadObjects") + received("Store/ReadFiles");
-    assert!(
-        got < size / 2,
-        "{got} bytes received for a version of a {size}-byte tree with one entry changed"
-    );
+    assert!(chunks.iter().all(|c| shared_b.cache.chunk(c).is_some()));
 }
 
 /// The tree at `assets` in a commit.
@@ -1734,4 +1714,37 @@ async fn assets_of(c: &Commit) -> jj_lib::backend::TreeId {
         Ok(Some(TreeValue::Tree(id))) => id,
         v => panic!("assets is {v:?}"),
     }
+}
+
+/// A large tree as the SCM sends one when asked for its chunks.
+async fn large_tree(
+    shared: &std::sync::Arc<ok_store::Shared>,
+    repository_id: i64,
+    tree: &jj_lib::backend::TreeId,
+) -> ok_store::pb::EncodedObject {
+    let sent = shared
+        .client
+        .store()
+        .await
+        .unwrap()
+        .read_objects(ok_store::pb::ReadObjectsRequest {
+            repository_id,
+            refs: vec![ok_store::pb::ObjectRef {
+                kind: ok_store::pb::ObjectKind::Tree as i32,
+                id: tree.as_bytes().to_vec(),
+            }],
+            large_trees_as_chunks: true,
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .message()
+        .await
+        .unwrap()
+        .unwrap();
+    let Some(ok_store::pb::object_result::Result::Object(o)) = sent.result else {
+        panic!("the tree was not found");
+    };
+    assert!(o.body.is_empty(), "a large tree sent whole");
+    o
 }
