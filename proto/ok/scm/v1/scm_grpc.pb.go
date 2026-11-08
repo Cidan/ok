@@ -1814,6 +1814,248 @@ var Landing_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
+	Locks_Lock_FullMethodName       = "/ok.scm.v1.Locks/Lock"
+	Locks_Unlock_FullMethodName     = "/ok.scm.v1.Locks/Unlock"
+	Locks_BreakLocks_FullMethodName = "/ok.scm.v1.Locks/BreakLocks"
+	Locks_ListLocks_FullMethodName  = "/ok.scm.v1.Locks/ListLocks"
+)
+
+// LocksClient is the client API for Locks service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+//
+// Locks of paths (docs/scm.md, "Locks"): a person locks paths of a repository — any file, or a
+// directory and everything under it — so that no one else's CL changing them lands, its submission
+// refused, while they work on them. A lock is theirs for 18 hours from when they took it, judged from
+// its record as it is read; they unlock it, a landing of theirs that changes its path releases it, or
+// a repository administrator breaks it. Uploading is never refused.
+type LocksClient interface {
+	// Lock locks paths for the caller, every one or none: a path someone else holds a live lock of
+	// refuses them all (FAILED_PRECONDITION, with a LockRejection). One the caller holds is taken
+	// again, its 18 hours starting over.
+	Lock(ctx context.Context, in *LockRequest, opts ...grpc.CallOption) (*LockResponse, error)
+	// Unlock ends the caller's locks of paths. A path someone else holds a live lock of refuses them
+	// all (FAILED_PRECONDITION, with a LockRejection); one no one holds is passed over.
+	Unlock(ctx context.Context, in *UnlockRequest, opts ...grpc.CallOption) (*UnlockResponse, error)
+	// BreakLocks ends whoever's locks of paths: a repository administrator's, in an emergency.
+	BreakLocks(ctx context.Context, in *BreakLocksRequest, opts ...grpc.CallOption) (*BreakLocksResponse, error)
+	// ListLocks lists a repository's live locks of a path and everything under it, by path.
+	ListLocks(ctx context.Context, in *ListLocksRequest, opts ...grpc.CallOption) (*ListLocksResponse, error)
+}
+
+type locksClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewLocksClient(cc grpc.ClientConnInterface) LocksClient {
+	return &locksClient{cc}
+}
+
+func (c *locksClient) Lock(ctx context.Context, in *LockRequest, opts ...grpc.CallOption) (*LockResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(LockResponse)
+	err := c.cc.Invoke(ctx, Locks_Lock_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *locksClient) Unlock(ctx context.Context, in *UnlockRequest, opts ...grpc.CallOption) (*UnlockResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(UnlockResponse)
+	err := c.cc.Invoke(ctx, Locks_Unlock_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *locksClient) BreakLocks(ctx context.Context, in *BreakLocksRequest, opts ...grpc.CallOption) (*BreakLocksResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(BreakLocksResponse)
+	err := c.cc.Invoke(ctx, Locks_BreakLocks_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *locksClient) ListLocks(ctx context.Context, in *ListLocksRequest, opts ...grpc.CallOption) (*ListLocksResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListLocksResponse)
+	err := c.cc.Invoke(ctx, Locks_ListLocks_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// LocksServer is the server API for Locks service.
+// All implementations must embed UnimplementedLocksServer
+// for forward compatibility.
+//
+// Locks of paths (docs/scm.md, "Locks"): a person locks paths of a repository — any file, or a
+// directory and everything under it — so that no one else's CL changing them lands, its submission
+// refused, while they work on them. A lock is theirs for 18 hours from when they took it, judged from
+// its record as it is read; they unlock it, a landing of theirs that changes its path releases it, or
+// a repository administrator breaks it. Uploading is never refused.
+type LocksServer interface {
+	// Lock locks paths for the caller, every one or none: a path someone else holds a live lock of
+	// refuses them all (FAILED_PRECONDITION, with a LockRejection). One the caller holds is taken
+	// again, its 18 hours starting over.
+	Lock(context.Context, *LockRequest) (*LockResponse, error)
+	// Unlock ends the caller's locks of paths. A path someone else holds a live lock of refuses them
+	// all (FAILED_PRECONDITION, with a LockRejection); one no one holds is passed over.
+	Unlock(context.Context, *UnlockRequest) (*UnlockResponse, error)
+	// BreakLocks ends whoever's locks of paths: a repository administrator's, in an emergency.
+	BreakLocks(context.Context, *BreakLocksRequest) (*BreakLocksResponse, error)
+	// ListLocks lists a repository's live locks of a path and everything under it, by path.
+	ListLocks(context.Context, *ListLocksRequest) (*ListLocksResponse, error)
+	mustEmbedUnimplementedLocksServer()
+}
+
+// UnimplementedLocksServer must be embedded to have
+// forward compatible implementations.
+//
+// NOTE: this should be embedded by value instead of pointer to avoid a nil
+// pointer dereference when methods are called.
+type UnimplementedLocksServer struct{}
+
+func (UnimplementedLocksServer) Lock(context.Context, *LockRequest) (*LockResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Lock not implemented")
+}
+func (UnimplementedLocksServer) Unlock(context.Context, *UnlockRequest) (*UnlockResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Unlock not implemented")
+}
+func (UnimplementedLocksServer) BreakLocks(context.Context, *BreakLocksRequest) (*BreakLocksResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method BreakLocks not implemented")
+}
+func (UnimplementedLocksServer) ListLocks(context.Context, *ListLocksRequest) (*ListLocksResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListLocks not implemented")
+}
+func (UnimplementedLocksServer) mustEmbedUnimplementedLocksServer() {}
+func (UnimplementedLocksServer) testEmbeddedByValue()               {}
+
+// UnsafeLocksServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to LocksServer will
+// result in compilation errors.
+type UnsafeLocksServer interface {
+	mustEmbedUnimplementedLocksServer()
+}
+
+func RegisterLocksServer(s grpc.ServiceRegistrar, srv LocksServer) {
+	// If the following call panics, it indicates UnimplementedLocksServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&Locks_ServiceDesc, srv)
+}
+
+func _Locks_Lock_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(LockRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LocksServer).Lock(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Locks_Lock_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LocksServer).Lock(ctx, req.(*LockRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Locks_Unlock_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(UnlockRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LocksServer).Unlock(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Locks_Unlock_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LocksServer).Unlock(ctx, req.(*UnlockRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Locks_BreakLocks_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(BreakLocksRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LocksServer).BreakLocks(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Locks_BreakLocks_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LocksServer).BreakLocks(ctx, req.(*BreakLocksRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Locks_ListLocks_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListLocksRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LocksServer).ListLocks(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Locks_ListLocks_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LocksServer).ListLocks(ctx, req.(*ListLocksRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// Locks_ServiceDesc is the grpc.ServiceDesc for Locks service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var Locks_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "ok.scm.v1.Locks",
+	HandlerType: (*LocksServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "Lock",
+			Handler:    _Locks_Lock_Handler,
+		},
+		{
+			MethodName: "Unlock",
+			Handler:    _Locks_Unlock_Handler,
+		},
+		{
+			MethodName: "BreakLocks",
+			Handler:    _Locks_BreakLocks_Handler,
+		},
+		{
+			MethodName: "ListLocks",
+			Handler:    _Locks_ListLocks_Handler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: "proto/ok/scm/v1/scm.proto",
+}
+
+const (
 	LandingChecks_DryRunLand_FullMethodName = "/ok.scm.v1.LandingChecks/DryRunLand"
 )
 

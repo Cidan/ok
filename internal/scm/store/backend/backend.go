@@ -599,6 +599,18 @@ type Ops interface {
 
 	// Candidate reads a pending candidate; ok is false when there is none.
 	Candidate(ctx context.Context, repo int64, commit encoding.ID) (Candidate, bool, error)
+	// FileLocks are a repository's locks of paths — every one, expired too: a lock lives by its
+	// TakenAt, as its reader judges — by path; with no paths, every lock of the repository.
+	FileLocks(ctx context.Context, repo int64, paths []string) (map[string]FileLock, error)
+	// PutFileLocks records locks, each replacing the one of its path, taken now: the database's
+	// time, which each lock returned holds.
+	PutFileLocks(ctx context.Context, repo int64, locks []FileLock) ([]FileLock, error)
+	// DeleteFileLocks deletes the locks of paths holder holds (any holder's, holder ""), and returns
+	// the paths whose locks it deleted.
+	DeleteFileLocks(ctx context.Context, repo int64, paths []string, holder string) ([]string, error)
+	// DeleteFileLocksBefore deletes a repository's locks taken before a time — expired — and returns
+	// how many.
+	DeleteFileLocksBefore(ctx context.Context, repo int64, before time.Time) (int64, error)
 	// CandidatesOf reads the pending candidates of commits, by commit; one with none is absent.
 	CandidatesOf(ctx context.Context, repo int64, commits []encoding.ID) (map[encoding.ID]Candidate, error)
 	// PutCandidate records a candidate, unless it is recorded, and returns it as recorded.

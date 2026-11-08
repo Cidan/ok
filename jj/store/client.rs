@@ -97,6 +97,7 @@ pub type Conn = Measured<Authed<Channel>>;
 pub type StoreClient = pb::store_client::StoreClient<Svc>;
 pub type RepositoriesClient = pb::repositories_client::RepositoriesClient<Svc>;
 pub type ChangeListsClient = pb::change_lists_client::ChangeListsClient<Svc>;
+pub type LocksClient = pb::locks_client::LocksClient<Svc>;
 pub type WorkspacesClient = pb::workspaces_client::WorkspacesClient<Svc>;
 pub type SecretsClient = ok_proto::ok::secrets::v1::secrets_client::SecretsClient<Svc>;
 
@@ -389,6 +390,15 @@ impl Client {
         let (channel, dev) = self.conn().await?;
         Ok(
             pb::change_lists_client::ChangeListsClient::with_interceptor(channel, dev)
+                .max_decoding_message_size(MAX_MESSAGE)
+                .max_encoding_message_size(MAX_MESSAGE),
+        )
+    }
+
+    pub async fn locks(&self) -> Result<LocksClient, Status> {
+        let (channel, dev) = self.conn().await?;
+        Ok(
+            pb::locks_client::LocksClient::with_interceptor(channel, dev)
                 .max_decoding_message_size(MAX_MESSAGE)
                 .max_encoding_message_size(MAX_MESSAGE),
         )

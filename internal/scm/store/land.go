@@ -29,6 +29,8 @@ const (
 	LandCandidateMismatch  LandReason = 8
 	LandUnknownBase        LandReason = 9
 	LandTooLarge           LandReason = 10
+	// LandLocked: the CL changes a path someone else holds a live lock of (locks.go).
+	LandLocked LandReason = 11
 )
 
 // LandRejection refuses a landing or a candidate: which CL, why, and every conflicting
@@ -307,6 +309,9 @@ func (s *Store) Land(ctx context.Context, repo int64, items []LandItem, expected
 		if dryRun {
 			return landed, plan.newHead, nil, nil
 		}
+		if s.landPlanned != nil {
+			s.landPlanned()
+		}
 		last, err := s.writeLanding(ctx, repo, numbers, plan)
 		if errors.Is(err, errStaleLanding) && attempt < landPlans {
 			continue // a CL changed since the plan read it: plan again, which says why it does not land
@@ -435,6 +440,11 @@ func (s *Store) planLanding(ctx context.Context, q *txn, repo int64, items []Lan
 		return nil, err
 	}
 
+	// Locks are few: every one of the repository's is read, and each CL's changes matched to them.
+	locks, err := q.FileLocks(ctx, repo, nil)
+	if err != nil {
+		return nil, err
+	}
 	plan := &landPlan{head: head, headSeq: headSeq, ts: ts}
 	at := time.Now()
 	running := head
@@ -494,6 +504,9 @@ func (s *Store) planLanding(ctx context.Context, q *txn, repo int64, items []Lan
 		}
 		paths, err := changedPaths(ts, from, to)
 		if err != nil {
+			return nil, err
+		}
+		if err := lockedPaths(locks, c.Number, c.Author, paths, at); err != nil {
 			return nil, err
 		}
 		plan.steps = append(plan.steps, landStep{cl: c, ps: ps, id: id, commit: commit, gen: runningGen + 1, parent: running,
@@ -589,6 +602,23 @@ func (s *Store) writeLanding(ctx context.Context, repo int64, numbers []int64, p
 			if !ok || c.Status != StatusOpen || c.CurrentPatchset != st.ps.Number || c.ParentNumber != st.cl.ParentNumber ||
 				c.Current().Commit != st.ps.Commit || c.Current().Base != st.ps.Base {
 				return errStaleLanding
+			}
+		}
+		// The locks again, as main's head orders them: one taken since the plan read them refuses it,
+		// and the author's of the paths each CL changes are released.
+		locks, err := tx.FileLocks(ctx, repo, nil)
+		if err != nil {
+			return err
+		}
+		now := time.Now()
+		for _, st := range plan.steps {
+			if err := lockedPaths(locks, st.cl.Number, st.cl.Author, st.paths, now); err != nil {
+				return err
+			}
+			if released := releasedLocks(locks, st.cl.Author, st.paths); len(released) > 0 {
+				if _, err := tx.DeleteFileLocks(ctx, repo, released, st.cl.Author); err != nil {
+					return err
+				}
 			}
 		}
 
@@ -786,6 +816,28 @@ func (s *Store) PrepareCandidate(ctx context.Context, repo, number int64, patchs
 		id, commit, err := s.landOnto(lc, ts, number, c.Current(), base, committer, time.Now())
 		if err != nil {
 			return err
+		}
+		// A candidate of a change to a path someone else holds a live lock of would not land.
+		locks, err := tx.FileLocks(ctx, repo, nil)
+		if err != nil {
+			return err
+		}
+		if len(locks) > 0 {
+			from, _, err := lc.tree(base)
+			if err != nil {
+				return err
+			}
+			to, _, err := lc.tree(id)
+			if err != nil {
+				return err
+			}
+			paths, err := changedPaths(ts, from, to)
+			if err != nil {
+				return err
+			}
+			if err := lockedPaths(locks, number, c.Author, paths, time.Now()); err != nil {
+				return err
+			}
 		}
 		if commit != nil {
 			gen, err := s.generation(ctx, repo, base)

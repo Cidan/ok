@@ -372,7 +372,7 @@ func (x RollbackRejection_Reason) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use RollbackRejection_Reason.Descriptor instead.
 func (RollbackRejection_Reason) EnumDescriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{52, 0}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{62, 0}
 }
 
 type UploadRequest_Readiness int32
@@ -423,7 +423,7 @@ func (x UploadRequest_Readiness) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use UploadRequest_Readiness.Descriptor instead.
 func (UploadRequest_Readiness) EnumDescriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{53, 0}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{63, 0}
 }
 
 type UploadResponse_Result_Outcome int32
@@ -475,7 +475,7 @@ func (x UploadResponse_Result_Outcome) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use UploadResponse_Result_Outcome.Descriptor instead.
 func (UploadResponse_Result_Outcome) EnumDescriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{54, 0, 0}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{64, 0, 0}
 }
 
 type ListSecretReferencesResponse_State int32
@@ -525,7 +525,7 @@ func (x ListSecretReferencesResponse_State) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use ListSecretReferencesResponse_State.Descriptor instead.
 func (ListSecretReferencesResponse_State) EnumDescriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{56, 0}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{66, 0}
 }
 
 type UploadRejection_Reason int32
@@ -612,7 +612,7 @@ func (x UploadRejection_Reason) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use UploadRejection_Reason.Descriptor instead.
 func (UploadRejection_Reason) EnumDescriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{58, 0}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{68, 0}
 }
 
 type TransitionRequest_Kind int32
@@ -667,7 +667,7 @@ func (x TransitionRequest_Kind) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use TransitionRequest_Kind.Descriptor instead.
 func (TransitionRequest_Kind) EnumDescriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{64, 0}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{74, 0}
 }
 
 type LandRejection_Reason int32
@@ -684,6 +684,7 @@ const (
 	LandRejection_REASON_CANDIDATE_MISMATCH   LandRejection_Reason = 8
 	LandRejection_REASON_UNKNOWN_BASE         LandRejection_Reason = 9  // a candidate's base is neither on main nor a pending candidate
 	LandRejection_REASON_TOO_LARGE            LandRejection_Reason = 10 // more than one transaction holds: land fewer CLs at once
+	LandRejection_REASON_LOCKED               LandRejection_Reason = 11 // it changes paths someone else holds live locks of (paths): Locks
 )
 
 // Enum value maps for LandRejection_Reason.
@@ -700,6 +701,7 @@ var (
 		8:  "REASON_CANDIDATE_MISMATCH",
 		9:  "REASON_UNKNOWN_BASE",
 		10: "REASON_TOO_LARGE",
+		11: "REASON_LOCKED",
 	}
 	LandRejection_Reason_value = map[string]int32{
 		"REASON_UNSPECIFIED":          0,
@@ -713,6 +715,7 @@ var (
 		"REASON_CANDIDATE_MISMATCH":   8,
 		"REASON_UNKNOWN_BASE":         9,
 		"REASON_TOO_LARGE":            10,
+		"REASON_LOCKED":               11,
 	}
 )
 
@@ -740,7 +743,7 @@ func (x LandRejection_Reason) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use LandRejection_Reason.Descriptor instead.
 func (LandRejection_Reason) EnumDescriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{74, 0}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{84, 0}
 }
 
 type PathChange_Kind int32
@@ -801,7 +804,7 @@ func (x PathChange_Kind) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use PathChange_Kind.Descriptor instead.
 func (PathChange_Kind) EnumDescriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{93, 0}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{103, 0}
 }
 
 type DiffLine_Op int32
@@ -853,7 +856,7 @@ func (x DiffLine_Op) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use DiffLine_Op.Descriptor instead.
 func (DiffLine_Op) EnumDescriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{96, 0}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{106, 0}
 }
 
 type ObjectRef struct {
@@ -4045,6 +4048,521 @@ func (x *PublishRejection) GetMessage() string {
 	return ""
 }
 
+// A lock of a path, as of when it was read.
+type FileLock struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Path          string                 `protobuf:"bytes,1,opt,name=path,proto3" json:"path,omitempty"`
+	HolderId      string                 `protobuf:"bytes,2,opt,name=holder_id,json=holderId,proto3" json:"holder_id,omitempty"` // the person's stable ID
+	Holder        string                 `protobuf:"bytes,3,opt,name=holder,proto3" json:"holder,omitempty"`                     // their name as of when they took it
+	TakenAt       *timestamppb.Timestamp `protobuf:"bytes,4,opt,name=taken_at,json=takenAt,proto3" json:"taken_at,omitempty"`
+	ExpiresAt     *timestamppb.Timestamp `protobuf:"bytes,5,opt,name=expires_at,json=expiresAt,proto3" json:"expires_at,omitempty"` // taken_at and 18 hours
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *FileLock) Reset() {
+	*x = FileLock{}
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[47]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *FileLock) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*FileLock) ProtoMessage() {}
+
+func (x *FileLock) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[47]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use FileLock.ProtoReflect.Descriptor instead.
+func (*FileLock) Descriptor() ([]byte, []int) {
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{47}
+}
+
+func (x *FileLock) GetPath() string {
+	if x != nil {
+		return x.Path
+	}
+	return ""
+}
+
+func (x *FileLock) GetHolderId() string {
+	if x != nil {
+		return x.HolderId
+	}
+	return ""
+}
+
+func (x *FileLock) GetHolder() string {
+	if x != nil {
+		return x.Holder
+	}
+	return ""
+}
+
+func (x *FileLock) GetTakenAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.TakenAt
+	}
+	return nil
+}
+
+func (x *FileLock) GetExpiresAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.ExpiresAt
+	}
+	return nil
+}
+
+// At most 1,000 paths, each repository-relative.
+type LockRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	RepositoryId  int64                  `protobuf:"varint,1,opt,name=repository_id,json=repositoryId,proto3" json:"repository_id,omitempty"`
+	Paths         []string               `protobuf:"bytes,2,rep,name=paths,proto3" json:"paths,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *LockRequest) Reset() {
+	*x = LockRequest{}
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[48]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *LockRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*LockRequest) ProtoMessage() {}
+
+func (x *LockRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[48]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use LockRequest.ProtoReflect.Descriptor instead.
+func (*LockRequest) Descriptor() ([]byte, []int) {
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{48}
+}
+
+func (x *LockRequest) GetRepositoryId() int64 {
+	if x != nil {
+		return x.RepositoryId
+	}
+	return 0
+}
+
+func (x *LockRequest) GetPaths() []string {
+	if x != nil {
+		return x.Paths
+	}
+	return nil
+}
+
+type LockResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Locks         []*FileLock            `protobuf:"bytes,1,rep,name=locks,proto3" json:"locks,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *LockResponse) Reset() {
+	*x = LockResponse{}
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[49]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *LockResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*LockResponse) ProtoMessage() {}
+
+func (x *LockResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[49]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use LockResponse.ProtoReflect.Descriptor instead.
+func (*LockResponse) Descriptor() ([]byte, []int) {
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{49}
+}
+
+func (x *LockResponse) GetLocks() []*FileLock {
+	if x != nil {
+		return x.Locks
+	}
+	return nil
+}
+
+type UnlockRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	RepositoryId  int64                  `protobuf:"varint,1,opt,name=repository_id,json=repositoryId,proto3" json:"repository_id,omitempty"`
+	Paths         []string               `protobuf:"bytes,2,rep,name=paths,proto3" json:"paths,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *UnlockRequest) Reset() {
+	*x = UnlockRequest{}
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[50]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *UnlockRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*UnlockRequest) ProtoMessage() {}
+
+func (x *UnlockRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[50]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use UnlockRequest.ProtoReflect.Descriptor instead.
+func (*UnlockRequest) Descriptor() ([]byte, []int) {
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{50}
+}
+
+func (x *UnlockRequest) GetRepositoryId() int64 {
+	if x != nil {
+		return x.RepositoryId
+	}
+	return 0
+}
+
+func (x *UnlockRequest) GetPaths() []string {
+	if x != nil {
+		return x.Paths
+	}
+	return nil
+}
+
+type UnlockResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Unlocked      []string               `protobuf:"bytes,1,rep,name=unlocked,proto3" json:"unlocked,omitempty"` // the paths the caller held
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *UnlockResponse) Reset() {
+	*x = UnlockResponse{}
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[51]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *UnlockResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*UnlockResponse) ProtoMessage() {}
+
+func (x *UnlockResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[51]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use UnlockResponse.ProtoReflect.Descriptor instead.
+func (*UnlockResponse) Descriptor() ([]byte, []int) {
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{51}
+}
+
+func (x *UnlockResponse) GetUnlocked() []string {
+	if x != nil {
+		return x.Unlocked
+	}
+	return nil
+}
+
+type BreakLocksRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	RepositoryId  int64                  `protobuf:"varint,1,opt,name=repository_id,json=repositoryId,proto3" json:"repository_id,omitempty"`
+	Paths         []string               `protobuf:"bytes,2,rep,name=paths,proto3" json:"paths,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *BreakLocksRequest) Reset() {
+	*x = BreakLocksRequest{}
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[52]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BreakLocksRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BreakLocksRequest) ProtoMessage() {}
+
+func (x *BreakLocksRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[52]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BreakLocksRequest.ProtoReflect.Descriptor instead.
+func (*BreakLocksRequest) Descriptor() ([]byte, []int) {
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{52}
+}
+
+func (x *BreakLocksRequest) GetRepositoryId() int64 {
+	if x != nil {
+		return x.RepositoryId
+	}
+	return 0
+}
+
+func (x *BreakLocksRequest) GetPaths() []string {
+	if x != nil {
+		return x.Paths
+	}
+	return nil
+}
+
+type BreakLocksResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Broken        []*FileLock            `protobuf:"bytes,1,rep,name=broken,proto3" json:"broken,omitempty"` // the live locks it ended
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *BreakLocksResponse) Reset() {
+	*x = BreakLocksResponse{}
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[53]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BreakLocksResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BreakLocksResponse) ProtoMessage() {}
+
+func (x *BreakLocksResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[53]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BreakLocksResponse.ProtoReflect.Descriptor instead.
+func (*BreakLocksResponse) Descriptor() ([]byte, []int) {
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{53}
+}
+
+func (x *BreakLocksResponse) GetBroken() []*FileLock {
+	if x != nil {
+		return x.Broken
+	}
+	return nil
+}
+
+type ListLocksRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	RepositoryId  int64                  `protobuf:"varint,1,opt,name=repository_id,json=repositoryId,proto3" json:"repository_id,omitempty"`
+	PathPrefix    string                 `protobuf:"bytes,2,opt,name=path_prefix,json=pathPrefix,proto3" json:"path_prefix,omitempty"` // "": every lock of the repository
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListLocksRequest) Reset() {
+	*x = ListLocksRequest{}
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[54]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListLocksRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListLocksRequest) ProtoMessage() {}
+
+func (x *ListLocksRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[54]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListLocksRequest.ProtoReflect.Descriptor instead.
+func (*ListLocksRequest) Descriptor() ([]byte, []int) {
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{54}
+}
+
+func (x *ListLocksRequest) GetRepositoryId() int64 {
+	if x != nil {
+		return x.RepositoryId
+	}
+	return 0
+}
+
+func (x *ListLocksRequest) GetPathPrefix() string {
+	if x != nil {
+		return x.PathPrefix
+	}
+	return ""
+}
+
+type ListLocksResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Locks         []*FileLock            `protobuf:"bytes,1,rep,name=locks,proto3" json:"locks,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListLocksResponse) Reset() {
+	*x = ListLocksResponse{}
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[55]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListLocksResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListLocksResponse) ProtoMessage() {}
+
+func (x *ListLocksResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[55]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListLocksResponse.ProtoReflect.Descriptor instead.
+func (*ListLocksResponse) Descriptor() ([]byte, []int) {
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{55}
+}
+
+func (x *ListLocksResponse) GetLocks() []*FileLock {
+	if x != nil {
+		return x.Locks
+	}
+	return nil
+}
+
+// Why a lock or an unlock was refused: the live lock someone else holds.
+type LockRejection struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Held          *FileLock              `protobuf:"bytes,1,opt,name=held,proto3" json:"held,omitempty"`
+	Message       string                 `protobuf:"bytes,2,opt,name=message,proto3" json:"message,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *LockRejection) Reset() {
+	*x = LockRejection{}
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[56]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *LockRejection) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*LockRejection) ProtoMessage() {}
+
+func (x *LockRejection) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[56]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use LockRejection.ProtoReflect.Descriptor instead.
+func (*LockRejection) Descriptor() ([]byte, []int) {
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{56}
+}
+
+func (x *LockRejection) GetHeld() *FileLock {
+	if x != nil {
+		return x.Held
+	}
+	return nil
+}
+
+func (x *LockRejection) GetMessage() string {
+	if x != nil {
+		return x.Message
+	}
+	return ""
+}
+
 type Patchset struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Number        int32                  `protobuf:"varint,1,opt,name=number,proto3" json:"number,omitempty"`
@@ -4059,7 +4577,7 @@ type Patchset struct {
 
 func (x *Patchset) Reset() {
 	*x = Patchset{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[47]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[57]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4071,7 +4589,7 @@ func (x *Patchset) String() string {
 func (*Patchset) ProtoMessage() {}
 
 func (x *Patchset) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[47]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[57]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4084,7 +4602,7 @@ func (x *Patchset) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Patchset.ProtoReflect.Descriptor instead.
 func (*Patchset) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{47}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{57}
 }
 
 func (x *Patchset) GetNumber() int32 {
@@ -4154,7 +4672,7 @@ type ChangeList struct {
 
 func (x *ChangeList) Reset() {
 	*x = ChangeList{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[48]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[58]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4166,7 +4684,7 @@ func (x *ChangeList) String() string {
 func (*ChangeList) ProtoMessage() {}
 
 func (x *ChangeList) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[48]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[58]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4179,7 +4697,7 @@ func (x *ChangeList) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ChangeList.ProtoReflect.Descriptor instead.
 func (*ChangeList) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{48}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{58}
 }
 
 func (x *ChangeList) GetRepositoryId() int64 {
@@ -4317,7 +4835,7 @@ type Rollback struct {
 
 func (x *Rollback) Reset() {
 	*x = Rollback{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[49]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[59]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4329,7 +4847,7 @@ func (x *Rollback) String() string {
 func (*Rollback) ProtoMessage() {}
 
 func (x *Rollback) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[49]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[59]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4342,7 +4860,7 @@ func (x *Rollback) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Rollback.ProtoReflect.Descriptor instead.
 func (*Rollback) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{49}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{59}
 }
 
 func (x *Rollback) GetChangeLists() []int64 {
@@ -4379,7 +4897,7 @@ type RollbackRequest struct {
 
 func (x *RollbackRequest) Reset() {
 	*x = RollbackRequest{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[50]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[60]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4391,7 +4909,7 @@ func (x *RollbackRequest) String() string {
 func (*RollbackRequest) ProtoMessage() {}
 
 func (x *RollbackRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[50]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[60]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4404,7 +4922,7 @@ func (x *RollbackRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RollbackRequest.ProtoReflect.Descriptor instead.
 func (*RollbackRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{50}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{60}
 }
 
 func (x *RollbackRequest) GetRepositoryId() int64 {
@@ -4452,7 +4970,7 @@ type RollbackResponse struct {
 
 func (x *RollbackResponse) Reset() {
 	*x = RollbackResponse{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[51]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[61]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4464,7 +4982,7 @@ func (x *RollbackResponse) String() string {
 func (*RollbackResponse) ProtoMessage() {}
 
 func (x *RollbackResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[51]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[61]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4477,7 +4995,7 @@ func (x *RollbackResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RollbackResponse.ProtoReflect.Descriptor instead.
 func (*RollbackResponse) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{51}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{61}
 }
 
 func (x *RollbackResponse) GetChangeList() *ChangeList {
@@ -4507,7 +5025,7 @@ type RollbackRejection struct {
 
 func (x *RollbackRejection) Reset() {
 	*x = RollbackRejection{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[52]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[62]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4519,7 +5037,7 @@ func (x *RollbackRejection) String() string {
 func (*RollbackRejection) ProtoMessage() {}
 
 func (x *RollbackRejection) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[52]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[62]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4532,7 +5050,7 @@ func (x *RollbackRejection) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RollbackRejection.ProtoReflect.Descriptor instead.
 func (*RollbackRejection) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{52}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{62}
 }
 
 func (x *RollbackRejection) GetNumber() int64 {
@@ -4575,7 +5093,7 @@ type UploadRequest struct {
 
 func (x *UploadRequest) Reset() {
 	*x = UploadRequest{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[53]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[63]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4587,7 +5105,7 @@ func (x *UploadRequest) String() string {
 func (*UploadRequest) ProtoMessage() {}
 
 func (x *UploadRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[53]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[63]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4600,7 +5118,7 @@ func (x *UploadRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UploadRequest.ProtoReflect.Descriptor instead.
 func (*UploadRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{53}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{63}
 }
 
 func (x *UploadRequest) GetRepositoryId() int64 {
@@ -4640,7 +5158,7 @@ type UploadResponse struct {
 
 func (x *UploadResponse) Reset() {
 	*x = UploadResponse{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[54]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[64]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4652,7 +5170,7 @@ func (x *UploadResponse) String() string {
 func (*UploadResponse) ProtoMessage() {}
 
 func (x *UploadResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[54]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[64]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4665,7 +5183,7 @@ func (x *UploadResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UploadResponse.ProtoReflect.Descriptor instead.
 func (*UploadResponse) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{54}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{64}
 }
 
 func (x *UploadResponse) GetResults() []*UploadResponse_Result {
@@ -4684,7 +5202,7 @@ type ListSecretReferencesRequest struct {
 
 func (x *ListSecretReferencesRequest) Reset() {
 	*x = ListSecretReferencesRequest{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[55]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[65]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4696,7 +5214,7 @@ func (x *ListSecretReferencesRequest) String() string {
 func (*ListSecretReferencesRequest) ProtoMessage() {}
 
 func (x *ListSecretReferencesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[55]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[65]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4709,7 +5227,7 @@ func (x *ListSecretReferencesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListSecretReferencesRequest.ProtoReflect.Descriptor instead.
 func (*ListSecretReferencesRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{55}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{65}
 }
 
 func (x *ListSecretReferencesRequest) GetRepositoryId() int64 {
@@ -4729,7 +5247,7 @@ type ListSecretReferencesResponse struct {
 
 func (x *ListSecretReferencesResponse) Reset() {
 	*x = ListSecretReferencesResponse{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[56]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[66]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4741,7 +5259,7 @@ func (x *ListSecretReferencesResponse) String() string {
 func (*ListSecretReferencesResponse) ProtoMessage() {}
 
 func (x *ListSecretReferencesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[56]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[66]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4754,7 +5272,7 @@ func (x *ListSecretReferencesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListSecretReferencesResponse.ProtoReflect.Descriptor instead.
 func (*ListSecretReferencesResponse) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{56}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{66}
 }
 
 func (x *ListSecretReferencesResponse) GetState() ListSecretReferencesResponse_State {
@@ -4782,7 +5300,7 @@ type SecretPointer struct {
 
 func (x *SecretPointer) Reset() {
 	*x = SecretPointer{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[57]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[67]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4794,7 +5312,7 @@ func (x *SecretPointer) String() string {
 func (*SecretPointer) ProtoMessage() {}
 
 func (x *SecretPointer) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[57]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[67]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4807,7 +5325,7 @@ func (x *SecretPointer) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SecretPointer.ProtoReflect.Descriptor instead.
 func (*SecretPointer) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{57}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{67}
 }
 
 func (x *SecretPointer) GetPath() string {
@@ -4838,7 +5356,7 @@ type UploadRejection struct {
 
 func (x *UploadRejection) Reset() {
 	*x = UploadRejection{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[58]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[68]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4850,7 +5368,7 @@ func (x *UploadRejection) String() string {
 func (*UploadRejection) ProtoMessage() {}
 
 func (x *UploadRejection) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[58]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[68]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4863,7 +5381,7 @@ func (x *UploadRejection) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UploadRejection.ProtoReflect.Descriptor instead.
 func (*UploadRejection) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{58}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{68}
 }
 
 func (x *UploadRejection) GetCommitId() []byte {
@@ -4911,7 +5429,7 @@ type GetChangeListRequest struct {
 
 func (x *GetChangeListRequest) Reset() {
 	*x = GetChangeListRequest{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[59]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[69]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4923,7 +5441,7 @@ func (x *GetChangeListRequest) String() string {
 func (*GetChangeListRequest) ProtoMessage() {}
 
 func (x *GetChangeListRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[59]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[69]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4936,7 +5454,7 @@ func (x *GetChangeListRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetChangeListRequest.ProtoReflect.Descriptor instead.
 func (*GetChangeListRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{59}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{69}
 }
 
 func (x *GetChangeListRequest) GetRepositoryId() int64 {
@@ -4969,7 +5487,7 @@ type ListChangeListsRequest struct {
 
 func (x *ListChangeListsRequest) Reset() {
 	*x = ListChangeListsRequest{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[60]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[70]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4981,7 +5499,7 @@ func (x *ListChangeListsRequest) String() string {
 func (*ListChangeListsRequest) ProtoMessage() {}
 
 func (x *ListChangeListsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[60]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[70]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4994,7 +5512,7 @@ func (x *ListChangeListsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListChangeListsRequest.ProtoReflect.Descriptor instead.
 func (*ListChangeListsRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{60}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{70}
 }
 
 func (x *ListChangeListsRequest) GetRepositoryId() int64 {
@@ -5049,7 +5567,7 @@ type ListChangeListsResponse struct {
 
 func (x *ListChangeListsResponse) Reset() {
 	*x = ListChangeListsResponse{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[61]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[71]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5061,7 +5579,7 @@ func (x *ListChangeListsResponse) String() string {
 func (*ListChangeListsResponse) ProtoMessage() {}
 
 func (x *ListChangeListsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[61]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[71]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5074,7 +5592,7 @@ func (x *ListChangeListsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListChangeListsResponse.ProtoReflect.Descriptor instead.
 func (*ListChangeListsResponse) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{61}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{71}
 }
 
 func (x *ListChangeListsResponse) GetChangeLists() []*ChangeList {
@@ -5101,7 +5619,7 @@ type LookupChangesRequest struct {
 
 func (x *LookupChangesRequest) Reset() {
 	*x = LookupChangesRequest{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[62]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[72]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5113,7 +5631,7 @@ func (x *LookupChangesRequest) String() string {
 func (*LookupChangesRequest) ProtoMessage() {}
 
 func (x *LookupChangesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[62]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[72]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5126,7 +5644,7 @@ func (x *LookupChangesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LookupChangesRequest.ProtoReflect.Descriptor instead.
 func (*LookupChangesRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{62}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{72}
 }
 
 func (x *LookupChangesRequest) GetRepositoryId() int64 {
@@ -5152,7 +5670,7 @@ type LookupChangesResponse struct {
 
 func (x *LookupChangesResponse) Reset() {
 	*x = LookupChangesResponse{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[63]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[73]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5164,7 +5682,7 @@ func (x *LookupChangesResponse) String() string {
 func (*LookupChangesResponse) ProtoMessage() {}
 
 func (x *LookupChangesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[63]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[73]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5177,7 +5695,7 @@ func (x *LookupChangesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LookupChangesResponse.ProtoReflect.Descriptor instead.
 func (*LookupChangesResponse) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{63}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{73}
 }
 
 func (x *LookupChangesResponse) GetChangeLists() []*ChangeList {
@@ -5200,7 +5718,7 @@ type TransitionRequest struct {
 
 func (x *TransitionRequest) Reset() {
 	*x = TransitionRequest{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[64]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[74]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5212,7 +5730,7 @@ func (x *TransitionRequest) String() string {
 func (*TransitionRequest) ProtoMessage() {}
 
 func (x *TransitionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[64]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[74]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5225,7 +5743,7 @@ func (x *TransitionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TransitionRequest.ProtoReflect.Descriptor instead.
 func (*TransitionRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{64}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{74}
 }
 
 func (x *TransitionRequest) GetRepositoryId() int64 {
@@ -5275,7 +5793,7 @@ type TransitionResponse struct {
 
 func (x *TransitionResponse) Reset() {
 	*x = TransitionResponse{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[65]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[75]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5287,7 +5805,7 @@ func (x *TransitionResponse) String() string {
 func (*TransitionResponse) ProtoMessage() {}
 
 func (x *TransitionResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[65]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[75]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5300,7 +5818,7 @@ func (x *TransitionResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TransitionResponse.ProtoReflect.Descriptor instead.
 func (*TransitionResponse) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{65}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{75}
 }
 
 func (x *TransitionResponse) GetChangeList() *ChangeList {
@@ -5330,7 +5848,7 @@ type PrepareCandidateRequest struct {
 
 func (x *PrepareCandidateRequest) Reset() {
 	*x = PrepareCandidateRequest{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[66]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[76]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5342,7 +5860,7 @@ func (x *PrepareCandidateRequest) String() string {
 func (*PrepareCandidateRequest) ProtoMessage() {}
 
 func (x *PrepareCandidateRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[66]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[76]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5355,7 +5873,7 @@ func (x *PrepareCandidateRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PrepareCandidateRequest.ProtoReflect.Descriptor instead.
 func (*PrepareCandidateRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{66}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{76}
 }
 
 func (x *PrepareCandidateRequest) GetRepositoryId() int64 {
@@ -5408,7 +5926,7 @@ type Candidate struct {
 
 func (x *Candidate) Reset() {
 	*x = Candidate{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[67]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[77]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5420,7 +5938,7 @@ func (x *Candidate) String() string {
 func (*Candidate) ProtoMessage() {}
 
 func (x *Candidate) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[67]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[77]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5433,7 +5951,7 @@ func (x *Candidate) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Candidate.ProtoReflect.Descriptor instead.
 func (*Candidate) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{67}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{77}
 }
 
 func (x *Candidate) GetCommitId() []byte {
@@ -5494,7 +6012,7 @@ type ListCandidatesRequest struct {
 
 func (x *ListCandidatesRequest) Reset() {
 	*x = ListCandidatesRequest{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[68]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[78]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5506,7 +6024,7 @@ func (x *ListCandidatesRequest) String() string {
 func (*ListCandidatesRequest) ProtoMessage() {}
 
 func (x *ListCandidatesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[68]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[78]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5519,7 +6037,7 @@ func (x *ListCandidatesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListCandidatesRequest.ProtoReflect.Descriptor instead.
 func (*ListCandidatesRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{68}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{78}
 }
 
 func (x *ListCandidatesRequest) GetRepositoryId() int64 {
@@ -5538,7 +6056,7 @@ type ListCandidatesResponse struct {
 
 func (x *ListCandidatesResponse) Reset() {
 	*x = ListCandidatesResponse{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[69]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[79]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5550,7 +6068,7 @@ func (x *ListCandidatesResponse) String() string {
 func (*ListCandidatesResponse) ProtoMessage() {}
 
 func (x *ListCandidatesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[69]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[79]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5563,7 +6081,7 @@ func (x *ListCandidatesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListCandidatesResponse.ProtoReflect.Descriptor instead.
 func (*ListCandidatesResponse) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{69}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{79}
 }
 
 func (x *ListCandidatesResponse) GetCandidates() []*Candidate {
@@ -5583,7 +6101,7 @@ type DiscardCandidateRequest struct {
 
 func (x *DiscardCandidateRequest) Reset() {
 	*x = DiscardCandidateRequest{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[70]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[80]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5595,7 +6113,7 @@ func (x *DiscardCandidateRequest) String() string {
 func (*DiscardCandidateRequest) ProtoMessage() {}
 
 func (x *DiscardCandidateRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[70]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[80]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5608,7 +6126,7 @@ func (x *DiscardCandidateRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DiscardCandidateRequest.ProtoReflect.Descriptor instead.
 func (*DiscardCandidateRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{70}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{80}
 }
 
 func (x *DiscardCandidateRequest) GetRepositoryId() int64 {
@@ -5633,7 +6151,7 @@ type DiscardCandidateResponse struct {
 
 func (x *DiscardCandidateResponse) Reset() {
 	*x = DiscardCandidateResponse{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[71]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[81]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5645,7 +6163,7 @@ func (x *DiscardCandidateResponse) String() string {
 func (*DiscardCandidateResponse) ProtoMessage() {}
 
 func (x *DiscardCandidateResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[71]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[81]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5658,7 +6176,7 @@ func (x *DiscardCandidateResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DiscardCandidateResponse.ProtoReflect.Descriptor instead.
 func (*DiscardCandidateResponse) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{71}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{81}
 }
 
 type LandRequest struct {
@@ -5674,7 +6192,7 @@ type LandRequest struct {
 
 func (x *LandRequest) Reset() {
 	*x = LandRequest{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[72]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[82]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5686,7 +6204,7 @@ func (x *LandRequest) String() string {
 func (*LandRequest) ProtoMessage() {}
 
 func (x *LandRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[72]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[82]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5699,7 +6217,7 @@ func (x *LandRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LandRequest.ProtoReflect.Descriptor instead.
 func (*LandRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{72}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{82}
 }
 
 func (x *LandRequest) GetRepositoryId() int64 {
@@ -5748,7 +6266,7 @@ type LandResponse struct {
 
 func (x *LandResponse) Reset() {
 	*x = LandResponse{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[73]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[83]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5760,7 +6278,7 @@ func (x *LandResponse) String() string {
 func (*LandResponse) ProtoMessage() {}
 
 func (x *LandResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[73]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[83]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5773,7 +6291,7 @@ func (x *LandResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LandResponse.ProtoReflect.Descriptor instead.
 func (*LandResponse) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{73}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{83}
 }
 
 func (x *LandResponse) GetLanded() []*LandResponse_Landed {
@@ -5810,7 +6328,7 @@ type LandRejection struct {
 
 func (x *LandRejection) Reset() {
 	*x = LandRejection{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[74]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[84]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5822,7 +6340,7 @@ func (x *LandRejection) String() string {
 func (*LandRejection) ProtoMessage() {}
 
 func (x *LandRejection) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[74]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[84]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5835,7 +6353,7 @@ func (x *LandRejection) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LandRejection.ProtoReflect.Descriptor instead.
 func (*LandRejection) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{74}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{84}
 }
 
 func (x *LandRejection) GetNumber() int64 {
@@ -5880,7 +6398,7 @@ type CodeSearchRequest struct {
 
 func (x *CodeSearchRequest) Reset() {
 	*x = CodeSearchRequest{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[75]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[85]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5892,7 +6410,7 @@ func (x *CodeSearchRequest) String() string {
 func (*CodeSearchRequest) ProtoMessage() {}
 
 func (x *CodeSearchRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[75]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[85]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5905,7 +6423,7 @@ func (x *CodeSearchRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CodeSearchRequest.ProtoReflect.Descriptor instead.
 func (*CodeSearchRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{75}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{85}
 }
 
 func (x *CodeSearchRequest) GetRepositoryId() int64 {
@@ -5963,7 +6481,7 @@ type CodeSearchResponse struct {
 
 func (x *CodeSearchResponse) Reset() {
 	*x = CodeSearchResponse{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[76]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[86]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -5975,7 +6493,7 @@ func (x *CodeSearchResponse) String() string {
 func (*CodeSearchResponse) ProtoMessage() {}
 
 func (x *CodeSearchResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[76]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[86]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -5988,7 +6506,7 @@ func (x *CodeSearchResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CodeSearchResponse.ProtoReflect.Descriptor instead.
 func (*CodeSearchResponse) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{76}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{86}
 }
 
 func (x *CodeSearchResponse) GetCommitId() []byte {
@@ -6039,7 +6557,7 @@ type CodeMatch struct {
 
 func (x *CodeMatch) Reset() {
 	*x = CodeMatch{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[77]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[87]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6051,7 +6569,7 @@ func (x *CodeMatch) String() string {
 func (*CodeMatch) ProtoMessage() {}
 
 func (x *CodeMatch) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[77]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[87]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6064,7 +6582,7 @@ func (x *CodeMatch) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CodeMatch.ProtoReflect.Descriptor instead.
 func (*CodeMatch) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{77}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{87}
 }
 
 func (x *CodeMatch) GetPath() string {
@@ -6114,7 +6632,7 @@ type Signature struct {
 
 func (x *Signature) Reset() {
 	*x = Signature{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[78]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[88]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6126,7 +6644,7 @@ func (x *Signature) String() string {
 func (*Signature) ProtoMessage() {}
 
 func (x *Signature) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[78]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[88]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6139,7 +6657,7 @@ func (x *Signature) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Signature.ProtoReflect.Descriptor instead.
 func (*Signature) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{78}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{88}
 }
 
 func (x *Signature) GetName() string {
@@ -6187,7 +6705,7 @@ type Commit struct {
 
 func (x *Commit) Reset() {
 	*x = Commit{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[79]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[89]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6199,7 +6717,7 @@ func (x *Commit) String() string {
 func (*Commit) ProtoMessage() {}
 
 func (x *Commit) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[79]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[89]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6212,7 +6730,7 @@ func (x *Commit) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Commit.ProtoReflect.Descriptor instead.
 func (*Commit) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{79}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{89}
 }
 
 func (x *Commit) GetId() []byte {
@@ -6288,7 +6806,7 @@ type GetCommitsRequest struct {
 
 func (x *GetCommitsRequest) Reset() {
 	*x = GetCommitsRequest{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[80]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[90]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6300,7 +6818,7 @@ func (x *GetCommitsRequest) String() string {
 func (*GetCommitsRequest) ProtoMessage() {}
 
 func (x *GetCommitsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[80]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[90]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6313,7 +6831,7 @@ func (x *GetCommitsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetCommitsRequest.ProtoReflect.Descriptor instead.
 func (*GetCommitsRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{80}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{90}
 }
 
 func (x *GetCommitsRequest) GetRepositoryId() int64 {
@@ -6339,7 +6857,7 @@ type GetCommitsResponse struct {
 
 func (x *GetCommitsResponse) Reset() {
 	*x = GetCommitsResponse{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[81]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[91]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6351,7 +6869,7 @@ func (x *GetCommitsResponse) String() string {
 func (*GetCommitsResponse) ProtoMessage() {}
 
 func (x *GetCommitsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[81]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[91]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6364,7 +6882,7 @@ func (x *GetCommitsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetCommitsResponse.ProtoReflect.Descriptor instead.
 func (*GetCommitsResponse) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{81}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{91}
 }
 
 func (x *GetCommitsResponse) GetCommits() []*Commit {
@@ -6389,7 +6907,7 @@ type LogRequest struct {
 
 func (x *LogRequest) Reset() {
 	*x = LogRequest{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[82]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[92]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6401,7 +6919,7 @@ func (x *LogRequest) String() string {
 func (*LogRequest) ProtoMessage() {}
 
 func (x *LogRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[82]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[92]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6414,7 +6932,7 @@ func (x *LogRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LogRequest.ProtoReflect.Descriptor instead.
 func (*LogRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{82}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{92}
 }
 
 func (x *LogRequest) GetRepositoryId() int64 {
@@ -6463,7 +6981,7 @@ type LogResponse struct {
 
 func (x *LogResponse) Reset() {
 	*x = LogResponse{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[83]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[93]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6475,7 +6993,7 @@ func (x *LogResponse) String() string {
 func (*LogResponse) ProtoMessage() {}
 
 func (x *LogResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[83]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[93]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6488,7 +7006,7 @@ func (x *LogResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LogResponse.ProtoReflect.Descriptor instead.
 func (*LogResponse) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{83}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{93}
 }
 
 func (x *LogResponse) GetCommits() []*Commit {
@@ -6526,7 +7044,7 @@ type TreeValue struct {
 
 func (x *TreeValue) Reset() {
 	*x = TreeValue{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[84]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[94]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6538,7 +7056,7 @@ func (x *TreeValue) String() string {
 func (*TreeValue) ProtoMessage() {}
 
 func (x *TreeValue) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[84]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[94]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6551,7 +7069,7 @@ func (x *TreeValue) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TreeValue.ProtoReflect.Descriptor instead.
 func (*TreeValue) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{84}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{94}
 }
 
 func (x *TreeValue) GetType() EntryType {
@@ -6607,7 +7125,7 @@ type TreeEntry struct {
 
 func (x *TreeEntry) Reset() {
 	*x = TreeEntry{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[85]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[95]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6619,7 +7137,7 @@ func (x *TreeEntry) String() string {
 func (*TreeEntry) ProtoMessage() {}
 
 func (x *TreeEntry) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[85]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[95]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6632,7 +7150,7 @@ func (x *TreeEntry) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TreeEntry.ProtoReflect.Descriptor instead.
 func (*TreeEntry) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{85}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{95}
 }
 
 func (x *TreeEntry) GetName() string {
@@ -6670,7 +7188,7 @@ type ReadTreeRequest struct {
 
 func (x *ReadTreeRequest) Reset() {
 	*x = ReadTreeRequest{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[86]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[96]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6682,7 +7200,7 @@ func (x *ReadTreeRequest) String() string {
 func (*ReadTreeRequest) ProtoMessage() {}
 
 func (x *ReadTreeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[86]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[96]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6695,7 +7213,7 @@ func (x *ReadTreeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReadTreeRequest.ProtoReflect.Descriptor instead.
 func (*ReadTreeRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{86}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{96}
 }
 
 func (x *ReadTreeRequest) GetRepositoryId() int64 {
@@ -6737,7 +7255,7 @@ type ReadTreeResponse struct {
 
 func (x *ReadTreeResponse) Reset() {
 	*x = ReadTreeResponse{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[87]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[97]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6749,7 +7267,7 @@ func (x *ReadTreeResponse) String() string {
 func (*ReadTreeResponse) ProtoMessage() {}
 
 func (x *ReadTreeResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[87]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[97]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6762,7 +7280,7 @@ func (x *ReadTreeResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReadTreeResponse.ProtoReflect.Descriptor instead.
 func (*ReadTreeResponse) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{87}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{97}
 }
 
 func (x *ReadTreeResponse) GetTreeId() []byte {
@@ -6799,7 +7317,7 @@ type ReadFileAtRequest struct {
 
 func (x *ReadFileAtRequest) Reset() {
 	*x = ReadFileAtRequest{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[88]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[98]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6811,7 +7329,7 @@ func (x *ReadFileAtRequest) String() string {
 func (*ReadFileAtRequest) ProtoMessage() {}
 
 func (x *ReadFileAtRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[88]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[98]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6824,7 +7342,7 @@ func (x *ReadFileAtRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReadFileAtRequest.ProtoReflect.Descriptor instead.
 func (*ReadFileAtRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{88}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{98}
 }
 
 func (x *ReadFileAtRequest) GetRepositoryId() int64 {
@@ -6872,7 +7390,7 @@ type ReadFileAtResponse struct {
 
 func (x *ReadFileAtResponse) Reset() {
 	*x = ReadFileAtResponse{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[89]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[99]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6884,7 +7402,7 @@ func (x *ReadFileAtResponse) String() string {
 func (*ReadFileAtResponse) ProtoMessage() {}
 
 func (x *ReadFileAtResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[89]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[99]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6897,7 +7415,7 @@ func (x *ReadFileAtResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReadFileAtResponse.ProtoReflect.Descriptor instead.
 func (*ReadFileAtResponse) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{89}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{99}
 }
 
 func (x *ReadFileAtResponse) GetValue() *TreeValue {
@@ -6928,7 +7446,7 @@ type ReadFilesAtRequest struct {
 
 func (x *ReadFilesAtRequest) Reset() {
 	*x = ReadFilesAtRequest{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[90]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[100]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -6940,7 +7458,7 @@ func (x *ReadFilesAtRequest) String() string {
 func (*ReadFilesAtRequest) ProtoMessage() {}
 
 func (x *ReadFilesAtRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[90]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[100]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -6953,7 +7471,7 @@ func (x *ReadFilesAtRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReadFilesAtRequest.ProtoReflect.Descriptor instead.
 func (*ReadFilesAtRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{90}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{100}
 }
 
 func (x *ReadFilesAtRequest) GetRepositoryId() int64 {
@@ -6995,7 +7513,7 @@ type ReadFilesAtResponse struct {
 
 func (x *ReadFilesAtResponse) Reset() {
 	*x = ReadFilesAtResponse{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[91]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[101]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7007,7 +7525,7 @@ func (x *ReadFilesAtResponse) String() string {
 func (*ReadFilesAtResponse) ProtoMessage() {}
 
 func (x *ReadFilesAtResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[91]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[101]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7020,7 +7538,7 @@ func (x *ReadFilesAtResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReadFilesAtResponse.ProtoReflect.Descriptor instead.
 func (*ReadFilesAtResponse) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{91}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{101}
 }
 
 func (x *ReadFilesAtResponse) GetPath() string {
@@ -7058,7 +7576,7 @@ type DiffTreesRequest struct {
 
 func (x *DiffTreesRequest) Reset() {
 	*x = DiffTreesRequest{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[92]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[102]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7070,7 +7588,7 @@ func (x *DiffTreesRequest) String() string {
 func (*DiffTreesRequest) ProtoMessage() {}
 
 func (x *DiffTreesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[92]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[102]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7083,7 +7601,7 @@ func (x *DiffTreesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DiffTreesRequest.ProtoReflect.Descriptor instead.
 func (*DiffTreesRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{92}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{102}
 }
 
 func (x *DiffTreesRequest) GetRepositoryId() int64 {
@@ -7141,7 +7659,7 @@ type PathChange struct {
 
 func (x *PathChange) Reset() {
 	*x = PathChange{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[93]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[103]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7153,7 +7671,7 @@ func (x *PathChange) String() string {
 func (*PathChange) ProtoMessage() {}
 
 func (x *PathChange) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[93]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[103]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7166,7 +7684,7 @@ func (x *PathChange) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PathChange.ProtoReflect.Descriptor instead.
 func (*PathChange) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{93}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{103}
 }
 
 func (x *PathChange) GetKind() PathChange_Kind {
@@ -7213,7 +7731,7 @@ type DiffTreesResponse struct {
 
 func (x *DiffTreesResponse) Reset() {
 	*x = DiffTreesResponse{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[94]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[104]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7225,7 +7743,7 @@ func (x *DiffTreesResponse) String() string {
 func (*DiffTreesResponse) ProtoMessage() {}
 
 func (x *DiffTreesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[94]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[104]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7238,7 +7756,7 @@ func (x *DiffTreesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DiffTreesResponse.ProtoReflect.Descriptor instead.
 func (*DiffTreesResponse) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{94}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{104}
 }
 
 func (x *DiffTreesResponse) GetChanges() []*PathChange {
@@ -7261,7 +7779,7 @@ type DiffFilesRequest struct {
 
 func (x *DiffFilesRequest) Reset() {
 	*x = DiffFilesRequest{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[95]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[105]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7273,7 +7791,7 @@ func (x *DiffFilesRequest) String() string {
 func (*DiffFilesRequest) ProtoMessage() {}
 
 func (x *DiffFilesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[95]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[105]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7286,7 +7804,7 @@ func (x *DiffFilesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DiffFilesRequest.ProtoReflect.Descriptor instead.
 func (*DiffFilesRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{95}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{105}
 }
 
 func (x *DiffFilesRequest) GetRepositoryId() int64 {
@@ -7328,7 +7846,7 @@ type DiffLine struct {
 
 func (x *DiffLine) Reset() {
 	*x = DiffLine{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[96]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[106]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7340,7 +7858,7 @@ func (x *DiffLine) String() string {
 func (*DiffLine) ProtoMessage() {}
 
 func (x *DiffLine) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[96]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[106]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7353,7 +7871,7 @@ func (x *DiffLine) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DiffLine.ProtoReflect.Descriptor instead.
 func (*DiffLine) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{96}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{106}
 }
 
 func (x *DiffLine) GetOp() DiffLine_Op {
@@ -7390,7 +7908,7 @@ type Hunk struct {
 
 func (x *Hunk) Reset() {
 	*x = Hunk{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[97]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[107]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7402,7 +7920,7 @@ func (x *Hunk) String() string {
 func (*Hunk) ProtoMessage() {}
 
 func (x *Hunk) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[97]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[107]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7415,7 +7933,7 @@ func (x *Hunk) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Hunk.ProtoReflect.Descriptor instead.
 func (*Hunk) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{97}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{107}
 }
 
 func (x *Hunk) GetOldStart() int32 {
@@ -7466,7 +7984,7 @@ type FileDiff struct {
 
 func (x *FileDiff) Reset() {
 	*x = FileDiff{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[98]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[108]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7478,7 +7996,7 @@ func (x *FileDiff) String() string {
 func (*FileDiff) ProtoMessage() {}
 
 func (x *FileDiff) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[98]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[108]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7491,7 +8009,7 @@ func (x *FileDiff) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FileDiff.ProtoReflect.Descriptor instead.
 func (*FileDiff) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{98}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{108}
 }
 
 func (x *FileDiff) GetBinary() bool {
@@ -7538,7 +8056,7 @@ type DiffFilesResponse struct {
 
 func (x *DiffFilesResponse) Reset() {
 	*x = DiffFilesResponse{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[99]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[109]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7550,7 +8068,7 @@ func (x *DiffFilesResponse) String() string {
 func (*DiffFilesResponse) ProtoMessage() {}
 
 func (x *DiffFilesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[99]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[109]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7563,7 +8081,7 @@ func (x *DiffFilesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DiffFilesResponse.ProtoReflect.Descriptor instead.
 func (*DiffFilesResponse) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{99}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{109}
 }
 
 func (x *DiffFilesResponse) GetDiffs() []*FileDiff {
@@ -7584,7 +8102,7 @@ type AnnotateRequest struct {
 
 func (x *AnnotateRequest) Reset() {
 	*x = AnnotateRequest{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[100]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[110]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7596,7 +8114,7 @@ func (x *AnnotateRequest) String() string {
 func (*AnnotateRequest) ProtoMessage() {}
 
 func (x *AnnotateRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[100]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[110]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7609,7 +8127,7 @@ func (x *AnnotateRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AnnotateRequest.ProtoReflect.Descriptor instead.
 func (*AnnotateRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{100}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{110}
 }
 
 func (x *AnnotateRequest) GetRepositoryId() int64 {
@@ -7642,7 +8160,7 @@ type AnnotateResponse struct {
 
 func (x *AnnotateResponse) Reset() {
 	*x = AnnotateResponse{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[101]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[111]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7654,7 +8172,7 @@ func (x *AnnotateResponse) String() string {
 func (*AnnotateResponse) ProtoMessage() {}
 
 func (x *AnnotateResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[101]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[111]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7667,7 +8185,7 @@ func (x *AnnotateResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AnnotateResponse.ProtoReflect.Descriptor instead.
 func (*AnnotateResponse) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{101}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{111}
 }
 
 func (x *AnnotateResponse) GetRanges() []*AnnotateResponse_Range {
@@ -7688,7 +8206,7 @@ type IsAncestorRequest struct {
 
 func (x *IsAncestorRequest) Reset() {
 	*x = IsAncestorRequest{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[102]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[112]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7700,7 +8218,7 @@ func (x *IsAncestorRequest) String() string {
 func (*IsAncestorRequest) ProtoMessage() {}
 
 func (x *IsAncestorRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[102]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[112]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7713,7 +8231,7 @@ func (x *IsAncestorRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use IsAncestorRequest.ProtoReflect.Descriptor instead.
 func (*IsAncestorRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{102}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{112}
 }
 
 func (x *IsAncestorRequest) GetRepositoryId() int64 {
@@ -7746,7 +8264,7 @@ type IsAncestorResponse struct {
 
 func (x *IsAncestorResponse) Reset() {
 	*x = IsAncestorResponse{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[103]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[113]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7758,7 +8276,7 @@ func (x *IsAncestorResponse) String() string {
 func (*IsAncestorResponse) ProtoMessage() {}
 
 func (x *IsAncestorResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[103]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[113]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7771,7 +8289,7 @@ func (x *IsAncestorResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use IsAncestorResponse.ProtoReflect.Descriptor instead.
 func (*IsAncestorResponse) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{103}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{113}
 }
 
 func (x *IsAncestorResponse) GetIsAncestor() bool {
@@ -7796,7 +8314,7 @@ type ExportRequest struct {
 
 func (x *ExportRequest) Reset() {
 	*x = ExportRequest{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[104]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[114]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7808,7 +8326,7 @@ func (x *ExportRequest) String() string {
 func (*ExportRequest) ProtoMessage() {}
 
 func (x *ExportRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[104]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[114]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7821,7 +8339,7 @@ func (x *ExportRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExportRequest.ProtoReflect.Descriptor instead.
 func (*ExportRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{104}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{114}
 }
 
 func (x *ExportRequest) GetRepositoryId() int64 {
@@ -7865,7 +8383,7 @@ type ExportResponse struct {
 
 func (x *ExportResponse) Reset() {
 	*x = ExportResponse{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[105]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[115]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7877,7 +8395,7 @@ func (x *ExportResponse) String() string {
 func (*ExportResponse) ProtoMessage() {}
 
 func (x *ExportResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[105]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[115]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7890,7 +8408,7 @@ func (x *ExportResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExportResponse.ProtoReflect.Descriptor instead.
 func (*ExportResponse) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{105}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{115}
 }
 
 func (x *ExportResponse) GetFrame() isExportResponse_Frame {
@@ -7944,7 +8462,7 @@ type ExportEntry struct {
 
 func (x *ExportEntry) Reset() {
 	*x = ExportEntry{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[106]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[116]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7956,7 +8474,7 @@ func (x *ExportEntry) String() string {
 func (*ExportEntry) ProtoMessage() {}
 
 func (x *ExportEntry) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[106]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[116]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7969,7 +8487,7 @@ func (x *ExportEntry) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExportEntry.ProtoReflect.Descriptor instead.
 func (*ExportEntry) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{106}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{116}
 }
 
 func (x *ExportEntry) GetPath() string {
@@ -7994,7 +8512,7 @@ type FollowRequest struct {
 
 func (x *FollowRequest) Reset() {
 	*x = FollowRequest{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[107]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[117]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8006,7 +8524,7 @@ func (x *FollowRequest) String() string {
 func (*FollowRequest) ProtoMessage() {}
 
 func (x *FollowRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[107]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[117]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8019,7 +8537,7 @@ func (x *FollowRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FollowRequest.ProtoReflect.Descriptor instead.
 func (*FollowRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{107}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{117}
 }
 
 type FollowResponse struct {
@@ -8030,7 +8548,7 @@ type FollowResponse struct {
 
 func (x *FollowResponse) Reset() {
 	*x = FollowResponse{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[108]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[118]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8042,7 +8560,7 @@ func (x *FollowResponse) String() string {
 func (*FollowResponse) ProtoMessage() {}
 
 func (x *FollowResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[108]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[118]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8055,7 +8573,7 @@ func (x *FollowResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FollowResponse.ProtoReflect.Descriptor instead.
 func (*FollowResponse) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{108}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{118}
 }
 
 type HeadsRequest struct {
@@ -8068,7 +8586,7 @@ type HeadsRequest struct {
 
 func (x *HeadsRequest) Reset() {
 	*x = HeadsRequest{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[109]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[119]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8080,7 +8598,7 @@ func (x *HeadsRequest) String() string {
 func (*HeadsRequest) ProtoMessage() {}
 
 func (x *HeadsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[109]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[119]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8093,7 +8611,7 @@ func (x *HeadsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HeadsRequest.ProtoReflect.Descriptor instead.
 func (*HeadsRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{109}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{119}
 }
 
 func (x *HeadsRequest) GetAfterRepositoryId() int64 {
@@ -8119,7 +8637,7 @@ type HeadsResponse struct {
 
 func (x *HeadsResponse) Reset() {
 	*x = HeadsResponse{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[110]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[120]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8131,7 +8649,7 @@ func (x *HeadsResponse) String() string {
 func (*HeadsResponse) ProtoMessage() {}
 
 func (x *HeadsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[110]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[120]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8144,7 +8662,7 @@ func (x *HeadsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HeadsResponse.ProtoReflect.Descriptor instead.
 func (*HeadsResponse) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{110}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{120}
 }
 
 func (x *HeadsResponse) GetHeads() []*HeadsResponse_Head {
@@ -8165,7 +8683,7 @@ type ReadEventsRequest struct {
 
 func (x *ReadEventsRequest) Reset() {
 	*x = ReadEventsRequest{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[111]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[121]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8177,7 +8695,7 @@ func (x *ReadEventsRequest) String() string {
 func (*ReadEventsRequest) ProtoMessage() {}
 
 func (x *ReadEventsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[111]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[121]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8190,7 +8708,7 @@ func (x *ReadEventsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReadEventsRequest.ProtoReflect.Descriptor instead.
 func (*ReadEventsRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{111}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{121}
 }
 
 func (x *ReadEventsRequest) GetRepositoryId() int64 {
@@ -8223,7 +8741,7 @@ type ReadEventsResponse struct {
 
 func (x *ReadEventsResponse) Reset() {
 	*x = ReadEventsResponse{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[112]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[122]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8235,7 +8753,7 @@ func (x *ReadEventsResponse) String() string {
 func (*ReadEventsResponse) ProtoMessage() {}
 
 func (x *ReadEventsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[112]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[122]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8248,7 +8766,7 @@ func (x *ReadEventsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReadEventsResponse.ProtoReflect.Descriptor instead.
 func (*ReadEventsResponse) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{112}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{122}
 }
 
 func (x *ReadEventsResponse) GetEvents() []*Event {
@@ -8280,7 +8798,7 @@ type Event struct {
 
 func (x *Event) Reset() {
 	*x = Event{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[113]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[123]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8292,7 +8810,7 @@ func (x *Event) String() string {
 func (*Event) ProtoMessage() {}
 
 func (x *Event) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[113]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[123]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8305,7 +8823,7 @@ func (x *Event) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Event.ProtoReflect.Descriptor instead.
 func (*Event) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{113}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{123}
 }
 
 func (x *Event) GetRepositoryId() int64 {
@@ -8445,7 +8963,7 @@ type ChangeListUploaded struct {
 
 func (x *ChangeListUploaded) Reset() {
 	*x = ChangeListUploaded{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[114]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[124]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8457,7 +8975,7 @@ func (x *ChangeListUploaded) String() string {
 func (*ChangeListUploaded) ProtoMessage() {}
 
 func (x *ChangeListUploaded) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[114]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[124]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8470,7 +8988,7 @@ func (x *ChangeListUploaded) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ChangeListUploaded.ProtoReflect.Descriptor instead.
 func (*ChangeListUploaded) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{114}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{124}
 }
 
 func (x *ChangeListUploaded) GetNumber() int64 {
@@ -8528,7 +9046,7 @@ type ChangeListTransitioned struct {
 
 func (x *ChangeListTransitioned) Reset() {
 	*x = ChangeListTransitioned{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[115]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[125]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8540,7 +9058,7 @@ func (x *ChangeListTransitioned) String() string {
 func (*ChangeListTransitioned) ProtoMessage() {}
 
 func (x *ChangeListTransitioned) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[115]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[125]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8553,7 +9071,7 @@ func (x *ChangeListTransitioned) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ChangeListTransitioned.ProtoReflect.Descriptor instead.
 func (*ChangeListTransitioned) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{115}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{125}
 }
 
 func (x *ChangeListTransitioned) GetNumber() int64 {
@@ -8603,7 +9121,7 @@ type ChangeListLanded struct {
 
 func (x *ChangeListLanded) Reset() {
 	*x = ChangeListLanded{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[116]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[126]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8615,7 +9133,7 @@ func (x *ChangeListLanded) String() string {
 func (*ChangeListLanded) ProtoMessage() {}
 
 func (x *ChangeListLanded) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[116]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[126]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8628,7 +9146,7 @@ func (x *ChangeListLanded) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ChangeListLanded.ProtoReflect.Descriptor instead.
 func (*ChangeListLanded) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{116}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{126}
 }
 
 func (x *ChangeListLanded) GetNumber() int64 {
@@ -8670,7 +9188,7 @@ type HeadMoved struct {
 
 func (x *HeadMoved) Reset() {
 	*x = HeadMoved{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[117]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[127]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8682,7 +9200,7 @@ func (x *HeadMoved) String() string {
 func (*HeadMoved) ProtoMessage() {}
 
 func (x *HeadMoved) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[117]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[127]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8695,7 +9213,7 @@ func (x *HeadMoved) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HeadMoved.ProtoReflect.Descriptor instead.
 func (*HeadMoved) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{117}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{127}
 }
 
 func (x *HeadMoved) GetOldHead() []byte {
@@ -8729,7 +9247,7 @@ type RepositoryCreated struct {
 
 func (x *RepositoryCreated) Reset() {
 	*x = RepositoryCreated{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[118]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[128]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8741,7 +9259,7 @@ func (x *RepositoryCreated) String() string {
 func (*RepositoryCreated) ProtoMessage() {}
 
 func (x *RepositoryCreated) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[118]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[128]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8754,7 +9272,7 @@ func (x *RepositoryCreated) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RepositoryCreated.ProtoReflect.Descriptor instead.
 func (*RepositoryCreated) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{118}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{128}
 }
 
 func (x *RepositoryCreated) GetCreatedById() string {
@@ -8776,7 +9294,7 @@ type RepositoryRenamed struct {
 
 func (x *RepositoryRenamed) Reset() {
 	*x = RepositoryRenamed{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[119]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[129]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8788,7 +9306,7 @@ func (x *RepositoryRenamed) String() string {
 func (*RepositoryRenamed) ProtoMessage() {}
 
 func (x *RepositoryRenamed) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[119]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[129]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8801,7 +9319,7 @@ func (x *RepositoryRenamed) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RepositoryRenamed.ProtoReflect.Descriptor instead.
 func (*RepositoryRenamed) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{119}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{129}
 }
 
 func (x *RepositoryRenamed) GetOldName() string {
@@ -8828,7 +9346,7 @@ type CreateWorkspaceRequest struct {
 
 func (x *CreateWorkspaceRequest) Reset() {
 	*x = CreateWorkspaceRequest{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[120]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[130]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8840,7 +9358,7 @@ func (x *CreateWorkspaceRequest) String() string {
 func (*CreateWorkspaceRequest) ProtoMessage() {}
 
 func (x *CreateWorkspaceRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[120]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[130]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8853,7 +9371,7 @@ func (x *CreateWorkspaceRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateWorkspaceRequest.ProtoReflect.Descriptor instead.
 func (*CreateWorkspaceRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{120}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{130}
 }
 
 func (x *CreateWorkspaceRequest) GetRepositoryId() int64 {
@@ -8885,7 +9403,7 @@ type Lease struct {
 
 func (x *Lease) Reset() {
 	*x = Lease{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[121]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[131]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8897,7 +9415,7 @@ func (x *Lease) String() string {
 func (*Lease) ProtoMessage() {}
 
 func (x *Lease) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[121]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[131]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8910,7 +9428,7 @@ func (x *Lease) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Lease.ProtoReflect.Descriptor instead.
 func (*Lease) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{121}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{131}
 }
 
 func (x *Lease) GetRepositoryId() int64 {
@@ -8960,7 +9478,7 @@ type AttachRequest struct {
 
 func (x *AttachRequest) Reset() {
 	*x = AttachRequest{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[122]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[132]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8972,7 +9490,7 @@ func (x *AttachRequest) String() string {
 func (*AttachRequest) ProtoMessage() {}
 
 func (x *AttachRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[122]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[132]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8985,7 +9503,7 @@ func (x *AttachRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AttachRequest.ProtoReflect.Descriptor instead.
 func (*AttachRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{122}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{132}
 }
 
 func (x *AttachRequest) GetRepositoryId() int64 {
@@ -9029,7 +9547,7 @@ type AttachResponse struct {
 
 func (x *AttachResponse) Reset() {
 	*x = AttachResponse{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[123]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[133]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9041,7 +9559,7 @@ func (x *AttachResponse) String() string {
 func (*AttachResponse) ProtoMessage() {}
 
 func (x *AttachResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[123]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[133]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9054,7 +9572,7 @@ func (x *AttachResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AttachResponse.ProtoReflect.Descriptor instead.
 func (*AttachResponse) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{123}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{133}
 }
 
 func (x *AttachResponse) GetGranted() bool {
@@ -9101,7 +9619,7 @@ type RenewRequest struct {
 
 func (x *RenewRequest) Reset() {
 	*x = RenewRequest{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[124]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[134]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9113,7 +9631,7 @@ func (x *RenewRequest) String() string {
 func (*RenewRequest) ProtoMessage() {}
 
 func (x *RenewRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[124]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[134]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9126,7 +9644,7 @@ func (x *RenewRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RenewRequest.ProtoReflect.Descriptor instead.
 func (*RenewRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{124}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{134}
 }
 
 func (x *RenewRequest) GetLease() *Lease {
@@ -9146,7 +9664,7 @@ type RenewResponse struct {
 
 func (x *RenewResponse) Reset() {
 	*x = RenewResponse{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[125]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[135]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9158,7 +9676,7 @@ func (x *RenewResponse) String() string {
 func (*RenewResponse) ProtoMessage() {}
 
 func (x *RenewResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[125]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[135]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9171,7 +9689,7 @@ func (x *RenewResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RenewResponse.ProtoReflect.Descriptor instead.
 func (*RenewResponse) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{125}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{135}
 }
 
 func (x *RenewResponse) GetLease() *Lease {
@@ -9197,7 +9715,7 @@ type ReleaseRequest struct {
 
 func (x *ReleaseRequest) Reset() {
 	*x = ReleaseRequest{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[126]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[136]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9209,7 +9727,7 @@ func (x *ReleaseRequest) String() string {
 func (*ReleaseRequest) ProtoMessage() {}
 
 func (x *ReleaseRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[126]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[136]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9222,7 +9740,7 @@ func (x *ReleaseRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReleaseRequest.ProtoReflect.Descriptor instead.
 func (*ReleaseRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{126}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{136}
 }
 
 func (x *ReleaseRequest) GetLease() *Lease {
@@ -9240,7 +9758,7 @@ type ReleaseResponse struct {
 
 func (x *ReleaseResponse) Reset() {
 	*x = ReleaseResponse{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[127]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[137]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9252,7 +9770,7 @@ func (x *ReleaseResponse) String() string {
 func (*ReleaseResponse) ProtoMessage() {}
 
 func (x *ReleaseResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[127]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[137]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9265,7 +9783,7 @@ func (x *ReleaseResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReleaseResponse.ProtoReflect.Descriptor instead.
 func (*ReleaseResponse) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{127}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{137}
 }
 
 type Checkpoint struct {
@@ -9285,7 +9803,7 @@ type Checkpoint struct {
 
 func (x *Checkpoint) Reset() {
 	*x = Checkpoint{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[128]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[138]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9297,7 +9815,7 @@ func (x *Checkpoint) String() string {
 func (*Checkpoint) ProtoMessage() {}
 
 func (x *Checkpoint) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[128]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[138]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9310,7 +9828,7 @@ func (x *Checkpoint) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Checkpoint.ProtoReflect.Descriptor instead.
 func (*Checkpoint) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{128}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{138}
 }
 
 func (x *Checkpoint) GetId() int64 {
@@ -9388,7 +9906,7 @@ type RecordCheckpointRequest struct {
 
 func (x *RecordCheckpointRequest) Reset() {
 	*x = RecordCheckpointRequest{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[129]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[139]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9400,7 +9918,7 @@ func (x *RecordCheckpointRequest) String() string {
 func (*RecordCheckpointRequest) ProtoMessage() {}
 
 func (x *RecordCheckpointRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[129]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[139]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9413,7 +9931,7 @@ func (x *RecordCheckpointRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RecordCheckpointRequest.ProtoReflect.Descriptor instead.
 func (*RecordCheckpointRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{129}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{139}
 }
 
 func (x *RecordCheckpointRequest) GetLease() *Lease {
@@ -9454,7 +9972,7 @@ type GetCheckpointRequest struct {
 
 func (x *GetCheckpointRequest) Reset() {
 	*x = GetCheckpointRequest{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[130]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[140]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9466,7 +9984,7 @@ func (x *GetCheckpointRequest) String() string {
 func (*GetCheckpointRequest) ProtoMessage() {}
 
 func (x *GetCheckpointRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[130]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[140]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9479,7 +9997,7 @@ func (x *GetCheckpointRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetCheckpointRequest.ProtoReflect.Descriptor instead.
 func (*GetCheckpointRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{130}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{140}
 }
 
 func (x *GetCheckpointRequest) GetRepositoryId() int64 {
@@ -9508,7 +10026,7 @@ type ListCheckpointsRequest struct {
 
 func (x *ListCheckpointsRequest) Reset() {
 	*x = ListCheckpointsRequest{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[131]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[141]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9520,7 +10038,7 @@ func (x *ListCheckpointsRequest) String() string {
 func (*ListCheckpointsRequest) ProtoMessage() {}
 
 func (x *ListCheckpointsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[131]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[141]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9533,7 +10051,7 @@ func (x *ListCheckpointsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListCheckpointsRequest.ProtoReflect.Descriptor instead.
 func (*ListCheckpointsRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{131}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{141}
 }
 
 func (x *ListCheckpointsRequest) GetRepositoryId() int64 {
@@ -9573,7 +10091,7 @@ type ListCheckpointsResponse struct {
 
 func (x *ListCheckpointsResponse) Reset() {
 	*x = ListCheckpointsResponse{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[132]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[142]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9585,7 +10103,7 @@ func (x *ListCheckpointsResponse) String() string {
 func (*ListCheckpointsResponse) ProtoMessage() {}
 
 func (x *ListCheckpointsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[132]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[142]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9598,7 +10116,7 @@ func (x *ListCheckpointsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListCheckpointsResponse.ProtoReflect.Descriptor instead.
 func (*ListCheckpointsResponse) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{132}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{142}
 }
 
 func (x *ListCheckpointsResponse) GetCheckpoints() []*Checkpoint {
@@ -9617,7 +10135,7 @@ type ListWorkspacesRequest struct {
 
 func (x *ListWorkspacesRequest) Reset() {
 	*x = ListWorkspacesRequest{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[133]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[143]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9629,7 +10147,7 @@ func (x *ListWorkspacesRequest) String() string {
 func (*ListWorkspacesRequest) ProtoMessage() {}
 
 func (x *ListWorkspacesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[133]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[143]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9642,7 +10160,7 @@ func (x *ListWorkspacesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListWorkspacesRequest.ProtoReflect.Descriptor instead.
 func (*ListWorkspacesRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{133}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{143}
 }
 
 func (x *ListWorkspacesRequest) GetRepositoryId() int64 {
@@ -9661,7 +10179,7 @@ type ListWorkspacesResponse struct {
 
 func (x *ListWorkspacesResponse) Reset() {
 	*x = ListWorkspacesResponse{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[134]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[144]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9673,7 +10191,7 @@ func (x *ListWorkspacesResponse) String() string {
 func (*ListWorkspacesResponse) ProtoMessage() {}
 
 func (x *ListWorkspacesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[134]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[144]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9686,7 +10204,7 @@ func (x *ListWorkspacesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListWorkspacesResponse.ProtoReflect.Descriptor instead.
 func (*ListWorkspacesResponse) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{134}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{144}
 }
 
 func (x *ListWorkspacesResponse) GetWorkspaces() []*WorkspaceState {
@@ -9713,7 +10231,7 @@ type WorkspaceState struct {
 
 func (x *WorkspaceState) Reset() {
 	*x = WorkspaceState{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[135]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[145]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9725,7 +10243,7 @@ func (x *WorkspaceState) String() string {
 func (*WorkspaceState) ProtoMessage() {}
 
 func (x *WorkspaceState) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[135]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[145]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9738,7 +10256,7 @@ func (x *WorkspaceState) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WorkspaceState.ProtoReflect.Descriptor instead.
 func (*WorkspaceState) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{135}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{145}
 }
 
 func (x *WorkspaceState) GetWorkspace() string {
@@ -9809,7 +10327,7 @@ type PublishRequest_Begin struct {
 
 func (x *PublishRequest_Begin) Reset() {
 	*x = PublishRequest_Begin{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[136]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[146]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9821,7 +10339,7 @@ func (x *PublishRequest_Begin) String() string {
 func (*PublishRequest_Begin) ProtoMessage() {}
 
 func (x *PublishRequest_Begin) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[136]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[146]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9881,7 +10399,7 @@ type PublishRequest_Commit struct {
 
 func (x *PublishRequest_Commit) Reset() {
 	*x = PublishRequest_Commit{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[137]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[147]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9893,7 +10411,7 @@ func (x *PublishRequest_Commit) String() string {
 func (*PublishRequest_Commit) ProtoMessage() {}
 
 func (x *PublishRequest_Commit) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[137]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[147]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9926,7 +10444,7 @@ type PublishResponse_Missing struct {
 
 func (x *PublishResponse_Missing) Reset() {
 	*x = PublishResponse_Missing{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[138]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[148]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9938,7 +10456,7 @@ func (x *PublishResponse_Missing) String() string {
 func (*PublishResponse_Missing) ProtoMessage() {}
 
 func (x *PublishResponse_Missing) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[138]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[148]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9977,7 +10495,7 @@ type PublishResponse_Done struct {
 
 func (x *PublishResponse_Done) Reset() {
 	*x = PublishResponse_Done{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[139]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[149]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9989,7 +10507,7 @@ func (x *PublishResponse_Done) String() string {
 func (*PublishResponse_Done) ProtoMessage() {}
 
 func (x *PublishResponse_Done) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[139]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[149]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10024,7 +10542,7 @@ type UploadResponse_Result struct {
 
 func (x *UploadResponse_Result) Reset() {
 	*x = UploadResponse_Result{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[140]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[150]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10036,7 +10554,7 @@ func (x *UploadResponse_Result) String() string {
 func (*UploadResponse_Result) ProtoMessage() {}
 
 func (x *UploadResponse_Result) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[140]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[150]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10049,7 +10567,7 @@ func (x *UploadResponse_Result) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UploadResponse_Result.ProtoReflect.Descriptor instead.
 func (*UploadResponse_Result) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{54, 0}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{64, 0}
 }
 
 func (x *UploadResponse_Result) GetCommitId() []byte {
@@ -10094,7 +10612,7 @@ type LandRequest_Item struct {
 
 func (x *LandRequest_Item) Reset() {
 	*x = LandRequest_Item{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[141]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[151]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10106,7 +10624,7 @@ func (x *LandRequest_Item) String() string {
 func (*LandRequest_Item) ProtoMessage() {}
 
 func (x *LandRequest_Item) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[141]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[151]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10119,7 +10637,7 @@ func (x *LandRequest_Item) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LandRequest_Item.ProtoReflect.Descriptor instead.
 func (*LandRequest_Item) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{72, 0}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{82, 0}
 }
 
 func (x *LandRequest_Item) GetNumber() int64 {
@@ -10160,7 +10678,7 @@ type LandResponse_Landed struct {
 
 func (x *LandResponse_Landed) Reset() {
 	*x = LandResponse_Landed{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[142]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[152]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10172,7 +10690,7 @@ func (x *LandResponse_Landed) String() string {
 func (*LandResponse_Landed) ProtoMessage() {}
 
 func (x *LandResponse_Landed) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[142]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[152]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10185,7 +10703,7 @@ func (x *LandResponse_Landed) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LandResponse_Landed.ProtoReflect.Descriptor instead.
 func (*LandResponse_Landed) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{73, 0}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{83, 0}
 }
 
 func (x *LandResponse_Landed) GetNumber() int64 {
@@ -10212,7 +10730,7 @@ type DiffFilesRequest_Pair struct {
 
 func (x *DiffFilesRequest_Pair) Reset() {
 	*x = DiffFilesRequest_Pair{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[143]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[153]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10224,7 +10742,7 @@ func (x *DiffFilesRequest_Pair) String() string {
 func (*DiffFilesRequest_Pair) ProtoMessage() {}
 
 func (x *DiffFilesRequest_Pair) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[143]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[153]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10237,7 +10755,7 @@ func (x *DiffFilesRequest_Pair) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DiffFilesRequest_Pair.ProtoReflect.Descriptor instead.
 func (*DiffFilesRequest_Pair) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{95, 0}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{105, 0}
 }
 
 func (x *DiffFilesRequest_Pair) GetOldFile() []byte {
@@ -10265,7 +10783,7 @@ type AnnotateResponse_Range struct {
 
 func (x *AnnotateResponse_Range) Reset() {
 	*x = AnnotateResponse_Range{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[144]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[154]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10277,7 +10795,7 @@ func (x *AnnotateResponse_Range) String() string {
 func (*AnnotateResponse_Range) ProtoMessage() {}
 
 func (x *AnnotateResponse_Range) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[144]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[154]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10290,7 +10808,7 @@ func (x *AnnotateResponse_Range) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AnnotateResponse_Range.ProtoReflect.Descriptor instead.
 func (*AnnotateResponse_Range) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{101, 0}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{111, 0}
 }
 
 func (x *AnnotateResponse_Range) GetFirstLine() int32 {
@@ -10324,7 +10842,7 @@ type HeadsResponse_Head struct {
 
 func (x *HeadsResponse_Head) Reset() {
 	*x = HeadsResponse_Head{}
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[145]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[155]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10336,7 +10854,7 @@ func (x *HeadsResponse_Head) String() string {
 func (*HeadsResponse_Head) ProtoMessage() {}
 
 func (x *HeadsResponse_Head) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[145]
+	mi := &file_proto_ok_scm_v1_scm_proto_msgTypes[155]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10349,7 +10867,7 @@ func (x *HeadsResponse_Head) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HeadsResponse_Head.ProtoReflect.Descriptor instead.
 func (*HeadsResponse_Head) Descriptor() ([]byte, []int) {
-	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{110, 0}
+	return file_proto_ok_scm_v1_scm_proto_rawDescGZIP(), []int{120, 0}
 }
 
 func (x *HeadsResponse_Head) GetRepositoryId() int64 {
@@ -10613,6 +11131,37 @@ const file_proto_ok_scm_v1_scm_proto_rawDesc = "" +
 	"\x04step\"\\\n" +
 	"\x10PublishRejection\x12.\n" +
 	"\amissing\x18\x01 \x03(\v2\x14.ok.scm.v1.ObjectRefR\amissing\x12\x18\n" +
+	"\amessage\x18\x02 \x01(\tR\amessage\"\xc5\x01\n" +
+	"\bFileLock\x12\x12\n" +
+	"\x04path\x18\x01 \x01(\tR\x04path\x12\x1b\n" +
+	"\tholder_id\x18\x02 \x01(\tR\bholderId\x12\x16\n" +
+	"\x06holder\x18\x03 \x01(\tR\x06holder\x125\n" +
+	"\btaken_at\x18\x04 \x01(\v2\x1a.google.protobuf.TimestampR\atakenAt\x129\n" +
+	"\n" +
+	"expires_at\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\texpiresAt\"H\n" +
+	"\vLockRequest\x12#\n" +
+	"\rrepository_id\x18\x01 \x01(\x03R\frepositoryId\x12\x14\n" +
+	"\x05paths\x18\x02 \x03(\tR\x05paths\"9\n" +
+	"\fLockResponse\x12)\n" +
+	"\x05locks\x18\x01 \x03(\v2\x13.ok.scm.v1.FileLockR\x05locks\"J\n" +
+	"\rUnlockRequest\x12#\n" +
+	"\rrepository_id\x18\x01 \x01(\x03R\frepositoryId\x12\x14\n" +
+	"\x05paths\x18\x02 \x03(\tR\x05paths\",\n" +
+	"\x0eUnlockResponse\x12\x1a\n" +
+	"\bunlocked\x18\x01 \x03(\tR\bunlocked\"N\n" +
+	"\x11BreakLocksRequest\x12#\n" +
+	"\rrepository_id\x18\x01 \x01(\x03R\frepositoryId\x12\x14\n" +
+	"\x05paths\x18\x02 \x03(\tR\x05paths\"A\n" +
+	"\x12BreakLocksResponse\x12+\n" +
+	"\x06broken\x18\x01 \x03(\v2\x13.ok.scm.v1.FileLockR\x06broken\"X\n" +
+	"\x10ListLocksRequest\x12#\n" +
+	"\rrepository_id\x18\x01 \x01(\x03R\frepositoryId\x12\x1f\n" +
+	"\vpath_prefix\x18\x02 \x01(\tR\n" +
+	"pathPrefix\">\n" +
+	"\x11ListLocksResponse\x12)\n" +
+	"\x05locks\x18\x01 \x03(\v2\x13.ok.scm.v1.FileLockR\x05locks\"R\n" +
+	"\rLockRejection\x12'\n" +
+	"\x04held\x18\x01 \x01(\v2\x13.ok.scm.v1.FileLockR\x04held\x12\x18\n" +
 	"\amessage\x18\x02 \x01(\tR\amessage\"\xe9\x01\n" +
 	"\bPatchset\x12\x16\n" +
 	"\x06number\x18\x01 \x01(\x05R\x06number\x12\x1b\n" +
@@ -10807,12 +11356,12 @@ const file_proto_ok_scm_v1_scm_proto_rawDesc = "" +
 	"\x0erepository_seq\x18\x04 \x01(\x03R\rrepositorySeq\x1a=\n" +
 	"\x06Landed\x12\x16\n" +
 	"\x06number\x18\x01 \x01(\x03R\x06number\x12\x1b\n" +
-	"\tcommit_id\x18\x02 \x01(\fR\bcommitIdJ\x04\b\x03\x10\x04R\tevent_seq\"\xb6\x03\n" +
+	"\tcommit_id\x18\x02 \x01(\fR\bcommitIdJ\x04\b\x03\x10\x04R\tevent_seq\"\xc9\x03\n" +
 	"\rLandRejection\x12\x16\n" +
 	"\x06number\x18\x01 \x01(\x03R\x06number\x127\n" +
 	"\x06reason\x18\x02 \x01(\x0e2\x1f.ok.scm.v1.LandRejection.ReasonR\x06reason\x12\x14\n" +
 	"\x05paths\x18\x03 \x03(\tR\x05paths\x12\x18\n" +
-	"\amessage\x18\x04 \x01(\tR\amessage\"\xa3\x02\n" +
+	"\amessage\x18\x04 \x01(\tR\amessage\"\xb6\x02\n" +
 	"\x06Reason\x12\x16\n" +
 	"\x12REASON_UNSPECIFIED\x10\x00\x12\x13\n" +
 	"\x0fREASON_NOT_OPEN\x10\x01\x12\x19\n" +
@@ -10825,7 +11374,8 @@ const file_proto_ok_scm_v1_scm_proto_rawDesc = "" +
 	"\x19REASON_CANDIDATE_MISMATCH\x10\b\x12\x17\n" +
 	"\x13REASON_UNKNOWN_BASE\x10\t\x12\x14\n" +
 	"\x10REASON_TOO_LARGE\x10\n" +
-	"\"\xbb\x01\n" +
+	"\x12\x11\n" +
+	"\rREASON_LOCKED\x10\v\"\xbb\x01\n" +
 	"\x11CodeSearchRequest\x12#\n" +
 	"\rrepository_id\x18\x01 \x01(\x03R\frepositoryId\x12\x18\n" +
 	"\apattern\x18\x02 \x01(\tR\apattern\x12\x16\n" +
@@ -11221,7 +11771,13 @@ const file_proto_ok_scm_v1_scm_proto_rawDesc = "" +
 	"\x10PrepareCandidate\x12\".ok.scm.v1.PrepareCandidateRequest\x1a\x14.ok.scm.v1.Candidate\x12[\n" +
 	"\x10DiscardCandidate\x12\".ok.scm.v1.DiscardCandidateRequest\x1a#.ok.scm.v1.DiscardCandidateResponse\x12U\n" +
 	"\x0eListCandidates\x12 .ok.scm.v1.ListCandidatesRequest\x1a!.ok.scm.v1.ListCandidatesResponse\x127\n" +
-	"\x04Land\x12\x16.ok.scm.v1.LandRequest\x1a\x17.ok.scm.v1.LandResponse\x1a\x05\xc2\xf3\x18\x01\r2V\n" +
+	"\x04Land\x12\x16.ok.scm.v1.LandRequest\x1a\x17.ok.scm.v1.LandResponse\x1a\x05\xc2\xf3\x18\x01\r2\x9b\x02\n" +
+	"\x05Locks\x127\n" +
+	"\x04Lock\x12\x16.ok.scm.v1.LockRequest\x1a\x17.ok.scm.v1.LockResponse\x12=\n" +
+	"\x06Unlock\x12\x18.ok.scm.v1.UnlockRequest\x1a\x19.ok.scm.v1.UnlockResponse\x12I\n" +
+	"\n" +
+	"BreakLocks\x12\x1c.ok.scm.v1.BreakLocksRequest\x1a\x1d.ok.scm.v1.BreakLocksResponse\x12F\n" +
+	"\tListLocks\x12\x1b.ok.scm.v1.ListLocksRequest\x1a\x1c.ok.scm.v1.ListLocksResponse\x1a\a\xc2\xf3\x18\x03\x02\x03\f2V\n" +
 	"\rLandingChecks\x12=\n" +
 	"\n" +
 	"DryRunLand\x12\x16.ok.scm.v1.LandRequest\x1a\x17.ok.scm.v1.LandResponse\x1a\x06\xc2\xf3\x18\x02\f\r2\x82\x01\n" +
@@ -11273,7 +11829,7 @@ func file_proto_ok_scm_v1_scm_proto_rawDescGZIP() []byte {
 }
 
 var file_proto_ok_scm_v1_scm_proto_enumTypes = make([]protoimpl.EnumInfo, 14)
-var file_proto_ok_scm_v1_scm_proto_msgTypes = make([]protoimpl.MessageInfo, 146)
+var file_proto_ok_scm_v1_scm_proto_msgTypes = make([]protoimpl.MessageInfo, 156)
 var file_proto_ok_scm_v1_scm_proto_goTypes = []any{
 	(ObjectKind)(0),       // 0: ok.scm.v1.ObjectKind
 	(ChunkCodec)(0),       // 1: ok.scm.v1.ChunkCodec
@@ -11336,106 +11892,116 @@ var file_proto_ok_scm_v1_scm_proto_goTypes = []any{
 	(*PublishRequest)(nil),                         // 58: ok.scm.v1.PublishRequest
 	(*PublishResponse)(nil),                        // 59: ok.scm.v1.PublishResponse
 	(*PublishRejection)(nil),                       // 60: ok.scm.v1.PublishRejection
-	(*Patchset)(nil),                               // 61: ok.scm.v1.Patchset
-	(*ChangeList)(nil),                             // 62: ok.scm.v1.ChangeList
-	(*Rollback)(nil),                               // 63: ok.scm.v1.Rollback
-	(*RollbackRequest)(nil),                        // 64: ok.scm.v1.RollbackRequest
-	(*RollbackResponse)(nil),                       // 65: ok.scm.v1.RollbackResponse
-	(*RollbackRejection)(nil),                      // 66: ok.scm.v1.RollbackRejection
-	(*UploadRequest)(nil),                          // 67: ok.scm.v1.UploadRequest
-	(*UploadResponse)(nil),                         // 68: ok.scm.v1.UploadResponse
-	(*ListSecretReferencesRequest)(nil),            // 69: ok.scm.v1.ListSecretReferencesRequest
-	(*ListSecretReferencesResponse)(nil),           // 70: ok.scm.v1.ListSecretReferencesResponse
-	(*SecretPointer)(nil),                          // 71: ok.scm.v1.SecretPointer
-	(*UploadRejection)(nil),                        // 72: ok.scm.v1.UploadRejection
-	(*GetChangeListRequest)(nil),                   // 73: ok.scm.v1.GetChangeListRequest
-	(*ListChangeListsRequest)(nil),                 // 74: ok.scm.v1.ListChangeListsRequest
-	(*ListChangeListsResponse)(nil),                // 75: ok.scm.v1.ListChangeListsResponse
-	(*LookupChangesRequest)(nil),                   // 76: ok.scm.v1.LookupChangesRequest
-	(*LookupChangesResponse)(nil),                  // 77: ok.scm.v1.LookupChangesResponse
-	(*TransitionRequest)(nil),                      // 78: ok.scm.v1.TransitionRequest
-	(*TransitionResponse)(nil),                     // 79: ok.scm.v1.TransitionResponse
-	(*PrepareCandidateRequest)(nil),                // 80: ok.scm.v1.PrepareCandidateRequest
-	(*Candidate)(nil),                              // 81: ok.scm.v1.Candidate
-	(*ListCandidatesRequest)(nil),                  // 82: ok.scm.v1.ListCandidatesRequest
-	(*ListCandidatesResponse)(nil),                 // 83: ok.scm.v1.ListCandidatesResponse
-	(*DiscardCandidateRequest)(nil),                // 84: ok.scm.v1.DiscardCandidateRequest
-	(*DiscardCandidateResponse)(nil),               // 85: ok.scm.v1.DiscardCandidateResponse
-	(*LandRequest)(nil),                            // 86: ok.scm.v1.LandRequest
-	(*LandResponse)(nil),                           // 87: ok.scm.v1.LandResponse
-	(*LandRejection)(nil),                          // 88: ok.scm.v1.LandRejection
-	(*CodeSearchRequest)(nil),                      // 89: ok.scm.v1.CodeSearchRequest
-	(*CodeSearchResponse)(nil),                     // 90: ok.scm.v1.CodeSearchResponse
-	(*CodeMatch)(nil),                              // 91: ok.scm.v1.CodeMatch
-	(*Signature)(nil),                              // 92: ok.scm.v1.Signature
-	(*Commit)(nil),                                 // 93: ok.scm.v1.Commit
-	(*GetCommitsRequest)(nil),                      // 94: ok.scm.v1.GetCommitsRequest
-	(*GetCommitsResponse)(nil),                     // 95: ok.scm.v1.GetCommitsResponse
-	(*LogRequest)(nil),                             // 96: ok.scm.v1.LogRequest
-	(*LogResponse)(nil),                            // 97: ok.scm.v1.LogResponse
-	(*TreeValue)(nil),                              // 98: ok.scm.v1.TreeValue
-	(*TreeEntry)(nil),                              // 99: ok.scm.v1.TreeEntry
-	(*ReadTreeRequest)(nil),                        // 100: ok.scm.v1.ReadTreeRequest
-	(*ReadTreeResponse)(nil),                       // 101: ok.scm.v1.ReadTreeResponse
-	(*ReadFileAtRequest)(nil),                      // 102: ok.scm.v1.ReadFileAtRequest
-	(*ReadFileAtResponse)(nil),                     // 103: ok.scm.v1.ReadFileAtResponse
-	(*ReadFilesAtRequest)(nil),                     // 104: ok.scm.v1.ReadFilesAtRequest
-	(*ReadFilesAtResponse)(nil),                    // 105: ok.scm.v1.ReadFilesAtResponse
-	(*DiffTreesRequest)(nil),                       // 106: ok.scm.v1.DiffTreesRequest
-	(*PathChange)(nil),                             // 107: ok.scm.v1.PathChange
-	(*DiffTreesResponse)(nil),                      // 108: ok.scm.v1.DiffTreesResponse
-	(*DiffFilesRequest)(nil),                       // 109: ok.scm.v1.DiffFilesRequest
-	(*DiffLine)(nil),                               // 110: ok.scm.v1.DiffLine
-	(*Hunk)(nil),                                   // 111: ok.scm.v1.Hunk
-	(*FileDiff)(nil),                               // 112: ok.scm.v1.FileDiff
-	(*DiffFilesResponse)(nil),                      // 113: ok.scm.v1.DiffFilesResponse
-	(*AnnotateRequest)(nil),                        // 114: ok.scm.v1.AnnotateRequest
-	(*AnnotateResponse)(nil),                       // 115: ok.scm.v1.AnnotateResponse
-	(*IsAncestorRequest)(nil),                      // 116: ok.scm.v1.IsAncestorRequest
-	(*IsAncestorResponse)(nil),                     // 117: ok.scm.v1.IsAncestorResponse
-	(*ExportRequest)(nil),                          // 118: ok.scm.v1.ExportRequest
-	(*ExportResponse)(nil),                         // 119: ok.scm.v1.ExportResponse
-	(*ExportEntry)(nil),                            // 120: ok.scm.v1.ExportEntry
-	(*FollowRequest)(nil),                          // 121: ok.scm.v1.FollowRequest
-	(*FollowResponse)(nil),                         // 122: ok.scm.v1.FollowResponse
-	(*HeadsRequest)(nil),                           // 123: ok.scm.v1.HeadsRequest
-	(*HeadsResponse)(nil),                          // 124: ok.scm.v1.HeadsResponse
-	(*ReadEventsRequest)(nil),                      // 125: ok.scm.v1.ReadEventsRequest
-	(*ReadEventsResponse)(nil),                     // 126: ok.scm.v1.ReadEventsResponse
-	(*Event)(nil),                                  // 127: ok.scm.v1.Event
-	(*ChangeListUploaded)(nil),                     // 128: ok.scm.v1.ChangeListUploaded
-	(*ChangeListTransitioned)(nil),                 // 129: ok.scm.v1.ChangeListTransitioned
-	(*ChangeListLanded)(nil),                       // 130: ok.scm.v1.ChangeListLanded
-	(*HeadMoved)(nil),                              // 131: ok.scm.v1.HeadMoved
-	(*RepositoryCreated)(nil),                      // 132: ok.scm.v1.RepositoryCreated
-	(*RepositoryRenamed)(nil),                      // 133: ok.scm.v1.RepositoryRenamed
-	(*CreateWorkspaceRequest)(nil),                 // 134: ok.scm.v1.CreateWorkspaceRequest
-	(*Lease)(nil),                                  // 135: ok.scm.v1.Lease
-	(*AttachRequest)(nil),                          // 136: ok.scm.v1.AttachRequest
-	(*AttachResponse)(nil),                         // 137: ok.scm.v1.AttachResponse
-	(*RenewRequest)(nil),                           // 138: ok.scm.v1.RenewRequest
-	(*RenewResponse)(nil),                          // 139: ok.scm.v1.RenewResponse
-	(*ReleaseRequest)(nil),                         // 140: ok.scm.v1.ReleaseRequest
-	(*ReleaseResponse)(nil),                        // 141: ok.scm.v1.ReleaseResponse
-	(*Checkpoint)(nil),                             // 142: ok.scm.v1.Checkpoint
-	(*RecordCheckpointRequest)(nil),                // 143: ok.scm.v1.RecordCheckpointRequest
-	(*GetCheckpointRequest)(nil),                   // 144: ok.scm.v1.GetCheckpointRequest
-	(*ListCheckpointsRequest)(nil),                 // 145: ok.scm.v1.ListCheckpointsRequest
-	(*ListCheckpointsResponse)(nil),                // 146: ok.scm.v1.ListCheckpointsResponse
-	(*ListWorkspacesRequest)(nil),                  // 147: ok.scm.v1.ListWorkspacesRequest
-	(*ListWorkspacesResponse)(nil),                 // 148: ok.scm.v1.ListWorkspacesResponse
-	(*WorkspaceState)(nil),                         // 149: ok.scm.v1.WorkspaceState
-	(*PublishRequest_Begin)(nil),                   // 150: ok.scm.v1.PublishRequest.Begin
-	(*PublishRequest_Commit)(nil),                  // 151: ok.scm.v1.PublishRequest.Commit
-	(*PublishResponse_Missing)(nil),                // 152: ok.scm.v1.PublishResponse.Missing
-	(*PublishResponse_Done)(nil),                   // 153: ok.scm.v1.PublishResponse.Done
-	(*UploadResponse_Result)(nil),                  // 154: ok.scm.v1.UploadResponse.Result
-	(*LandRequest_Item)(nil),                       // 155: ok.scm.v1.LandRequest.Item
-	(*LandResponse_Landed)(nil),                    // 156: ok.scm.v1.LandResponse.Landed
-	(*DiffFilesRequest_Pair)(nil),                  // 157: ok.scm.v1.DiffFilesRequest.Pair
-	(*AnnotateResponse_Range)(nil),                 // 158: ok.scm.v1.AnnotateResponse.Range
-	(*HeadsResponse_Head)(nil),                     // 159: ok.scm.v1.HeadsResponse.Head
-	(*timestamppb.Timestamp)(nil),                  // 160: google.protobuf.Timestamp
+	(*FileLock)(nil),                               // 61: ok.scm.v1.FileLock
+	(*LockRequest)(nil),                            // 62: ok.scm.v1.LockRequest
+	(*LockResponse)(nil),                           // 63: ok.scm.v1.LockResponse
+	(*UnlockRequest)(nil),                          // 64: ok.scm.v1.UnlockRequest
+	(*UnlockResponse)(nil),                         // 65: ok.scm.v1.UnlockResponse
+	(*BreakLocksRequest)(nil),                      // 66: ok.scm.v1.BreakLocksRequest
+	(*BreakLocksResponse)(nil),                     // 67: ok.scm.v1.BreakLocksResponse
+	(*ListLocksRequest)(nil),                       // 68: ok.scm.v1.ListLocksRequest
+	(*ListLocksResponse)(nil),                      // 69: ok.scm.v1.ListLocksResponse
+	(*LockRejection)(nil),                          // 70: ok.scm.v1.LockRejection
+	(*Patchset)(nil),                               // 71: ok.scm.v1.Patchset
+	(*ChangeList)(nil),                             // 72: ok.scm.v1.ChangeList
+	(*Rollback)(nil),                               // 73: ok.scm.v1.Rollback
+	(*RollbackRequest)(nil),                        // 74: ok.scm.v1.RollbackRequest
+	(*RollbackResponse)(nil),                       // 75: ok.scm.v1.RollbackResponse
+	(*RollbackRejection)(nil),                      // 76: ok.scm.v1.RollbackRejection
+	(*UploadRequest)(nil),                          // 77: ok.scm.v1.UploadRequest
+	(*UploadResponse)(nil),                         // 78: ok.scm.v1.UploadResponse
+	(*ListSecretReferencesRequest)(nil),            // 79: ok.scm.v1.ListSecretReferencesRequest
+	(*ListSecretReferencesResponse)(nil),           // 80: ok.scm.v1.ListSecretReferencesResponse
+	(*SecretPointer)(nil),                          // 81: ok.scm.v1.SecretPointer
+	(*UploadRejection)(nil),                        // 82: ok.scm.v1.UploadRejection
+	(*GetChangeListRequest)(nil),                   // 83: ok.scm.v1.GetChangeListRequest
+	(*ListChangeListsRequest)(nil),                 // 84: ok.scm.v1.ListChangeListsRequest
+	(*ListChangeListsResponse)(nil),                // 85: ok.scm.v1.ListChangeListsResponse
+	(*LookupChangesRequest)(nil),                   // 86: ok.scm.v1.LookupChangesRequest
+	(*LookupChangesResponse)(nil),                  // 87: ok.scm.v1.LookupChangesResponse
+	(*TransitionRequest)(nil),                      // 88: ok.scm.v1.TransitionRequest
+	(*TransitionResponse)(nil),                     // 89: ok.scm.v1.TransitionResponse
+	(*PrepareCandidateRequest)(nil),                // 90: ok.scm.v1.PrepareCandidateRequest
+	(*Candidate)(nil),                              // 91: ok.scm.v1.Candidate
+	(*ListCandidatesRequest)(nil),                  // 92: ok.scm.v1.ListCandidatesRequest
+	(*ListCandidatesResponse)(nil),                 // 93: ok.scm.v1.ListCandidatesResponse
+	(*DiscardCandidateRequest)(nil),                // 94: ok.scm.v1.DiscardCandidateRequest
+	(*DiscardCandidateResponse)(nil),               // 95: ok.scm.v1.DiscardCandidateResponse
+	(*LandRequest)(nil),                            // 96: ok.scm.v1.LandRequest
+	(*LandResponse)(nil),                           // 97: ok.scm.v1.LandResponse
+	(*LandRejection)(nil),                          // 98: ok.scm.v1.LandRejection
+	(*CodeSearchRequest)(nil),                      // 99: ok.scm.v1.CodeSearchRequest
+	(*CodeSearchResponse)(nil),                     // 100: ok.scm.v1.CodeSearchResponse
+	(*CodeMatch)(nil),                              // 101: ok.scm.v1.CodeMatch
+	(*Signature)(nil),                              // 102: ok.scm.v1.Signature
+	(*Commit)(nil),                                 // 103: ok.scm.v1.Commit
+	(*GetCommitsRequest)(nil),                      // 104: ok.scm.v1.GetCommitsRequest
+	(*GetCommitsResponse)(nil),                     // 105: ok.scm.v1.GetCommitsResponse
+	(*LogRequest)(nil),                             // 106: ok.scm.v1.LogRequest
+	(*LogResponse)(nil),                            // 107: ok.scm.v1.LogResponse
+	(*TreeValue)(nil),                              // 108: ok.scm.v1.TreeValue
+	(*TreeEntry)(nil),                              // 109: ok.scm.v1.TreeEntry
+	(*ReadTreeRequest)(nil),                        // 110: ok.scm.v1.ReadTreeRequest
+	(*ReadTreeResponse)(nil),                       // 111: ok.scm.v1.ReadTreeResponse
+	(*ReadFileAtRequest)(nil),                      // 112: ok.scm.v1.ReadFileAtRequest
+	(*ReadFileAtResponse)(nil),                     // 113: ok.scm.v1.ReadFileAtResponse
+	(*ReadFilesAtRequest)(nil),                     // 114: ok.scm.v1.ReadFilesAtRequest
+	(*ReadFilesAtResponse)(nil),                    // 115: ok.scm.v1.ReadFilesAtResponse
+	(*DiffTreesRequest)(nil),                       // 116: ok.scm.v1.DiffTreesRequest
+	(*PathChange)(nil),                             // 117: ok.scm.v1.PathChange
+	(*DiffTreesResponse)(nil),                      // 118: ok.scm.v1.DiffTreesResponse
+	(*DiffFilesRequest)(nil),                       // 119: ok.scm.v1.DiffFilesRequest
+	(*DiffLine)(nil),                               // 120: ok.scm.v1.DiffLine
+	(*Hunk)(nil),                                   // 121: ok.scm.v1.Hunk
+	(*FileDiff)(nil),                               // 122: ok.scm.v1.FileDiff
+	(*DiffFilesResponse)(nil),                      // 123: ok.scm.v1.DiffFilesResponse
+	(*AnnotateRequest)(nil),                        // 124: ok.scm.v1.AnnotateRequest
+	(*AnnotateResponse)(nil),                       // 125: ok.scm.v1.AnnotateResponse
+	(*IsAncestorRequest)(nil),                      // 126: ok.scm.v1.IsAncestorRequest
+	(*IsAncestorResponse)(nil),                     // 127: ok.scm.v1.IsAncestorResponse
+	(*ExportRequest)(nil),                          // 128: ok.scm.v1.ExportRequest
+	(*ExportResponse)(nil),                         // 129: ok.scm.v1.ExportResponse
+	(*ExportEntry)(nil),                            // 130: ok.scm.v1.ExportEntry
+	(*FollowRequest)(nil),                          // 131: ok.scm.v1.FollowRequest
+	(*FollowResponse)(nil),                         // 132: ok.scm.v1.FollowResponse
+	(*HeadsRequest)(nil),                           // 133: ok.scm.v1.HeadsRequest
+	(*HeadsResponse)(nil),                          // 134: ok.scm.v1.HeadsResponse
+	(*ReadEventsRequest)(nil),                      // 135: ok.scm.v1.ReadEventsRequest
+	(*ReadEventsResponse)(nil),                     // 136: ok.scm.v1.ReadEventsResponse
+	(*Event)(nil),                                  // 137: ok.scm.v1.Event
+	(*ChangeListUploaded)(nil),                     // 138: ok.scm.v1.ChangeListUploaded
+	(*ChangeListTransitioned)(nil),                 // 139: ok.scm.v1.ChangeListTransitioned
+	(*ChangeListLanded)(nil),                       // 140: ok.scm.v1.ChangeListLanded
+	(*HeadMoved)(nil),                              // 141: ok.scm.v1.HeadMoved
+	(*RepositoryCreated)(nil),                      // 142: ok.scm.v1.RepositoryCreated
+	(*RepositoryRenamed)(nil),                      // 143: ok.scm.v1.RepositoryRenamed
+	(*CreateWorkspaceRequest)(nil),                 // 144: ok.scm.v1.CreateWorkspaceRequest
+	(*Lease)(nil),                                  // 145: ok.scm.v1.Lease
+	(*AttachRequest)(nil),                          // 146: ok.scm.v1.AttachRequest
+	(*AttachResponse)(nil),                         // 147: ok.scm.v1.AttachResponse
+	(*RenewRequest)(nil),                           // 148: ok.scm.v1.RenewRequest
+	(*RenewResponse)(nil),                          // 149: ok.scm.v1.RenewResponse
+	(*ReleaseRequest)(nil),                         // 150: ok.scm.v1.ReleaseRequest
+	(*ReleaseResponse)(nil),                        // 151: ok.scm.v1.ReleaseResponse
+	(*Checkpoint)(nil),                             // 152: ok.scm.v1.Checkpoint
+	(*RecordCheckpointRequest)(nil),                // 153: ok.scm.v1.RecordCheckpointRequest
+	(*GetCheckpointRequest)(nil),                   // 154: ok.scm.v1.GetCheckpointRequest
+	(*ListCheckpointsRequest)(nil),                 // 155: ok.scm.v1.ListCheckpointsRequest
+	(*ListCheckpointsResponse)(nil),                // 156: ok.scm.v1.ListCheckpointsResponse
+	(*ListWorkspacesRequest)(nil),                  // 157: ok.scm.v1.ListWorkspacesRequest
+	(*ListWorkspacesResponse)(nil),                 // 158: ok.scm.v1.ListWorkspacesResponse
+	(*WorkspaceState)(nil),                         // 159: ok.scm.v1.WorkspaceState
+	(*PublishRequest_Begin)(nil),                   // 160: ok.scm.v1.PublishRequest.Begin
+	(*PublishRequest_Commit)(nil),                  // 161: ok.scm.v1.PublishRequest.Commit
+	(*PublishResponse_Missing)(nil),                // 162: ok.scm.v1.PublishResponse.Missing
+	(*PublishResponse_Done)(nil),                   // 163: ok.scm.v1.PublishResponse.Done
+	(*UploadResponse_Result)(nil),                  // 164: ok.scm.v1.UploadResponse.Result
+	(*LandRequest_Item)(nil),                       // 165: ok.scm.v1.LandRequest.Item
+	(*LandResponse_Landed)(nil),                    // 166: ok.scm.v1.LandResponse.Landed
+	(*DiffFilesRequest_Pair)(nil),                  // 167: ok.scm.v1.DiffFilesRequest.Pair
+	(*AnnotateResponse_Range)(nil),                 // 168: ok.scm.v1.AnnotateResponse.Range
+	(*HeadsResponse_Head)(nil),                     // 169: ok.scm.v1.HeadsResponse.Head
+	(*timestamppb.Timestamp)(nil),                  // 170: google.protobuf.Timestamp
 }
 var file_proto_ok_scm_v1_scm_proto_depIdxs = []int32{
 	0,   // 0: ok.scm.v1.ObjectRef.kind:type_name -> ok.scm.v1.ObjectKind
@@ -11443,7 +12009,7 @@ var file_proto_ok_scm_v1_scm_proto_depIdxs = []int32{
 	54,  // 2: ok.scm.v1.EncodedObject.chunks:type_name -> ok.scm.v1.ChunkRef
 	15,  // 3: ok.scm.v1.ObjectResult.object:type_name -> ok.scm.v1.EncodedObject
 	14,  // 4: ok.scm.v1.ObjectResult.not_found:type_name -> ok.scm.v1.ObjectRef
-	160, // 5: ok.scm.v1.Repository.created_at:type_name -> google.protobuf.Timestamp
+	170, // 5: ok.scm.v1.Repository.created_at:type_name -> google.protobuf.Timestamp
 	14,  // 6: ok.scm.v1.ReadObjectsRequest.refs:type_name -> ok.scm.v1.ObjectRef
 	25,  // 7: ok.scm.v1.ReadFilesRequest.files:type_name -> ok.scm.v1.FileRange
 	1,   // 8: ok.scm.v1.FileData.codec:type_name -> ok.scm.v1.ChunkCodec
@@ -11455,213 +12021,227 @@ var file_proto_ok_scm_v1_scm_proto_depIdxs = []int32{
 	41,  // 14: ok.scm.v1.GraphFrame.records:type_name -> ok.scm.v1.GraphRecords
 	14,  // 15: ok.scm.v1.ReadOperationsRequest.refs:type_name -> ok.scm.v1.ObjectRef
 	4,   // 16: ok.scm.v1.ResolveOperationPrefixResponse.resolution:type_name -> ok.scm.v1.ResolveOperationPrefixResponse.Resolution
-	160, // 17: ok.scm.v1.CollectOperationsRequest.keep_newer:type_name -> google.protobuf.Timestamp
+	170, // 17: ok.scm.v1.CollectOperationsRequest.keep_newer:type_name -> google.protobuf.Timestamp
 	54,  // 18: ok.scm.v1.FileManifest.chunks:type_name -> ok.scm.v1.ChunkRef
-	150, // 19: ok.scm.v1.PublishRequest.begin:type_name -> ok.scm.v1.PublishRequest.Begin
+	160, // 19: ok.scm.v1.PublishRequest.begin:type_name -> ok.scm.v1.PublishRequest.Begin
 	15,  // 20: ok.scm.v1.PublishRequest.object:type_name -> ok.scm.v1.EncodedObject
 	56,  // 21: ok.scm.v1.PublishRequest.chunk:type_name -> ok.scm.v1.ChunkData
-	151, // 22: ok.scm.v1.PublishRequest.commit:type_name -> ok.scm.v1.PublishRequest.Commit
-	152, // 23: ok.scm.v1.PublishResponse.missing:type_name -> ok.scm.v1.PublishResponse.Missing
-	153, // 24: ok.scm.v1.PublishResponse.done:type_name -> ok.scm.v1.PublishResponse.Done
+	161, // 22: ok.scm.v1.PublishRequest.commit:type_name -> ok.scm.v1.PublishRequest.Commit
+	162, // 23: ok.scm.v1.PublishResponse.missing:type_name -> ok.scm.v1.PublishResponse.Missing
+	163, // 24: ok.scm.v1.PublishResponse.done:type_name -> ok.scm.v1.PublishResponse.Done
 	14,  // 25: ok.scm.v1.PublishRejection.missing:type_name -> ok.scm.v1.ObjectRef
-	160, // 26: ok.scm.v1.Patchset.uploaded_at:type_name -> google.protobuf.Timestamp
-	2,   // 27: ok.scm.v1.ChangeList.status:type_name -> ok.scm.v1.ChangeListStatus
-	2,   // 28: ok.scm.v1.ChangeList.abandoned_from:type_name -> ok.scm.v1.ChangeListStatus
-	61,  // 29: ok.scm.v1.ChangeList.patchsets:type_name -> ok.scm.v1.Patchset
-	160, // 30: ok.scm.v1.ChangeList.created_at:type_name -> google.protobuf.Timestamp
-	160, // 31: ok.scm.v1.ChangeList.updated_at:type_name -> google.protobuf.Timestamp
-	63,  // 32: ok.scm.v1.ChangeList.rollback:type_name -> ok.scm.v1.Rollback
-	62,  // 33: ok.scm.v1.RollbackResponse.change_list:type_name -> ok.scm.v1.ChangeList
-	5,   // 34: ok.scm.v1.RollbackRejection.reason:type_name -> ok.scm.v1.RollbackRejection.Reason
-	6,   // 35: ok.scm.v1.UploadRequest.readiness:type_name -> ok.scm.v1.UploadRequest.Readiness
-	154, // 36: ok.scm.v1.UploadResponse.results:type_name -> ok.scm.v1.UploadResponse.Result
-	8,   // 37: ok.scm.v1.ListSecretReferencesResponse.state:type_name -> ok.scm.v1.ListSecretReferencesResponse.State
-	71,  // 38: ok.scm.v1.ListSecretReferencesResponse.pointers:type_name -> ok.scm.v1.SecretPointer
-	9,   // 39: ok.scm.v1.UploadRejection.reason:type_name -> ok.scm.v1.UploadRejection.Reason
-	2,   // 40: ok.scm.v1.ListChangeListsRequest.statuses:type_name -> ok.scm.v1.ChangeListStatus
-	62,  // 41: ok.scm.v1.ListChangeListsResponse.change_lists:type_name -> ok.scm.v1.ChangeList
-	62,  // 42: ok.scm.v1.LookupChangesResponse.change_lists:type_name -> ok.scm.v1.ChangeList
-	10,  // 43: ok.scm.v1.TransitionRequest.kind:type_name -> ok.scm.v1.TransitionRequest.Kind
-	62,  // 44: ok.scm.v1.TransitionResponse.change_list:type_name -> ok.scm.v1.ChangeList
-	160, // 45: ok.scm.v1.Candidate.prepared_at:type_name -> google.protobuf.Timestamp
-	81,  // 46: ok.scm.v1.ListCandidatesResponse.candidates:type_name -> ok.scm.v1.Candidate
-	155, // 47: ok.scm.v1.LandRequest.items:type_name -> ok.scm.v1.LandRequest.Item
-	156, // 48: ok.scm.v1.LandResponse.landed:type_name -> ok.scm.v1.LandResponse.Landed
-	11,  // 49: ok.scm.v1.LandRejection.reason:type_name -> ok.scm.v1.LandRejection.Reason
-	91,  // 50: ok.scm.v1.CodeSearchResponse.matches:type_name -> ok.scm.v1.CodeMatch
-	92,  // 51: ok.scm.v1.Commit.author:type_name -> ok.scm.v1.Signature
-	92,  // 52: ok.scm.v1.Commit.committer:type_name -> ok.scm.v1.Signature
-	93,  // 53: ok.scm.v1.GetCommitsResponse.commits:type_name -> ok.scm.v1.Commit
-	93,  // 54: ok.scm.v1.LogResponse.commits:type_name -> ok.scm.v1.Commit
-	3,   // 55: ok.scm.v1.TreeValue.type:type_name -> ok.scm.v1.EntryType
-	98,  // 56: ok.scm.v1.TreeEntry.value:type_name -> ok.scm.v1.TreeValue
-	99,  // 57: ok.scm.v1.ReadTreeResponse.entries:type_name -> ok.scm.v1.TreeEntry
-	93,  // 58: ok.scm.v1.ReadTreeResponse.commits:type_name -> ok.scm.v1.Commit
-	98,  // 59: ok.scm.v1.ReadFileAtResponse.value:type_name -> ok.scm.v1.TreeValue
-	98,  // 60: ok.scm.v1.ReadFilesAtResponse.value:type_name -> ok.scm.v1.TreeValue
-	12,  // 61: ok.scm.v1.PathChange.kind:type_name -> ok.scm.v1.PathChange.Kind
-	98,  // 62: ok.scm.v1.PathChange.before:type_name -> ok.scm.v1.TreeValue
-	98,  // 63: ok.scm.v1.PathChange.after:type_name -> ok.scm.v1.TreeValue
-	107, // 64: ok.scm.v1.DiffTreesResponse.changes:type_name -> ok.scm.v1.PathChange
-	157, // 65: ok.scm.v1.DiffFilesRequest.pairs:type_name -> ok.scm.v1.DiffFilesRequest.Pair
-	13,  // 66: ok.scm.v1.DiffLine.op:type_name -> ok.scm.v1.DiffLine.Op
-	110, // 67: ok.scm.v1.Hunk.lines:type_name -> ok.scm.v1.DiffLine
-	111, // 68: ok.scm.v1.FileDiff.hunks:type_name -> ok.scm.v1.Hunk
-	112, // 69: ok.scm.v1.DiffFilesResponse.diffs:type_name -> ok.scm.v1.FileDiff
-	158, // 70: ok.scm.v1.AnnotateResponse.ranges:type_name -> ok.scm.v1.AnnotateResponse.Range
-	120, // 71: ok.scm.v1.ExportResponse.entry:type_name -> ok.scm.v1.ExportEntry
-	98,  // 72: ok.scm.v1.ExportEntry.value:type_name -> ok.scm.v1.TreeValue
-	159, // 73: ok.scm.v1.HeadsResponse.heads:type_name -> ok.scm.v1.HeadsResponse.Head
-	127, // 74: ok.scm.v1.ReadEventsResponse.events:type_name -> ok.scm.v1.Event
-	160, // 75: ok.scm.v1.Event.at:type_name -> google.protobuf.Timestamp
-	128, // 76: ok.scm.v1.Event.uploaded:type_name -> ok.scm.v1.ChangeListUploaded
-	129, // 77: ok.scm.v1.Event.transitioned:type_name -> ok.scm.v1.ChangeListTransitioned
-	130, // 78: ok.scm.v1.Event.landed:type_name -> ok.scm.v1.ChangeListLanded
-	131, // 79: ok.scm.v1.Event.head_moved:type_name -> ok.scm.v1.HeadMoved
-	132, // 80: ok.scm.v1.Event.repository_created:type_name -> ok.scm.v1.RepositoryCreated
-	133, // 81: ok.scm.v1.Event.repository_renamed:type_name -> ok.scm.v1.RepositoryRenamed
-	2,   // 82: ok.scm.v1.ChangeListUploaded.status:type_name -> ok.scm.v1.ChangeListStatus
-	2,   // 83: ok.scm.v1.ChangeListTransitioned.from:type_name -> ok.scm.v1.ChangeListStatus
-	2,   // 84: ok.scm.v1.ChangeListTransitioned.to:type_name -> ok.scm.v1.ChangeListStatus
-	160, // 85: ok.scm.v1.Lease.expires_at:type_name -> google.protobuf.Timestamp
-	135, // 86: ok.scm.v1.AttachResponse.lease:type_name -> ok.scm.v1.Lease
-	160, // 87: ok.scm.v1.AttachResponse.holder_expires_at:type_name -> google.protobuf.Timestamp
-	142, // 88: ok.scm.v1.AttachResponse.latest:type_name -> ok.scm.v1.Checkpoint
-	135, // 89: ok.scm.v1.RenewRequest.lease:type_name -> ok.scm.v1.Lease
-	135, // 90: ok.scm.v1.RenewResponse.lease:type_name -> ok.scm.v1.Lease
-	135, // 91: ok.scm.v1.ReleaseRequest.lease:type_name -> ok.scm.v1.Lease
-	160, // 92: ok.scm.v1.Checkpoint.created_at:type_name -> google.protobuf.Timestamp
-	135, // 93: ok.scm.v1.RecordCheckpointRequest.lease:type_name -> ok.scm.v1.Lease
-	142, // 94: ok.scm.v1.ListCheckpointsResponse.checkpoints:type_name -> ok.scm.v1.Checkpoint
-	149, // 95: ok.scm.v1.ListWorkspacesResponse.workspaces:type_name -> ok.scm.v1.WorkspaceState
-	160, // 96: ok.scm.v1.WorkspaceState.expires_at:type_name -> google.protobuf.Timestamp
-	142, // 97: ok.scm.v1.WorkspaceState.latest:type_name -> ok.scm.v1.Checkpoint
-	14,  // 98: ok.scm.v1.PublishRequest.Begin.objects:type_name -> ok.scm.v1.ObjectRef
-	55,  // 99: ok.scm.v1.PublishRequest.Begin.files:type_name -> ok.scm.v1.FileManifest
-	57,  // 100: ok.scm.v1.PublishRequest.Commit.op_heads:type_name -> ok.scm.v1.OpHeadsUpdate
-	14,  // 101: ok.scm.v1.PublishResponse.Missing.objects:type_name -> ok.scm.v1.ObjectRef
-	7,   // 102: ok.scm.v1.UploadResponse.Result.outcome:type_name -> ok.scm.v1.UploadResponse.Result.Outcome
-	17,  // 103: ok.scm.v1.Cells.MakeRepository:input_type -> ok.scm.v1.MakeRepositoryRequest
-	22,  // 104: ok.scm.v1.Repositories.CreateRepository:input_type -> ok.scm.v1.CreateRepositoryRequest
-	23,  // 105: ok.scm.v1.Repositories.GetRepository:input_type -> ok.scm.v1.GetRepositoryRequest
-	19,  // 106: ok.scm.v1.Repositories.ForkRepository:input_type -> ok.scm.v1.ForkRepositoryRequest
-	20,  // 107: ok.scm.v1.Repositories.SyncFork:input_type -> ok.scm.v1.SyncForkRequest
-	24,  // 108: ok.scm.v1.Store.ReadObjects:input_type -> ok.scm.v1.ReadObjectsRequest
-	26,  // 109: ok.scm.v1.Store.ReadFiles:input_type -> ok.scm.v1.ReadFilesRequest
-	28,  // 110: ok.scm.v1.Store.GetRelatedCopies:input_type -> ok.scm.v1.GetRelatedCopiesRequest
-	30,  // 111: ok.scm.v1.Store.GetCopyRecords:input_type -> ok.scm.v1.GetCopyRecordsRequest
-	32,  // 112: ok.scm.v1.Store.PrefetchCommits:input_type -> ok.scm.v1.PrefetchCommitsRequest
-	34,  // 113: ok.scm.v1.Store.ReadTreeClosure:input_type -> ok.scm.v1.ReadTreeClosureRequest
-	43,  // 114: ok.scm.v1.Store.ReadTreeSizes:input_type -> ok.scm.v1.ReadTreeSizesRequest
-	44,  // 115: ok.scm.v1.Store.ReadDictionary:input_type -> ok.scm.v1.ReadDictionaryRequest
-	35,  // 116: ok.scm.v1.Store.ReadCheckout:input_type -> ok.scm.v1.ReadCheckoutRequest
-	38,  // 117: ok.scm.v1.Store.ReadGraph:input_type -> ok.scm.v1.ReadGraphRequest
-	47,  // 118: ok.scm.v1.Store.GetOpHeads:input_type -> ok.scm.v1.GetOpHeadsRequest
-	48,  // 119: ok.scm.v1.Store.ReadOperations:input_type -> ok.scm.v1.ReadOperationsRequest
-	33,  // 120: ok.scm.v1.Store.PrefetchOperations:input_type -> ok.scm.v1.PrefetchOperationsRequest
-	50,  // 121: ok.scm.v1.Store.ResolveOperationPrefix:input_type -> ok.scm.v1.ResolveOperationPrefixRequest
-	52,  // 122: ok.scm.v1.Store.CollectOperations:input_type -> ok.scm.v1.CollectOperationsRequest
-	58,  // 123: ok.scm.v1.Store.Publish:input_type -> ok.scm.v1.PublishRequest
-	67,  // 124: ok.scm.v1.ChangeLists.Upload:input_type -> ok.scm.v1.UploadRequest
-	73,  // 125: ok.scm.v1.ChangeLists.GetChangeList:input_type -> ok.scm.v1.GetChangeListRequest
-	74,  // 126: ok.scm.v1.ChangeLists.ListChangeLists:input_type -> ok.scm.v1.ListChangeListsRequest
-	76,  // 127: ok.scm.v1.ChangeLists.LookupChanges:input_type -> ok.scm.v1.LookupChangesRequest
-	22,  // 128: ok.scm.v1.Review.CreateRepository:input_type -> ok.scm.v1.CreateRepositoryRequest
-	19,  // 129: ok.scm.v1.Review.ForkRepository:input_type -> ok.scm.v1.ForkRepositoryRequest
-	20,  // 130: ok.scm.v1.Review.SyncFork:input_type -> ok.scm.v1.SyncForkRequest
-	78,  // 131: ok.scm.v1.Review.Transition:input_type -> ok.scm.v1.TransitionRequest
-	64,  // 132: ok.scm.v1.Review.Rollback:input_type -> ok.scm.v1.RollbackRequest
-	80,  // 133: ok.scm.v1.Landing.PrepareCandidate:input_type -> ok.scm.v1.PrepareCandidateRequest
-	84,  // 134: ok.scm.v1.Landing.DiscardCandidate:input_type -> ok.scm.v1.DiscardCandidateRequest
-	82,  // 135: ok.scm.v1.Landing.ListCandidates:input_type -> ok.scm.v1.ListCandidatesRequest
-	86,  // 136: ok.scm.v1.Landing.Land:input_type -> ok.scm.v1.LandRequest
-	86,  // 137: ok.scm.v1.LandingChecks.DryRunLand:input_type -> ok.scm.v1.LandRequest
-	69,  // 138: ok.scm.v1.SecretReferences.ListSecretReferences:input_type -> ok.scm.v1.ListSecretReferencesRequest
-	94,  // 139: ok.scm.v1.Browse.GetCommits:input_type -> ok.scm.v1.GetCommitsRequest
-	96,  // 140: ok.scm.v1.Browse.Log:input_type -> ok.scm.v1.LogRequest
-	100, // 141: ok.scm.v1.Browse.ReadTree:input_type -> ok.scm.v1.ReadTreeRequest
-	102, // 142: ok.scm.v1.Browse.ReadFileAt:input_type -> ok.scm.v1.ReadFileAtRequest
-	104, // 143: ok.scm.v1.Browse.ReadFilesAt:input_type -> ok.scm.v1.ReadFilesAtRequest
-	106, // 144: ok.scm.v1.Browse.DiffTrees:input_type -> ok.scm.v1.DiffTreesRequest
-	109, // 145: ok.scm.v1.Browse.DiffFiles:input_type -> ok.scm.v1.DiffFilesRequest
-	114, // 146: ok.scm.v1.Browse.Annotate:input_type -> ok.scm.v1.AnnotateRequest
-	116, // 147: ok.scm.v1.Browse.IsAncestor:input_type -> ok.scm.v1.IsAncestorRequest
-	118, // 148: ok.scm.v1.Browse.Export:input_type -> ok.scm.v1.ExportRequest
-	89,  // 149: ok.scm.v1.Search.Code:input_type -> ok.scm.v1.CodeSearchRequest
-	125, // 150: ok.scm.v1.Events.Read:input_type -> ok.scm.v1.ReadEventsRequest
-	123, // 151: ok.scm.v1.Events.Heads:input_type -> ok.scm.v1.HeadsRequest
-	121, // 152: ok.scm.v1.Events.Follow:input_type -> ok.scm.v1.FollowRequest
-	136, // 153: ok.scm.v1.Workspaces.Attach:input_type -> ok.scm.v1.AttachRequest
-	138, // 154: ok.scm.v1.Workspaces.Renew:input_type -> ok.scm.v1.RenewRequest
-	140, // 155: ok.scm.v1.Workspaces.Release:input_type -> ok.scm.v1.ReleaseRequest
-	143, // 156: ok.scm.v1.Workspaces.RecordCheckpoint:input_type -> ok.scm.v1.RecordCheckpointRequest
-	144, // 157: ok.scm.v1.Workspaces.GetCheckpoint:input_type -> ok.scm.v1.GetCheckpointRequest
-	145, // 158: ok.scm.v1.Workspaces.ListCheckpoints:input_type -> ok.scm.v1.ListCheckpointsRequest
-	147, // 159: ok.scm.v1.Workspaces.ListWorkspaces:input_type -> ok.scm.v1.ListWorkspacesRequest
-	134, // 160: ok.scm.v1.Workspaces.CreateWorkspace:input_type -> ok.scm.v1.CreateWorkspaceRequest
-	18,  // 161: ok.scm.v1.Cells.MakeRepository:output_type -> ok.scm.v1.Repository
-	18,  // 162: ok.scm.v1.Repositories.CreateRepository:output_type -> ok.scm.v1.Repository
-	18,  // 163: ok.scm.v1.Repositories.GetRepository:output_type -> ok.scm.v1.Repository
-	18,  // 164: ok.scm.v1.Repositories.ForkRepository:output_type -> ok.scm.v1.Repository
-	21,  // 165: ok.scm.v1.Repositories.SyncFork:output_type -> ok.scm.v1.SyncForkResponse
-	16,  // 166: ok.scm.v1.Store.ReadObjects:output_type -> ok.scm.v1.ObjectResult
-	27,  // 167: ok.scm.v1.Store.ReadFiles:output_type -> ok.scm.v1.FileData
-	29,  // 168: ok.scm.v1.Store.GetRelatedCopies:output_type -> ok.scm.v1.GetRelatedCopiesResponse
-	31,  // 169: ok.scm.v1.Store.GetCopyRecords:output_type -> ok.scm.v1.CopyRecord
-	15,  // 170: ok.scm.v1.Store.PrefetchCommits:output_type -> ok.scm.v1.EncodedObject
-	15,  // 171: ok.scm.v1.Store.ReadTreeClosure:output_type -> ok.scm.v1.EncodedObject
-	46,  // 172: ok.scm.v1.Store.ReadTreeSizes:output_type -> ok.scm.v1.TreeSizes
-	45,  // 173: ok.scm.v1.Store.ReadDictionary:output_type -> ok.scm.v1.Dictionary
-	36,  // 174: ok.scm.v1.Store.ReadCheckout:output_type -> ok.scm.v1.CheckoutFrame
-	39,  // 175: ok.scm.v1.Store.ReadGraph:output_type -> ok.scm.v1.GraphFrame
-	49,  // 176: ok.scm.v1.Store.GetOpHeads:output_type -> ok.scm.v1.GetOpHeadsResponse
-	16,  // 177: ok.scm.v1.Store.ReadOperations:output_type -> ok.scm.v1.ObjectResult
-	15,  // 178: ok.scm.v1.Store.PrefetchOperations:output_type -> ok.scm.v1.EncodedObject
-	51,  // 179: ok.scm.v1.Store.ResolveOperationPrefix:output_type -> ok.scm.v1.ResolveOperationPrefixResponse
-	53,  // 180: ok.scm.v1.Store.CollectOperations:output_type -> ok.scm.v1.CollectOperationsResponse
-	59,  // 181: ok.scm.v1.Store.Publish:output_type -> ok.scm.v1.PublishResponse
-	68,  // 182: ok.scm.v1.ChangeLists.Upload:output_type -> ok.scm.v1.UploadResponse
-	62,  // 183: ok.scm.v1.ChangeLists.GetChangeList:output_type -> ok.scm.v1.ChangeList
-	75,  // 184: ok.scm.v1.ChangeLists.ListChangeLists:output_type -> ok.scm.v1.ListChangeListsResponse
-	77,  // 185: ok.scm.v1.ChangeLists.LookupChanges:output_type -> ok.scm.v1.LookupChangesResponse
-	18,  // 186: ok.scm.v1.Review.CreateRepository:output_type -> ok.scm.v1.Repository
-	18,  // 187: ok.scm.v1.Review.ForkRepository:output_type -> ok.scm.v1.Repository
-	21,  // 188: ok.scm.v1.Review.SyncFork:output_type -> ok.scm.v1.SyncForkResponse
-	79,  // 189: ok.scm.v1.Review.Transition:output_type -> ok.scm.v1.TransitionResponse
-	65,  // 190: ok.scm.v1.Review.Rollback:output_type -> ok.scm.v1.RollbackResponse
-	81,  // 191: ok.scm.v1.Landing.PrepareCandidate:output_type -> ok.scm.v1.Candidate
-	85,  // 192: ok.scm.v1.Landing.DiscardCandidate:output_type -> ok.scm.v1.DiscardCandidateResponse
-	83,  // 193: ok.scm.v1.Landing.ListCandidates:output_type -> ok.scm.v1.ListCandidatesResponse
-	87,  // 194: ok.scm.v1.Landing.Land:output_type -> ok.scm.v1.LandResponse
-	87,  // 195: ok.scm.v1.LandingChecks.DryRunLand:output_type -> ok.scm.v1.LandResponse
-	70,  // 196: ok.scm.v1.SecretReferences.ListSecretReferences:output_type -> ok.scm.v1.ListSecretReferencesResponse
-	95,  // 197: ok.scm.v1.Browse.GetCommits:output_type -> ok.scm.v1.GetCommitsResponse
-	97,  // 198: ok.scm.v1.Browse.Log:output_type -> ok.scm.v1.LogResponse
-	101, // 199: ok.scm.v1.Browse.ReadTree:output_type -> ok.scm.v1.ReadTreeResponse
-	103, // 200: ok.scm.v1.Browse.ReadFileAt:output_type -> ok.scm.v1.ReadFileAtResponse
-	105, // 201: ok.scm.v1.Browse.ReadFilesAt:output_type -> ok.scm.v1.ReadFilesAtResponse
-	108, // 202: ok.scm.v1.Browse.DiffTrees:output_type -> ok.scm.v1.DiffTreesResponse
-	113, // 203: ok.scm.v1.Browse.DiffFiles:output_type -> ok.scm.v1.DiffFilesResponse
-	115, // 204: ok.scm.v1.Browse.Annotate:output_type -> ok.scm.v1.AnnotateResponse
-	117, // 205: ok.scm.v1.Browse.IsAncestor:output_type -> ok.scm.v1.IsAncestorResponse
-	119, // 206: ok.scm.v1.Browse.Export:output_type -> ok.scm.v1.ExportResponse
-	90,  // 207: ok.scm.v1.Search.Code:output_type -> ok.scm.v1.CodeSearchResponse
-	126, // 208: ok.scm.v1.Events.Read:output_type -> ok.scm.v1.ReadEventsResponse
-	124, // 209: ok.scm.v1.Events.Heads:output_type -> ok.scm.v1.HeadsResponse
-	122, // 210: ok.scm.v1.Events.Follow:output_type -> ok.scm.v1.FollowResponse
-	137, // 211: ok.scm.v1.Workspaces.Attach:output_type -> ok.scm.v1.AttachResponse
-	139, // 212: ok.scm.v1.Workspaces.Renew:output_type -> ok.scm.v1.RenewResponse
-	141, // 213: ok.scm.v1.Workspaces.Release:output_type -> ok.scm.v1.ReleaseResponse
-	142, // 214: ok.scm.v1.Workspaces.RecordCheckpoint:output_type -> ok.scm.v1.Checkpoint
-	142, // 215: ok.scm.v1.Workspaces.GetCheckpoint:output_type -> ok.scm.v1.Checkpoint
-	146, // 216: ok.scm.v1.Workspaces.ListCheckpoints:output_type -> ok.scm.v1.ListCheckpointsResponse
-	148, // 217: ok.scm.v1.Workspaces.ListWorkspaces:output_type -> ok.scm.v1.ListWorkspacesResponse
-	149, // 218: ok.scm.v1.Workspaces.CreateWorkspace:output_type -> ok.scm.v1.WorkspaceState
-	161, // [161:219] is the sub-list for method output_type
-	103, // [103:161] is the sub-list for method input_type
-	103, // [103:103] is the sub-list for extension type_name
-	103, // [103:103] is the sub-list for extension extendee
-	0,   // [0:103] is the sub-list for field type_name
+	170, // 26: ok.scm.v1.FileLock.taken_at:type_name -> google.protobuf.Timestamp
+	170, // 27: ok.scm.v1.FileLock.expires_at:type_name -> google.protobuf.Timestamp
+	61,  // 28: ok.scm.v1.LockResponse.locks:type_name -> ok.scm.v1.FileLock
+	61,  // 29: ok.scm.v1.BreakLocksResponse.broken:type_name -> ok.scm.v1.FileLock
+	61,  // 30: ok.scm.v1.ListLocksResponse.locks:type_name -> ok.scm.v1.FileLock
+	61,  // 31: ok.scm.v1.LockRejection.held:type_name -> ok.scm.v1.FileLock
+	170, // 32: ok.scm.v1.Patchset.uploaded_at:type_name -> google.protobuf.Timestamp
+	2,   // 33: ok.scm.v1.ChangeList.status:type_name -> ok.scm.v1.ChangeListStatus
+	2,   // 34: ok.scm.v1.ChangeList.abandoned_from:type_name -> ok.scm.v1.ChangeListStatus
+	71,  // 35: ok.scm.v1.ChangeList.patchsets:type_name -> ok.scm.v1.Patchset
+	170, // 36: ok.scm.v1.ChangeList.created_at:type_name -> google.protobuf.Timestamp
+	170, // 37: ok.scm.v1.ChangeList.updated_at:type_name -> google.protobuf.Timestamp
+	73,  // 38: ok.scm.v1.ChangeList.rollback:type_name -> ok.scm.v1.Rollback
+	72,  // 39: ok.scm.v1.RollbackResponse.change_list:type_name -> ok.scm.v1.ChangeList
+	5,   // 40: ok.scm.v1.RollbackRejection.reason:type_name -> ok.scm.v1.RollbackRejection.Reason
+	6,   // 41: ok.scm.v1.UploadRequest.readiness:type_name -> ok.scm.v1.UploadRequest.Readiness
+	164, // 42: ok.scm.v1.UploadResponse.results:type_name -> ok.scm.v1.UploadResponse.Result
+	8,   // 43: ok.scm.v1.ListSecretReferencesResponse.state:type_name -> ok.scm.v1.ListSecretReferencesResponse.State
+	81,  // 44: ok.scm.v1.ListSecretReferencesResponse.pointers:type_name -> ok.scm.v1.SecretPointer
+	9,   // 45: ok.scm.v1.UploadRejection.reason:type_name -> ok.scm.v1.UploadRejection.Reason
+	2,   // 46: ok.scm.v1.ListChangeListsRequest.statuses:type_name -> ok.scm.v1.ChangeListStatus
+	72,  // 47: ok.scm.v1.ListChangeListsResponse.change_lists:type_name -> ok.scm.v1.ChangeList
+	72,  // 48: ok.scm.v1.LookupChangesResponse.change_lists:type_name -> ok.scm.v1.ChangeList
+	10,  // 49: ok.scm.v1.TransitionRequest.kind:type_name -> ok.scm.v1.TransitionRequest.Kind
+	72,  // 50: ok.scm.v1.TransitionResponse.change_list:type_name -> ok.scm.v1.ChangeList
+	170, // 51: ok.scm.v1.Candidate.prepared_at:type_name -> google.protobuf.Timestamp
+	91,  // 52: ok.scm.v1.ListCandidatesResponse.candidates:type_name -> ok.scm.v1.Candidate
+	165, // 53: ok.scm.v1.LandRequest.items:type_name -> ok.scm.v1.LandRequest.Item
+	166, // 54: ok.scm.v1.LandResponse.landed:type_name -> ok.scm.v1.LandResponse.Landed
+	11,  // 55: ok.scm.v1.LandRejection.reason:type_name -> ok.scm.v1.LandRejection.Reason
+	101, // 56: ok.scm.v1.CodeSearchResponse.matches:type_name -> ok.scm.v1.CodeMatch
+	102, // 57: ok.scm.v1.Commit.author:type_name -> ok.scm.v1.Signature
+	102, // 58: ok.scm.v1.Commit.committer:type_name -> ok.scm.v1.Signature
+	103, // 59: ok.scm.v1.GetCommitsResponse.commits:type_name -> ok.scm.v1.Commit
+	103, // 60: ok.scm.v1.LogResponse.commits:type_name -> ok.scm.v1.Commit
+	3,   // 61: ok.scm.v1.TreeValue.type:type_name -> ok.scm.v1.EntryType
+	108, // 62: ok.scm.v1.TreeEntry.value:type_name -> ok.scm.v1.TreeValue
+	109, // 63: ok.scm.v1.ReadTreeResponse.entries:type_name -> ok.scm.v1.TreeEntry
+	103, // 64: ok.scm.v1.ReadTreeResponse.commits:type_name -> ok.scm.v1.Commit
+	108, // 65: ok.scm.v1.ReadFileAtResponse.value:type_name -> ok.scm.v1.TreeValue
+	108, // 66: ok.scm.v1.ReadFilesAtResponse.value:type_name -> ok.scm.v1.TreeValue
+	12,  // 67: ok.scm.v1.PathChange.kind:type_name -> ok.scm.v1.PathChange.Kind
+	108, // 68: ok.scm.v1.PathChange.before:type_name -> ok.scm.v1.TreeValue
+	108, // 69: ok.scm.v1.PathChange.after:type_name -> ok.scm.v1.TreeValue
+	117, // 70: ok.scm.v1.DiffTreesResponse.changes:type_name -> ok.scm.v1.PathChange
+	167, // 71: ok.scm.v1.DiffFilesRequest.pairs:type_name -> ok.scm.v1.DiffFilesRequest.Pair
+	13,  // 72: ok.scm.v1.DiffLine.op:type_name -> ok.scm.v1.DiffLine.Op
+	120, // 73: ok.scm.v1.Hunk.lines:type_name -> ok.scm.v1.DiffLine
+	121, // 74: ok.scm.v1.FileDiff.hunks:type_name -> ok.scm.v1.Hunk
+	122, // 75: ok.scm.v1.DiffFilesResponse.diffs:type_name -> ok.scm.v1.FileDiff
+	168, // 76: ok.scm.v1.AnnotateResponse.ranges:type_name -> ok.scm.v1.AnnotateResponse.Range
+	130, // 77: ok.scm.v1.ExportResponse.entry:type_name -> ok.scm.v1.ExportEntry
+	108, // 78: ok.scm.v1.ExportEntry.value:type_name -> ok.scm.v1.TreeValue
+	169, // 79: ok.scm.v1.HeadsResponse.heads:type_name -> ok.scm.v1.HeadsResponse.Head
+	137, // 80: ok.scm.v1.ReadEventsResponse.events:type_name -> ok.scm.v1.Event
+	170, // 81: ok.scm.v1.Event.at:type_name -> google.protobuf.Timestamp
+	138, // 82: ok.scm.v1.Event.uploaded:type_name -> ok.scm.v1.ChangeListUploaded
+	139, // 83: ok.scm.v1.Event.transitioned:type_name -> ok.scm.v1.ChangeListTransitioned
+	140, // 84: ok.scm.v1.Event.landed:type_name -> ok.scm.v1.ChangeListLanded
+	141, // 85: ok.scm.v1.Event.head_moved:type_name -> ok.scm.v1.HeadMoved
+	142, // 86: ok.scm.v1.Event.repository_created:type_name -> ok.scm.v1.RepositoryCreated
+	143, // 87: ok.scm.v1.Event.repository_renamed:type_name -> ok.scm.v1.RepositoryRenamed
+	2,   // 88: ok.scm.v1.ChangeListUploaded.status:type_name -> ok.scm.v1.ChangeListStatus
+	2,   // 89: ok.scm.v1.ChangeListTransitioned.from:type_name -> ok.scm.v1.ChangeListStatus
+	2,   // 90: ok.scm.v1.ChangeListTransitioned.to:type_name -> ok.scm.v1.ChangeListStatus
+	170, // 91: ok.scm.v1.Lease.expires_at:type_name -> google.protobuf.Timestamp
+	145, // 92: ok.scm.v1.AttachResponse.lease:type_name -> ok.scm.v1.Lease
+	170, // 93: ok.scm.v1.AttachResponse.holder_expires_at:type_name -> google.protobuf.Timestamp
+	152, // 94: ok.scm.v1.AttachResponse.latest:type_name -> ok.scm.v1.Checkpoint
+	145, // 95: ok.scm.v1.RenewRequest.lease:type_name -> ok.scm.v1.Lease
+	145, // 96: ok.scm.v1.RenewResponse.lease:type_name -> ok.scm.v1.Lease
+	145, // 97: ok.scm.v1.ReleaseRequest.lease:type_name -> ok.scm.v1.Lease
+	170, // 98: ok.scm.v1.Checkpoint.created_at:type_name -> google.protobuf.Timestamp
+	145, // 99: ok.scm.v1.RecordCheckpointRequest.lease:type_name -> ok.scm.v1.Lease
+	152, // 100: ok.scm.v1.ListCheckpointsResponse.checkpoints:type_name -> ok.scm.v1.Checkpoint
+	159, // 101: ok.scm.v1.ListWorkspacesResponse.workspaces:type_name -> ok.scm.v1.WorkspaceState
+	170, // 102: ok.scm.v1.WorkspaceState.expires_at:type_name -> google.protobuf.Timestamp
+	152, // 103: ok.scm.v1.WorkspaceState.latest:type_name -> ok.scm.v1.Checkpoint
+	14,  // 104: ok.scm.v1.PublishRequest.Begin.objects:type_name -> ok.scm.v1.ObjectRef
+	55,  // 105: ok.scm.v1.PublishRequest.Begin.files:type_name -> ok.scm.v1.FileManifest
+	57,  // 106: ok.scm.v1.PublishRequest.Commit.op_heads:type_name -> ok.scm.v1.OpHeadsUpdate
+	14,  // 107: ok.scm.v1.PublishResponse.Missing.objects:type_name -> ok.scm.v1.ObjectRef
+	7,   // 108: ok.scm.v1.UploadResponse.Result.outcome:type_name -> ok.scm.v1.UploadResponse.Result.Outcome
+	17,  // 109: ok.scm.v1.Cells.MakeRepository:input_type -> ok.scm.v1.MakeRepositoryRequest
+	22,  // 110: ok.scm.v1.Repositories.CreateRepository:input_type -> ok.scm.v1.CreateRepositoryRequest
+	23,  // 111: ok.scm.v1.Repositories.GetRepository:input_type -> ok.scm.v1.GetRepositoryRequest
+	19,  // 112: ok.scm.v1.Repositories.ForkRepository:input_type -> ok.scm.v1.ForkRepositoryRequest
+	20,  // 113: ok.scm.v1.Repositories.SyncFork:input_type -> ok.scm.v1.SyncForkRequest
+	24,  // 114: ok.scm.v1.Store.ReadObjects:input_type -> ok.scm.v1.ReadObjectsRequest
+	26,  // 115: ok.scm.v1.Store.ReadFiles:input_type -> ok.scm.v1.ReadFilesRequest
+	28,  // 116: ok.scm.v1.Store.GetRelatedCopies:input_type -> ok.scm.v1.GetRelatedCopiesRequest
+	30,  // 117: ok.scm.v1.Store.GetCopyRecords:input_type -> ok.scm.v1.GetCopyRecordsRequest
+	32,  // 118: ok.scm.v1.Store.PrefetchCommits:input_type -> ok.scm.v1.PrefetchCommitsRequest
+	34,  // 119: ok.scm.v1.Store.ReadTreeClosure:input_type -> ok.scm.v1.ReadTreeClosureRequest
+	43,  // 120: ok.scm.v1.Store.ReadTreeSizes:input_type -> ok.scm.v1.ReadTreeSizesRequest
+	44,  // 121: ok.scm.v1.Store.ReadDictionary:input_type -> ok.scm.v1.ReadDictionaryRequest
+	35,  // 122: ok.scm.v1.Store.ReadCheckout:input_type -> ok.scm.v1.ReadCheckoutRequest
+	38,  // 123: ok.scm.v1.Store.ReadGraph:input_type -> ok.scm.v1.ReadGraphRequest
+	47,  // 124: ok.scm.v1.Store.GetOpHeads:input_type -> ok.scm.v1.GetOpHeadsRequest
+	48,  // 125: ok.scm.v1.Store.ReadOperations:input_type -> ok.scm.v1.ReadOperationsRequest
+	33,  // 126: ok.scm.v1.Store.PrefetchOperations:input_type -> ok.scm.v1.PrefetchOperationsRequest
+	50,  // 127: ok.scm.v1.Store.ResolveOperationPrefix:input_type -> ok.scm.v1.ResolveOperationPrefixRequest
+	52,  // 128: ok.scm.v1.Store.CollectOperations:input_type -> ok.scm.v1.CollectOperationsRequest
+	58,  // 129: ok.scm.v1.Store.Publish:input_type -> ok.scm.v1.PublishRequest
+	77,  // 130: ok.scm.v1.ChangeLists.Upload:input_type -> ok.scm.v1.UploadRequest
+	83,  // 131: ok.scm.v1.ChangeLists.GetChangeList:input_type -> ok.scm.v1.GetChangeListRequest
+	84,  // 132: ok.scm.v1.ChangeLists.ListChangeLists:input_type -> ok.scm.v1.ListChangeListsRequest
+	86,  // 133: ok.scm.v1.ChangeLists.LookupChanges:input_type -> ok.scm.v1.LookupChangesRequest
+	22,  // 134: ok.scm.v1.Review.CreateRepository:input_type -> ok.scm.v1.CreateRepositoryRequest
+	19,  // 135: ok.scm.v1.Review.ForkRepository:input_type -> ok.scm.v1.ForkRepositoryRequest
+	20,  // 136: ok.scm.v1.Review.SyncFork:input_type -> ok.scm.v1.SyncForkRequest
+	88,  // 137: ok.scm.v1.Review.Transition:input_type -> ok.scm.v1.TransitionRequest
+	74,  // 138: ok.scm.v1.Review.Rollback:input_type -> ok.scm.v1.RollbackRequest
+	90,  // 139: ok.scm.v1.Landing.PrepareCandidate:input_type -> ok.scm.v1.PrepareCandidateRequest
+	94,  // 140: ok.scm.v1.Landing.DiscardCandidate:input_type -> ok.scm.v1.DiscardCandidateRequest
+	92,  // 141: ok.scm.v1.Landing.ListCandidates:input_type -> ok.scm.v1.ListCandidatesRequest
+	96,  // 142: ok.scm.v1.Landing.Land:input_type -> ok.scm.v1.LandRequest
+	62,  // 143: ok.scm.v1.Locks.Lock:input_type -> ok.scm.v1.LockRequest
+	64,  // 144: ok.scm.v1.Locks.Unlock:input_type -> ok.scm.v1.UnlockRequest
+	66,  // 145: ok.scm.v1.Locks.BreakLocks:input_type -> ok.scm.v1.BreakLocksRequest
+	68,  // 146: ok.scm.v1.Locks.ListLocks:input_type -> ok.scm.v1.ListLocksRequest
+	96,  // 147: ok.scm.v1.LandingChecks.DryRunLand:input_type -> ok.scm.v1.LandRequest
+	79,  // 148: ok.scm.v1.SecretReferences.ListSecretReferences:input_type -> ok.scm.v1.ListSecretReferencesRequest
+	104, // 149: ok.scm.v1.Browse.GetCommits:input_type -> ok.scm.v1.GetCommitsRequest
+	106, // 150: ok.scm.v1.Browse.Log:input_type -> ok.scm.v1.LogRequest
+	110, // 151: ok.scm.v1.Browse.ReadTree:input_type -> ok.scm.v1.ReadTreeRequest
+	112, // 152: ok.scm.v1.Browse.ReadFileAt:input_type -> ok.scm.v1.ReadFileAtRequest
+	114, // 153: ok.scm.v1.Browse.ReadFilesAt:input_type -> ok.scm.v1.ReadFilesAtRequest
+	116, // 154: ok.scm.v1.Browse.DiffTrees:input_type -> ok.scm.v1.DiffTreesRequest
+	119, // 155: ok.scm.v1.Browse.DiffFiles:input_type -> ok.scm.v1.DiffFilesRequest
+	124, // 156: ok.scm.v1.Browse.Annotate:input_type -> ok.scm.v1.AnnotateRequest
+	126, // 157: ok.scm.v1.Browse.IsAncestor:input_type -> ok.scm.v1.IsAncestorRequest
+	128, // 158: ok.scm.v1.Browse.Export:input_type -> ok.scm.v1.ExportRequest
+	99,  // 159: ok.scm.v1.Search.Code:input_type -> ok.scm.v1.CodeSearchRequest
+	135, // 160: ok.scm.v1.Events.Read:input_type -> ok.scm.v1.ReadEventsRequest
+	133, // 161: ok.scm.v1.Events.Heads:input_type -> ok.scm.v1.HeadsRequest
+	131, // 162: ok.scm.v1.Events.Follow:input_type -> ok.scm.v1.FollowRequest
+	146, // 163: ok.scm.v1.Workspaces.Attach:input_type -> ok.scm.v1.AttachRequest
+	148, // 164: ok.scm.v1.Workspaces.Renew:input_type -> ok.scm.v1.RenewRequest
+	150, // 165: ok.scm.v1.Workspaces.Release:input_type -> ok.scm.v1.ReleaseRequest
+	153, // 166: ok.scm.v1.Workspaces.RecordCheckpoint:input_type -> ok.scm.v1.RecordCheckpointRequest
+	154, // 167: ok.scm.v1.Workspaces.GetCheckpoint:input_type -> ok.scm.v1.GetCheckpointRequest
+	155, // 168: ok.scm.v1.Workspaces.ListCheckpoints:input_type -> ok.scm.v1.ListCheckpointsRequest
+	157, // 169: ok.scm.v1.Workspaces.ListWorkspaces:input_type -> ok.scm.v1.ListWorkspacesRequest
+	144, // 170: ok.scm.v1.Workspaces.CreateWorkspace:input_type -> ok.scm.v1.CreateWorkspaceRequest
+	18,  // 171: ok.scm.v1.Cells.MakeRepository:output_type -> ok.scm.v1.Repository
+	18,  // 172: ok.scm.v1.Repositories.CreateRepository:output_type -> ok.scm.v1.Repository
+	18,  // 173: ok.scm.v1.Repositories.GetRepository:output_type -> ok.scm.v1.Repository
+	18,  // 174: ok.scm.v1.Repositories.ForkRepository:output_type -> ok.scm.v1.Repository
+	21,  // 175: ok.scm.v1.Repositories.SyncFork:output_type -> ok.scm.v1.SyncForkResponse
+	16,  // 176: ok.scm.v1.Store.ReadObjects:output_type -> ok.scm.v1.ObjectResult
+	27,  // 177: ok.scm.v1.Store.ReadFiles:output_type -> ok.scm.v1.FileData
+	29,  // 178: ok.scm.v1.Store.GetRelatedCopies:output_type -> ok.scm.v1.GetRelatedCopiesResponse
+	31,  // 179: ok.scm.v1.Store.GetCopyRecords:output_type -> ok.scm.v1.CopyRecord
+	15,  // 180: ok.scm.v1.Store.PrefetchCommits:output_type -> ok.scm.v1.EncodedObject
+	15,  // 181: ok.scm.v1.Store.ReadTreeClosure:output_type -> ok.scm.v1.EncodedObject
+	46,  // 182: ok.scm.v1.Store.ReadTreeSizes:output_type -> ok.scm.v1.TreeSizes
+	45,  // 183: ok.scm.v1.Store.ReadDictionary:output_type -> ok.scm.v1.Dictionary
+	36,  // 184: ok.scm.v1.Store.ReadCheckout:output_type -> ok.scm.v1.CheckoutFrame
+	39,  // 185: ok.scm.v1.Store.ReadGraph:output_type -> ok.scm.v1.GraphFrame
+	49,  // 186: ok.scm.v1.Store.GetOpHeads:output_type -> ok.scm.v1.GetOpHeadsResponse
+	16,  // 187: ok.scm.v1.Store.ReadOperations:output_type -> ok.scm.v1.ObjectResult
+	15,  // 188: ok.scm.v1.Store.PrefetchOperations:output_type -> ok.scm.v1.EncodedObject
+	51,  // 189: ok.scm.v1.Store.ResolveOperationPrefix:output_type -> ok.scm.v1.ResolveOperationPrefixResponse
+	53,  // 190: ok.scm.v1.Store.CollectOperations:output_type -> ok.scm.v1.CollectOperationsResponse
+	59,  // 191: ok.scm.v1.Store.Publish:output_type -> ok.scm.v1.PublishResponse
+	78,  // 192: ok.scm.v1.ChangeLists.Upload:output_type -> ok.scm.v1.UploadResponse
+	72,  // 193: ok.scm.v1.ChangeLists.GetChangeList:output_type -> ok.scm.v1.ChangeList
+	85,  // 194: ok.scm.v1.ChangeLists.ListChangeLists:output_type -> ok.scm.v1.ListChangeListsResponse
+	87,  // 195: ok.scm.v1.ChangeLists.LookupChanges:output_type -> ok.scm.v1.LookupChangesResponse
+	18,  // 196: ok.scm.v1.Review.CreateRepository:output_type -> ok.scm.v1.Repository
+	18,  // 197: ok.scm.v1.Review.ForkRepository:output_type -> ok.scm.v1.Repository
+	21,  // 198: ok.scm.v1.Review.SyncFork:output_type -> ok.scm.v1.SyncForkResponse
+	89,  // 199: ok.scm.v1.Review.Transition:output_type -> ok.scm.v1.TransitionResponse
+	75,  // 200: ok.scm.v1.Review.Rollback:output_type -> ok.scm.v1.RollbackResponse
+	91,  // 201: ok.scm.v1.Landing.PrepareCandidate:output_type -> ok.scm.v1.Candidate
+	95,  // 202: ok.scm.v1.Landing.DiscardCandidate:output_type -> ok.scm.v1.DiscardCandidateResponse
+	93,  // 203: ok.scm.v1.Landing.ListCandidates:output_type -> ok.scm.v1.ListCandidatesResponse
+	97,  // 204: ok.scm.v1.Landing.Land:output_type -> ok.scm.v1.LandResponse
+	63,  // 205: ok.scm.v1.Locks.Lock:output_type -> ok.scm.v1.LockResponse
+	65,  // 206: ok.scm.v1.Locks.Unlock:output_type -> ok.scm.v1.UnlockResponse
+	67,  // 207: ok.scm.v1.Locks.BreakLocks:output_type -> ok.scm.v1.BreakLocksResponse
+	69,  // 208: ok.scm.v1.Locks.ListLocks:output_type -> ok.scm.v1.ListLocksResponse
+	97,  // 209: ok.scm.v1.LandingChecks.DryRunLand:output_type -> ok.scm.v1.LandResponse
+	80,  // 210: ok.scm.v1.SecretReferences.ListSecretReferences:output_type -> ok.scm.v1.ListSecretReferencesResponse
+	105, // 211: ok.scm.v1.Browse.GetCommits:output_type -> ok.scm.v1.GetCommitsResponse
+	107, // 212: ok.scm.v1.Browse.Log:output_type -> ok.scm.v1.LogResponse
+	111, // 213: ok.scm.v1.Browse.ReadTree:output_type -> ok.scm.v1.ReadTreeResponse
+	113, // 214: ok.scm.v1.Browse.ReadFileAt:output_type -> ok.scm.v1.ReadFileAtResponse
+	115, // 215: ok.scm.v1.Browse.ReadFilesAt:output_type -> ok.scm.v1.ReadFilesAtResponse
+	118, // 216: ok.scm.v1.Browse.DiffTrees:output_type -> ok.scm.v1.DiffTreesResponse
+	123, // 217: ok.scm.v1.Browse.DiffFiles:output_type -> ok.scm.v1.DiffFilesResponse
+	125, // 218: ok.scm.v1.Browse.Annotate:output_type -> ok.scm.v1.AnnotateResponse
+	127, // 219: ok.scm.v1.Browse.IsAncestor:output_type -> ok.scm.v1.IsAncestorResponse
+	129, // 220: ok.scm.v1.Browse.Export:output_type -> ok.scm.v1.ExportResponse
+	100, // 221: ok.scm.v1.Search.Code:output_type -> ok.scm.v1.CodeSearchResponse
+	136, // 222: ok.scm.v1.Events.Read:output_type -> ok.scm.v1.ReadEventsResponse
+	134, // 223: ok.scm.v1.Events.Heads:output_type -> ok.scm.v1.HeadsResponse
+	132, // 224: ok.scm.v1.Events.Follow:output_type -> ok.scm.v1.FollowResponse
+	147, // 225: ok.scm.v1.Workspaces.Attach:output_type -> ok.scm.v1.AttachResponse
+	149, // 226: ok.scm.v1.Workspaces.Renew:output_type -> ok.scm.v1.RenewResponse
+	151, // 227: ok.scm.v1.Workspaces.Release:output_type -> ok.scm.v1.ReleaseResponse
+	152, // 228: ok.scm.v1.Workspaces.RecordCheckpoint:output_type -> ok.scm.v1.Checkpoint
+	152, // 229: ok.scm.v1.Workspaces.GetCheckpoint:output_type -> ok.scm.v1.Checkpoint
+	156, // 230: ok.scm.v1.Workspaces.ListCheckpoints:output_type -> ok.scm.v1.ListCheckpointsResponse
+	158, // 231: ok.scm.v1.Workspaces.ListWorkspaces:output_type -> ok.scm.v1.ListWorkspacesResponse
+	159, // 232: ok.scm.v1.Workspaces.CreateWorkspace:output_type -> ok.scm.v1.WorkspaceState
+	171, // [171:233] is the sub-list for method output_type
+	109, // [109:171] is the sub-list for method input_type
+	109, // [109:109] is the sub-list for extension type_name
+	109, // [109:109] is the sub-list for extension extendee
+	0,   // [0:109] is the sub-list for field type_name
 }
 
 func init() { file_proto_ok_scm_v1_scm_proto_init() }
@@ -11696,11 +12276,11 @@ func file_proto_ok_scm_v1_scm_proto_init() {
 		(*PublishResponse_Missing_)(nil),
 		(*PublishResponse_Done_)(nil),
 	}
-	file_proto_ok_scm_v1_scm_proto_msgTypes[105].OneofWrappers = []any{
+	file_proto_ok_scm_v1_scm_proto_msgTypes[115].OneofWrappers = []any{
 		(*ExportResponse_Entry)(nil),
 		(*ExportResponse_Data)(nil),
 	}
-	file_proto_ok_scm_v1_scm_proto_msgTypes[113].OneofWrappers = []any{
+	file_proto_ok_scm_v1_scm_proto_msgTypes[123].OneofWrappers = []any{
 		(*Event_Uploaded)(nil),
 		(*Event_Transitioned)(nil),
 		(*Event_Landed)(nil),
@@ -11714,9 +12294,9 @@ func file_proto_ok_scm_v1_scm_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_ok_scm_v1_scm_proto_rawDesc), len(file_proto_ok_scm_v1_scm_proto_rawDesc)),
 			NumEnums:      14,
-			NumMessages:   146,
+			NumMessages:   156,
 			NumExtensions: 0,
-			NumServices:   12,
+			NumServices:   13,
 		},
 		GoTypes:           file_proto_ok_scm_v1_scm_proto_goTypes,
 		DependencyIndexes: file_proto_ok_scm_v1_scm_proto_depIdxs,

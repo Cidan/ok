@@ -384,3 +384,71 @@ func (x queries) DeleteCandidatesOf(ctx context.Context, repo int64, numbers []i
 	_, err := x.q.Exec(ctx, `DELETE FROM candidate WHERE repository_id = $1 AND cl_number = ANY($2)`, repo, numbers)
 	return err
 }
+
+func (x queries) FileLocks(ctx context.Context, repo int64, paths []string) (map[string]backend.FileLock, error) {
+	q, args := `SELECT path, holder, holder_name, taken_at FROM file_lock WHERE repository_id = $1`, []any{repo}
+	if paths != nil {
+		q, args = q+` AND path = ANY($2)`, append(args, paths)
+	}
+	rows, err := x.q.Query(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]backend.FileLock{}
+	for rows.Next() {
+		var l backend.FileLock
+		if err := rows.Scan(&l.Path, &l.Holder, &l.HolderName, &l.TakenAt); err != nil {
+			return nil, err
+		}
+		out[l.Path] = l
+	}
+	return out, rows.Err()
+}
+
+func (x queries) PutFileLocks(ctx context.Context, repo int64, locks []backend.FileLock) ([]backend.FileLock, error) {
+	paths, holders, names := make([]string, len(locks)), make([]string, len(locks)), make([]string, len(locks))
+	for i, l := range locks {
+		paths[i], holders[i], names[i] = l.Path, l.Holder, l.HolderName
+	}
+	rows, err := x.q.Query(ctx, `INSERT INTO file_lock (repository_id, path, holder, holder_name, taken_at)
+		SELECT $1, u.p, u.h, u.n, now() FROM unnest($2::text[], $3::text[], $4::text[]) AS u(p, h, n) ORDER BY u.p
+		ON CONFLICT (repository_id, path) DO UPDATE SET holder = EXCLUDED.holder, holder_name = EXCLUDED.holder_name, taken_at = EXCLUDED.taken_at
+		RETURNING path, holder, holder_name, taken_at`, repo, paths, holders, names)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []backend.FileLock
+	for rows.Next() {
+		var l backend.FileLock
+		if err := rows.Scan(&l.Path, &l.Holder, &l.HolderName, &l.TakenAt); err != nil {
+			return nil, err
+		}
+		out = append(out, l)
+	}
+	return out, rows.Err()
+}
+
+func (x queries) DeleteFileLocks(ctx context.Context, repo int64, paths []string, holder string) ([]string, error) {
+	rows, err := x.q.Query(ctx, `DELETE FROM file_lock WHERE repository_id = $1 AND path = ANY($2) AND ($3 = '' OR holder = $3)
+		RETURNING path`, repo, paths, holder)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+func (x queries) DeleteFileLocksBefore(ctx context.Context, repo int64, before time.Time) (int64, error) {
+	tag, err := x.q.Exec(ctx, `DELETE FROM file_lock WHERE repository_id = $1 AND taken_at < $2`, repo, before)
+	return tag.RowsAffected(), err
+}

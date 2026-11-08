@@ -1330,6 +1330,11 @@ impl Person {
 
 /// Lands a CL through the protocol, as ok control and the landing queue do, on main's head.
 async fn land_cl(name: &str, number: i64, actor: &str) {
+    try_land_cl(name, number, actor).await.unwrap();
+}
+
+/// Lands a CL as land_cl does, returning the SCM's refusal rather than failing on it.
+async fn try_land_cl(name: &str, number: i64, actor: &str) -> Result<(), tonic::Status> {
     let repo = ok_testscm::repositories(actor)
         .await
         .get_repository(pb::GetRepositoryRequest {
@@ -1365,7 +1370,7 @@ async fn land_cl(name: &str, number: i64, actor: &str) {
             dry_run: false,
         })
         .await
-        .unwrap();
+        .map(|_| ())
 }
 
 /// Secrets (docs/secrets.md): alice makes the repository keep them, under //secret, which
@@ -1914,4 +1919,59 @@ pub async fn git_workflow(mode: Mode) {
     );
     bob.git_exits("repo", &["frobnicate"], 1);
     println!("git_workflow: scenario done");
+}
+
+/// Locks (docs/scm.md, "Locks"): alice locks a file; bob cannot lock it or unlock it, sees it in
+/// `jj locks`, and uploads a change of it, which is refused its landing, naming her. A path no one
+/// locked lands meanwhile; her own CL of the asset lands and releases her lock.
+pub async fn locks(mode: Mode) {
+    let name = format!("locks-{}-{mode:?}", std::process::id()).to_lowercase();
+    let alice = Person::new(ALICE, mode);
+    let bob = Person::new(BOB, mode);
+    alice.ok(".", &["create", &name, "repo"]);
+    alice.write("repo/art/hero.uasset", "v1\n");
+    alice.write("repo/notes.txt", "n1\n");
+    alice.ok("repo", &["describe", "-m", "assets"]);
+    alice.ok("repo", &["cl"]);
+    land_cl(&name, 1, ALICE).await;
+    alice.ok("repo", &["sync"]);
+    bob.ok(".", &["clone", &name, "repo"]);
+
+    let out = alice.ok("repo/art", &["lock", "hero.uasset"]);
+    assert!(out.contains("Locked art/hero.uasset until"), "{out}");
+    let out = bob.fails("repo", &["lock", "//art/hero.uasset"]);
+    assert!(
+        out.contains("alice") && out.contains("locked art/hero.uasset until"),
+        "{out}"
+    );
+    let out = bob.fails("repo", &["unlock", "art/hero.uasset"]);
+    assert!(out.contains("only they unlock it"), "{out}");
+    let out = bob.ok("repo", &["locks"]);
+    assert!(out.contains("art/hero.uasset\talice"), "{out}");
+    assert_eq!(bob.ok("repo", &["locks", "notes.txt"]).trim(), "");
+
+    // bob's change of the asset uploads, and is refused its landing.
+    bob.write("repo/art/hero.uasset", "bob's\n");
+    bob.ok("repo", &["describe", "-m", "bob's hero"]);
+    bob.ok("repo", &["cl"]);
+    let refused = try_land_cl(&name, 2, BOB).await.unwrap_err();
+    assert!(
+        refused.message().contains("changes locked paths") && refused.message().contains("alice"),
+        "{refused:?}"
+    );
+
+    // A path no one locked lands.
+    alice.ok("repo", &["new", "trunk()", "-m", "notes"]);
+    alice.write("repo/notes.txt", "n2\n");
+    alice.ok("repo", &["cl"]);
+    land_cl(&name, 3, ALICE).await;
+
+    // alice's own change of the asset lands, releasing her lock: then bob's lands.
+    alice.ok("repo", &["new", "trunk()", "-m", "alice's hero"]);
+    alice.write("repo/art/hero.uasset", "v2\n");
+    alice.ok("repo", &["cl"]);
+    land_cl(&name, 4, ALICE).await;
+    assert_eq!(alice.ok("repo", &["locks"]).trim(), "");
+    let out = bob.ok("repo", &["unlock", "art/hero.uasset"]);
+    assert!(out.contains("You held no lock"), "{out}");
 }

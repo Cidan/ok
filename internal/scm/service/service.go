@@ -86,6 +86,7 @@ func toStatus(err error) error {
 	var rej *store.Rejection
 	var upload *store.UploadRejection
 	var land *store.LandRejection
+	var lock *store.LockRejection
 	var rollback *store.RollbackRejection
 	switch {
 	case err == nil:
@@ -102,6 +103,8 @@ func toStatus(err error) error {
 		return withDetails(codes.FailedPrecondition, rollback.Error(), &scmpb.RollbackRejection{
 			Number: rollback.Number, Reason: scmpb.RollbackRejection_Reason(rollback.Reason), Message: rollback.Message, Paths: rollback.Paths,
 		})
+	case errors.As(err, &lock):
+		return lockRejection(lock)
 	case errors.As(err, &land):
 		return withDetails(codes.FailedPrecondition, land.Error(), &scmpb.LandRejection{
 			Number: land.Number, Reason: scmpb.LandRejection_Reason(land.Reason), Paths: land.Paths, Message: land.Message,
@@ -874,6 +877,7 @@ type Services struct {
 	Search        *Search
 	// SecretReferences is ok secrets': the pointers repositories hold.
 	SecretReferences *SecretReferences
+	Locks            *Locks
 
 	access *access
 }
@@ -886,7 +890,7 @@ func New(s *store.Store, dir Directory, ten Tenancy, facts authz.Source) Service
 	c.access = &access{checker: authz.NewChecker(facts)}
 	return Services{Repositories: &Repositories{c: c}, Store: &Store{c: c}, ChangeLists: &ChangeLists{c: c}, Review: &Review{c: c},
 		Landing: &Landing{c: c}, LandingChecks: &LandingChecks{c: c}, Browse: &Browse{c: c}, Events: &Events{c: c}, Workspaces: &Workspaces{c: c},
-		Cells: &Cells{c: c}, Search: &Search{c: c}, SecretReferences: &SecretReferences{c: c}, access: c.access}
+		Cells: &Cells{c: c}, Search: &Search{c: c}, SecretReferences: &SecretReferences{c: c}, Locks: &Locks{c: c}, access: c.access}
 }
 
 // InCell says which cell the services serve, how they reach other cells' SCMs, and where the
@@ -919,6 +923,7 @@ func (s Services) Register(reg grpc.ServiceRegistrar) {
 	scmpb.RegisterCellsServer(r, s.Cells)
 	scmpb.RegisterSearchServer(r, s.Search)
 	scmpb.RegisterSecretReferencesServer(r, s.SecretReferences)
+	scmpb.RegisterLocksServer(r, s.Locks)
 }
 
 // unreachable reports an error that is a backend not answering — the database, or object storage

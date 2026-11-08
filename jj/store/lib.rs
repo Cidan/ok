@@ -19,6 +19,7 @@ pub mod client;
 pub mod config;
 pub mod graph;
 mod ids;
+pub mod locks;
 mod op_heads;
 mod op_store;
 mod outbox;

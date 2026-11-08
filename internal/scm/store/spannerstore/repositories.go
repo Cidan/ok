@@ -118,6 +118,7 @@ var repositoryTail = []tableRows{
 	{"sequence_pending", "repository_id = @id"},
 	{"event_pending", "repository_id = @id"},
 	{"event", "repository_id = @id"},
+	{"file_lock", "repository_id = @id"},
 	{"candidate", "repository_id = @id"},
 	{"patchset", "repository_id = @id"},
 	{"changelist", "repository_id = @id"},

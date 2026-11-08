@@ -260,6 +260,8 @@ type Store struct {
 	afterLocate func()
 	// beforeCommit runs just before a publish's commit transaction (a test sweeps there).
 	beforeCommit func()
+	// landPlanned runs between a landing's plan and its transaction (a test locks there).
+	landPlanned func()
 	// dictionaryMinSamples, when set, is the fewest small files a dictionary trains on (a test
 	// trains on few).
 	dictionaryMinSamples int

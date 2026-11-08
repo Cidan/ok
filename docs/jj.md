@@ -162,7 +162,7 @@ The Cargo workspace at the repository's root; every crate is under `jj/`.
 
 | Crate | What it is |
 |---|---|
-| `jj/cli` (`ok-jj`, the `jj` binary) | `main.rs` (`CliRunner` with ok's stores, working copy, commands, and configuration), `auth.rs` (`jj auth`), `commands.rs` (`jj clone`, `jj create`, `jj fork`), `changelists.rs` (`jj cl`, `jj cl get`, `jj sync`), `lifecycle.rs` (`jj cl status` and the rest of a CL's lifecycle), `fs.rs` (`jj fs`), and `git.rs` with `git/` (git's commands, when the binary runs as `git`: [git.md](git.md)) |
+| `jj/cli` (`ok-jj`, the `jj` binary) | `main.rs` (`CliRunner` with ok's stores, working copy, commands, and configuration), `auth.rs` (`jj auth`), `commands.rs` (`jj clone`, `jj create`, `jj fork`), `changelists.rs` (`jj cl`, `jj cl get`, `jj sync`), `lifecycle.rs` (`jj cl status` and the rest of a CL's lifecycle), `fs.rs` (`jj fs`), `locks.rs` (`jj lock`, `jj unlock`, `jj locks`), and `git.rs` with `git/` (git's commands, when the binary runs as `git`: [git.md](git.md)) |
 | `jj/workingcopy` (`ok-working-copy`) | jj's local working copy honoring `.ignore` files, and the workspace loader that gives every ok workspace it |
 | `jj/cl` (`ok-cl`) | The ChangeList workflow over jj-lib — what `jj cl` refuses before asking the SCM, the upload (publishing first), `jj cl get`, and `jj sync` — so tests drive it without the command line |
 | `jj/store` (`ok-store`) | jj's `Backend`, `OpStore`, and `OpHeadsStore` over the SCM, with the cache, the outbox, publishing, prefetch, and laying out `.jj/repo` for a clone; `changelists` holds the SCM calls behind the CL commands |
@@ -203,6 +203,19 @@ printf %s "$value" | jj secret write //secret/prod/db-password   # a new version
 In a virtual workspace on Linux a secret's file is its value: read it after `jj secret unseal`,
 and write it as any file; the next snapshot keeps it in ok secrets and records its pointer
 ([okfs.md](okfs.md), "Secrets").
+
+Locks ([scm.md](scm.md), "Locks"): locking a file, or a directory and everything under it, keeps
+anyone else's CL that changes it from landing — its submission refused, naming you — for 18 hours
+from when you lock it, or until you unlock it or a CL of yours that changes it lands. Uploading is
+never refused.
+
+```bash
+jj lock art/hero.uasset            # from the working directory, or //art/hero.uasset from the root
+jj locks                           # the repository's locks, who holds them, and until when
+jj locks art                       # those of art and everything under it
+jj unlock art/hero.uasset          # yours
+jj unlock --break art/hero.uasset  # anyone's: a repository administrator's, in an emergency
+```
 
 ## What it asks ok
 

@@ -46,9 +46,12 @@ pub enum Command {
     Fork(ForkArgs),
     #[command(subcommand)]
     Fs(crate::fs::FsCommand),
+    Lock(crate::locks::LockArgs),
+    Locks(crate::locks::LocksArgs),
     #[command(subcommand)]
     Secret(crate::secrets::SecretCommand),
     Sync(crate::changelists::SyncArgs),
+    Unlock(crate::locks::UnlockArgs),
 }
 
 /// Clone a repository from ok
@@ -162,6 +165,9 @@ pub async fn run(ui: &mut Ui, command: &CommandHelper, cmd: Command) -> Result<(
         Command::Sync(args) => crate::changelists::run_sync(ui, command, args).await,
         Command::Fs(cmd) => crate::fs::run(ui, command, cmd).await,
         Command::Secret(cmd) => crate::secrets::run(ui, command, cmd).await,
+        Command::Lock(args) => crate::locks::run_lock(ui, command, args).await,
+        Command::Unlock(args) => crate::locks::run_unlock(ui, command, args).await,
+        Command::Locks(args) => crate::locks::run_locks(ui, command, args).await,
         Command::Clone(args) => {
             let endpoint = scm_endpoint(command)?;
             let real = args.real || !VIRTUAL_WORKSPACES;

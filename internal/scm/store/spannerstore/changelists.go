@@ -479,3 +479,70 @@ func (x queries) DeleteCandidatesOf(ctx context.Context, repo int64, numbers []i
 		map[string]any{"repo": repo, "numbers": numbers})
 	return err
 }
+
+func (x queries) FileLocks(ctx context.Context, repo int64, paths []string) (map[string]backend.FileLock, error) {
+	q, p := `SELECT path, holder, holder_name, taken_at FROM file_lock WHERE repository_id = @repo`, map[string]any{"repo": repo}
+	if paths != nil {
+		q, p["paths"] = q+` AND path IN UNNEST(@paths)`, paths
+	}
+	out := map[string]backend.FileLock{}
+	err := x.rows(ctx, q, p, func() { out = map[string]backend.FileLock{} }, func(row *spanner.Row) error {
+		var l backend.FileLock
+		if err := row.Columns(&l.Path, &l.Holder, &l.HolderName, &l.TakenAt); err != nil {
+			return err
+		}
+		out[l.Path] = l
+		return nil
+	})
+	return out, err
+}
+
+func (x queries) PutFileLocks(ctx context.Context, repo int64, locks []backend.FileLock) ([]backend.FileLock, error) {
+	var out []backend.FileLock
+	err := x.write(ctx, func(tx *spanner.ReadWriteTransaction) error {
+		out = out[:0]
+		paths := make([]string, len(locks))
+		for i, l := range locks {
+			paths[i] = l.Path
+			if _, err := spannerdata.Update(ctx, tx, `INSERT OR UPDATE INTO file_lock (repository_id, path, holder, holder_name, taken_at)
+				VALUES (@repo, @path, @holder, @name, `+now+`)`, map[string]any{"repo": repo, "path": l.Path, "holder": l.Holder,
+				"name": l.HolderName}); err != nil {
+				return err
+			}
+		}
+		return spannerdata.Each(ctx, tx, `SELECT path, holder, holder_name, taken_at FROM file_lock
+			WHERE repository_id = @repo AND path IN UNNEST(@paths) ORDER BY path`, map[string]any{"repo": repo, "paths": paths},
+			func(row *spanner.Row) error {
+				var l backend.FileLock
+				if err := row.Columns(&l.Path, &l.Holder, &l.HolderName, &l.TakenAt); err != nil {
+					return err
+				}
+				out = append(out, l)
+				return nil
+			})
+	})
+	return out, err
+}
+
+func (x queries) DeleteFileLocks(ctx context.Context, repo int64, paths []string, holder string) ([]string, error) {
+	var out []string
+	err := x.write(ctx, func(tx *spanner.ReadWriteTransaction) error {
+		out = out[:0]
+		return spannerdata.Each(ctx, tx, `DELETE FROM file_lock WHERE repository_id = @repo AND path IN UNNEST(@paths)
+			AND (@holder = '' OR holder = @holder) THEN RETURN path`, map[string]any{"repo": repo, "paths": paths, "holder": holder},
+			func(row *spanner.Row) error {
+				var p string
+				if err := row.Columns(&p); err != nil {
+					return err
+				}
+				out = append(out, p)
+				return nil
+			})
+	})
+	return out, err
+}
+
+func (x queries) DeleteFileLocksBefore(ctx context.Context, repo int64, before time.Time) (int64, error) {
+	return x.exec(ctx, `DELETE FROM file_lock WHERE repository_id = @repo AND taken_at < @before`,
+		map[string]any{"repo": repo, "before": before})
+}

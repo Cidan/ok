@@ -65,6 +65,15 @@ async fn git_in_real_checkouts() {
     git_workflow(Mode::Real).await;
 }
 
+/// Locks: `jj lock`, `jj unlock`, and `jj locks`, and the landings they refuse (docs/scm.md, "Locks").
+#[tokio::test(flavor = "multi_thread")]
+async fn locks_in_real_checkouts() {
+    if !ok_testscm::available() {
+        return;
+    }
+    locks(Mode::Real).await;
+}
+
 /// Forks: `jj fork`, and `jj sync --upstream`.
 #[tokio::test(flavor = "multi_thread")]
 async fn fork() {

@@ -750,6 +750,31 @@ needs a level at a time, each level in one query (up to 1,000 trees), before wal
 path order; `Export` fills its leaves' sizes and symlink targets 2,000 at a time. A walk of the
 monorepo's 13,000 directories is a dozen queries, not one per directory.
 
+### Locks
+
+A file no one can merge — a game's level, a model, a binary document — wants one person at a time.
+A person **locks** paths of a repository: any file, or a directory and everything under it. No one
+else's CL that changes a path they hold lands while they hold it (`internal/scm/store`, `locks.go`;
+the `Locks` service; `jj lock`, `jj unlock`, `jj locks`, [jj.md](jj.md)).
+
+- **Holding.** A lock is its holder's for 18 hours from when they took it, judged from its record
+  (`file_lock`: the path, the holder's stable ID and their name then, when they took it) as it is
+  read — no timer ends it. Locking a path again starts its hours over. Locking several paths takes
+  every one or none: a path someone else holds refuses them all, naming them and until when.
+- **Ending.** The holder unlocks it; a landing of theirs that changes the path releases it, in the
+  landing's transaction; a repository administrator breaks it (`BreakLocks`, `jj unlock --break`),
+  in an emergency. The daily collection deletes the rows of locks past their hours.
+- **What it refuses.** Uploading never: a CL that changes a locked path uploads and is reviewed as
+  any. Its landing is refused (`REASON_LOCKED`, naming each holder), so its submission is, whose dry
+  run lands — and the Submit button says why — and so is a candidate of it. A CL's changed paths are
+  main's path history's, each changed file and every directory above one, so a lock of a directory
+  is of everything under it. A lock taken while a CL waits in the landing queue fails its submission
+  when it lands: the landing's plan reads the locks, and its transaction reads them again holding
+  main's head, which a lock holds too as it is taken, so the two are ordered. A rollback is not
+  refused.
+- **Who.** Who may propose a change may lock and unlock (`authz.Propose`), who may read the
+  repository may list its locks, and its administrators alone break another's.
+
 ### Large trees
 
 A directory of 100,000 entries is a tree of about 7.5 MB, which an edit of one entry rewrites whole,

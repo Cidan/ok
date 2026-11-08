@@ -179,7 +179,7 @@ pub async fn prefetch(
 
 /// The rejection a FAILED_PRECONDITION status carries in its details, if it carries one
 /// of type `M` (named `ok.scm.v1.<name>`).
-fn rejection<M: prost::Message + Default>(status: &Status, name: &str) -> Option<M> {
+pub(crate) fn rejection<M: prost::Message + Default>(status: &Status, name: &str) -> Option<M> {
     if status.code() != Code::FailedPrecondition {
         return None;
     }

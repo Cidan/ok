@@ -587,6 +587,76 @@ service Landing {
   rpc Land(LandRequest) returns (LandResponse);
 }
 
+// Locks of paths (docs/scm.md, "Locks"): a person locks paths of a repository — any file, or a
+// directory and everything under it — so that no one else's CL changing them lands, its submission
+// refused, while they work on them. A lock is theirs for 18 hours from when they took it, judged
+// from its record as it is read; they unlock it, a landing of theirs that changes its path releases
+// it, or a repository administrator breaks it. Uploading is never refused.
+service Locks {
+  option (ok.v1.callers) = CALLER_PEOPLE;
+  option (ok.v1.callers) = CALLER_ROBOTS;
+  option (ok.v1.callers) = CALLER_CONTROL;
+  // Lock locks paths for the caller, every one or none: a path someone else holds a live lock of
+  // refuses them all (FAILED_PRECONDITION, with a LockRejection). One the caller holds is taken
+  // again, its 18 hours starting over.
+  rpc Lock(LockRequest) returns (LockResponse);
+  // Unlock ends the caller's locks of paths. A path someone else holds a live lock of refuses them
+  // all (FAILED_PRECONDITION, with a LockRejection); one no one holds is passed over.
+  rpc Unlock(UnlockRequest) returns (UnlockResponse);
+  // BreakLocks ends whoever's locks of paths: a repository administrator's, in an emergency.
+  rpc BreakLocks(BreakLocksRequest) returns (BreakLocksResponse);
+  // ListLocks lists a repository's live locks of a path and everything under it, by path.
+  rpc ListLocks(ListLocksRequest) returns (ListLocksResponse);
+}
+
+// A lock of a path, as of when it was read.
+message FileLock {
+  string path = 1;
+  string holder_id = 2;  // the person's stable ID
+  string holder = 3;     // their name as of when they took it
+  google.protobuf.Timestamp taken_at = 4;
+  google.protobuf.Timestamp expires_at = 5;  // taken_at and 18 hours
+}
+
+// At most 1,000 paths, each repository-relative.
+message LockRequest {
+  int64 repository_id = 1;
+  repeated string paths = 2;
+}
+message LockResponse {
+  repeated FileLock locks = 1;
+}
+
+message UnlockRequest {
+  int64 repository_id = 1;
+  repeated string paths = 2;
+}
+message UnlockResponse {
+  repeated string unlocked = 1;  // the paths the caller held
+}
+
+message BreakLocksRequest {
+  int64 repository_id = 1;
+  repeated string paths = 2;
+}
+message BreakLocksResponse {
+  repeated FileLock broken = 1;  // the live locks it ended
+}
+
+message ListLocksRequest {
+  int64 repository_id = 1;
+  string path_prefix = 2;  // "": every lock of the repository
+}
+message ListLocksResponse {
+  repeated FileLock locks = 1;
+}
+
+// Why a lock or an unlock was refused: the live lock someone else holds.
+message LockRejection {
+  FileLock held = 1;
+  string message = 2;
+}
+
 // LandingChecks dry-runs a landing — what ok control's Submit button checks — changing nothing.
 service LandingChecks {
   option (ok.v1.callers) = CALLER_CONTROL;
@@ -891,6 +961,7 @@ message LandRejection {
     REASON_CANDIDATE_MISMATCH = 8;
     REASON_UNKNOWN_BASE = 9;  // a candidate's base is neither on main nor a pending candidate
     REASON_TOO_LARGE = 10;    // more than one transaction holds: land fewer CLs at once
+    REASON_LOCKED = 11;       // it changes paths someone else holds live locks of (paths): Locks
   }
   int64 number = 1;
   Reason reason = 2;

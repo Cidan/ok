@@ -119,6 +119,7 @@ var repositoryTail = []tableRows{
 	{"copy_parent", "repository_id = $1"},
 	{"event_pending", "repository_id = $1"},
 	{"event", "repository_id = $1"},
+	{"file_lock", "repository_id = $1"},
 	{"candidate", "repository_id = $1"},
 	{"patchset", "repository_id = $1"},
 	{"changelist", "repository_id = $1"},

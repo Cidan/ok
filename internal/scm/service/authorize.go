@@ -44,8 +44,14 @@ var actions = map[string]authz.Action{
 	"/ok.scm.v1.Store/CollectOperations":      authz.ReadCode,
 	// Publishing writes to the person's own workspace, whose operation log is on the SCM: every jj
 	// command a reader runs records one there. Proposing what they publish is Upload's.
-	"/ok.scm.v1.Store/Publish":                 authz.ReadCode,
-	"/ok.scm.v1.ChangeLists/Upload":            authz.Propose,
+	"/ok.scm.v1.Store/Publish":      authz.ReadCode,
+	"/ok.scm.v1.ChangeLists/Upload": authz.Propose,
+	// Locks of paths (docs/scm.md, "Locks"): who may propose a change may lock what it changes, and
+	// a repository's administrators alone break another's lock.
+	"/ok.scm.v1.Locks/Lock":                    authz.Propose,
+	"/ok.scm.v1.Locks/Unlock":                  authz.Propose,
+	"/ok.scm.v1.Locks/BreakLocks":              authz.Administer,
+	"/ok.scm.v1.Locks/ListLocks":               authz.ReadCode,
 	"/ok.scm.v1.ChangeLists/GetChangeList":     authz.ReadCode,
 	"/ok.scm.v1.ChangeLists/ListChangeLists":   authz.ReadCode,
 	"/ok.scm.v1.ChangeLists/LookupChanges":     authz.ReadCode,

@@ -7,6 +7,7 @@ mod commands;
 mod fs;
 mod git;
 mod lifecycle;
+mod locks;
 mod secrets;
 
 // The allocator upstream jj uses, on the platforms it uses it on (jj-cli's main.rs).

@@ -336,6 +336,16 @@ type Landing struct {
 	Author      string
 }
 
+// FileLock is a person's lock of a path of a repository (docs/scm.md, "Locks"): held from TakenAt
+// until LockFor after it, unless they unlock it or a landing of theirs that changes it releases it.
+// HolderName is their name as of when they took it, for the refusals that name them.
+type FileLock struct {
+	Path       string
+	Holder     string
+	HolderName string
+	TakenAt    time.Time
+}
+
 // Candidate is a pending candidate.
 type Candidate struct {
 	Commit     encoding.ID
