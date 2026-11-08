@@ -882,3 +882,52 @@ fn graph_vectors() {
         assert!(got.is_err(), "{}: decoded {got:?}", c.name);
     }
 }
+
+// --- changed-path filters ------------------------------------------------------------------
+
+const PATH_FILTER_VECTORS: &str =
+    include_str!("../../internal/scm/encoding/testdata/path_filter.json");
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PathFilterVectors {
+    #[allow(dead_code)]
+    comment: Vec<String>,
+    cases: Vec<PathFilterCase>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PathFilterCase {
+    name: String,
+    #[allow(dead_code)]
+    paths: Vec<String>,
+    filter: Vec<String>,
+    queries: Vec<PathFilterQuery>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PathFilterQuery {
+    path: String,
+    holds: bool,
+}
+
+#[test]
+fn path_filter_vectors() {
+    let v: PathFilterVectors =
+        serde_json::from_str(PATH_FILTER_VECTORS).expect("parsing path_filter.json");
+    assert!(!v.cases.is_empty());
+    for c in v.cases {
+        let filter = hex_lines(&c.filter);
+        for q in c.queries {
+            assert_eq!(
+                path_filter_holds(&filter, q.path.as_bytes()),
+                q.holds,
+                "{}: {:?}",
+                c.name,
+                q.path
+            );
+        }
+    }
+}

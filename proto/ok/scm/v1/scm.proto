@@ -364,6 +364,8 @@ message ReadGraphRequest {
   repeated bytes have = 3;
   // Layers of main's graph the client indexed, any head's: a layer it holds is not sent.
   repeated bytes held_layers = 4;
+  // No layer of main's: every commit the heads reach that the haves do not is sent as a record.
+  bool records_only = 5;
 }
 
 // A graph's stream: its header, then the bytes of each of main's layers the client does not hold,

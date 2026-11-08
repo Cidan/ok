@@ -2141,10 +2141,14 @@ pub async fn log(ui: &mut Ui, cx: &Cx<'_>, name: &str, args: &[String]) -> Code 
             .stream();
         let mut skipped = 0;
         let max = a.max_count.unwrap_or(usize::MAX);
+        let check = repo::PathCheck::new(&ws, &matcher);
         while let Some(id) = stream.next().await {
             let id = id.map_err(jj_cli::command_error::internal_error)?;
             if !a.reverse && ids.len() >= max {
                 break;
+            }
+            if check.rules_out(&id) {
+                continue;
             }
             let c = repo.store().get_commit_async(&id).await?;
             let parents = c
@@ -2662,10 +2666,14 @@ pub async fn rev_list(ui: &mut Ui, cx: &Cx<'_>, args: &[String]) -> Code {
         .map_err(jj_cli::command_error::internal_error)?
         .stream();
     let mut skipped = 0;
+    let check = repo::PathCheck::new(&ws, &matcher);
     while let Some(id) = stream.next().await {
         let id = id.map_err(jj_cli::command_error::internal_error)?;
         if !a.reverse && a.max_count.is_some_and(|m| ids.len() >= m) {
             break;
+        }
+        if check.rules_out(&id) {
+            continue;
         }
         let needs_commit = a.merges
             || a.no_merges
@@ -2820,8 +2828,12 @@ pub async fn shortlog(ui: &mut Ui, cx: &Cx<'_>, args: &[String]) -> Code {
         .evaluate(repo)
         .map_err(jj_cli::command_error::internal_error)?
         .stream();
+    let check = repo::PathCheck::new(&ws, &matcher);
     while let Some(id) = stream.next().await {
         let id = id.map_err(jj_cli::command_error::internal_error)?;
+        if check.rules_out(&id) {
+            continue;
+        }
         let c = repo.store().get_commit_async(&id).await?;
         if a.no_merges && c.parent_ids().len() > 1 {
             continue;

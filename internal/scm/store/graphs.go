@@ -8,9 +8,12 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"path"
 	"slices"
 	"strconv"
 	"time"
+
+	"golang.org/x/sync/errgroup"
 
 	"github.com/Cidan/ok/internal/blob"
 	"github.com/Cidan/ok/internal/scm/encoding"
@@ -61,6 +64,8 @@ type GraphLayerRef struct {
 type MainGraph struct {
 	Top    encoding.ID
 	Layers []GraphLayerRef
+	// Version is the manifest's version.
+	Version byte
 }
 
 func graphsPrefix(repo int64) string { return "graphs/" + strconv.FormatInt(repo, 10) + "/" }
@@ -75,15 +80,17 @@ func graphLayerKey(repo int64, id encoding.ID) string {
 // and each layer's ID, size (uvarint), and commits (uvarint).
 const mainGraphMagic = "OKGRAPHM"
 
-// mainGraphVersion is the manifest's version this release writes.
-const mainGraphVersion = 1
+// mainGraphVersion is the manifest's version this release writes: 2, whose layers' records carry
+// commits' changed-path filters. A manifest of version 1 names layers without them: main's graph is
+// derived again, whole, as this release writes it.
+const mainGraphVersion = 2
 
 // errNewerGraph is a manifest a later release wrote, naming layers this release cannot read: it is
 // as if there were none, and this release derives main's graph again, as it writes it.
 var errNewerGraph = errors.New("main's graph is a later release's")
 
 func encodeMainGraph(g MainGraph) []byte {
-	out := append([]byte(mainGraphMagic), mainGraphVersion)
+	out := append([]byte(mainGraphMagic), g.Version)
 	out = append(out, g.Top[:]...)
 	out = binary.AppendUvarint(out, uint64(len(g.Layers)))
 	for _, l := range g.Layers {
@@ -99,11 +106,13 @@ func decodeMainGraph(b []byte) (MainGraph, error) {
 	if len(b) < len(mainGraphMagic)+1 || string(b[:len(mainGraphMagic)]) != mainGraphMagic {
 		return g, errors.New("not a main graph")
 	}
-	if v := b[len(mainGraphMagic)]; v != mainGraphVersion {
-		if v > mainGraphVersion {
-			return g, errNewerGraph
-		}
-		return g, fmt.Errorf("a main graph of version %d", v)
+	switch v := b[len(mainGraphMagic)]; {
+	case v > mainGraphVersion:
+		return g, errNewerGraph
+	case v == 0:
+		return g, errors.New("a main graph of version 0")
+	default:
+		g.Version = v
 	}
 	if len(b) < len(mainGraphMagic)+1+encoding.IDLen {
 		return g, errors.New("a main graph is truncated")
@@ -208,7 +217,89 @@ func (s *Store) graphRecords(ctx context.Context, repo int64, want, have []encod
 			})
 		}
 	}
+	if err := s.pathFilters(ctx, repo, out); err != nil {
+		return nil, err
+	}
 	return out, nil
+}
+
+// pathFiltersAtOnce bounds the commits whose changed paths one read of the graph diffs at once.
+const pathFiltersAtOnce = 8
+
+// errTooManyPaths stops a diff whose commit changed more paths than a filter holds.
+var errTooManyPaths = errors.New("more changed paths than a filter holds")
+
+// pathFilters gives each record whose commit has one parent and no conflict, nor its parent, its
+// changed-path filter: of each path it changed from its parent — every changed file and every
+// directory above one — or, past encoding.PathFilterMaxPaths of them, the filter of every path.
+// Each is made once on a replica and kept in memory by commit: a commit never changes.
+func (s *Store) pathFilters(ctx context.Context, repo int64, recs []encoding.GraphRecord) error {
+	trees := make(map[encoding.ID]encoding.Merge[encoding.ID], len(recs)+1)
+	trees[encoding.RootCommitID] = encoding.Merge[encoding.ID]{encoding.EmptyTreeID}
+	for _, r := range recs {
+		trees[r.ID] = r.Tree
+	}
+	var parents []ObjectRef
+	for _, r := range recs {
+		if len(r.Parents) == 1 {
+			if _, ok := trees[r.Parents[0]]; !ok {
+				trees[r.Parents[0]] = nil
+				parents = append(parents, ObjectRef{Kind: encoding.KindCommit, ID: r.Parents[0]})
+			}
+		}
+	}
+	for start := 0; start < len(parents); start += graphBodiesBatch {
+		res, err := s.ReadObjects(ctx, repo, parents[start:min(start+graphBodiesBatch, len(parents))])
+		if err != nil {
+			return err
+		}
+		for _, r := range res {
+			if !r.Found {
+				continue
+			}
+			o, err := decodeStored(encoding.KindCommit, r.Ref.ID, r.Body)
+			if err != nil {
+				return err
+			}
+			trees[r.Ref.ID] = o.(*encoding.Commit).RootTree
+		}
+	}
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(pathFiltersAtOnce)
+	for i := range recs {
+		r := &recs[i]
+		if len(r.Parents) != 1 || len(r.Tree) != 1 || len(trees[r.Parents[0]]) != 1 {
+			continue
+		}
+		key := graphsPrefix(repo) + "f/" + hex.EncodeToString(r.ID[:])
+		if f, ok := s.layers.get(key); ok {
+			r.Filter = f
+			continue
+		}
+		from, to := trees[r.Parents[0]][0], r.Tree[0]
+		g.Go(func() error {
+			seen := map[string]bool{}
+			var paths []string
+			err := diffTrees(s.pendingTrees(gctx, repo), from, to, "", func(ch leafChange) error {
+				for p := ch.Path; p != "." && !seen[p]; p = path.Dir(p) {
+					seen[p] = true
+					paths = append(paths, p)
+				}
+				if len(paths) > encoding.PathFilterMaxPaths {
+					return errTooManyPaths
+				}
+				return nil
+			})
+			if err != nil && !errors.Is(err, errTooManyPaths) {
+				return err
+			}
+			f := encoding.PathFilter(paths)
+			s.layers.put(key, f, len(key)+len(f))
+			r.Filter = f
+			return nil
+		})
+	}
+	return g.Wait()
 }
 
 // putGraphLayer writes a layer of records to the bucket, unless it is there, and keeps its bytes.
@@ -248,7 +339,7 @@ func (s *Store) DeriveMainGraph(ctx context.Context, repo int64) error {
 // deriveMainGraph derives main's graph as far as its head and returns it as kept. The commits since
 // the head the kept graph reaches become a layer on its layers, and the top layers merge — each pair
 // into one of both's records — until each is more than twice the one above it and there are at most
-// graphMaxLayers. Main's first graph, a graph a later release wrote, one with a layer gone, and one
+// graphMaxLayers. Main's first graph, a graph another release wrote, one with a layer gone, and one
 // derived whole are one layer of all of main's history.
 func (s *Store) deriveMainGraph(ctx context.Context, repo int64, whole bool) (MainGraph, error) {
 	start := time.Now()
@@ -266,7 +357,7 @@ func (s *Store) deriveMainGraph(ctx context.Context, repo int64, whole bool) (Ma
 	if err != nil {
 		return MainGraph{}, err
 	}
-	if whole {
+	if whole || kept.Version < mainGraphVersion {
 		ok = false
 	}
 	if ok && kept.Top == r.Head {
@@ -280,7 +371,7 @@ func (s *Store) deriveMainGraph(ctx context.Context, repo int64, whole bool) (Ma
 	if err != nil {
 		return MainGraph{}, err
 	}
-	out := MainGraph{Top: r.Head}
+	out := MainGraph{Top: r.Head, Version: mainGraphVersion}
 	if ok {
 		out.Layers = slices.Clone(kept.Layers)
 	}
@@ -335,18 +426,24 @@ func (s *Store) mergeGraphLayers(ctx context.Context, repo int64, lower, upper G
 // graph is first derived), each of those layers held does not name, in pieces, and then the records
 // of every commit reachable from heads and from neither have nor that head, in topological order,
 // graphRecordsPiece a message. A head the repository does not hold is passed over: a client indexes
-// what it has not published itself. Should the manifest be a later release's, or name a layer that
-// is gone, main's graph is derived again first.
-func (s *Store) ReadGraph(ctx context.Context, repo int64, heads, have, held []encoding.ID,
+// what it has not published itself. Should the manifest be another release's, or name a layer that
+// is gone, main's graph is derived again first. Records only, it sends no layer: every commit the
+// heads reach that the haves do not is a record — what jj sync reads of main's new commits.
+func (s *Store) ReadGraph(ctx context.Context, repo int64, heads, have, held []encoding.ID, recordsOnly bool,
 	header func(top encoding.ID, layers []GraphLayerRef) error, piece func(id encoding.ID, data []byte, last bool) error,
 	records func(data []byte) error) error {
-	kept, ok, err := s.mainGraph(ctx, repo)
-	if errors.Is(err, errNewerGraph) {
-		kept, err = s.deriveMainGraph(ctx, repo, true)
-		ok = len(kept.Layers) > 0
-	}
-	if err != nil {
-		return err
+	var kept MainGraph
+	var ok bool
+	var err error
+	if !recordsOnly {
+		kept, ok, err = s.mainGraph(ctx, repo)
+		if errors.Is(err, errNewerGraph) || (err == nil && ok && kept.Version < mainGraphVersion) {
+			kept, err = s.deriveMainGraph(ctx, repo, true)
+			ok = len(kept.Layers) > 0
+		}
+		if err != nil {
+			return err
+		}
 	}
 	var bodies [][]byte
 	for attempt := 0; ok; attempt++ {

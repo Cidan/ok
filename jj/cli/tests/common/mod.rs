@@ -1824,6 +1824,26 @@ pub async fn git_workflow(mode: Mode) {
             .stdout,
         "add a\n"
     );
+    // History by path: main's commit ruled out, or in, by its changed-path filter, which the pull
+    // took in; the branch's commit, which has none, by its trees.
+    for (args, want) in [
+        (
+            &["log", "--format=%s", "--", "b.txt"][..],
+            "add b and more\n",
+        ),
+        (
+            &["log", "--format=%s", "--", "a.txt"][..],
+            "add b and more\nadd a\n",
+        ),
+        (&["log", "--format=%s", "--", "nowhere"][..], ""),
+        (&["rev-list", "--count", "HEAD", "--", "b.txt"][..], "1\n"),
+        (
+            &["shortlog", "-s", "HEAD", "--", "a.txt"][..],
+            "     2\talice\n",
+        ),
+    ] {
+        assert_eq!(alice.git_ok("repo", args).stdout, want, "git {args:?}");
+    }
     let run = alice.git_ok("repo", &["switch", "main"]);
     assert!(
         run.stderr.contains("Switched to branch 'main'"),

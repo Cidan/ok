@@ -815,6 +815,22 @@ impl Pathspec {
         self.everything
     }
 
+    /// The paths a commit must have changed one of, or one under one of, to touch the pathspec —
+    /// every path it includes, as repository paths — when all are literal paths, none the root:
+    /// what a commit's changed-path filter can answer (`PathCheck`).
+    pub fn filter_paths(&self) -> Option<Vec<String>> {
+        if self.everything {
+            return None;
+        }
+        self.include
+            .iter()
+            .map(|s| match s {
+                Spec::Prefix(p) if !p.is_root() => Some(p.as_internal_file_string().to_owned()),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// The literal paths given (not wildcards), to tell which matched nothing.
     pub fn literal_paths(&self) -> Vec<RepoPathBuf> {
         self.include
@@ -920,6 +936,31 @@ pub async fn files(
 }
 
 /// Whether a commit changes anything a matcher names, against its parents.
+/// What tells, without a commit or its trees, that a commit does not touch a pathspec: the changed-path
+/// filters the commit graph sent (`ok_store::graph::PathFilters`), for a pathspec of literal paths. A
+/// commit it cannot rule out is read and diffed (`touches`).
+pub struct PathCheck {
+    filters: Option<(ok_store::graph::PathFilters, Vec<String>)>,
+}
+
+impl PathCheck {
+    /// The check of `spec` in the workspace's repository.
+    pub fn new(ws: &WorkspaceCommandHelper, spec: &Pathspec) -> Self {
+        Self {
+            filters: spec
+                .filter_paths()
+                .map(|paths| (ok_store::graph::PathFilters::load(ws.repo_path()), paths)),
+        }
+    }
+
+    /// Whether the commit certainly does not touch the pathspec.
+    pub fn rules_out(&self, commit: &CommitId) -> bool {
+        self.filters
+            .as_ref()
+            .is_some_and(|(f, paths)| f.may_change(commit, paths) == Some(false))
+    }
+}
+
 pub async fn touches(
     repo: &dyn Repo,
     commit: &Commit,

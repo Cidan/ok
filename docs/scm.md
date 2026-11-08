@@ -762,21 +762,35 @@ commits' metadata lazily, is the model.
 - **Records.** Each commit's ID, change ID, generation, committer's time, tree (a merge's terms),
   and parents, in topological order; a commit whose one parent is the record before it — main's
   history, a stack — names it with a flag, not its ID (`internal/scm/encoding/graph.go`, held to
-  golden vectors both languages pass, `testdata/graph.json`). A record may carry a filter of the
-  paths its commit changed.
+  golden vectors both languages pass, `testdata/graph.json`). A record may carry its commit's
+  changed-path filter.
+- **Changed-path filters.** A commit of one parent and no conflict, nor its parent — every commit of
+  main — has a Bloom filter of the paths it changed from its parent: each changed file and every
+  directory above one, as main's path history records them — git's commit-graph filters
+  (`BIDX`/`BDAT`), with BLAKE3 for the hash: each path sets 7 bits of 10 a path, rounded up to
+  bytes; one that changed none has the empty filter, and one that changed more than 512 paths the
+  byte `0xff`, which holds every path (`internal/scm/encoding/pathfilter.go`, golden vectors in
+  `testdata/path_filter.json`, which jj's Rust check passes too). The SCM diffs each commit's tree
+  against its parent's to make it, at most 8 at once, once a replica, keeping it in memory by commit.
 - **Main's layers.** Main's history is derived as it moves (`GraphWork`, keyed work marked by
   every move of main, as checkouts' is) into layers in the bucket — immutable, named by the
   BLAKE3 of their bytes, magic `OKGRAPHL`, a version, and one zstd frame of records
   (`internal/scm/graph`) — merged as checkouts' are: the commits since the head the last
   derivation reached become a layer on the others, and the top layers merge until each is more
   than twice the one above it and there are at most 16. One manifest per repository names them and
-  the head they reach (`graphs/<repository>/main`); layers are at `graphs/<repository>/l/<layer>`.
+  the head they reach (`graphs/<repository>/main`, magic `OKGRAPHM`, version 2: version 1's layers
+  carry no filters, and a manifest of it is derived again, whole); layers are at
+  `graphs/<repository>/l/<layer>`. A manifest a later release wrote reads as none — this release
+  derives main's graph again, as it writes it, and prunes no layer meanwhile — and one that names a
+  layer gone has main's graph derived again, whole, before it is read: rolling back and forward
+  costs a derivation each way.
 - **Reading it.** `ReadGraph` names the commits to index (`heads`), those whose whole ancestry
   the client indexed (`have`), and the layers of main it holds (`held_layers`). It answers the
   manifest's layers and head, the bytes of each layer not held in pieces of up to 1 MiB, then the
   records of every commit the heads reach that neither the haves nor main's layers do — a
   workspace's commits beyond main, and main's own while its derivation is behind — 4,096 a message.
-  A head the SCM does not hold is passed over.
+  A head the SCM does not hold is passed over. With `records_only`, it sends no layer: every commit
+  the heads reach that the haves do not is a record.
 - **Building the index.** A clone, before jj loads the repository, builds the index at each
   operation head jj's default index store has none of: from the nearest operation it has an index
   of, it reads the graph for every commit the operations since reference, adds each record whose
@@ -787,6 +801,14 @@ commits' metadata lazily, is the model.
   next time; a layer named as held that the index lacks is asked for again. A build the graph cannot
   finish — an SCM that serves none, or out of reach — is left to jj, which reads the commits.
   An operation made since is indexed by jj as it is made, reading only the commits it adds.
+- **Path history from the filters.** The filters the graph sends are kept beside the index
+  (`ok_graph_filters` in its directory: each a commit's ID, a length, and the filter, appended as
+  they arrive), and `jj sync`'s fetch of main adds its new commits' (`records_only`). `git log`,
+  `git rev-list`, and `git shortlog` with pathspecs of literal paths rule a commit out by its
+  filter before reading it or its trees, and read and diff only those it may have changed — as git
+  reads its commit-graph's — so a path's history needs no tree of a commit that did not touch it.
+  jj's own `files()` (`jj log <path>`) diffs trees as before: jj's changed-path index is jj-lib's
+  own, filled only from trees.
 - **Kept.** Garbage collection deletes the layers the manifest no longer names, a day after they
   were written.
 

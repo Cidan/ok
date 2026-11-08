@@ -2597,7 +2597,9 @@ type ReadGraphRequest struct {
 	// Commits whose whole ancestry the client indexed: nothing reachable from them is sent.
 	Have [][]byte `protobuf:"bytes,3,rep,name=have,proto3" json:"have,omitempty"`
 	// Layers of main's graph the client indexed, any head's: a layer it holds is not sent.
-	HeldLayers    [][]byte `protobuf:"bytes,4,rep,name=held_layers,json=heldLayers,proto3" json:"held_layers,omitempty"`
+	HeldLayers [][]byte `protobuf:"bytes,4,rep,name=held_layers,json=heldLayers,proto3" json:"held_layers,omitempty"`
+	// No layer of main's: every commit the heads reach that the haves do not is sent as a record.
+	RecordsOnly   bool `protobuf:"varint,5,opt,name=records_only,json=recordsOnly,proto3" json:"records_only,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2658,6 +2660,13 @@ func (x *ReadGraphRequest) GetHeldLayers() [][]byte {
 		return x.HeldLayers
 	}
 	return nil
+}
+
+func (x *ReadGraphRequest) GetRecordsOnly() bool {
+	if x != nil {
+		return x.RecordsOnly
+	}
+	return false
 }
 
 // A graph's stream: its header, then the bytes of each of main's layers the client does not hold,
@@ -10444,13 +10453,14 @@ const file_proto_ok_scm_v1_scm_proto_rawDesc = "" +
 	"\atree_id\x18\x01 \x01(\fR\x06treeId\x12\x16\n" +
 	"\x06layers\x18\x02 \x03(\fR\x06layers\x12\x1d\n" +
 	"\n" +
-	"since_tree\x18\x03 \x01(\fR\tsinceTree\"\x82\x01\n" +
+	"since_tree\x18\x03 \x01(\fR\tsinceTree\"\xa5\x01\n" +
 	"\x10ReadGraphRequest\x12#\n" +
 	"\rrepository_id\x18\x01 \x01(\x03R\frepositoryId\x12\x14\n" +
 	"\x05heads\x18\x02 \x03(\fR\x05heads\x12\x12\n" +
 	"\x04have\x18\x03 \x03(\fR\x04have\x12\x1f\n" +
 	"\vheld_layers\x18\x04 \x03(\fR\n" +
-	"heldLayers\"\xaa\x01\n" +
+	"heldLayers\x12!\n" +
+	"\frecords_only\x18\x05 \x01(\bR\vrecordsOnly\"\xaa\x01\n" +
 	"\n" +
 	"GraphFrame\x120\n" +
 	"\x06header\x18\x01 \x01(\v2\x16.ok.scm.v1.GraphHeaderH\x00R\x06header\x12,\n" +

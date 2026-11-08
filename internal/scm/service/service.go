@@ -572,7 +572,7 @@ func (s *Store) ReadGraph(req *scmpb.ReadGraphRequest, stream grpc.ServerStreami
 	if err != nil {
 		return err
 	}
-	return toStatus(s.c.store.ReadGraph(ctx, req.GetRepositoryId(), heads, have, held, func(top encoding.ID, layers []store.GraphLayerRef) error {
+	return toStatus(s.c.store.ReadGraph(ctx, req.GetRepositoryId(), heads, have, held, req.GetRecordsOnly(), func(top encoding.ID, layers []store.GraphLayerRef) error {
 		h := &scmpb.GraphHeader{}
 		if top != (encoding.ID{}) {
 			h.Top = top[:]

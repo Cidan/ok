@@ -296,6 +296,9 @@ pub async fn fetch(repo: &mut MutableRepo) -> Result<Fetched, ClError> {
     let old_main = main_target(repo);
     let have: Vec<CommitId> = old_main.iter().cloned().collect();
     let fetched = changelists::prefetch(&shared, std::slice::from_ref(&head), &have).await?;
+    // The new commits' changed-path filters, which git's path history reads (ok_store::graph): an
+    // SCM that serves no graph leaves their trees to be diffed instead.
+    let _ = ok_store::graph::add_main_filters(&shared, std::slice::from_ref(&head), &have).await;
     if head != *store.root_commit_id() {
         let commit = store.get_commit_async(&head).await?;
         repo.add_head(&commit).await?;

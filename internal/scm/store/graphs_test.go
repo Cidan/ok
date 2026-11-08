@@ -121,7 +121,7 @@ func readGraph(t *testing.T, s *Store, repo int64, heads, have, held []encoding.
 	var named []encoding.ID
 	sent := map[encoding.ID][]byte{}
 	var recs []encoding.GraphRecord
-	err := s.ReadGraph(context.Background(), repo, heads, have, held, func(tp encoding.ID, layers []GraphLayerRef) error {
+	err := s.ReadGraph(context.Background(), repo, heads, have, held, false, func(tp encoding.ID, layers []GraphLayerRef) error {
 		top = tp
 		for _, l := range layers {
 			named = append(named, l.ID)
@@ -272,4 +272,114 @@ func TestMainGraphOfAnotherRelease(t *testing.T) {
 	if _, recs := graphOf(t, cold, e.repo); len(recs) != 5 {
 		t.Fatalf("main's graph after another landing holds %d commits", len(recs))
 	}
+}
+
+// Each record of a commit of one parent and no conflict carries the filter of the paths it changed —
+// each file and every directory above one — main's layers' and the records ReadGraph sends alike; a
+// commit that changed more paths than a filter holds has the filter of every path. A manifest of
+// version 1, whose layers' records have none, is derived again, whole. Records only, ReadGraph sends
+// no layer.
+func TestGraphPathFilters(t *testing.T) {
+	ctx := context.Background()
+	e := newCLEnv(t)
+	// Each commit main's files and these.
+	with := func(add map[string]string) map[string]string {
+		files := map[string]string{}
+		if e.head() != encoding.RootCommitID {
+			files = e.flatAt(e.head())
+		}
+		for p, c := range add {
+			files[p] = c
+		}
+		return files
+	}
+	e.landChange("one file", with(map[string]string{"src/a/one.go": "1\n"}))
+	e.landChange("another", with(map[string]string{"docs/readme.md": "2\n"}))
+	many := map[string]string{}
+	for i := range encoding.PathFilterMaxPaths + 1 {
+		many[fmt.Sprintf("big/f%04d", i)] = "x\n"
+	}
+	e.landChange("many", with(many))
+	if err := e.s.DeriveMainGraph(ctx, e.repo); err != nil {
+		t.Fatal(err)
+	}
+	g, recs := graphOf(t, e.s, e.repo)
+	if g.Version != mainGraphVersion || len(recs) != 3 {
+		t.Fatalf("version %d, %d records", g.Version, len(recs))
+	}
+	holds := func(r encoding.GraphRecord, p string) bool { return encoding.PathFilterHolds(r.Filter, p) }
+	for _, r := range recs {
+		if r.Filter == nil {
+			t.Fatalf("commit %s has no filter", r.ID)
+		}
+	}
+	if !holds(recs[0], "src/a/one.go") || !holds(recs[0], "src/a") || !holds(recs[0], "src") || holds(recs[0], "docs/readme.md") || holds(recs[0], "docs") {
+		t.Errorf("the first commit's filter: %x", recs[0].Filter)
+	}
+	if !holds(recs[1], "docs/readme.md") || !holds(recs[1], "docs") || holds(recs[1], "src/a/one.go") || holds(recs[1], "src") {
+		t.Errorf("the second commit's filter: %x", recs[1].Filter)
+	}
+	if !bytes.Equal(recs[2].Filter, []byte{0xff}) {
+		t.Errorf("a commit of %d paths has the filter %x, not every path's", len(many)+1, recs[2].Filter)
+	}
+
+	// A workspace's commit beyond main, sent as a record, and one with two parents, which has none.
+	w := e.commit(alice, newChange(), e.head(), "work", with(map[string]string{"src/a/two.go": "2\n"}))
+	b := newBuilder(t)
+	merge := b.commit(b.flat(map[string]string{"m": "m\n"}), "merge", e.head(), w)
+	mustPublish(t, e.s, e.repo, alice, b, nil)
+	_, _, _, loose := readGraph(t, e.s, e.repo, []encoding.ID{merge}, nil, nil)
+	if len(loose) != 2 || loose[0].ID != w || loose[1].ID != merge {
+		t.Fatalf("%d records beyond main", len(loose))
+	}
+	if !holds(loose[0], "src/a/two.go") || holds(loose[0], "docs") || loose[1].Filter != nil {
+		t.Errorf("filters beyond main: %x, %x", loose[0].Filter, loose[1].Filter)
+	}
+
+	// Records only: no layer, and every commit from main's first to w.
+	top, named, sent, only := readGraphOnly(t, e.s, e.repo, []encoding.ID{w})
+	if top != (encoding.ID{}) || len(named) != 0 || len(sent) != 0 || len(only) != 4 || only[3].ID != w {
+		t.Fatalf("records only: top %s, %d layers, %d sent, %d records", top, len(named), len(sent), len(only))
+	}
+
+	// A version 1 manifest is derived again, whole, its records' filters with it.
+	old := g
+	old.Version = 1
+	b1 := encodeMainGraph(old)
+	if err := e.s.blobs.Put(ctx, mainGraphKey(e.repo), bytes.NewReader(b1), int64(len(b1))); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.s.DeriveMainGraph(ctx, e.repo); err != nil {
+		t.Fatal(err)
+	}
+	if again, recs := graphOf(t, e.s, e.repo); again.Version != mainGraphVersion || len(again.Layers) != 1 || len(recs) != 3 || recs[0].Filter == nil {
+		t.Fatalf("a version 1 manifest derived again: version %d, %d layers, %d records", again.Version, len(again.Layers), len(recs))
+	}
+}
+
+// readGraphOnly runs ReadGraph for records alone.
+func readGraphOnly(t *testing.T, s *Store, repo int64, heads []encoding.ID) (encoding.ID, []encoding.ID, map[encoding.ID][]byte, []encoding.GraphRecord) {
+	t.Helper()
+	var top encoding.ID
+	var named []encoding.ID
+	sent := map[encoding.ID][]byte{}
+	var recs []encoding.GraphRecord
+	err := s.ReadGraph(context.Background(), repo, heads, nil, nil, true, func(tp encoding.ID, layers []GraphLayerRef) error {
+		top = tp
+		for _, l := range layers {
+			named = append(named, l.ID)
+		}
+		return nil
+	}, func(id encoding.ID, data []byte, last bool) error {
+		sent[id] = append(sent[id], data...)
+		return nil
+	}, func(data []byte) error {
+		got, err := encoding.DecodeGraphRecords(data)
+		recs = append(recs, got...)
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return top, named, sent, recs
 }

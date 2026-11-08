@@ -1498,10 +1498,15 @@ async fn a_clone_indexes_from_the_commit_graph() {
     // Main's graph is derived as main moves.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
-        let read =
-            ok_store::graph::read_graph(shared_a.clone(), Vec::new(), Vec::new(), Vec::new())
-                .await
-                .unwrap();
+        let read = ok_store::graph::read_graph(
+            shared_a.clone(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            false,
+        )
+        .await
+        .unwrap();
         if !read.layers.is_empty() {
             break;
         }
@@ -1560,4 +1565,57 @@ async fn a_clone_indexes_from_the_commit_graph() {
     // Looking at the commit reads it: its description is no index's.
     let read_tip = repo_b.store().get_commit_async(tip.id()).await.unwrap();
     assert_eq!(read_tip.description(), "work 29\n");
+
+    // Every commit indexed came with its changed-path filter: the one that landed changed a, the
+    // workspace's f.
+    let filters = ok_store::graph::PathFilters::load(&b.repo_dir);
+    let changes = |c: &Commit, p: &str| filters.may_change(c.id(), &[p.to_owned()]);
+    assert_eq!(changes(&landed, "a"), Some(true));
+    assert_eq!(changes(&landed, "f"), Some(false));
+    assert_eq!(changes(&tip, "f"), Some(true));
+    assert_eq!(changes(&tip, "a"), Some(false));
+
+    // A sync's fetch adds main's new commits' filters.
+    let mut tx = repo.start_transaction();
+    let next = child(&mut tx, &landed, &[("n/x", Content::File(b"x\n"))], "next").await;
+    repo = tx.commit("next").await.unwrap();
+    let up = ok_store::changelists::upload(
+        &shared_a,
+        std::slice::from_ref(next.id()),
+        ok_store::pb::upload_request::Readiness::Ready,
+        Vec::new(),
+    )
+    .await
+    .unwrap();
+    ok_testscm::landing(ok_testscm::AUTOMATION)
+        .await
+        .land(ok_store::pb::LandRequest {
+            repository_id: remote.id,
+            items: vec![ok_store::pb::land_request::Item {
+                number: up.results[0].number,
+                patchset: 1,
+                candidate: Vec::new(),
+                actor_id: String::new(),
+            }],
+            actor_id: ok_testscm::id(PRINCIPAL).await,
+            expected_head: landed.id().to_bytes(),
+            dry_run: false,
+        })
+        .await
+        .unwrap();
+    let main = ok_store::changelists::repository(&shared_b)
+        .await
+        .unwrap()
+        .head;
+    ok_store::graph::add_main_filters(
+        &shared_b,
+        std::slice::from_ref(&main),
+        std::slice::from_ref(landed.id()),
+    )
+    .await
+    .unwrap();
+    let filters = ok_store::graph::PathFilters::load(&b.repo_dir);
+    assert_eq!(filters.may_change(&main, &["n".to_owned()]), Some(true));
+    assert_eq!(filters.may_change(&main, &["a".to_owned()]), Some(false));
+    let _ = repo;
 }

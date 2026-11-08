@@ -59,6 +59,11 @@ const HELD_MAX: usize = 64;
 /// took in: the next read names them as held.
 const HELD_FILE: &str = "ok_graph_layers";
 
+/// The file beside jj's own, in the index's directory, of the changed-path filters of the commits
+/// the graph sent: each a commit's ID, its filter's length (uvarint), and its filter, appended as
+/// records arrive. A record cut short by a crash ends what is read of it.
+const FILTERS_FILE: &str = "ok_graph_filters";
+
 /// What a read of the graph brought: the layers of main the SCM named, and every record, layers'
 /// first, in topological order.
 pub struct GraphRead {
@@ -67,12 +72,14 @@ pub struct GraphRead {
 }
 
 /// Reads what an index of the commits reachable from `heads` needs, the index holding everything
-/// reachable from `have` and the layers of main's graph `held` names.
+/// reachable from `have` and the layers of main's graph `held` names. Records only, the SCM sends no
+/// layer: every commit the heads reach that the haves do not is a record.
 pub async fn read_graph(
     shared: Arc<Shared>,
     heads: Vec<Id>,
     have: Vec<Id>,
     held: Vec<Id>,
+    records_only: bool,
 ) -> Result<GraphRead, Status> {
     shared::run(async move {
         let mut store = shared.client.store().await?;
@@ -82,6 +89,7 @@ pub async fn read_graph(
                 heads: heads.iter().map(|h| h.to_vec()).collect(),
                 have: have.iter().map(|h| h.to_vec()).collect(),
                 held_layers: held.iter().map(|h| h.to_vec()).collect(),
+                records_only,
             })
             .await?
             .into_inner();
@@ -288,9 +296,16 @@ impl GraphIndex<'_> {
                 .collect();
             let mut held = self.held();
             loop {
-                let read =
-                    read_graph(shared.clone(), wanted.clone(), have.clone(), held.clone()).await?;
+                let read = read_graph(
+                    shared.clone(),
+                    wanted.clone(),
+                    have.clone(),
+                    held.clone(),
+                    false,
+                )
+                .await?;
                 add_records(index.as_mut(), store, &read.records).await?;
+                add_filters(&self.dir, &read.records)?;
                 let mut missing = false;
                 for h in &heads {
                     missing = missing || !index.as_index().has_id(h).await?;
@@ -405,4 +420,104 @@ async fn add_commits(
         index.add_commit(c).await?;
     }
     Ok(())
+}
+
+/// Appends the filters of `records` that carry one to the index directory's filters file.
+fn add_filters(index_dir: &Path, records: &[GraphRecord]) -> std::io::Result<()> {
+    let mut out = Vec::new();
+    for r in records {
+        let Some(f) = &r.filter else { continue };
+        out.extend_from_slice(&r.id);
+        let mut n = f.len() as u64;
+        loop {
+            let b = (n & 0x7f) as u8;
+            n >>= 7;
+            if n == 0 {
+                out.push(b);
+                break;
+            }
+            out.push(b | 0x80);
+        }
+        out.extend_from_slice(f);
+    }
+    if out.is_empty() {
+        return Ok(());
+    }
+    // One write, so concurrent appends do not interleave.
+    fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(index_dir.join(FILTERS_FILE))?
+        .write_all(&out)
+}
+
+/// Adds the filters of main's commits reachable from `heads` and not from `have` — what `jj sync`
+/// just fetched — to the repository's index directory, read as records alone.
+pub async fn add_main_filters(
+    shared: &Arc<Shared>,
+    heads: &[CommitId],
+    have: &[CommitId],
+) -> Result<(), Status> {
+    let ids = |c: &[CommitId]| -> Vec<Id> {
+        c.iter()
+            .filter_map(|c| <Id>::try_from(c.as_bytes()).ok())
+            .collect()
+    };
+    let read = read_graph(shared.clone(), ids(heads), ids(have), Vec::new(), true).await?;
+    add_filters(&shared.repo_dir.join("index"), &read.records)
+        .map_err(|e| Status::internal(format!("the index's filters: {e}")))
+}
+
+/// The changed-path filters the graph sent of a repository's commits, by commit (docs/scm.md, "The
+/// commit graph"): what tells, without a commit's trees, that it did not change a path.
+pub struct PathFilters {
+    by_commit: HashMap<Id, Vec<u8>>,
+}
+
+impl PathFilters {
+    /// The filters of the repository at `repo_dir` (`.jj/repo`); none if it has none.
+    pub fn load(repo_dir: &Path) -> Self {
+        let mut by_commit = HashMap::new();
+        if let Ok(b) = fs::read(repo_dir.join("index").join(FILTERS_FILE)) {
+            let mut off = 0;
+            while let Some(head) = b.get(off..off + 32) {
+                let id: Id = head.try_into().expect("32 bytes");
+                let mut at = off + 32;
+                let (mut n, mut shift) = (0u64, 0);
+                let len = loop {
+                    let Some(&c) = b.get(at) else { break None };
+                    at += 1;
+                    n |= u64::from(c & 0x7f) << shift;
+                    if c < 0x80 {
+                        break Some(n);
+                    }
+                    shift += 7;
+                    if shift > 63 {
+                        break None;
+                    }
+                };
+                let Some(f) = len
+                    .and_then(|n| usize::try_from(n).ok())
+                    .and_then(|n| b.get(at..at.checked_add(n)?))
+                else {
+                    break;
+                };
+                by_commit.insert(id, f.to_vec());
+                off = at + f.len();
+            }
+        }
+        Self { by_commit }
+    }
+
+    /// Whether the commit may have changed any of `paths` (each a repository path, `/`-separated,
+    /// none the root): false is certain; None when the graph sent no filter of it.
+    pub fn may_change(&self, commit: &CommitId, paths: &[String]) -> Option<bool> {
+        let id = <Id>::try_from(commit.as_bytes()).ok()?;
+        let f = self.by_commit.get(&id)?;
+        Some(
+            paths
+                .iter()
+                .any(|p| ok_encoding::path_filter_holds(f, p.as_bytes())),
+        )
+    }
 }
