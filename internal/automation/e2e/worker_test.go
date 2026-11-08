@@ -169,7 +169,7 @@ func TestWorker(t *testing.T) {
 	waitFor("the slow test to run on w1", 2*time.Minute, running(id, "w1"))
 	w1.stop()
 	r = get(id)
-	if r.GetStatus() != automationpb.Run_STATUS_QUEUED || r.GetAttempt() != 1 || !strings.Contains(r.GetReason(), "w1 is shutting down") {
+	if r.GetStatus() != automationpb.Run_STATUS_QUEUED || r.GetAttempt() != 1 || !strings.Contains(r.GetReason(), "its worker w1 shut down; it runs again") {
 		t.Fatalf("after w1 shut down: %v", r)
 	}
 	w2 := e.startWorker("w2", 1)

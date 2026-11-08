@@ -379,7 +379,7 @@ func execute(ctx context.Context, cfg Config, files *changedFiles, run *automati
 			case <-done:
 				return
 			case <-ctx.Done():
-				st.set(stopRelease, "worker "+cfg.Name+" is shutting down")
+				st.set(stopRelease, "its worker "+cfg.Name+" shut down; it runs again")
 				return
 			case <-t.C:
 				// A heartbeat that does not return in time is as good as missed: the next
