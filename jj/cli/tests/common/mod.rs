@@ -1035,6 +1035,17 @@ pub fn checkpoint_after_restart() {
     let covered = alice.checkpoint_after("repo", before);
 
     alice.crash_daemon();
+    // The daemon serves its socket before it has mounted anything: the mount is back once its root
+    // answers, a lookup of the root alone.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while std::fs::metadata(alice.home.path().join("repo")).is_err() {
+        assert!(
+            Instant::now() < deadline,
+            "the mount did not come back:\n{}",
+            alice.daemon_log()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
     // Only the root is looked up from here on: a/b/c's tree is read by the snapshot alone.
     alice.write("repo/after.txt", "written after the restart\n");
     alice.checkpoint_after("repo", covered);
