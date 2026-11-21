@@ -791,6 +791,7 @@ func perform(ctx context.Context, cfg Config, files *changedFiles, run *automati
 		return outcome{status: automationpb.Run_STATUS_ERROR, reason: "checking out: " + err.Error()}
 	}
 	log.Printf("checked out in %s: %s", time.Since(start).Round(time.Millisecond), stats)
+	reads := watchReads(cfg.checkout.Dir())
 	values, refused, err := runSecrets(ctx, cfg, run, log)
 	switch {
 	case ctx.Err() != nil:
@@ -812,7 +813,7 @@ func perform(ctx context.Context, cfg Config, files *changedFiles, run *automati
 		cfg.secretsDir = dir
 	}
 	if cfg.cache {
-		proxy, err := cfg.startCache(run)
+		proxy, err := cfg.startCache(run, reads)
 		if err != nil {
 			return outcome{status: automationpb.Run_STATUS_ERROR, reason: "the run's remote cache: " + err.Error()}
 		}
@@ -891,6 +892,14 @@ func perform(ctx context.Context, cfg Config, files *changedFiles, run *automati
 	}
 	if ctx.Err() != nil {
 		return outcome{status: automationpb.Run_STATUS_CANCELED, reason: "stopped", stopped: true}
+	}
+	if err := reads.failed(); err != nil {
+		// Bazel's output base keeps what it built from them under the right keys: the slot's next run
+		// begins with none.
+		if xerr := d.Expunge(context.WithoutCancel(ctx), cfg.checkout.Dir()); xerr != nil {
+			log.Printf("emptying the output base: %v", xerr)
+		}
+		return outcome{status: automationpb.Run_STATUS_ERROR, reason: err.Error()}
 	}
 	if len(failed) > 0 {
 		return outcome{status: automationpb.Run_STATUS_FAILED, exit: firstExit, reason: strings.Join(failed, "; ")}

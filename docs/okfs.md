@@ -222,6 +222,20 @@ prefetches the directory's other files of up to 1 MiB in the background (their m
 request, then their contents in another), and a read of one of them waits for that rather than
 fetching it again. A fetch that ok does not answer in 30 seconds fails the read with `EIO`.
 
+#### Failed reads
+
+A fetch that fails — ok unreachable, refusing, or too slow — fails the operation that needed it with
+an error, and so does a read that ok answers with fewer bytes than the file holds, which the kernel
+would take for the end of the file. Not every program notices: protoc takes a read's error for the
+end of its input and compiles what it got, so a `.proto` read while the SCM was down becomes an
+empty file's descriptor, and protoc succeeds; kept in a shared cache under the right key, such a
+descriptor is served to every builder after. Every such failure is
+counted, and a mount's root reports the count as `user.ok.fetch_failures` (decimal; a new daemon
+starts again from 0). A worker reads it on its checkout when the commit is presented and again as
+the run ends: once it has risen, or fallen, or is gone, the run's pass-through to the remote cache
+records no action's result, the slot's output base is emptied (`bazel clean --expunge`), since
+Bazel's own action cache keeps what it built, and the run ends in error, to run again.
+
 ### Writes
 
 The first operation that changes a virtual inode materializes it: open for write, truncate,

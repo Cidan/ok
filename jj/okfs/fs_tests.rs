@@ -112,3 +112,96 @@ fn a_directorys_sizes_come_with_it() {
     assert_eq!(per_tree, 0);
     assert!(per_file >= 3, "without records, {per_file} files sized");
 }
+
+/// A source whose reads of file contents fail, or, with `short`, come back half their length.
+struct Failing {
+    inner: FixtureFetch,
+    short: bool,
+}
+
+impl crate::fs::Fetch for Failing {
+    fn tree(&self, id: &jj_lib::backend::TreeId) -> std::io::Result<Arc<jj_lib::backend::Tree>> {
+        self.inner.tree(id)
+    }
+    fn sizes(
+        &self,
+        ids: &[jj_lib::backend::FileId],
+    ) -> std::io::Result<std::collections::HashMap<jj_lib::backend::FileId, u64>> {
+        self.inner.sizes(ids)
+    }
+    fn tree_sizes(
+        &self,
+        _: &[(jj_lib::backend::TreeId, Arc<jj_lib::backend::Tree>)],
+    ) -> std::io::Result<std::collections::HashMap<jj_lib::backend::FileId, u64>> {
+        Ok(Default::default())
+    }
+    fn symlink(&self, id: &jj_lib::backend::SymlinkId) -> std::io::Result<Vec<u8>> {
+        self.inner.symlink(id)
+    }
+    fn content(&self, id: &jj_lib::backend::FileId, to: &std::path::Path) -> std::io::Result<()> {
+        self.inner.content(id, to)
+    }
+    fn read(
+        &self,
+        id: &jj_lib::backend::FileId,
+        size: u64,
+        offset: u64,
+        len: u64,
+    ) -> std::io::Result<Vec<u8>> {
+        if !self.short {
+            return Err(std::io::Error::from_raw_os_error(libc::EIO));
+        }
+        let mut data = self.inner.read(id, size, offset, len)?;
+        data.truncate(data.len() / 2);
+        Ok(data)
+    }
+}
+
+// A read ok cannot answer fails with EIO, and so does one it answers short, which the kernel would
+// take for the end of the file; the root's user.ok.fetch_failures counts both.
+#[test]
+fn a_failed_or_short_read_is_an_error_and_is_counted() {
+    use crate::fs::FETCH_FAILURES_XATTR;
+    use crate::model::ROOT;
+    use crate::testfix::name;
+    use okfs_fuse::Filesystem as _;
+    let ctx = okfs_fuse::Ctx {
+        uid: 0,
+        gid: 0,
+        pid: 0,
+    };
+    for short in [false, true] {
+        let mut fx = Fixture::new();
+        let base = base_tree(&mut fx);
+        let (model, _log) = fx.model(&base);
+        let staging = fx.dir.as_ref().unwrap().path().join("staging");
+        let fx = Arc::new(fx);
+        let fetch = Arc::new(Failing {
+            inner: FixtureFetch(fx, Arc::default()),
+            short,
+        });
+        let mount = Mount::new(model, fetch, staging, Box::new(|| {})).unwrap();
+        let failures = || {
+            let b = mount
+                .getxattr(&ctx, ROOT, std::ffi::OsStr::new(FETCH_FAILURES_XATTR))
+                .unwrap();
+            String::from_utf8(b).unwrap().parse::<u64>().unwrap()
+        };
+        assert_eq!(failures(), 0);
+        let src = mount
+            .with(|m| m.lookup(ROOT, name("src"), true))
+            .unwrap()
+            .unwrap();
+        let file = mount
+            .with(|m| m.lookup(src, name("a.rs"), true))
+            .unwrap()
+            .unwrap();
+        let opened = mount.open(&ctx, file, libc::O_RDONLY).unwrap();
+        assert_eq!(
+            mount.read(&ctx, file, opened.fh, 0, 4096),
+            Err(libc::EIO),
+            "short={short}"
+        );
+        assert_eq!(failures(), 1, "short={short}");
+    }
+}

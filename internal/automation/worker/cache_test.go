@@ -5,10 +5,12 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"net"
 	"path/filepath"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	repb "github.com/bazelbuild/remote-apis/build/bazel/remote/execution/v2"
@@ -55,7 +57,13 @@ func TestCachePassThrough(t *testing.T) {
 	}
 	defer auto.Close()
 
-	proxy, err := startCacheProxy(filepath.Join(t.TempDir(), "cache.sock"), auto, 42)
+	var refusing atomic.Bool
+	proxy, err := startCacheProxy(filepath.Join(t.TempDir(), "cache.sock"), auto, 42, func() error {
+		if refusing.Load() {
+			return errors.New("okfs failed 1 reads of ok")
+		}
+		return nil
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,5 +124,16 @@ func TestCachePassThrough(t *testing.T) {
 	// Not the cache: refused, never forwarded.
 	if _, err := automationpb.NewWorkClient(conn).Lease(ctx, &automationpb.LeaseRequest{}); status.Code(err) != codes.Unimplemented {
 		t.Errorf("another service through the pass-through: %v", err)
+	}
+
+	// Once the run's reads cannot be trusted, no result is recorded; results are still read.
+	refusing.Store(true)
+	ac := repb.NewActionCacheClient(conn)
+	update := &repb.UpdateActionResultRequest{ActionDigest: &repb.Digest{Hash: hash, SizeBytes: int64(len(data))}, ActionResult: &repb.ActionResult{}}
+	if _, err := ac.UpdateActionResult(ctx, update); status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("recording a result after a failed read: %v", err)
+	}
+	if _, err := ac.GetActionResult(ctx, &repb.GetActionResultRequest{ActionDigest: update.ActionDigest}); status.Code(err) != codes.NotFound {
+		t.Errorf("the refused result was recorded: %v", err)
 	}
 }

@@ -549,6 +549,17 @@ PostgreSQL's WAL archive, Spanner's PITR) and its buckets replicate to another r
 region's cells are rebuilt elsewhere from what replicated. A repository's region can be chosen, for
 data residency.
 
+On PostgreSQL, a content index's log is read by transaction ID (`content_log.xid`, and the fold's
+place `content_index.folded_through`, a snapshot). A recovery from the WAL archive keeps them and the
+transaction counter together. A logical restore does not: `pg_dump` carries the column and the
+snapshot but not the counter, so the new cluster numbers its transactions below both, reading on from
+the fold's place misses every row written after the restore, and a fold's cleanup deletes them as
+folded. Before anything writes, move the counter past the dump's — stopped, `pg_resetwal -x` with the
+first commit-log segment boundary past the old cluster's `pg_current_xact_id()` ((old / 1048576 + 1)
+× 1048576). The SCM refuses to read a log holding a transaction the database has not reached, or a
+place past its snapshot, and says so; a replica whose place is from before a recovery to an earlier
+point drops its view and loads it again.
+
 ### Cells, as built
 
 Phase 7's design, settled against ok's code before it is built. Phase 4 left each repository's

@@ -120,6 +120,13 @@ func (d *Driver) OutputFiles(ctx context.Context, dir, target string) ([]string,
 	return files, nil
 }
 
+// Expunge stops the output base's Bazel server and deletes the output base: its action cache, and
+// everything it built.
+func (d *Driver) Expunge(ctx context.Context, dir string) error {
+	_, err := d.output(ctx, dir, append(d.startup(), "clean", "--expunge"))
+	return err
+}
+
 // output runs Bazel with args in dir and returns what it printed.
 func (d *Driver) output(ctx context.Context, dir string, args []string) ([]byte, error) {
 	var stdout, stderr bytes.Buffer

@@ -159,7 +159,15 @@ pub struct Stats {
     /// Directory prefetches started, and the files they asked for.
     pub prefetches: AtomicU64,
     pub prefetched_files: AtomicU64,
+    /// Fetches from ok that failed and were answered with an error (`FETCH_FAILURES_XATTR`). A
+    /// program that takes a read's error for the end of its file has read too little, and says
+    /// nothing: protoc does.
+    pub fetch_failures: AtomicU64,
 }
+
+/// The root's extended attribute holding `Stats::fetch_failures`, in decimal: what a worker reads
+/// before and after a run, so nothing a run made while ok could not be read is kept.
+pub const FETCH_FAILURES_XATTR: &str = "user.ok.fetch_failures";
 
 pub struct Mount {
     model: Mutex<Model>,
@@ -270,6 +278,7 @@ impl Mount {
                 Err(Error::Errno(e)) => break Err(e),
                 Err(Error::Need(n)) => {
                     if let Err(e) = self.satisfy(&n, &mut staged) {
+                        self.stats.fetch_failures.fetch_add(1, Ordering::Relaxed);
                         break Err(to_errno(e));
                     }
                 }
@@ -826,7 +835,15 @@ impl fuse::Filesystem for Mount {
                     return Ok(Vec::new());
                 }
                 let n = (size as u64).min(len - offset);
-                let data = self.fetch.read(&id, len, offset, n).map_err(to_errno)?;
+                let data = self.fetch.read(&id, len, offset, n).map_err(|e| {
+                    self.stats.fetch_failures.fetch_add(1, Ordering::Relaxed);
+                    to_errno(e)
+                })?;
+                if (data.len() as u64) < n {
+                    // The kernel takes a short read for the end of the file.
+                    self.stats.fetch_failures.fetch_add(1, Ordering::Relaxed);
+                    return Err(libc::EIO);
+                }
                 self.stats
                     .fetched_bytes
                     .fetch_add(data.len() as u64, Ordering::Relaxed);
@@ -922,6 +939,14 @@ impl fuse::Filesystem for Mount {
     }
 
     fn getxattr(&self, _: &fuse::Ctx, ino: u64, name: &OsStr) -> fuse::Result<Vec<u8>> {
+        if ino == ROOT && name == FETCH_FAILURES_XATTR {
+            return Ok(self
+                .stats
+                .fetch_failures
+                .load(Ordering::Relaxed)
+                .to_string()
+                .into_bytes());
+        }
         self.with(|m| m.getxattr(ino, name))
     }
 

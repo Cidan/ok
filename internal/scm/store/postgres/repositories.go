@@ -492,13 +492,17 @@ func snapshotText(p backend.LogPlace) *string {
 func (x queries) ContentLogSince(ctx context.Context, sc backend.Scope, since backend.LogPlace) ([]backend.ContentLog, backend.LogPlace, error) {
 	scope, owner := scopeOf(sc)
 	var snap string
-	var own *string
+	var own, newest *string
 	var bodies [][]byte
 	err := x.q.QueryRow(ctx, `SELECT pg_current_snapshot()::text, pg_current_xact_id_if_assigned()::text,
+			(SELECT max(xid) FROM content_log WHERE scope = $1 AND owner_id = $2)::text,
 			coalesce((SELECT array_agg(body ORDER BY stamp, id) FROM content_log WHERE scope = $1 AND owner_id = $2
 				AND ($3::text IS NULL OR (xid >= pg_snapshot_xmin($3::text::pg_snapshot) AND NOT pg_visible_in_snapshot(xid, $3::text::pg_snapshot)))),
-				'{}')`, scope, owner, snapshotText(since)).Scan(&snap, &own, &bodies)
+				'{}')`, scope, owner, snapshotText(since)).Scan(&snap, &own, &newest, &bodies)
 	if err != nil {
+		return nil, nil, err
+	}
+	if err := checkLog(sc, snap, newest, since); err != nil {
 		return nil, nil, err
 	}
 	place, err := readerPlace(snap, own)
@@ -519,15 +523,19 @@ func (x queries) ContentLogCurrent(ctx context.Context, sc backend.Scope, gen in
 	var today time.Time
 	var current bool
 	var snap string
-	var own *string
+	var own, newest *string
 	var bodies [][]byte
 	err := x.q.QueryRow(ctx, `SELECT current_date,
 			coalesce((SELECT generation FROM content_index WHERE scope = $1 AND owner_id = $2) = $4, false),
 			pg_current_snapshot()::text, pg_current_xact_id_if_assigned()::text,
+			(SELECT max(xid) FROM content_log WHERE scope = $1 AND owner_id = $2)::text,
 			coalesce((SELECT array_agg(body ORDER BY stamp, id) FROM content_log WHERE scope = $1 AND owner_id = $2
 				AND ($3::text IS NULL OR (xid >= pg_snapshot_xmin($3::text::pg_snapshot) AND NOT pg_visible_in_snapshot(xid, $3::text::pg_snapshot)))),
-				'{}')`, scope, owner, snapshotText(since), gen).Scan(&today, &current, &snap, &own, &bodies)
+				'{}')`, scope, owner, snapshotText(since), gen).Scan(&today, &current, &snap, &own, &newest, &bodies)
 	if err != nil || !current {
+		return today, false, nil, nil, err
+	}
+	if err := checkLog(sc, snap, newest, since); err != nil {
 		return today, false, nil, nil, err
 	}
 	place, err := readerPlace(snap, own)
@@ -539,6 +547,54 @@ func (x queries) ContentLogCurrent(ctx context.Context, sc backend.Scope, gen in
 		out[i] = backend.ContentLog{Body: b}
 	}
 	return today, true, out, place, nil
+}
+
+// checkLog refuses a content log this database cannot read rightly: one holding a row of a
+// transaction the database has not reached, or a place past the database's snapshot (since, a
+// reader's or a fold's). A dump carries the log's xid column and the fold's place, and not the
+// transaction counter they were read against, so under a counter restored near zero every row
+// written after a restore is numbered below both: reading on from the place misses those rows, and a
+// fold's cleanup deletes them as folded. A restore of a backup from earlier, or a failover to a
+// replica behind, leaves a place past the database the same way. The database's transaction IDs must
+// be moved past the restored rows' and places' first (pg_resetwal -x; docs/hosted.md, "Regions and
+// recovery").
+func checkLog(sc backend.Scope, snap string, newest *string, since backend.LogPlace) error {
+	now, err := snapshotXmax(snap)
+	if err != nil {
+		return err
+	}
+	if newest != nil {
+		n, err := strconv.ParseUint(*newest, 10, 64)
+		if err != nil {
+			return fmt.Errorf("%s's newest content log row %q: %w", sc.Name(), *newest, err)
+		}
+		if n >= now {
+			return fmt.Errorf("%s's content log holds transaction %d, which this database has not reached (its next is %d): it was restored without its transaction IDs; move them past %d (pg_resetwal -x) before ok reads it", sc.Name(), n, now, n)
+		}
+	}
+	if since != nil {
+		at, err := snapshotXmax(string(since))
+		if err != nil {
+			return err
+		}
+		if at > now {
+			return fmt.Errorf("%s's content log place %q is past this database's snapshot %q: it was kept from before a restore; move the database's transaction IDs past %d (pg_resetwal -x) before ok reads it", sc.Name(), string(since), snap, at)
+		}
+	}
+	return nil
+}
+
+// snapshotXmax is a pg_snapshot's xmax: the first transaction it has not seen begin.
+func snapshotXmax(snap string) (uint64, error) {
+	parts := strings.SplitN(snap, ":", 3)
+	if len(parts) != 3 {
+		return 0, fmt.Errorf("a snapshot %q", snap)
+	}
+	xmax, err := strconv.ParseUint(parts[1], 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("a snapshot %q: %w", snap, err)
+	}
+	return xmax, nil
 }
 
 // readerPlace is a snapshot as the place of the transaction that took it: with its own ID among
@@ -600,6 +656,17 @@ func (x queries) DeleteFoldedContentLogs(ctx context.Context, sc backend.Scope, 
 		return 0, nil
 	}
 	scope, owner := scopeOf(sc)
+	var snap string
+	var newest *string
+	if err := x.q.QueryRow(ctx, `SELECT pg_current_snapshot()::text, (SELECT max(xid) FROM content_log WHERE scope = $1 AND owner_id = $2)::text`,
+		scope, owner).Scan(&snap, &newest); err != nil {
+		return 0, err
+	}
+	// A fold's place a restore carried over is past every row written since, which would be deleted
+	// as folded.
+	if err := checkLog(sc, snap, newest, folded); err != nil {
+		return 0, err
+	}
 	tag, err := x.q.Exec(ctx, `DELETE FROM content_log WHERE ctid IN (SELECT ctid FROM content_log WHERE scope = $1 AND owner_id = $2
 		AND (xid < pg_snapshot_xmin($3::text::pg_snapshot) OR pg_visible_in_snapshot(xid, $3::text::pg_snapshot)) LIMIT $4)`,
 		scope, owner, string(folded), limit)

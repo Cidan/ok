@@ -27,6 +27,10 @@ import (
 // runHeader names the run a cache call is for (automation's service.RunHeader).
 const runHeader = "x-ok-run"
 
+// updateActionResult is the one call that says what an action made: refused once the run's reads
+// cannot be trusted (readsGuard), so the cache never takes a result built from too little of a file.
+const updateActionResult = "/build.bazel.remote.execution.v2.ActionCache/UpdateActionResult"
+
 // cacheServices are the services the pass-through forwards: Bazel's remote cache's.
 var cacheServices = []string{
 	"/build.bazel.remote.execution.v2.ContentAddressableStorage/",
@@ -63,8 +67,9 @@ type cacheProxy struct {
 	path string
 }
 
-// startCacheProxy serves a run's pass-through on a socket at path, forwarding to automation.
-func startCacheProxy(path string, automation grpc.ClientConnInterface, run int64) (*cacheProxy, error) {
+// startCacheProxy serves a run's pass-through on a socket at path, forwarding to automation. While
+// refuse, when given, is an error, it refuses to record any action's result.
+func startCacheProxy(path string, automation grpc.ClientConnInterface, run int64, refuse func() error) (*cacheProxy, error) {
 	_ = os.Remove(path)
 	l, err := net.Listen("unix", path)
 	if err != nil {
@@ -75,6 +80,11 @@ func startCacheProxy(path string, automation grpc.ClientConnInterface, run int64
 		method, ok := grpc.MethodFromServerStream(in)
 		if !ok || !forwarded(method) {
 			return status.Errorf(codes.Unimplemented, "the cache's pass-through serves the remote cache alone, not %s", method)
+		}
+		if method == updateActionResult && refuse != nil {
+			if err := refuse(); err != nil {
+				return status.Error(codes.FailedPrecondition, err.Error())
+			}
 		}
 		ctx, cancel := context.WithCancel(in.Context())
 		defer cancel()
@@ -150,8 +160,9 @@ func cacheFlags(socket string) []string {
 }
 
 // startCache starts a run's pass-through: in a microVM, on the host alone, which the guest's
-// microvm.CacheSocket reaches; else in the run's slot's scratch, which no other slot's runs see.
-func (cfg Config) startCache(run *automationpb.Run) (*cacheProxy, error) {
+// microvm.CacheSocket reaches; else in the run's slot's scratch, which no other slot's runs see. It
+// records no result once reads has failed.
+func (cfg Config) startCache(run *automationpb.Run, reads *readsGuard) (*cacheProxy, error) {
 	dir := cfg.scratch
 	if cfg.MicroVM != nil {
 		var err error
@@ -159,7 +170,7 @@ func (cfg Config) startCache(run *automationpb.Run) (*cacheProxy, error) {
 			return nil, err
 		}
 	}
-	return startCacheProxy(filepath.Join(dir, "cache-"+strconv.FormatInt(run.GetId(), 10)+".sock"), cfg.Automation, run.GetId())
+	return startCacheProxy(filepath.Join(dir, "cache-"+strconv.FormatInt(run.GetId(), 10)+".sock"), cfg.Automation, run.GetId(), reads.failed)
 }
 
 // runCacheFlags are a run's Bazel's flags for its remote cache, if it has one.
