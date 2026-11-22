@@ -35,7 +35,19 @@ service Deployments {
   rpc ListServices(ListServicesRequest) returns (ListServicesResponse);
   // GetService reads one service, with its recent deployments.
   rpc GetService(GetServiceRequest) returns (Service);
+  // RemoveService removes a service main no longer declares, with no deployment of it under
+  // way: ListServices and GetService pass over it from then on, and the observer stops reading
+  // its workload, which stays as it is in the cluster. Its deployments stay. A plan that declares
+  // its deploy again restores it.
+  rpc RemoveService(RemoveServiceRequest) returns (RemoveServiceResponse);
 }
+
+message RemoveServiceRequest {
+  int64 id = 1;
+  string for_person_id = 2;  // ok control only
+}
+
+message RemoveServiceResponse {}
 
 message ListServicesRequest {
   int64 repository_id = 1;  // 0: every repository's

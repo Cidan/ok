@@ -32,8 +32,8 @@ func (matrixAccess) Forget(int64)                                    {}
 
 // ok control's operations hold to the permission matrix: for every kind of caller — a personal or
 // installation token presented with the request — at every visibility, each action is required as
-// Authorize allows it, and a CL's lifecycle, submitting, its checks, and deployments are each
-// allowed exactly as the actions they need are.
+// Authorize allows it, and a CL's lifecycle, submitting, its checks, deployments, and removing a
+// service are each allowed exactly as the actions they need are.
 func TestAccessMatrix(t *testing.T) {
 	repo := &scmpb.Repository{Id: authztest.RepositoryID}
 	for v := tenancy.Private; v <= tenancy.Public; v++ {
@@ -61,6 +61,7 @@ func TestAccessMatrix(t *testing.T) {
 				"retrying another's deployment": {s.MayActOnDeployment(ctx, repo, who, DeploymentRetry, false) == nil, may(authz.Administer) || may(authz.Maintain)},
 				"halting their own deployment":  {s.MayActOnDeployment(ctx, repo, who, DeploymentHalt, true) == nil, may(authz.Administer) || may(authz.Maintain) || may(authz.Land)},
 				"allowing a deployment":         {s.MayActOnDeployment(ctx, repo, who, DeploymentAllow, true) == nil, may(authz.Administer)},
+				"removing a service":            {s.MayRemoveService(ctx, repo, who) == nil, signedIn && may(authz.Administer)},
 				"administering":                 {s.IsAdmin(ctx, repo, who), signedIn && may(authz.Administer)},
 			} {
 				if tc.got != tc.want {

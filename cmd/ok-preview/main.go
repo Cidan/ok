@@ -815,6 +815,9 @@ func mockService(sv pages.ServiceSummary) pages.ServiceView {
 		Workload: sv.Workload, Declared: sv.Declared, StatusLabel: sv.StatusLabel, StatusKind: sv.StatusKind, Reason: sv.Reason,
 		Found: sv.Found, Live: "green", Ready: sv.Ready, Replicas: sv.Replicas, Recent: recent,
 	}
+	if !sv.Declared {
+		v.RemoveHref = pages.ServiceHref(sv.ID) + "/remove"
+	}
 	if len(recent) == 0 {
 		return v
 	}
@@ -1228,6 +1231,10 @@ func main() {
 		mockServiceGroup(w, r, strings.TrimPrefix(r.URL.Path, "/services/group/"), 0)
 	})
 	mux.HandleFunc("/services/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/remove") {
+			pages.NavigateContent(w, r, "/services")
+			return
+		}
 		id, _ := strconv.ParseInt(strings.TrimPrefix(r.URL.Path, "/services/"), 10, 64)
 		mockServiceGroup(w, r, "", id)
 	})

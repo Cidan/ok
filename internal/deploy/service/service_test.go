@@ -289,6 +289,36 @@ func TestServices(t *testing.T) {
 	if _, err := c.GetService(as(control), &deploypb.GetServiceRequest{Id: 999}); status.Code(err) != codes.NotFound {
 		t.Errorf("a service that does not exist: %v", err)
 	}
+
+	// ok control removes a service no longer declared for the person it names; a declared one
+	// stays.
+	for _, tc := range []struct {
+		what string
+		ctx  context.Context
+		req  *deploypb.RemoveServiceRequest
+		want codes.Code
+	}{
+		{"unidentified", as(""), &deploypb.RemoveServiceRequest{Id: g.GetId(), ForPersonId: admin}, codes.Unauthenticated},
+		{"naming no one", as(control), &deploypb.RemoveServiceRequest{Id: g.GetId()}, codes.InvalidArgument},
+		{"a declared service", as(control), &deploypb.RemoveServiceRequest{Id: s.GetId(), ForPersonId: admin}, codes.FailedPrecondition},
+		{"a service that does not exist", as(control), &deploypb.RemoveServiceRequest{Id: 999, ForPersonId: admin}, codes.NotFound},
+		{"a service no longer declared", as(control), &deploypb.RemoveServiceRequest{Id: g.GetId(), ForPersonId: admin}, codes.OK},
+		{"a removed service", as(control), &deploypb.RemoveServiceRequest{Id: g.GetId(), ForPersonId: admin}, codes.NotFound},
+	} {
+		if _, err := c.RemoveService(tc.ctx, tc.req); status.Code(err) != tc.want {
+			t.Errorf("removing %s: %v, want %s", tc.what, err, tc.want)
+		}
+	}
+	if err := (&observe.Observer{Store: st, Kube: cluster.Kube}).Round(ctx); err != nil {
+		t.Fatal(err)
+	}
+	list, err = c.ListServices(as(control), &deploypb.ListServicesRequest{})
+	if err != nil || len(list.GetServices()) != 1 || list.GetServices()[0].GetId() != s.GetId() {
+		t.Errorf("services after gone's removal %v (%v)", list.GetServices(), err)
+	}
+	if _, err := c.GetService(as(control), &deploypb.GetServiceRequest{Id: g.GetId()}); status.Code(err) != codes.NotFound {
+		t.Errorf("reading a removed service: %v", err)
+	}
 }
 
 // TestCallers pins who may call the deployer: only ok control, which ok's runtime holds to the

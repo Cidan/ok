@@ -649,9 +649,13 @@ func (s *Store) Recent(ctx context.Context, sv *Service, limit int) ([]*Deployme
 	return s.b.DeployDeployments(ctx, sv.Repository, sv.Deploy, limit)
 }
 
-// RecordObservation stores what the observer read of a service's workload.
+// RecordObservation stores what the observer read of a service's workload: nothing of a service
+// removed since it was read (RemoveService), or gone with its repository.
 func (s *Store) RecordObservation(ctx context.Context, service int64, o Observation) error {
 	sv, err := s.GetService(ctx, service)
+	if errors.Is(err, ErrNotFound) {
+		return nil
+	}
 	if err != nil {
 		return err
 	}
@@ -1015,6 +1019,44 @@ func (s *Store) Allow(ctx context.Context, id int64, by string) (*Deployment, er
 		return nil, err
 	}
 	return s.Get(ctx, id)
+}
+
+// RemoveService removes a service main no longer declares, for a person (by stable ID): the
+// Services pages and the observer pass over it from then on, what the observer last read of it
+// goes, and its deployments stay. A plan that declares its deploy again restores it
+// (Ops.RecordServices). A service with a deployment under way is removed once that ends.
+func (s *Store) RemoveService(ctx context.Context, id int64, by string) error {
+	sv, ok, err := s.b.Service(ctx, id)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return ErrNotFound
+	}
+	ctx = move.WithRepository(ctx, sv.Repository)
+	return s.write(ctx, func(tx Ops) error {
+		repo, deploy, declared, ok, err := tx.LockService(ctx, id)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return ErrNotFound
+		}
+		if declared {
+			return conflict("service %d remains declared: workflow files on main still define this service", id)
+		}
+		open, ok, err := tx.OpenDeploymentOf(ctx, repo, deploy)
+		if err != nil {
+			return err
+		}
+		if ok {
+			return conflict("deployment %d for service %d is in progress: remove the service after the deployment finishes", open, id)
+		}
+		if err := tx.RemoveService(ctx, id, by); err != nil {
+			return err
+		}
+		return pendChanged(ctx, tx, wait.ServicesSubject)
+	})
 }
 
 // ─── Agents (docs/hosted.md, "Deploy agents, as built") ───

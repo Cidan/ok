@@ -326,7 +326,7 @@ func (x queries) RecordServices(ctx context.Context, repo, seq int64, deploys []
 				return err
 			}
 			sql := `UPDATE service SET name = @name, namespace = @namespace, kind = @kind, workload = @workload, declared = TRUE,
-				declared_seq = @seq, group_name = @group WHERE service_id = @id`
+				declared_seq = @seq, group_name = @group, removed_by = NULL, removed_at = NULL WHERE service_id = @id`
 			if ok {
 				p["id"] = id
 			} else {
@@ -593,6 +593,19 @@ func (x queries) NewerOf(ctx context.Context, repo int64, deploy string, id int6
 	return newer, ok, err
 }
 
+func (x queries) OpenDeploymentOf(ctx context.Context, repo int64, deploy string) (int64, bool, error) {
+	var open int64
+	var ok bool
+	err := x.Read(func(r spannerdata.Reader) error {
+		var err error
+		ok, err = spannerdata.First(ctx, r, `SELECT deployment_id FROM deployment WHERE repository_id = @repo AND deploy = @deploy
+			AND status IN (@waiting, @running) ORDER BY created_at, deployment_id LIMIT 1`,
+			map[string]any{"repo": repo, "deploy": deploy, "waiting": int64(store.Waiting), "running": int64(store.Running)}, &open)
+		return err
+	})
+	return open, ok, err
+}
+
 func (x queries) PlanStatuses(ctx context.Context, plan int64) (map[int][]store.Status, error) {
 	var out map[int][]store.Status
 	err := x.Read(func(r spannerdata.Reader) error {
@@ -739,15 +752,36 @@ func (x queries) services(ctx context.Context, where string, params map[string]a
 
 func (x queries) Services(ctx context.Context, repo int64) ([]store.ServiceRow, error) {
 	return x.services(ctx, `WHERE (@repo = 0 AND NOT EXISTS (SELECT 1 FROM move_gate g WHERE g.repository_id = s.repository_id AND g.move_state != '')
-		OR s.repository_id = @repo) ORDER BY r.name, s.name, s.service_id`, map[string]any{"repo": repo})
+		OR s.repository_id = @repo) AND s.removed_at IS NULL ORDER BY r.name, s.name, s.service_id`, map[string]any{"repo": repo})
 }
 
 func (x queries) Service(ctx context.Context, id int64) (store.ServiceRow, bool, error) {
-	out, err := x.services(ctx, `WHERE s.service_id = @id`, map[string]any{"id": id})
+	out, err := x.services(ctx, `WHERE s.service_id = @id AND s.removed_at IS NULL`, map[string]any{"id": id})
 	if err != nil || len(out) == 0 {
 		return store.ServiceRow{}, false, err
 	}
 	return out[0], true, nil
+}
+
+func (x queries) LockService(ctx context.Context, id int64) (repo int64, deploy string, declared, ok bool, err error) {
+	err = x.Read(func(r spannerdata.Reader) error {
+		var err error
+		ok, err = spannerdata.First(ctx, r, `SELECT repository_id, deploy, declared FROM service WHERE service_id = @id AND removed_at IS NULL FOR UPDATE`,
+			map[string]any{"id": id}, &repo, &deploy, &declared)
+		return err
+	})
+	return repo, deploy, declared, ok, err
+}
+
+func (x queries) RemoveService(ctx context.Context, id int64, by string) error {
+	return x.Write(ctx, func(tx *spanner.ReadWriteTransaction) error {
+		p := map[string]any{"id": id, "by": by}
+		if _, err := spannerdata.Update(ctx, tx, `UPDATE service SET removed_by = @by, removed_at = CURRENT_TIMESTAMP() WHERE service_id = @id`, p); err != nil {
+			return err
+		}
+		_, err := spannerdata.Update(ctx, tx, `DELETE FROM service_observation WHERE service_id = @id`, p)
+		return err
+	})
 }
 
 func (x queries) RecordObservation(ctx context.Context, service int64, o store.Observation) error {
@@ -771,7 +805,11 @@ func (x queries) RecordObservation(ctx context.Context, service int64, o store.O
 		"ready": int64(o.Ready), "images": string(images), "pods": string(podsJSON)}
 	return x.Write(ctx, func(tx *spanner.ReadWriteTransaction) error {
 		var one int64
-		ok, err := spannerdata.First(ctx, tx, `SELECT 1 FROM service_observation WHERE service_id = @service`, p, &one)
+		ok, err := spannerdata.First(ctx, tx, `SELECT 1 FROM service WHERE service_id = @service AND removed_at IS NULL`, p, &one)
+		if err != nil || !ok {
+			return err
+		}
+		ok, err = spannerdata.First(ctx, tx, `SELECT 1 FROM service_observation WHERE service_id = @service`, p, &one)
 		if err != nil {
 			return err
 		}

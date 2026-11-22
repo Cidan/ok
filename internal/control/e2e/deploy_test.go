@@ -62,6 +62,24 @@ func (d *deployer) GetService(_ context.Context, req *deploypb.GetServiceRequest
 	return nil, status.Error(codes.NotFound, "no such service")
 }
 
+// RemoveService removes a service no longer declared, as the deployer does; a declared one stays.
+func (d *deployer) RemoveService(_ context.Context, req *deploypb.RemoveServiceRequest) (*deploypb.RemoveServiceResponse, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.asked = append(d.asked, "remove service "+itoa(req.GetId())+" for "+req.GetForPersonId())
+	for i, sv := range d.services {
+		if sv.GetId() != req.GetId() {
+			continue
+		}
+		if sv.GetDeclared() {
+			return nil, status.Errorf(codes.FailedPrecondition, "service %d remains declared: workflow files on main still define this service", sv.GetId())
+		}
+		d.services = append(d.services[:i], d.services[i+1:]...)
+		return &deploypb.RemoveServiceResponse{}, nil
+	}
+	return nil, status.Error(codes.NotFound, "no such service")
+}
+
 // startDeployer serves the deployer's stand-in on a loopback port.
 func startDeployer(t *testing.T) (*deployer, string) {
 	t.Helper()

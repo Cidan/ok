@@ -98,7 +98,8 @@ type Ops interface {
 	// Plans are a repository's plans (0: every repository's), oldest first.
 	Plans(ctx context.Context, repo int64) ([]Plan, error)
 	// RecordServices records the services a repository's main declares at seq: each deploy that
-	// rolls a workload. Its services not among them are no longer declared.
+	// rolls a workload, restoring any a person removed. Its services not among them are no longer
+	// declared.
 	RecordServices(ctx context.Context, repo, seq int64, deploys []workflow.Deploy) error
 
 	// ─── Deployments ───
@@ -136,6 +137,9 @@ type Ops interface {
 	// NewerOf is the newest deployment of a repository's deploy made after the deployment id, if
 	// any.
 	NewerOf(ctx context.Context, repo int64, deploy string, id int64) (int64, bool, error)
+	// OpenDeploymentOf is the oldest waiting or running deployment of a repository's deploy, if
+	// any.
+	OpenDeploymentOf(ctx context.Context, repo int64, deploy string) (int64, bool, error)
 	// PlanStatuses are the statuses of a plan's deployments, by wave.
 	PlanStatuses(ctx context.Context, plan int64) (map[int][]Status, error)
 
@@ -172,13 +176,20 @@ type Ops interface {
 
 	// ─── Services ───
 
-	// Services are the services of a repository (0: every repository but those moving between
-	// cells, or moved), by repository name, name, and ID, each with its latest and its latest
-	// succeeded deployment's IDs.
+	// Services are the services not removed of a repository (0: every repository but those moving
+	// between cells, or moved), by repository name, name, and ID, each with its latest and its
+	// latest succeeded deployment's IDs.
 	Services(ctx context.Context, repo int64) ([]ServiceRow, error)
-	// Service reads a service; ok is false when there is none.
+	// Service reads a service; ok is false when there is none, or it was removed.
 	Service(ctx context.Context, id int64) (ServiceRow, bool, error)
-	// RecordObservation stores what the observer read of a service's workload.
+	// LockService reads a service not removed, held: its repository, its deploy's identity, and
+	// whether main declares it; ok is false when there is none.
+	LockService(ctx context.Context, id int64) (repo int64, deploy string, declared, ok bool, err error)
+	// RemoveService records that a person (by stable ID) removed a service, and deletes what the
+	// observer last read of it.
+	RemoveService(ctx context.Context, id int64, by string) error
+	// RecordObservation stores what the observer read of a service's workload, unless the service
+	// was removed.
 	RecordObservation(ctx context.Context, service int64, o Observation) error
 	// Observations are the latest observations of services, by service.
 	Observations(ctx context.Context, ids []int64) (map[int64]*Observation, error)

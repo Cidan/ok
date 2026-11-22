@@ -1,5 +1,6 @@
 // Package service is the deployer's Deployments service: ok control reads deployments for the
-// CLs they cover, and retries, halts, and allows hazards on behalf of the people it has authorized.
+// CLs they cover and the services ok deploys, and retries, halts, and allows hazards, and removes
+// services no longer declared, on behalf of the people it has authorized.
 package service
 
 import (
@@ -174,6 +175,17 @@ func (s *Service) ListServices(ctx context.Context, req *deploypb.ListServicesRe
 		out.Services = append(out.Services, serviceOut(sv))
 	}
 	return out, nil
+}
+
+func (s *Service) RemoveService(ctx context.Context, req *deploypb.RemoveServiceRequest) (*deploypb.RemoveServiceResponse, error) {
+	who, err := s.requester(ctx, req.GetForPersonId())
+	if err != nil {
+		return nil, err
+	}
+	if err := s.store.RemoveService(ctx, req.GetId(), who); err != nil {
+		return nil, toStatus(err)
+	}
+	return &deploypb.RemoveServiceResponse{}, nil
 }
 
 func (s *Service) GetService(ctx context.Context, req *deploypb.GetServiceRequest) (*deploypb.Service, error) {

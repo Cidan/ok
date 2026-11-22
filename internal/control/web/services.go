@@ -22,6 +22,7 @@ import (
 	"github.com/Cidan/ok/internal/control/review"
 	"github.com/Cidan/ok/internal/control/scm"
 	deploypb "github.com/Cidan/ok/proto/ok/deploy/v1"
+	scmpb "github.com/Cidan/ok/proto/ok/scm/v1"
 )
 
 // services is the Services page: every group of services ok deploys, with its status
@@ -54,7 +55,7 @@ func (s *Server) serviceGroup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !g.Overview() {
-		s.serveService(w, r, g, g.Members[0].ID)
+		s.serveService(w, r, g, g.Members[0].ID, "")
 		return
 	}
 	recent, err := s.groupRecent(ctx, g)
@@ -82,7 +83,68 @@ func (s *Server) service(w http.ResponseWriter, r *http.Request) {
 		fail(w, r, review.ErrNotFound)
 		return
 	}
-	s.serveService(w, r, g, id)
+	s.serveService(w, r, g, id, "")
+}
+
+// removeService removes a service its repository's main no longer declares, for an admin of that
+// repository, then goes to what is left of its group — or, the group gone with it, the Services
+// page. A refusal, ok control's or the deployer's, is the pane's notice.
+func (s *Server) removeService(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil || id < 1 {
+		fail(w, r, review.ErrNotFound)
+		return
+	}
+	groups, err := s.serviceGroups(ctx)
+	if err != nil {
+		s.groupFailed(w, r, err)
+		return
+	}
+	g, ok := servicegroup.Find(groups, id)
+	if !ok {
+		fail(w, r, review.ErrNotFound)
+		return
+	}
+	sv, err := s.deploys.GetService(ctx, &deploypb.GetServiceRequest{Id: id, Recent: 1})
+	if status.Code(err) == codes.NotFound {
+		fail(w, r, review.ErrNotFound)
+		return
+	}
+	if err != nil {
+		s.groupFailed(w, r, fmt.Errorf("%w: %w", errDeployer, err))
+		return
+	}
+	me := principal(r)
+	if err := s.review.MayRemoveService(ctx, &scmpb.Repository{Id: sv.GetRepositoryId()}, me); err != nil {
+		s.serveService(w, r, g, id, err.Error())
+		return
+	}
+	_, err = s.deploys.RemoveService(ctx, &deploypb.RemoveServiceRequest{Id: id, ForPersonId: me})
+	switch status.Code(err) {
+	case codes.OK, codes.NotFound:
+		// Removed, now or by someone else just before.
+	case codes.FailedPrecondition:
+		s.serveService(w, r, g, id, upperFirst(status.Convert(err).Message()))
+		return
+	default:
+		s.groupFailed(w, r, fmt.Errorf("%w: %w", errDeployer, err))
+		return
+	}
+	pages.NavigateContent(w, r, s.remainingGroupHref(ctx, g))
+}
+
+// remainingGroupHref is where the browser goes once a service of g is removed: what is left of the
+// group, or the Services page when nothing is.
+func (s *Server) remainingGroupHref(ctx context.Context, g servicegroup.Group) string {
+	if g.Named {
+		if groups, err := s.serviceGroups(ctx); err == nil {
+			if left, ok := servicegroup.FindNamed(groups, g.Name); ok {
+				return left.Href()
+			}
+		}
+	}
+	return "/services"
 }
 
 // errDeployer wraps a failure to ask the deployer.
@@ -191,9 +253,9 @@ func (s *Server) groupRecent(ctx context.Context, g servicegroup.Group) ([]pages
 	return out, nil
 }
 
-// serveService serves a service's page in its group: what the deployer says of it, and the
-// group's services beside it.
-func (s *Server) serveService(w http.ResponseWriter, r *http.Request, g servicegroup.Group, id int64) {
+// serveService serves a service's page in its group: what the deployer says of it, what the viewer
+// may do to it, and the group's services beside it; notice says why an action on it was refused.
+func (s *Server) serveService(w http.ResponseWriter, r *http.Request, g servicegroup.Group, id int64, notice string) {
 	ctx := r.Context()
 	sv, err := s.deploys.GetService(ctx, &deploypb.GetServiceRequest{Id: id})
 	if status.Code(err) == codes.NotFound {
@@ -246,7 +308,10 @@ func (s *Server) serveService(w http.ResponseWriter, r *http.Request, g serviceg
 	for _, d := range sv.GetRecent() {
 		v.Recent = append(v.Recent, *deployment(d))
 	}
-	pages.ServeServiceGroup(w, r, pages.ServiceGroupView{Group: g, Selected: id, Service: &v})
+	if !sv.GetDeclared() && s.review.MayRemoveService(ctx, &scmpb.Repository{Id: sv.GetRepositoryId()}, principal(r)) == nil {
+		v.RemoveHref = pages.ServiceHref(id) + "/remove"
+	}
+	pages.ServeServiceGroup(w, r, pages.ServiceGroupView{Group: g, Selected: id, Service: &v, Notice: notice})
 }
 
 // serviceDeployment is a deployment of a service: its status, stage, and why; the commit it

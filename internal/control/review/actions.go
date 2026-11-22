@@ -68,6 +68,15 @@ func (s *Service) MayActOnDeployment(ctx context.Context, repo *scmpb.Repository
 	return refuse("Only a repository admin or maintainer, or the author of a CL it deploys, can %s this deployment", action)
 }
 
+// MayRemoveService refuses a person who may not remove a service its repository's main no longer
+// declares from the Services pages: that is a repository admin's alone.
+func (s *Service) MayRemoveService(ctx context.Context, repo *scmpb.Repository, principal string) error {
+	if !s.IsAdmin(ctx, repo, principal) {
+		return refuse("You must be a repository admin to remove this service")
+	}
+	return nil
+}
+
 // Admins are the repository's admins, by stable ID, sorted by name; none when ok identity cannot
 // say.
 func (s *Service) Admins(ctx context.Context, repo *scmpb.Repository) []string {

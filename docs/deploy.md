@@ -351,13 +351,25 @@ its head. For each, the deployer answers what ok deployed — its latest deploym
 the images by digest, the commit they were built at — its latest deployment of any status, and what
 the cluster runs: the live copy, the replicas it wants and has Ready, and each pod's copy,
 readiness, restarts, and the image digest each container actually runs. ok control's Services
-pages show them, read-only.
+pages display these services read-only, aside from removing a service that `main` no longer
+declares.
 
 **Groups.** A deploy's `group` puts its service with others that make up one system, and the
 Services pages show groups: one namespace across repositories, so a group's services may be
 declared anywhere, and a service with no group is a group of its own. A group's status is its worst
 service's (Last Deploy Failed, then Degraded, Unknown, Drifted, Deploying, Not Deployed Yet,
 Healthy).
+
+**Removing a service.** A service whose stanza `main` no longer declares remains on the Services
+pages marked No Longer Declared until a repository admin removes the service. On that service's
+page, ok control provides Remove and calls `RemoveService` on ok's deployer for that person. ok's
+deployer refuses removal when `main` still declares the service or when a deployment for the service
+is waiting or running. Upon removal, ok's deployer retains the service row, records the removing
+person by stable ID in `removed_by` and the timestamp in `removed_at`, and deletes the last
+recorded observation; `ListServices`, `GetService`, and the observer skip removed services. Removal
+leaves the cluster workload unmodified and preserves deployments on the CLs they cover. When a
+later plan declares the deploy again, ok's deployer clears `removed_by` and `removed_at` and
+restores the service with the same ID.
 
 **What runs is read in the background, never on a request.** The deployer's observer reads each
 service's workload from the cluster and records it, ten seconds after its last read ended: each
@@ -372,5 +384,6 @@ migrations' plans, the push runs' logs, and the actions — Retry, Halt, and All
 hazard. A failed deployment offers Roll Back of the CLs it covers ([automation.md](automation.md),
 "Rollbacks").
 
-**Who may act:** Retry and Halt, the authors of the CLs a deployment covers and repository admins;
-allowing a hazard, repository admins.
+**Who may act:** Retry and Halt, repository admins and the authors of CLs covered by a deployment;
+allowing a hazard, repository admins; removing a service that `main` no longer declares,
+repository admins.

@@ -2,9 +2,11 @@ package e2e
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/url"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -192,6 +194,59 @@ func TestServices(t *testing.T) {
 	}
 	if p := hx("/services/group/edge", "main#content"); !strings.HasPrefix(p.body, `<div class="flex h-full`) || !p.has(`id="service-main"`) {
 		t.Errorf("entering the group: %s", excerpt(p.body))
+	}
+
+	// A repository admin removes a service main no longer declares; no one else is offered it, and
+	// a declared service stays.
+	const removeGone = `action="/services/6/remove"`
+	if p := e.get(carol, "/services/6"); p.has(removeGone) {
+		t.Errorf("a person who does not administer svc is offered Remove: %s", excerpt(p.body))
+	}
+	if p := e.get(dana, "/services/6"); !p.has(removeGone) || !p.has("Remove Service") {
+		t.Errorf("svc's admin is not offered Remove: %s", excerpt(p.body))
+	}
+	if p := e.get(dana, "/services/1"); p.has(`action="/services/1/remove"`) {
+		t.Errorf("a declared service offers Remove")
+	}
+	removing := func(who, path string) page {
+		return e.do(who, http.MethodPost, path, url.Values{}, map[string]string{"HX-Request": "true", "HX-Target": "div#service-main"})
+	}
+	if p := removing(carol, "/services/6/remove"); p.status != http.StatusOK || !p.has("data-notice") || !p.has("You must be a repository admin to remove this service") ||
+		!strings.HasPrefix(p.body, `<div class="pb-16">`) {
+		t.Errorf("carol removing gone: %d %s", p.status, excerpt(p.body))
+	}
+	if p := removing(dana, "/services/1/remove"); !p.has("data-notice") || !p.has("Service 1 remains declared: workflow files on main still define this service") {
+		t.Errorf("removing a declared service: %s", excerpt(p.body))
+	}
+	location := func(p page) (path, target string) {
+		var loc struct{ Path, Target string }
+		if err := json.Unmarshal([]byte(p.header.Get("HX-Location")), &loc); err != nil {
+			t.Errorf("HX-Location %q: %v", p.header.Get("HX-Location"), err)
+		}
+		return loc.Path, loc.Target
+	}
+	// gone was a group of its own: the browser goes to the Services page, which no longer lists it.
+	if path, target := location(removing(dana, "/services/6/remove")); path != "/services" || target != "#content" {
+		t.Errorf("after removing gone: %s into %s", path, target)
+	}
+	if got := e.deployer.actions(); !slices.Equal(got, []string{"remove service 1 for " + e.id(dana), "remove service 6 for " + e.id(dana)}) {
+		t.Errorf("asked of the deployer: %v", got)
+	}
+	if p := e.get(carol, "/services"); strings.Contains(p.body, `href="/services/6"`) {
+		t.Errorf("the Services page still lists gone: %s", excerpt(p.body))
+	}
+	if p := e.do(carol, http.MethodGet, "/services/6", nil, nil); p.status != http.StatusNotFound {
+		t.Errorf("a removed service's page: %d", p.status)
+	}
+	// One of a group's services: the browser goes to what is left of the group.
+	e.deployer.mu.Lock()
+	e.deployer.services[2].Declared = false
+	e.deployer.mu.Unlock()
+	if path, _ := location(removing(dana, "/services/3/remove")); path != "/services/group/edge" {
+		t.Errorf("after removing web from edge: %s", path)
+	}
+	if p := e.get(carol, "/services/group/edge"); p.has(`href="/services/3"`) || !p.has(`href="/services/2"`) {
+		t.Errorf("edge after web's removal: %s", excerpt(p.body))
 	}
 
 	e.deployer.mu.Lock()

@@ -11,8 +11,9 @@ import (
 // The Services pages (docs/deploy.md, "Services"): every group of services ok deploys
 // (groups.go), each with its status in aggregate; and a group's page — the sub-nav of its
 // services beside the pane, which shows the group's overview or one of its services: what it
-// runs and what ok deployed, its pods, the image each runs, its recent deployments. Read-only,
-// and live: each refreshes itself as the deployer says its services changed — a deployment, or a
+// runs and what ok deployed, its pods, the image each runs, its recent deployments. Read-only but
+// for removing a service main no longer declares, and live: each refreshes itself as the deployer
+// says its services changed — a deployment, or a
 // change in what its observer, reading the cluster every ten seconds, found (live.js).
 //
 // Regions, smallest first (docs/web.md, "Navigation & hydration"):
@@ -179,17 +180,47 @@ templ ServiceGroupContent(v ServiceGroupView) {
 	</div>
 }
 
-// ServiceGroupMain is the pane: where it is in the group, then what it shows — a live region
-// that refreshes itself.
+// ServiceGroupMain is the pane: where it is in the group, with what the viewer may do to the
+// service it shows, then what it shows — a live region that refreshes itself, which an action's
+// popover stays out of.
 templ ServiceGroupMain(v ServiceGroupView) {
 	<div class="pb-16">
-		<div class="mb-4 flex min-h-9 items-center">
-			@breadcrumb.Trail(serviceGroupCrumbs(v), "")
+		<div class="mb-4 flex min-h-9 items-center gap-4">
+			<div class="min-w-0 flex-1">
+				@breadcrumb.Trail(serviceGroupCrumbs(v), "")
+			</div>
+			if v.Service != nil && v.Service.RemoveHref != "" {
+				@serviceRemoveForm(v.Service.RemoveHref)
+			}
 		</div>
+		if v.Notice != "" {
+			<div data-notice class="mb-4 flex items-start gap-2.5 rounded-xl border border-warn-line bg-warn-soft px-4 py-3 text-sm text-warn">
+				@iconAlert()
+				<span>{ v.Notice }</span>
+			</div>
+		}
 		<div id="service-live" data-live hx-get={ v.Href() } hx-trigger="live" data-live-events={ servicesEvents } hx-target="this" hx-swap="innerHTML" class="space-y-4">
 			@serviceGroupBody(v)
 		</div>
 	</div>
+}
+
+// serviceRemoveForm is the Remove disclosure of a service main no longer declares: a popover
+// panel saying what removing it does. Removed, the browser goes to what is left of its group; a
+// refusal re-renders the pane with its notice.
+templ serviceRemoveForm(href string) {
+	<details class="group/remove relative shrink-0">
+		<summary class={ btnClass(btnSecondary), "list-none [&::-webkit-details-marker]:hidden" }>Remove</summary>
+		<form method="post" action={ templ.SafeURL(href) } hx-post={ href } hx-target="#service-main" hx-swap={ swapAction } class={ popoverClass, "absolute right-0 z-20 mt-2 w-80" }>
+			@panelTitle("Remove Service")
+			@panelBody() {
+				<p class="mb-3 text-sm text-muted">Remove this service from the Services pages without changing the cluster workload or deleting deployments. If main declares this service again, the service returns.</p>
+				<div class="mt-3 flex justify-end">
+					<button type="submit" class={ btnClass(btnSecondary) }>Remove</button>
+				</div>
+			}
+		</form>
+	</details>
 }
 
 // serviceGroupPane is the response to a navigation within the group: the pane, and the sub-nav

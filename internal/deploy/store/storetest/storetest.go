@@ -32,6 +32,7 @@ func Run(t *testing.T, open func(t *testing.T) store.Backend) {
 		{"Plans", testPlans}, {"PlanTellsWaiters", testPlanTellsWaiters}, {"Purge", testPurge},
 		{"Lifecycle", testLifecycle},
 		{"Actions", testActions},
+		{"RemoveService", testRemoveService},
 		{"Retiring", testRetiring},
 		{"Leases", testLeases},
 		{"Gates", testGates},
@@ -366,6 +367,70 @@ func testActions(t *testing.T, s *store.Store) {
 	}
 	if _, err := s.Get(ctx, 9999); !errors.Is(err, store.ErrNotFound) {
 		t.Errorf("a deployment that does not exist: %v", err)
+	}
+}
+
+// A person removes a service main no longer declares, once no deployment of it is under way: the
+// services and the observer pass over it, and its deployments stay. A plan that declares it again
+// restores it, as the same service, with nothing observed of it while it was removed.
+func testRemoveService(t *testing.T, s *store.Store) {
+	ctx := context.Background()
+	moveMain(t, s, 3)
+	const alice = "alice.human.example.com"
+	if _, err := s.RecordPlan(ctx, store.PlanResult{Repository: 1, Head: commit(1), HeadSeq: 1, By: self,
+		Deployments: []store.NewDeployment{{Deploy: web(), Why: "w", Wave: 1}}, Services: []workflow.Deploy{web()}}); err != nil {
+		t.Fatal(err)
+	}
+	svs, err := s.Services(ctx, 0)
+	if err != nil || len(svs) != 1 {
+		t.Fatalf("services %+v (%v)", svs, err)
+	}
+	id := svs[0].ID
+	var conflictErr *store.ConflictError
+	if err := s.RemoveService(ctx, id, alice); !errors.As(err, &conflictErr) || !strings.Contains(err.Error(), "remains declared") {
+		t.Errorf("removing a declared service: %v", err)
+	}
+	if _, err := s.RecordPlan(ctx, store.PlanResult{Repository: 1, Head: commit(2), HeadSeq: 2, BaseSeq: 1, By: self}); err != nil {
+		t.Fatal(err)
+	}
+	open, _ := s.Unfinished(ctx)
+	if err := s.RemoveService(ctx, id, alice); !errors.As(err, &conflictErr) || !strings.Contains(err.Error(), "in progress") {
+		t.Errorf("removing a service whose deployment waits: %v", err)
+	}
+	if err := s.Finish(ctx, open[0].ID, store.Canceled, "canceled"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordObservation(ctx, id, store.Observation{Error: "ok's deployer holds no grant"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RemoveService(ctx, id, alice); err != nil {
+		t.Fatal(err)
+	}
+	if svs, err := s.Services(ctx, 0); err != nil || len(svs) != 0 {
+		t.Errorf("services after the removal %+v (%v)", svs, err)
+	}
+	if _, err := s.GetService(ctx, id); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("reading a removed service: %v", err)
+	}
+	if err := s.RemoveService(ctx, id, alice); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("removing it twice: %v", err)
+	}
+	// An observer that read the service before its removal records nothing of it.
+	if err := s.RecordObservation(ctx, id, store.Observation{Found: true}); err != nil {
+		t.Errorf("observing a removed service: %v", err)
+	}
+	if d, err := s.Get(ctx, open[0].ID); err != nil || d.Deploy != web().ID() {
+		t.Errorf("its deployment after the removal %+v (%v)", d, err)
+	}
+	if err := s.RemoveService(ctx, 9999, alice); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("removing a service that does not exist: %v", err)
+	}
+
+	if _, err := s.RecordPlan(ctx, store.PlanResult{Repository: 1, Head: commit(3), HeadSeq: 3, BaseSeq: 2, By: self, Services: []workflow.Deploy{web()}}); err != nil {
+		t.Fatal(err)
+	}
+	if sv, err := s.GetService(ctx, id); err != nil || !sv.Declared || sv.DeclaredSeq != 3 || sv.Observation != nil || sv.Latest == nil || sv.Latest.ID != open[0].ID {
+		t.Errorf("declared again %+v (%v)", sv, err)
 	}
 }
 

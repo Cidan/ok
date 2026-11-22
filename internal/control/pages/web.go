@@ -1152,6 +1152,9 @@ type ServiceView struct {
 	Images         []ServiceImage
 	Pods           []ServicePod
 	Recent         []ServiceDeployment
+	// RemoveHref removes it from the Services pages: main no longer declares it, and the viewer
+	// administers its repository ("" otherwise).
+	RemoveHref string
 }
 
 // ServiceDeployment is a deployment of a service. Service names it, in a group's deployments.
@@ -1201,13 +1204,15 @@ type ServicePodImage struct {
 
 // ServiceGroupView is a group's page: the group, and what its pane shows — the overview (Selected
 // 0: its services, and Recent, its latest deployments) or one of its services (Service). Error,
-// on a live region's refresh, says the deployer could not be asked; nothing else is set.
+// on a live region's refresh, says the deployer could not be asked; nothing else is set. Notice
+// says why an action the viewer took on the service was refused.
 type ServiceGroupView struct {
 	Group    ServiceGroup
 	Selected int64
 	Service  *ServiceView
 	Recent   []ServiceDeployment
 	Error    string
+	Notice   string
 }
 
 // Href is what the page shows: the group's overview, or the service selected.
@@ -1802,11 +1807,22 @@ func hxTargetIs(r *http.Request, id string) bool {
 // request follows HX-Location — a GET swapped into the #repo-main boundary, pushing href — and
 // any other a 303 redirect.
 func Navigate(w http.ResponseWriter, r *http.Request, href string) {
+	navigate(w, r, href, "#repo-main")
+}
+
+// NavigateContent sends the browser to href, a page outside any repository (the Services pages),
+// after an action that leaves the page it was posted from: an htmx request follows HX-Location — a
+// GET swapped into the #content region, pushing href — and any other a 303 redirect.
+func NavigateContent(w http.ResponseWriter, r *http.Request, href string) {
+	navigate(w, r, href, "#content")
+}
+
+func navigate(w http.ResponseWriter, r *http.Request, href, target string) {
 	if r.Header.Get("HX-Request") != "true" {
 		http.Redirect(w, r, href, http.StatusSeeOther)
 		return
 	}
-	loc, _ := json.Marshal(map[string]string{"path": href, "target": "#repo-main", "swap": swapNav})
+	loc, _ := json.Marshal(map[string]string{"path": href, "target": target, "swap": swapNav})
 	w.Header().Set("HX-Location", string(loc))
 	w.WriteHeader(http.StatusOK)
 }

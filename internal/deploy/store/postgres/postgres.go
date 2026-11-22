@@ -265,7 +265,8 @@ func (x queries) RecordServices(ctx context.Context, repo, seq int64, deploys []
 		ids = append(ids, d.ID())
 		if _, err := x.q.Exec(ctx, `INSERT INTO service (id, repository_id, deploy, name, namespace, kind, workload, declared, declared_seq, group_name)
 			VALUES ($9, $1, $2, $3, $4, $5, $6, true, $7, $8)
-			ON CONFLICT (repository_id, deploy) DO UPDATE SET name = $3, namespace = $4, kind = $5, workload = $6, declared = true, declared_seq = $7, group_name = $8`,
+			ON CONFLICT (repository_id, deploy) DO UPDATE SET name = $3, namespace = $4, kind = $5, workload = $6, declared = true, declared_seq = $7, group_name = $8,
+				removed_by = NULL, removed_at = NULL`,
 			repo, d.ID(), d.Name, w.Namespace, string(w.Kind), w.Name, seq, d.Group, data.NewID()); err != nil {
 			return err
 		}
@@ -529,6 +530,16 @@ func (x queries) NewerOf(ctx context.Context, repo int64, deploy string, id int6
 	return newer, err == nil, err
 }
 
+func (x queries) OpenDeploymentOf(ctx context.Context, repo int64, deploy string) (int64, bool, error) {
+	var open int64
+	err := x.q.QueryRow(ctx, `SELECT id FROM deployment WHERE repository_id = $1 AND deploy = $2 AND status IN ($3, $4)
+		ORDER BY created_at, id LIMIT 1`, repo, deploy, store.Waiting, store.Running).Scan(&open)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, false, nil
+	}
+	return open, err == nil, err
+}
+
 func (x queries) PlanStatuses(ctx context.Context, plan int64) (map[int][]store.Status, error) {
 	rows, err := x.q.Query(ctx, `SELECT wave, status FROM deployment WHERE plan_id = $1`, plan)
 	if err != nil {
@@ -651,15 +662,32 @@ func (x queries) services(ctx context.Context, where string, arg int64) ([]store
 
 func (x queries) Services(ctx context.Context, repo int64) ([]store.ServiceRow, error) {
 	return x.services(ctx, `WHERE ($1::bigint = 0 AND NOT EXISTS (SELECT 1 FROM move_gate g WHERE g.repository_id = s.repository_id AND g.move_state <> '')
-		OR s.repository_id = $1) ORDER BY r.name, s.name, s.id`, repo)
+		OR s.repository_id = $1) AND s.removed_at IS NULL ORDER BY r.name, s.name, s.id`, repo)
 }
 
 func (x queries) Service(ctx context.Context, id int64) (store.ServiceRow, bool, error) {
-	out, err := x.services(ctx, `WHERE s.id = $1`, id)
+	out, err := x.services(ctx, `WHERE s.id = $1 AND s.removed_at IS NULL`, id)
 	if err != nil || len(out) == 0 {
 		return store.ServiceRow{}, false, err
 	}
 	return out[0], true, nil
+}
+
+func (x queries) LockService(ctx context.Context, id int64) (repo int64, deploy string, declared, ok bool, err error) {
+	err = x.q.QueryRow(ctx, `SELECT repository_id, deploy, declared FROM service WHERE id = $1 AND removed_at IS NULL FOR UPDATE`, id).
+		Scan(&repo, &deploy, &declared)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, "", false, false, nil
+	}
+	return repo, deploy, declared, err == nil, err
+}
+
+func (x queries) RemoveService(ctx context.Context, id int64, by string) error {
+	if _, err := x.q.Exec(ctx, `UPDATE service SET removed_by = $2, removed_at = now() WHERE id = $1`, id, by); err != nil {
+		return err
+	}
+	_, err := x.q.Exec(ctx, `DELETE FROM service_observation WHERE service_id = $1`, id)
+	return err
 }
 
 func (x queries) RecordObservation(ctx context.Context, service int64, o store.Observation) error {
@@ -679,8 +707,9 @@ func (x queries) RecordObservation(ctx context.Context, service int64, o store.O
 	if err != nil {
 		return err
 	}
+	// A service removed meanwhile is passed over, once its removal commits.
 	_, err = x.q.Exec(ctx, `INSERT INTO service_observation (service_id, error, found, live, replicas, ready, images, pods)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		SELECT id, $2::text, $3::boolean, $4::text, $5::int, $6::int, $7::jsonb, $8::jsonb FROM service WHERE id = $1 AND removed_at IS NULL FOR KEY SHARE
 		ON CONFLICT (service_id) DO UPDATE SET error = EXCLUDED.error, found = EXCLUDED.found,
 			live = EXCLUDED.live, replicas = EXCLUDED.replicas, ready = EXCLUDED.ready, images = EXCLUDED.images, pods = EXCLUDED.pods`,
 		service, o.Error, o.Found, o.Live, o.Replicas, o.Ready, images, podsJSON)

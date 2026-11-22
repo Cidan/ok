@@ -123,6 +123,7 @@ func (s *Server) Mount(r chi.Router) {
 		r.Get("/services", s.services)
 		r.Get("/services/events", s.servicesEvents)
 		r.Get("/services/{id}", s.service)
+		r.Post("/services/{id}/remove", s.removeService)
 		r.Get("/services/group/{name}", s.serviceGroup)
 		r.Post("/repositories/new", s.createRepository)
 		r.Get("/notifications", s.notifications)

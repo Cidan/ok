@@ -30,6 +30,7 @@ const (
 	Deployments_AllowHazards_FullMethodName    = "/ok.deploy.v1.Deployments/AllowHazards"
 	Deployments_ListServices_FullMethodName    = "/ok.deploy.v1.Deployments/ListServices"
 	Deployments_GetService_FullMethodName      = "/ok.deploy.v1.Deployments/GetService"
+	Deployments_RemoveService_FullMethodName   = "/ok.deploy.v1.Deployments/RemoveService"
 )
 
 // DeploymentsClient is the client API for Deployments service.
@@ -59,6 +60,11 @@ type DeploymentsClient interface {
 	ListServices(ctx context.Context, in *ListServicesRequest, opts ...grpc.CallOption) (*ListServicesResponse, error)
 	// GetService reads one service, with its recent deployments.
 	GetService(ctx context.Context, in *GetServiceRequest, opts ...grpc.CallOption) (*Service, error)
+	// RemoveService removes a service main no longer declares, with no deployment of it under
+	// way: ListServices and GetService pass over it from then on, and the observer stops reading
+	// its workload, which stays as it is in the cluster. Its deployments stay. A plan that declares
+	// its deploy again restores it.
+	RemoveService(ctx context.Context, in *RemoveServiceRequest, opts ...grpc.CallOption) (*RemoveServiceResponse, error)
 }
 
 type deploymentsClient struct {
@@ -139,6 +145,16 @@ func (c *deploymentsClient) GetService(ctx context.Context, in *GetServiceReques
 	return out, nil
 }
 
+func (c *deploymentsClient) RemoveService(ctx context.Context, in *RemoveServiceRequest, opts ...grpc.CallOption) (*RemoveServiceResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RemoveServiceResponse)
+	err := c.cc.Invoke(ctx, Deployments_RemoveService_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // DeploymentsServer is the server API for Deployments service.
 // All implementations must embed UnimplementedDeploymentsServer
 // for forward compatibility.
@@ -166,6 +182,11 @@ type DeploymentsServer interface {
 	ListServices(context.Context, *ListServicesRequest) (*ListServicesResponse, error)
 	// GetService reads one service, with its recent deployments.
 	GetService(context.Context, *GetServiceRequest) (*Service, error)
+	// RemoveService removes a service main no longer declares, with no deployment of it under
+	// way: ListServices and GetService pass over it from then on, and the observer stops reading
+	// its workload, which stays as it is in the cluster. Its deployments stay. A plan that declares
+	// its deploy again restores it.
+	RemoveService(context.Context, *RemoveServiceRequest) (*RemoveServiceResponse, error)
 	mustEmbedUnimplementedDeploymentsServer()
 }
 
@@ -196,6 +217,9 @@ func (UnimplementedDeploymentsServer) ListServices(context.Context, *ListService
 }
 func (UnimplementedDeploymentsServer) GetService(context.Context, *GetServiceRequest) (*Service, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetService not implemented")
+}
+func (UnimplementedDeploymentsServer) RemoveService(context.Context, *RemoveServiceRequest) (*RemoveServiceResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method RemoveService not implemented")
 }
 func (UnimplementedDeploymentsServer) mustEmbedUnimplementedDeploymentsServer() {}
 func (UnimplementedDeploymentsServer) testEmbeddedByValue()                     {}
@@ -344,6 +368,24 @@ func _Deployments_GetService_Handler(srv interface{}, ctx context.Context, dec f
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Deployments_RemoveService_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RemoveServiceRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(DeploymentsServer).RemoveService(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Deployments_RemoveService_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(DeploymentsServer).RemoveService(ctx, req.(*RemoveServiceRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Deployments_ServiceDesc is the grpc.ServiceDesc for Deployments service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -378,6 +420,10 @@ var Deployments_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetService",
 			Handler:    _Deployments_GetService_Handler,
+		},
+		{
+			MethodName: "RemoveService",
+			Handler:    _Deployments_RemoveService_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

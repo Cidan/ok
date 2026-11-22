@@ -94,7 +94,7 @@ func (o *Observer) Round(ctx context.Context) error {
 func (o *Observer) observe(ctx context.Context, id int64) error {
 	sv, err := o.Store.GetService(ctx, id)
 	if errors.Is(err, store.ErrNotFound) {
-		return nil // no longer declared
+		return nil // removed, or gone with its repository
 	}
 	if err != nil {
 		return err
